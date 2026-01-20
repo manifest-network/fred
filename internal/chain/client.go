@@ -274,3 +274,78 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 		}
 	}
 }
+
+// GetActiveLeasesByProvider returns all active leases for a provider.
+func (c *Client) GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+	var allLeases []billingtypes.Lease
+	var nextKey []byte
+
+	for {
+		resp, err := c.billingQuery.LeasesByProvider(ctx, &billingtypes.QueryLeasesByProviderRequest{
+			ProviderUuid: providerUUID,
+			StateFilter:  billingtypes.LEASE_STATE_ACTIVE,
+			Pagination: &query.PageRequest{
+				Key:   nextKey,
+				Limit: 100,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to query active leases: %w", err)
+		}
+
+		allLeases = append(allLeases, resp.Leases...)
+
+		if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
+	}
+
+	return allLeases, nil
+}
+
+// GetCreditAccount returns the credit account and balances for a tenant.
+func (c *Client) GetCreditAccount(ctx context.Context, tenant string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+	resp, err := c.billingQuery.CreditAccount(ctx, &billingtypes.QueryCreditAccountRequest{
+		Tenant: tenant,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query credit account: %w", err)
+	}
+
+	return &resp.CreditAccount, resp.Balances, nil
+}
+
+// CloseLeases closes the given leases. Returns the number of leases closed.
+func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string) (uint64, error) {
+	if len(leaseUUIDs) == 0 {
+		return 0, nil
+	}
+
+	// Batch up to 100 leases per transaction
+	const batchSize = 100
+	var totalClosed uint64
+
+	for i := 0; i < len(leaseUUIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(leaseUUIDs) {
+			end = len(leaseUUIDs)
+		}
+		batch := leaseUUIDs[i:end]
+
+		msg := &billingtypes.MsgCloseLease{
+			Sender:     c.signer.Address(),
+			LeaseUuids: batch,
+		}
+
+		txHash, err := c.broadcastTx(ctx, msg)
+		if err != nil {
+			return totalClosed, fmt.Errorf("failed to close leases: %w", err)
+		}
+
+		slog.Info("closed leases", "count", len(batch), "tx_hash", txHash)
+		totalClosed += uint64(len(batch))
+	}
+
+	return totalClosed, nil
+}

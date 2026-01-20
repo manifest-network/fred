@@ -42,19 +42,54 @@ func New(client *chain.Client, eventSubscriber *chain.EventSubscriber, providerU
 	}
 }
 
+// ScanAndAcknowledge scans for pending leases and optionally acknowledges them.
+// This should be called once at startup before Start().
+// Returns the number of pending leases found.
+func (w *Watcher) ScanAndAcknowledge(ctx context.Context) (int, error) {
+	slog.Info("scanning for pending leases")
+
+	leases, err := w.client.GetPendingLeases(ctx, w.providerUUID)
+	if err != nil {
+		return 0, err
+	}
+
+	count := len(leases)
+	if count == 0 {
+		slog.Info("no pending leases found")
+		return 0, nil
+	}
+
+	slog.Info("found pending leases", "count", count)
+
+	// If auto-acknowledge is disabled, just report and return
+	if !w.autoAcknowledge {
+		slog.Info("auto-acknowledge disabled, skipping acknowledgment", "pending_count", count)
+		return count, nil
+	}
+
+	// Collect lease UUIDs for acknowledgment
+	var leaseUUIDs []string
+	for _, lease := range leases {
+		leaseUUIDs = append(leaseUUIDs, lease.Uuid)
+	}
+
+	slog.Info("auto-acknowledging pending leases", "count", len(leaseUUIDs))
+
+	// Acknowledge in batches of 100
+	if err := w.acknowledgeLeases(ctx, leaseUUIDs); err != nil {
+		return count, err
+	}
+
+	return count, nil
+}
+
 // Start begins watching for lease events.
+// Note: Call ScanAndAcknowledge() before Start() to handle existing pending leases.
 func (w *Watcher) Start(ctx context.Context) error {
 	slog.Info("starting lease watcher",
 		"provider_uuid", w.providerUUID,
 		"auto_acknowledge", w.autoAcknowledge,
 	)
-
-	// Acknowledge existing pending leases on startup
-	if w.autoAcknowledge {
-		if err := w.acknowledgeExistingPending(ctx); err != nil {
-			slog.Error("failed to acknowledge existing pending leases", "error", err)
-		}
-	}
 
 	// Start event subscriber in a goroutine
 	go func() {
@@ -65,32 +100,6 @@ func (w *Watcher) Start(ctx context.Context) error {
 
 	// Process events
 	return w.processEvents(ctx)
-}
-
-// acknowledgeExistingPending queries and acknowledges all pending leases for the provider.
-func (w *Watcher) acknowledgeExistingPending(ctx context.Context) error {
-	slog.Info("checking for existing pending leases")
-
-	leases, err := w.client.GetPendingLeases(ctx, w.providerUUID)
-	if err != nil {
-		return err
-	}
-
-	if len(leases) == 0 {
-		slog.Info("no existing pending leases found")
-		return nil
-	}
-
-	slog.Info("found existing pending leases", "count", len(leases))
-
-	// Collect lease UUIDs
-	var leaseUUIDs []string
-	for _, lease := range leases {
-		leaseUUIDs = append(leaseUUIDs, lease.Uuid)
-	}
-
-	// Acknowledge in batches of 100
-	return w.acknowledgeLeases(ctx, leaseUUIDs)
 }
 
 // processEvents handles incoming lease events.

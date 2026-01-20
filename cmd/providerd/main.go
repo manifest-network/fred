@@ -117,7 +117,21 @@ func run(cmd *cobra.Command, args []string) error {
 	// Initialize withdrawal scheduler
 	withdrawScheduler := scheduler.NewWithdrawScheduler(chainClient, cfg.ProviderUUID, cfg.WithdrawInterval)
 
-	// Start components
+	// Perform startup operations sequentially to avoid same-block transaction conflicts
+	// First: withdraw any accumulated funds
+	slog.Info("performing initial withdrawal")
+	withdrawScheduler.WithdrawOnce(ctx)
+
+	// Second: scan and acknowledge pending leases (must wait for withdrawal tx to be in a block)
+	pendingCount, err := leaseWatcher.ScanAndAcknowledge(ctx)
+	if err != nil {
+		slog.Error("failed to scan/acknowledge pending leases", "error", err)
+		// Continue startup - this is not fatal
+	} else if pendingCount > 0 {
+		slog.Info("startup lease scan complete", "pending_count", pendingCount)
+	}
+
+	// Start background components
 	errChan := make(chan error, 4)
 
 	go func() {
