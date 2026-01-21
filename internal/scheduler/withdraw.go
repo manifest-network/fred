@@ -106,6 +106,20 @@ func (s *WithdrawScheduler) withdrawAndCheckCredits(ctx context.Context) {
 func (s *WithdrawScheduler) withdraw(ctx context.Context) {
 	slog.Debug("starting withdrawal cycle", "provider_uuid", s.providerUUID)
 
+	// Check if there's anything to withdraw before executing transaction
+	withdrawable, err := s.client.GetProviderWithdrawable(ctx, s.providerUUID)
+	if err != nil {
+		slog.Error("failed to check withdrawable amounts", "error", err)
+		return
+	}
+
+	if withdrawable.IsZero() {
+		slog.Debug("no funds to withdraw", "provider_uuid", s.providerUUID)
+		return
+	}
+
+	slog.Info("withdrawable amounts available", "amounts", withdrawable)
+
 	totalWithdrawn := make(map[string]int64) // denom -> amount
 	iterations := 0
 	maxIterations := 100 // Safety limit
@@ -142,8 +156,6 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) {
 			"iterations", iterations,
 			"amounts", totalWithdrawn,
 		)
-	} else {
-		slog.Debug("no funds to withdraw", "provider_uuid", s.providerUUID)
 	}
 }
 

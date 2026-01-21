@@ -316,6 +316,19 @@ func (c *Client) GetCreditAccount(ctx context.Context, tenant string) (*billingt
 	return &resp.CreditAccount, resp.Balances, nil
 }
 
+// GetProviderWithdrawable returns the total withdrawable amounts for a provider.
+func (c *Client) GetProviderWithdrawable(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+	resp, err := c.billingQuery.ProviderWithdrawable(ctx, &billingtypes.QueryProviderWithdrawableRequest{
+		ProviderUuid: providerUUID,
+		Limit:        1000, // Max limit to get accurate total
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query provider withdrawable: %w", err)
+	}
+
+	return resp.Amounts, nil
+}
+
 // CloseLeases closes the given leases. Returns the number of leases closed.
 func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string) (uint64, error) {
 	if len(leaseUUIDs) == 0 {
