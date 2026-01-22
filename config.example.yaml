@@ -62,12 +62,17 @@ rate_limit_burst: 20
 # At least one backend must be configured. Backends handle the actual
 # provisioning of resources when leases are created.
 backends:
-  # Example: Kubernetes backend for k8s-* SKUs
-  - name: kubernetes
-    url: "http://k8s-backend:9000"
+  # Mock backend for testing (run with: make run-mock)
+  - name: mock
+    url: "http://localhost:9000"
     timeout: 30s
-    sku_prefix: "k8s-"
     default: true  # This backend is used for SKUs that don't match any prefix
+
+  # Example: Kubernetes backend for k8s-* SKUs
+  # - name: kubernetes
+  #   url: "http://k8s-backend:9000"
+  #   timeout: 30s
+  #   sku_prefix: "k8s-"
 
   # Example: GPU backend for gpu-* SKUs
   # - name: gpu
@@ -84,7 +89,7 @@ backends:
 # Callback URL (required when backends are configured)
 # This is the URL backends will call to report provisioning status.
 # Must be reachable from your backends.
-callback_base_url: "http://fred.provider.example.com:8080"
+callback_base_url: "http://localhost:8080"
 
 # Advanced timeout configuration (optional)
 # HTTP server timeouts

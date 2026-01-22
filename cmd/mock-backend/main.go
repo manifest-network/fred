@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -51,9 +52,20 @@ func main() {
 		ProvisionDelay: delay,
 	})
 
+	// Create HTTP client that skips TLS verification (for self-signed certs)
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
 	// Create HTTP server
 	server := &MockBackendServer{
-		backend: mockBackend,
+		backend:    mockBackend,
+		httpClient: httpClient,
 	}
 
 	mux := http.NewServeMux()
@@ -102,7 +114,8 @@ func main() {
 
 // MockBackendServer wraps the mock backend with HTTP handlers.
 type MockBackendServer struct {
-	backend *backend.MockBackend
+	backend    *backend.MockBackend
+	httpClient *http.Client
 }
 
 func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Request) {
@@ -200,7 +213,7 @@ func (s *MockBackendServer) handleHealth(w http.ResponseWriter, r *http.Request)
 	w.Write([]byte("ok"))
 }
 
-func (s *MockBackendServer) sendCallback(url string, payload backend.CallbackPayload) {
+func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.CallbackPayload) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		slog.Error("failed to marshal callback payload", "error", err)
@@ -208,20 +221,27 @@ func (s *MockBackendServer) sendCallback(url string, payload backend.CallbackPay
 	}
 
 	slog.Info("sending callback",
-		"url", url,
+		"url", callbackURL,
 		"lease_uuid", payload.LeaseUUID,
 		"status", payload.Status,
 	)
 
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, callbackURL, bytes.NewReader(body))
 	if err != nil {
-		slog.Error("failed to send callback", "error", err, "url", url)
+		slog.Error("failed to create callback request", "error", err, "url", callbackURL)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		slog.Error("failed to send callback", "error", err, "url", callbackURL)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		slog.Error("callback returned error", "status", resp.StatusCode, "url", url)
+		slog.Error("callback returned error", "status", resp.StatusCode, "url", callbackURL)
 		return
 	}
 
