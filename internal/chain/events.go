@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -22,6 +22,23 @@ const (
 	LeaseClosed       LeaseEventType = "lease_closed"
 	LeaseExpired      LeaseEventType = "lease_expired"
 	LeaseAutoClosed   LeaseEventType = "lease_auto_closed" // Credit exhaustion (any provider)
+)
+
+const (
+	// eventChannelCapacity is the buffer size for the lease events channel.
+	// If the channel fills up, events will be dropped with a warning log.
+	// Increase this value if you observe "event channel full" warnings.
+	eventChannelCapacity = 100
+
+	// invalidMsgThreshold is the count at which invalid message logging escalates to warning.
+	invalidMsgThreshold = 10
+
+	// readGoroutineCleanupTimeout is how long to wait for the read goroutine to finish during cleanup.
+	readGoroutineCleanupTimeout = 5 * time.Second
+
+	// backoffJitterDivisor controls the jitter range (1/N of backoff duration).
+	// A value of 4 means jitter is 0-25% of the backoff duration.
+	backoffJitterDivisor = 4
 )
 
 // LeaseEvent represents a lease-related event from the chain.
@@ -80,7 +97,7 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 		pingInterval:     pingInterval,
 		reconnectInitial: reconnectInitial,
 		reconnectMax:     reconnectMax,
-		events:           make(chan LeaseEvent, 100),
+		events:           make(chan LeaseEvent, eventChannelCapacity),
 		done:             make(chan struct{}),
 	}, nil
 }
@@ -134,7 +151,7 @@ func (s *EventSubscriber) Start(ctx context.Context) error {
 			backoff = s.reconnectMax
 		}
 		// Add jitter: random value between 0 and 25% of backoff to prevent thundering herd
-		jitter := time.Duration(rand.Int63n(int64(backoff) / 4))
+		jitter := time.Duration(rand.Int64N(int64(backoff) / backoffJitterDivisor))
 		backoff = backoff + jitter
 	}
 }
@@ -155,7 +172,11 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 	s.conn = conn
 	s.mu.Unlock()
 
+	// Cleanup function to close connection and wait for read goroutine
+	// We declare readDone here so we can reference it in the defer
+	var readDone chan struct{}
 	defer func() {
+		// Close connection first to unblock any pending ReadMessage
 		s.mu.Lock()
 		if s.conn != nil {
 			if err := s.conn.Close(); err != nil {
@@ -164,6 +185,15 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 			s.conn = nil
 		}
 		s.mu.Unlock()
+
+		// Wait for read goroutine to finish (if it was started)
+		if readDone != nil {
+			select {
+			case <-readDone:
+			case <-time.After(readGoroutineCleanupTimeout):
+				slog.Warn("timeout waiting for read goroutine to finish")
+			}
+		}
 	}()
 
 	slog.Info("websocket connected", "url", s.url)
@@ -193,7 +223,7 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 
 	// Channel to signal read errors and completion
 	readErr := make(chan error, 1)
-	readDone := make(chan struct{})
+	readDone = make(chan struct{})
 
 	// Read messages in a goroutine
 	go func() {
@@ -209,18 +239,6 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 				return
 			}
 			s.handleMessage(message)
-		}
-	}()
-
-	// Ensure read goroutine is stopped before returning
-	defer func() {
-		// Close connection to unblock ReadMessage (already done by outer defer, but be explicit)
-		conn.Close()
-		// Wait for read goroutine to finish with timeout
-		select {
-		case <-readDone:
-		case <-time.After(5 * time.Second):
-			slog.Warn("timeout waiting for read goroutine to finish")
 		}
 	}()
 
@@ -272,20 +290,19 @@ func (s *EventSubscriber) handleMessage(message []byte) {
 		return
 	}
 
-	if resp.Result == nil {
+	if len(resp.Result) == 0 {
 		// This is normal for subscription confirmations
 		return
 	}
 
 	// Parse the result to extract events
-	result, ok := resp.Result.(map[string]interface{})
-	if !ok {
-		s.trackInvalidMessage("result_not_map", nil)
+	var result txEventResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		s.trackInvalidMessage("result_unmarshal_error", err)
 		return
 	}
 
-	events, ok := result["events"].(map[string]interface{})
-	if !ok {
+	if result.Events == nil {
 		// This is normal - not all messages contain events
 		return
 	}
@@ -296,7 +313,7 @@ func (s *EventSubscriber) handleMessage(message []byte) {
 	s.mu.Unlock()
 
 	// Extract lease events
-	event := s.parseLeaseEvent(events)
+	event := s.parseLeaseEvent(result.Events)
 	if event != nil {
 		select {
 		case s.events <- *event:
@@ -314,32 +331,24 @@ func (s *EventSubscriber) trackInvalidMessage(reason string, err error) {
 	s.invalidMsgCount++
 	s.lastInvalidMsgTime = time.Now()
 
-	// Escalate to warning after 10 consecutive invalid messages
-	if s.invalidMsgCount == 10 {
-		if err != nil {
-			slog.Warn("high rate of invalid WebSocket messages",
-				"reason", reason,
-				"count", s.invalidMsgCount,
-				"error", err,
-			)
-		} else {
-			slog.Warn("high rate of invalid WebSocket messages",
-				"reason", reason,
-				"count", s.invalidMsgCount,
-			)
-		}
-	} else if s.invalidMsgCount < 10 {
-		if err != nil {
-			slog.Debug("invalid WebSocket message", "reason", reason, "error", err)
-		} else {
-			slog.Debug("invalid WebSocket message", "reason", reason)
-		}
+	// Build log attributes
+	attrs := []interface{}{"reason", reason}
+	if err != nil {
+		attrs = append(attrs, "error", err)
 	}
-	// After 10, stop logging to avoid spam
+
+	switch {
+	case s.invalidMsgCount == invalidMsgThreshold:
+		// Escalate to warning at threshold
+		slog.Warn("high rate of invalid WebSocket messages", append(attrs, "count", s.invalidMsgCount)...)
+	case s.invalidMsgCount < invalidMsgThreshold:
+		slog.Debug("invalid WebSocket message", attrs...)
+	}
+	// After threshold, stop logging to avoid spam
 }
 
 // parseLeaseEvent extracts a LeaseEvent from CometBFT events.
-func (s *EventSubscriber) parseLeaseEvent(events map[string]interface{}) *LeaseEvent {
+func (s *EventSubscriber) parseLeaseEvent(events map[string][]string) *LeaseEvent {
 	// Check for lease_auto_closed events first (these are not filtered by provider)
 	if event := s.parseAutoClosedEvent(events); event != nil {
 		return event
@@ -388,7 +397,7 @@ func (s *EventSubscriber) parseLeaseEvent(events map[string]interface{}) *LeaseE
 }
 
 // parseAutoClosedEvent parses lease_auto_closed events (from any provider).
-func (s *EventSubscriber) parseAutoClosedEvent(events map[string]interface{}) *LeaseEvent {
+func (s *EventSubscriber) parseAutoClosedEvent(events map[string][]string) *LeaseEvent {
 	prefix := string(LeaseAutoClosed)
 
 	leaseUUID := getEventAttribute(events, prefix+".lease_uuid")
@@ -420,11 +429,9 @@ func (s *EventSubscriber) parseAutoClosedEvent(events map[string]interface{}) *L
 }
 
 // getEventAttribute extracts an attribute value from events.
-func getEventAttribute(events map[string]interface{}, key string) string {
-	if values, ok := events[key].([]interface{}); ok && len(values) > 0 {
-		if str, ok := values[0].(string); ok {
-			return str
-		}
+func getEventAttribute(events map[string][]string, key string) string {
+	if values, ok := events[key]; ok && len(values) > 0 {
+		return values[0]
 	}
 	return ""
 }
@@ -450,10 +457,15 @@ type jsonRPCRequest struct {
 }
 
 type jsonRPCResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result"`
-	Error   *rpcError   `json:"error,omitempty"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      int             `json:"id"`
+	Result  json.RawMessage `json:"result"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+// txEventResult represents the result structure for transaction events.
+type txEventResult struct {
+	Events map[string][]string `json:"events"`
 }
 
 type rpcError struct {

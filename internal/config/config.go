@@ -2,12 +2,18 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/spf13/viper"
+)
+
+// Default values for configuration.
+const (
+	DefaultMaxRequestBodySize int64 = 1 << 20 // 1MB
 )
 
 // Config holds all configuration for the provider daemon.
@@ -104,7 +110,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("websocket_reconnect_max", "60s")
 
 	// API limits defaults
-	v.SetDefault("max_request_body_size", 1<<20) // 1MB
+	v.SetDefault("max_request_body_size", DefaultMaxRequestBodySize)
 
 	// Credit check defaults
 	v.SetDefault("credit_check_error_threshold", 3)
@@ -237,8 +243,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.GRPCEndpoint != "" && !strings.Contains(c.GRPCEndpoint, ":") {
-		return fmt.Errorf("grpc_endpoint must be in host:port format")
+	if c.GRPCEndpoint != "" {
+		if _, _, err := net.SplitHostPort(c.GRPCEndpoint); err != nil {
+			return fmt.Errorf("grpc_endpoint must be in host:port format: %w", err)
+		}
 	}
 
 	// TLS file validation - if one is set, both must be set

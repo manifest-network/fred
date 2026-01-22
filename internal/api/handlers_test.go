@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/manifest-network/fred/internal/testutil"
@@ -85,38 +86,17 @@ func TestGenerateConnectionDetails_ValidOutput(t *testing.T) {
 	conn := generateConnectionDetails(testutil.ValidUUID1)
 
 	// Verify host is from the list
-	validHost := false
-	for _, h := range hostnames {
-		if conn.Host == h {
-			validHost = true
-			break
-		}
-	}
-	if !validHost {
+	if !slices.Contains(hostnames, conn.Host) {
 		t.Errorf("Host %q is not in valid hostnames list", conn.Host)
 	}
 
 	// Verify port is from the list
-	validPort := false
-	for _, p := range ports {
-		if conn.Port == p {
-			validPort = true
-			break
-		}
-	}
-	if !validPort {
+	if !slices.Contains(ports, conn.Port) {
 		t.Errorf("Port %d is not in valid ports list", conn.Port)
 	}
 
 	// Verify protocol is from the list
-	validProtocol := false
-	for _, p := range protocols {
-		if conn.Protocol == p {
-			validProtocol = true
-			break
-		}
-	}
-	if !validProtocol {
+	if !slices.Contains(protocols, conn.Protocol) {
 		t.Errorf("Protocol %q is not in valid protocols list", conn.Protocol)
 	}
 
@@ -136,10 +116,8 @@ func TestGenerateConnectionDetails_ValidOutput(t *testing.T) {
 }
 
 func TestWriteError(t *testing.T) {
-	h := &Handlers{}
-
 	rec := httptest.NewRecorder()
-	h.writeError(rec, "test error", http.StatusBadRequest)
+	writeError(rec, "test error", http.StatusBadRequest)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("writeError() status = %d, want %d", rec.Code, http.StatusBadRequest)
@@ -159,12 +137,10 @@ func TestWriteError(t *testing.T) {
 }
 
 func TestWriteJSON(t *testing.T) {
-	h := &Handlers{}
-
 	data := map[string]string{"key": "value"}
 
 	rec := httptest.NewRecorder()
-	h.writeJSON(rec, data, http.StatusOK)
+	writeJSON(rec, data, http.StatusOK)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("writeJSON() status = %d, want %d", rec.Code, http.StatusOK)
@@ -194,8 +170,8 @@ func TestExtractToken_MissingAuth(t *testing.T) {
 	if err == nil {
 		t.Error("extractToken() = nil error, want error for missing auth")
 	}
-	if err != ErrMissingAuth {
-		t.Errorf("extractToken() error = %v, want ErrMissingAuth", err)
+	if err != errMissingAuth {
+		t.Errorf("extractToken() error = %v, want errMissingAuth", err)
 	}
 }
 
@@ -232,13 +208,8 @@ func TestExtractToken_InvalidFormat(t *testing.T) {
 func TestExtractToken_ValidToken(t *testing.T) {
 	h := &Handlers{}
 
-	kp := testutil.NewTestKeyPair("extract-token-test")
-
-	// Create a simple valid base64 JSON token
-	tokenJSON := `{"tenant":"manifest1abc","lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","timestamp":1234567890,"pub_key":"dGVzdA==","signature":"dGVzdA=="}`
+	// Pre-encoded valid token JSON for testing extraction (not signature validation)
 	tokenB64 := "eyJ0ZW5hbnQiOiJtYW5pZmVzdDFhYmMiLCJsZWFzZV91dWlkIjoiMDEyMzQ1NjctODlhYi1jZGVmLTAxMjMtNDU2Nzg5YWJjZGVmIiwidGltZXN0YW1wIjoxMjM0NTY3ODkwLCJwdWJfa2V5IjoiZEdWemRBPT0iLCJzaWduYXR1cmUiOiJkR1Z6ZEE9PSJ9"
-	_ = tokenJSON
-	_ = kp
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Authorization", "Bearer "+tokenB64)
@@ -273,14 +244,6 @@ func TestExtractToken_CaseInsensitiveBearer(t *testing.T) {
 				t.Errorf("extractToken() with %q error = %v", prefix, err)
 			}
 		})
-	}
-}
-
-func TestAuthError(t *testing.T) {
-	err := &AuthError{message: "test error"}
-
-	if err.Error() != "test error" {
-		t.Errorf("AuthError.Error() = %q, want %q", err.Error(), "test error")
 	}
 }
 

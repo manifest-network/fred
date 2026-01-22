@@ -15,18 +15,27 @@ const (
 	maxRetries     = 3
 	initialBackoff = 1 * time.Second
 	maxBackoff     = 10 * time.Second
+
+	// depletionCheckBuffer is how far before estimated depletion to schedule the next check.
+	// This ensures we catch depletion before it happens.
+	depletionCheckBuffer = 10 * time.Second
 )
 
 // ChainClient defines the interface for chain operations needed by the scheduler.
 type ChainClient interface {
 	GetProviderWithdrawable(ctx context.Context, providerUUID string) (sdktypes.Coins, error)
-	WithdrawByProvider(ctx context.Context, providerUUID string) (sdktypes.Coins, bool, string, error)
+	WithdrawByProvider(ctx context.Context, providerUUID string) (string, error)
 	GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	GetCreditAccount(ctx context.Context, tenant string) (*billingtypes.CreditAccount, sdktypes.Coins, error)
 	CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
 
 // tenantState tracks a tenant's balance history for burn rate calculation.
+//
+// Note: The current implementation assumes a single denomination for credit.
+// While the data structures support multiple denoms, the burn rate calculation
+// treats each denom independently and finds the earliest depletion time.
+// Multi-denom support with proportional burn rates is not implemented.
 type tenantState struct {
 	lastBalance      sdktypes.Coins
 	lastCheckTime    time.Time
@@ -228,46 +237,16 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) {
 
 	slog.Info("withdrawable amounts available", "amounts", withdrawable)
 
-	totalWithdrawn := make(map[string]int64) // denom -> amount
-	var txHashes []string
-	iterations := 0
-
-	for iterations < s.maxWithdrawIterations {
-		iterations++
-
-		amounts, hasMore, txHash, err := s.client.WithdrawByProvider(ctx, s.providerUUID)
-		if err != nil {
-			slog.Error("withdrawal failed", "error", err, "iteration", iterations)
-			break
-		}
-
-		txHashes = append(txHashes, txHash)
-
-		// Accumulate withdrawn amounts
-		for _, coin := range amounts {
-			totalWithdrawn[coin.Denom] += coin.Amount.Int64()
-		}
-
-		if !hasMore {
-			break
-		}
-
-		slog.Debug("more leases to withdraw", "iteration", iterations)
+	txHash, err := s.client.WithdrawByProvider(ctx, s.providerUUID)
+	if err != nil {
+		slog.Error("withdrawal failed", "error", err)
+		return
 	}
 
-	if iterations >= s.maxWithdrawIterations {
-		slog.Warn("reached maximum withdrawal iterations", "max", s.maxWithdrawIterations)
-	}
-
-	// Log summary
-	if len(txHashes) > 0 {
-		slog.Info("withdrawal cycle complete",
-			"provider_uuid", s.providerUUID,
-			"iterations", iterations,
-			"amounts", totalWithdrawn,
-			"tx_hashes", txHashes,
-		)
-	}
+	slog.Info("withdrawal complete",
+		"provider_uuid", s.providerUUID,
+		"tx_hash", txHash,
+	)
 }
 
 // checkCreditsAndClose checks tenant credit balances and closes leases for
@@ -287,7 +266,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 		slog.Debug("no active leases to check")
 		// Clear tenant state when no leases
 		s.mu.Lock()
-		s.tenants = make(map[string]*tenantState)
+		clear(s.tenants)
 		s.mu.Unlock()
 		return defaultNextCheck
 	}
@@ -397,11 +376,11 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 
 	// Determine next check time
 	if !earliestDepletion.IsZero() && earliestDepletion.Before(defaultNextCheck) {
-		// Schedule check 10 seconds BEFORE estimated depletion to catch it in time
-		nextCheck := earliestDepletion.Add(-10 * time.Second)
+		// Schedule check before estimated depletion to catch it in time
+		nextCheck := earliestDepletion.Add(-depletionCheckBuffer)
 		if nextCheck.Before(now) {
-			// If depletion is imminent, check again in 10 seconds
-			nextCheck = now.Add(10 * time.Second)
+			// If depletion is imminent, check again after the buffer period
+			nextCheck = now.Add(depletionCheckBuffer)
 		}
 		slog.Info("tenant approaching credit depletion, scheduling early check",
 			"depletion_estimate", earliestDepletion,
@@ -415,6 +394,11 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 
 // estimateDepletionTime calculates when a tenant's credit will be depleted
 // based on observed burn rate.
+//
+// Note: This implementation only supports a single denomination. While it iterates
+// over all denoms in the balance, it assumes each denom is being spent independently.
+// For multi-denom scenarios where spending is proportional across denoms, this would
+// need to be extended to calculate a weighted burn rate.
 func (s *WithdrawScheduler) estimateDepletionTime(prevBalance, currBalance sdktypes.Coins, elapsed time.Duration, now time.Time) time.Time {
 	// Calculate burn rate for each denom and find the earliest depletion
 	var earliestDepletion time.Time

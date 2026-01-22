@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"time"
 
 	"google.golang.org/grpc"
@@ -20,6 +21,11 @@ import (
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	skutypes "github.com/manifest-network/manifest-ledger/x/sku/types"
+)
+
+const (
+	// maxLeasesPerBatch is the maximum number of leases to process in a single transaction.
+	maxLeasesPerBatch = 100
 )
 
 // Client provides methods to query and submit transactions to the chain.
@@ -207,18 +213,10 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 		return 0, nil, nil
 	}
 
-	// Batch up to 100 leases per transaction
-	const batchSize = 100
 	var totalAcknowledged uint64
 	var txHashes []string
 
-	for i := 0; i < len(leaseUUIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(leaseUUIDs) {
-			end = len(leaseUUIDs)
-		}
-		batch := leaseUUIDs[i:end]
-
+	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
 		msg := &billingtypes.MsgAcknowledgeLease{
 			Sender:     c.signer.Address(),
 			LeaseUuids: batch,
@@ -238,21 +236,21 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 }
 
 // WithdrawByProvider withdraws funds from all active leases for a provider.
-// Returns the total amounts withdrawn, whether there are more leases to process, and the tx hash.
-func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (sdktypes.Coins, bool, string, error) {
+// Returns the transaction hash on success.
+func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (string, error) {
 	msg := &billingtypes.MsgWithdraw{
 		Sender:       c.signer.Address(),
 		ProviderUuid: providerUUID,
-		Limit:        100,
+		Limit:        maxLeasesPerBatch,
 	}
 
 	txHash, err := c.broadcastTx(ctx, msg)
 	if err != nil {
-		return nil, false, "", fmt.Errorf("failed to withdraw: %w", err)
+		return "", fmt.Errorf("failed to withdraw: %w", err)
 	}
 
 	slog.Info("withdrawal completed", "tx_hash", txHash)
-	return nil, false, txHash, nil
+	return txHash, nil
 }
 
 // broadcastTx signs and broadcasts a transaction, waits for execution, returns tx hash.
@@ -378,18 +376,10 @@ func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string, reason st
 		return 0, nil, nil
 	}
 
-	// Batch up to 100 leases per transaction
-	const batchSize = 100
 	var totalClosed uint64
 	var txHashes []string
 
-	for i := 0; i < len(leaseUUIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(leaseUUIDs) {
-			end = len(leaseUUIDs)
-		}
-		batch := leaseUUIDs[i:end]
-
+	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
 		msg := &billingtypes.MsgCloseLease{
 			Sender:     c.signer.Address(),
 			LeaseUuids: batch,

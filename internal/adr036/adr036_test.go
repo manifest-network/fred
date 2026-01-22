@@ -1,10 +1,11 @@
-package adr036
+package adr036_test
 
 import (
 	"encoding/base64"
 	"encoding/json"
 	"testing"
 
+	"github.com/manifest-network/fred/internal/adr036"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -12,13 +13,13 @@ func TestVerifySignature_Valid(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-seed-1")
 
 	message := []byte("test message")
-	signBytes := CreateSignBytes(message, kp.Address)
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
 	sig, err := kp.PrivKey.Sign(signBytes)
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
 
-	err = VerifySignature(kp.PubKey.Bytes(), message, sig, kp.Address)
+	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, sig, kp.Address)
 	if err != nil {
 		t.Errorf("VerifySignature() error = %v, want nil", err)
 	}
@@ -38,7 +39,7 @@ func TestVerifySignature_InvalidPubKeyLength(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pubKey := make([]byte, tt.pubKeyLen)
-			err := VerifySignature(pubKey, []byte("test"), []byte("sig"), "signer")
+			err := adr036.VerifySignature(pubKey, []byte("test"), []byte("sig"), "signer")
 			if err == nil {
 				t.Error("VerifySignature() = nil, want error")
 			}
@@ -58,7 +59,7 @@ func TestVerifySignature_InvalidSignature(t *testing.T) {
 	message := []byte("test message")
 	wrongSig := make([]byte, 64) // Invalid signature
 
-	err := VerifySignature(kp.PubKey.Bytes(), message, wrongSig, kp.Address)
+	err := adr036.VerifySignature(kp.PubKey.Bytes(), message, wrongSig, kp.Address)
 	if err == nil {
 		t.Error("VerifySignature() = nil, want error")
 	}
@@ -68,12 +69,15 @@ func TestVerifySignature_WrongMessage(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-seed-3")
 
 	originalMessage := []byte("original message")
-	signBytes := CreateSignBytes(originalMessage, kp.Address)
-	sig, _ := kp.PrivKey.Sign(signBytes)
+	signBytes := adr036.CreateSignBytes(originalMessage, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
 
 	// Try to verify with different message
 	differentMessage := []byte("different message")
-	err := VerifySignature(kp.PubKey.Bytes(), differentMessage, sig, kp.Address)
+	err = adr036.VerifySignature(kp.PubKey.Bytes(), differentMessage, sig, kp.Address)
 	if err == nil {
 		t.Error("VerifySignature() = nil, want error for wrong message")
 	}
@@ -84,11 +88,14 @@ func TestVerifySignature_WrongSigner(t *testing.T) {
 
 	message := []byte("test message")
 	// Sign with correct signer
-	signBytes := CreateSignBytes(message, kp.Address)
-	sig, _ := kp.PrivKey.Sign(signBytes)
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
 
 	// Verify with wrong signer address
-	err := VerifySignature(kp.PubKey.Bytes(), message, sig, "manifest1wrongaddress")
+	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, sig, "manifest1wrongaddress")
 	if err == nil {
 		t.Error("VerifySignature() = nil, want error for wrong signer")
 	}
@@ -98,13 +105,13 @@ func TestCreateSignBytes(t *testing.T) {
 	message := []byte("hello world")
 	signer := "manifest1abc123"
 
-	signBytes := CreateSignBytes(message, signer)
+	signBytes := adr036.CreateSignBytes(message, signer)
 	if signBytes == nil {
 		t.Fatal("CreateSignBytes() = nil")
 	}
 
 	// Verify it's valid JSON
-	var doc SignDoc
+	var doc adr036.SignDoc
 	if err := json.Unmarshal(signBytes, &doc); err != nil {
 		t.Fatalf("CreateSignBytes() produced invalid JSON: %v", err)
 	}
@@ -149,7 +156,7 @@ func TestCreateSignDoc(t *testing.T) {
 	message := []byte("test data")
 	signer := "manifest1xyz789"
 
-	doc := CreateSignDoc(message, signer)
+	doc := adr036.CreateSignDoc(message, signer)
 	if doc == nil {
 		t.Fatal("CreateSignDoc() = nil")
 	}
@@ -181,9 +188,9 @@ func TestCreateSignBytes_Deterministic(t *testing.T) {
 	signer := "manifest1deterministic"
 
 	// Call multiple times and verify same result
-	result1 := CreateSignBytes(message, signer)
-	result2 := CreateSignBytes(message, signer)
-	result3 := CreateSignBytes(message, signer)
+	result1 := adr036.CreateSignBytes(message, signer)
+	result2 := adr036.CreateSignBytes(message, signer)
+	result3 := adr036.CreateSignBytes(message, signer)
 
 	if string(result1) != string(result2) || string(result2) != string(result3) {
 		t.Error("CreateSignBytes() is not deterministic")

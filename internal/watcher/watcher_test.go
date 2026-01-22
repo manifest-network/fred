@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -42,11 +43,9 @@ func TestQueueForAcknowledgment_ThreadSafe(t *testing.T) {
 
 	// Queue from multiple goroutines
 	for _, uuid := range uuids {
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			w.queueForAcknowledgment(u)
-		}(uuid)
+		wg.Go(func() {
+			w.queueForAcknowledgment(uuid)
+		})
 	}
 
 	wg.Wait()
@@ -265,9 +264,8 @@ func TestNew(t *testing.T) {
 func TestAcknowledgeLeases_Batching(t *testing.T) {
 	// Generate 150 UUIDs (should be split into 2 batches of 100)
 	var uuids []string
-	for i := 0; i < 150; i++ {
-		// Simple UUID-like string for testing
-		uuid := "00000000-0000-0000-0000-" + padLeft(itoa(i), 12, '0')
+	for i := range 150 {
+		uuid := fmt.Sprintf("00000000-0000-0000-0000-%012d", i)
 		uuids = append(uuids, uuid)
 	}
 
@@ -276,26 +274,4 @@ func TestAcknowledgeLeases_Batching(t *testing.T) {
 	if len(uuids) != 150 {
 		t.Errorf("generated %d UUIDs, want 150", len(uuids))
 	}
-}
-
-// Helper functions for test
-func padLeft(s string, length int, pad byte) string {
-	for len(s) < length {
-		s = string(pad) + s
-	}
-	return s
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [10]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }

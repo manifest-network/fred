@@ -205,21 +205,23 @@ func (w *Watcher) handleCrossProviderAutoClose(tenant, eventProviderUUID string)
 	w.mu.Lock()
 	_, hasTenant := w.activeTenants[tenant]
 	trigger := w.withdrawTrigger
-	w.mu.Unlock()
-
 	if !hasTenant {
+		w.mu.Unlock()
 		slog.Debug("ignoring auto-close event for tenant without active leases",
 			"tenant", tenant,
 			"event_provider", eventProviderUUID,
 		)
 		return
 	}
+	w.mu.Unlock()
 
 	slog.Info("cross-provider credit depletion detected, triggering withdrawal",
 		"tenant", tenant,
 		"event_provider", eventProviderUUID,
 	)
 
+	// trigger is captured while holding the lock; safe because SetWithdrawTrigger
+	// is only called once during startup before the watcher processes events.
 	if trigger != nil {
 		trigger()
 	}
@@ -257,7 +259,7 @@ func (w *Watcher) processPendingBatch(ctx context.Context) {
 		leaseUUIDs = append(leaseUUIDs, uuid)
 	}
 	// Clear the map while still holding the lock
-	w.pendingLeases = make(map[string]struct{})
+	clear(w.pendingLeases)
 	w.mu.Unlock()
 
 	if err := w.acknowledgeLeases(ctx, leaseUUIDs); err != nil {
@@ -272,24 +274,13 @@ func (w *Watcher) processPendingBatch(ctx context.Context) {
 	}
 }
 
-// acknowledgeLeases acknowledges leases in batches of 100.
+// acknowledgeLeases acknowledges leases. Batching is handled by the client.
 func (w *Watcher) acknowledgeLeases(ctx context.Context, leaseUUIDs []string) error {
-	const batchSize = 100
-
-	for i := 0; i < len(leaseUUIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(leaseUUIDs) {
-			end = len(leaseUUIDs)
-		}
-		batch := leaseUUIDs[i:end]
-
-		count, txHashes, err := w.client.AcknowledgeLeases(ctx, batch)
-		if err != nil {
-			return err
-		}
-
-		slog.Info("acknowledged leases batch", "count", count, "tx_hashes", txHashes)
+	count, txHashes, err := w.client.AcknowledgeLeases(ctx, leaseUUIDs)
+	if err != nil {
+		return err
 	}
 
+	slog.Info("acknowledged leases", "count", count, "tx_hashes", txHashes)
 	return nil
 }

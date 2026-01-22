@@ -19,6 +19,13 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
 
+const (
+	// gasPriceDivisor converts gas price from micro-units to base units.
+	gasPriceDivisor = 1_000_000
+	// minFeeAmount is the minimum fee amount in base units.
+	minFeeAmount = 1
+)
+
 // Signer handles transaction signing using a Cosmos keyring.
 type Signer struct {
 	keyring   keyring.Keyring
@@ -108,9 +115,9 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 
 	// Set gas and fees from configuration
 	txBuilder.SetGasLimit(s.gasLimit)
-	feeAmount := int64(s.gasLimit) * s.gasPrice / 1000000 // Convert to fee based on gas price
-	if feeAmount < 1 {
-		feeAmount = 1 // Minimum fee
+	feeAmount := int64(s.gasLimit) * s.gasPrice / gasPriceDivisor
+	if feeAmount < minFeeAmount {
+		feeAmount = minFeeAmount
 	}
 	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, math.NewInt(feeAmount))))
 

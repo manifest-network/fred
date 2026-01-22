@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/config"
 )
 
 // Server is the HTTP API server.
@@ -45,7 +47,7 @@ func NewServer(cfg ServerConfig, client *chain.Client) *Server {
 	// Apply default for max request body size
 	maxBodySize := cfg.MaxRequestBodySize
 	if maxBodySize <= 0 {
-		maxBodySize = 1 << 20 // 1MB default
+		maxBodySize = config.DefaultMaxRequestBodySize
 	}
 
 	router := mux.NewRouter()
@@ -97,7 +99,7 @@ func (s *Server) Start(ctx context.Context) error {
 		} else {
 			err = s.server.ListenAndServe()
 		}
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()
@@ -111,18 +113,13 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // Shutdown gracefully shuts down the server.
-func (s *Server) Shutdown(ctx context.Context) {
+func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down API server")
-
-	// Stop the rate limiter cleanup goroutine
-	s.rateLimiter.Stop()
 
 	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("failed to shutdown server gracefully", "error", err)
-	}
+	return s.server.Shutdown(shutdownCtx)
 }
 
 // maxBodySizeMiddleware limits the size of request bodies.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -174,29 +175,23 @@ func run(cmd *cobra.Command, args []string) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 4)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := leaseWatcher.Start(ctx); err != nil && err != context.Canceled {
+	wg.Go(func() {
+		if err := leaseWatcher.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("watcher error: %w", err)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := apiServer.Start(ctx); err != nil && err != context.Canceled {
+	wg.Go(func() {
+		if err := apiServer.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("api server error: %w", err)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := withdrawScheduler.Start(ctx); err != nil && err != context.Canceled {
+	wg.Go(func() {
+		if err := withdrawScheduler.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("scheduler error: %w", err)
 		}
-	}()
+	})
 
 	slog.Info("providerd started successfully",
 		"api_addr", cfg.APIListenAddr,
@@ -224,7 +219,9 @@ func run(cmd *cobra.Command, args []string) error {
 	defer shutdownCancel()
 
 	// Shutdown API server (uses its own timeout)
-	apiServer.Shutdown(shutdownCtx)
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		slog.Error("failed to shutdown API server gracefully", "error", err)
+	}
 
 	// Close event subscriber
 	eventSub.Close()

@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/manifest-network/manifest-ledger v0.0.1
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.19.0

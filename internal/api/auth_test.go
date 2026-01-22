@@ -151,47 +151,6 @@ func TestValidate_WrongBech32Prefix(t *testing.T) {
 	}
 }
 
-func TestAddressToBech32(t *testing.T) {
-	// Known test vector - 20-byte address
-	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-		0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}
-
-	result, err := addressToBech32("manifest", data)
-	if err != nil {
-		t.Fatalf("addressToBech32() error = %v", err)
-	}
-
-	// Verify it starts with prefix
-	if result[:9] != "manifest1" {
-		t.Errorf("addressToBech32() prefix = %q, want %q", result[:9], "manifest1")
-	}
-
-	// Verify non-empty result
-	if len(result) < 10 {
-		t.Error("addressToBech32() result too short")
-	}
-}
-
-func TestAddressToBech32_DifferentPrefixes(t *testing.T) {
-	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-		0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}
-
-	prefixes := []string{"manifest", "cosmos", "osmo", "juno"}
-
-	for _, prefix := range prefixes {
-		result, err := addressToBech32(prefix, data)
-		if err != nil {
-			t.Errorf("addressToBech32(%q, data) error = %v", prefix, err)
-			continue
-		}
-		expectedPrefix := prefix + "1"
-		if result[:len(expectedPrefix)] != expectedPrefix {
-			t.Errorf("addressToBech32(%q, data) prefix = %q, want %q",
-				prefix, result[:len(expectedPrefix)], expectedPrefix)
-		}
-	}
-}
-
 func TestVerifyAddress_Valid(t *testing.T) {
 	kp := testutil.NewTestKeyPair("address-test-1")
 
@@ -266,7 +225,10 @@ func TestAuthToken_RoundTrip(t *testing.T) {
 	}
 
 	// Re-encode and compare
-	jsonBytes, _ := json.Marshal(token)
+	jsonBytes, err := json.Marshal(token)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
 	reencoded := base64.StdEncoding.EncodeToString(jsonBytes)
 
 	if reencoded != tokenStr {

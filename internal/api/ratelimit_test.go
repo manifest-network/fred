@@ -7,14 +7,10 @@ import (
 )
 
 func TestRateLimiter_AllowsWithinLimit(t *testing.T) {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		rate:     10, // 10 requests per second
-		burst:    10,
-	}
+	rl := NewRateLimiter(10, 10) // 10 requests per second, burst of 10
 
 	// Should allow requests within limit
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		limiter := rl.getVisitor("192.168.1.1")
 		if !limiter.Allow() {
 			t.Errorf("Request %d was blocked, should be allowed", i)
@@ -23,11 +19,7 @@ func TestRateLimiter_AllowsWithinLimit(t *testing.T) {
 }
 
 func TestRateLimiter_BlocksOverLimit(t *testing.T) {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		rate:     1,  // 1 request per second
-		burst:    1,  // burst of 1
-	}
+	rl := NewRateLimiter(1, 1) // 1 request per second, burst of 1
 
 	ip := "192.168.1.2"
 	limiter := rl.getVisitor(ip)
@@ -44,17 +36,13 @@ func TestRateLimiter_BlocksOverLimit(t *testing.T) {
 }
 
 func TestRateLimiter_BurstAllowed(t *testing.T) {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		rate:     1,   // 1 request per second
-		burst:    5,   // burst of 5
-	}
+	rl := NewRateLimiter(1, 5) // 1 request per second, burst of 5
 
 	ip := "192.168.1.3"
 	limiter := rl.getVisitor(ip)
 
 	// All burst requests should be allowed
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if !limiter.Allow() {
 			t.Errorf("Burst request %d was blocked, should be allowed", i)
 		}
@@ -67,11 +55,7 @@ func TestRateLimiter_BurstAllowed(t *testing.T) {
 }
 
 func TestRateLimiter_PerIPIsolation(t *testing.T) {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		rate:     1,
-		burst:    1,
-	}
+	rl := NewRateLimiter(1, 1)
 
 	// Exhaust limit for IP1
 	limiter1 := rl.getVisitor("192.168.1.1")
@@ -85,11 +69,7 @@ func TestRateLimiter_PerIPIsolation(t *testing.T) {
 }
 
 func TestRateLimiter_Middleware(t *testing.T) {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		rate:     1,
-		burst:    1,
-	}
+	rl := NewRateLimiter(1, 1)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -255,34 +235,37 @@ func TestGetClientIP_InvalidXRealIP(t *testing.T) {
 }
 
 func TestRateLimiter_MaxVisitors(t *testing.T) {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		rate:     10,
-		burst:    10,
-	}
+	rl := NewRateLimiter(10, 10)
 
 	// Add maxVisitors entries
-	for i := 0; i < maxVisitors; i++ {
-		rl.getVisitor(t.Name() + string(rune(i)))
+	for i := range maxVisitors {
+		rl.getVisitor(string(rune('a'+i%26)) + string(rune(i)))
 	}
 
-	if len(rl.visitors) != maxVisitors {
-		t.Errorf("visitors count = %d, want %d", len(rl.visitors), maxVisitors)
+	if rl.visitors.Len() != maxVisitors {
+		t.Errorf("visitors count = %d, want %d", rl.visitors.Len(), maxVisitors)
 	}
 
-	// Adding one more should trigger eviction
+	// Adding one more should trigger eviction (LRU handles this automatically)
 	rl.getVisitor("new-visitor")
 
-	if len(rl.visitors) != maxVisitors {
-		t.Errorf("visitors count after eviction = %d, want %d", len(rl.visitors), maxVisitors)
+	if rl.visitors.Len() != maxVisitors {
+		t.Errorf("visitors count after eviction = %d, want %d", rl.visitors.Len(), maxVisitors)
 	}
 }
 
-func TestRateLimiter_StopMultipleTimes(t *testing.T) {
+func TestRateLimiter_GetVisitorReturnsExisting(t *testing.T) {
 	rl := NewRateLimiter(10, 10)
 
-	// Should not panic when called multiple times
-	rl.Stop()
-	rl.Stop()
-	rl.Stop()
+	ip := "192.168.1.1"
+
+	// Get limiter first time
+	limiter1 := rl.getVisitor(ip)
+
+	// Get limiter second time - should return the same one
+	limiter2 := rl.getVisitor(ip)
+
+	if limiter1 != limiter2 {
+		t.Error("getVisitor should return the same limiter for the same IP")
+	}
 }

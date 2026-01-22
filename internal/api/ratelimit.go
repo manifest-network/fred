@@ -5,114 +5,51 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/time/rate"
 )
 
 const (
 	// maxVisitors limits the number of tracked IPs to prevent memory exhaustion
 	maxVisitors = 10000
+	// visitorTTL is how long a visitor entry stays in the cache without access
+	visitorTTL = 3 * time.Minute
 )
 
 // RateLimiter implements per-IP rate limiting using a token bucket algorithm.
 type RateLimiter struct {
-	visitors map[string]*visitor
-	mu       sync.RWMutex
+	visitors *lru.LRU[string, *rate.Limiter]
 	rate     rate.Limit // requests per second
 	burst    int        // max burst size
-	cleanup  time.Duration
-	done     chan struct{} // signals cleanup goroutine to stop
-	stopOnce sync.Once     // ensures Stop() is safe to call multiple times
-}
-
-type visitor struct {
-	limiter  *rate.Limiter
-	lastSeen time.Time
 }
 
 // NewRateLimiter creates a new rate limiter.
 // rps is requests per second, burst is the maximum burst size.
 func NewRateLimiter(rps float64, burst int) *RateLimiter {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
+	// expirable.LRU handles both LRU eviction (when maxVisitors reached)
+	// and TTL-based expiration (cleanup of stale entries)
+	cache := lru.NewLRU[string, *rate.Limiter](maxVisitors, nil, visitorTTL)
+
+	return &RateLimiter{
+		visitors: cache,
 		rate:     rate.Limit(rps),
 		burst:    burst,
-		cleanup:  3 * time.Minute,
-		done:     make(chan struct{}),
 	}
-
-	// Start cleanup goroutine to remove stale entries
-	go rl.cleanupLoop()
-
-	return rl
-}
-
-// Stop stops the cleanup goroutine. Safe to call multiple times.
-func (rl *RateLimiter) Stop() {
-	rl.stopOnce.Do(func() {
-		close(rl.done)
-	})
 }
 
 // getVisitor retrieves or creates a rate limiter for the given IP.
 func (rl *RateLimiter) getVisitor(ip string) *rate.Limiter {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	v, exists := rl.visitors[ip]
-	if !exists {
-		// Enforce max visitors limit to prevent memory exhaustion
-		if len(rl.visitors) >= maxVisitors {
-			// Evict oldest entry
-			rl.evictOldest()
-		}
-		limiter := rate.NewLimiter(rl.rate, rl.burst)
-		rl.visitors[ip] = &visitor{limiter: limiter, lastSeen: time.Now()}
+	// Try to get existing limiter (also refreshes TTL)
+	if limiter, ok := rl.visitors.Get(ip); ok {
 		return limiter
 	}
 
-	v.lastSeen = time.Now()
-	return v.limiter
-}
-
-// evictOldest removes the oldest visitor entry. Must be called with lock held.
-func (rl *RateLimiter) evictOldest() {
-	var oldestIP string
-	var oldestTime time.Time
-
-	for ip, v := range rl.visitors {
-		if oldestIP == "" || v.lastSeen.Before(oldestTime) {
-			oldestIP = ip
-			oldestTime = v.lastSeen
-		}
-	}
-
-	if oldestIP != "" {
-		delete(rl.visitors, oldestIP)
-	}
-}
-
-// cleanupLoop periodically removes stale visitor entries.
-func (rl *RateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-rl.done:
-			return
-		case <-ticker.C:
-			rl.mu.Lock()
-			for ip, v := range rl.visitors {
-				if time.Since(v.lastSeen) > rl.cleanup {
-					delete(rl.visitors, ip)
-				}
-			}
-			rl.mu.Unlock()
-		}
-	}
+	// Create new limiter - LRU will automatically evict oldest if at capacity
+	limiter := rate.NewLimiter(rl.rate, rl.burst)
+	rl.visitors.Add(ip, limiter)
+	return limiter
 }
 
 // Middleware returns an HTTP middleware that enforces rate limiting.
@@ -124,7 +61,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		if !limiter.Allow() {
 			slog.Warn("rate limit exceeded", "ip", ip, "path", r.URL.Path)
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, `{"error":"rate limit exceeded","code":429}`, http.StatusTooManyRequests)
+			writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 

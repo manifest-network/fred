@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,11 @@ import (
 
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
+)
+
+const (
+	// maxInstanceID is the upper bound for generated instance IDs.
+	maxInstanceID = 10000
 )
 
 // Connection property lists for deterministic generation
@@ -45,6 +51,14 @@ var (
 
 	tiers = []string{"standard", "premium", "dedicated"}
 )
+
+func init() {
+	// Validate connection property slices are non-empty to prevent runtime panics
+	if len(hostnames) == 0 || len(ports) == 0 || len(protocols) == 0 ||
+		len(regions) == 0 || len(tiers) == 0 {
+		panic("connection property slices must not be empty")
+	}
+}
 
 // Handlers contains HTTP request handlers.
 type Handlers struct {
@@ -92,7 +106,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {
 		slog.Warn("invalid lease UUID format", "lease_uuid", leaseUUID)
-		h.writeError(w, "invalid lease UUID format", http.StatusBadRequest)
+		writeError(w, "invalid lease UUID format", http.StatusBadRequest)
 		return
 	}
 
@@ -100,14 +114,14 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	token, err := h.extractToken(r)
 	if err != nil {
 		slog.Warn("invalid authorization", "error", err)
-		h.writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	// Validate the token
 	if err := token.Validate(h.bech32Prefix); err != nil {
 		slog.Warn("token validation failed", "error", err)
-		h.writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -117,7 +131,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 			"token_lease_uuid", token.LeaseUUID,
 			"request_lease_uuid", leaseUUID,
 		)
-		h.writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -125,13 +139,13 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	lease, err := h.client.GetActiveLease(r.Context(), leaseUUID)
 	if err != nil {
 		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		h.writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	if lease == nil {
 		slog.Warn("lease not found or not active", "lease_uuid", leaseUUID)
-		h.writeError(w, "lease not found or not active", http.StatusNotFound)
+		writeError(w, "lease not found or not active", http.StatusNotFound)
 		return
 	}
 
@@ -141,7 +155,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 			"token_tenant", token.Tenant,
 			"lease_tenant", lease.Tenant,
 		)
-		h.writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -151,7 +165,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 			"lease_provider_uuid", lease.ProviderUuid,
 			"our_provider_uuid", h.providerUUID,
 		)
-		h.writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -170,7 +184,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 		"tenant", token.Tenant,
 	)
 
-	h.writeJSON(w, response, http.StatusOK)
+	writeJSON(w, response, http.StatusOK)
 }
 
 // HealthResponse represents the health check response.
@@ -219,26 +233,26 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		Checks:       checks,
 	}
 
-	h.writeJSON(w, response, httpStatus)
+	writeJSON(w, response, httpStatus)
 }
 
 // extractToken extracts and parses the bearer token from the Authorization header.
 func (h *Handlers) extractToken(r *http.Request) (*AuthToken, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		return nil, ErrMissingAuth
+		return nil, errMissingAuth
 	}
 
 	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return nil, ErrInvalidAuthFormat
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		return nil, errInvalidAuthFormat
 	}
 
 	return ParseAuthToken(parts[1])
 }
 
 // writeJSON writes a JSON response.
-func (h *Handlers) writeJSON(w http.ResponseWriter, data interface{}, status int) {
+func writeJSON(w http.ResponseWriter, data interface{}, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
@@ -247,26 +261,18 @@ func (h *Handlers) writeJSON(w http.ResponseWriter, data interface{}, status int
 }
 
 // writeError writes an error response.
-func (h *Handlers) writeError(w http.ResponseWriter, message string, status int) {
+func writeError(w http.ResponseWriter, message string, status int) {
 	response := ErrorResponse{
 		Error: message,
 		Code:  status,
 	}
-	h.writeJSON(w, response, status)
+	writeJSON(w, response, status)
 }
 
-// Error types
-type AuthError struct {
-	message string
-}
-
-func (e *AuthError) Error() string {
-	return e.message
-}
-
+// Sentinel errors for authentication (unexported - internal to package)
 var (
-	ErrMissingAuth       = &AuthError{"missing authorization header"}
-	ErrInvalidAuthFormat = &AuthError{"invalid authorization format, expected 'Bearer <token>'"}
+	errMissingAuth       = errors.New("missing authorization header")
+	errInvalidAuthFormat = errors.New("invalid authorization format, expected 'Bearer <token>'")
 )
 
 // generateConnectionDetails creates deterministic connection details from a lease UUID.
@@ -283,7 +289,7 @@ func generateConnectionDetails(leaseUUID string) ConnectionDetails {
 	tierIdx := int(binary.BigEndian.Uint32(hash[16:20])) % len(tiers)
 
 	// Generate a deterministic instance ID from the hash
-	instanceID := binary.BigEndian.Uint32(hash[20:24]) % 10000
+	instanceID := binary.BigEndian.Uint32(hash[20:24]) % maxInstanceID
 
 	return ConnectionDetails{
 		Host:     hostnames[hostIdx],

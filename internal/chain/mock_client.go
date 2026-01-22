@@ -14,7 +14,7 @@ type MockClient struct {
 	GetActiveLeasesByProviderFunc func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	AcknowledgeLeasesFunc         func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
 	CloseLeasesFunc               func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
-	WithdrawByProviderFunc        func(ctx context.Context, providerUUID string) (sdktypes.Coins, bool, string, error)
+	WithdrawByProviderFunc        func(ctx context.Context, providerUUID string) (string, error)
 	GetProviderWithdrawableFunc   func(ctx context.Context, providerUUID string) (sdktypes.Coins, error)
 	GetCreditAccountFunc          func(ctx context.Context, tenant string) (*billingtypes.CreditAccount, sdktypes.Coins, error)
 	PingFunc                      func(ctx context.Context) error
@@ -60,12 +60,12 @@ func (m *MockClient) CloseLeases(ctx context.Context, leaseUUIDs []string, reaso
 	return 0, nil, nil
 }
 
-// WithdrawByProvider calls the mock function if set, otherwise returns nil.
-func (m *MockClient) WithdrawByProvider(ctx context.Context, providerUUID string) (sdktypes.Coins, bool, string, error) {
+// WithdrawByProvider calls the mock function if set, otherwise returns empty string.
+func (m *MockClient) WithdrawByProvider(ctx context.Context, providerUUID string) (string, error) {
 	if m.WithdrawByProviderFunc != nil {
 		return m.WithdrawByProviderFunc(ctx, providerUUID)
 	}
-	return nil, false, "", nil
+	return "", nil
 }
 
 // GetProviderWithdrawable calls the mock function if set, otherwise returns nil.

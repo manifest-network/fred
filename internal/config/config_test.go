@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,8 +112,8 @@ func TestConfig_Validate_MissingRequired(t *testing.T) {
 				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
 				return
 			}
-			if err.Error() != tt.wantErr {
-				t.Errorf("Validate() error = %q, want %q", err.Error(), tt.wantErr)
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
 			}
 		})
 	}
@@ -262,8 +263,8 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 				t.Errorf("Validate() = nil, want error %q", tt.wantErr)
 				return
 			}
-			if err.Error() != tt.wantErr {
-				t.Errorf("Validate() error = %q, want %q", err.Error(), tt.wantErr)
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
 			}
 		})
 	}
@@ -356,8 +357,8 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 				t.Errorf("Validate() = nil, want error %q", tt.wantErr)
 				return
 			}
-			if err.Error() != tt.wantErr {
-				t.Errorf("Validate() error = %q, want %q", err.Error(), tt.wantErr)
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
 			}
 		})
 	}
@@ -442,8 +443,8 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 				t.Errorf("Validate() = nil, want error %q", tt.wantErr)
 				return
 			}
-			if err.Error() != tt.wantErr {
-				t.Errorf("Validate() error = %q, want %q", err.Error(), tt.wantErr)
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
 			}
 		})
 	}

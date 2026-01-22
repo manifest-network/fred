@@ -83,10 +83,13 @@ func TestNewEventSubscriber(t *testing.T) {
 }
 
 func TestEventSubscriber_Events(t *testing.T) {
-	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: "test-uuid",
 	})
+	if err != nil {
+		t.Fatalf("NewEventSubscriber() error = %v", err)
+	}
 
 	ch := sub.Events()
 	if ch == nil {
@@ -97,55 +100,47 @@ func TestEventSubscriber_Events(t *testing.T) {
 func TestGetEventAttribute(t *testing.T) {
 	tests := []struct {
 		name   string
-		events map[string]interface{}
+		events map[string][]string
 		key    string
 		want   string
 	}{
 		{
 			name: "existing attribute",
-			events: map[string]interface{}{
-				"lease_created.lease_uuid": []interface{}{"uuid-123"},
+			events: map[string][]string{
+				"lease_created.lease_uuid": {"uuid-123"},
 			},
 			key:  "lease_created.lease_uuid",
 			want: "uuid-123",
 		},
 		{
 			name: "missing attribute",
-			events: map[string]interface{}{
-				"other.attr": []interface{}{"value"},
+			events: map[string][]string{
+				"other.attr": {"value"},
 			},
 			key:  "lease_created.lease_uuid",
 			want: "",
 		},
 		{
 			name:   "empty events",
-			events: map[string]interface{}{},
+			events: map[string][]string{},
 			key:    "lease_created.lease_uuid",
 			want:   "",
 		},
 		{
 			name: "empty array",
-			events: map[string]interface{}{
-				"lease_created.lease_uuid": []interface{}{},
+			events: map[string][]string{
+				"lease_created.lease_uuid": {},
 			},
 			key:  "lease_created.lease_uuid",
 			want: "",
 		},
 		{
-			name: "non-string value",
-			events: map[string]interface{}{
-				"lease_created.lease_uuid": []interface{}{123},
+			name: "multiple values returns first",
+			events: map[string][]string{
+				"lease_created.lease_uuid": {"first", "second"},
 			},
 			key:  "lease_created.lease_uuid",
-			want: "",
-		},
-		{
-			name: "not an array",
-			events: map[string]interface{}{
-				"lease_created.lease_uuid": "direct-value",
-			},
-			key:  "lease_created.lease_uuid",
-			want: "",
+			want: "first",
 		},
 	}
 
@@ -161,22 +156,25 @@ func TestGetEventAttribute(t *testing.T) {
 
 func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 	providerUUID := "provider-uuid-123"
-	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: providerUUID,
 	})
+	if err != nil {
+		t.Fatalf("NewEventSubscriber() error = %v", err)
+	}
 
 	tests := []struct {
 		name   string
-		events map[string]interface{}
+		events map[string][]string
 		want   *LeaseEvent
 	}{
 		{
 			name: "lease_created event",
-			events: map[string]interface{}{
-				"lease_created.lease_uuid":    []interface{}{"lease-uuid-1"},
-				"lease_created.provider_uuid": []interface{}{providerUUID},
-				"lease_created.tenant":        []interface{}{"tenant-addr"},
+			events: map[string][]string{
+				"lease_created.lease_uuid":    {"lease-uuid-1"},
+				"lease_created.provider_uuid": {providerUUID},
+				"lease_created.tenant":        {"tenant-addr"},
 			},
 			want: &LeaseEvent{
 				Type:         LeaseCreated,
@@ -187,10 +185,10 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 		},
 		{
 			name: "lease_acknowledged event",
-			events: map[string]interface{}{
-				"lease_acknowledged.lease_uuid":    []interface{}{"lease-uuid-2"},
-				"lease_acknowledged.provider_uuid": []interface{}{providerUUID},
-				"lease_acknowledged.tenant":        []interface{}{"tenant-addr"},
+			events: map[string][]string{
+				"lease_acknowledged.lease_uuid":    {"lease-uuid-2"},
+				"lease_acknowledged.provider_uuid": {providerUUID},
+				"lease_acknowledged.tenant":        {"tenant-addr"},
 			},
 			want: &LeaseEvent{
 				Type:         LeaseAcknowledged,
@@ -201,20 +199,20 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 		},
 		{
 			name: "event for different provider - ignored",
-			events: map[string]interface{}{
-				"lease_created.lease_uuid":    []interface{}{"lease-uuid-3"},
-				"lease_created.provider_uuid": []interface{}{"other-provider"},
-				"lease_created.tenant":        []interface{}{"tenant-addr"},
+			events: map[string][]string{
+				"lease_created.lease_uuid":    {"lease-uuid-3"},
+				"lease_created.provider_uuid": {"other-provider"},
+				"lease_created.tenant":        {"tenant-addr"},
 			},
 			want: nil,
 		},
 		{
 			name: "auto_closed event",
-			events: map[string]interface{}{
-				"lease_auto_closed.lease_uuid":    []interface{}{"lease-uuid-4"},
-				"lease_auto_closed.provider_uuid": []interface{}{"any-provider"},
-				"lease_auto_closed.tenant":        []interface{}{"tenant-addr"},
-				"lease_auto_closed.reason":        []interface{}{"credit_exhausted"},
+			events: map[string][]string{
+				"lease_auto_closed.lease_uuid":    {"lease-uuid-4"},
+				"lease_auto_closed.provider_uuid": {"any-provider"},
+				"lease_auto_closed.tenant":        {"tenant-addr"},
+				"lease_auto_closed.reason":        {"credit_exhausted"},
 			},
 			want: &LeaseEvent{
 				Type:         LeaseAutoClosed,
@@ -225,7 +223,7 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 		},
 		{
 			name:   "no relevant events",
-			events: map[string]interface{}{},
+			events: map[string][]string{},
 			want:   nil,
 		},
 	}
@@ -260,50 +258,70 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 
 func TestEventSubscriber_HandleMessage(t *testing.T) {
 	providerUUID := "provider-uuid-123"
-	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: providerUUID,
 	})
+	if err != nil {
+		t.Fatalf("NewEventSubscriber() error = %v", err)
+	}
+
+	// Helper to create result JSON with events
+	makeResultJSON := func(events map[string][]string) json.RawMessage {
+		result := txEventResult{Events: events}
+		data, _ := json.Marshal(result)
+		return data
+	}
 
 	tests := []struct {
 		name        string
-		message     interface{}
+		message     string
 		expectEvent bool
 	}{
 		{
 			name: "valid lease_created message",
-			message: jsonRPCResponse{
-				JSONRPC: "2.0",
-				ID:      1,
-				Result: map[string]interface{}{
-					"events": map[string]interface{}{
-						"lease_created.lease_uuid":    []interface{}{"lease-uuid-1"},
-						"lease_created.provider_uuid": []interface{}{providerUUID},
-						"lease_created.tenant":        []interface{}{"tenant-addr"},
-					},
-				},
-			},
+			message: func() string {
+				resp := jsonRPCResponse{
+					JSONRPC: "2.0",
+					ID:      1,
+					Result: makeResultJSON(map[string][]string{
+						"lease_created.lease_uuid":    {"lease-uuid-1"},
+						"lease_created.provider_uuid": {providerUUID},
+						"lease_created.tenant":        {"tenant-addr"},
+					}),
+				}
+				data, _ := json.Marshal(resp)
+				return string(data)
+			}(),
 			expectEvent: true,
 		},
 		{
-			name: "subscription confirmation (nil result)",
-			message: jsonRPCResponse{
-				JSONRPC: "2.0",
-				ID:      1,
-				Result:  nil,
-			},
+			name: "subscription confirmation (empty result)",
+			message: func() string {
+				resp := jsonRPCResponse{
+					JSONRPC: "2.0",
+					ID:      1,
+					Result:  nil,
+				}
+				data, _ := json.Marshal(resp)
+				return string(data)
+			}(),
 			expectEvent: false,
 		},
 		{
 			name: "rpc error",
-			message: jsonRPCResponse{
-				JSONRPC: "2.0",
-				ID:      1,
-				Error: &rpcError{
-					Code:    -1,
-					Message: "some error",
-				},
-			},
+			message: func() string {
+				resp := jsonRPCResponse{
+					JSONRPC: "2.0",
+					ID:      1,
+					Error: &rpcError{
+						Code:    -1,
+						Message: "some error",
+					},
+				}
+				data, _ := json.Marshal(resp)
+				return string(data)
+			}(),
 			expectEvent: false,
 		},
 		{
@@ -315,21 +333,13 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var msgBytes []byte
-			switch v := tt.message.(type) {
-			case string:
-				msgBytes = []byte(v)
-			default:
-				msgBytes, _ = json.Marshal(v)
-			}
-
 			// Drain any existing events
 			select {
 			case <-sub.events:
 			default:
 			}
 
-			sub.handleMessage(msgBytes)
+			sub.handleMessage([]byte(tt.message))
 
 			// Check if event was emitted
 			select {
@@ -347,13 +357,16 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 }
 
 func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
-	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: "test-uuid",
 	})
+	if err != nil {
+		t.Fatalf("NewEventSubscriber() error = %v", err)
+	}
 
 	// Track multiple invalid messages
-	for i := 0; i < 15; i++ {
+	for range 15 {
 		sub.trackInvalidMessage("test_error", nil)
 	}
 
@@ -367,10 +380,13 @@ func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
 }
 
 func TestEventSubscriber_Close(t *testing.T) {
-	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: "test-uuid",
 	})
+	if err != nil {
+		t.Fatalf("NewEventSubscriber() error = %v", err)
+	}
 
 	// Close should not panic
 	sub.Close()

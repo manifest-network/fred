@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -11,6 +10,7 @@ import (
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 
 	"github.com/manifest-network/fred/internal/adr036"
+	"github.com/manifest-network/fred/internal/auth"
 )
 
 const (
@@ -84,9 +84,7 @@ func (t *AuthToken) Validate(bech32Prefix string) error {
 
 // createSignData creates the message data to be signed.
 func (t *AuthToken) createSignData() []byte {
-	// The data to sign: tenant + lease_uuid + timestamp
-	data := fmt.Sprintf("%s:%s:%d", t.Tenant, t.LeaseUUID, t.Timestamp)
-	return []byte(data)
+	return auth.FormatSignData(t.Tenant, t.LeaseUUID, t.Timestamp)
 }
 
 // verifyAddress verifies that the public key corresponds to the tenant address.
@@ -99,7 +97,7 @@ func (t *AuthToken) verifyAddress(pubKeyBytes []byte, bech32Prefix string) error
 	addr := pubKey.Address()
 
 	// Convert to bech32 address with configured prefix
-	expectedAddr, err := addressToBech32(bech32Prefix, addr.Bytes())
+	expectedAddr, err := sdktypes.Bech32ifyAddressBytes(bech32Prefix, addr.Bytes())
 	if err != nil {
 		return fmt.Errorf("failed to convert address to bech32: %w", err)
 	}
@@ -109,14 +107,4 @@ func (t *AuthToken) verifyAddress(pubKeyBytes []byte, bech32Prefix string) error
 	}
 
 	return nil
-}
-
-// addressToBech32 converts raw address bytes to a bech32 address.
-func addressToBech32(prefix string, addrBytes []byte) (string, error) {
-	return sdktypes.Bech32ifyAddressBytes(prefix, addrBytes)
-}
-
-// HashToHex converts raw bytes to hex string.
-func HashToHex(data []byte) string {
-	return hex.EncodeToString(data)
 }
