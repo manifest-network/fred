@@ -24,19 +24,29 @@ type Server struct {
 
 // ServerConfig holds configuration for the API server.
 type ServerConfig struct {
-	Addr           string
-	ProviderUUID   string
-	Bech32Prefix   string
-	TLSCertFile    string
-	TLSKeyFile     string
-	RateLimitRPS   float64
-	RateLimitBurst int
+	Addr               string
+	ProviderUUID       string
+	Bech32Prefix       string
+	TLSCertFile        string
+	TLSKeyFile         string
+	RateLimitRPS       float64
+	RateLimitBurst     int
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	IdleTimeout        time.Duration
+	MaxRequestBodySize int64
 }
 
 // NewServer creates a new API server.
 func NewServer(cfg ServerConfig, client *chain.Client) *Server {
 	handlers := NewHandlers(client, cfg.ProviderUUID, cfg.Bech32Prefix)
 	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+
+	// Apply default for max request body size
+	maxBodySize := cfg.MaxRequestBodySize
+	if maxBodySize <= 0 {
+		maxBodySize = 1 << 20 // 1MB default
+	}
 
 	router := mux.NewRouter()
 
@@ -46,15 +56,15 @@ func NewServer(cfg ServerConfig, client *chain.Client) *Server {
 
 	// Add middleware (order matters: rate limit first, then body size, then logging)
 	router.Use(rateLimiter.Middleware)
-	router.Use(maxBodySizeMiddleware(1 << 20)) // 1MB max request body
+	router.Use(maxBodySizeMiddleware(maxBodySize))
 	router.Use(loggingMiddleware)
 
 	server := &http.Server{
 		Addr:         cfg.Addr,
 		Handler:      router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  cfg.ReadTimeout,
+		WriteTimeout: cfg.WriteTimeout,
+		IdleTimeout:  cfg.IdleTimeout,
 	}
 
 	return &Server{
@@ -103,6 +113,9 @@ func (s *Server) Start(ctx context.Context) error {
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) {
 	slog.Info("shutting down API server")
+
+	// Stop the rate limiter cleanup goroutine
+	s.rateLimiter.Stop()
 
 	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

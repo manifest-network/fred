@@ -173,13 +173,53 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, response, http.StatusOK)
 }
 
+// HealthResponse represents the health check response.
+type HealthResponse struct {
+	Status       string                  `json:"status"`
+	ProviderUUID string                  `json:"provider_uuid"`
+	Checks       map[string]*CheckResult `json:"checks"`
+}
+
+// CheckResult represents the result of a single health check.
+type CheckResult struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
 // HealthCheck handles GET /health
 func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	response := map[string]string{
-		"status":        "healthy",
-		"provider_uuid": h.providerUUID,
+	checks := make(map[string]*CheckResult)
+	overallHealthy := true
+
+	// Check chain connectivity
+	if h.client != nil {
+		if err := h.client.Ping(r.Context()); err != nil {
+			checks["chain"] = &CheckResult{
+				Status:  "unhealthy",
+				Message: err.Error(),
+			}
+			overallHealthy = false
+		} else {
+			checks["chain"] = &CheckResult{
+				Status: "healthy",
+			}
+		}
 	}
-	h.writeJSON(w, response, http.StatusOK)
+
+	status := "healthy"
+	httpStatus := http.StatusOK
+	if !overallHealthy {
+		status = "unhealthy"
+		httpStatus = http.StatusServiceUnavailable
+	}
+
+	response := HealthResponse{
+		Status:       status,
+		ProviderUUID: h.providerUUID,
+		Checks:       checks,
+	}
+
+	h.writeJSON(w, response, httpStatus)
 }
 
 // extractToken extracts and parses the bearer token from the Authorization header.

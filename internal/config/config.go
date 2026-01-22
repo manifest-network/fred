@@ -2,37 +2,61 @@ package config
 
 import (
 	"fmt"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/viper"
 )
 
-// uuidRegex validates UUID format (RFC 4122)
-var uuidRegex = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-
 // Config holds all configuration for the provider daemon.
 type Config struct {
-	ChainID          string        `mapstructure:"chain_id"`
-	GRPCEndpoint     string        `mapstructure:"grpc_endpoint"`
-	WebSocketURL     string        `mapstructure:"websocket_url"`
-	ProviderUUID     string        `mapstructure:"provider_uuid"`
-	ProviderAddress  string        `mapstructure:"provider_address"`
-	KeyringBackend   string        `mapstructure:"keyring_backend"`
-	KeyringDir       string        `mapstructure:"keyring_dir"`
-	KeyName          string        `mapstructure:"key_name"`
-	APIListenAddr    string        `mapstructure:"api_listen_addr"`
-	WithdrawInterval time.Duration `mapstructure:"withdraw_interval"`
-	AutoAcknowledge  bool          `mapstructure:"auto_acknowledge"`
-	TLSCertFile      string        `mapstructure:"tls_cert_file"`
-	TLSKeyFile       string        `mapstructure:"tls_key_file"`
-	Bech32Prefix     string        `mapstructure:"bech32_prefix"`
-	RateLimitRPS     float64       `mapstructure:"rate_limit_rps"`
-	RateLimitBurst   int           `mapstructure:"rate_limit_burst"`
-	GRPCTLSEnabled   bool          `mapstructure:"grpc_tls_enabled"`
-	GRPCTLSCAFile    string        `mapstructure:"grpc_tls_ca_file"`
-	GRPCTLSSkipVerify bool         `mapstructure:"grpc_tls_skip_verify"`
+	ChainID           string        `mapstructure:"chain_id"`
+	GRPCEndpoint      string        `mapstructure:"grpc_endpoint"`
+	WebSocketURL      string        `mapstructure:"websocket_url"`
+	ProviderUUID      string        `mapstructure:"provider_uuid"`
+	ProviderAddress   string        `mapstructure:"provider_address"`
+	KeyringBackend    string        `mapstructure:"keyring_backend"`
+	KeyringDir        string        `mapstructure:"keyring_dir"`
+	KeyName           string        `mapstructure:"key_name"`
+	APIListenAddr     string        `mapstructure:"api_listen_addr"`
+	WithdrawInterval  time.Duration `mapstructure:"withdraw_interval"`
+	AutoAcknowledge   bool          `mapstructure:"auto_acknowledge"`
+	TLSCertFile       string        `mapstructure:"tls_cert_file"`
+	TLSKeyFile        string        `mapstructure:"tls_key_file"`
+	Bech32Prefix      string        `mapstructure:"bech32_prefix"`
+	RateLimitRPS      float64       `mapstructure:"rate_limit_rps"`
+	RateLimitBurst    int           `mapstructure:"rate_limit_burst"`
+	GRPCTLSEnabled    bool          `mapstructure:"grpc_tls_enabled"`
+	GRPCTLSCAFile     string        `mapstructure:"grpc_tls_ca_file"`
+	GRPCTLSSkipVerify bool          `mapstructure:"grpc_tls_skip_verify"`
+	GasLimit          uint64        `mapstructure:"gas_limit"`
+	GasPrice          int64         `mapstructure:"gas_price"`
+	FeeDenom          string        `mapstructure:"fee_denom"`
+
+	// Timeout configuration
+	HTTPReadTimeout       time.Duration `mapstructure:"http_read_timeout"`
+	HTTPWriteTimeout      time.Duration `mapstructure:"http_write_timeout"`
+	HTTPIdleTimeout       time.Duration `mapstructure:"http_idle_timeout"`
+	WebSocketPingInterval time.Duration `mapstructure:"websocket_ping_interval"`
+	TxPollInterval        time.Duration `mapstructure:"tx_poll_interval"`
+	TxTimeout             time.Duration `mapstructure:"tx_timeout"`
+
+	// Query and pagination limits
+	QueryPageLimit        int `mapstructure:"query_page_limit"`
+	MaxWithdrawIterations int `mapstructure:"max_withdraw_iterations"`
+
+	// WebSocket reconnection backoff
+	WebSocketReconnectInitial time.Duration `mapstructure:"websocket_reconnect_initial"`
+	WebSocketReconnectMax     time.Duration `mapstructure:"websocket_reconnect_max"`
+
+	// API limits
+	MaxRequestBodySize int64 `mapstructure:"max_request_body_size"`
+
+	// Credit check thresholds
+	CreditCheckErrorThreshold int           `mapstructure:"credit_check_error_threshold"`
+	CreditCheckRetryInterval  time.Duration `mapstructure:"credit_check_retry_interval"`
 }
 
 // TLSEnabled returns true if TLS is configured.
@@ -59,6 +83,32 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
+	v.SetDefault("gas_limit", 500000)
+	v.SetDefault("gas_price", 25)        // price per gas unit in smallest denom
+	v.SetDefault("fee_denom", "umfx")
+
+	// Timeout defaults
+	v.SetDefault("http_read_timeout", "15s")
+	v.SetDefault("http_write_timeout", "15s")
+	v.SetDefault("http_idle_timeout", "60s")
+	v.SetDefault("websocket_ping_interval", "30s")
+	v.SetDefault("tx_poll_interval", "500ms")
+	v.SetDefault("tx_timeout", "30s")
+
+	// Query and pagination defaults
+	v.SetDefault("query_page_limit", 100)
+	v.SetDefault("max_withdraw_iterations", 100)
+
+	// WebSocket reconnection defaults
+	v.SetDefault("websocket_reconnect_initial", "1s")
+	v.SetDefault("websocket_reconnect_max", "60s")
+
+	// API limits defaults
+	v.SetDefault("max_request_body_size", 1<<20) // 1MB
+
+	// Credit check defaults
+	v.SetDefault("credit_check_error_threshold", 3)
+	v.SetDefault("credit_check_retry_interval", "30s")
 
 	// Environment variable support
 	v.SetEnvPrefix("PROVIDER")
@@ -85,8 +135,9 @@ func Load(configPath string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Validate checks that required configuration fields are set.
+// Validate checks that required configuration fields are set and valid.
 func (c *Config) Validate() error {
+	// Required fields
 	if c.ProviderUUID == "" {
 		return fmt.Errorf("provider_uuid is required")
 	}
@@ -105,10 +156,101 @@ func (c *Config) Validate() error {
 	if c.Bech32Prefix == "" {
 		return fmt.Errorf("bech32_prefix is required")
 	}
+
+	// Numeric validations
+	if c.WithdrawInterval <= 0 {
+		return fmt.Errorf("withdraw_interval must be positive")
+	}
+	if c.RateLimitRPS <= 0 {
+		return fmt.Errorf("rate_limit_rps must be positive")
+	}
+	if c.RateLimitBurst <= 0 {
+		return fmt.Errorf("rate_limit_burst must be positive")
+	}
+	if c.GasLimit == 0 {
+		return fmt.Errorf("gas_limit must be positive")
+	}
+	if c.GasPrice < 0 {
+		return fmt.Errorf("gas_price cannot be negative")
+	}
+	if c.FeeDenom == "" {
+		return fmt.Errorf("fee_denom is required")
+	}
+
+	// Timeout validations
+	if c.HTTPReadTimeout <= 0 {
+		return fmt.Errorf("http_read_timeout must be positive")
+	}
+	if c.HTTPWriteTimeout <= 0 {
+		return fmt.Errorf("http_write_timeout must be positive")
+	}
+	if c.HTTPIdleTimeout <= 0 {
+		return fmt.Errorf("http_idle_timeout must be positive")
+	}
+	if c.WebSocketPingInterval <= 0 {
+		return fmt.Errorf("websocket_ping_interval must be positive")
+	}
+	if c.TxPollInterval <= 0 {
+		return fmt.Errorf("tx_poll_interval must be positive")
+	}
+	if c.TxTimeout <= 0 {
+		return fmt.Errorf("tx_timeout must be positive")
+	}
+
+	// Query and pagination validations
+	if c.QueryPageLimit <= 0 {
+		return fmt.Errorf("query_page_limit must be positive")
+	}
+	if c.MaxWithdrawIterations <= 0 {
+		return fmt.Errorf("max_withdraw_iterations must be positive")
+	}
+
+	// WebSocket reconnection validations
+	if c.WebSocketReconnectInitial <= 0 {
+		return fmt.Errorf("websocket_reconnect_initial must be positive")
+	}
+	if c.WebSocketReconnectMax <= 0 {
+		return fmt.Errorf("websocket_reconnect_max must be positive")
+	}
+
+	// API limits validations
+	if c.MaxRequestBodySize <= 0 {
+		return fmt.Errorf("max_request_body_size must be positive")
+	}
+
+	// Credit check validations
+	if c.CreditCheckErrorThreshold <= 0 {
+		return fmt.Errorf("credit_check_error_threshold must be positive")
+	}
+	if c.CreditCheckRetryInterval <= 0 {
+		return fmt.Errorf("credit_check_retry_interval must be positive")
+	}
+
+	// URL/endpoint validations
+	if c.WebSocketURL != "" {
+		wsURL, err := url.Parse(c.WebSocketURL)
+		if err != nil {
+			return fmt.Errorf("websocket_url is not a valid URL: %w", err)
+		}
+		if wsURL.Scheme != "ws" && wsURL.Scheme != "wss" {
+			return fmt.Errorf("websocket_url must use ws:// or wss:// scheme")
+		}
+	}
+
+	if c.GRPCEndpoint != "" && !strings.Contains(c.GRPCEndpoint, ":") {
+		return fmt.Errorf("grpc_endpoint must be in host:port format")
+	}
+
+	// TLS file validation - if one is set, both must be set
+	if (c.TLSCertFile != "") != (c.TLSKeyFile != "") {
+		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
+	}
+
 	return nil
 }
 
 // IsValidUUID checks if a string is a valid UUID format (RFC 4122).
-func IsValidUUID(uuid string) bool {
-	return uuidRegex.MatchString(uuid)
+func IsValidUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return err == nil
 }

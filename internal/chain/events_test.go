@@ -1,0 +1,407 @@
+package chain
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+)
+
+func TestNewEventSubscriber(t *testing.T) {
+	tests := []struct {
+		name             string
+		url              string
+		providerUUID     string
+		pingInterval     time.Duration
+		reconnectInitial time.Duration
+		reconnectMax     time.Duration
+		wantPing         time.Duration
+		wantInitial      time.Duration
+		wantMax          time.Duration
+	}{
+		{
+			name:             "with defaults",
+			url:              "ws://localhost:26657/websocket",
+			providerUUID:     "test-uuid",
+			pingInterval:     0,
+			reconnectInitial: 0,
+			reconnectMax:     0,
+			wantPing:         30 * time.Second,
+			wantInitial:      time.Second,
+			wantMax:          60 * time.Second,
+		},
+		{
+			name:             "with custom values",
+			url:              "wss://example.com/websocket",
+			providerUUID:     "custom-uuid",
+			pingInterval:     15 * time.Second,
+			reconnectInitial: 2 * time.Second,
+			reconnectMax:     120 * time.Second,
+			wantPing:         15 * time.Second,
+			wantInitial:      2 * time.Second,
+			wantMax:          120 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sub, err := NewEventSubscriber(EventSubscriberConfig{
+				URL:              tt.url,
+				ProviderUUID:     tt.providerUUID,
+				PingInterval:     tt.pingInterval,
+				ReconnectInitial: tt.reconnectInitial,
+				ReconnectMax:     tt.reconnectMax,
+			})
+			if err != nil {
+				t.Fatalf("NewEventSubscriber() error = %v", err)
+			}
+			if sub == nil {
+				t.Fatal("NewEventSubscriber() returned nil")
+			}
+			if sub.url != tt.url {
+				t.Errorf("url = %q, want %q", sub.url, tt.url)
+			}
+			if sub.providerUUID != tt.providerUUID {
+				t.Errorf("providerUUID = %q, want %q", sub.providerUUID, tt.providerUUID)
+			}
+			if sub.pingInterval != tt.wantPing {
+				t.Errorf("pingInterval = %v, want %v", sub.pingInterval, tt.wantPing)
+			}
+			if sub.reconnectInitial != tt.wantInitial {
+				t.Errorf("reconnectInitial = %v, want %v", sub.reconnectInitial, tt.wantInitial)
+			}
+			if sub.reconnectMax != tt.wantMax {
+				t.Errorf("reconnectMax = %v, want %v", sub.reconnectMax, tt.wantMax)
+			}
+			if sub.events == nil {
+				t.Error("events channel is nil")
+			}
+			if sub.done == nil {
+				t.Error("done channel is nil")
+			}
+		})
+	}
+}
+
+func TestEventSubscriber_Events(t *testing.T) {
+	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+		URL:          "ws://localhost:26657/websocket",
+		ProviderUUID: "test-uuid",
+	})
+
+	ch := sub.Events()
+	if ch == nil {
+		t.Error("Events() returned nil channel")
+	}
+}
+
+func TestGetEventAttribute(t *testing.T) {
+	tests := []struct {
+		name   string
+		events map[string]interface{}
+		key    string
+		want   string
+	}{
+		{
+			name: "existing attribute",
+			events: map[string]interface{}{
+				"lease_created.lease_uuid": []interface{}{"uuid-123"},
+			},
+			key:  "lease_created.lease_uuid",
+			want: "uuid-123",
+		},
+		{
+			name: "missing attribute",
+			events: map[string]interface{}{
+				"other.attr": []interface{}{"value"},
+			},
+			key:  "lease_created.lease_uuid",
+			want: "",
+		},
+		{
+			name:   "empty events",
+			events: map[string]interface{}{},
+			key:    "lease_created.lease_uuid",
+			want:   "",
+		},
+		{
+			name: "empty array",
+			events: map[string]interface{}{
+				"lease_created.lease_uuid": []interface{}{},
+			},
+			key:  "lease_created.lease_uuid",
+			want: "",
+		},
+		{
+			name: "non-string value",
+			events: map[string]interface{}{
+				"lease_created.lease_uuid": []interface{}{123},
+			},
+			key:  "lease_created.lease_uuid",
+			want: "",
+		},
+		{
+			name: "not an array",
+			events: map[string]interface{}{
+				"lease_created.lease_uuid": "direct-value",
+			},
+			key:  "lease_created.lease_uuid",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getEventAttribute(tt.events, tt.key)
+			if got != tt.want {
+				t.Errorf("getEventAttribute() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
+	providerUUID := "provider-uuid-123"
+	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+		URL:          "ws://localhost:26657/websocket",
+		ProviderUUID: providerUUID,
+	})
+
+	tests := []struct {
+		name   string
+		events map[string]interface{}
+		want   *LeaseEvent
+	}{
+		{
+			name: "lease_created event",
+			events: map[string]interface{}{
+				"lease_created.lease_uuid":    []interface{}{"lease-uuid-1"},
+				"lease_created.provider_uuid": []interface{}{providerUUID},
+				"lease_created.tenant":        []interface{}{"tenant-addr"},
+			},
+			want: &LeaseEvent{
+				Type:         LeaseCreated,
+				LeaseUUID:    "lease-uuid-1",
+				ProviderUUID: providerUUID,
+				Tenant:       "tenant-addr",
+			},
+		},
+		{
+			name: "lease_acknowledged event",
+			events: map[string]interface{}{
+				"lease_acknowledged.lease_uuid":    []interface{}{"lease-uuid-2"},
+				"lease_acknowledged.provider_uuid": []interface{}{providerUUID},
+				"lease_acknowledged.tenant":        []interface{}{"tenant-addr"},
+			},
+			want: &LeaseEvent{
+				Type:         LeaseAcknowledged,
+				LeaseUUID:    "lease-uuid-2",
+				ProviderUUID: providerUUID,
+				Tenant:       "tenant-addr",
+			},
+		},
+		{
+			name: "event for different provider - ignored",
+			events: map[string]interface{}{
+				"lease_created.lease_uuid":    []interface{}{"lease-uuid-3"},
+				"lease_created.provider_uuid": []interface{}{"other-provider"},
+				"lease_created.tenant":        []interface{}{"tenant-addr"},
+			},
+			want: nil,
+		},
+		{
+			name: "auto_closed event",
+			events: map[string]interface{}{
+				"lease_auto_closed.lease_uuid":    []interface{}{"lease-uuid-4"},
+				"lease_auto_closed.provider_uuid": []interface{}{"any-provider"},
+				"lease_auto_closed.tenant":        []interface{}{"tenant-addr"},
+				"lease_auto_closed.reason":        []interface{}{"credit_exhausted"},
+			},
+			want: &LeaseEvent{
+				Type:         LeaseAutoClosed,
+				LeaseUUID:    "lease-uuid-4",
+				ProviderUUID: "any-provider",
+				Tenant:       "tenant-addr",
+			},
+		},
+		{
+			name:   "no relevant events",
+			events: map[string]interface{}{},
+			want:   nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sub.parseLeaseEvent(tt.events)
+			if tt.want == nil {
+				if got != nil {
+					t.Errorf("parseLeaseEvent() = %v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("parseLeaseEvent() = nil, want non-nil")
+			}
+			if got.Type != tt.want.Type {
+				t.Errorf("Type = %v, want %v", got.Type, tt.want.Type)
+			}
+			if got.LeaseUUID != tt.want.LeaseUUID {
+				t.Errorf("LeaseUUID = %q, want %q", got.LeaseUUID, tt.want.LeaseUUID)
+			}
+			if got.ProviderUUID != tt.want.ProviderUUID {
+				t.Errorf("ProviderUUID = %q, want %q", got.ProviderUUID, tt.want.ProviderUUID)
+			}
+			if got.Tenant != tt.want.Tenant {
+				t.Errorf("Tenant = %q, want %q", got.Tenant, tt.want.Tenant)
+			}
+		})
+	}
+}
+
+func TestEventSubscriber_HandleMessage(t *testing.T) {
+	providerUUID := "provider-uuid-123"
+	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+		URL:          "ws://localhost:26657/websocket",
+		ProviderUUID: providerUUID,
+	})
+
+	tests := []struct {
+		name        string
+		message     interface{}
+		expectEvent bool
+	}{
+		{
+			name: "valid lease_created message",
+			message: jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      1,
+				Result: map[string]interface{}{
+					"events": map[string]interface{}{
+						"lease_created.lease_uuid":    []interface{}{"lease-uuid-1"},
+						"lease_created.provider_uuid": []interface{}{providerUUID},
+						"lease_created.tenant":        []interface{}{"tenant-addr"},
+					},
+				},
+			},
+			expectEvent: true,
+		},
+		{
+			name: "subscription confirmation (nil result)",
+			message: jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      1,
+				Result:  nil,
+			},
+			expectEvent: false,
+		},
+		{
+			name: "rpc error",
+			message: jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      1,
+				Error: &rpcError{
+					Code:    -1,
+					Message: "some error",
+				},
+			},
+			expectEvent: false,
+		},
+		{
+			name:        "invalid json",
+			message:     "not json",
+			expectEvent: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var msgBytes []byte
+			switch v := tt.message.(type) {
+			case string:
+				msgBytes = []byte(v)
+			default:
+				msgBytes, _ = json.Marshal(v)
+			}
+
+			// Drain any existing events
+			select {
+			case <-sub.events:
+			default:
+			}
+
+			sub.handleMessage(msgBytes)
+
+			// Check if event was emitted
+			select {
+			case <-sub.events:
+				if !tt.expectEvent {
+					t.Error("handleMessage() emitted event when none expected")
+				}
+			default:
+				if tt.expectEvent {
+					t.Error("handleMessage() did not emit expected event")
+				}
+			}
+		})
+	}
+}
+
+func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
+	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+		URL:          "ws://localhost:26657/websocket",
+		ProviderUUID: "test-uuid",
+	})
+
+	// Track multiple invalid messages
+	for i := 0; i < 15; i++ {
+		sub.trackInvalidMessage("test_error", nil)
+	}
+
+	sub.mu.Lock()
+	count := sub.invalidMsgCount
+	sub.mu.Unlock()
+
+	if count != 15 {
+		t.Errorf("invalidMsgCount = %d, want 15", count)
+	}
+}
+
+func TestEventSubscriber_Close(t *testing.T) {
+	sub, _ := NewEventSubscriber(EventSubscriberConfig{
+		URL:          "ws://localhost:26657/websocket",
+		ProviderUUID: "test-uuid",
+	})
+
+	// Close should not panic
+	sub.Close()
+
+	// Verify done channel is closed
+	select {
+	case <-sub.done:
+		// Expected - channel is closed
+	default:
+		t.Error("Close() did not close done channel")
+	}
+}
+
+func TestLeaseEventType_String(t *testing.T) {
+	tests := []struct {
+		eventType LeaseEventType
+		want      string
+	}{
+		{LeaseCreated, "lease_created"},
+		{LeaseAcknowledged, "lease_acknowledged"},
+		{LeaseRejected, "lease_rejected"},
+		{LeaseClosed, "lease_closed"},
+		{LeaseExpired, "lease_expired"},
+		{LeaseAutoClosed, "lease_auto_closed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.eventType), func(t *testing.T) {
+			if string(tt.eventType) != tt.want {
+				t.Errorf("LeaseEventType = %q, want %q", tt.eventType, tt.want)
+			}
+		})
+	}
+}

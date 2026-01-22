@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/spf13/cobra"
@@ -16,6 +18,11 @@ import (
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/scheduler"
 	"github.com/manifest-network/fred/internal/watcher"
+)
+
+const (
+	// shutdownTimeout is the maximum time to wait for graceful shutdown
+	shutdownTimeout = 30 * time.Second
 )
 
 var (
@@ -74,7 +81,15 @@ func run(cmd *cobra.Command, args []string) error {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Initialize signer
-	signer, err := chain.NewSigner(cfg.KeyringBackend, cfg.KeyringDir, cfg.KeyName, cfg.ChainID)
+	signer, err := chain.NewSigner(chain.SignerConfig{
+		KeyringBackend: cfg.KeyringBackend,
+		KeyringDir:     cfg.KeyringDir,
+		KeyName:        cfg.KeyName,
+		ChainID:        cfg.ChainID,
+		GasLimit:       cfg.GasLimit,
+		GasPrice:       cfg.GasPrice,
+		FeeDenom:       cfg.FeeDenom,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create signer: %w", err)
 	}
@@ -82,10 +97,13 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Initialize chain client
 	chainClient, err := chain.NewClient(chain.ClientConfig{
-		Endpoint:      cfg.GRPCEndpoint,
-		TLSEnabled:    cfg.GRPCTLSEnabled,
-		TLSCAFile:     cfg.GRPCTLSCAFile,
-		TLSSkipVerify: cfg.GRPCTLSSkipVerify,
+		Endpoint:       cfg.GRPCEndpoint,
+		TLSEnabled:     cfg.GRPCTLSEnabled,
+		TLSCAFile:      cfg.GRPCTLSCAFile,
+		TLSSkipVerify:  cfg.GRPCTLSSkipVerify,
+		TxPollInterval: cfg.TxPollInterval,
+		TxTimeout:      cfg.TxTimeout,
+		QueryPageLimit: cfg.QueryPageLimit,
 	}, signer)
 	if err != nil {
 		return fmt.Errorf("failed to create chain client: %w", err)
@@ -94,7 +112,13 @@ func run(cmd *cobra.Command, args []string) error {
 	slog.Info("chain client connected", "endpoint", cfg.GRPCEndpoint, "tls", cfg.GRPCTLSEnabled)
 
 	// Initialize event subscriber
-	eventSub, err := chain.NewEventSubscriber(cfg.WebSocketURL, cfg.ProviderUUID)
+	eventSub, err := chain.NewEventSubscriber(chain.EventSubscriberConfig{
+		URL:              cfg.WebSocketURL,
+		ProviderUUID:     cfg.ProviderUUID,
+		PingInterval:     cfg.WebSocketPingInterval,
+		ReconnectInitial: cfg.WebSocketReconnectInitial,
+		ReconnectMax:     cfg.WebSocketReconnectMax,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create event subscriber: %w", err)
 	}
@@ -105,24 +129,39 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Initialize API server
 	apiServer := api.NewServer(api.ServerConfig{
-		Addr:           cfg.APIListenAddr,
-		ProviderUUID:   cfg.ProviderUUID,
-		Bech32Prefix:   cfg.Bech32Prefix,
-		TLSCertFile:    cfg.TLSCertFile,
-		TLSKeyFile:     cfg.TLSKeyFile,
-		RateLimitRPS:   cfg.RateLimitRPS,
-		RateLimitBurst: cfg.RateLimitBurst,
+		Addr:               cfg.APIListenAddr,
+		ProviderUUID:       cfg.ProviderUUID,
+		Bech32Prefix:       cfg.Bech32Prefix,
+		TLSCertFile:        cfg.TLSCertFile,
+		TLSKeyFile:         cfg.TLSKeyFile,
+		RateLimitRPS:       cfg.RateLimitRPS,
+		RateLimitBurst:     cfg.RateLimitBurst,
+		ReadTimeout:        cfg.HTTPReadTimeout,
+		WriteTimeout:       cfg.HTTPWriteTimeout,
+		IdleTimeout:        cfg.HTTPIdleTimeout,
+		MaxRequestBodySize: cfg.MaxRequestBodySize,
 	}, chainClient)
 
 	// Initialize withdrawal scheduler
-	withdrawScheduler := scheduler.NewWithdrawScheduler(chainClient, cfg.ProviderUUID, cfg.WithdrawInterval)
+	withdrawScheduler := scheduler.NewWithdrawScheduler(chainClient, scheduler.WithdrawSchedulerConfig{
+		ProviderUUID:              cfg.ProviderUUID,
+		Interval:                  cfg.WithdrawInterval,
+		MaxWithdrawIterations:     cfg.MaxWithdrawIterations,
+		CreditCheckErrorThreshold: cfg.CreditCheckErrorThreshold,
+		CreditCheckRetryInterval:  cfg.CreditCheckRetryInterval,
+	})
+
+	// Wire up cross-provider credit depletion detection
+	// When another provider's withdrawal depletes a tenant's credit, trigger our withdrawal
+	// to auto-close our leases for that tenant
+	leaseWatcher.SetWithdrawTrigger(withdrawScheduler.TriggerWithdraw)
 
 	// Perform startup operations sequentially to avoid same-block transaction conflicts
-	// First: withdraw any accumulated funds
+	// WithdrawOnce waits for block inclusion before returning, ensuring the next tx is in a different block
 	slog.Info("performing initial withdrawal")
 	withdrawScheduler.WithdrawOnce(ctx)
 
-	// Second: scan and acknowledge pending leases (must wait for withdrawal tx to be in a block)
+	// Scan and acknowledge pending leases (runs after withdrawal completes)
 	pendingCount, err := leaseWatcher.ScanAndAcknowledge(ctx)
 	if err != nil {
 		slog.Error("failed to scan/acknowledge pending leases", "error", err)
@@ -131,23 +170,30 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Info("startup lease scan complete", "pending_count", pendingCount)
 	}
 
-	// Start background components
+	// Start background components with WaitGroup for graceful shutdown
+	var wg sync.WaitGroup
 	errChan := make(chan error, 4)
 
+	wg.Add(1)
 	go func() {
-		if err := leaseWatcher.Start(ctx); err != nil {
+		defer wg.Done()
+		if err := leaseWatcher.Start(ctx); err != nil && err != context.Canceled {
 			errChan <- fmt.Errorf("watcher error: %w", err)
 		}
 	}()
 
+	wg.Add(1)
 	go func() {
-		if err := apiServer.Start(ctx); err != nil {
+		defer wg.Done()
+		if err := apiServer.Start(ctx); err != nil && err != context.Canceled {
 			errChan <- fmt.Errorf("api server error: %w", err)
 		}
 	}()
 
+	wg.Add(1)
 	go func() {
-		if err := withdrawScheduler.Start(ctx); err != nil {
+		defer wg.Done()
+		if err := withdrawScheduler.Start(ctx); err != nil && err != context.Canceled {
 			errChan <- fmt.Errorf("scheduler error: %w", err)
 		}
 	}()
@@ -169,11 +215,33 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Graceful shutdown
 	slog.Info("shutting down...")
+
+	// Signal all components to stop
 	cancel()
 
-	// Give components time to clean up
-	apiServer.Shutdown(ctx)
+	// Create shutdown context with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+
+	// Shutdown API server (uses its own timeout)
+	apiServer.Shutdown(shutdownCtx)
+
+	// Close event subscriber
 	eventSub.Close()
+
+	// Wait for all goroutines to finish with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		slog.Info("all components stopped gracefully")
+	case <-shutdownCtx.Done():
+		slog.Warn("shutdown timed out, some components may not have stopped cleanly")
+	}
 
 	slog.Info("providerd stopped")
 	return nil
