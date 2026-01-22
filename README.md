@@ -1,36 +1,52 @@
 # fred - Manifest Provider Daemon
 
-A Go daemon for Manifest Network providers that watches for lease events, auto-acknowledges them, serves a tenant authentication API, and periodically withdraws accumulated funds.
+A Go daemon for Manifest Network providers that manages the complete lease lifecycle with pluggable backend integration, event-driven provisioning, and automatic resource management.
 
 ## Features
 
-- **Lease Event Watching**: Subscribes to CometBFT WebSocket events to monitor lease creation and state changes
-- **Auto-Acknowledgment**: Automatically acknowledges pending leases on startup and as they arrive
+- **Lease Lifecycle Management**: Watches chain events and orchestrates provisioning through backends
+- **Multi-Backend Support**: Route leases to different backends based on SKU prefix
+- **Event-Driven Architecture**: Uses Watermill for internal event routing with retries and middleware
 - **Tenant Authentication API**: HTTP/HTTPS API with ADR-036 signature verification for tenant access
 - **Periodic Withdrawals**: Configurable scheduled withdrawal of accumulated fees from active leases
 - **Credit Monitoring**: Tracks tenant credit balances and auto-closes leases when credit is depleted
 - **Cross-Provider Credit Detection**: Responds to credit depletion events from other providers
-- **Security**: Rate limiting, request size limits, input validation, and optional TLS for both API and gRPC
+- **Security**: Rate limiting, request size limits, input validation, and optional TLS
 
-## How It Works
+## Architecture Overview
 
-```mermaid
-flowchart LR
-    subgraph Chain["Manifest Chain"]
-        EVENTS[Lease Events]
-        GRPC[gRPC]
-    end
-
-    FRED[Fred]
-
-    subgraph Tenant["Tenant"]
-        APP[Application]
-    end
-
-    EVENTS -->|WebSocket| FRED
-    FRED -->|Transactions| GRPC
-    FRED -->|Queries| GRPC
-    APP -->|HTTP API| FRED
+```
+                              MANIFEST CHAIN
+                                    |
+                                    | WebSocket (events)
+                                    v
++------------------------------------------------------------------+
+|                              FRED                                 |
+|                                                                   |
+|  +------------------+     +------------------+     +------------+ |
+|  | Chain Subscriber |---->| Watermill Router |---->| Provision  | |
+|  | (WebSocket)      |     | (event routing)  |     | Manager    | |
+|  +------------------+     +------------------+     +------------+ |
+|                                                          |        |
+|  +------------------+     +------------------+            |        |
+|  | Watcher          |     | API Server       |<-----------+        |
+|  | (cross-provider) |     | (tenant access)  |            |        |
+|  +------------------+     +------------------+            |        |
+|                                                          v        |
+|                                    +------------------+           |
+|                                    | Backend Router   |           |
+|                                    | (SKU routing)    |           |
+|                                    +------------------+           |
+|                                            |                      |
++------------------------------------------------------------------+
+                                            |
+              +-----------------------------+-----------------------------+
+              v                             v                             v
+      +---------------+            +---------------+            +---------------+
+      |  Kubernetes   |            |     GPU       |            |      VM       |
+      |   Backend     |            |   Backend     |            |   Backend     |
+      | (sku: k8s-*)  |            | (sku: gpu-*)  |            | (sku: vm-*)   |
+      +---------------+            +---------------+            +---------------+
 ```
 
 ## Lease Lifecycle
@@ -40,72 +56,43 @@ sequenceDiagram
     participant T as Tenant
     participant C as Chain
     participant F as Fred
-    participant P as Provider Backend
+    participant B as Backend
 
-    Note over T,P: Lease Creation & Acknowledgment
-    T->>C: Create Lease
+    Note over T,B: Lease Creation & Provisioning
+    T->>C: Create Lease (with SKU)
     C-->>F: lease_created event
-    F->>F: Queue for acknowledgment
+    F->>F: Route by SKU to backend
+    F->>B: POST /provision
+    B->>B: Provision resource (async)
+    B->>F: POST /callbacks/provision (success)
     F->>C: MsgAcknowledgeLease
     C-->>F: lease_acknowledged event
-    F->>F: Track tenant for credit monitoring
 
-    Note over T,P: Tenant Access
+    Note over T,B: Tenant Access
     T->>T: Sign auth token (ADR-036)
     T->>F: GET /v1/leases/{uuid}/connection
     F->>F: Verify signature & lease ownership
-    F->>C: Query lease state
+    F->>B: GET /info/{uuid}
     F-->>T: Connection details
 
-    Note over T,P: Periodic Withdrawal
-    F->>C: Query withdrawable amounts
-    F->>C: MsgWithdraw
-    F->>C: Query tenant credit balances
-    F->>F: Calculate burn rates
-
-    Note over T,P: Credit Depletion (Auto-Close)
-    F->>F: Detect zero/negative balance
-    F->>C: MsgCloseLease (credit_exhausted)
-    C-->>F: lease_auto_closed event
-    F->>F: Remove tenant from tracking
+    Note over T,B: Lease Closure
+    T->>C: Close Lease (or credit depleted)
+    C-->>F: lease_closed event
+    F->>B: POST /deprovision
+    B->>B: Cleanup resources
 ```
-
-## Credit Monitoring & Auto-Close
-
-```mermaid
-flowchart LR
-    subgraph Monitoring["Credit Monitoring Loop"]
-        direction TB
-        W[Withdraw Funds] --> Q[Query Active Leases]
-        Q --> G[Get Credit Balances]
-        G --> C{Credit > 0?}
-        C -->|Yes| B[Calculate Burn Rate]
-        C -->|No| CL[Close Leases]
-        B --> S[Schedule Next Check]
-        CL --> S
-    end
-
-    subgraph CrossProvider["Cross-Provider Detection"]
-        direction TB
-        E[Auto-Close Event] --> CH{Our Tenant?}
-        CH -->|Yes| TW[Trigger Withdrawal]
-        CH -->|No| IG[Ignore]
-        TW --> W
-    end
-```
-
-The burn rate calculator estimates when a tenant's credit will be depleted based on the observed spending rate between checks. This allows fred to schedule more frequent checks as depletion approaches.
-
-> **Note**: The current implementation assumes a single denomination for credit. Multi-denom support with proportional burn rates is not yet implemented.
 
 ## Building
 
 ```bash
-# Build the binary
+# Build all binaries (providerd and mock-backend)
 make build
 
-# Or directly with Go
+# Build only providerd
 go build -o build/providerd ./cmd/providerd
+
+# Build only mock-backend
+go build -o build/mock-backend ./cmd/mock-backend
 ```
 
 ## Configuration
@@ -116,7 +103,38 @@ Copy the example configuration and customize:
 cp config.example.yaml config.yaml
 ```
 
-### Configuration Options
+### Required Configuration
+
+| Option | Description |
+|--------|-------------|
+| `provider_uuid` | Your registered provider UUID |
+| `provider_address` | Provider management address |
+| `keyring_dir` | Directory containing keyring |
+| `key_name` | Key name for signing transactions |
+| `backends` | At least one backend must be configured |
+| `callback_base_url` | URL where backends send callbacks |
+
+### Backend Configuration
+
+Backends are services that handle the actual resource provisioning:
+
+```yaml
+backends:
+  - name: kubernetes
+    url: "http://k8s-backend:9000"
+    timeout: 30s
+    sku_prefix: "k8s-"
+    default: true  # Fallback for unmatched SKUs
+
+  - name: gpu
+    url: "http://gpu-backend:9000"
+    timeout: 60s
+    sku_prefix: "gpu-"
+
+callback_base_url: "http://fred.provider.example.com:8080"
+```
+
+### Full Configuration Reference
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -130,20 +148,21 @@ cp config.example.yaml config.yaml
 | `key_name` | Key name for signing transactions | (required) |
 | `api_listen_addr` | API server listen address | `:8080` |
 | `withdraw_interval` | How often to withdraw funds | `1h` |
-| `auto_acknowledge` | Auto-acknowledge pending leases | `true` |
 | `bech32_prefix` | Address prefix for validation | `manifest` |
 | `rate_limit_rps` | API rate limit (requests/second) | `10` |
 | `rate_limit_burst` | Rate limit burst size | `20` |
+| `backends` | List of backend configurations | (required) |
+| `callback_base_url` | Base URL for backend callbacks | (required) |
 
-### TLS Configuration (API)
+### TLS Configuration
 
+**API Server TLS:**
 ```yaml
 tls_cert_file: "/path/to/cert.pem"
 tls_key_file: "/path/to/key.pem"
 ```
 
-### TLS Configuration (gRPC to Chain)
-
+**gRPC to Chain TLS:**
 ```yaml
 grpc_tls_enabled: true
 grpc_tls_ca_file: "/path/to/ca.pem"  # Optional, uses system CAs if empty
@@ -157,7 +176,7 @@ All options can be set via environment variables with the `PROVIDER_` prefix:
 ```bash
 export PROVIDER_CHAIN_ID=manifest-1
 export PROVIDER_PROVIDER_UUID=01234567-89ab-cdef-0123-456789abcdef
-export PROVIDER_GRPC_TLS_ENABLED=true
+export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 ```
 
 ## Usage
@@ -178,13 +197,16 @@ export PROVIDER_GRPC_TLS_ENABLED=true
 GET /health
 ```
 
-Returns server health status.
+Returns server health status including chain connectivity.
 
 **Response:**
 ```json
 {
   "status": "healthy",
-  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef"
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "checks": {
+    "chain": {"status": "healthy"}
+  }
 }
 ```
 
@@ -195,7 +217,7 @@ GET /v1/leases/{lease_uuid}/connection
 Authorization: Bearer <token>
 ```
 
-Returns connection details for an active lease. Requires ADR-036 signed authentication token.
+Returns connection details for an active lease from the backend. Requires ADR-036 signed authentication token.
 
 **Token Format** (base64-encoded JSON):
 ```json
@@ -220,48 +242,265 @@ Returns connection details for an active lease. Requires ADR-036 signed authenti
     "protocol": "https",
     "metadata": {
       "region": "us-east-1",
-      "tier": "standard",
-      "instance_id": "i-1234",
-      "status": "connected"
+      "backend": "kubernetes"
     }
   }
 }
 ```
 
-### Authentication
+### Provision Callback (Backend -> Fred)
 
-The API uses ADR-036 off-chain message signing for authentication:
+```
+POST /callbacks/provision
+Content-Type: application/json
+```
 
-1. Create message: `{tenant}:{lease_uuid}:{timestamp}`
-2. Sign using ADR-036 format with your wallet
-3. Base64-encode the token JSON
-4. Pass as `Authorization: Bearer <token>`
+Called by backends to report provisioning status.
 
-Example using `manifestd`:
+**Request:**
+```json
+{
+  "lease_uuid": "...",
+  "status": "success",
+  "error": ""
+}
+```
+
+Status must be either `"success"` or `"failed"`.
+
+## Backend API Specification
+
+Any backend must implement these HTTP endpoints:
+
+### POST /provision
+
+Start provisioning a resource (async).
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "sku": "k8s-small",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision",
+  "payload": "<base64-encoded-bytes>",
+  "payload_hash": "abc123..."
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "provision_id": "..."
+}
+```
+
+### GET /info/{lease_uuid}
+
+Get lease information for a provisioned resource.
+
+**Response:** `200 OK`
+```json
+{
+  "host": "10.0.0.1",
+  "port": 8080,
+  "protocol": "https",
+  "credentials": {"token": "..."},
+  "metadata": {"region": "us-east-1"},
+  "custom_field": "any additional backend-specific data"
+}
+```
+
+The response can contain any JSON fields the backend wants to return.
+
+**Response:** `404 Not Found` if not provisioned.
+
+### POST /deprovision
+
+Deprovision a resource (idempotent).
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response:** `200 OK`
+
+### GET /provisions
+
+List all provisions (for reconciliation).
+
+**Response:**
+```json
+{
+  "provisions": [
+    {
+      "lease_uuid": "...",
+      "status": "ready",
+      "created_at": "2024-01-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+## Running E2E Tests with Mock Backend
+
+The mock backend allows you to test fred's provisioning flow without a real backend.
+
+### 1. Start the Mock Backend
+
 ```bash
-MESSAGE="${TENANT}:${LEASE_UUID}:$(date +%s)"
-SIGNATURE=$(echo -n "$MESSAGE" | manifestd tx sign-arbitrary - --from $TENANT)
+# Build mock-backend
+make build-mock
+
+# Run with default settings (port 9000)
+./build/mock-backend
+
+# Or with custom settings
+MOCK_BACKEND_ADDR=:9001 MOCK_BACKEND_NAME=test-backend MOCK_BACKEND_DELAY=2s ./build/mock-backend
 ```
 
-## Architecture
+**Environment Variables:**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MOCK_BACKEND_ADDR` | Listen address | `:9000` |
+| `MOCK_BACKEND_NAME` | Backend name (in responses) | `mock-backend` |
+| `MOCK_BACKEND_DELAY` | Simulated provisioning delay | `0s` |
+
+### 2. Configure Fred
+
+Create a config file that points to the mock backend:
+
+```yaml
+# config-test.yaml
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1test..."
+keyring_backend: "test"
+keyring_dir: "/tmp/test-keyring"
+key_name: "test"
+
+chain_id: "test-chain"
+grpc_endpoint: "localhost:9090"
+websocket_url: "ws://localhost:26657/websocket"
+
+api_listen_addr: ":8080"
+
+backends:
+  - name: mock
+    url: "http://localhost:9000"
+    timeout: 30s
+    default: true
+
+callback_base_url: "http://localhost:8080"
+```
+
+### 3. Run Fred
+
+```bash
+./build/providerd -c config-test.yaml
+```
+
+### 4. Test the Flow
+
+**Check mock backend health:**
+```bash
+curl http://localhost:9000/health
+```
+
+**Simulate a provision request (directly to mock backend):**
+```bash
+curl -X POST http://localhost:9000/provision \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "tenant": "manifest1abc",
+    "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+    "callback_url": "http://localhost:8080/callbacks/provision"
+  }'
+```
+
+**Check provisioned resources:**
+```bash
+curl http://localhost:9000/provisions
+```
+
+**Get lease info:**
+```bash
+curl http://localhost:9000/info/550e8400-e29b-41d4-a716-446655440000
+```
+
+**Deprovision:**
+```bash
+curl -X POST http://localhost:9000/deprovision \
+  -H "Content-Type: application/json" \
+  -d '{"lease_uuid": "550e8400-e29b-41d4-a716-446655440000"}'
+```
+
+### 5. Using Docker Compose (Optional)
+
+Create a `docker-compose.yaml` for integrated testing:
+
+```yaml
+version: '3.8'
+
+services:
+  mock-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock
+    environment:
+      - MOCK_BACKEND_ADDR=:9000
+      - MOCK_BACKEND_DELAY=1s
+    ports:
+      - "9000:9000"
+
+  fred:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - PROVIDER_PROVIDER_UUID=01234567-89ab-cdef-0123-456789abcdef
+      - PROVIDER_API_LISTEN_ADDR=:8080
+      - PROVIDER_CALLBACK_BASE_URL=http://fred:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mock-backend
+```
+
+## Project Structure
 
 ```
-cmd/providerd/          # Entry point, CLI
+cmd/
+├── providerd/          # Main daemon entry point
+└── mock-backend/       # Mock backend for testing
+
 internal/
 ├── adr036/             # ADR-036 signature verification
 ├── api/                # HTTP server, handlers, rate limiting
 ├── auth/               # Shared authentication utilities
+├── backend/            # Backend client and router
+│   ├── client.go       # HTTP client for backends
+│   ├── router.go       # SKU-based routing
+│   └── mock.go         # In-memory mock for unit tests
 ├── chain/              # gRPC client, WebSocket subscriber, signer
 ├── config/             # Configuration loading and validation
+├── provisioner/        # Provision lifecycle management
+│   ├── manager.go      # Watermill handlers
+│   └── bridge.go       # Chain events -> Watermill
 ├── scheduler/          # Periodic withdrawal and credit monitoring
 ├── testutil/           # Test fixtures and helpers
-└── watcher/            # Lease event watcher and acknowledgment
+└── watcher/            # Cross-provider event detection
 ```
 
 ## Security Features
 
 - **Rate Limiting**: Per-IP token bucket rate limiting (configurable RPS and burst)
-- **Request Size Limits**: 1MB max request body
+- **Request Size Limits**: Configurable max request body size (default 1MB)
 - **Input Validation**: UUID format validation on all inputs
 - **Error Sanitization**: Generic error messages to clients, detailed logs server-side
 - **TLS Support**: Optional HTTPS for API and TLS for gRPC
@@ -270,7 +509,8 @@ internal/
 
 ## Dependencies
 
-- Go 1.25+ (uses `sync.WaitGroup.Go()`, `range` over integers, iterators)
+- Go 1.25+ (uses `sync.WaitGroup.Go()`, `range` over integers)
+- Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x
 - manifest-ledger (for billing/sku types)

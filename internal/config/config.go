@@ -26,10 +26,9 @@ type Config struct {
 	KeyringBackend    string        `mapstructure:"keyring_backend"`
 	KeyringDir        string        `mapstructure:"keyring_dir"`
 	KeyName           string        `mapstructure:"key_name"`
-	APIListenAddr     string        `mapstructure:"api_listen_addr"`
-	WithdrawInterval  time.Duration `mapstructure:"withdraw_interval"`
-	AutoAcknowledge   bool          `mapstructure:"auto_acknowledge"`
-	TLSCertFile       string        `mapstructure:"tls_cert_file"`
+	APIListenAddr    string        `mapstructure:"api_listen_addr"`
+	WithdrawInterval time.Duration `mapstructure:"withdraw_interval"`
+	TLSCertFile      string        `mapstructure:"tls_cert_file"`
 	TLSKeyFile        string        `mapstructure:"tls_key_file"`
 	Bech32Prefix      string        `mapstructure:"bech32_prefix"`
 	RateLimitRPS      float64       `mapstructure:"rate_limit_rps"`
@@ -63,6 +62,19 @@ type Config struct {
 	// Credit check thresholds
 	CreditCheckErrorThreshold int           `mapstructure:"credit_check_error_threshold"`
 	CreditCheckRetryInterval  time.Duration `mapstructure:"credit_check_retry_interval"`
+
+	// Backend configuration
+	Backends        []BackendConfig `mapstructure:"backends"`
+	CallbackBaseURL string          `mapstructure:"callback_base_url"`
+}
+
+// BackendConfig configures a single provisioning backend.
+type BackendConfig struct {
+	Name      string        `mapstructure:"name"`
+	URL       string        `mapstructure:"url"`
+	Timeout   time.Duration `mapstructure:"timeout"`
+	SKUPrefix string        `mapstructure:"sku_prefix"`
+	IsDefault bool          `mapstructure:"default"`
 }
 
 // TLSEnabled returns true if TLS is configured.
@@ -82,7 +94,6 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("keyring_backend", "file")
 	v.SetDefault("api_listen_addr", ":8080")
 	v.SetDefault("withdraw_interval", "1h")
-	v.SetDefault("auto_acknowledge", true)
 	v.SetDefault("bech32_prefix", "manifest")
 	v.SetDefault("rate_limit_rps", 10.0)   // 10 requests per second
 	v.SetDefault("rate_limit_burst", 20)   // burst of 20 requests
@@ -252,6 +263,44 @@ func (c *Config) Validate() error {
 	// TLS file validation - if one is set, both must be set
 	if (c.TLSCertFile != "") != (c.TLSKeyFile != "") {
 		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
+	}
+
+	// Backend validation (optional - for backward compatibility)
+	if len(c.Backends) > 0 {
+		hasDefault := false
+		seenNames := make(map[string]bool)
+
+		for i, b := range c.Backends {
+			if b.Name == "" {
+				return fmt.Errorf("backends[%d].name is required", i)
+			}
+			if seenNames[b.Name] {
+				return fmt.Errorf("duplicate backend name: %s", b.Name)
+			}
+			seenNames[b.Name] = true
+
+			if b.URL == "" {
+				return fmt.Errorf("backends[%d].url is required", i)
+			}
+			if _, err := url.Parse(b.URL); err != nil {
+				return fmt.Errorf("backends[%d].url is not a valid URL: %w", i, err)
+			}
+
+			if b.IsDefault {
+				if hasDefault {
+					return fmt.Errorf("multiple default backends specified")
+				}
+				hasDefault = true
+			}
+		}
+
+		// If backends are configured, callback_base_url is required
+		if c.CallbackBaseURL == "" {
+			return fmt.Errorf("callback_base_url is required when backends are configured")
+		}
+		if _, err := url.Parse(c.CallbackBaseURL); err != nil {
+			return fmt.Errorf("callback_base_url is not a valid URL: %w", err)
+		}
 	}
 
 	return nil

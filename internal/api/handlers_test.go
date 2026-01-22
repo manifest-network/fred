@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"testing"
 
 	"github.com/manifest-network/fred/internal/testutil"
@@ -41,77 +40,6 @@ func TestHealthCheck(t *testing.T) {
 	// Check Content-Type header
 	if rec.Header().Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type = %q, want %q", rec.Header().Get("Content-Type"), "application/json")
-	}
-}
-
-func TestGenerateConnectionDetails_Deterministic(t *testing.T) {
-	uuid := testutil.ValidUUID1
-
-	// Generate multiple times
-	conn1 := generateConnectionDetails(uuid)
-	conn2 := generateConnectionDetails(uuid)
-	conn3 := generateConnectionDetails(uuid)
-
-	// All should be identical
-	if conn1.Host != conn2.Host || conn2.Host != conn3.Host {
-		t.Error("generateConnectionDetails() is not deterministic for Host")
-	}
-	if conn1.Port != conn2.Port || conn2.Port != conn3.Port {
-		t.Error("generateConnectionDetails() is not deterministic for Port")
-	}
-	if conn1.Protocol != conn2.Protocol || conn2.Protocol != conn3.Protocol {
-		t.Error("generateConnectionDetails() is not deterministic for Protocol")
-	}
-	if conn1.Metadata["region"] != conn2.Metadata["region"] {
-		t.Error("generateConnectionDetails() is not deterministic for Metadata")
-	}
-}
-
-func TestGenerateConnectionDetails_DifferentUUIDs(t *testing.T) {
-	conn1 := generateConnectionDetails(testutil.ValidUUID1)
-	conn2 := generateConnectionDetails(testutil.ValidUUID2)
-	conn3 := generateConnectionDetails(testutil.ValidUUID3)
-
-	// Different UUIDs should (likely) produce different results
-	// Note: There's a small chance of collision, but with different UUIDs it's unlikely
-	allSame := conn1.Host == conn2.Host && conn2.Host == conn3.Host &&
-		conn1.Port == conn2.Port && conn2.Port == conn3.Port
-
-	if allSame {
-		t.Log("Warning: All three different UUIDs produced identical connection details (unlikely but possible)")
-	}
-}
-
-func TestGenerateConnectionDetails_ValidOutput(t *testing.T) {
-	conn := generateConnectionDetails(testutil.ValidUUID1)
-
-	// Verify host is from the list
-	if !slices.Contains(hostnames, conn.Host) {
-		t.Errorf("Host %q is not in valid hostnames list", conn.Host)
-	}
-
-	// Verify port is from the list
-	if !slices.Contains(ports, conn.Port) {
-		t.Errorf("Port %d is not in valid ports list", conn.Port)
-	}
-
-	// Verify protocol is from the list
-	if !slices.Contains(protocols, conn.Protocol) {
-		t.Errorf("Protocol %q is not in valid protocols list", conn.Protocol)
-	}
-
-	// Verify metadata fields exist
-	if conn.Metadata["region"] == "" {
-		t.Error("Metadata region is empty")
-	}
-	if conn.Metadata["tier"] == "" {
-		t.Error("Metadata tier is empty")
-	}
-	if conn.Metadata["instance_id"] == "" {
-		t.Error("Metadata instance_id is empty")
-	}
-	if conn.Metadata["status"] != "connected" {
-		t.Errorf("Metadata status = %q, want %q", conn.Metadata["status"], "connected")
 	}
 }
 

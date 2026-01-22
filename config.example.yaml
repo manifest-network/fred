@@ -48,10 +48,6 @@ tls_key_file: ""
 # Supports Go duration format: 1h, 30m, 24h, etc.
 withdraw_interval: "1h"
 
-# Auto-acknowledgment
-# If true, automatically acknowledge pending leases
-auto_acknowledge: true
-
 # Bech32 prefix for address validation
 # This should match the chain's address prefix (e.g., "manifest", "cosmos", "osmo")
 bech32_prefix: "manifest"
@@ -61,3 +57,60 @@ bech32_prefix: "manifest"
 rate_limit_rps: 10
 # Maximum burst size (requests allowed in a burst before rate limiting kicks in)
 rate_limit_burst: 20
+
+# Backend configuration (required)
+# At least one backend must be configured. Backends handle the actual
+# provisioning of resources when leases are created.
+backends:
+  # Example: Kubernetes backend for k8s-* SKUs
+  - name: kubernetes
+    url: "http://k8s-backend:9000"
+    timeout: 30s
+    sku_prefix: "k8s-"
+    default: true  # This backend is used for SKUs that don't match any prefix
+
+  # Example: GPU backend for gpu-* SKUs
+  # - name: gpu
+  #   url: "http://gpu-backend:9000"
+  #   timeout: 60s
+  #   sku_prefix: "gpu-"
+
+  # Example: VM backend for vm-* SKUs
+  # - name: vm
+  #   url: "http://vm-backend:9000"
+  #   timeout: 30s
+  #   sku_prefix: "vm-"
+
+# Callback URL (required when backends are configured)
+# This is the URL backends will call to report provisioning status.
+# Must be reachable from your backends.
+callback_base_url: "http://fred.provider.example.com:8080"
+
+# Advanced timeout configuration (optional)
+# HTTP server timeouts
+http_read_timeout: "15s"
+http_write_timeout: "15s"
+http_idle_timeout: "60s"
+
+# WebSocket configuration
+websocket_ping_interval: "30s"
+websocket_reconnect_initial: "1s"
+websocket_reconnect_max: "60s"
+
+# Transaction configuration
+tx_poll_interval: "500ms"
+tx_timeout: "30s"
+gas_limit: 500000
+gas_price: 25
+fee_denom: "umfx"
+
+# Query and pagination limits
+query_page_limit: 100
+max_withdraw_iterations: 100
+
+# API limits
+max_request_body_size: 1048576  # 1MB
+
+# Credit check configuration
+credit_check_error_threshold: 3
+credit_check_retry_interval: "30s"

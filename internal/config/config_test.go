@@ -525,9 +525,6 @@ keyring_dir: "/home/provider/.manifest"
 	if cfg.APIListenAddr != ":8080" {
 		t.Errorf("APIListenAddr = %q, want %q", cfg.APIListenAddr, ":8080")
 	}
-	if cfg.AutoAcknowledge != true {
-		t.Errorf("AutoAcknowledge = %v, want %v", cfg.AutoAcknowledge, true)
-	}
 	if cfg.Bech32Prefix != "manifest" {
 		t.Errorf("Bech32Prefix = %q, want %q", cfg.Bech32Prefix, "manifest")
 	}
@@ -549,7 +546,6 @@ provider_address: "manifest1abc"
 key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 chain_id: "test-chain-1"
-auto_acknowledge: false
 rate_limit_rps: 50
 `
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
@@ -563,9 +559,6 @@ rate_limit_rps: 50
 
 	if cfg.ChainID != "test-chain-1" {
 		t.Errorf("ChainID = %q, want %q", cfg.ChainID, "test-chain-1")
-	}
-	if cfg.AutoAcknowledge != false {
-		t.Errorf("AutoAcknowledge = %v, want %v", cfg.AutoAcknowledge, false)
 	}
 	if cfg.RateLimitRPS != 50.0 {
 		t.Errorf("RateLimitRPS = %v, want %v", cfg.RateLimitRPS, 50.0)

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 )
@@ -18,15 +19,21 @@ const (
 	serverShutdownTimeout = 10 * time.Second
 )
 
+// CallbackPublisher publishes backend callbacks to the provisioner.
+type CallbackPublisher interface {
+	PublishCallback(callback backend.CallbackPayload) error
+}
+
 // Server is the HTTP API server.
 type Server struct {
-	addr         string
-	server       *http.Server
-	handlers     *Handlers
-	providerUUID string
-	tlsCertFile  string
-	tlsKeyFile   string
-	rateLimiter  *RateLimiter
+	addr              string
+	server            *http.Server
+	handlers          *Handlers
+	providerUUID      string
+	tlsCertFile       string
+	tlsKeyFile        string
+	rateLimiter       *RateLimiter
+	callbackPublisher CallbackPublisher
 }
 
 // ServerConfig holds configuration for the API server.
@@ -45,8 +52,8 @@ type ServerConfig struct {
 }
 
 // NewServer creates a new API server.
-func NewServer(cfg ServerConfig, client *chain.Client) *Server {
-	handlers := NewHandlers(client, cfg.ProviderUUID, cfg.Bech32Prefix)
+func NewServer(cfg ServerConfig, client *chain.Client, backendRouter *backend.Router, callbackPublisher CallbackPublisher) *Server {
+	handlers := NewHandlers(client, backendRouter, cfg.ProviderUUID, cfg.Bech32Prefix)
 	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	// Apply default for max request body size
@@ -57,16 +64,27 @@ func NewServer(cfg ServerConfig, client *chain.Client) *Server {
 
 	router := mux.NewRouter()
 
+	s := &Server{
+		addr:              cfg.Addr,
+		handlers:          handlers,
+		providerUUID:      cfg.ProviderUUID,
+		tlsCertFile:       cfg.TLSCertFile,
+		tlsKeyFile:        cfg.TLSKeyFile,
+		rateLimiter:       rateLimiter,
+		callbackPublisher: callbackPublisher,
+	}
+
 	// Register routes
 	router.HandleFunc("/health", handlers.HealthCheck).Methods("GET")
 	router.HandleFunc("/v1/leases/{lease_uuid}/connection", handlers.GetLeaseConnection).Methods("GET")
+	router.HandleFunc("/callbacks/provision", s.handleProvisionCallback).Methods("POST")
 
 	// Add middleware (order matters: rate limit first, then body size, then logging)
 	router.Use(rateLimiter.Middleware)
 	router.Use(maxBodySizeMiddleware(maxBodySize))
 	router.Use(loggingMiddleware)
 
-	server := &http.Server{
+	s.server = &http.Server{
 		Addr:         cfg.Addr,
 		Handler:      router,
 		ReadTimeout:  cfg.ReadTimeout,
@@ -74,15 +92,46 @@ func NewServer(cfg ServerConfig, client *chain.Client) *Server {
 		IdleTimeout:  cfg.IdleTimeout,
 	}
 
-	return &Server{
-		addr:         cfg.Addr,
-		server:       server,
-		handlers:     handlers,
-		providerUUID: cfg.ProviderUUID,
-		tlsCertFile:  cfg.TLSCertFile,
-		tlsKeyFile:   cfg.TLSKeyFile,
-		rateLimiter:  rateLimiter,
+	return s
+}
+
+// handleProvisionCallback handles POST /callbacks/provision from backends.
+func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request) {
+	if s.callbackPublisher == nil {
+		slog.Error("callback publisher not configured")
+		writeError(w, "service not configured", http.StatusServiceUnavailable)
+		return
 	}
+
+	var callback backend.CallbackPayload
+	if err := decodeJSON(r, &callback); err != nil {
+		slog.Warn("invalid callback payload", "error", err)
+		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if callback.LeaseUUID == "" {
+		writeError(w, "lease_uuid is required", http.StatusBadRequest)
+		return
+	}
+
+	if callback.Status != "success" && callback.Status != "failed" {
+		writeError(w, "status must be 'success' or 'failed'", http.StatusBadRequest)
+		return
+	}
+
+	slog.Info("received provision callback",
+		"lease_uuid", callback.LeaseUUID,
+		"status", callback.Status,
+	)
+
+	if err := s.callbackPublisher.PublishCallback(callback); err != nil {
+		slog.Error("failed to publish callback", "error", err)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // Start begins serving HTTP requests.
