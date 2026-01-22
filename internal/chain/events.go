@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -20,6 +21,24 @@ const (
 	LeaseRejected     LeaseEventType = "lease_rejected"
 	LeaseClosed       LeaseEventType = "lease_closed"
 	LeaseExpired      LeaseEventType = "lease_expired"
+	LeaseAutoClosed   LeaseEventType = "lease_auto_closed" // Credit exhaustion (any provider)
+)
+
+const (
+	// eventChannelCapacity is the buffer size for the lease events channel.
+	// If the channel fills up, events will be dropped with a warning log.
+	// Increase this value if you observe "event channel full" warnings.
+	eventChannelCapacity = 100
+
+	// invalidMsgThreshold is the count at which invalid message logging escalates to warning.
+	invalidMsgThreshold = 10
+
+	// readGoroutineCleanupTimeout is how long to wait for the read goroutine to finish during cleanup.
+	readGoroutineCleanupTimeout = 5 * time.Second
+
+	// backoffJitterDivisor controls the jitter range (1/N of backoff duration).
+	// A value of 4 means jitter is 0-25% of the backoff duration.
+	backoffJitterDivisor = 4
 )
 
 // LeaseEvent represents a lease-related event from the chain.
@@ -32,21 +51,54 @@ type LeaseEvent struct {
 
 // EventSubscriber handles WebSocket subscription to CometBFT events.
 type EventSubscriber struct {
-	url          string
-	providerUUID string
-	conn         *websocket.Conn
-	events       chan LeaseEvent
-	done         chan struct{}
-	mu           sync.Mutex
+	url              string
+	providerUUID     string
+	pingInterval     time.Duration
+	reconnectInitial time.Duration
+	reconnectMax     time.Duration
+	conn             *websocket.Conn
+	events           chan LeaseEvent
+	done             chan struct{}
+	mu               sync.Mutex
+
+	// Track invalid messages for escalated logging
+	invalidMsgCount    int
+	lastInvalidMsgTime time.Time
+}
+
+// EventSubscriberConfig holds configuration for the event subscriber.
+type EventSubscriberConfig struct {
+	URL              string
+	ProviderUUID     string
+	PingInterval     time.Duration
+	ReconnectInitial time.Duration
+	ReconnectMax     time.Duration
 }
 
 // NewEventSubscriber creates a new event subscriber.
-func NewEventSubscriber(url, providerUUID string) (*EventSubscriber, error) {
+func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
+	// Apply defaults
+	pingInterval := cfg.PingInterval
+	if pingInterval == 0 {
+		pingInterval = 30 * time.Second
+	}
+	reconnectInitial := cfg.ReconnectInitial
+	if reconnectInitial == 0 {
+		reconnectInitial = time.Second
+	}
+	reconnectMax := cfg.ReconnectMax
+	if reconnectMax == 0 {
+		reconnectMax = 60 * time.Second
+	}
+
 	return &EventSubscriber{
-		url:          url,
-		providerUUID: providerUUID,
-		events:       make(chan LeaseEvent, 100),
-		done:         make(chan struct{}),
+		url:              cfg.URL,
+		providerUUID:     cfg.ProviderUUID,
+		pingInterval:     pingInterval,
+		reconnectInitial: reconnectInitial,
+		reconnectMax:     reconnectMax,
+		events:           make(chan LeaseEvent, eventChannelCapacity),
+		done:             make(chan struct{}),
 	}, nil
 }
 
@@ -57,8 +109,7 @@ func (s *EventSubscriber) Events() <-chan LeaseEvent {
 
 // Start begins listening for events. It will automatically reconnect on failure.
 func (s *EventSubscriber) Start(ctx context.Context) error {
-	backoff := time.Second
-	maxBackoff := 60 * time.Second
+	backoff := s.reconnectInitial
 
 	for {
 		select {
@@ -94,11 +145,14 @@ func (s *EventSubscriber) Start(ctx context.Context) error {
 		case <-time.After(backoff):
 		}
 
-		// Exponential backoff, capped at maxBackoff
+		// Exponential backoff with jitter, capped at max
 		backoff = backoff * 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		if backoff > s.reconnectMax {
+			backoff = s.reconnectMax
 		}
+		// Add jitter: random value between 0 and 25% of backoff to prevent thundering herd
+		jitter := time.Duration(rand.Int64N(int64(backoff) / backoffJitterDivisor))
+		backoff = backoff + jitter
 	}
 }
 
@@ -118,13 +172,28 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 	s.conn = conn
 	s.mu.Unlock()
 
+	// Cleanup function to close connection and wait for read goroutine
+	// We declare readDone here so we can reference it in the defer
+	var readDone chan struct{}
 	defer func() {
+		// Close connection first to unblock any pending ReadMessage
 		s.mu.Lock()
 		if s.conn != nil {
-			s.conn.Close()
+			if err := s.conn.Close(); err != nil {
+				slog.Debug("error closing websocket connection", "error", err)
+			}
 			s.conn = nil
 		}
 		s.mu.Unlock()
+
+		// Wait for read goroutine to finish (if it was started)
+		if readDone != nil {
+			select {
+			case <-readDone:
+			case <-time.After(readGoroutineCleanupTimeout):
+				slog.Warn("timeout waiting for read goroutine to finish")
+			}
+		}
 	}()
 
 	slog.Info("websocket connected", "url", s.url)
@@ -136,25 +205,37 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 
 	// Subscribe to lease events for this provider
 	query := fmt.Sprintf("tm.event='Tx' AND lease_created.provider_uuid='%s'", s.providerUUID)
-	if err := s.subscribe(conn, query); err != nil {
-		return fmt.Errorf("failed to subscribe: %w", err)
+	if err := s.subscribe(conn, query, 1); err != nil {
+		return fmt.Errorf("failed to subscribe to provider events: %w", err)
 	}
+	slog.Info("subscribed to provider lease events", "provider_uuid", s.providerUUID)
 
-	slog.Info("subscribed to lease events", "provider_uuid", s.providerUUID)
+	// Subscribe to ALL lease_auto_closed events (any provider) to detect cross-provider credit depletion
+	autoCloseQuery := "tm.event='Tx' AND lease_auto_closed.reason='credit_exhausted'"
+	if err := s.subscribe(conn, autoCloseQuery, 2); err != nil {
+		return fmt.Errorf("failed to subscribe to auto-close events: %w", err)
+	}
+	slog.Info("subscribed to lease auto-close events")
 
 	// Start ping ticker to keep connection alive
-	pingTicker := time.NewTicker(30 * time.Second)
+	pingTicker := time.NewTicker(s.pingInterval)
 	defer pingTicker.Stop()
 
-	// Channel to signal read errors
+	// Channel to signal read errors and completion
 	readErr := make(chan error, 1)
+	readDone = make(chan struct{})
 
 	// Read messages in a goroutine
 	go func() {
+		defer close(readDone)
 		for {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				readErr <- err
+				// Only send error if channel is not full (non-blocking)
+				select {
+				case readErr <- err:
+				default:
+				}
 				return
 			}
 			s.handleMessage(message)
@@ -179,11 +260,11 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 }
 
 // subscribe sends a subscription request.
-func (s *EventSubscriber) subscribe(conn *websocket.Conn, query string) error {
+func (s *EventSubscriber) subscribe(conn *websocket.Conn, query string, id int) error {
 	req := jsonRPCRequest{
 		JSONRPC: "2.0",
 		Method:  "subscribe",
-		ID:      1,
+		ID:      id,
 		Params: map[string]string{
 			"query": query,
 		},
@@ -196,27 +277,43 @@ func (s *EventSubscriber) subscribe(conn *websocket.Conn, query string) error {
 func (s *EventSubscriber) handleMessage(message []byte) {
 	var resp jsonRPCResponse
 	if err := json.Unmarshal(message, &resp); err != nil {
-		slog.Debug("failed to unmarshal message", "error", err)
+		s.trackInvalidMessage("json_unmarshal_error", err)
 		return
 	}
 
-	if resp.Result == nil {
+	// Check for RPC errors
+	if resp.Error != nil {
+		slog.Warn("received RPC error",
+			"code", resp.Error.Code,
+			"message", resp.Error.Message,
+		)
+		return
+	}
+
+	if len(resp.Result) == 0 {
+		// This is normal for subscription confirmations
 		return
 	}
 
 	// Parse the result to extract events
-	result, ok := resp.Result.(map[string]interface{})
-	if !ok {
+	var result txEventResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		s.trackInvalidMessage("result_unmarshal_error", err)
 		return
 	}
 
-	events, ok := result["events"].(map[string]interface{})
-	if !ok {
+	if result.Events == nil {
+		// This is normal - not all messages contain events
 		return
 	}
+
+	// Reset invalid message counter on successful event processing
+	s.mu.Lock()
+	s.invalidMsgCount = 0
+	s.mu.Unlock()
 
 	// Extract lease events
-	event := s.parseLeaseEvent(events)
+	event := s.parseLeaseEvent(result.Events)
 	if event != nil {
 		select {
 		case s.events <- *event:
@@ -226,9 +323,38 @@ func (s *EventSubscriber) handleMessage(message []byte) {
 	}
 }
 
+// trackInvalidMessage tracks invalid messages and escalates logging if threshold exceeded.
+func (s *EventSubscriber) trackInvalidMessage(reason string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.invalidMsgCount++
+	s.lastInvalidMsgTime = time.Now()
+
+	// Build log attributes
+	attrs := []interface{}{"reason", reason}
+	if err != nil {
+		attrs = append(attrs, "error", err)
+	}
+
+	switch {
+	case s.invalidMsgCount == invalidMsgThreshold:
+		// Escalate to warning at threshold
+		slog.Warn("high rate of invalid WebSocket messages", append(attrs, "count", s.invalidMsgCount)...)
+	case s.invalidMsgCount < invalidMsgThreshold:
+		slog.Debug("invalid WebSocket message", attrs...)
+	}
+	// After threshold, stop logging to avoid spam
+}
+
 // parseLeaseEvent extracts a LeaseEvent from CometBFT events.
-func (s *EventSubscriber) parseLeaseEvent(events map[string]interface{}) *LeaseEvent {
-	// Check for different event types
+func (s *EventSubscriber) parseLeaseEvent(events map[string][]string) *LeaseEvent {
+	// Check for lease_auto_closed events first (these are not filtered by provider)
+	if event := s.parseAutoClosedEvent(events); event != nil {
+		return event
+	}
+
+	// Check for provider-specific event types
 	eventTypes := []LeaseEventType{
 		LeaseCreated,
 		LeaseAcknowledged,
@@ -270,12 +396,42 @@ func (s *EventSubscriber) parseLeaseEvent(events map[string]interface{}) *LeaseE
 	return nil
 }
 
+// parseAutoClosedEvent parses lease_auto_closed events (from any provider).
+func (s *EventSubscriber) parseAutoClosedEvent(events map[string][]string) *LeaseEvent {
+	prefix := string(LeaseAutoClosed)
+
+	leaseUUID := getEventAttribute(events, prefix+".lease_uuid")
+	if leaseUUID == "" {
+		return nil
+	}
+
+	tenant := getEventAttribute(events, prefix+".tenant")
+	if tenant == "" {
+		return nil
+	}
+
+	providerUUID := getEventAttribute(events, prefix+".provider_uuid")
+	reason := getEventAttribute(events, prefix+".reason")
+
+	slog.Info("received lease auto-closed event",
+		"lease_uuid", leaseUUID,
+		"tenant", tenant,
+		"provider_uuid", providerUUID,
+		"reason", reason,
+	)
+
+	return &LeaseEvent{
+		Type:         LeaseAutoClosed,
+		LeaseUUID:    leaseUUID,
+		ProviderUUID: providerUUID,
+		Tenant:       tenant,
+	}
+}
+
 // getEventAttribute extracts an attribute value from events.
-func getEventAttribute(events map[string]interface{}, key string) string {
-	if values, ok := events[key].([]interface{}); ok && len(values) > 0 {
-		if str, ok := values[0].(string); ok {
-			return str
-		}
+func getEventAttribute(events map[string][]string, key string) string {
+	if values, ok := events[key]; ok && len(values) > 0 {
+		return values[0]
 	}
 	return ""
 }
@@ -285,7 +441,9 @@ func (s *EventSubscriber) Close() {
 	close(s.done)
 	s.mu.Lock()
 	if s.conn != nil {
-		s.conn.Close()
+		if err := s.conn.Close(); err != nil {
+			slog.Debug("error closing websocket connection", "error", err)
+		}
 	}
 	s.mu.Unlock()
 }
@@ -299,10 +457,15 @@ type jsonRPCRequest struct {
 }
 
 type jsonRPCResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result"`
-	Error   *rpcError   `json:"error,omitempty"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      int             `json:"id"`
+	Result  json.RawMessage `json:"result"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+// txEventResult represents the result structure for transaction events.
+type txEventResult struct {
+	Events map[string][]string `json:"events"`
 }
 
 type rpcError struct {

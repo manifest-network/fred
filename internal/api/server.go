@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -9,6 +10,12 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/config"
+)
+
+const (
+	// serverShutdownTimeout is the maximum time to wait for the server to shutdown gracefully.
+	serverShutdownTimeout = 10 * time.Second
 )
 
 // Server is the HTTP API server.
@@ -24,19 +31,29 @@ type Server struct {
 
 // ServerConfig holds configuration for the API server.
 type ServerConfig struct {
-	Addr           string
-	ProviderUUID   string
-	Bech32Prefix   string
-	TLSCertFile    string
-	TLSKeyFile     string
-	RateLimitRPS   float64
-	RateLimitBurst int
+	Addr               string
+	ProviderUUID       string
+	Bech32Prefix       string
+	TLSCertFile        string
+	TLSKeyFile         string
+	RateLimitRPS       float64
+	RateLimitBurst     int
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	IdleTimeout        time.Duration
+	MaxRequestBodySize int64
 }
 
 // NewServer creates a new API server.
 func NewServer(cfg ServerConfig, client *chain.Client) *Server {
 	handlers := NewHandlers(client, cfg.ProviderUUID, cfg.Bech32Prefix)
 	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+
+	// Apply default for max request body size
+	maxBodySize := cfg.MaxRequestBodySize
+	if maxBodySize <= 0 {
+		maxBodySize = config.DefaultMaxRequestBodySize
+	}
 
 	router := mux.NewRouter()
 
@@ -46,15 +63,15 @@ func NewServer(cfg ServerConfig, client *chain.Client) *Server {
 
 	// Add middleware (order matters: rate limit first, then body size, then logging)
 	router.Use(rateLimiter.Middleware)
-	router.Use(maxBodySizeMiddleware(1 << 20)) // 1MB max request body
+	router.Use(maxBodySizeMiddleware(maxBodySize))
 	router.Use(loggingMiddleware)
 
 	server := &http.Server{
 		Addr:         cfg.Addr,
 		Handler:      router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  cfg.ReadTimeout,
+		WriteTimeout: cfg.WriteTimeout,
+		IdleTimeout:  cfg.IdleTimeout,
 	}
 
 	return &Server{
@@ -87,7 +104,7 @@ func (s *Server) Start(ctx context.Context) error {
 		} else {
 			err = s.server.ListenAndServe()
 		}
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()
@@ -101,15 +118,13 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // Shutdown gracefully shuts down the server.
-func (s *Server) Shutdown(ctx context.Context) {
+func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down API server")
 
-	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(ctx, serverShutdownTimeout)
 	defer cancel()
 
-	if err := s.server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("failed to shutdown server gracefully", "error", err)
-	}
+	return s.server.Shutdown(shutdownCtx)
 }
 
 // maxBodySizeMiddleware limits the size of request bodies.

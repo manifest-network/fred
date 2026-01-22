@@ -19,6 +19,13 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
 
+const (
+	// gasPriceDivisor converts gas price from micro-units to base units.
+	gasPriceDivisor = 1_000_000
+	// minFeeAmount is the minimum fee amount in base units.
+	minFeeAmount = 1
+)
+
 // Signer handles transaction signing using a Cosmos keyring.
 type Signer struct {
 	keyring   keyring.Keyring
@@ -27,10 +34,24 @@ type Signer struct {
 	chainID   string
 	txConfig  client.TxConfig
 	cdc       codec.Codec
+	gasLimit  uint64
+	gasPrice  int64
+	feeDenom  string
 }
 
-// NewSigner creates a new signer using the specified keyring backend.
-func NewSigner(backend, keyringDir, keyName, chainID string) (*Signer, error) {
+// SignerConfig holds configuration for the transaction signer.
+type SignerConfig struct {
+	KeyringBackend string
+	KeyringDir     string
+	KeyName        string
+	ChainID        string
+	GasLimit       uint64
+	GasPrice       int64
+	FeeDenom       string
+}
+
+// NewSigner creates a new signer using the specified configuration.
+func NewSigner(cfg SignerConfig) (*Signer, error) {
 	// Create codec with required types
 	interfaceRegistry := codectypes.NewInterfaceRegistry()
 
@@ -41,15 +62,15 @@ func NewSigner(backend, keyringDir, keyName, chainID string) (*Signer, error) {
 	cdc := codec.NewProtoCodec(interfaceRegistry)
 
 	// Create keyring
-	kr, err := keyring.New("manifest", backend, keyringDir, nil, cdc)
+	kr, err := keyring.New("manifest", cfg.KeyringBackend, cfg.KeyringDir, nil, cdc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create keyring: %w", err)
 	}
 
 	// Get key info
-	keyInfo, err := kr.Key(keyName)
+	keyInfo, err := kr.Key(cfg.KeyName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get key %s: %w", keyName, err)
+		return nil, fmt.Errorf("failed to get key %s: %w", cfg.KeyName, err)
 	}
 
 	addr, err := keyInfo.GetAddress()
@@ -62,11 +83,14 @@ func NewSigner(backend, keyringDir, keyName, chainID string) (*Signer, error) {
 
 	return &Signer{
 		keyring:  kr,
-		keyName:  keyName,
+		keyName:  cfg.KeyName,
 		address:  addr.String(),
-		chainID:  chainID,
+		chainID:  cfg.ChainID,
 		txConfig: txConfig,
 		cdc:      cdc,
+		gasLimit: cfg.GasLimit,
+		gasPrice: cfg.GasPrice,
+		feeDenom: cfg.FeeDenom,
 	}, nil
 }
 
@@ -89,9 +113,13 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 		return nil, fmt.Errorf("failed to set messages: %w", err)
 	}
 
-	// Set gas and fees (500k gas for batch operations like withdraw)
-	txBuilder.SetGasLimit(500000)
-	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(12500))))
+	// Set gas and fees from configuration
+	txBuilder.SetGasLimit(s.gasLimit)
+	feeAmount := int64(s.gasLimit) * s.gasPrice / gasPriceDivisor
+	if feeAmount < minFeeAmount {
+		feeAmount = minFeeAmount
+	}
+	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, math.NewInt(feeAmount))))
 
 	// Get the key
 	keyInfo, err := s.keyring.Key(s.keyName)

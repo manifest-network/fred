@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"time"
 
 	"google.golang.org/grpc"
@@ -22,22 +23,33 @@ import (
 	skutypes "github.com/manifest-network/manifest-ledger/x/sku/types"
 )
 
+const (
+	// maxLeasesPerBatch is the maximum number of leases to process in a single transaction.
+	maxLeasesPerBatch = 100
+)
+
 // Client provides methods to query and submit transactions to the chain.
 type Client struct {
-	conn         *grpc.ClientConn
-	signer       *Signer
-	billingQuery billingtypes.QueryClient
-	skuQuery     skutypes.QueryClient
-	authQuery    authtypes.QueryClient
-	txService    tx.ServiceClient
+	conn           *grpc.ClientConn
+	signer         *Signer
+	billingQuery   billingtypes.QueryClient
+	skuQuery       skutypes.QueryClient
+	authQuery      authtypes.QueryClient
+	txService      tx.ServiceClient
+	txPollInterval time.Duration
+	txTimeout      time.Duration
+	queryPageLimit uint64
 }
 
 // ClientConfig holds configuration for the chain client.
 type ClientConfig struct {
-	Endpoint      string
-	TLSEnabled    bool
-	TLSCAFile     string // Path to CA certificate file (optional, uses system CAs if empty)
-	TLSSkipVerify bool   // Skip certificate verification (for testing only)
+	Endpoint       string
+	TLSEnabled     bool
+	TLSCAFile      string        // Path to CA certificate file (optional, uses system CAs if empty)
+	TLSSkipVerify  bool          // Skip certificate verification (for testing only)
+	TxPollInterval time.Duration // Interval for polling tx status (default: 500ms)
+	TxTimeout      time.Duration // Timeout for waiting for tx inclusion (default: 30s)
+	QueryPageLimit int           // Page limit for paginated queries (default: 100)
 }
 
 // NewClient creates a new chain client connected to the given gRPC endpoint.
@@ -60,13 +72,30 @@ func NewClient(cfg ClientConfig, signer *Signer) (*Client, error) {
 		return nil, fmt.Errorf("failed to connect to gRPC endpoint: %w", err)
 	}
 
+	// Apply defaults for timeouts
+	txPollInterval := cfg.TxPollInterval
+	if txPollInterval == 0 {
+		txPollInterval = 500 * time.Millisecond
+	}
+	txTimeout := cfg.TxTimeout
+	if txTimeout == 0 {
+		txTimeout = 30 * time.Second
+	}
+	queryPageLimit := cfg.QueryPageLimit
+	if queryPageLimit <= 0 {
+		queryPageLimit = 100
+	}
+
 	return &Client{
-		conn:         conn,
-		signer:       signer,
-		billingQuery: billingtypes.NewQueryClient(conn),
-		skuQuery:     skutypes.NewQueryClient(conn),
-		authQuery:    authtypes.NewQueryClient(conn),
-		txService:    tx.NewServiceClient(conn),
+		conn:           conn,
+		signer:         signer,
+		billingQuery:   billingtypes.NewQueryClient(conn),
+		skuQuery:       skutypes.NewQueryClient(conn),
+		authQuery:      authtypes.NewQueryClient(conn),
+		txService:      tx.NewServiceClient(conn),
+		txPollInterval: txPollInterval,
+		txTimeout:      txTimeout,
+		queryPageLimit: uint64(queryPageLimit),
 	}, nil
 }
 
@@ -99,22 +128,35 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// GetPendingLeases returns all pending leases for a provider.
-func (c *Client) GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+// Ping checks if the chain connection is healthy by querying the signer's account.
+// Returns nil if healthy, otherwise returns the error.
+func (c *Client) Ping(ctx context.Context) error {
+	// Use a short timeout for health checks
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
+		Address: c.signer.Address(),
+	})
+	return err
+}
+
+// getLeasesByProviderWithState fetches all leases for a provider with the given state filter.
+func (c *Client) getLeasesByProviderWithState(ctx context.Context, providerUUID string, state billingtypes.LeaseState) ([]billingtypes.Lease, error) {
 	var allLeases []billingtypes.Lease
 	var nextKey []byte
 
 	for {
 		resp, err := c.billingQuery.LeasesByProvider(ctx, &billingtypes.QueryLeasesByProviderRequest{
 			ProviderUuid: providerUUID,
-			StateFilter:  billingtypes.LEASE_STATE_PENDING,
+			StateFilter:  state,
 			Pagination: &query.PageRequest{
 				Key:   nextKey,
-				Limit: 100,
+				Limit: c.queryPageLimit,
 			},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to query pending leases: %w", err)
+			return nil, err
 		}
 
 		allLeases = append(allLeases, resp.Leases...)
@@ -126,6 +168,15 @@ func (c *Client) GetPendingLeases(ctx context.Context, providerUUID string) ([]b
 	}
 
 	return allLeases, nil
+}
+
+// GetPendingLeases returns all pending leases for a provider.
+func (c *Client) GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+	leases, err := c.getLeasesByProviderWithState(ctx, providerUUID, billingtypes.LEASE_STATE_PENDING)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending leases: %w", err)
+	}
+	return leases, nil
 }
 
 // GetActiveLease returns an active lease by UUID, or nil if not found or not active.
@@ -156,23 +207,16 @@ func (c *Client) GetProvider(ctx context.Context, providerUUID string) (*skutype
 	return &resp.Provider, nil
 }
 
-// AcknowledgeLeases acknowledges the given leases. Returns the number of leases acknowledged.
-func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, error) {
+// AcknowledgeLeases acknowledges the given leases. Returns the number of leases acknowledged and tx hashes.
+func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 	if len(leaseUUIDs) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 
-	// Batch up to 100 leases per transaction
-	const batchSize = 100
 	var totalAcknowledged uint64
+	var txHashes []string
 
-	for i := 0; i < len(leaseUUIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(leaseUUIDs) {
-			end = len(leaseUUIDs)
-		}
-		batch := leaseUUIDs[i:end]
-
+	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
 		msg := &billingtypes.MsgAcknowledgeLease{
 			Sender:     c.signer.Address(),
 			LeaseUuids: batch,
@@ -180,32 +224,33 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 
 		txHash, err := c.broadcastTx(ctx, msg)
 		if err != nil {
-			return totalAcknowledged, fmt.Errorf("failed to acknowledge leases: %w", err)
+			return totalAcknowledged, txHashes, fmt.Errorf("failed to acknowledge leases: %w", err)
 		}
 
 		slog.Info("acknowledged leases", "count", len(batch), "tx_hash", txHash)
+		txHashes = append(txHashes, txHash)
 		totalAcknowledged += uint64(len(batch))
 	}
 
-	return totalAcknowledged, nil
+	return totalAcknowledged, txHashes, nil
 }
 
 // WithdrawByProvider withdraws funds from all active leases for a provider.
-// Returns the total amounts withdrawn and whether there are more leases to process.
-func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (sdktypes.Coins, bool, error) {
+// Returns the transaction hash on success.
+func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (string, error) {
 	msg := &billingtypes.MsgWithdraw{
 		Sender:       c.signer.Address(),
 		ProviderUuid: providerUUID,
-		Limit:        100,
+		Limit:        maxLeasesPerBatch,
 	}
 
 	txHash, err := c.broadcastTx(ctx, msg)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to withdraw: %w", err)
+		return "", fmt.Errorf("failed to withdraw: %w", err)
 	}
 
 	slog.Info("withdrawal completed", "tx_hash", txHash)
-	return nil, false, nil
+	return txHash, nil
 }
 
 // broadcastTx signs and broadcasts a transaction, waits for execution, returns tx hash.
@@ -253,24 +298,103 @@ func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, err
 
 // waitForTx polls for a transaction until it's included in a block.
 func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxResponse, error) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(c.txPollInterval)
 	defer ticker.Stop()
 
-	timeout := time.After(30 * time.Second)
+	timeout := time.After(c.txTimeout)
+	var consecutiveErrors int
+	var lastErr error
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timeout:
+			if lastErr != nil {
+				return nil, fmt.Errorf("timeout waiting for tx %s (last error: %v)", txHash, lastErr)
+			}
 			return nil, fmt.Errorf("timeout waiting for tx %s", txHash)
 		case <-ticker.C:
 			resp, err := c.txService.GetTx(ctx, &tx.GetTxRequest{Hash: txHash})
 			if err != nil {
-				// Tx not found yet, keep polling
+				consecutiveErrors++
+				lastErr = err
+				// Log warning after several consecutive failures to help with debugging
+				if consecutiveErrors == 5 {
+					slog.Warn("repeated errors polling for tx",
+						"tx_hash", txHash,
+						"consecutive_errors", consecutiveErrors,
+						"last_error", err,
+					)
+				}
+				// Keep polling - tx may not be indexed yet
 				continue
 			}
 			return resp, nil
 		}
 	}
+}
+
+// GetActiveLeasesByProvider returns all active leases for a provider.
+func (c *Client) GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+	leases, err := c.getLeasesByProviderWithState(ctx, providerUUID, billingtypes.LEASE_STATE_ACTIVE)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active leases: %w", err)
+	}
+	return leases, nil
+}
+
+// GetCreditAccount returns the credit account and balances for a tenant.
+func (c *Client) GetCreditAccount(ctx context.Context, tenant string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+	resp, err := c.billingQuery.CreditAccount(ctx, &billingtypes.QueryCreditAccountRequest{
+		Tenant: tenant,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query credit account: %w", err)
+	}
+
+	return &resp.CreditAccount, resp.Balances, nil
+}
+
+// GetProviderWithdrawable returns the total withdrawable amounts for a provider.
+func (c *Client) GetProviderWithdrawable(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+	// Use a higher limit for totals query (10x normal page limit)
+	resp, err := c.billingQuery.ProviderWithdrawable(ctx, &billingtypes.QueryProviderWithdrawableRequest{
+		ProviderUuid: providerUUID,
+		Limit:        c.queryPageLimit * 10,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query provider withdrawable: %w", err)
+	}
+
+	return resp.Amounts, nil
+}
+
+// CloseLeases closes the given leases with an optional reason. Returns the number of leases closed and tx hashes.
+func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	if len(leaseUUIDs) == 0 {
+		return 0, nil, nil
+	}
+
+	var totalClosed uint64
+	var txHashes []string
+
+	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
+		msg := &billingtypes.MsgCloseLease{
+			Sender:     c.signer.Address(),
+			LeaseUuids: batch,
+			Reason:     reason,
+		}
+
+		txHash, err := c.broadcastTx(ctx, msg)
+		if err != nil {
+			return totalClosed, txHashes, fmt.Errorf("failed to close leases: %w", err)
+		}
+
+		slog.Info("closed leases", "count", len(batch), "reason", reason, "tx_hash", txHash)
+		txHashes = append(txHashes, txHash)
+		totalClosed += uint64(len(batch))
+	}
+
+	return totalClosed, txHashes, nil
 }

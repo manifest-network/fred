@@ -8,7 +8,95 @@ A Go daemon for Manifest Network providers that watches for lease events, auto-a
 - **Auto-Acknowledgment**: Automatically acknowledges pending leases on startup and as they arrive
 - **Tenant Authentication API**: HTTP/HTTPS API with ADR-036 signature verification for tenant access
 - **Periodic Withdrawals**: Configurable scheduled withdrawal of accumulated fees from active leases
+- **Credit Monitoring**: Tracks tenant credit balances and auto-closes leases when credit is depleted
+- **Cross-Provider Credit Detection**: Responds to credit depletion events from other providers
 - **Security**: Rate limiting, request size limits, input validation, and optional TLS for both API and gRPC
+
+## How It Works
+
+```mermaid
+flowchart LR
+    subgraph Chain["Manifest Chain"]
+        EVENTS[Lease Events]
+        GRPC[gRPC]
+    end
+
+    FRED[Fred]
+
+    subgraph Tenant["Tenant"]
+        APP[Application]
+    end
+
+    EVENTS -->|WebSocket| FRED
+    FRED -->|Transactions| GRPC
+    FRED -->|Queries| GRPC
+    APP -->|HTTP API| FRED
+```
+
+## Lease Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant T as Tenant
+    participant C as Chain
+    participant F as Fred
+    participant P as Provider Backend
+
+    Note over T,P: Lease Creation & Acknowledgment
+    T->>C: Create Lease
+    C-->>F: lease_created event
+    F->>F: Queue for acknowledgment
+    F->>C: MsgAcknowledgeLease
+    C-->>F: lease_acknowledged event
+    F->>F: Track tenant for credit monitoring
+
+    Note over T,P: Tenant Access
+    T->>T: Sign auth token (ADR-036)
+    T->>F: GET /v1/leases/{uuid}/connection
+    F->>F: Verify signature & lease ownership
+    F->>C: Query lease state
+    F-->>T: Connection details
+
+    Note over T,P: Periodic Withdrawal
+    F->>C: Query withdrawable amounts
+    F->>C: MsgWithdraw
+    F->>C: Query tenant credit balances
+    F->>F: Calculate burn rates
+
+    Note over T,P: Credit Depletion (Auto-Close)
+    F->>F: Detect zero/negative balance
+    F->>C: MsgCloseLease (credit_exhausted)
+    C-->>F: lease_auto_closed event
+    F->>F: Remove tenant from tracking
+```
+
+## Credit Monitoring & Auto-Close
+
+```mermaid
+flowchart LR
+    subgraph Monitoring["Credit Monitoring Loop"]
+        direction TB
+        W[Withdraw Funds] --> Q[Query Active Leases]
+        Q --> G[Get Credit Balances]
+        G --> C{Credit > 0?}
+        C -->|Yes| B[Calculate Burn Rate]
+        C -->|No| CL[Close Leases]
+        B --> S[Schedule Next Check]
+        CL --> S
+    end
+
+    subgraph CrossProvider["Cross-Provider Detection"]
+        direction TB
+        E[Auto-Close Event] --> CH{Our Tenant?}
+        CH -->|Yes| TW[Trigger Withdrawal]
+        CH -->|No| IG[Ignore]
+        TW --> W
+    end
+```
+
+The burn rate calculator estimates when a tenant's credit will be depleted based on the observed spending rate between checks. This allows fred to schedule more frequent checks as depletion approaches.
+
+> **Note**: The current implementation assumes a single denomination for credit. Multi-denom support with proportional burn rates is not yet implemented.
 
 ## Building
 
@@ -162,10 +250,12 @@ cmd/providerd/          # Entry point, CLI
 internal/
 ├── adr036/             # ADR-036 signature verification
 ├── api/                # HTTP server, handlers, rate limiting
+├── auth/               # Shared authentication utilities
 ├── chain/              # gRPC client, WebSocket subscriber, signer
-├── config/             # Configuration loading
-├── scheduler/          # Periodic withdrawal scheduler
-└── watcher/            # Lease event watcher
+├── config/             # Configuration loading and validation
+├── scheduler/          # Periodic withdrawal and credit monitoring
+├── testutil/           # Test fixtures and helpers
+└── watcher/            # Lease event watcher and acknowledgment
 ```
 
 ## Security Features
@@ -180,6 +270,7 @@ internal/
 
 ## Dependencies
 
+- Go 1.25+ (uses `sync.WaitGroup.Go()`, `range` over integers, iterators)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x
 - manifest-ledger (for billing/sku types)

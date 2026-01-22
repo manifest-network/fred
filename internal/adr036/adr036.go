@@ -1,5 +1,10 @@
 // Package adr036 implements ADR-036 off-chain message signing and verification.
 // See: https://docs.cosmos.network/main/build/architecture/adr-036-arbitrary-signature
+//
+// Note: This package uses custom Coin/Fee types instead of sdk.Coin because ADR-036
+// requires the legacy Amino JSON format with string amounts. The SDK's sdk.Coin uses
+// math.Int which serializes differently and would produce invalid sign documents that
+// wallets cannot verify.
 package adr036
 
 import (
@@ -21,10 +26,16 @@ type SignDoc struct {
 	Sequence      string       `json:"sequence"`
 }
 
+// Coin represents a coin amount (used in fee structure).
+type Coin struct {
+	Denom  string `json:"denom"`
+	Amount string `json:"amount"`
+}
+
 // Fee represents the fee structure in ADR-036 (always zero for off-chain).
 type Fee struct {
-	Amount []interface{} `json:"amount"`
-	Gas    string        `json:"gas"`
+	Amount []Coin `json:"amount"`
+	Gas    string `json:"gas"`
 }
 
 // MsgWrapper wraps the ADR-036 message.
@@ -74,7 +85,7 @@ func CreateSignBytes(message []byte, signer string) []byte {
 		AccountNumber: "0",
 		ChainID:       "",
 		Fee: Fee{
-			Amount: []interface{}{},
+			Amount: []Coin{},
 			Gas:    "0",
 		},
 		Memo: "",
@@ -106,7 +117,7 @@ func CreateSignDoc(message []byte, signer string) *SignDoc {
 		AccountNumber: "0",
 		ChainID:       "",
 		Fee: Fee{
-			Amount: []interface{}{},
+			Amount: []Coin{},
 			Gas:    "0",
 		},
 		Memo: "",

@@ -4,72 +4,52 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"sync"
+	"strings"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/time/rate"
+)
+
+const (
+	// maxVisitors limits the number of tracked IPs to prevent memory exhaustion
+	maxVisitors = 10000
+	// visitorTTL is how long a visitor entry stays in the cache without access
+	visitorTTL = 3 * time.Minute
 )
 
 // RateLimiter implements per-IP rate limiting using a token bucket algorithm.
 type RateLimiter struct {
-	visitors map[string]*visitor
-	mu       sync.RWMutex
+	visitors *lru.LRU[string, *rate.Limiter]
 	rate     rate.Limit // requests per second
 	burst    int        // max burst size
-	cleanup  time.Duration
-}
-
-type visitor struct {
-	limiter  *rate.Limiter
-	lastSeen time.Time
 }
 
 // NewRateLimiter creates a new rate limiter.
 // rps is requests per second, burst is the maximum burst size.
 func NewRateLimiter(rps float64, burst int) *RateLimiter {
-	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
+	// expirable.LRU handles both LRU eviction (when maxVisitors reached)
+	// and TTL-based expiration (cleanup of stale entries)
+	cache := lru.NewLRU[string, *rate.Limiter](maxVisitors, nil, visitorTTL)
+
+	return &RateLimiter{
+		visitors: cache,
 		rate:     rate.Limit(rps),
 		burst:    burst,
-		cleanup:  3 * time.Minute,
 	}
-
-	// Start cleanup goroutine to remove stale entries
-	go rl.cleanupLoop()
-
-	return rl
 }
 
 // getVisitor retrieves or creates a rate limiter for the given IP.
 func (rl *RateLimiter) getVisitor(ip string) *rate.Limiter {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	v, exists := rl.visitors[ip]
-	if !exists {
-		limiter := rate.NewLimiter(rl.rate, rl.burst)
-		rl.visitors[ip] = &visitor{limiter: limiter, lastSeen: time.Now()}
+	// Try to get existing limiter (also refreshes TTL)
+	if limiter, ok := rl.visitors.Get(ip); ok {
 		return limiter
 	}
 
-	v.lastSeen = time.Now()
-	return v.limiter
-}
-
-// cleanupLoop periodically removes stale visitor entries.
-func (rl *RateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		rl.mu.Lock()
-		for ip, v := range rl.visitors {
-			if time.Since(v.lastSeen) > rl.cleanup {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
+	// Create new limiter - LRU will automatically evict oldest if at capacity
+	limiter := rate.NewLimiter(rl.rate, rl.burst)
+	rl.visitors.Add(ip, limiter)
+	return limiter
 }
 
 // Middleware returns an HTTP middleware that enforces rate limiting.
@@ -81,7 +61,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		if !limiter.Allow() {
 			slog.Warn("rate limit exceeded", "ip", ip, "path", r.URL.Path)
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, `{"error":"rate limit exceeded","code":429}`, http.StatusTooManyRequests)
+			writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 
@@ -95,15 +75,23 @@ func getClientIP(r *http.Request) string {
 	// Check X-Forwarded-For header (may contain multiple IPs)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		// Take the first IP (original client)
-		if ip, _, found := cut(xff, ","); found {
-			return trimSpace(ip)
+		ip, _, _ := strings.Cut(xff, ",")
+		ip = strings.TrimSpace(ip)
+		// Validate it's a real IP address
+		if validIP := net.ParseIP(ip); validIP != nil {
+			return ip
 		}
-		return trimSpace(xff)
+		// Invalid IP in header, fall through to RemoteAddr
 	}
 
 	// Check X-Real-IP header
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return trimSpace(xri)
+		ip := strings.TrimSpace(xri)
+		// Validate it's a real IP address
+		if validIP := net.ParseIP(ip); validIP != nil {
+			return ip
+		}
+		// Invalid IP in header, fall through to RemoteAddr
 	}
 
 	// Fall back to RemoteAddr
@@ -112,26 +100,4 @@ func getClientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return ip
-}
-
-// cut is a simple string split helper (strings.Cut equivalent for older Go)
-func cut(s, sep string) (before, after string, found bool) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep[0] {
-			return s[:i], s[i+1:], true
-		}
-	}
-	return s, "", false
-}
-
-// trimSpace removes leading/trailing whitespace
-func trimSpace(s string) string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
 }
