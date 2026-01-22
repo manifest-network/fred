@@ -13,6 +13,11 @@ import (
 	"github.com/manifest-network/fred/internal/config"
 )
 
+const (
+	// serverShutdownTimeout is the maximum time to wait for the server to shutdown gracefully.
+	serverShutdownTimeout = 10 * time.Second
+)
+
 // Server is the HTTP API server.
 type Server struct {
 	addr         string
@@ -116,7 +121,7 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down API server")
 
-	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(ctx, serverShutdownTimeout)
 	defer cancel()
 
 	return s.server.Shutdown(shutdownCtx)
