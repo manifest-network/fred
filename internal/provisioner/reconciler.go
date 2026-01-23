@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -246,6 +247,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 			continue
 		}
 
+		// Count only orphans that will actually be deprovisioned
 		orphans++
 		slog.Warn("reconcile: orphan provision found",
 			"lease_uuid", leaseUUID,
@@ -340,7 +342,20 @@ func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) err
 
 // Start begins periodic reconciliation.
 func (r *Reconciler) Start(ctx context.Context) error {
-	slog.Info("starting periodic reconciliation", "interval", r.interval)
+	// Add jitter (0-25% of interval) to prevent thundering herd when
+	// multiple fred instances start simultaneously.
+	jitter := time.Duration(rand.Int64N(int64(r.interval / 4)))
+	slog.Info("starting periodic reconciliation",
+		"interval", r.interval,
+		"initial_jitter", jitter,
+	)
+
+	// Wait for initial jitter before starting ticker
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(jitter):
+	}
 
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()

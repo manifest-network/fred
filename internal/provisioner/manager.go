@@ -310,7 +310,8 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
 	}
 
-	// Track in-flight provision
+	// Track in-flight BEFORE calling Provision to prevent race condition:
+	// If backend responds synchronously, callback could arrive before tracking.
 	m.TrackInFlight(event.LeaseUUID, event.Tenant, "", backendClient.Name())
 
 	// Start provisioning (async - backend will call back)
@@ -321,14 +322,14 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 		CallbackURL:  m.callbackURL(),
 	})
 	if err != nil {
+		// Clean up in-flight tracking on failure
+		m.UntrackInFlight(event.LeaseUUID)
+
 		slog.Error("failed to start provisioning",
 			"lease_uuid", event.LeaseUUID,
 			"backend", backendClient.Name(),
 			"error", err,
 		)
-		// Remove from in-flight
-		m.UntrackInFlight(event.LeaseUUID)
-
 		// Watermill will retry; TODO(phase-3): Add lease rejection after max retries
 		return fmt.Errorf("%w: %v", ErrProvisioningFailed, err)
 	}

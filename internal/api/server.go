@@ -140,6 +140,11 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if !config.IsValidUUID(callback.LeaseUUID) {
+		writeError(w, "lease_uuid must be a valid UUID", http.StatusBadRequest)
+		return
+	}
+
 	if callback.Status != "success" && callback.Status != "failed" {
 		writeError(w, "status must be 'success' or 'failed'", http.StatusBadRequest)
 		return

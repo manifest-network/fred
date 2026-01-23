@@ -213,13 +213,13 @@ func TestHandleProvisionCallback_Authentication(t *testing.T) {
 	}{
 		{
 			name:           "valid signed request",
-			body:           `{"lease_uuid":"abc-123","status":"success"}`,
+			body:           `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`,
 			addSignature:   true,
 			wantStatusCode: http.StatusOK,
 		},
 		{
 			name:           "missing signature",
-			body:           `{"lease_uuid":"abc-123","status":"success"}`,
+			body:           `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`,
 			addSignature:   false,
 			wantStatusCode: http.StatusUnauthorized,
 		},
