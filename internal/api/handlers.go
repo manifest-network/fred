@@ -259,6 +259,11 @@ func decodeJSON(r *http.Request, v interface{}) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
+// decodeJSONBytes decodes JSON from a byte slice.
+func decodeJSONBytes(data []byte, v interface{}) error {
+	return json.Unmarshal(data, v)
+}
+
 // extractConnectionDetails extracts ConnectionDetails from a backend LeaseInfo map.
 // Unknown fields are placed in Metadata.
 func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {

@@ -132,6 +132,7 @@ All required fields are validated at startup. The daemon will fail to start with
 | `key_name` | Key name for signing transactions |
 | `backends` | At least one backend must be configured |
 | `callback_base_url` | URL where backends send callbacks (must be absolute http/https URL) |
+| `callback_secret` | Shared secret for HMAC callback authentication (minimum 32 characters) |
 
 ### Backend Configuration
 
@@ -151,6 +152,7 @@ backends:
     sku_prefix: "gpu-"
 
 callback_base_url: "http://fred.provider.example.com:8080"
+callback_secret: "your-32-character-or-longer-secret-here"
 ```
 
 **Validation rules:**
@@ -178,6 +180,7 @@ callback_base_url: "http://fred.provider.example.com:8080"
 | `rate_limit_burst` | Rate limit burst size | `20` |
 | `backends` | List of backend configurations | (required) |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
+| `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
 
 ### TLS Configuration
 
@@ -278,9 +281,13 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 ```
 POST /callbacks/provision
 Content-Type: application/json
+X-Fred-Signature: sha256=<hmac-sha256-hex>
 ```
 
-Called by backends to report provisioning status.
+Called by backends to report provisioning status. Requires HMAC-SHA256 authentication.
+
+**Authentication:**
+The `X-Fred-Signature` header must contain an HMAC-SHA256 signature of the request body, using the shared `callback_secret`. Format: `sha256=<hex-encoded-signature>`.
 
 **Request:**
 ```json
@@ -292,6 +299,10 @@ Called by backends to report provisioning status.
 ```
 
 Status must be either `"success"` or `"failed"`.
+
+**Response Codes:**
+- `200 OK` - Callback processed successfully
+- `401 Unauthorized` - Missing or invalid signature
 
 ## Backend API Specification
 
@@ -381,11 +392,15 @@ The mock backend allows you to test fred's provisioning flow without a real back
 # Build mock-backend
 make build-mock
 
-# Run with default settings (port 9000)
-./build/mock-backend
+# Run with required callback secret
+MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" ./build/mock-backend
 
 # Or with custom settings
-MOCK_BACKEND_ADDR=:9001 MOCK_BACKEND_NAME=test-backend MOCK_BACKEND_DELAY=2s ./build/mock-backend
+MOCK_BACKEND_ADDR=:9001 \
+MOCK_BACKEND_NAME=test-backend \
+MOCK_BACKEND_DELAY=2s \
+MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
+./build/mock-backend
 ```
 
 **Environment Variables:**
@@ -396,6 +411,7 @@ MOCK_BACKEND_ADDR=:9001 MOCK_BACKEND_NAME=test-backend MOCK_BACKEND_DELAY=2s ./b
 | `MOCK_BACKEND_NAME` | Backend name (in responses) | `mock-backend` |
 | `MOCK_BACKEND_DELAY` | Simulated provisioning delay | `0s` |
 | `MOCK_BACKEND_TLS_SKIP_VERIFY` | Skip TLS verification for callbacks (use `true` for self-signed certs) | `false` |
+| `MOCK_BACKEND_CALLBACK_SECRET` | HMAC secret for signing callbacks (required, min 32 chars) | (required) |
 
 **Note:** The mock backend stores callback URLs per lease UUID, so concurrent provisions with different callback URLs are handled correctly without race conditions.
 
@@ -424,6 +440,7 @@ backends:
     default: true
 
 callback_base_url: "http://localhost:8080"
+callback_secret: "test-secret-at-least-32-characters-long"
 ```
 
 ### 3. Run Fred
@@ -483,6 +500,7 @@ services:
     environment:
       - MOCK_BACKEND_ADDR=:9000
       - MOCK_BACKEND_DELAY=1s
+      - MOCK_BACKEND_CALLBACK_SECRET=shared-secret-at-least-32-characters
     ports:
       - "9000:9000"
 
@@ -494,6 +512,7 @@ services:
       - PROVIDER_PROVIDER_UUID=01234567-89ab-cdef-0123-456789abcdef
       - PROVIDER_API_LISTEN_ADDR=:8080
       - PROVIDER_CALLBACK_BASE_URL=http://fred:8080
+      - PROVIDER_CALLBACK_SECRET=shared-secret-at-least-32-characters
     ports:
       - "8080:8080"
     depends_on:
@@ -534,6 +553,7 @@ internal/
 - **TLS Support**: Optional HTTPS for API and TLS for gRPC
 - **ADR-036 Authentication**: Cryptographic signature verification for tenant access
 - **Token Expiry**: 5-minute validity window on authentication tokens
+- **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
 
 ## Dependencies
 

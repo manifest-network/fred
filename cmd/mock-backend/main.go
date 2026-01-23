@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -72,11 +75,23 @@ func main() {
 		}
 	}
 
+	// Get callback secret for signing
+	callbackSecret := os.Getenv("MOCK_BACKEND_CALLBACK_SECRET")
+	if callbackSecret == "" {
+		slog.Error("MOCK_BACKEND_CALLBACK_SECRET is required for callback authentication")
+		os.Exit(1)
+	}
+	if len(callbackSecret) < 32 {
+		slog.Error("MOCK_BACKEND_CALLBACK_SECRET must be at least 32 characters")
+		os.Exit(1)
+	}
+
 	// Create HTTP server
 	server := &MockBackendServer{
-		backend:      mockBackend,
-		httpClient:   httpClient,
-		callbackURLs: make(map[string]string),
+		backend:        mockBackend,
+		httpClient:     httpClient,
+		callbackSecret: callbackSecret,
+		callbackURLs:   make(map[string]string),
 	}
 
 	// Set up a single callback function that routes by lease UUID
@@ -128,8 +143,9 @@ func main() {
 
 // MockBackendServer wraps the mock backend with HTTP handlers.
 type MockBackendServer struct {
-	backend    *backend.MockBackend
-	httpClient *http.Client
+	backend        *backend.MockBackend
+	httpClient     *http.Client
+	callbackSecret string // HMAC secret for signing callbacks
 
 	// Per-lease callback URLs to avoid race conditions with concurrent provisions
 	callbackURLs   map[string]string
@@ -267,6 +283,9 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 		return
 	}
 
+	// Compute HMAC signature
+	signature := s.computeSignature(body)
+
 	slog.Info("sending callback",
 		"url", callbackURL,
 		"lease_uuid", payload.LeaseUUID,
@@ -279,6 +298,7 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Fred-Signature", signature)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -293,4 +313,11 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 	}
 
 	slog.Info("callback sent successfully", "lease_uuid", payload.LeaseUUID)
+}
+
+// computeSignature computes the HMAC-SHA256 signature for a payload.
+func (s *MockBackendServer) computeSignature(payload []byte) string {
+	mac := hmac.New(sha256.New, []byte(s.callbackSecret))
+	mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }

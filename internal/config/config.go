@@ -66,6 +66,7 @@ type Config struct {
 	// Backend configuration
 	Backends        []BackendConfig `mapstructure:"backends"`
 	CallbackBaseURL string          `mapstructure:"callback_base_url"`
+	CallbackSecret  string          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
 }
 
 // BackendConfig configures a single provisioning backend.
@@ -306,6 +307,14 @@ func (c *Config) Validate() error {
 	}
 	// Normalize: strip trailing slashes to avoid double slashes when joining paths
 	c.CallbackBaseURL = strings.TrimRight(c.CallbackBaseURL, "/")
+
+	// callback_secret is required for callback authentication (HMAC)
+	if c.CallbackSecret == "" {
+		return fmt.Errorf("callback_secret is required for callback authentication")
+	}
+	if len(c.CallbackSecret) < 32 {
+		return fmt.Errorf("callback_secret must be at least 32 characters")
+	}
 
 	return nil
 }

@@ -194,6 +194,7 @@ func run(cmd *cobra.Command, args []string) error {
 		WriteTimeout:       cfg.HTTPWriteTimeout,
 		IdleTimeout:        cfg.HTTPIdleTimeout,
 		MaxRequestBodySize: cfg.MaxRequestBodySize,
+		CallbackSecret:     cfg.CallbackSecret,
 	}, chainClient, backendRouter, provisionMgr)
 
 	// Initialize withdrawal scheduler

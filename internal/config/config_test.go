@@ -149,6 +149,7 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		CreditCheckRetryInterval:  30 * time.Second,
 		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 		CallbackBaseURL:           "http://localhost:8080",
+		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -195,6 +196,87 @@ func TestConfig_Validate_NoBackends(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_CallbackSecret(t *testing.T) {
+	baseConfig := func() Config {
+		return Config{
+			ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+			ProviderAddress:           "manifest1abc",
+			KeyName:                   "provider",
+			KeyringDir:                "/home/provider/.manifest",
+			Bech32Prefix:              "manifest",
+			WithdrawInterval:          time.Hour,
+			RateLimitRPS:              10,
+			RateLimitBurst:            20,
+			GasLimit:                  500000,
+			GasPrice:                  25,
+			FeeDenom:                  "umfx",
+			HTTPReadTimeout:           15 * time.Second,
+			HTTPWriteTimeout:          15 * time.Second,
+			HTTPIdleTimeout:           60 * time.Second,
+			WebSocketPingInterval:     30 * time.Second,
+			TxPollInterval:            500 * time.Millisecond,
+			TxTimeout:                 30 * time.Second,
+			QueryPageLimit:            100,
+			MaxWithdrawIterations:     100,
+			WebSocketReconnectInitial: time.Second,
+			WebSocketReconnectMax:     60 * time.Second,
+			MaxRequestBodySize:        1 << 20,
+			CreditCheckErrorThreshold: 3,
+			CreditCheckRetryInterval:  30 * time.Second,
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://localhost:8080",
+		}
+	}
+
+	tests := []struct {
+		name           string
+		callbackSecret string
+		wantErr        string
+	}{
+		{
+			name:           "missing callback_secret",
+			callbackSecret: "",
+			wantErr:        "callback_secret is required",
+		},
+		{
+			name:           "callback_secret too short",
+			callbackSecret: "short",
+			wantErr:        "callback_secret must be at least 32 characters",
+		},
+		{
+			name:           "callback_secret exactly 32 chars",
+			callbackSecret: "12345678901234567890123456789012",
+			wantErr:        "", // should pass
+		},
+		{
+			name:           "valid callback_secret",
+			callbackSecret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			wantErr:        "", // should pass
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.CallbackSecret = tt.callbackSecret
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
+				return
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestConfig_Validate_NumericFields(t *testing.T) {
 	baseConfig := func() Config {
 		return Config{
@@ -224,6 +306,7 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			CreditCheckRetryInterval:  30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
 
@@ -342,6 +425,7 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			CreditCheckRetryInterval:  30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
 
@@ -438,6 +522,7 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			CreditCheckRetryInterval:  30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
 
@@ -547,6 +632,7 @@ provider_address: "manifest1abc"
 key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -600,6 +686,7 @@ keyring_dir: "/home/provider/.manifest"
 chain_id: "test-chain-1"
 rate_limit_rps: 50
 callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -649,6 +736,7 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			MaxRequestBodySize:        1 << 20,
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
 
@@ -772,6 +860,7 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			MaxRequestBodySize:        1 << 20,
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
 
@@ -834,6 +923,7 @@ keyring_dir: "/file/keyring"
 bech32_prefix: "manifest"
 rate_limit_rps: 100
 callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
 backends:
   - name: "mock"
     url: "http://localhost:9000"

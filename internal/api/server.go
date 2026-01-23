@@ -26,14 +26,15 @@ type CallbackPublisher interface {
 
 // Server is the HTTP API server.
 type Server struct {
-	addr              string
-	server            *http.Server
-	handlers          *Handlers
-	providerUUID      string
-	tlsCertFile       string
-	tlsKeyFile        string
-	rateLimiter       *RateLimiter
-	callbackPublisher CallbackPublisher
+	addr                  string
+	server                *http.Server
+	handlers              *Handlers
+	providerUUID          string
+	tlsCertFile           string
+	tlsKeyFile            string
+	rateLimiter           *RateLimiter
+	callbackPublisher     CallbackPublisher
+	callbackAuthenticator *CallbackAuthenticator
 }
 
 // ServerConfig holds configuration for the API server.
@@ -49,6 +50,7 @@ type ServerConfig struct {
 	WriteTimeout       time.Duration
 	IdleTimeout        time.Duration
 	MaxRequestBodySize int64
+	CallbackSecret     string // HMAC secret for callback authentication
 }
 
 // NewServer creates a new API server.
@@ -62,16 +64,23 @@ func NewServer(cfg ServerConfig, client *chain.Client, backendRouter *backend.Ro
 		maxBodySize = config.DefaultMaxRequestBodySize
 	}
 
+	// Create callback authenticator if secret is provided
+	var callbackAuth *CallbackAuthenticator
+	if cfg.CallbackSecret != "" {
+		callbackAuth = NewCallbackAuthenticator(cfg.CallbackSecret)
+	}
+
 	router := mux.NewRouter()
 
 	s := &Server{
-		addr:              cfg.Addr,
-		handlers:          handlers,
-		providerUUID:      cfg.ProviderUUID,
-		tlsCertFile:       cfg.TLSCertFile,
-		tlsKeyFile:        cfg.TLSKeyFile,
-		rateLimiter:       rateLimiter,
-		callbackPublisher: callbackPublisher,
+		addr:                  cfg.Addr,
+		handlers:              handlers,
+		providerUUID:          cfg.ProviderUUID,
+		tlsCertFile:           cfg.TLSCertFile,
+		tlsKeyFile:            cfg.TLSKeyFile,
+		rateLimiter:           rateLimiter,
+		callbackPublisher:     callbackPublisher,
+		callbackAuthenticator: callbackAuth,
 	}
 
 	// Register routes
@@ -103,8 +112,25 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Verify callback authentication
+	if s.callbackAuthenticator == nil {
+		slog.Error("callback authenticator not configured")
+		writeError(w, "service not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	body, err := s.callbackAuthenticator.VerifyRequest(r)
+	if err != nil {
+		slog.Warn("callback authentication failed",
+			"error", err,
+			"remote_addr", r.RemoteAddr,
+		)
+		writeError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var callback backend.CallbackPayload
-	if err := decodeJSON(r, &callback); err != nil {
+	if err := decodeJSONBytes(body, &callback); err != nil {
 		slog.Warn("invalid callback payload", "error", err)
 		writeError(w, "invalid request body", http.StatusBadRequest)
 		return
