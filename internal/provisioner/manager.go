@@ -102,6 +102,25 @@ func (m *Manager) TrackInFlight(leaseUUID, tenant, sku, backendName string) {
 	}
 }
 
+// TryTrackInFlight atomically checks if a lease is already in-flight and tracks it if not.
+// Returns true if the lease was successfully tracked (was not already in-flight),
+// false if the lease was already being provisioned.
+// This prevents TOCTOU races between checking and tracking.
+func (m *Manager) TryTrackInFlight(leaseUUID, tenant, sku, backendName string) bool {
+	m.inFlightMu.Lock()
+	defer m.inFlightMu.Unlock()
+	if _, exists := m.inFlight[leaseUUID]; exists {
+		return false
+	}
+	m.inFlight[leaseUUID] = inFlightProvision{
+		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
+		SKU:       sku,
+		Backend:   backendName,
+	}
+	return true
+}
+
 // UntrackInFlight removes a lease from the in-flight tracking.
 func (m *Manager) UntrackInFlight(leaseUUID string) {
 	m.inFlightMu.Lock()
@@ -310,9 +329,15 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
 	}
 
-	// Track in-flight BEFORE calling Provision to prevent race condition:
-	// If backend responds synchronously, callback could arrive before tracking.
-	m.TrackInFlight(event.LeaseUUID, event.Tenant, "", backendClient.Name())
+	// Atomically track in-flight BEFORE calling Provision to prevent:
+	// 1. Race with reconciler (TOCTOU between IsInFlight check and TrackInFlight)
+	// 2. Race with fast backend response (callback arriving before tracking)
+	if !m.TryTrackInFlight(event.LeaseUUID, event.Tenant, "", backendClient.Name()) {
+		slog.Debug("lease already in-flight, skipping",
+			"lease_uuid", event.LeaseUUID,
+		)
+		return nil
+	}
 
 	// Start provisioning (async - backend will call back)
 	err := backendClient.Provision(msg.Context(), backend.ProvisionRequest{
@@ -444,9 +469,8 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 				// This can happen if we received a duplicate callback or the reconciler
 				// already acknowledged it. Treat as success - the lease is active.
 				m.UntrackInFlight(callback.LeaseUUID)
-				slog.Info("lease already acknowledged or not pending, treating as success",
+				slog.Info("lease already acknowledged, skipping",
 					"lease_uuid", callback.LeaseUUID,
-					"error", err,
 				)
 				return nil
 			}

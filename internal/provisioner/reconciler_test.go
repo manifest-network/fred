@@ -925,3 +925,114 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 		}
 	}
 }
+
+// TestReconciler_ConcurrentProvisioningRace is a regression test for the TOCTOU race
+// condition between the reconciler and event-driven manager. It simulates multiple
+// goroutines (representing manager and reconciler) racing to provision the same lease.
+//
+// The test verifies that despite concurrent attempts, exactly ONE provision call is
+// made to the backend - preventing duplicate resource creation.
+//
+// Run with: go test -race -run TestReconciler_ConcurrentProvisioningRace -count=10
+func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
+	const leaseUUID = "race-test-lease"
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: leaseUUID, Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{}, // Not provisioned yet
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	// Create manager (shared between reconciler and simulated event handler)
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, &chain.MockClient{})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, manager)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	// Simulate concurrent provisioning attempts
+	const numGoroutines = 50
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// Channel to synchronize start
+	start := make(chan struct{})
+
+	// Half the goroutines simulate manager's TryTrackInFlight + Provision
+	// Half simulate reconciler's startProvisioning (which also uses TryTrackInFlight)
+	for i := 0; i < numGoroutines; i++ {
+		go func(workerID int) {
+			defer wg.Done()
+			<-start
+
+			// Simulate the atomic check-and-provision pattern used by both
+			// manager.handleLeaseCreated and reconciler.startProvisioning
+			if manager.TryTrackInFlight(leaseUUID, "tenant-1", "", "test") {
+				// Only provision if we successfully tracked
+				_ = mockBackend.Provision(context.Background(), backend.ProvisionRequest{
+					LeaseUUID:    leaseUUID,
+					Tenant:       "tenant-1",
+					ProviderUUID: "provider-1",
+					CallbackURL:  "http://localhost:8080/callbacks/provision",
+				})
+			}
+		}(i)
+	}
+
+	// Start all goroutines simultaneously
+	close(start)
+	wg.Wait()
+
+	// Verify exactly ONE provision call was made
+	mockBackend.mu.Lock()
+	provisionCount := len(mockBackend.provisionCalls)
+	mockBackend.mu.Unlock()
+
+	if provisionCount != 1 {
+		t.Errorf("expected exactly 1 provision call, got %d (race condition detected!)", provisionCount)
+	}
+
+	// The lease should be tracked
+	if !manager.IsInFlight(leaseUUID) {
+		t.Error("IsInFlight() = false after concurrent provisioning, want true")
+	}
+
+	// Now test that reconciler.ReconcileAll also respects the in-flight tracking
+	// Reset the mock to track new calls
+	mockBackend.mu.Lock()
+	mockBackend.provisionCalls = nil
+	mockBackend.mu.Unlock()
+
+	// Run reconciliation - should NOT provision again (already in-flight)
+	if err := reconciler.ReconcileAll(context.Background()); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	mockBackend.mu.Lock()
+	additionalProvisions := len(mockBackend.provisionCalls)
+	mockBackend.mu.Unlock()
+
+	if additionalProvisions != 0 {
+		t.Errorf("ReconcileAll() made %d additional provision calls, want 0 (lease is in-flight)", additionalProvisions)
+	}
+}

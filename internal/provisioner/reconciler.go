@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -12,6 +13,10 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 )
+
+// errLeaseAlreadyInFlight indicates the lease is already being provisioned.
+// This is not a real error - the caller should not treat it as a failure.
+var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
 
 // ReconcilerChainClient defines the chain operations needed by the reconciler.
 type ReconcilerChainClient interface {
@@ -165,20 +170,21 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 
 		switch {
 		case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:
-			// Check if already being provisioned by the event-driven path
-			if r.manager != nil && r.manager.IsInFlight(leaseUUID) {
-				slog.Debug("reconcile: lease already in-flight, skipping",
-					"lease_uuid", leaseUUID,
-				)
-				continue
-			}
 			// TODO(phase-4): Check for meta_hash and await payload upload
 			// before starting provisioning. For now, start immediately.
 			if err := r.startProvisioning(ctx, lease); err != nil {
-				slog.Error("reconcile: failed to start provisioning",
-					"lease_uuid", leaseUUID,
-					"error", err,
-				)
+				// errLeaseAlreadyInFlight is not a real error - the event-driven
+				// path is handling this lease, so we just skip it.
+				if errors.Is(err, errLeaseAlreadyInFlight) {
+					slog.Debug("reconcile: lease already in-flight, skipping",
+						"lease_uuid", leaseUUID,
+					)
+				} else {
+					slog.Error("reconcile: failed to start provisioning",
+						"lease_uuid", leaseUUID,
+						"error", err,
+					)
+				}
 			} else {
 				provisioned++
 			}
@@ -218,10 +224,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 			anomalies++
 			// Attempt to provision
 			if err := r.startProvisioning(ctx, lease); err != nil {
-				slog.Error("reconcile: failed to provision anomalous lease",
-					"lease_uuid", leaseUUID,
-					"error", err,
-				)
+				if !errors.Is(err, errLeaseAlreadyInFlight) {
+					slog.Error("reconcile: failed to provision anomalous lease",
+						"lease_uuid", leaseUUID,
+						"error", err,
+					)
+				}
 			}
 
 		case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned:
@@ -285,6 +293,8 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 }
 
 // startProvisioning initiates provisioning for a lease.
+// Returns errLeaseAlreadyInFlight if the lease is already being provisioned by
+// the event-driven path (this is not a real error, just a signal to skip).
 func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.Lease) error {
 	// TODO(phase-3): Use SKU-based routing when implemented
 	// backendClient := r.backendRouter.Route(lease.Sku)
@@ -293,11 +303,14 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 		return fmt.Errorf("no backend available")
 	}
 
-	// Track in manager's in-flight map if manager is available
-	// This allows the manager to handle callbacks for this lease
+	// Atomically track in manager's in-flight map if manager is available.
+	// This prevents TOCTOU race between the reconciler and event-driven path:
+	// both may try to provision the same lease concurrently.
 	if r.manager != nil {
 		// TODO(phase-3): Extract SKU from lease.Items for routing
-		r.manager.TrackInFlight(lease.Uuid, lease.Tenant, "", backendClient.Name())
+		if !r.manager.TryTrackInFlight(lease.Uuid, lease.Tenant, "", backendClient.Name()) {
+			return errLeaseAlreadyInFlight
+		}
 	}
 
 	err := backendClient.Provision(ctx, backend.ProvisionRequest{

@@ -186,6 +186,119 @@ func TestManager_InFlightTracking(t *testing.T) {
 	}
 }
 
+func TestManager_TryTrackInFlight(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// First attempt should succeed
+	if !manager.TryTrackInFlight("lease-1", "tenant-1", "sku-1", "test-backend") {
+		t.Error("TryTrackInFlight() first call = false, want true")
+	}
+
+	// Verify it was tracked
+	if !manager.IsInFlight("lease-1") {
+		t.Error("IsInFlight() = false after TryTrackInFlight, want true")
+	}
+
+	// Second attempt for same lease should fail (already tracked)
+	if manager.TryTrackInFlight("lease-1", "tenant-2", "sku-2", "other-backend") {
+		t.Error("TryTrackInFlight() second call = true, want false")
+	}
+
+	// Original tracking data should be preserved
+	provision, exists := manager.GetInFlight("lease-1")
+	if !exists {
+		t.Fatal("GetInFlight() exists = false, want true")
+	}
+	if provision.Tenant != "tenant-1" {
+		t.Errorf("GetInFlight() Tenant = %q, want %q (original data should be preserved)", provision.Tenant, "tenant-1")
+	}
+
+	// Different lease should succeed
+	if !manager.TryTrackInFlight("lease-2", "tenant-2", "sku-2", "test-backend") {
+		t.Error("TryTrackInFlight() for different lease = false, want true")
+	}
+}
+
+// TestManager_TryTrackInFlight_RaceCondition is a regression test for the TOCTOU
+// race condition between the reconciler and event-driven manager. It verifies that
+// when multiple goroutines concurrently try to track the same lease, exactly one
+// succeeds and the rest fail atomically.
+//
+// Run with: go test -race -run TestManager_TryTrackInFlight_RaceCondition
+func TestManager_TryTrackInFlight_RaceCondition(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	const numGoroutines = 100
+	const leaseUUID = "race-test-lease"
+
+	// Track how many goroutines successfully tracked the lease
+	var successCount int
+	var mu sync.Mutex
+
+	// Use a WaitGroup to synchronize goroutine completion
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// Use a channel to synchronize goroutine start (maximize contention)
+	start := make(chan struct{})
+
+	for i := 0; i < numGoroutines; i++ {
+		go func(workerID int) {
+			defer wg.Done()
+
+			// Wait for signal to start (all goroutines start at once)
+			<-start
+
+			// Try to track the lease
+			if manager.TryTrackInFlight(leaseUUID, "tenant", "sku", "backend") {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	// Start all goroutines simultaneously
+	close(start)
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Exactly one goroutine should have succeeded
+	if successCount != 1 {
+		t.Errorf("TryTrackInFlight() success count = %d, want exactly 1", successCount)
+	}
+
+	// The lease should be tracked
+	if !manager.IsInFlight(leaseUUID) {
+		t.Error("IsInFlight() = false after race test, want true")
+	}
+}
+
 func TestManager_PopInFlight(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
