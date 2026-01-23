@@ -1,78 +1,41 @@
 package api
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/gorilla/mux"
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
-	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
 )
 
-const (
-	// maxInstanceID is the upper bound for generated instance IDs.
-	maxInstanceID = 10000
-)
-
-// Connection property lists for deterministic generation
-var (
-	hostnames = []string{
-		"compute-alpha.example.com",
-		"compute-beta.example.com",
-		"compute-gamma.example.com",
-		"compute-delta.example.com",
-		"node-east.example.com",
-		"node-west.example.com",
-		"node-central.example.com",
-		"worker-1.example.com",
-		"worker-2.example.com",
-		"worker-3.example.com",
-	}
-
-	ports = []int{8443, 9443, 10443, 11443, 12443, 8080, 9090, 3000, 5000, 6000}
-
-	protocols = []string{"https", "grpc", "wss"}
-
-	regions = []string{
-		"us-east-1",
-		"us-west-2",
-		"eu-west-1",
-		"eu-central-1",
-		"ap-southeast-1",
-		"ap-northeast-1",
-	}
-
-	tiers = []string{"standard", "premium", "dedicated"}
-)
-
-func init() {
-	// Validate connection property slices are non-empty to prevent runtime panics
-	if len(hostnames) == 0 || len(ports) == 0 || len(protocols) == 0 ||
-		len(regions) == 0 || len(tiers) == 0 {
-		panic("connection property slices must not be empty")
-	}
+// ChainClient defines the chain operations needed by handlers.
+type ChainClient interface {
+	GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
+	Ping(ctx context.Context) error
 }
 
 // Handlers contains HTTP request handlers.
 type Handlers struct {
-	client       *chain.Client
-	providerUUID string
-	bech32Prefix string
+	client        ChainClient
+	backendRouter *backend.Router
+	providerUUID  string
+	bech32Prefix  string
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(client *chain.Client, providerUUID, bech32Prefix string) *Handlers {
+func NewHandlers(client ChainClient, backendRouter *backend.Router, providerUUID, bech32Prefix string) *Handlers {
 	return &Handlers{
-		client:       client,
-		providerUUID: providerUUID,
-		bech32Prefix: bech32Prefix,
+		client:        client,
+		backendRouter: backendRouter,
+		providerUUID:  providerUUID,
+		bech32Prefix:  bech32Prefix,
 	}
 }
 
@@ -169,19 +132,43 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate deterministic connection details based on lease UUID
-	connection := generateConnectionDetails(leaseUUID)
+	// Check if backend router is configured
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, "service not configured", http.StatusServiceUnavailable)
+		return
+	}
 
+	// Get lease info from backend
+	// TODO(phase-2): Implement SKU-based routing.
+	// Currently we always use the default backend. To route by SKU prefix,
+	// we should call h.backendRouter.Route(lease.Sku). For now, tenants whose
+	// leases were provisioned on a non-default backend may get 404/incorrect info.
+	backendClient := h.backendRouter.Default()
+	info, err := backendClient.GetInfo(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			slog.Warn("lease not yet provisioned", "lease_uuid", leaseUUID)
+			writeError(w, "lease not yet provisioned", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to get info from backend", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Build response with lease info from backend
 	response := ConnectionResponse{
 		LeaseUUID:    leaseUUID,
 		Tenant:       lease.Tenant,
 		ProviderUUID: h.providerUUID,
-		Connection:   connection,
+		Connection:   extractConnectionDetails(*info),
 	}
 
-	slog.Info("connection details served",
+	slog.Info("lease info served",
 		"lease_uuid", leaseUUID,
 		"tenant", token.Tenant,
+		"backend", backendClient.Name(),
 	)
 
 	writeJSON(w, response, http.StatusOK)
@@ -269,37 +256,73 @@ func writeError(w http.ResponseWriter, message string, status int) {
 	writeJSON(w, response, status)
 }
 
+// decodeJSON decodes a JSON request body.
+func decodeJSON(r *http.Request, v interface{}) error {
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// decodeJSONBytes decodes JSON from a byte slice.
+func decodeJSONBytes(data []byte, v interface{}) error {
+	return json.Unmarshal(data, v)
+}
+
+// extractConnectionDetails extracts ConnectionDetails from a backend LeaseInfo map.
+// Known fields (host, port, protocol, metadata) are mapped to struct fields.
+// Unknown top-level string fields are placed in Metadata.
+func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
+	details := ConnectionDetails{
+		Metadata: make(map[string]string),
+	}
+
+	// Known fields that map to struct fields
+	knownFields := map[string]bool{
+		"host":     true,
+		"port":     true,
+		"protocol": true,
+		"metadata": true,
+	}
+
+	// Extract known fields
+	if host, ok := info["host"].(string); ok {
+		details.Host = host
+	}
+	if port, ok := info["port"].(float64); ok {
+		details.Port = int(port)
+	} else if port, ok := info["port"].(int); ok {
+		details.Port = port
+	}
+	if protocol, ok := info["protocol"].(string); ok {
+		details.Protocol = protocol
+	}
+
+	// Extract explicit metadata field first
+	if metadata, ok := info["metadata"].(map[string]string); ok {
+		for k, v := range metadata {
+			details.Metadata[k] = v
+		}
+	} else if metadata, ok := info["metadata"].(map[string]any); ok {
+		for k, v := range metadata {
+			if s, ok := v.(string); ok {
+				details.Metadata[k] = s
+			}
+		}
+	}
+
+	// Add unknown top-level string fields to Metadata
+	for k, v := range info {
+		if knownFields[k] {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			details.Metadata[k] = s
+		}
+	}
+
+	return details
+}
+
 // Sentinel errors for authentication (unexported - internal to package)
 var (
 	errMissingAuth       = errors.New("missing authorization header")
 	errInvalidAuthFormat = errors.New("invalid authorization format, expected 'Bearer <token>'")
 )
-
-// generateConnectionDetails creates deterministic connection details from a lease UUID.
-// The same UUID always produces the same connection details.
-func generateConnectionDetails(leaseUUID string) ConnectionDetails {
-	// Hash the UUID to get deterministic random bytes
-	hash := sha256.Sum256([]byte(leaseUUID))
-
-	// Use different parts of the hash to select from each list
-	hostIdx := int(binary.BigEndian.Uint32(hash[0:4])) % len(hostnames)
-	portIdx := int(binary.BigEndian.Uint32(hash[4:8])) % len(ports)
-	protoIdx := int(binary.BigEndian.Uint32(hash[8:12])) % len(protocols)
-	regionIdx := int(binary.BigEndian.Uint32(hash[12:16])) % len(regions)
-	tierIdx := int(binary.BigEndian.Uint32(hash[16:20])) % len(tiers)
-
-	// Generate a deterministic instance ID from the hash
-	instanceID := binary.BigEndian.Uint32(hash[20:24]) % maxInstanceID
-
-	return ConnectionDetails{
-		Host:     hostnames[hostIdx],
-		Port:     ports[portIdx],
-		Protocol: protocols[protoIdx],
-		Metadata: map[string]string{
-			"region":      regions[regionIdx],
-			"tier":        tiers[tierIdx],
-			"instance_id": fmt.Sprintf("i-%04d", instanceID),
-			"status":      "connected",
-		},
-	}
-}

@@ -1,12 +1,18 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"testing"
+	"time"
 
+	"github.com/gorilla/mux"
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -41,77 +47,6 @@ func TestHealthCheck(t *testing.T) {
 	// Check Content-Type header
 	if rec.Header().Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type = %q, want %q", rec.Header().Get("Content-Type"), "application/json")
-	}
-}
-
-func TestGenerateConnectionDetails_Deterministic(t *testing.T) {
-	uuid := testutil.ValidUUID1
-
-	// Generate multiple times
-	conn1 := generateConnectionDetails(uuid)
-	conn2 := generateConnectionDetails(uuid)
-	conn3 := generateConnectionDetails(uuid)
-
-	// All should be identical
-	if conn1.Host != conn2.Host || conn2.Host != conn3.Host {
-		t.Error("generateConnectionDetails() is not deterministic for Host")
-	}
-	if conn1.Port != conn2.Port || conn2.Port != conn3.Port {
-		t.Error("generateConnectionDetails() is not deterministic for Port")
-	}
-	if conn1.Protocol != conn2.Protocol || conn2.Protocol != conn3.Protocol {
-		t.Error("generateConnectionDetails() is not deterministic for Protocol")
-	}
-	if conn1.Metadata["region"] != conn2.Metadata["region"] {
-		t.Error("generateConnectionDetails() is not deterministic for Metadata")
-	}
-}
-
-func TestGenerateConnectionDetails_DifferentUUIDs(t *testing.T) {
-	conn1 := generateConnectionDetails(testutil.ValidUUID1)
-	conn2 := generateConnectionDetails(testutil.ValidUUID2)
-	conn3 := generateConnectionDetails(testutil.ValidUUID3)
-
-	// Different UUIDs should (likely) produce different results
-	// Note: There's a small chance of collision, but with different UUIDs it's unlikely
-	allSame := conn1.Host == conn2.Host && conn2.Host == conn3.Host &&
-		conn1.Port == conn2.Port && conn2.Port == conn3.Port
-
-	if allSame {
-		t.Log("Warning: All three different UUIDs produced identical connection details (unlikely but possible)")
-	}
-}
-
-func TestGenerateConnectionDetails_ValidOutput(t *testing.T) {
-	conn := generateConnectionDetails(testutil.ValidUUID1)
-
-	// Verify host is from the list
-	if !slices.Contains(hostnames, conn.Host) {
-		t.Errorf("Host %q is not in valid hostnames list", conn.Host)
-	}
-
-	// Verify port is from the list
-	if !slices.Contains(ports, conn.Port) {
-		t.Errorf("Port %d is not in valid ports list", conn.Port)
-	}
-
-	// Verify protocol is from the list
-	if !slices.Contains(protocols, conn.Protocol) {
-		t.Errorf("Protocol %q is not in valid protocols list", conn.Protocol)
-	}
-
-	// Verify metadata fields exist
-	if conn.Metadata["region"] == "" {
-		t.Error("Metadata region is empty")
-	}
-	if conn.Metadata["tier"] == "" {
-		t.Error("Metadata tier is empty")
-	}
-	if conn.Metadata["instance_id"] == "" {
-		t.Error("Metadata instance_id is empty")
-	}
-	if conn.Metadata["status"] != "connected" {
-		t.Errorf("Metadata status = %q, want %q", conn.Metadata["status"], "connected")
 	}
 }
 
@@ -278,4 +213,576 @@ func TestConnectionResponse_JSON(t *testing.T) {
 	if decoded.Connection.Host != response.Connection.Host {
 		t.Errorf("Connection.Host = %q, want %q", decoded.Connection.Host, response.Connection.Host)
 	}
+}
+
+// mockChainClient implements ChainClient for testing.
+type mockChainClient struct {
+	getActiveLeaseFunc func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
+	pingFunc           func(ctx context.Context) error
+}
+
+func (m *mockChainClient) GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+	if m.getActiveLeaseFunc != nil {
+		return m.getActiveLeaseFunc(ctx, leaseUUID)
+	}
+	return nil, nil
+}
+
+func (m *mockChainClient) Ping(ctx context.Context) error {
+	if m.pingFunc != nil {
+		return m.pingFunc(ctx)
+	}
+	return nil
+}
+
+// TestGetLeaseConnection_BackendIntegration tests the backend integration path
+// in GetLeaseConnection using httptest.Server and a real backend.Router.
+func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
+	// Create a test key pair for signing tokens
+	kp := testutil.NewTestKeyPair("test-tenant")
+
+	// Test lease details
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	// Create a valid auth token
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	// Mock chain client that returns an active lease
+	chainClient := &mockChainClient{
+		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	t.Run("router_missing_returns_503", func(t *testing.T) {
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil, // No backend router configured
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+
+		var errResp ErrorResponse
+		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if errResp.Error != "service not configured" {
+			t.Errorf("error = %q, want %q", errResp.Error, "service not configured")
+		}
+	})
+
+	t.Run("not_provisioned_returns_404", func(t *testing.T) {
+		// Create backend server that returns 404 (not provisioned)
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/info/"+leaseUUID {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte("not found"))
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		// Create real backend client and router
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create router: %v", err)
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+
+		var errResp ErrorResponse
+		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if errResp.Error != "lease not yet provisioned" {
+			t.Errorf("error = %q, want %q", errResp.Error, "lease not yet provisioned")
+		}
+	})
+
+	t.Run("backend_error_returns_500", func(t *testing.T) {
+		// Create backend server that returns 500
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/info/"+leaseUUID {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("internal error"))
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create router: %v", err)
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+
+		var errResp ErrorResponse
+		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if errResp.Error != "internal server error" {
+			t.Errorf("error = %q, want %q", errResp.Error, "internal server error")
+		}
+	})
+
+	t.Run("happy_path_extracts_connection_details", func(t *testing.T) {
+		// Create backend server that returns valid lease info
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/info/"+leaseUUID && r.Method == "GET" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{
+					"host":     "compute-alpha.example.com",
+					"port":     8443,
+					"protocol": "https",
+					"metadata": map[string]any{
+						"region":  "us-east-1",
+						"backend": "test-backend",
+					},
+					"credentials": map[string]any{"token": "secret"}, // non-string map, ignored
+				})
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create router: %v", err)
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var response ConnectionResponse
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		// Verify response fields
+		if response.LeaseUUID != leaseUUID {
+			t.Errorf("LeaseUUID = %q, want %q", response.LeaseUUID, leaseUUID)
+		}
+		if response.Tenant != kp.Address {
+			t.Errorf("Tenant = %q, want %q", response.Tenant, kp.Address)
+		}
+		if response.ProviderUUID != providerUUID {
+			t.Errorf("ProviderUUID = %q, want %q", response.ProviderUUID, providerUUID)
+		}
+
+		// Verify connection details extraction
+		if response.Connection.Host != "compute-alpha.example.com" {
+			t.Errorf("Connection.Host = %q, want %q", response.Connection.Host, "compute-alpha.example.com")
+		}
+		if response.Connection.Port != 8443 {
+			t.Errorf("Connection.Port = %d, want %d", response.Connection.Port, 8443)
+		}
+		if response.Connection.Protocol != "https" {
+			t.Errorf("Connection.Protocol = %q, want %q", response.Connection.Protocol, "https")
+		}
+		if response.Connection.Metadata["region"] != "us-east-1" {
+			t.Errorf("Connection.Metadata[region] = %q, want %q", response.Connection.Metadata["region"], "us-east-1")
+		}
+		if response.Connection.Metadata["backend"] != "test-backend" {
+			t.Errorf("Connection.Metadata[backend] = %q, want %q", response.Connection.Metadata["backend"], "test-backend")
+		}
+	})
+
+	t.Run("happy_path_with_int_port", func(t *testing.T) {
+		// Test that integer ports (not float64 from JSON) are handled correctly
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/info/"+leaseUUID && r.Method == "GET" {
+				// Return raw JSON to ensure port comes as float64 from json.Unmarshal
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"host":"test.example.com","port":9000,"protocol":"grpc"}`))
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create router: %v", err)
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var response ConnectionResponse
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if response.Connection.Port != 9000 {
+			t.Errorf("Connection.Port = %d, want %d", response.Connection.Port, 9000)
+		}
+	})
+}
+
+// TestExtractConnectionDetails tests the extractConnectionDetails helper function.
+func TestExtractConnectionDetails(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    backend.LeaseInfo
+		expected ConnectionDetails
+	}{
+		{
+			name: "full info with string metadata",
+			input: backend.LeaseInfo{
+				"host":     "test.example.com",
+				"port":     float64(8080), // JSON numbers are float64
+				"protocol": "https",
+				"metadata": map[string]string{"key": "value"},
+			},
+			expected: ConnectionDetails{
+				Host:     "test.example.com",
+				Port:     8080,
+				Protocol: "https",
+				Metadata: map[string]string{"key": "value"},
+			},
+		},
+		{
+			name: "full info with any metadata",
+			input: backend.LeaseInfo{
+				"host":     "test.example.com",
+				"port":     float64(8080),
+				"protocol": "https",
+				"metadata": map[string]any{"key": "value", "number": 123},
+			},
+			expected: ConnectionDetails{
+				Host:     "test.example.com",
+				Port:     8080,
+				Protocol: "https",
+				Metadata: map[string]string{"key": "value"}, // non-string values filtered
+			},
+		},
+		{
+			name: "int port instead of float64",
+			input: backend.LeaseInfo{
+				"host": "test.example.com",
+				"port": 9000, // int instead of float64
+			},
+			expected: ConnectionDetails{
+				Host:     "test.example.com",
+				Port:     9000,
+				Metadata: map[string]string{},
+			},
+		},
+		{
+			name:  "empty info",
+			input: backend.LeaseInfo{},
+			expected: ConnectionDetails{
+				Metadata: map[string]string{},
+			},
+		},
+		{
+			name: "missing optional fields",
+			input: backend.LeaseInfo{
+				"host": "test.example.com",
+			},
+			expected: ConnectionDetails{
+				Host:     "test.example.com",
+				Metadata: map[string]string{},
+			},
+		},
+		{
+			name: "unknown string fields go to metadata",
+			input: backend.LeaseInfo{
+				"host":        "test.example.com",
+				"port":        float64(8080),
+				"region":      "us-east-1",
+				"backend":     "kubernetes",
+				"credentials": map[string]string{"token": "secret"}, // non-string, ignored
+			},
+			expected: ConnectionDetails{
+				Host:     "test.example.com",
+				Port:     8080,
+				Metadata: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
+			},
+		},
+		{
+			name: "unknown fields merged with explicit metadata",
+			input: backend.LeaseInfo{
+				"host":     "test.example.com",
+				"metadata": map[string]string{"key": "value"},
+				"region":   "us-west-2",
+			},
+			expected: ConnectionDetails{
+				Host:     "test.example.com",
+				Metadata: map[string]string{"key": "value", "region": "us-west-2"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractConnectionDetails(tt.input)
+
+			if result.Host != tt.expected.Host {
+				t.Errorf("Host = %q, want %q", result.Host, tt.expected.Host)
+			}
+			if result.Port != tt.expected.Port {
+				t.Errorf("Port = %d, want %d", result.Port, tt.expected.Port)
+			}
+			if result.Protocol != tt.expected.Protocol {
+				t.Errorf("Protocol = %q, want %q", result.Protocol, tt.expected.Protocol)
+			}
+			if len(result.Metadata) != len(tt.expected.Metadata) {
+				t.Errorf("Metadata length = %d, want %d", len(result.Metadata), len(tt.expected.Metadata))
+			}
+			for k, v := range tt.expected.Metadata {
+				if result.Metadata[k] != v {
+					t.Errorf("Metadata[%q] = %q, want %q", k, result.Metadata[k], v)
+				}
+			}
+		})
+	}
+}
+
+// TestGetLeaseConnection_ChainErrors tests chain-related error paths.
+func TestGetLeaseConnection_ChainErrors(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	t.Run("chain_error_returns_500", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return nil, fmt.Errorf("chain unavailable")
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("lease_not_found_returns_404", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return nil, nil // Lease not found
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("tenant_mismatch_returns_403", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       "manifest1different", // Different tenant
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
+
+	t.Run("provider_mismatch_returns_403", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: testutil.ValidUUID3, // Different provider
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
 }

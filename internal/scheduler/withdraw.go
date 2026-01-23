@@ -60,9 +60,13 @@ type WithdrawScheduler struct {
 	// nextCheckTime is dynamically adjusted based on estimated depletion times
 	nextCheckTime time.Time
 
-	// ctx is the context for the scheduler, set when Start() is called
+	// ctx is the context for the scheduler, protected by ctxMu
 	ctx    context.Context
 	cancel context.CancelFunc
+	ctxMu  sync.RWMutex
+
+	// wg tracks spawned goroutines for graceful shutdown
+	wg sync.WaitGroup
 }
 
 // WithdrawSchedulerConfig holds configuration for the withdrawal scheduler.
@@ -114,12 +118,21 @@ func (s *WithdrawScheduler) WithdrawOnce(ctx context.Context) {
 // Uses the scheduler's context so it can be cancelled on shutdown.
 func (s *WithdrawScheduler) TriggerWithdraw() {
 	slog.Info("withdrawal triggered by cross-provider credit depletion")
+
+	// Get context under read lock
+	s.ctxMu.RLock()
+	ctx := s.ctx
+	s.ctxMu.RUnlock()
+
+	// Use background context if scheduler hasn't started yet
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Track the goroutine for graceful shutdown
+	s.wg.Add(1)
 	go func() {
-		// Use the scheduler's context if available, otherwise use background
-		ctx := s.ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
+		defer s.wg.Done()
 		s.withdrawAndCheckCredits(ctx)
 	}()
 }
@@ -133,8 +146,10 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 		"interval", s.interval,
 	)
 
-	// Store context for use by TriggerWithdraw
+	// Store context for use by TriggerWithdraw (protected by mutex)
+	s.ctxMu.Lock()
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.ctxMu.Unlock()
 
 	// Set initial next check time
 	s.mu.Lock()
@@ -160,6 +175,8 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 				default:
 				}
 			}
+			// Wait for any TriggerWithdraw goroutines to complete
+			s.wg.Wait()
 			slog.Info("withdrawal scheduler stopped")
 			return ctx.Err()
 

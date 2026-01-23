@@ -72,8 +72,8 @@ func TestNewEventSubscriber(t *testing.T) {
 			if sub.reconnectMax != tt.wantMax {
 				t.Errorf("reconnectMax = %v, want %v", sub.reconnectMax, tt.wantMax)
 			}
-			if sub.events == nil {
-				t.Error("events channel is nil")
+			if sub.subscribers == nil {
+				t.Error("subscribers map is nil")
 			}
 			if sub.done == nil {
 				t.Error("done channel is nil")
@@ -82,7 +82,7 @@ func TestNewEventSubscriber(t *testing.T) {
 	}
 }
 
-func TestEventSubscriber_Events(t *testing.T) {
+func TestEventSubscriber_Subscribe(t *testing.T) {
 	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: "test-uuid",
@@ -91,10 +91,26 @@ func TestEventSubscriber_Events(t *testing.T) {
 		t.Fatalf("NewEventSubscriber() error = %v", err)
 	}
 
-	ch := sub.Events()
+	ch := sub.Subscribe()
 	if ch == nil {
-		t.Error("Events() returned nil channel")
+		t.Error("Subscribe() returned nil channel")
 	}
+
+	// Should be able to unsubscribe
+	sub.Unsubscribe(ch)
+
+	// Multiple subscriptions should work
+	ch1 := sub.Subscribe()
+	ch2 := sub.Subscribe()
+	if ch1 == nil || ch2 == nil {
+		t.Error("Subscribe() returned nil channel")
+	}
+	if ch1 == ch2 {
+		t.Error("Subscribe() should return different channels")
+	}
+
+	sub.Unsubscribe(ch1)
+	sub.Unsubscribe(ch2)
 }
 
 func TestGetEventAttribute(t *testing.T) {
@@ -331,11 +347,15 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 		},
 	}
 
+	// Subscribe to receive events
+	events := sub.Subscribe()
+	defer sub.Unsubscribe(events)
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Drain any existing events
 			select {
-			case <-sub.events:
+			case <-events:
 			default:
 			}
 
@@ -343,7 +363,7 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 
 			// Check if event was emitted
 			select {
-			case <-sub.events:
+			case <-events:
 				if !tt.expectEvent {
 					t.Error("handleMessage() emitted event when none expected")
 				}

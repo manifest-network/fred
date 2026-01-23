@@ -15,8 +15,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/manifest-network/fred/internal/api"
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/scheduler"
 	"github.com/manifest-network/fred/internal/watcher"
 )
@@ -70,7 +72,6 @@ func run(cmd *cobra.Command, args []string) error {
 	slog.Info("starting providerd",
 		"provider_uuid", cfg.ProviderUUID,
 		"chain_id", cfg.ChainID,
-		"auto_acknowledge", cfg.AutoAcknowledge,
 	)
 
 	// Create context with cancellation
@@ -125,8 +126,60 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	slog.Info("event subscriber initialized", "url", cfg.WebSocketURL)
 
-	// Initialize watcher
-	leaseWatcher := watcher.New(chainClient, eventSub, cfg.ProviderUUID, cfg.AutoAcknowledge)
+	// Initialize backends
+	slog.Info("initializing provisioner with backends", "count", len(cfg.Backends))
+
+	var backendEntries []backend.BackendEntry
+	for _, bcfg := range cfg.Backends {
+		client := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    bcfg.Name,
+			BaseURL: bcfg.URL,
+			Timeout: bcfg.Timeout,
+		})
+
+		backendEntries = append(backendEntries, backend.BackendEntry{
+			Backend: client,
+			Match: backend.MatchCriteria{
+				SKUPrefix: bcfg.SKUPrefix,
+			},
+			IsDefault: bcfg.IsDefault,
+		})
+
+		slog.Info("configured backend",
+			"name", bcfg.Name,
+			"url", bcfg.URL,
+			"sku_prefix", bcfg.SKUPrefix,
+			"default", bcfg.IsDefault,
+		)
+	}
+
+	// Create backend router
+	backendRouter, err := backend.NewRouter(backend.RouterConfig{
+		Backends: backendEntries,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create backend router: %w", err)
+	}
+
+	// Create provision manager
+	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
+		ProviderUUID:    cfg.ProviderUUID,
+		CallbackBaseURL: cfg.CallbackBaseURL,
+	}, backendRouter, chainClient)
+	if err != nil {
+		return fmt.Errorf("failed to create provision manager: %w", err)
+	}
+
+	// Create event bridge to forward chain events to Watermill
+	eventBridge := provisioner.NewEventBridge(eventSub, provisionMgr)
+
+	slog.Info("provisioner initialized",
+		"backends", len(cfg.Backends),
+		"callback_url", cfg.CallbackBaseURL,
+	)
+
+	// Initialize watcher for cross-provider events only
+	leaseWatcher := watcher.New(chainClient, eventSub, cfg.ProviderUUID)
 
 	// Initialize API server
 	apiServer := api.NewServer(api.ServerConfig{
@@ -141,7 +194,8 @@ func run(cmd *cobra.Command, args []string) error {
 		WriteTimeout:       cfg.HTTPWriteTimeout,
 		IdleTimeout:        cfg.HTTPIdleTimeout,
 		MaxRequestBodySize: cfg.MaxRequestBodySize,
-	}, chainClient)
+		CallbackSecret:     cfg.CallbackSecret,
+	}, chainClient, backendRouter, provisionMgr)
 
 	// Initialize withdrawal scheduler
 	withdrawScheduler := scheduler.NewWithdrawScheduler(chainClient, scheduler.WithdrawSchedulerConfig{
@@ -162,19 +216,32 @@ func run(cmd *cobra.Command, args []string) error {
 	slog.Info("performing initial withdrawal")
 	withdrawScheduler.WithdrawOnce(ctx)
 
-	// Scan and acknowledge pending leases (runs after withdrawal completes)
-	pendingCount, err := leaseWatcher.ScanAndAcknowledge(ctx)
-	if err != nil {
-		slog.Error("failed to scan/acknowledge pending leases", "error", err)
-		// Continue startup - this is not fatal
-	} else if pendingCount > 0 {
-		slog.Info("startup lease scan complete", "pending_count", pendingCount)
-	}
-
 	// Start background components with WaitGroup for graceful shutdown
 	var wg sync.WaitGroup
-	errChan := make(chan error, 4)
+	errChan := make(chan error, 6)
 
+	// Start event subscriber (single reader, multiple consumers via Subscribe())
+	wg.Go(func() {
+		if err := eventSub.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errChan <- fmt.Errorf("event subscriber error: %w", err)
+		}
+	})
+
+	// Start provisioner
+	wg.Go(func() {
+		if err := provisionMgr.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errChan <- fmt.Errorf("provision manager error: %w", err)
+		}
+	})
+
+	// Start event bridge (subscribes to eventSub, forwards to Watermill)
+	wg.Go(func() {
+		if err := eventBridge.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errChan <- fmt.Errorf("event bridge error: %w", err)
+		}
+	})
+
+	// Start watcher for cross-provider events (subscribes to eventSub)
 	wg.Go(func() {
 		if err := leaseWatcher.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("watcher error: %w", err)
@@ -198,6 +265,7 @@ func run(cmd *cobra.Command, args []string) error {
 		"withdraw_interval", cfg.WithdrawInterval,
 		"rate_limit_rps", cfg.RateLimitRPS,
 		"rate_limit_burst", cfg.RateLimitBurst,
+		"backends", len(cfg.Backends),
 	)
 
 	// Wait for shutdown signal or error
@@ -211,22 +279,24 @@ func run(cmd *cobra.Command, args []string) error {
 	// Graceful shutdown
 	slog.Info("shutting down...")
 
-	// Signal all components to stop
-	cancel()
-
 	// Create shutdown context with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
-	// Shutdown API server (uses its own timeout)
+	// Shutdown API server first (stops accepting new requests)
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("failed to shutdown API server gracefully", "error", err)
 	}
 
-	// Close event subscriber
+	// Close event subscriber (stops receiving chain events)
 	eventSub.Close()
 
+	// Signal all components to stop via context cancellation
+	// This triggers Watermill router shutdown in provisionMgr
+	cancel()
+
 	// Wait for all goroutines to finish with timeout
+	// This includes provisionMgr.Start() which runs the Watermill router
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
