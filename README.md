@@ -415,6 +415,8 @@ MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
 
 **Note:** The mock backend stores callback URLs per lease UUID, so concurrent provisions with different callback URLs are handled correctly without race conditions.
 
+**Security Warning:** The mock backend accepts arbitrary `callback_url` values and issues HTTP requests to them, which is an SSRF risk if exposed to untrusted networks. Only run the mock backend on trusted interfaces (e.g., localhost) for local testing. Do not expose it to the internet or untrusted users.
+
 ### 2. Configure Fred
 
 Create a config file that points to the mock backend:

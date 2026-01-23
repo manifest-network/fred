@@ -1,4 +1,4 @@
-.PHONY: build build-mock install clean test lint run run-mock
+.PHONY: all build build-mock install clean deps test test-coverage lint run run-mock run-mock-delay fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -75,17 +75,17 @@ lint:
 # Run the daemon with example config
 run: build
 	@echo "Running $(BINARY_NAME)..."
-	$(BUILD_DIR)/$(BINARY_NAME) --config config.example.yaml
+	@exec $(BUILD_DIR)/$(BINARY_NAME) --config config.example.yaml
 
 # Run the mock backend
 run-mock: build-mock
 	@echo "Running $(MOCK_BINARY_NAME)..."
-	$(BUILD_DIR)/$(MOCK_BINARY_NAME)
+	@exec $(BUILD_DIR)/$(MOCK_BINARY_NAME)
 
 # Run mock backend with delay (for testing async provisioning)
 run-mock-delay: build-mock
 	@echo "Running $(MOCK_BINARY_NAME) with 2s delay..."
-	MOCK_BACKEND_DELAY=2s $(BUILD_DIR)/$(MOCK_BINARY_NAME)
+	@MOCK_BACKEND_DELAY=2s exec $(BUILD_DIR)/$(MOCK_BINARY_NAME)
 
 # Format code
 fmt:

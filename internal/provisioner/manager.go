@@ -206,9 +206,11 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 		"tenant", event.Tenant,
 	)
 
-	// Route to appropriate backend based on SKU
-	// Phase 2: Fetch lease details from chain to get SKU for routing
-	// For now, use the default backend
+	// TODO(phase-2): Implement SKU-based routing.
+	// Currently we always use the default backend. To route by SKU prefix
+	// (as documented in config), we need to fetch lease details from chain
+	// to get the SKU, then call m.router.Route(sku). For now, all leases
+	// go to the default backend regardless of sku_prefix configuration.
 	backendClient := m.router.Default()
 	if backendClient == nil {
 		slog.Error("no backend available for provisioning",

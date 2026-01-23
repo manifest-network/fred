@@ -160,6 +160,16 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Validate required fields
+	if req.LeaseUUID == "" {
+		http.Error(w, "lease_uuid is required", http.StatusBadRequest)
+		return
+	}
+	if req.CallbackURL == "" {
+		http.Error(w, "callback_url is required", http.StatusBadRequest)
+		return
+	}
+
 	slog.Info("provision request",
 		"lease_uuid", req.LeaseUUID,
 		"tenant", req.Tenant,
@@ -168,17 +178,15 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		"has_payload", len(req.Payload) > 0,
 	)
 
-	// Validate and store callback URL for this lease (thread-safe)
-	if req.CallbackURL != "" {
-		parsedURL, err := url.Parse(req.CallbackURL)
-		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-			http.Error(w, "invalid callback_url: must be a valid http/https URL", http.StatusBadRequest)
-			return
-		}
-		s.callbackURLsMu.Lock()
-		s.callbackURLs[req.LeaseUUID] = req.CallbackURL
-		s.callbackURLsMu.Unlock()
+	// Validate callback URL format and store for this lease (thread-safe)
+	parsedURL, err := url.Parse(req.CallbackURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		http.Error(w, "invalid callback_url: must be a valid http/https URL", http.StatusBadRequest)
+		return
 	}
+	s.callbackURLsMu.Lock()
+	s.callbackURLs[req.LeaseUUID] = req.CallbackURL
+	s.callbackURLsMu.Unlock()
 
 	if err := s.backend.Provision(r.Context(), req); err != nil {
 		// Clean up callback URL on error

@@ -279,27 +279,24 @@ func run(cmd *cobra.Command, args []string) error {
 	// Graceful shutdown
 	slog.Info("shutting down...")
 
-	// Signal all components to stop
-	cancel()
-
 	// Create shutdown context with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
-	// Shutdown API server (uses its own timeout)
+	// Shutdown API server first (stops accepting new requests)
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("failed to shutdown API server gracefully", "error", err)
 	}
 
-	// Close provision manager
-	if err := provisionMgr.Close(); err != nil {
-		slog.Error("failed to close provision manager", "error", err)
-	}
-
-	// Close event subscriber
+	// Close event subscriber (stops receiving chain events)
 	eventSub.Close()
 
+	// Signal all components to stop via context cancellation
+	// This triggers Watermill router shutdown in provisionMgr
+	cancel()
+
 	// Wait for all goroutines to finish with timeout
+	// This includes provisionMgr.Start() which runs the Watermill router
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()

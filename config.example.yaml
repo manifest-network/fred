@@ -61,6 +61,10 @@ rate_limit_burst: 20
 # Backend configuration (required)
 # At least one backend must be configured. Backends handle the actual
 # provisioning of resources when leases are created.
+#
+# NOTE: SKU-based routing (sku_prefix) is not yet implemented. Currently all
+# leases are routed to the default backend. Multi-backend routing is planned
+# for a future release.
 backends:
   # Mock backend for testing (run with: make run-mock)
   - name: mock
@@ -90,6 +94,11 @@ backends:
 # This is the URL backends will call to report provisioning status.
 # Must be reachable from your backends.
 callback_base_url: "http://localhost:8080"
+
+# Callback secret (required)
+# HMAC-SHA256 secret for authenticating callbacks from backends.
+# Must be at least 32 characters. Generate with: openssl rand -hex 32
+callback_secret: "your-secret-key-at-least-32-characters-long"
 
 # Advanced timeout configuration (optional)
 # HTTP server timeouts
