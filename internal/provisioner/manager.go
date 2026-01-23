@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -15,6 +16,22 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+)
+
+// Sentinel errors for provisioner operations.
+var (
+	// ErrMalformedMessage indicates the message payload could not be parsed.
+	// This is a terminal error - the message should not be retried.
+	ErrMalformedMessage = errors.New("malformed message payload")
+
+	// ErrNoBackendAvailable indicates no backend is configured to handle the request.
+	ErrNoBackendAvailable = errors.New("no backend available")
+
+	// ErrProvisioningFailed indicates the backend failed to provision the resource.
+	ErrProvisioningFailed = errors.New("provisioning failed")
+
+	// ErrAcknowledgeFailed indicates the lease acknowledgment on chain failed.
+	ErrAcknowledgeFailed = errors.New("lease acknowledgment failed")
 )
 
 // Watermill topic names for internal event routing.
@@ -177,7 +194,10 @@ func (m *Manager) PublishCallback(callback backend.CallbackPayload) error {
 func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 	var event chain.LeaseEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		slog.Error("failed to unmarshal lease created event", "error", err)
+		slog.Error("failed to unmarshal lease created event",
+			"error", err,
+			"error_type", ErrMalformedMessage,
+		)
 		return nil // Don't retry malformed messages
 	}
 
@@ -190,6 +210,12 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 	// Phase 2: Fetch lease details from chain to get SKU for routing
 	// For now, use the default backend
 	backendClient := m.router.Default()
+	if backendClient == nil {
+		slog.Error("no backend available for provisioning",
+			"lease_uuid", event.LeaseUUID,
+		)
+		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
+	}
 
 	// Track in-flight provision
 	m.inFlightMu.Lock()
@@ -222,7 +248,7 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 		m.inFlightMu.Unlock()
 
 		// Watermill will retry; Phase 2 will add lease rejection after max retries
-		return err
+		return fmt.Errorf("%w: %v", ErrProvisioningFailed, err)
 	}
 
 	slog.Info("provisioning started",
@@ -237,8 +263,11 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 func (m *Manager) handleLeaseClosed(msg *message.Message) error {
 	var event chain.LeaseEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		slog.Error("failed to unmarshal lease closed event", "error", err)
-		return nil
+		slog.Error("failed to unmarshal lease closed event",
+			"error", err,
+			"error_type", ErrMalformedMessage,
+		)
+		return nil // Don't retry malformed messages
 	}
 
 	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID)
@@ -261,7 +290,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) error {
 		slog.Error("no backend available for deprovision",
 			"lease_uuid", event.LeaseUUID,
 		)
-		return fmt.Errorf("no backend available for deprovision")
+		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
 	}
 
 	// Deprovision (idempotent)
@@ -271,7 +300,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) error {
 			"backend", backendClient.Name(),
 			"error", err,
 		)
-		return err // Retry
+		return fmt.Errorf("deprovision lease %s: %w", event.LeaseUUID, err)
 	}
 
 	slog.Info("deprovisioned successfully",
@@ -292,19 +321,17 @@ func (m *Manager) handleLeaseExpired(msg *message.Message) error {
 func (m *Manager) handleBackendCallback(msg *message.Message) error {
 	var callback backend.CallbackPayload
 	if err := json.Unmarshal(msg.Payload, &callback); err != nil {
-		slog.Error("failed to unmarshal backend callback", "error", err)
-		return nil
+		slog.Error("failed to unmarshal backend callback",
+			"error", err,
+			"error_type", ErrMalformedMessage,
+		)
+		return nil // Don't retry malformed messages
 	}
 
 	slog.Info("processing backend callback",
 		"lease_uuid", callback.LeaseUUID,
 		"status", callback.Status,
 	)
-
-	// Remove from in-flight
-	m.inFlightMu.Lock()
-	delete(m.inFlight, callback.LeaseUUID)
-	m.inFlightMu.Unlock()
 
 	switch callback.Status {
 	case "success":
@@ -315,8 +342,14 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 				"lease_uuid", callback.LeaseUUID,
 				"error", err,
 			)
-			return err // Retry
+			// Keep in-flight tracking for retry - Watermill will retry this message
+			return fmt.Errorf("%w: lease %s: %v", ErrAcknowledgeFailed, callback.LeaseUUID, err)
 		}
+
+		// Only remove from in-flight after successful acknowledgment
+		m.inFlightMu.Lock()
+		delete(m.inFlight, callback.LeaseUUID)
+		m.inFlightMu.Unlock()
 
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
@@ -325,6 +358,11 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 		)
 
 	case "failed":
+		// Remove from in-flight - this is a terminal state, no retry needed
+		m.inFlightMu.Lock()
+		delete(m.inFlight, callback.LeaseUUID)
+		m.inFlightMu.Unlock()
+
 		// Phase 2: Add RejectLease to chain client to reject failed provisions
 		// For now, just log the failure; the lease will eventually expire
 		slog.Warn("provisioning failed",

@@ -5,17 +5,24 @@ import (
 	"log/slog"
 	"sync"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
 	"github.com/manifest-network/fred/internal/chain"
 )
 
 // WithdrawTrigger is a function that can be called to trigger a withdrawal.
 type WithdrawTrigger func()
 
+// ChainClient defines the chain operations needed by the watcher.
+type ChainClient interface {
+	GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
+}
+
 // Watcher monitors lease events for cross-provider credit depletion detection.
 // It tracks active tenants and triggers withdrawals when another provider's
 // withdrawal causes a tenant's credit to be depleted.
 type Watcher struct {
-	client          *chain.Client
+	client          ChainClient
 	eventSubscriber *chain.EventSubscriber
 	providerUUID    string
 
@@ -25,7 +32,7 @@ type Watcher struct {
 }
 
 // New creates a new lease watcher.
-func New(client *chain.Client, eventSubscriber *chain.EventSubscriber, providerUUID string) *Watcher {
+func New(client ChainClient, eventSubscriber *chain.EventSubscriber, providerUUID string) *Watcher {
 	return &Watcher{
 		client:          client,
 		eventSubscriber: eventSubscriber,
