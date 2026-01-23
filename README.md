@@ -23,31 +23,48 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 +------------------------------------------------------------------+
 |                              FRED                                 |
 |                                                                   |
-|  +------------------+     +------------------+     +------------+ |
-|  | Chain Subscriber |---->| Watermill Router |---->| Provision  | |
-|  | (WebSocket)      |     | (event routing)  |     | Manager    | |
-|  +------------------+     +------------------+     +------------+ |
-|                                                          |        |
-|  +------------------+     +------------------+            |        |
-|  | Watcher          |     | API Server       |<-----------+        |
-|  | (cross-provider) |     | (tenant access)  |            |        |
-|  +------------------+     +------------------+            |        |
-|                                                          v        |
-|                                    +------------------+           |
-|                                    | Backend Router   |           |
-|                                    | (SKU routing)    |           |
-|                                    +------------------+           |
-|                                            |                      |
+|  +------------------+                                             |
+|  | Event Subscriber |  (fan-out: each consumer gets all events)  |
+|  | (WebSocket)      |-----+------------------+                    |
+|  +------------------+     |                  |                    |
+|                           v                  v                    |
+|  +------------------+  +------------------+  +------------------+ |
+|  | Event Bridge     |  | Watcher          |  | (other future    | |
+|  | -> Watermill     |  | (cross-provider) |  |  consumers)      | |
+|  +------------------+  +------------------+  +------------------+ |
+|           |                                                       |
+|           v                                                       |
+|  +------------------+     +------------------+                    |
+|  | Watermill Router |---->| Provision        |                    |
+|  | (event routing)  |     | Manager          |                    |
+|  +------------------+     +------------------+                    |
+|                                   |                               |
+|  +------------------+             |                               |
+|  | API Server       |<------------+                               |
+|  | (tenant access)  |             |                               |
+|  +------------------+             v                               |
+|                           +------------------+                    |
+|                           | Backend Router   |                    |
+|                           | (SKU routing)    |                    |
+|                           +------------------+                    |
+|                                   |                               |
 +------------------------------------------------------------------+
-                                            |
-              +-----------------------------+-----------------------------+
-              v                             v                             v
-      +---------------+            +---------------+            +---------------+
-      |  Kubernetes   |            |     GPU       |            |      VM       |
-      |   Backend     |            |   Backend     |            |   Backend     |
-      | (sku: k8s-*)  |            | (sku: gpu-*)  |            | (sku: vm-*)   |
-      +---------------+            +---------------+            +---------------+
+                                    |
+              +---------------------+---------------------+
+              v                     v                     v
+      +---------------+     +---------------+     +---------------+
+      |  Kubernetes   |     |     GPU       |     |      VM       |
+      |   Backend     |     |   Backend     |     |   Backend     |
+      | (sku: k8s-*)  |     | (sku: gpu-*)  |     | (sku: vm-*)   |
+      +---------------+     +---------------+     +---------------+
 ```
+
+### Event Fan-Out
+
+The Event Subscriber uses a fan-out pattern where each consumer (Event Bridge, Watcher, etc.) gets its own channel and receives **all** events independently. This ensures that:
+- The provisioner never misses lease events
+- The watcher always sees cross-provider credit depletion events
+- New consumers can be added without affecting existing ones
 
 ## Lease Lifecycle
 
@@ -105,18 +122,20 @@ cp config.example.yaml config.yaml
 
 ### Required Configuration
 
+All required fields are validated at startup. The daemon will fail to start with a clear error message if any required configuration is missing or invalid.
+
 | Option | Description |
 |--------|-------------|
-| `provider_uuid` | Your registered provider UUID |
+| `provider_uuid` | Your registered provider UUID (must be valid UUID format) |
 | `provider_address` | Provider management address |
 | `keyring_dir` | Directory containing keyring |
 | `key_name` | Key name for signing transactions |
 | `backends` | At least one backend must be configured |
-| `callback_base_url` | URL where backends send callbacks |
+| `callback_base_url` | URL where backends send callbacks (must be absolute http/https URL) |
 
 ### Backend Configuration
 
-Backends are services that handle the actual resource provisioning:
+Backends are services that handle the actual resource provisioning. Each backend URL must be an absolute URL with `http://` or `https://` scheme.
 
 ```yaml
 backends:
@@ -133,6 +152,12 @@ backends:
 
 callback_base_url: "http://fred.provider.example.com:8080"
 ```
+
+**Validation rules:**
+- Backend names must be unique
+- Backend URLs must be absolute `http://` or `https://` URLs with a host
+- `callback_base_url` must be an absolute `http://` or `https://` URL
+- Trailing slashes on `callback_base_url` are automatically stripped
 
 ### Full Configuration Reference
 
@@ -348,7 +373,7 @@ List all provisions (for reconciliation).
 
 ## Running E2E Tests with Mock Backend
 
-The mock backend allows you to test fred's provisioning flow without a real backend.
+The mock backend allows you to test fred's provisioning flow without a real backend. It supports concurrent provisions with per-lease callback routing.
 
 ### 1. Start the Mock Backend
 
@@ -370,6 +395,9 @@ MOCK_BACKEND_ADDR=:9001 MOCK_BACKEND_NAME=test-backend MOCK_BACKEND_DELAY=2s ./b
 | `MOCK_BACKEND_ADDR` | Listen address | `:9000` |
 | `MOCK_BACKEND_NAME` | Backend name (in responses) | `mock-backend` |
 | `MOCK_BACKEND_DELAY` | Simulated provisioning delay | `0s` |
+| `MOCK_BACKEND_TLS_SKIP_VERIFY` | Skip TLS verification for callbacks (use `true` for self-signed certs) | `false` |
+
+**Note:** The mock backend stores callback URLs per lease UUID, so concurrent provisions with different callback URLs are handled correctly without race conditions.
 
 ### 2. Configure Fred
 

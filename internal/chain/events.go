@@ -50,6 +50,8 @@ type LeaseEvent struct {
 }
 
 // EventSubscriber handles WebSocket subscription to CometBFT events.
+// It supports multiple consumers via Subscribe() - each subscriber gets
+// its own channel and receives all events (fan-out pattern).
 type EventSubscriber struct {
 	url              string
 	providerUUID     string
@@ -57,9 +59,13 @@ type EventSubscriber struct {
 	reconnectInitial time.Duration
 	reconnectMax     time.Duration
 	conn             *websocket.Conn
-	events           chan LeaseEvent
 	done             chan struct{}
 	mu               sync.Mutex
+
+	// Fan-out: multiple subscribers each with their own channel
+	subscribers   map[chan LeaseEvent]struct{}
+	subscribersMu sync.RWMutex
+	nextSubID     int // For logging/debugging
 
 	// Track invalid messages for escalated logging
 	invalidMsgCount    int
@@ -97,14 +103,65 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 		pingInterval:     pingInterval,
 		reconnectInitial: reconnectInitial,
 		reconnectMax:     reconnectMax,
-		events:           make(chan LeaseEvent, eventChannelCapacity),
 		done:             make(chan struct{}),
+		subscribers:      make(map[chan LeaseEvent]struct{}),
 	}, nil
 }
 
-// Events returns the channel for receiving lease events.
-func (s *EventSubscriber) Events() <-chan LeaseEvent {
-	return s.events
+// Subscribe creates a new subscription and returns a channel that receives all events.
+// Each subscriber gets its own buffered channel. Call Unsubscribe when done to avoid leaks.
+func (s *EventSubscriber) Subscribe() <-chan LeaseEvent {
+	ch := make(chan LeaseEvent, eventChannelCapacity)
+
+	s.subscribersMu.Lock()
+	s.subscribers[ch] = struct{}{}
+	s.nextSubID++
+	subID := s.nextSubID
+	s.subscribersMu.Unlock()
+
+	slog.Debug("new event subscriber registered", "subscriber_id", subID)
+	return ch
+}
+
+// Unsubscribe removes a subscription and closes its channel.
+// Safe to call multiple times or with a nil channel.
+func (s *EventSubscriber) Unsubscribe(ch <-chan LeaseEvent) {
+	if ch == nil {
+		return
+	}
+
+	// Type assert to get the sendable channel for map lookup
+	sendCh, ok := interface{}(ch).(chan LeaseEvent)
+	if !ok {
+		return
+	}
+
+	s.subscribersMu.Lock()
+	defer s.subscribersMu.Unlock()
+
+	if _, exists := s.subscribers[sendCh]; exists {
+		delete(s.subscribers, sendCh)
+		close(sendCh)
+		slog.Debug("event subscriber unregistered")
+	}
+}
+
+// broadcast sends an event to all subscribers. Non-blocking: if a subscriber's
+// channel is full, the event is dropped for that subscriber with a warning.
+func (s *EventSubscriber) broadcast(event LeaseEvent) {
+	s.subscribersMu.RLock()
+	defer s.subscribersMu.RUnlock()
+
+	for ch := range s.subscribers {
+		select {
+		case ch <- event:
+		default:
+			slog.Warn("subscriber channel full, dropping event",
+				"event_type", event.Type,
+				"lease_uuid", event.LeaseUUID,
+			)
+		}
+	}
 }
 
 // Start begins listening for events. It will automatically reconnect on failure.
@@ -312,14 +369,10 @@ func (s *EventSubscriber) handleMessage(message []byte) {
 	s.invalidMsgCount = 0
 	s.mu.Unlock()
 
-	// Extract lease events
+	// Extract lease events and broadcast to all subscribers
 	event := s.parseLeaseEvent(result.Events)
 	if event != nil {
-		select {
-		case s.events <- *event:
-		default:
-			slog.Warn("event channel full, dropping event")
-		}
+		s.broadcast(*event)
 	}
 }
 
@@ -436,9 +489,10 @@ func getEventAttribute(events map[string][]string, key string) string {
 	return ""
 }
 
-// Close shuts down the event subscriber.
+// Close shuts down the event subscriber and closes all subscriber channels.
 func (s *EventSubscriber) Close() {
 	close(s.done)
+
 	s.mu.Lock()
 	if s.conn != nil {
 		if err := s.conn.Close(); err != nil {
@@ -446,6 +500,14 @@ func (s *EventSubscriber) Close() {
 		}
 	}
 	s.mu.Unlock()
+
+	// Close all subscriber channels
+	s.subscribersMu.Lock()
+	for ch := range s.subscribers {
+		close(ch)
+		delete(s.subscribers, ch)
+	}
+	s.subscribersMu.Unlock()
 }
 
 // JSON-RPC types for CometBFT WebSocket.

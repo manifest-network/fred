@@ -265,43 +265,47 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
 	}
 
-	// Backend validation (optional - for backward compatibility)
-	if len(c.Backends) > 0 {
-		hasDefault := false
-		seenNames := make(map[string]bool)
+	// Backend validation - at least one backend is required
+	if len(c.Backends) == 0 {
+		return fmt.Errorf("at least one backend must be configured")
+	}
 
-		for i, b := range c.Backends {
-			if b.Name == "" {
-				return fmt.Errorf("backends[%d].name is required", i)
-			}
-			if seenNames[b.Name] {
-				return fmt.Errorf("duplicate backend name: %s", b.Name)
-			}
-			seenNames[b.Name] = true
+	hasDefault := false
+	seenNames := make(map[string]bool)
 
-			if b.URL == "" {
-				return fmt.Errorf("backends[%d].url is required", i)
-			}
-			if _, err := url.Parse(b.URL); err != nil {
-				return fmt.Errorf("backends[%d].url is not a valid URL: %w", i, err)
-			}
+	for i, b := range c.Backends {
+		if b.Name == "" {
+			return fmt.Errorf("backends[%d].name is required", i)
+		}
+		if seenNames[b.Name] {
+			return fmt.Errorf("duplicate backend name: %s", b.Name)
+		}
+		seenNames[b.Name] = true
 
-			if b.IsDefault {
-				if hasDefault {
-					return fmt.Errorf("multiple default backends specified")
-				}
-				hasDefault = true
-			}
+		if b.URL == "" {
+			return fmt.Errorf("backends[%d].url is required", i)
+		}
+		if err := validateHTTPURL(b.URL); err != nil {
+			return fmt.Errorf("backends[%d].url: %w", i, err)
 		}
 
-		// If backends are configured, callback_base_url is required
-		if c.CallbackBaseURL == "" {
-			return fmt.Errorf("callback_base_url is required when backends are configured")
-		}
-		if _, err := url.Parse(c.CallbackBaseURL); err != nil {
-			return fmt.Errorf("callback_base_url is not a valid URL: %w", err)
+		if b.IsDefault {
+			if hasDefault {
+				return fmt.Errorf("multiple default backends specified")
+			}
+			hasDefault = true
 		}
 	}
+
+	// callback_base_url is required for backend callbacks
+	if c.CallbackBaseURL == "" {
+		return fmt.Errorf("callback_base_url is required")
+	}
+	if err := validateHTTPURL(c.CallbackBaseURL); err != nil {
+		return fmt.Errorf("callback_base_url: %w", err)
+	}
+	// Normalize: strip trailing slashes to avoid double slashes when joining paths
+	c.CallbackBaseURL = strings.TrimRight(c.CallbackBaseURL, "/")
 
 	return nil
 }
@@ -310,4 +314,19 @@ func (c *Config) Validate() error {
 func IsValidUUID(s string) bool {
 	_, err := uuid.Parse(s)
 	return err == nil
+}
+
+// validateHTTPURL checks that a URL is an absolute http/https URL with non-empty host.
+func validateHTTPURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URL must use http:// or https:// scheme, got %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("URL must have a host")
+	}
+	return nil
 }

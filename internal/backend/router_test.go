@@ -185,3 +185,48 @@ func TestRouter_GetBackendByName(t *testing.T) {
 		t.Errorf("GetBackendByName(nonexistent) = %v, want nil", b)
 	}
 }
+
+func TestRouter_NilBackend(t *testing.T) {
+	validBackend := NewMockBackend(MockBackendConfig{Name: "valid"})
+
+	tests := []struct {
+		name     string
+		backends []BackendEntry
+		wantErr  string
+	}{
+		{
+			name: "nil backend at index 0",
+			backends: []BackendEntry{
+				{Backend: nil},
+			},
+			wantErr: "backend at index 0 is nil",
+		},
+		{
+			name: "nil backend at index 1",
+			backends: []BackendEntry{
+				{Backend: validBackend},
+				{Backend: nil},
+			},
+			wantErr: "backend at index 1 is nil",
+		},
+		{
+			name: "nil default backend",
+			backends: []BackendEntry{
+				{Backend: nil, IsDefault: true},
+			},
+			wantErr: "backend at index 0 is nil",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewRouter(RouterConfig{Backends: tt.backends})
+			if err == nil {
+				t.Fatal("NewRouter() with nil backend should return error")
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

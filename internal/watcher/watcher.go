@@ -60,6 +60,7 @@ func (w *Watcher) loadActiveTenants(ctx context.Context) error {
 }
 
 // Start begins watching for lease events.
+// Note: The EventSubscriber must be started separately (typically in main.go).
 func (w *Watcher) Start(ctx context.Context) error {
 	slog.Info("starting lease watcher", "provider_uuid", w.providerUUID)
 
@@ -69,25 +70,21 @@ func (w *Watcher) Start(ctx context.Context) error {
 		// Continue - this is not fatal
 	}
 
-	// Start event subscriber in a goroutine
-	go func() {
-		if err := w.eventSubscriber.Start(ctx); err != nil {
-			slog.Error("event subscriber error", "error", err)
-		}
-	}()
+	// Subscribe to receive events (fan-out: each subscriber gets all events)
+	events := w.eventSubscriber.Subscribe()
+	defer w.eventSubscriber.Unsubscribe(events)
 
 	// Process events
-	return w.processEvents(ctx)
-}
-
-// processEvents handles incoming lease events.
-func (w *Watcher) processEvents(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case event := <-w.eventSubscriber.Events():
+		case event, ok := <-events:
+			if !ok {
+				// Channel closed, subscriber is shutting down
+				return nil
+			}
 			w.handleEvent(event)
 		}
 	}

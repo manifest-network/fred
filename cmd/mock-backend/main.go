@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,21 +53,34 @@ func main() {
 		ProvisionDelay: delay,
 	})
 
-	// Create HTTP client that skips TLS verification (for self-signed certs)
+	// Create HTTP client for callbacks
+	// By default, TLS verification is enabled. Set MOCK_BACKEND_TLS_SKIP_VERIFY=true
+	// to skip verification (e.g., for self-signed certs in local testing).
 	httpClient := &http.Client{
 		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
+	}
+
+	tlsSkipVerify := os.Getenv("MOCK_BACKEND_TLS_SKIP_VERIFY")
+	if tlsSkipVerify == "true" || tlsSkipVerify == "1" {
+		slog.Warn("TLS certificate verification is DISABLED for callbacks - do not use in production",
+			"env_var", "MOCK_BACKEND_TLS_SKIP_VERIFY",
+		)
+		httpClient.Transport = &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 			},
-		},
+		}
 	}
 
 	// Create HTTP server
 	server := &MockBackendServer{
-		backend:    mockBackend,
-		httpClient: httpClient,
+		backend:      mockBackend,
+		httpClient:   httpClient,
+		callbackURLs: make(map[string]string),
 	}
+
+	// Set up a single callback function that routes by lease UUID
+	mockBackend.SetCallbackFunc(server.handleCallback)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /provision", server.handleProvision)
@@ -116,6 +130,10 @@ func main() {
 type MockBackendServer struct {
 	backend    *backend.MockBackend
 	httpClient *http.Client
+
+	// Per-lease callback URLs to avoid race conditions with concurrent provisions
+	callbackURLs   map[string]string
+	callbackURLsMu sync.Mutex
 }
 
 func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Request) {
@@ -133,14 +151,19 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		"has_payload", len(req.Payload) > 0,
 	)
 
-	// Set up callback function if URL provided
+	// Store callback URL for this lease (thread-safe)
 	if req.CallbackURL != "" {
-		s.backend.SetCallbackFunc(func(payload backend.CallbackPayload) {
-			s.sendCallback(req.CallbackURL, payload)
-		})
+		s.callbackURLsMu.Lock()
+		s.callbackURLs[req.LeaseUUID] = req.CallbackURL
+		s.callbackURLsMu.Unlock()
 	}
 
 	if err := s.backend.Provision(r.Context(), req); err != nil {
+		// Clean up callback URL on error
+		s.callbackURLsMu.Lock()
+		delete(s.callbackURLs, req.LeaseUUID)
+		s.callbackURLsMu.Unlock()
+
 		if strings.Contains(err.Error(), "already provisioned") {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
@@ -192,6 +215,11 @@ func (s *MockBackendServer) handleDeprovision(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Clean up callback URL
+	s.callbackURLsMu.Lock()
+	delete(s.callbackURLs, req.LeaseUUID)
+	s.callbackURLsMu.Unlock()
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -211,6 +239,25 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 func (s *MockBackendServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
+}
+
+// handleCallback is called by MockBackend when provisioning completes.
+// It looks up the callback URL for the lease and sends the callback.
+func (s *MockBackendServer) handleCallback(payload backend.CallbackPayload) {
+	s.callbackURLsMu.Lock()
+	callbackURL, exists := s.callbackURLs[payload.LeaseUUID]
+	if exists {
+		// Remove from map after retrieving (callback is one-time)
+		delete(s.callbackURLs, payload.LeaseUUID)
+	}
+	s.callbackURLsMu.Unlock()
+
+	if !exists || callbackURL == "" {
+		slog.Debug("no callback URL for lease", "lease_uuid", payload.LeaseUUID)
+		return
+	}
+
+	s.sendCallback(callbackURL, payload)
 }
 
 func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.CallbackPayload) {

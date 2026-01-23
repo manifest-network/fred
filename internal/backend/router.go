@@ -42,7 +42,11 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 
 	r := &Router{}
 
-	for _, entry := range cfg.Backends {
+	for i, entry := range cfg.Backends {
+		if entry.Backend == nil {
+			return nil, fmt.Errorf("backend at index %d is nil", i)
+		}
+
 		r.backends = append(r.backends, backendEntry{
 			backend: entry.Backend,
 			match:   entry.Match,
@@ -56,7 +60,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		}
 	}
 
-	// If no explicit default, use the first backend
+	// If no explicit default, use the first backend (already validated non-nil above)
 	if r.defaultBackend == nil {
 		r.defaultBackend = cfg.Backends[0].Backend
 	}

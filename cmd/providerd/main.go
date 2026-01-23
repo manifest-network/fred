@@ -69,11 +69,6 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Require backends to be configured
-	if len(cfg.Backends) == 0 {
-		return fmt.Errorf("at least one backend must be configured")
-	}
-
 	slog.Info("starting providerd",
 		"provider_uuid", cfg.ProviderUUID,
 		"chain_id", cfg.ChainID,
@@ -222,7 +217,14 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Start background components with WaitGroup for graceful shutdown
 	var wg sync.WaitGroup
-	errChan := make(chan error, 5)
+	errChan := make(chan error, 6)
+
+	// Start event subscriber (single reader, multiple consumers via Subscribe())
+	wg.Go(func() {
+		if err := eventSub.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errChan <- fmt.Errorf("event subscriber error: %w", err)
+		}
+	})
 
 	// Start provisioner
 	wg.Go(func() {
@@ -231,14 +233,14 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	})
 
-	// Start event bridge
+	// Start event bridge (subscribes to eventSub, forwards to Watermill)
 	wg.Go(func() {
 		if err := eventBridge.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("event bridge error: %w", err)
 		}
 	})
 
-	// Start watcher for cross-provider events
+	// Start watcher for cross-provider events (subscribes to eventSub)
 	wg.Go(func() {
 		if err := leaseWatcher.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("watcher error: %w", err)

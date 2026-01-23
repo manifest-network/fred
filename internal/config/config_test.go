@@ -147,10 +147,51 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		MaxRequestBodySize:        1 << 20,
 		CreditCheckErrorThreshold: 3,
 		CreditCheckRetryInterval:  30 * time.Second,
+		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+		CallbackBaseURL:           "http://localhost:8080",
 	}
 
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestConfig_Validate_NoBackends(t *testing.T) {
+	cfg := Config{
+		ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+		ProviderAddress:           "manifest1abc",
+		KeyName:                   "provider",
+		KeyringDir:                "/home/provider/.manifest",
+		Bech32Prefix:              "manifest",
+		WithdrawInterval:          time.Hour,
+		RateLimitRPS:              10,
+		RateLimitBurst:            20,
+		GasLimit:                  500000,
+		GasPrice:                  25,
+		FeeDenom:                  "umfx",
+		HTTPReadTimeout:           15 * time.Second,
+		HTTPWriteTimeout:          15 * time.Second,
+		HTTPIdleTimeout:           60 * time.Second,
+		WebSocketPingInterval:     30 * time.Second,
+		TxPollInterval:            500 * time.Millisecond,
+		TxTimeout:                 30 * time.Second,
+		QueryPageLimit:            100,
+		MaxWithdrawIterations:     100,
+		WebSocketReconnectInitial: time.Second,
+		WebSocketReconnectMax:     60 * time.Second,
+		MaxRequestBodySize:        1 << 20,
+		CreditCheckErrorThreshold: 3,
+		CreditCheckRetryInterval:  30 * time.Second,
+		// No backends configured
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Error("Validate() = nil, want error about missing backends")
+		return
+	}
+	if !strings.Contains(err.Error(), "at least one backend must be configured") {
+		t.Errorf("Validate() error = %q, want error containing 'at least one backend must be configured'", err.Error())
 	}
 }
 
@@ -181,6 +222,8 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			MaxRequestBodySize:        1 << 20,
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://localhost:8080",
 		}
 	}
 
@@ -297,6 +340,8 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			MaxRequestBodySize:        1 << 20,
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://localhost:8080",
 		}
 	}
 
@@ -391,6 +436,8 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			MaxRequestBodySize:        1 << 20,
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://localhost:8080",
 		}
 	}
 
@@ -499,6 +546,11 @@ provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
 provider_address: "manifest1abc"
 key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+backends:
+  - name: "mock"
+    url: "http://localhost:9000"
+    default: true
 `
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -547,6 +599,11 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 chain_id: "test-chain-1"
 rate_limit_rps: 50
+callback_base_url: "http://localhost:8080"
+backends:
+  - name: "mock"
+    url: "http://localhost:9000"
+    default: true
 `
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -565,6 +622,204 @@ rate_limit_rps: 50
 	}
 }
 
+func TestConfig_Validate_BackendURLs(t *testing.T) {
+	baseConfig := func() Config {
+		return Config{
+			ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+			ProviderAddress:           "manifest1abc",
+			KeyName:                   "provider",
+			KeyringDir:                "/home/provider/.manifest",
+			Bech32Prefix:              "manifest",
+			WithdrawInterval:          time.Hour,
+			RateLimitRPS:              10,
+			RateLimitBurst:            20,
+			GasLimit:                  500000,
+			GasPrice:                  25,
+			FeeDenom:                  "umfx",
+			HTTPReadTimeout:           15 * time.Second,
+			HTTPWriteTimeout:          15 * time.Second,
+			HTTPIdleTimeout:           60 * time.Second,
+			WebSocketPingInterval:     30 * time.Second,
+			TxPollInterval:            500 * time.Millisecond,
+			TxTimeout:                 30 * time.Second,
+			QueryPageLimit:            100,
+			MaxWithdrawIterations:     100,
+			WebSocketReconnectInitial: time.Second,
+			WebSocketReconnectMax:     60 * time.Second,
+			MaxRequestBodySize:        1 << 20,
+			CreditCheckErrorThreshold: 3,
+			CreditCheckRetryInterval:  30 * time.Second,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		modify  func(*Config)
+		wantErr string
+	}{
+		{
+			name: "valid http backend URL",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "",
+		},
+		{
+			name: "valid https backend URL",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example.com:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com:8080"
+			},
+			wantErr: "",
+		},
+		{
+			name: "relative backend URL",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "/api/provision", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL must use http:// or https:// scheme",
+		},
+		{
+			name: "backend URL without scheme",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL must use http:// or https:// scheme",
+		},
+		{
+			name: "backend URL with ftp scheme",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "ftp://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL must use http:// or https:// scheme",
+		},
+		{
+			name: "backend URL without host",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http:///path", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL must have a host",
+		},
+		{
+			name: "relative callback URL",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "/callbacks"
+			},
+			wantErr: "callback_base_url: URL must use http:// or https:// scheme",
+		},
+		{
+			name: "callback URL without scheme",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "localhost:8080"
+			},
+			wantErr: "callback_base_url: URL must use http:// or https:// scheme",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			tt.modify(&cfg)
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
+				return
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
+	baseConfig := func() Config {
+		return Config{
+			ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+			ProviderAddress:           "manifest1abc",
+			KeyName:                   "provider",
+			KeyringDir:                "/home/provider/.manifest",
+			Bech32Prefix:              "manifest",
+			WithdrawInterval:          time.Hour,
+			RateLimitRPS:              10,
+			RateLimitBurst:            20,
+			GasLimit:                  500000,
+			GasPrice:                  25,
+			FeeDenom:                  "umfx",
+			HTTPReadTimeout:           15 * time.Second,
+			HTTPWriteTimeout:          15 * time.Second,
+			HTTPIdleTimeout:           60 * time.Second,
+			WebSocketPingInterval:     30 * time.Second,
+			TxPollInterval:            500 * time.Millisecond,
+			TxTimeout:                 30 * time.Second,
+			QueryPageLimit:            100,
+			MaxWithdrawIterations:     100,
+			WebSocketReconnectInitial: time.Second,
+			WebSocketReconnectMax:     60 * time.Second,
+			MaxRequestBodySize:        1 << 20,
+			CreditCheckErrorThreshold: 3,
+			CreditCheckRetryInterval:  30 * time.Second,
+		}
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "no trailing slash",
+			input:    "http://localhost:8080",
+			expected: "http://localhost:8080",
+		},
+		{
+			name:     "single trailing slash",
+			input:    "http://localhost:8080/",
+			expected: "http://localhost:8080",
+		},
+		{
+			name:     "multiple trailing slashes",
+			input:    "http://localhost:8080///",
+			expected: "http://localhost:8080",
+		},
+		{
+			name:     "with path and trailing slash",
+			input:    "http://localhost:8080/api/",
+			expected: "http://localhost:8080/api",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+			cfg.CallbackBaseURL = tt.input
+
+			err := cfg.Validate()
+			if err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+
+			if cfg.CallbackBaseURL != tt.expected {
+				t.Errorf("CallbackBaseURL = %q, want %q", cfg.CallbackBaseURL, tt.expected)
+			}
+		})
+	}
+}
+
 func TestLoad_ConfigFile(t *testing.T) {
 	// Create a temp config file
 	tmpDir := t.TempDir()
@@ -578,6 +833,11 @@ key_name: "filekey"
 keyring_dir: "/file/keyring"
 bech32_prefix: "manifest"
 rate_limit_rps: 100
+callback_base_url: "http://localhost:8080"
+backends:
+  - name: "mock"
+    url: "http://localhost:9000"
+    default: true
 `
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)

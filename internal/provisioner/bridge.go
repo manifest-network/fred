@@ -13,7 +13,7 @@ type EventPublisher interface {
 }
 
 // EventBridge bridges chain events to Watermill via the Manager.
-// It listens on the EventSubscriber's channel and publishes to Watermill topics.
+// It subscribes to the EventSubscriber and publishes to Watermill topics.
 type EventBridge struct {
 	subscriber *chain.EventSubscriber
 	publisher  EventPublisher
@@ -32,12 +32,20 @@ func NewEventBridge(subscriber *chain.EventSubscriber, publisher EventPublisher)
 func (b *EventBridge) Start(ctx context.Context) error {
 	slog.Info("starting event bridge")
 
+	// Subscribe to receive events (fan-out: each subscriber gets all events)
+	events := b.subscriber.Subscribe()
+	defer b.subscriber.Unsubscribe(events)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case event := <-b.subscriber.Events():
+		case event, ok := <-events:
+			if !ok {
+				// Channel closed, subscriber is shutting down
+				return nil
+			}
 			if err := b.publisher.PublishLeaseEvent(event); err != nil {
 				slog.Error("failed to publish event to watermill",
 					"event_type", event.Type,

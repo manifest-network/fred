@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -8,15 +9,22 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 )
 
+// ChainClient defines the chain operations needed by handlers.
+type ChainClient interface {
+	GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
+	Ping(ctx context.Context) error
+}
+
 // Handlers contains HTTP request handlers.
 type Handlers struct {
-	client        *chain.Client
+	client        ChainClient
 	backendRouter *backend.Router
 	providerUUID  string
 	bech32Prefix  string
