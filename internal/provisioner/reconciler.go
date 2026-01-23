@@ -231,9 +231,22 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 		delete(allProvisions, leaseUUID)
 	}
 
-	// 4. Remaining provisions have no lease - these are orphans
-	orphans := len(allProvisions)
+	// 4. Remaining provisions have no lease - check for orphans
+	// Only deprovision orphans that belong to this provider to avoid
+	// interfering with other providers sharing the same backend.
+	var orphans int
 	for leaseUUID, provision := range allProvisions {
+		// Skip provisions that belong to a different provider
+		if provision.ProviderUUID != "" && provision.ProviderUUID != r.providerUUID {
+			slog.Debug("reconcile: skipping provision owned by different provider",
+				"lease_uuid", leaseUUID,
+				"provision_provider", provision.ProviderUUID,
+				"our_provider", r.providerUUID,
+			)
+			continue
+		}
+
+		orphans++
 		slog.Warn("reconcile: orphan provision found",
 			"lease_uuid", leaseUUID,
 			"backend", provision.BackendName,

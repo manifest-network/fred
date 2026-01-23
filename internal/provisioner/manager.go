@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,20 @@ var (
 	// ErrAcknowledgeFailed indicates the lease acknowledgment on chain failed.
 	ErrAcknowledgeFailed = errors.New("lease acknowledgment failed")
 )
+
+// isTerminalAcknowledgeError returns true if the error indicates the lease
+// cannot be acknowledged and retrying won't help. This includes cases where
+// the lease is already acknowledged (not in PENDING state).
+func isTerminalAcknowledgeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Chain returns "lease not in pending state" when the lease is already ACTIVE
+	// or in another terminal state. Retrying is pointless.
+	return strings.Contains(errStr, "not in PENDING state") ||
+		strings.Contains(errStr, "lease not found")
+}
 
 // Watermill topic names for internal event routing.
 const (
@@ -422,6 +437,19 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 		// Acknowledge the lease on chain
 		acknowledged, txHashes, err := m.chainClient.AcknowledgeLeases(msg.Context(), []string{callback.LeaseUUID})
 		if err != nil {
+			// Check if this is a terminal error (e.g., lease already acknowledged)
+			if isTerminalAcknowledgeError(err) {
+				// Lease is already in a non-PENDING state (likely already ACTIVE).
+				// This can happen if we received a duplicate callback or the reconciler
+				// already acknowledged it. Treat as success - the lease is active.
+				m.UntrackInFlight(callback.LeaseUUID)
+				slog.Info("lease already acknowledged or not pending, treating as success",
+					"lease_uuid", callback.LeaseUUID,
+					"error", err,
+				)
+				return nil
+			}
+
 			slog.Error("failed to acknowledge lease",
 				"lease_uuid", callback.LeaseUUID,
 				"error", err,

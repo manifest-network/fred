@@ -55,10 +55,11 @@ type LeaseInfo map[string]any
 
 // ProvisionInfo describes a single provisioned resource.
 type ProvisionInfo struct {
-	LeaseUUID   string    `json:"lease_uuid"`
-	Status      string    `json:"status"` // "provisioning", "ready", "failed"
-	CreatedAt   time.Time `json:"created_at"`
-	BackendName string    `json:"-"` // Set by reconciler, not from backend
+	LeaseUUID    string    `json:"lease_uuid"`
+	ProviderUUID string    `json:"provider_uuid"`
+	Status       string    `json:"status"` // "provisioning", "ready", "failed"
+	CreatedAt    time.Time `json:"created_at"`
+	BackendName  string    `json:"-"` // Set by reconciler, not from backend
 }
 
 // CallbackPayload is sent by backends to fred's callback endpoint.

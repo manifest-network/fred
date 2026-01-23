@@ -618,6 +618,94 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	}
 }
 
+func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
+	// Test that "not in PENDING state" errors are treated as terminal (success)
+	// This prevents infinite retry loops when the lease is already acknowledged.
+	terminalErr := errors.New("failed to acknowledge leases: lease not in PENDING state")
+
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			return 0, nil, terminalErr
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track the lease
+	manager.TrackInFlight("lease-1", "tenant-1", "", "test")
+
+	callback := backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusSuccess,
+	}
+	payload, _ := json.Marshal(callback)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should return nil (terminal error treated as success)
+	err = manager.handleBackendCallback(msg)
+	if err != nil {
+		t.Errorf("handleBackendCallback() error = %v, want nil for terminal acknowledge error", err)
+	}
+
+	// Verify removed from in-flight (not stuck for retry)
+	if manager.IsInFlight("lease-1") {
+		t.Error("lease should NOT be in-flight after terminal acknowledge error")
+	}
+}
+
+func TestManager_IsTerminalAcknowledgeError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		terminal bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			terminal: false,
+		},
+		{
+			name:     "transient error",
+			err:      errors.New("connection refused"),
+			terminal: false,
+		},
+		{
+			name:     "not in PENDING state",
+			err:      errors.New("lease 123 is not in PENDING state"),
+			terminal: true,
+		},
+		{
+			name:     "wrapped not in PENDING state",
+			err:      errors.New("failed to acknowledge: transaction failed: lease not in PENDING state"),
+			terminal: true,
+		},
+		{
+			name:     "lease not found",
+			err:      errors.New("lease not found"),
+			terminal: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTerminalAcknowledgeError(tt.err)
+			if got != tt.terminal {
+				t.Errorf("isTerminalAcknowledgeError() = %v, want %v", got, tt.terminal)
+			}
+		})
+	}
+}
+
 func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{

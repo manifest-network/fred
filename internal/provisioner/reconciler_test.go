@@ -872,3 +872,56 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 		t.Errorf("expected 2 deprovision attempts (even with errors), got %d", deprovisionCount)
 	}
 }
+
+func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
+	// Test that reconciler does NOT deprovision orphans belonging to other providers.
+	// This is critical when multiple providers share the same backend.
+	mockChain := &chain.MockClient{
+		// No leases for our provider
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			// Orphan belonging to a DIFFERENT provider - should NOT be deprovisioned
+			{LeaseUUID: "other-provider-lease", ProviderUUID: "other-provider-uuid", Status: backend.ProvisionStatusReady},
+			// Orphan belonging to OUR provider - should be deprovisioned
+			{LeaseUUID: "our-orphan-lease", ProviderUUID: "provider-1", Status: backend.ProvisionStatusReady},
+			// Orphan with empty provider UUID (legacy) - should be deprovisioned (conservative)
+			{LeaseUUID: "legacy-orphan-lease", ProviderUUID: "", Status: backend.ProvisionStatusReady},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	// Verify only our orphans were deprovisioned (not the other provider's)
+	mockBackend.mu.Lock()
+	deprovisionCalls := mockBackend.deprovisionCalls
+	mockBackend.mu.Unlock()
+
+	// Should have deprovisioned 2 leases: our-orphan-lease and legacy-orphan-lease
+	// Should NOT have deprovisioned other-provider-lease
+	if len(deprovisionCalls) != 2 {
+		t.Errorf("expected 2 deprovision calls, got %d: %v", len(deprovisionCalls), deprovisionCalls)
+	}
+
+	// Verify the other provider's lease was NOT deprovisioned
+	for _, call := range deprovisionCalls {
+		if call == "other-provider-lease" {
+			t.Error("should NOT have deprovisioned lease belonging to other provider")
+		}
+	}
+}
