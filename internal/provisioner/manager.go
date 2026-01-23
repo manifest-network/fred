@@ -76,6 +76,22 @@ type ManagerConfig struct {
 
 // NewManager creates a new provision manager with Watermill routing.
 func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClient) (*Manager, error) {
+	// Validate required dependencies
+	if router == nil {
+		return nil, fmt.Errorf("router is required")
+	}
+	if chainClient == nil {
+		return nil, fmt.Errorf("chainClient is required")
+	}
+
+	// Validate required config fields
+	if cfg.ProviderUUID == "" {
+		return nil, fmt.Errorf("ProviderUUID is required")
+	}
+	if cfg.CallbackBaseURL == "" {
+		return nil, fmt.Errorf("CallbackBaseURL is required")
+	}
+
 	// Create Watermill logger adapter
 	wmLogger := watermill.NewSlogLogger(slog.Default())
 
@@ -330,9 +346,26 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 		return nil // Don't retry malformed messages
 	}
 
+	// Check if this lease is in-flight (idempotency check)
+	// Ignore callbacks for unknown/already-processed leases to prevent:
+	// - Duplicate on-chain transactions from replay attacks
+	// - Processing misrouted callbacks from other providers
+	m.inFlightMu.Lock()
+	provision, exists := m.inFlight[callback.LeaseUUID]
+	m.inFlightMu.Unlock()
+
+	if !exists {
+		slog.Warn("ignoring callback for unknown or already-processed lease",
+			"lease_uuid", callback.LeaseUUID,
+			"status", callback.Status,
+		)
+		return nil // Don't retry - this is not an error
+	}
+
 	slog.Info("processing backend callback",
 		"lease_uuid", callback.LeaseUUID,
 		"status", callback.Status,
+		"backend", provision.Backend,
 	)
 
 	switch callback.Status {
