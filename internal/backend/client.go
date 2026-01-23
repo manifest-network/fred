@@ -71,6 +71,13 @@ type CallbackPayload struct {
 // ErrNotProvisioned is returned when a lease is not yet provisioned.
 var ErrNotProvisioned = fmt.Errorf("lease not provisioned")
 
+// Provision status constants.
+const (
+	ProvisionStatusProvisioning = "provisioning"
+	ProvisionStatusReady        = "ready"
+	ProvisionStatusFailed       = "failed"
+)
+
 // HTTPClient implements Backend using HTTP calls to a backend service.
 type HTTPClient struct {
 	name       string

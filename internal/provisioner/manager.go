@@ -68,6 +68,26 @@ type inFlightProvision struct {
 	Backend   string
 }
 
+// TrackInFlight registers a lease as being provisioned.
+// This allows the manager to handle callbacks for this lease.
+func (m *Manager) TrackInFlight(leaseUUID, tenant, sku, backendName string) {
+	m.inFlightMu.Lock()
+	defer m.inFlightMu.Unlock()
+	m.inFlight[leaseUUID] = inFlightProvision{
+		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
+		SKU:       sku,
+		Backend:   backendName,
+	}
+}
+
+// UntrackInFlight removes a lease from the in-flight tracking.
+func (m *Manager) UntrackInFlight(leaseUUID string) {
+	m.inFlightMu.Lock()
+	defer m.inFlightMu.Unlock()
+	delete(m.inFlight, leaseUUID)
+}
+
 // ManagerConfig configures the provision manager.
 type ManagerConfig struct {
 	ProviderUUID    string
@@ -222,7 +242,7 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 		"tenant", event.Tenant,
 	)
 
-	// TODO(phase-2): Implement SKU-based routing.
+	// TODO(phase-3): Implement SKU-based routing.
 	// Currently we always use the default backend. To route by SKU prefix
 	// (as documented in config), we need to fetch lease details from chain
 	// to get the SKU, then call m.router.Route(sku). For now, all leases

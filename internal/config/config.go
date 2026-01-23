@@ -67,6 +67,9 @@ type Config struct {
 	Backends        []BackendConfig `mapstructure:"backends"`
 	CallbackBaseURL string          `mapstructure:"callback_base_url"`
 	CallbackSecret  string          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
+
+	// Reconciliation configuration
+	ReconciliationInterval time.Duration `mapstructure:"reconciliation_interval"`
 }
 
 // BackendConfig configures a single provisioning backend.
@@ -127,6 +130,9 @@ func Load(configPath string) (*Config, error) {
 	// Credit check defaults
 	v.SetDefault("credit_check_error_threshold", 3)
 	v.SetDefault("credit_check_retry_interval", "30s")
+
+	// Reconciliation defaults
+	v.SetDefault("reconciliation_interval", "5m")
 
 	// Environment variable support
 	v.SetEnvPrefix("PROVIDER")
@@ -242,6 +248,11 @@ func (c *Config) Validate() error {
 	}
 	if c.CreditCheckRetryInterval <= 0 {
 		return fmt.Errorf("credit_check_retry_interval must be positive")
+	}
+
+	// Reconciliation validations
+	if c.ReconciliationInterval <= 0 {
+		return fmt.Errorf("reconciliation_interval must be positive")
 	}
 
 	// URL/endpoint validations

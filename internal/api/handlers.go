@@ -140,7 +140,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get lease info from backend
-	// TODO(phase-2): Implement SKU-based routing.
+	// TODO(phase-3): Implement SKU-based routing.
 	// Currently we always use the default backend. To route by SKU prefix,
 	// we should call h.backendRouter.Route(lease.Sku). For now, tenants whose
 	// leases were provisioned on a non-default backend may get 404/incorrect info.

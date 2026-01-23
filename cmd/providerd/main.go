@@ -206,6 +206,16 @@ func run(cmd *cobra.Command, args []string) error {
 		CreditCheckRetryInterval:  cfg.CreditCheckRetryInterval,
 	})
 
+	// Create reconciler for level-triggered state reconciliation
+	reconciler, err := provisioner.NewReconciler(provisioner.ReconcilerConfig{
+		ProviderUUID:    cfg.ProviderUUID,
+		CallbackBaseURL: cfg.CallbackBaseURL,
+		Interval:        cfg.ReconciliationInterval,
+	}, chainClient, backendRouter, provisionMgr)
+	if err != nil {
+		return fmt.Errorf("failed to create reconciler: %w", err)
+	}
+
 	// Wire up cross-provider credit depletion detection
 	// When another provider's withdrawal depletes a tenant's credit, trigger our withdrawal
 	// to auto-close our leases for that tenant
@@ -216,9 +226,17 @@ func run(cmd *cobra.Command, args []string) error {
 	slog.Info("performing initial withdrawal")
 	withdrawScheduler.WithdrawOnce(ctx)
 
+	// Run startup reconciliation to recover from any crash
+	// This compares chain state vs backend state and fixes inconsistencies
+	slog.Info("performing startup reconciliation")
+	if err := reconciler.RunOnce(ctx); err != nil {
+		slog.Error("startup reconciliation failed", "error", err)
+		// Continue anyway - periodic reconciliation will retry
+	}
+
 	// Start background components with WaitGroup for graceful shutdown
 	var wg sync.WaitGroup
-	errChan := make(chan error, 6)
+	errChan := make(chan error, 7)
 
 	// Start event subscriber (single reader, multiple consumers via Subscribe())
 	wg.Go(func() {
@@ -260,9 +278,17 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	})
 
+	// Start periodic reconciliation
+	wg.Go(func() {
+		if err := reconciler.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errChan <- fmt.Errorf("reconciler error: %w", err)
+		}
+	})
+
 	slog.Info("providerd started successfully",
 		"api_addr", cfg.APIListenAddr,
 		"withdraw_interval", cfg.WithdrawInterval,
+		"reconciliation_interval", cfg.ReconciliationInterval,
 		"rate_limit_rps", cfg.RateLimitRPS,
 		"rate_limit_burst", cfg.RateLimitBurst,
 		"backends", len(cfg.Backends),
