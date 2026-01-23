@@ -26,7 +26,7 @@ type Reconciler struct {
 	callbackBaseURL string
 	chainClient     ReconcilerChainClient
 	backendRouter   *backend.Router
-	manager         *Manager // For publishing events to Watermill
+	manager         *Manager // For tracking in-flight provisions (shared state with event-driven path)
 
 	interval time.Duration
 	mu       sync.Mutex
@@ -77,7 +77,9 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 // | Chain State | Backend State | Action |
 // |-------------|---------------|--------|
 // | PENDING     | Not provisioned | Start provisioning |
+// | PENDING     | Provisioning (in progress) | Nothing (wait for callback) |
 // | PENDING     | Provisioned + ready | Acknowledge lease |
+// | PENDING     | Provisioned + failed | Log warning (wait for expiry) |
 // | ACTIVE      | Provisioned | Nothing (healthy) |
 // | ACTIVE      | Not provisioned | Anomaly: Log + provision |
 // | Not found   | Provisioned | Orphan: Deprovision |
@@ -160,6 +162,13 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 
 		switch {
 		case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:
+			// Check if already being provisioned by the event-driven path
+			if r.manager != nil && r.manager.IsInFlight(leaseUUID) {
+				slog.Debug("reconcile: lease already in-flight, skipping",
+					"lease_uuid", leaseUUID,
+				)
+				continue
+			}
 			// TODO(phase-4): Check for meta_hash and await payload upload
 			// before starting provisioning. For now, start immediately.
 			if err := r.startProvisioning(ctx, lease); err != nil {
@@ -181,6 +190,20 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 			} else {
 				acknowledged++
 			}
+
+		case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusProvisioning:
+			// Provisioning in progress - wait for callback
+			slog.Debug("reconcile: lease provisioning in progress",
+				"lease_uuid", leaseUUID,
+			)
+
+		case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusFailed:
+			// Provisioning failed - lease will eventually expire
+			// TODO(phase-3): Consider calling RejectLease here
+			slog.Warn("reconcile: lease provisioning failed, waiting for expiry",
+				"lease_uuid", leaseUUID,
+				"tenant", lease.Tenant,
+			)
 
 		case lease.State == billingtypes.LEASE_STATE_ACTIVE && !isProvisioned:
 			// Anomaly: Lease is active but not provisioned
@@ -253,8 +276,6 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 		return fmt.Errorf("no backend available")
 	}
 
-	callbackURL := fmt.Sprintf("%s/callbacks/provision", r.callbackBaseURL)
-
 	// Track in manager's in-flight map if manager is available
 	// This allows the manager to handle callbacks for this lease
 	if r.manager != nil {
@@ -267,7 +288,7 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 		Tenant:       lease.Tenant,
 		ProviderUUID: r.providerUUID,
 		// TODO(phase-3): Extract SKU from lease.Items for routing
-		CallbackURL: callbackURL,
+		CallbackURL: r.callbackURL(),
 	})
 	if err != nil {
 		// Clean up in-flight on error
@@ -327,4 +348,9 @@ func (r *Reconciler) Start(ctx context.Context) error {
 // RunOnce performs a single reconciliation. Use this at startup.
 func (r *Reconciler) RunOnce(ctx context.Context) error {
 	return r.ReconcileAll(ctx)
+}
+
+// callbackURL returns the callback URL for backend provisioning.
+func (r *Reconciler) callbackURL() string {
+	return r.callbackBaseURL + "/callbacks/provision"
 }

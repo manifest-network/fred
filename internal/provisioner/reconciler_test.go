@@ -11,48 +11,8 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/chain"
 )
-
-// mockReconcilerChainClient implements ReconcilerChainClient for testing.
-type mockReconcilerChainClient struct {
-	mu                  sync.Mutex
-	pendingLeases       []billingtypes.Lease
-	activeLeases        []billingtypes.Lease
-	acknowledgedLeases  []string
-	getPendingErr       error
-	getActiveErr        error
-	acknowledgeErr      error
-	acknowledgeCount    uint64
-}
-
-func (m *mockReconcilerChainClient) GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.getPendingErr != nil {
-		return nil, m.getPendingErr
-	}
-	return m.pendingLeases, nil
-}
-
-func (m *mockReconcilerChainClient) GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.getActiveErr != nil {
-		return nil, m.getActiveErr
-	}
-	return m.activeLeases, nil
-}
-
-func (m *mockReconcilerChainClient) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.acknowledgeErr != nil {
-		return 0, nil, m.acknowledgeErr
-	}
-	m.acknowledgedLeases = append(m.acknowledgedLeases, leaseUUIDs...)
-	m.acknowledgeCount += uint64(len(leaseUUIDs))
-	return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
-}
 
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
@@ -105,7 +65,7 @@ func (m *mockReconcilerBackend) ListProvisions(ctx context.Context) ([]backend.P
 }
 
 func TestNewReconciler_Validation(t *testing.T) {
-	mockChain := &mockReconcilerChainClient{}
+	mockChain := &chain.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -176,9 +136,11 @@ func TestNewReconciler_Validation(t *testing.T) {
 func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	// Setup: Pending lease on chain, not provisioned on backend
 	// Expected: Start provisioning
-	mockChain := &mockReconcilerChainClient{
-		pendingLeases: []billingtypes.Lease{
-			{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
 		},
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -216,9 +178,20 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	// Setup: Pending lease on chain, provisioned and ready on backend
 	// Expected: Acknowledge the lease
-	mockChain := &mockReconcilerChainClient{
-		pendingLeases: []billingtypes.Lease{
-			{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+	var acknowledgedLeases []string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			acknowledgedLeases = append(acknowledgedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 		},
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -245,22 +218,24 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	}
 
 	// Verify lease was acknowledged
-	mockChain.mu.Lock()
-	defer mockChain.mu.Unlock()
-	if len(mockChain.acknowledgedLeases) != 1 {
-		t.Errorf("expected 1 acknowledged lease, got %d", len(mockChain.acknowledgedLeases))
+	mu.Lock()
+	defer mu.Unlock()
+	if len(acknowledgedLeases) != 1 {
+		t.Errorf("expected 1 acknowledged lease, got %d", len(acknowledgedLeases))
 	}
-	if mockChain.acknowledgedLeases[0] != "lease-1" {
-		t.Errorf("expected lease-1, got %s", mockChain.acknowledgedLeases[0])
+	if acknowledgedLeases[0] != "lease-1" {
+		t.Errorf("expected lease-1, got %s", acknowledgedLeases[0])
 	}
 }
 
 func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 	// Setup: Active lease on chain, not provisioned on backend (anomaly)
 	// Expected: Log anomaly and attempt to provision
-	mockChain := &mockReconcilerChainClient{
-		activeLeases: []billingtypes.Lease{
-			{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
 		},
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -295,9 +270,20 @@ func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	// Setup: Active lease on chain, provisioned on backend
 	// Expected: Nothing (healthy state)
-	mockChain := &mockReconcilerChainClient{
-		activeLeases: []billingtypes.Lease{
-			{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+	var acknowledgeCount int
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			acknowledgeCount += len(leaseUUIDs)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 		},
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -329,9 +315,9 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	deprovisionCount := len(mockBackend.deprovisionCalls)
 	mockBackend.mu.Unlock()
 
-	mockChain.mu.Lock()
-	acknowledgeCount := len(mockChain.acknowledgedLeases)
-	mockChain.mu.Unlock()
+	mu.Lock()
+	ackCount := acknowledgeCount
+	mu.Unlock()
 
 	if provisionCount != 0 {
 		t.Errorf("expected 0 provision calls, got %d", provisionCount)
@@ -339,16 +325,16 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	if deprovisionCount != 0 {
 		t.Errorf("expected 0 deprovision calls, got %d", deprovisionCount)
 	}
-	if acknowledgeCount != 0 {
-		t.Errorf("expected 0 acknowledge calls, got %d", acknowledgeCount)
+	if ackCount != 0 {
+		t.Errorf("expected 0 acknowledge calls, got %d", ackCount)
 	}
 }
 
 func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 	// Setup: No lease on chain, but provisioned on backend (orphan)
 	// Expected: Deprovision the orphan
-	mockChain := &mockReconcilerChainClient{
-		// No leases
+	mockChain := &chain.MockClient{
+		// No leases - default funcs return empty slices
 	}
 	mockBackend := &mockReconcilerBackend{
 		name: "test",
@@ -392,29 +378,37 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 	})
 
 	tests := []struct {
-		name          string
-		getPendingErr error
-		getActiveErr  error
-		wantErr       string
+		name    string
+		setup   func() *chain.MockClient
+		wantErr string
 	}{
 		{
-			name:          "get pending error",
-			getPendingErr: errors.New("chain unavailable"),
-			wantErr:       "failed to get pending leases",
+			name: "get pending error",
+			setup: func() *chain.MockClient {
+				return &chain.MockClient{
+					GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+						return nil, errors.New("chain unavailable")
+					},
+				}
+			},
+			wantErr: "failed to get pending leases",
 		},
 		{
-			name:         "get active error",
-			getActiveErr: errors.New("chain unavailable"),
-			wantErr:      "failed to get active leases",
+			name: "get active error",
+			setup: func() *chain.MockClient {
+				return &chain.MockClient{
+					GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+						return nil, errors.New("chain unavailable")
+					},
+				}
+			},
+			wantErr: "failed to get active leases",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockChain := &mockReconcilerChainClient{
-				getPendingErr: tt.getPendingErr,
-				getActiveErr:  tt.getActiveErr,
-			}
+			mockChain := tt.setup()
 
 			reconciler, err := NewReconciler(ReconcilerConfig{
 				ProviderUUID:    "provider-1",
@@ -437,9 +431,11 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 
 func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 	// Test that ReconcileAll respects context cancellation
-	mockChain := &mockReconcilerChainClient{
-		pendingLeases: []billingtypes.Lease{
-			{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
 		},
 	}
 	mockBackend := &mockReconcilerBackend{name: "test"}
@@ -467,7 +463,7 @@ func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 
 func TestReconciler_Start_ContextCancellation(t *testing.T) {
 	// Test that Start respects context cancellation
-	mockChain := &mockReconcilerChainClient{}
+	mockChain := &chain.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -506,7 +502,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 }
 
 func TestReconciler_DefaultInterval(t *testing.T) {
-	mockChain := &mockReconcilerChainClient{}
+	mockChain := &chain.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -530,9 +526,11 @@ func TestReconciler_DefaultInterval(t *testing.T) {
 
 func TestReconciler_RunOnce(t *testing.T) {
 	// Verify RunOnce calls ReconcileAll
-	mockChain := &mockReconcilerChainClient{
-		pendingLeases: []billingtypes.Lease{
-			{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
 		},
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -564,9 +562,54 @@ func TestReconciler_RunOnce(t *testing.T) {
 	}
 }
 
+func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
+	// Test that reconciler skips leases that are already being provisioned
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{}, // Not provisioned yet
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	// Create a manager and mark the lease as in-flight
+	manager, _ := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, &chain.MockClient{})
+	manager.TrackInFlight("lease-1", "tenant-1", "", "test")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, manager)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	// Verify provisioning was NOT started (lease is in-flight)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 0 {
+		t.Errorf("expected 0 provision calls (lease in-flight), got %d", len(mockBackend.provisionCalls))
+	}
+}
+
 func TestReconciler_MultipleBackends(t *testing.T) {
 	// Test reconciliation with multiple backends
-	mockChain := &mockReconcilerChainClient{}
+	mockChain := &chain.MockClient{}
 
 	backend1 := &mockReconcilerBackend{
 		name: "backend1",
@@ -613,5 +656,219 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 	// Total deprovisions should be 2
 	if b1Calls+b2Calls != 2 {
 		t.Errorf("expected 2 total deprovision calls, got %d", b1Calls+b2Calls)
+	}
+}
+
+func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
+	// Setup: Pending lease on chain, provisioning in progress on backend
+	// Expected: Wait (do nothing) - let the callback complete the flow
+	var acknowledgeCount int
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			acknowledgeCount += len(leaseUUIDs)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusProvisioning},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	// Verify no actions were taken
+	mockBackend.mu.Lock()
+	provisionCount := len(mockBackend.provisionCalls)
+	deprovisionCount := len(mockBackend.deprovisionCalls)
+	mockBackend.mu.Unlock()
+
+	mu.Lock()
+	ackCount := acknowledgeCount
+	mu.Unlock()
+
+	if provisionCount != 0 {
+		t.Errorf("expected 0 provision calls (already provisioning), got %d", provisionCount)
+	}
+	if deprovisionCount != 0 {
+		t.Errorf("expected 0 deprovision calls, got %d", deprovisionCount)
+	}
+	if ackCount != 0 {
+		t.Errorf("expected 0 acknowledge calls (not ready yet), got %d", ackCount)
+	}
+}
+
+func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
+	// Setup: Pending lease on chain, provisioning failed on backend
+	// Expected: Log warning, wait for expiry (no retry in reconciler)
+	var acknowledgeCount int
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			acknowledgeCount += len(leaseUUIDs)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailed},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	// Verify no actions were taken (lease will expire naturally)
+	mockBackend.mu.Lock()
+	provisionCount := len(mockBackend.provisionCalls)
+	deprovisionCount := len(mockBackend.deprovisionCalls)
+	mockBackend.mu.Unlock()
+
+	mu.Lock()
+	ackCount := acknowledgeCount
+	mu.Unlock()
+
+	if provisionCount != 0 {
+		t.Errorf("expected 0 provision calls (failed, waiting for expiry), got %d", provisionCount)
+	}
+	if deprovisionCount != 0 {
+		t.Errorf("expected 0 deprovision calls, got %d", deprovisionCount)
+	}
+	if ackCount != 0 {
+		t.Errorf("expected 0 acknowledge calls (failed provisioning), got %d", ackCount)
+	}
+}
+
+func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
+	// Test that acknowledge failure is logged but doesn't stop reconciliation
+	acknowledgeErr := errors.New("chain unavailable")
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+				{Uuid: "lease-2", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			return 0, nil, acknowledgeErr
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+			{LeaseUUID: "lease-2", Status: backend.ProvisionStatusReady},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	// ReconcileAll should succeed even if individual acknowledges fail
+	// (errors are logged, not propagated)
+	err = reconciler.ReconcileAll(ctx)
+	if err != nil {
+		t.Errorf("ReconcileAll() error = %v, want nil (acknowledge errors should be logged, not returned)", err)
+	}
+}
+
+func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
+	// Test that deprovision failure during orphan cleanup is logged but continues
+	deprovisionErr := errors.New("backend unavailable")
+
+	mockChain := &chain.MockClient{
+		// No leases - both provisions are orphans
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "orphan-1", Status: backend.ProvisionStatusReady},
+			{LeaseUUID: "orphan-2", Status: backend.ProvisionStatusReady},
+		},
+		deprovisionErr: deprovisionErr,
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	// ReconcileAll should succeed even if deprovisions fail
+	// (errors are logged, not propagated)
+	err = reconciler.ReconcileAll(ctx)
+	if err != nil {
+		t.Errorf("ReconcileAll() error = %v, want nil (deprovision errors should be logged, not returned)", err)
+	}
+
+	// Verify both deprovisions were attempted
+	mockBackend.mu.Lock()
+	deprovisionCount := len(mockBackend.deprovisionCalls)
+	mockBackend.mu.Unlock()
+
+	if deprovisionCount != 2 {
+		t.Errorf("expected 2 deprovision attempts (even with errors), got %d", deprovisionCount)
 	}
 }

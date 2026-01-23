@@ -78,6 +78,12 @@ const (
 	ProvisionStatusFailed       = "failed"
 )
 
+// Callback status constants.
+const (
+	CallbackStatusSuccess = "success"
+	CallbackStatusFailed  = "failed"
+)
+
 // HTTPClient implements Backend using HTTP calls to a backend service.
 type HTTPClient struct {
 	name       string
