@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -70,7 +71,7 @@ type CallbackPayload struct {
 }
 
 // ErrNotProvisioned is returned when a lease is not yet provisioned.
-var ErrNotProvisioned = fmt.Errorf("lease not provisioned")
+var ErrNotProvisioned = errors.New("lease not provisioned")
 
 // Provision status constants.
 const (

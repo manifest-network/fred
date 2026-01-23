@@ -163,6 +163,11 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 
 	slog.Info("fetched backend provisions", "total", len(allProvisions))
 
+	// Check for cancellation before reconciliation loop
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// 3. Reconcile each chain lease
 	var (
 		provisioned  int
