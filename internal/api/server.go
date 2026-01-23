@@ -145,7 +145,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if callback.Status != "success" && callback.Status != "failed" {
+	if callback.Status != backend.CallbackStatusSuccess && callback.Status != backend.CallbackStatusFailed {
 		writeError(w, "status must be 'success' or 'failed'", http.StatusBadRequest)
 		return
 	}

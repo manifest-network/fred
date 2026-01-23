@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +13,8 @@ import (
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/ThreeDotsLabs/watermill/message/router/middleware"
 	"github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
@@ -45,11 +46,11 @@ func isTerminalAcknowledgeError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
-	// Chain returns "lease not in pending state" when the lease is already ACTIVE
-	// or in another terminal state. Retrying is pointless.
-	return strings.Contains(errStr, "not in PENDING state") ||
-		strings.Contains(errStr, "lease not found")
+	// Check against specific billing module errors using errors.Is().
+	// ErrLeaseNotPending: lease is already ACTIVE or in another terminal state.
+	// ErrLeaseNotFound: lease doesn't exist (may have been deleted).
+	return errors.Is(err, billingtypes.ErrLeaseNotPending) ||
+		errors.Is(err, billingtypes.ErrLeaseNotFound)
 }
 
 // Watermill topic names for internal event routing.

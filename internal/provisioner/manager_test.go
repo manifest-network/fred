@@ -732,9 +732,10 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 }
 
 func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
-	// Test that "not in PENDING state" errors are treated as terminal (success)
+	// Test that ErrLeaseNotPending errors are treated as terminal (success)
 	// This prevents infinite retry loops when the lease is already acknowledged.
-	terminalErr := errors.New("failed to acknowledge leases: lease not in PENDING state")
+	// Code 22 is ErrLeaseNotPending in the billing module.
+	terminalErr := &chain.ChainTxError{Code: 22, Codespace: "billing", RawLog: "lease not in pending state"}
 
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -793,19 +794,24 @@ func TestManager_IsTerminalAcknowledgeError(t *testing.T) {
 			terminal: false,
 		},
 		{
-			name:     "not in PENDING state",
-			err:      errors.New("lease 123 is not in PENDING state"),
+			name:     "lease not pending - chain error",
+			err:      &chain.ChainTxError{Code: 22, Codespace: "billing", RawLog: "lease not in pending state"},
 			terminal: true,
 		},
 		{
-			name:     "wrapped not in PENDING state",
-			err:      errors.New("failed to acknowledge: transaction failed: lease not in PENDING state"),
+			name:     "lease not found - chain error",
+			err:      &chain.ChainTxError{Code: 2, Codespace: "billing", RawLog: "lease not found"},
 			terminal: true,
 		},
 		{
-			name:     "lease not found",
-			err:      errors.New("lease not found"),
-			terminal: true,
+			name:     "wrong codespace - not terminal",
+			err:      &chain.ChainTxError{Code: 22, Codespace: "other-module", RawLog: "some error"},
+			terminal: false,
+		},
+		{
+			name:     "wrong code - not terminal",
+			err:      &chain.ChainTxError{Code: 999, Codespace: "billing", RawLog: "some error"},
+			terminal: false,
 		},
 	}
 

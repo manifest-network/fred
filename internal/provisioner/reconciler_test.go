@@ -1036,3 +1036,70 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 		t.Errorf("ReconcileAll() made %d additional provision calls, want 0 (lease is in-flight)", additionalProvisions)
 	}
 }
+
+func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
+	// Test that concurrent reconciliation attempts don't block - they skip instead.
+	// This verifies the atomic flag approach works correctly.
+	reconcileStarted := make(chan struct{})
+	reconcileCanContinue := make(chan struct{})
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			// Signal that reconciliation has started
+			close(reconcileStarted)
+			// Wait for permission to continue (simulates long-running operation)
+			<-reconcileCanContinue
+			return nil, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	// Start first reconciliation in background
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- reconciler.ReconcileAll(context.Background())
+	}()
+
+	// Wait for first reconciliation to start
+	<-reconcileStarted
+
+	// Try second reconciliation - should return immediately (non-blocking)
+	secondStart := time.Now()
+	err = reconciler.ReconcileAll(context.Background())
+	secondDuration := time.Since(secondStart)
+
+	// Second call should return quickly (not block waiting for first)
+	if secondDuration > 100*time.Millisecond {
+		t.Errorf("concurrent ReconcileAll() took %v, expected to return immediately", secondDuration)
+	}
+
+	// No error expected - it just skips
+	if err != nil {
+		t.Errorf("concurrent ReconcileAll() error = %v, want nil", err)
+	}
+
+	// Let first reconciliation complete
+	close(reconcileCanContinue)
+	if err := <-firstDone; err != nil {
+		t.Errorf("first ReconcileAll() error = %v", err)
+	}
+
+	// After first completes, a new reconciliation should be allowed
+	mockChain.GetPendingLeasesFunc = func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+		return nil, nil
+	}
+	if err := reconciler.ReconcileAll(context.Background()); err != nil {
+		t.Errorf("subsequent ReconcileAll() error = %v", err)
+	}
+}

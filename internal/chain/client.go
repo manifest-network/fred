@@ -279,7 +279,11 @@ func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, err
 
 	// SYNC mode only confirms mempool acceptance, not execution
 	if resp.TxResponse.Code != 0 {
-		return "", fmt.Errorf("transaction rejected: %s", resp.TxResponse.RawLog)
+		return "", &ChainTxError{
+			Code:      resp.TxResponse.Code,
+			Codespace: resp.TxResponse.Codespace,
+			RawLog:    resp.TxResponse.RawLog,
+		}
 	}
 
 	// Wait for tx to be included in a block and check execution result
@@ -290,7 +294,11 @@ func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, err
 	}
 
 	if execResp.TxResponse.Code != 0 {
-		return "", fmt.Errorf("transaction failed (code %d): %s", execResp.TxResponse.Code, execResp.TxResponse.RawLog)
+		return "", &ChainTxError{
+			Code:      execResp.TxResponse.Code,
+			Codespace: execResp.TxResponse.Codespace,
+			RawLog:    execResp.TxResponse.RawLog,
+		}
 	}
 
 	return txHash, nil

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
@@ -34,8 +34,8 @@ type Reconciler struct {
 	backendRouter   *backend.Router
 	manager         *Manager // For tracking in-flight provisions (shared state with event-driven path)
 
-	interval time.Duration
-	mu       sync.Mutex
+	interval    time.Duration
+	reconciling atomic.Bool // Non-blocking flag to prevent concurrent reconciliation
 }
 
 // ReconcilerConfig configures the reconciler.
@@ -90,8 +90,13 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 // | ACTIVE      | Not provisioned | Anomaly: Log + provision |
 // | Not found   | Provisioned | Orphan: Deprovision |
 func (r *Reconciler) ReconcileAll(ctx context.Context) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Use atomic flag to prevent concurrent reconciliation without blocking.
+	// If reconciliation is already in progress, skip this run.
+	if !r.reconciling.CompareAndSwap(false, true) {
+		slog.Debug("reconciliation already in progress, skipping")
+		return nil
+	}
+	defer r.reconciling.Store(false)
 
 	// Check for cancellation before starting
 	if err := ctx.Err(); err != nil {
@@ -255,23 +260,26 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 			continue
 		}
 
-		// Count only orphans that will actually be deprovisioned
-		orphans++
-		slog.Warn("reconcile: orphan provision found",
-			"lease_uuid", leaseUUID,
-			"backend", provision.BackendName,
-		)
-
+		// Look up the backend that originally provisioned this resource.
+		// We must use the same backend for deprovisioning - falling back to a
+		// different backend would fail since it doesn't have the resource.
 		b := r.backendRouter.GetBackendByName(provision.BackendName)
 		if b == nil {
-			b = r.backendRouter.Default()
-		}
-		if b == nil {
-			slog.Error("reconcile: no backend available to deprovision orphan",
+			// Backend is no longer configured. This orphan requires manual cleanup.
+			// Do NOT fall back to default backend - it can't deprovision resources
+			// from a different backend system.
+			slog.Error("reconcile: orphan provision on unconfigured backend - MANUAL CLEANUP REQUIRED",
 				"lease_uuid", leaseUUID,
+				"backend", provision.BackendName,
 			)
 			continue
 		}
+
+		orphans++
+		slog.Warn("reconcile: orphan provision found, deprovisioning",
+			"lease_uuid", leaseUUID,
+			"backend", provision.BackendName,
+		)
 
 		if err := b.Deprovision(ctx, leaseUUID); err != nil {
 			slog.Error("reconcile: failed to deprovision orphan",
