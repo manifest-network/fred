@@ -128,3 +128,8 @@ max_request_body_size: 1048576  # 1MB
 # Credit check configuration
 credit_check_error_threshold: 3
 credit_check_retry_interval: "30s"
+
+# Reconciliation configuration
+# How often to run level-triggered reconciliation (compares chain state vs backend state)
+# This provides crash recovery and consistency checks
+reconciliation_interval: "5m"

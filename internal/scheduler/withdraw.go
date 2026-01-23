@@ -37,9 +37,9 @@ type ChainClient interface {
 // treats each denom independently and finds the earliest depletion time.
 // Multi-denom support with proportional burn rates is not implemented.
 type tenantState struct {
-	lastBalance      sdktypes.Coins
-	lastCheckTime    time.Time
-	consecutiveErrs  int // Track consecutive errors fetching credit account
+	lastBalance     sdktypes.Coins
+	lastCheckTime   time.Time
+	consecutiveErrs int // Track consecutive errors fetching credit account
 }
 
 // WithdrawScheduler periodically withdraws funds from active leases and

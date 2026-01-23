@@ -26,13 +26,14 @@ type MockBackend struct {
 }
 
 type mockProvision struct {
-	LeaseUUID   string
-	Tenant      string
-	SKU         string
-	Status      string // "provisioning", "ready", "failed"
-	CreatedAt   time.Time
-	Payload     []byte
-	PayloadHash string
+	LeaseUUID    string
+	ProviderUUID string
+	Tenant       string
+	SKU          string
+	Status       string // "provisioning", "ready", "failed"
+	CreatedAt    time.Time
+	Payload      []byte
+	PayloadHash  string
 }
 
 // MockBackendConfig configures a mock backend.
@@ -80,13 +81,14 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 
 	// Create provision record
 	provision := &mockProvision{
-		LeaseUUID:   req.LeaseUUID,
-		Tenant:      req.Tenant,
-		SKU:         req.SKU,
-		Status:      "provisioning",
-		CreatedAt:   time.Now(),
-		Payload:     req.Payload,
-		PayloadHash: req.PayloadHash,
+		LeaseUUID:    req.LeaseUUID,
+		ProviderUUID: req.ProviderUUID,
+		Tenant:       req.Tenant,
+		SKU:          req.SKU,
+		Status:       "provisioning",
+		CreatedAt:    time.Now(),
+		Payload:      req.Payload,
+		PayloadHash:  req.PayloadHash,
 	}
 	m.provisions[req.LeaseUUID] = provision
 
@@ -173,9 +175,10 @@ func (m *MockBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, erro
 	var result []ProvisionInfo
 	for _, p := range m.provisions {
 		result = append(result, ProvisionInfo{
-			LeaseUUID: p.LeaseUUID,
-			Status:    p.Status,
-			CreatedAt: p.CreatedAt,
+			LeaseUUID:    p.LeaseUUID,
+			ProviderUUID: p.ProviderUUID,
+			Status:       p.Status,
+			CreatedAt:    p.CreatedAt,
 		})
 	}
 

@@ -26,9 +26,9 @@ type Config struct {
 	KeyringBackend    string        `mapstructure:"keyring_backend"`
 	KeyringDir        string        `mapstructure:"keyring_dir"`
 	KeyName           string        `mapstructure:"key_name"`
-	APIListenAddr    string        `mapstructure:"api_listen_addr"`
-	WithdrawInterval time.Duration `mapstructure:"withdraw_interval"`
-	TLSCertFile      string        `mapstructure:"tls_cert_file"`
+	APIListenAddr     string        `mapstructure:"api_listen_addr"`
+	WithdrawInterval  time.Duration `mapstructure:"withdraw_interval"`
+	TLSCertFile       string        `mapstructure:"tls_cert_file"`
 	TLSKeyFile        string        `mapstructure:"tls_key_file"`
 	Bech32Prefix      string        `mapstructure:"bech32_prefix"`
 	RateLimitRPS      float64       `mapstructure:"rate_limit_rps"`
@@ -67,6 +67,9 @@ type Config struct {
 	Backends        []BackendConfig `mapstructure:"backends"`
 	CallbackBaseURL string          `mapstructure:"callback_base_url"`
 	CallbackSecret  string          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
+
+	// Reconciliation configuration
+	ReconciliationInterval time.Duration `mapstructure:"reconciliation_interval"`
 }
 
 // BackendConfig configures a single provisioning backend.
@@ -96,13 +99,13 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("api_listen_addr", ":8080")
 	v.SetDefault("withdraw_interval", "1h")
 	v.SetDefault("bech32_prefix", "manifest")
-	v.SetDefault("rate_limit_rps", 10.0)   // 10 requests per second
-	v.SetDefault("rate_limit_burst", 20)   // burst of 20 requests
+	v.SetDefault("rate_limit_rps", 10.0) // 10 requests per second
+	v.SetDefault("rate_limit_burst", 20) // burst of 20 requests
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
 	v.SetDefault("gas_limit", 500000)
-	v.SetDefault("gas_price", 25)        // price per gas unit in smallest denom
+	v.SetDefault("gas_price", 25) // price per gas unit in smallest denom
 	v.SetDefault("fee_denom", "umfx")
 
 	// Timeout defaults
@@ -127,6 +130,9 @@ func Load(configPath string) (*Config, error) {
 	// Credit check defaults
 	v.SetDefault("credit_check_error_threshold", 3)
 	v.SetDefault("credit_check_retry_interval", "30s")
+
+	// Reconciliation defaults
+	v.SetDefault("reconciliation_interval", "5m")
 
 	// Environment variable support
 	v.SetEnvPrefix("PROVIDER")
@@ -242,6 +248,11 @@ func (c *Config) Validate() error {
 	}
 	if c.CreditCheckRetryInterval <= 0 {
 		return fmt.Errorf("credit_check_retry_interval must be positive")
+	}
+
+	// Reconciliation validations
+	if c.ReconciliationInterval <= 0 {
+		return fmt.Errorf("reconciliation_interval must be positive")
 	}
 
 	// URL/endpoint validations

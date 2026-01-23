@@ -8,6 +8,7 @@ import (
 // Router routes requests to backends based on SKU matching.
 type Router struct {
 	backends       []backendEntry
+	backendsByName map[string]Backend // O(1) lookup by name
 	defaultBackend Backend
 }
 
@@ -40,7 +41,9 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		return nil, fmt.Errorf("at least one backend is required")
 	}
 
-	r := &Router{}
+	r := &Router{
+		backendsByName: make(map[string]Backend),
+	}
 
 	for i, entry := range cfg.Backends {
 		if entry.Backend == nil {
@@ -51,6 +54,12 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 			backend: entry.Backend,
 			match:   entry.Match,
 		})
+
+		// Build name lookup map (first backend with a given name wins)
+		name := entry.Backend.Name()
+		if _, exists := r.backendsByName[name]; !exists {
+			r.backendsByName[name] = entry.Backend
+		}
 
 		if entry.IsDefault {
 			if r.defaultBackend != nil {
@@ -116,12 +125,7 @@ func (r *Router) Backends() []Backend {
 	return backends
 }
 
-// GetBackendByName returns a backend by its name.
+// GetBackendByName returns a backend by its name. Returns nil if not found.
 func (r *Router) GetBackendByName(name string) Backend {
-	for _, entry := range r.backends {
-		if entry.backend.Name() == name {
-			return entry.backend
-		}
-	}
-	return nil
+	return r.backendsByName[name]
 }
