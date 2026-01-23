@@ -451,7 +451,12 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 		)
 
 	default:
-		slog.Warn("ignoring callback with unknown status",
+		// Unknown status is treated as terminal to prevent leases from being stuck
+		// in the in-flight map indefinitely. The reconciler will pick up the lease
+		// and handle it based on its actual chain/backend state.
+		m.UntrackInFlight(callback.LeaseUUID)
+
+		slog.Warn("unknown callback status, treating as terminal",
 			"lease_uuid", callback.LeaseUUID,
 			"status", callback.Status,
 		)

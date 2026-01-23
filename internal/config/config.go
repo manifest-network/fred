@@ -26,9 +26,9 @@ type Config struct {
 	KeyringBackend    string        `mapstructure:"keyring_backend"`
 	KeyringDir        string        `mapstructure:"keyring_dir"`
 	KeyName           string        `mapstructure:"key_name"`
-	APIListenAddr    string        `mapstructure:"api_listen_addr"`
-	WithdrawInterval time.Duration `mapstructure:"withdraw_interval"`
-	TLSCertFile      string        `mapstructure:"tls_cert_file"`
+	APIListenAddr     string        `mapstructure:"api_listen_addr"`
+	WithdrawInterval  time.Duration `mapstructure:"withdraw_interval"`
+	TLSCertFile       string        `mapstructure:"tls_cert_file"`
 	TLSKeyFile        string        `mapstructure:"tls_key_file"`
 	Bech32Prefix      string        `mapstructure:"bech32_prefix"`
 	RateLimitRPS      float64       `mapstructure:"rate_limit_rps"`
@@ -99,13 +99,13 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("api_listen_addr", ":8080")
 	v.SetDefault("withdraw_interval", "1h")
 	v.SetDefault("bech32_prefix", "manifest")
-	v.SetDefault("rate_limit_rps", 10.0)   // 10 requests per second
-	v.SetDefault("rate_limit_burst", 20)   // burst of 20 requests
+	v.SetDefault("rate_limit_rps", 10.0) // 10 requests per second
+	v.SetDefault("rate_limit_burst", 20) // burst of 20 requests
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
 	v.SetDefault("gas_limit", 500000)
-	v.SetDefault("gas_price", 25)        // price per gas unit in smallest denom
+	v.SetDefault("gas_price", 25) // price per gas unit in smallest denom
 	v.SetDefault("fee_denom", "umfx")
 
 	// Timeout defaults

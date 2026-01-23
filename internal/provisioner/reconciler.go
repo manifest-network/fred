@@ -138,6 +138,8 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 		}
 
 		for _, p := range provisions {
+			// Create an enriched copy with backend name (p is already a copy since
+			// ProvisionInfo is a value type; we're not modifying the original slice)
 			p.BackendName = b.Name()
 			allProvisions[p.LeaseUUID] = p
 		}

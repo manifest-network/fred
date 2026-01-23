@@ -649,9 +649,10 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 		t.Errorf("handleBackendCallback() error = %v, want nil for unknown status", err)
 	}
 
-	// Lease should still be in-flight (unknown status doesn't change state)
-	if !manager.IsInFlight("lease-1") {
-		t.Error("lease should still be in-flight after unknown status callback")
+	// Lease should be removed from in-flight (unknown status is treated as terminal
+	// to prevent leases from being stuck indefinitely)
+	if manager.IsInFlight("lease-1") {
+		t.Error("lease should NOT be in-flight after unknown status callback (treated as terminal)")
 	}
 }
 

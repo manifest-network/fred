@@ -28,15 +28,15 @@ const (
 
 // Signer handles transaction signing using a Cosmos keyring.
 type Signer struct {
-	keyring   keyring.Keyring
-	keyName   string
-	address   string
-	chainID   string
-	txConfig  client.TxConfig
-	cdc       codec.Codec
-	gasLimit  uint64
-	gasPrice  int64
-	feeDenom  string
+	keyring  keyring.Keyring
+	keyName  string
+	address  string
+	chainID  string
+	txConfig client.TxConfig
+	cdc      codec.Codec
+	gasLimit uint64
+	gasPrice int64
+	feeDenom string
 }
 
 // SignerConfig holds configuration for the transaction signer.

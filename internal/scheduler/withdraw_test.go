@@ -61,11 +61,11 @@ func (m *mockChainClient) CloseLeases(ctx context.Context, leaseUUIDs []string, 
 
 func TestNewWithdrawScheduler(t *testing.T) {
 	tests := []struct {
-		name                      string
-		cfg                       WithdrawSchedulerConfig
-		wantMaxIterations         int
-		wantErrorThreshold        int
-		wantRetryInterval         time.Duration
+		name               string
+		cfg                WithdrawSchedulerConfig
+		wantMaxIterations  int
+		wantErrorThreshold int
+		wantRetryInterval  time.Duration
 	}{
 		{
 			name: "with defaults",
@@ -377,7 +377,7 @@ func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 			currBalance:  sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(900))),
 			elapsed:      time.Minute,
 			wantZero:     false,
-			minRemaining: 8 * time.Minute,  // 900 / (100/60s) = 540s = 9min, give some buffer
+			minRemaining: 8 * time.Minute, // 900 / (100/60s) = 540s = 9min, give some buffer
 			maxRemaining: 10 * time.Minute,
 		},
 		{

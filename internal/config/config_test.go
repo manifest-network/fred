@@ -147,7 +147,7 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		MaxRequestBodySize:        1 << 20,
 		CreditCheckErrorThreshold: 3,
 		CreditCheckRetryInterval:  30 * time.Second,
-			ReconciliationInterval:    5 * time.Minute,
+		ReconciliationInterval:    5 * time.Minute,
 		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 		CallbackBaseURL:           "http://localhost:8080",
 		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
@@ -184,7 +184,7 @@ func TestConfig_Validate_NoBackends(t *testing.T) {
 		MaxRequestBodySize:        1 << 20,
 		CreditCheckErrorThreshold: 3,
 		CreditCheckRetryInterval:  30 * time.Second,
-			ReconciliationInterval:    5 * time.Minute,
+		ReconciliationInterval:    5 * time.Minute,
 		// No backends configured
 	}
 

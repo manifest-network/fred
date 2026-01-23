@@ -160,4 +160,3 @@ func (w *Watcher) handleCrossProviderAutoClose(tenant, eventProviderUUID string)
 		trigger()
 	}
 }
-
