@@ -352,5 +352,5 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 
 // callbackURL returns the callback URL for backend provisioning.
 func (r *Reconciler) callbackURL() string {
-	return r.callbackBaseURL + "/callbacks/provision"
+	return r.callbackBaseURL + CallbackPath
 }

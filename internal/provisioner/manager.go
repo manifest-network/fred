@@ -30,17 +30,23 @@ var (
 	// ErrProvisioningFailed indicates the backend failed to provision the resource.
 	ErrProvisioningFailed = errors.New("provisioning failed")
 
+	// ErrDeprovisionFailed indicates the backend failed to deprovision the resource.
+	ErrDeprovisionFailed = errors.New("deprovision failed")
+
 	// ErrAcknowledgeFailed indicates the lease acknowledgment on chain failed.
 	ErrAcknowledgeFailed = errors.New("lease acknowledgment failed")
 )
 
 // Watermill topic names for internal event routing.
 const (
-	TopicLeaseCreated   = "events.lease.created"
-	TopicLeaseClosed    = "events.lease.closed"
-	TopicLeaseExpired   = "events.lease.expired"
+	TopicLeaseCreated    = "events.lease.created"
+	TopicLeaseClosed     = "events.lease.closed"
+	TopicLeaseExpired    = "events.lease.expired"
 	TopicBackendCallback = "events.backend.callback"
 )
+
+// CallbackPath is the path suffix for backend provision callbacks.
+const CallbackPath = "/callbacks/provision"
 
 // ChainClient defines the chain operations needed by the provisioner.
 type ChainClient interface {
@@ -58,7 +64,7 @@ type Manager struct {
 
 	// Track in-flight provisions (ephemeral - recovered via reconciliation)
 	inFlight   map[string]inFlightProvision
-	inFlightMu sync.Mutex
+	inFlightMu sync.RWMutex
 }
 
 type inFlightProvision struct {
@@ -90,8 +96,8 @@ func (m *Manager) UntrackInFlight(leaseUUID string) {
 
 // IsInFlight checks if a lease is currently being provisioned.
 func (m *Manager) IsInFlight(leaseUUID string) bool {
-	m.inFlightMu.Lock()
-	defer m.inFlightMu.Unlock()
+	m.inFlightMu.RLock()
+	defer m.inFlightMu.RUnlock()
 	_, exists := m.inFlight[leaseUUID]
 	return exists
 }
@@ -108,9 +114,18 @@ func (m *Manager) PopInFlight(leaseUUID string) (inFlightProvision, bool) {
 	return provision, exists
 }
 
+// GetInFlight returns the in-flight provision info without removing it.
+// Returns the provision info and true if found, or zero value and false if not found.
+func (m *Manager) GetInFlight(leaseUUID string) (inFlightProvision, bool) {
+	m.inFlightMu.RLock()
+	defer m.inFlightMu.RUnlock()
+	provision, exists := m.inFlight[leaseUUID]
+	return provision, exists
+}
+
 // callbackURL returns the callback URL for backend provisioning.
 func (m *Manager) callbackURL() string {
-	return m.callbackBaseURL + "/callbacks/provision"
+	return m.callbackBaseURL + CallbackPath
 }
 
 // ManagerConfig configures the provision manager.
@@ -329,8 +344,14 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) error {
 
 	// Get the backend (either from in-flight info or route by default)
 	var backendClient backend.Backend
-	if exists {
+	if exists && provision.Backend != "" {
 		backendClient = m.router.GetBackendByName(provision.Backend)
+		if backendClient == nil {
+			slog.Warn("backend not found by name, falling back to default",
+				"lease_uuid", event.LeaseUUID,
+				"backend_name", provision.Backend,
+			)
+		}
 	}
 	if backendClient == nil {
 		backendClient = m.router.Default()
@@ -349,7 +370,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) error {
 			"backend", backendClient.Name(),
 			"error", err,
 		)
-		return fmt.Errorf("deprovision lease %s: %w", event.LeaseUUID, err)
+		return fmt.Errorf("%w: lease %s: %v", ErrDeprovisionFailed, event.LeaseUUID, err)
 	}
 
 	slog.Info("deprovisioned successfully",
@@ -381,10 +402,7 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 	// Ignore callbacks for unknown/already-processed leases to prevent:
 	// - Duplicate on-chain transactions from replay attacks
 	// - Processing misrouted callbacks from other providers
-	m.inFlightMu.Lock()
-	provision, exists := m.inFlight[callback.LeaseUUID]
-	m.inFlightMu.Unlock()
-
+	provision, exists := m.GetInFlight(callback.LeaseUUID)
 	if !exists {
 		slog.Warn("ignoring callback for unknown or already-processed lease",
 			"lease_uuid", callback.LeaseUUID,
