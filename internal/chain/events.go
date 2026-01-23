@@ -110,7 +110,8 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 
 // Subscribe creates a new subscription and returns a channel that receives all events.
 // Each subscriber gets its own buffered channel. Call Unsubscribe when done to avoid leaks.
-func (s *EventSubscriber) Subscribe() <-chan LeaseEvent {
+// Returns a bidirectional channel so it can be passed to Unsubscribe for cleanup.
+func (s *EventSubscriber) Subscribe() chan LeaseEvent {
 	ch := make(chan LeaseEvent, eventChannelCapacity)
 
 	s.subscribersMu.Lock()
@@ -125,23 +126,17 @@ func (s *EventSubscriber) Subscribe() <-chan LeaseEvent {
 
 // Unsubscribe removes a subscription and closes its channel.
 // Safe to call multiple times or with a nil channel.
-func (s *EventSubscriber) Unsubscribe(ch <-chan LeaseEvent) {
+func (s *EventSubscriber) Unsubscribe(ch chan LeaseEvent) {
 	if ch == nil {
-		return
-	}
-
-	// Type assert to get the sendable channel for map lookup
-	sendCh, ok := interface{}(ch).(chan LeaseEvent)
-	if !ok {
 		return
 	}
 
 	s.subscribersMu.Lock()
 	defer s.subscribersMu.Unlock()
 
-	if _, exists := s.subscribers[sendCh]; exists {
-		delete(s.subscribers, sendCh)
-		close(sendCh)
+	if _, exists := s.subscribers[ch]; exists {
+		delete(s.subscribers, ch)
+		close(ch)
 		slog.Debug("event subscriber unregistered")
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 )
 
@@ -54,7 +53,7 @@ type ServerConfig struct {
 }
 
 // NewServer creates a new API server.
-func NewServer(cfg ServerConfig, client *chain.Client, backendRouter *backend.Router, callbackPublisher CallbackPublisher) *Server {
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher) *Server {
 	handlers := NewHandlers(client, backendRouter, cfg.ProviderUUID, cfg.Bech32Prefix)
 	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 

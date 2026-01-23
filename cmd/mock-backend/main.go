@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -167,8 +168,13 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		"has_payload", len(req.Payload) > 0,
 	)
 
-	// Store callback URL for this lease (thread-safe)
+	// Validate and store callback URL for this lease (thread-safe)
 	if req.CallbackURL != "" {
+		parsedURL, err := url.Parse(req.CallbackURL)
+		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+			http.Error(w, "invalid callback_url: must be a valid http/https URL", http.StatusBadRequest)
+			return
+		}
 		s.callbackURLsMu.Lock()
 		s.callbackURLs[req.LeaseUUID] = req.CallbackURL
 		s.callbackURLsMu.Unlock()
@@ -189,9 +195,11 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(backend.ProvisionResponse{
+	if err := json.NewEncoder(w).Encode(backend.ProvisionResponse{
 		ProvisionID: req.LeaseUUID,
-	})
+	}); err != nil {
+		slog.Error("failed to encode provision response", "error", err)
+	}
 }
 
 func (s *MockBackendServer) handleGetInfo(w http.ResponseWriter, r *http.Request) {
@@ -212,7 +220,9 @@ func (s *MockBackendServer) handleGetInfo(w http.ResponseWriter, r *http.Request
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	if err := json.NewEncoder(w).Encode(info); err != nil {
+		slog.Error("failed to encode info response", "error", err)
+	}
 }
 
 func (s *MockBackendServer) handleDeprovision(w http.ResponseWriter, r *http.Request) {
@@ -247,9 +257,11 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"provisions": provisions,
-	})
+	}); err != nil {
+		slog.Error("failed to encode provisions response", "error", err)
+	}
 }
 
 func (s *MockBackendServer) handleHealth(w http.ResponseWriter, r *http.Request) {

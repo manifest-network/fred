@@ -257,6 +257,12 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) error {
 	if backendClient == nil {
 		backendClient = m.router.Default()
 	}
+	if backendClient == nil {
+		slog.Error("no backend available for deprovision",
+			"lease_uuid", event.LeaseUUID,
+		)
+		return fmt.Errorf("no backend available for deprovision")
+	}
 
 	// Deprovision (idempotent)
 	if err := backendClient.Deprovision(msg.Context(), event.LeaseUUID); err != nil {

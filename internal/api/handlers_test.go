@@ -413,7 +413,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 						"region":  "us-east-1",
 						"backend": "test-backend",
 					},
-					"extra_field": "should be ignored",
+					"credentials": map[string]any{"token": "secret"}, // non-string map, ignored
 				})
 				return
 			}
@@ -612,17 +612,30 @@ func TestExtractConnectionDetails(t *testing.T) {
 			},
 		},
 		{
-			name: "extra fields are ignored",
+			name: "unknown string fields go to metadata",
 			input: backend.LeaseInfo{
 				"host":        "test.example.com",
 				"port":        float64(8080),
-				"extra_field": "should be ignored",
-				"credentials": map[string]string{"token": "secret"},
+				"region":      "us-east-1",
+				"backend":     "kubernetes",
+				"credentials": map[string]string{"token": "secret"}, // non-string, ignored
 			},
 			expected: ConnectionDetails{
 				Host:     "test.example.com",
 				Port:     8080,
-				Metadata: map[string]string{},
+				Metadata: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
+			},
+		},
+		{
+			name: "unknown fields merged with explicit metadata",
+			input: backend.LeaseInfo{
+				"host":     "test.example.com",
+				"metadata": map[string]string{"key": "value"},
+				"region":   "us-west-2",
+			},
+			expected: ConnectionDetails{
+				Host:     "test.example.com",
+				Metadata: map[string]string{"key": "value", "region": "us-west-2"},
 			},
 		},
 	}

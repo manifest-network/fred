@@ -12,7 +12,6 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 )
 
@@ -31,7 +30,7 @@ type Handlers struct {
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(client *chain.Client, backendRouter *backend.Router, providerUUID, bech32Prefix string) *Handlers {
+func NewHandlers(client ChainClient, backendRouter *backend.Router, providerUUID, bech32Prefix string) *Handlers {
 	return &Handlers{
 		client:        client,
 		backendRouter: backendRouter,
@@ -265,12 +264,22 @@ func decodeJSONBytes(data []byte, v interface{}) error {
 }
 
 // extractConnectionDetails extracts ConnectionDetails from a backend LeaseInfo map.
-// Unknown fields are placed in Metadata.
+// Known fields (host, port, protocol, metadata) are mapped to struct fields.
+// Unknown top-level string fields are placed in Metadata.
 func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 	details := ConnectionDetails{
 		Metadata: make(map[string]string),
 	}
 
+	// Known fields that map to struct fields
+	knownFields := map[string]bool{
+		"host":     true,
+		"port":     true,
+		"protocol": true,
+		"metadata": true,
+	}
+
+	// Extract known fields
 	if host, ok := info["host"].(string); ok {
 		details.Host = host
 	}
@@ -282,13 +291,27 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 	if protocol, ok := info["protocol"].(string); ok {
 		details.Protocol = protocol
 	}
+
+	// Extract explicit metadata field first
 	if metadata, ok := info["metadata"].(map[string]string); ok {
-		details.Metadata = metadata
+		for k, v := range metadata {
+			details.Metadata[k] = v
+		}
 	} else if metadata, ok := info["metadata"].(map[string]any); ok {
 		for k, v := range metadata {
 			if s, ok := v.(string); ok {
 				details.Metadata[k] = s
 			}
+		}
+	}
+
+	// Add unknown top-level string fields to Metadata
+	for k, v := range info {
+		if knownFields[k] {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			details.Metadata[k] = s
 		}
 	}
 
