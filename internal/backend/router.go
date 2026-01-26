@@ -110,7 +110,9 @@ func (r *Router) Default() Backend {
 	return r.defaultBackend
 }
 
-// Backends returns all configured backends (for reconciliation).
+// Backends returns all unique backends for operations like reconciliation and health checks.
+// The same backend may be registered multiple times with different SKU prefixes, but
+// this method returns each backend only once (deduplicated by name).
 func (r *Router) Backends() []Backend {
 	seen := make(map[string]bool)
 	var backends []Backend

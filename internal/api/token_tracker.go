@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -108,12 +109,17 @@ func (t *TokenTracker) TryUse(key string) error {
 	now := time.Now()
 	expiresAt := now.Add(t.maxAge)
 
-	// Retry with exponential backoff on timeout errors (database contention)
-	var err error
-	backoff := bboltInitialBackoff
+	// Configure exponential backoff for database contention
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = bboltInitialBackoff
+	bo.MaxInterval = bboltMaxBackoff
+	bo.MaxElapsedTime = 0 // We control max retries via WithMaxRetries
 
-	for attempt := 1; attempt <= bboltMaxRetries; attempt++ {
-		err = t.db.Update(func(tx *bolt.Tx) error {
+	// Wrap with max retries
+	boWithRetries := backoff.WithMaxRetries(bo, bboltMaxRetries-1) // -1 because first attempt doesn't count
+
+	operation := func() error {
+		err := t.db.Update(func(tx *bolt.Tx) error {
 			b := tx.Bucket(bucketName)
 
 			// Check if token already exists
@@ -133,26 +139,25 @@ func (t *TokenTracker) TryUse(key string) error {
 
 		// Don't retry for application-level errors (token already used)
 		if err == nil || errors.Is(err, ErrTokenAlreadyUsed) {
+			return backoff.Permanent(err)
+		}
+
+		// Only retry on timeout errors (database locked)
+		if errors.Is(err, bolt.ErrTimeout) || errors.Is(err, bolt.ErrDatabaseNotOpen) {
+			slog.Debug("bbolt timeout, will retry", "error", err)
 			return err
 		}
 
-		// Check if this is a timeout error (database locked)
-		if !errors.Is(err, bolt.ErrTimeout) && !errors.Is(err, bolt.ErrDatabaseNotOpen) {
-			return err
-		}
+		// Other errors are not retryable
+		return backoff.Permanent(err)
+	}
 
-		if attempt < bboltMaxRetries {
-			slog.Debug("bbolt timeout, retrying",
-				"attempt", attempt,
-				"backoff", backoff,
-				"error", err,
-			)
-			time.Sleep(backoff)
-			backoff *= 2
-			if backoff > bboltMaxBackoff {
-				backoff = bboltMaxBackoff
-			}
-		}
+	err := backoff.Retry(operation, boWithRetries)
+
+	// Unwrap permanent errors to return the original error
+	var permanentErr *backoff.PermanentError
+	if errors.As(err, &permanentErr) {
+		return permanentErr.Unwrap()
 	}
 
 	return err

@@ -31,10 +31,11 @@ type Config struct {
 	TLSCertFile       string        `mapstructure:"tls_cert_file"`
 	TLSKeyFile        string        `mapstructure:"tls_key_file"`
 	Bech32Prefix      string        `mapstructure:"bech32_prefix"`
-	RateLimitRPS         float64 `mapstructure:"rate_limit_rps"`
-	RateLimitBurst       int     `mapstructure:"rate_limit_burst"`
-	TenantRateLimitRPS   float64 `mapstructure:"tenant_rate_limit_rps"`   // Per-tenant rate limit (requests per second)
-	TenantRateLimitBurst int     `mapstructure:"tenant_rate_limit_burst"` // Per-tenant burst limit
+	RateLimitRPS         float64  `mapstructure:"rate_limit_rps"`
+	RateLimitBurst       int      `mapstructure:"rate_limit_burst"`
+	TenantRateLimitRPS   float64  `mapstructure:"tenant_rate_limit_rps"`   // Per-tenant rate limit (requests per second)
+	TenantRateLimitBurst int      `mapstructure:"tenant_rate_limit_burst"` // Per-tenant burst limit
+	TrustedProxies       []string `mapstructure:"trusted_proxies"`         // CIDR blocks of trusted proxies for X-Forwarded-For
 	GRPCTLSEnabled    bool          `mapstructure:"grpc_tls_enabled"`
 	GRPCTLSCAFile     string        `mapstructure:"grpc_tls_ca_file"`
 	GRPCTLSSkipVerify bool          `mapstructure:"grpc_tls_skip_verify"`

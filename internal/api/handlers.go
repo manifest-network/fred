@@ -382,17 +382,11 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 
 // extractToken extracts and parses the bearer token from the Authorization header.
 func (h *Handlers) extractToken(r *http.Request) (*AuthToken, error) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return nil, errMissingAuth
+	tokenStr, err := extractBearerToken(r)
+	if err != nil {
+		return nil, err
 	}
-
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
-		return nil, errInvalidAuthFormat
-	}
-
-	return ParseAuthToken(parts[1])
+	return ParseAuthToken(tokenStr)
 }
 
 // writeJSON writes a JSON response.
@@ -483,3 +477,19 @@ var (
 	errMissingAuth       = errors.New("missing authorization header")
 	errInvalidAuthFormat = errors.New("invalid authorization format, expected 'Bearer <token>'")
 )
+
+// extractBearerToken extracts the raw token string from a Bearer authorization header.
+// Returns the token string or an error if the header is missing or malformed.
+func extractBearerToken(r *http.Request) (string, error) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return "", errMissingAuth
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		return "", errInvalidAuthFormat
+	}
+
+	return parts[1], nil
+}

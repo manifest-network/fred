@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 
 	"github.com/gorilla/mux"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
@@ -215,15 +214,9 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 
 // extractPayloadToken extracts and parses the bearer token for payload upload.
 func (h *PayloadHandler) extractPayloadToken(r *http.Request) (*PayloadAuthToken, error) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return nil, errMissingAuth
+	tokenStr, err := extractBearerToken(r)
+	if err != nil {
+		return nil, err
 	}
-
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
-		return nil, errInvalidAuthFormat
-	}
-
-	return ParsePayloadAuthToken(parts[1])
+	return ParsePayloadAuthToken(tokenStr)
 }

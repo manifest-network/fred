@@ -227,6 +227,7 @@ func run(cmd *cobra.Command, args []string) error {
 		RateLimitBurst:       cfg.RateLimitBurst,
 		TenantRateLimitRPS:   cfg.TenantRateLimitRPS,
 		TenantRateLimitBurst: cfg.TenantRateLimitBurst,
+		TrustedProxies:       cfg.TrustedProxies,
 		ReadTimeout:          cfg.HTTPReadTimeout,
 		WriteTimeout:         cfg.HTTPWriteTimeout,
 		IdleTimeout:          cfg.HTTPIdleTimeout,

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -314,54 +315,43 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (s
 // broadcastTx signs and broadcasts a transaction, waits for execution, returns tx hash.
 // It automatically retries on transient errors and sequence mismatches with exponential backoff.
 func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
-	var lastErr error
-	backoff := txInitialBackoff
+	var txHash string
 
-	for attempt := 1; attempt <= txMaxRetries; attempt++ {
-		txHash, err := c.doBroadcastTx(ctx, msg)
+	// Configure exponential backoff with jitter
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = txInitialBackoff
+	bo.MaxInterval = txMaxBackoff
+	bo.MaxElapsedTime = 0 // We control max retries via WithMaxRetries
+
+	// Wrap with context and max retries
+	boCtx := backoff.WithContext(
+		backoff.WithMaxRetries(bo, txMaxRetries-1), // -1 because first attempt doesn't count as retry
+		ctx,
+	)
+
+	operation := func() error {
+		var err error
+		txHash, err = c.doBroadcastTx(ctx, msg)
 		if err == nil {
-			return txHash, nil
+			return nil
 		}
-
-		lastErr = err
 
 		// Check if error is retryable
 		if !c.isRetryableTxError(err) {
-			return "", err
+			return backoff.Permanent(err)
 		}
 
-		// Don't retry if context is done
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-
-		// Don't wait after the last attempt
-		if attempt == txMaxRetries {
-			break
-		}
-
-		slog.Warn("transaction failed, retrying",
-			"attempt", attempt,
-			"max_attempts", txMaxRetries,
-			"backoff", backoff,
+		slog.Warn("transaction failed, will retry",
 			"error", err,
 		)
-
-		// Wait before retrying
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(backoff):
-		}
-
-		// Exponential backoff capped at max
-		backoff *= 2
-		if backoff > txMaxBackoff {
-			backoff = txMaxBackoff
-		}
+		return err
 	}
 
-	return "", fmt.Errorf("transaction failed after %d attempts: %w", txMaxRetries, lastErr)
+	if err := backoff.Retry(operation, boCtx); err != nil {
+		return "", fmt.Errorf("transaction failed: %w", err)
+	}
+
+	return txHash, nil
 }
 
 // isRetryableTxError checks if a transaction error is retryable.

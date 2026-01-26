@@ -54,21 +54,22 @@ type Server struct {
 
 // ServerConfig holds configuration for the API server.
 type ServerConfig struct {
-	Addr               string
-	ProviderUUID       string
-	Bech32Prefix       string
-	TLSCertFile        string
-	TLSKeyFile         string
-	RateLimitRPS       float64
-	RateLimitBurst     int
-	TenantRateLimitRPS   float64 // Per-tenant rate limit (requests per second), 0 = disabled
-	TenantRateLimitBurst int     // Per-tenant burst limit
-	ReadTimeout        time.Duration
-	WriteTimeout       time.Duration
-	IdleTimeout        time.Duration
-	MaxRequestBodySize int64
-	CallbackSecret     string // HMAC secret for callback authentication
-	TokenTrackerDBPath string // Path to token tracker database (enables replay protection)
+	Addr                 string
+	ProviderUUID         string
+	Bech32Prefix         string
+	TLSCertFile          string
+	TLSKeyFile           string
+	RateLimitRPS         float64
+	RateLimitBurst       int
+	TenantRateLimitRPS   float64  // Per-tenant rate limit (requests per second), 0 = disabled
+	TenantRateLimitBurst int      // Per-tenant burst limit
+	TrustedProxies       []string // CIDR blocks of trusted reverse proxies for X-Forwarded-For
+	ReadTimeout          time.Duration
+	WriteTimeout         time.Duration
+	IdleTimeout          time.Duration
+	MaxRequestBodySize   int64
+	CallbackSecret       string // HMAC secret for callback authentication
+	TokenTrackerDBPath   string // Path to token tracker database (enables replay protection)
 }
 
 // NewServer creates a new API server.
@@ -91,7 +92,14 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	}
 
 	handlers := NewHandlers(client, backendRouter, tokenTracker, statusChecker, cfg.ProviderUUID, cfg.Bech32Prefix)
-	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+
+	// Parse trusted proxies for secure X-Forwarded-For handling
+	var trustedProxies *TrustedProxyConfig
+	if len(cfg.TrustedProxies) > 0 {
+		trustedProxies = NewTrustedProxyConfig(cfg.TrustedProxies)
+		slog.Info("trusted proxies configured for rate limiting", "count", len(cfg.TrustedProxies))
+	}
+	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, trustedProxies)
 
 	// Create per-tenant rate limiter if configured
 	var tenantRateLimiter *TenantRateLimiter
