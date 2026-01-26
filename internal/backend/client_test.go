@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,5 +170,196 @@ func TestHTTPClient_Name(t *testing.T) {
 
 	if client.Name() != "my-backend" {
 		t.Errorf("Name() = %q, want %q", client.Name(), "my-backend")
+	}
+}
+
+func TestHTTPClient_CircuitBreaker(t *testing.T) {
+	failCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failCount++
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	// Configure circuit breaker to trip after 3 failures with a short timeout
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-cb",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: 3,
+		CBTimeout:       100 * time.Millisecond, // Short timeout for testing
+	})
+
+	// First 3 calls should go through to server (and fail)
+	for i := 0; i < 3; i++ {
+		err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+		if err == nil {
+			t.Fatalf("Provision() call %d should have failed", i+1)
+		}
+		if err == ErrCircuitOpen {
+			t.Fatalf("Circuit should not be open yet at call %d", i+1)
+		}
+	}
+
+	// Verify server received all 3 requests
+	if failCount != 3 {
+		t.Errorf("Server should have received 3 requests, got %d", failCount)
+	}
+
+	// 4th call should fail immediately with circuit open error
+	err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+	if err != ErrCircuitOpen {
+		t.Errorf("Provision() should return ErrCircuitOpen, got %v", err)
+	}
+
+	// Server should not receive the 4th request (circuit is open)
+	if failCount != 3 {
+		t.Errorf("Server should still have 3 requests after circuit open, got %d", failCount)
+	}
+
+	// Wait for circuit breaker timeout to transition to half-open
+	time.Sleep(150 * time.Millisecond)
+
+	// Next call should go through (half-open state) but still fail
+	err = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+	if err == ErrCircuitOpen {
+		t.Error("Circuit should be half-open, not open")
+	}
+	if failCount != 4 {
+		t.Errorf("Server should have received 4 requests after half-open, got %d", failCount)
+	}
+}
+
+func TestHTTPClient_CircuitBreaker_Recovery(t *testing.T) {
+	callCount := 0
+	shouldFail := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if shouldFail {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	// Configure circuit breaker to trip after 2 failures
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-cb-recovery",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: 2,
+		CBTimeout:       100 * time.Millisecond,
+	})
+
+	// Fail twice to trip the breaker
+	for i := 0; i < 2; i++ {
+		_ = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+	}
+
+	// Verify circuit is open
+	err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+	if err != ErrCircuitOpen {
+		t.Errorf("Circuit should be open, got %v", err)
+	}
+
+	// Wait for half-open
+	time.Sleep(150 * time.Millisecond)
+
+	// Now make the server healthy
+	shouldFail = false
+
+	// This call should succeed and close the circuit
+	err = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+	if err != nil {
+		t.Errorf("Provision() should succeed after recovery, got %v", err)
+	}
+
+	// Verify circuit is closed by making more calls
+	for i := 0; i < 3; i++ {
+		err = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+		if err != nil {
+			t.Errorf("Provision() call %d should succeed, got %v", i+1, err)
+		}
+	}
+}
+
+func TestHTTPClient_Health_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			t.Errorf("Expected /health path, got %s", r.URL.Path)
+		}
+		if r.Method != http.MethodGet {
+			t.Errorf("Expected GET method, got %s", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-health",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Health(context.Background())
+	if err != nil {
+		t.Errorf("Health() error = %v, want nil", err)
+	}
+}
+
+func TestHTTPClient_Health_Unhealthy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-health-unhealthy",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Health(context.Background())
+	if err == nil {
+		t.Error("Health() should return error for unhealthy backend")
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("Health() error should mention status code, got: %v", err)
+	}
+}
+
+func TestHTTPClient_Health_ConnectionError(t *testing.T) {
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-health-conn-err",
+		BaseURL: "http://localhost:59999", // Unlikely to be in use
+		Timeout: 100 * time.Millisecond,
+	})
+
+	err := client.Health(context.Background())
+	if err == nil {
+		t.Error("Health() should return error when backend is unreachable")
+	}
+}
+
+func TestHTTPClient_Health_ContextCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-health-ctx",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := client.Health(ctx)
+	if err == nil {
+		t.Error("Health() should return error when context is cancelled")
 	}
 }

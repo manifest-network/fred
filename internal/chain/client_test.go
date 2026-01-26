@@ -1,17 +1,22 @@
 package chain
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestBuildTLSConfig_Defaults(t *testing.T) {
@@ -249,6 +254,138 @@ func chunk[S ~[]E, E any](s S, n int) func(func(S) bool) {
 				return
 			}
 		}
+	}
+}
+
+func TestIsRetryableTxError(t *testing.T) {
+	client := &Client{}
+
+	tests := []struct {
+		name       string
+		err        error
+		wantRetry  bool
+	}{
+		{
+			name:      "nil error",
+			err:       nil,
+			wantRetry: false,
+		},
+		{
+			name: "sequence mismatch error",
+			err: &ChainTxError{
+				Code:      32,
+				Codespace: "sdk",
+				RawLog:    "account sequence mismatch",
+			},
+			wantRetry: true,
+		},
+		{
+			name: "other chain error",
+			err: &ChainTxError{
+				Code:      4, // Unauthorized
+				Codespace: "sdk",
+				RawLog:    "unauthorized",
+			},
+			wantRetry: false,
+		},
+		{
+			name: "billing module error",
+			err: &ChainTxError{
+				Code:      1,
+				Codespace: "billing",
+				RawLog:    "lease not found",
+			},
+			wantRetry: false,
+		},
+		{
+			name:      "gRPC unavailable error",
+			err:       status.Error(codes.Unavailable, "connection refused"),
+			wantRetry: true,
+		},
+		{
+			name:      "gRPC deadline exceeded error",
+			err:       status.Error(codes.DeadlineExceeded, "deadline exceeded"),
+			wantRetry: true,
+		},
+		{
+			name:      "gRPC resource exhausted error",
+			err:       status.Error(codes.ResourceExhausted, "rate limited"),
+			wantRetry: true,
+		},
+		{
+			name:      "gRPC aborted error",
+			err:       status.Error(codes.Aborted, "operation aborted"),
+			wantRetry: true,
+		},
+		{
+			name:      "gRPC internal error",
+			err:       status.Error(codes.Internal, "internal error"),
+			wantRetry: true,
+		},
+		{
+			name:      "gRPC unknown error",
+			err:       status.Error(codes.Unknown, "unknown error"),
+			wantRetry: true,
+		},
+		{
+			name:      "context deadline exceeded",
+			err:       context.DeadlineExceeded,
+			wantRetry: true,
+		},
+		{
+			name:      "context canceled",
+			err:       context.Canceled,
+			wantRetry: true,
+		},
+		{
+			name:      "wrapped gRPC unavailable error",
+			err:       fmt.Errorf("failed to connect: %w", status.Error(codes.Unavailable, "server unavailable")),
+			wantRetry: true,
+		},
+		{
+			name:      "gRPC not found error (not retryable)",
+			err:       status.Error(codes.NotFound, "not found"),
+			wantRetry: false,
+		},
+		{
+			name:      "gRPC invalid argument error (not retryable)",
+			err:       status.Error(codes.InvalidArgument, "invalid argument"),
+			wantRetry: false,
+		},
+		{
+			name:      "gRPC permission denied error (not retryable)",
+			err:       status.Error(codes.PermissionDenied, "permission denied"),
+			wantRetry: false,
+		},
+		{
+			name:      "random plain error (not retryable)",
+			err:       fmt.Errorf("some unknown error"),
+			wantRetry: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := client.isRetryableTxError(tt.err)
+			if got != tt.wantRetry {
+				t.Errorf("isRetryableTxError() = %v, want %v", got, tt.wantRetry)
+			}
+		})
+	}
+}
+
+func TestTxRetryConstants(t *testing.T) {
+	// Verify retry constants are reasonable
+	if txMaxRetries < 1 || txMaxRetries > 10 {
+		t.Errorf("txMaxRetries = %d, expected between 1 and 10", txMaxRetries)
+	}
+
+	if txInitialBackoff < 100*time.Millisecond || txInitialBackoff > 5*time.Second {
+		t.Errorf("txInitialBackoff = %v, expected between 100ms and 5s", txInitialBackoff)
+	}
+
+	if txMaxBackoff < txInitialBackoff {
+		t.Error("txMaxBackoff should be >= txInitialBackoff")
 	}
 }
 

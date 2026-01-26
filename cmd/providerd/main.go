@@ -28,6 +28,24 @@ const (
 	shutdownTimeout = 30 * time.Second
 )
 
+// safeGo runs a function in a goroutine with panic recovery.
+// If the function panics, the panic is converted to an error and sent to errChan.
+// The component name is included in the error for debugging.
+func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func() error) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				errChan <- fmt.Errorf("%s panic: %v", component, r)
+			}
+		}()
+		if err := fn(); err != nil && !errors.Is(err, context.Canceled) {
+			errChan <- fmt.Errorf("%s error: %w", component, err)
+		}
+	}()
+}
+
 var (
 	configFile string
 	rootCmd    = &cobra.Command{
@@ -161,10 +179,27 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create backend router: %w", err)
 	}
 
+	// Create payload store if database path is configured
+	var payloadStore *provisioner.PayloadStore
+	if cfg.PayloadStoreDBPath != "" {
+		payloadStore, err = provisioner.NewPayloadStore(provisioner.PayloadStoreConfig{
+			DBPath:          cfg.PayloadStoreDBPath,
+			TTL:             cfg.PayloadStoreTTL,
+			CleanupInterval: cfg.PayloadStoreCleanupFreq,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create payload store: %w", err)
+		}
+		slog.Info("payload store initialized", "db_path", cfg.PayloadStoreDBPath)
+	} else {
+		slog.Warn("payload store disabled (no payload_store_db_path configured)")
+	}
+
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:    cfg.ProviderUUID,
 		CallbackBaseURL: cfg.CallbackBaseURL,
+		PayloadStore:    payloadStore,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -183,20 +218,22 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Initialize API server
 	apiServer, err := api.NewServer(api.ServerConfig{
-		Addr:               cfg.APIListenAddr,
-		ProviderUUID:       cfg.ProviderUUID,
-		Bech32Prefix:       cfg.Bech32Prefix,
-		TLSCertFile:        cfg.TLSCertFile,
-		TLSKeyFile:         cfg.TLSKeyFile,
-		RateLimitRPS:       cfg.RateLimitRPS,
-		RateLimitBurst:     cfg.RateLimitBurst,
-		ReadTimeout:        cfg.HTTPReadTimeout,
-		WriteTimeout:       cfg.HTTPWriteTimeout,
-		IdleTimeout:        cfg.HTTPIdleTimeout,
-		MaxRequestBodySize: cfg.MaxRequestBodySize,
-		CallbackSecret:     cfg.CallbackSecret,
-		TokenTrackerDBPath: cfg.TokenTrackerDBPath,
-	}, chainClient, backendRouter, provisionMgr, provisionMgr)
+		Addr:                 cfg.APIListenAddr,
+		ProviderUUID:         cfg.ProviderUUID,
+		Bech32Prefix:         cfg.Bech32Prefix,
+		TLSCertFile:          cfg.TLSCertFile,
+		TLSKeyFile:           cfg.TLSKeyFile,
+		RateLimitRPS:         cfg.RateLimitRPS,
+		RateLimitBurst:       cfg.RateLimitBurst,
+		TenantRateLimitRPS:   cfg.TenantRateLimitRPS,
+		TenantRateLimitBurst: cfg.TenantRateLimitBurst,
+		ReadTimeout:          cfg.HTTPReadTimeout,
+		WriteTimeout:         cfg.HTTPWriteTimeout,
+		IdleTimeout:          cfg.HTTPIdleTimeout,
+		MaxRequestBodySize:   cfg.MaxRequestBodySize,
+		CallbackSecret:       cfg.CallbackSecret,
+		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,
+	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr)
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
 	}
@@ -238,55 +275,45 @@ func run(cmd *cobra.Command, args []string) error {
 		// Continue anyway - periodic reconciliation will retry
 	}
 
-	// Start background components with WaitGroup for graceful shutdown
+	// Start background components with WaitGroup for graceful shutdown.
+	// Each component is wrapped with panic recovery via safeGo() to prevent
+	// silent crashes and convert panics to errors.
 	var wg sync.WaitGroup
 	errChan := make(chan error, 7)
 
 	// Start event subscriber (single reader, multiple consumers via Subscribe())
-	wg.Go(func() {
-		if err := eventSub.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("event subscriber error: %w", err)
-		}
+	safeGo(&wg, errChan, "event subscriber", func() error {
+		return eventSub.Start(ctx)
 	})
 
 	// Start provisioner
-	wg.Go(func() {
-		if err := provisionMgr.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("provision manager error: %w", err)
-		}
+	safeGo(&wg, errChan, "provision manager", func() error {
+		return provisionMgr.Start(ctx)
 	})
 
 	// Start event bridge (subscribes to eventSub, forwards to Watermill)
-	wg.Go(func() {
-		if err := eventBridge.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("event bridge error: %w", err)
-		}
+	safeGo(&wg, errChan, "event bridge", func() error {
+		return eventBridge.Start(ctx)
 	})
 
 	// Start watcher for cross-provider events (subscribes to eventSub)
-	wg.Go(func() {
-		if err := leaseWatcher.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("watcher error: %w", err)
-		}
+	safeGo(&wg, errChan, "watcher", func() error {
+		return leaseWatcher.Start(ctx)
 	})
 
-	wg.Go(func() {
-		if err := apiServer.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("api server error: %w", err)
-		}
+	// Start API server
+	safeGo(&wg, errChan, "api server", func() error {
+		return apiServer.Start(ctx)
 	})
 
-	wg.Go(func() {
-		if err := withdrawScheduler.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("scheduler error: %w", err)
-		}
+	// Start withdrawal scheduler
+	safeGo(&wg, errChan, "scheduler", func() error {
+		return withdrawScheduler.Start(ctx)
 	})
 
 	// Start periodic reconciliation
-	wg.Go(func() {
-		if err := reconciler.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("reconciler error: %w", err)
-		}
+	safeGo(&wg, errChan, "reconciler", func() error {
+		return reconciler.Start(ctx)
 	})
 
 	slog.Info("providerd started successfully",
@@ -295,6 +322,8 @@ func run(cmd *cobra.Command, args []string) error {
 		"reconciliation_interval", cfg.ReconciliationInterval,
 		"rate_limit_rps", cfg.RateLimitRPS,
 		"rate_limit_burst", cfg.RateLimitBurst,
+		"tenant_rate_limit_rps", cfg.TenantRateLimitRPS,
+		"tenant_rate_limit_burst", cfg.TenantRateLimitBurst,
 		"backends", len(cfg.Backends),
 	)
 
@@ -318,26 +347,61 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Error("failed to shutdown API server gracefully", "error", err)
 	}
 
-	// Close event subscriber (stops receiving chain events)
-	eventSub.Close()
+	// Wait for in-flight provisions to drain before stopping event processing.
+	// This allows pending backend callbacks to complete.
+	// Use half of the shutdown timeout for draining, leaving time for cleanup.
+	drainTimeout := shutdownTimeout / 2
+	remaining := provisionMgr.WaitForDrain(shutdownCtx, drainTimeout)
+	if remaining > 0 {
+		slog.Warn("proceeding with shutdown despite pending provisions",
+			"remaining", remaining,
+			"note", "these will be recovered by reconciliation on restart",
+		)
+	}
 
-	// Signal all components to stop via context cancellation
-	// This triggers Watermill router shutdown in provisionMgr
+	// Signal all components to stop via context cancellation.
+	// This triggers ctx.Done() in all component loops.
 	cancel()
 
-	// Wait for all goroutines to finish with timeout
-	// This includes provisionMgr.Start() which runs the Watermill router
+	// Close event subscriber to unblock any components waiting on events.
+	// Components check ctx.Done() first, so they'll exit cleanly.
+	eventSub.Close()
+
+	// Wait for all goroutines to finish with timeout.
+	// This includes provisionMgr.Start() which runs the Watermill router.
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
 
+	timedOut := false
 	select {
 	case <-done:
 		slog.Info("all components stopped gracefully")
 	case <-shutdownCtx.Done():
+		timedOut = true
 		slog.Warn("shutdown timed out, some components may not have stopped cleanly")
+	}
+
+	// Always close provision manager to clean up Watermill router and payload store.
+	// This is safe even if components are still running - Watermill handles concurrent Close().
+	// We must close this regardless of timeout to prevent resource leaks.
+	if err := provisionMgr.Close(); err != nil {
+		slog.Error("failed to close provision manager", "error", err)
+	}
+
+	// If we timed out, give components a brief additional grace period.
+	// This helps prevent goroutine leaks in edge cases.
+	if timedOut {
+		gracePeriod := 2 * time.Second
+		slog.Info("waiting additional grace period for lingering components", "duration", gracePeriod)
+		select {
+		case <-done:
+			slog.Info("all components stopped after grace period")
+		case <-time.After(gracePeriod):
+			slog.Warn("some components did not stop within grace period")
+		}
 	}
 
 	slog.Info("providerd stopped")

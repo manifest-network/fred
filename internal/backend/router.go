@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -128,4 +129,33 @@ func (r *Router) Backends() []Backend {
 // GetBackendByName returns a backend by its name. Returns nil if not found.
 func (r *Router) GetBackendByName(name string) Backend {
 	return r.backendsByName[name]
+}
+
+// BackendHealth represents the health status of a single backend.
+type BackendHealth struct {
+	Name    string `json:"name"`
+	Healthy bool   `json:"healthy"`
+	Error   string `json:"error,omitempty"`
+}
+
+// HealthCheck checks the health of all configured backends.
+// Returns a slice of health statuses and an overall healthy flag.
+func (r *Router) HealthCheck(ctx context.Context) ([]BackendHealth, bool) {
+	backends := r.Backends()
+	results := make([]BackendHealth, 0, len(backends))
+	allHealthy := true
+
+	for _, b := range backends {
+		health := BackendHealth{Name: b.Name(), Healthy: true}
+
+		if err := b.Health(ctx); err != nil {
+			health.Healthy = false
+			health.Error = err.Error()
+			allHealthy = false
+		}
+
+		results = append(results, health)
+	}
+
+	return results, allHealthy
 }

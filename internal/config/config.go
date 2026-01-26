@@ -31,8 +31,10 @@ type Config struct {
 	TLSCertFile       string        `mapstructure:"tls_cert_file"`
 	TLSKeyFile        string        `mapstructure:"tls_key_file"`
 	Bech32Prefix      string        `mapstructure:"bech32_prefix"`
-	RateLimitRPS      float64       `mapstructure:"rate_limit_rps"`
-	RateLimitBurst    int           `mapstructure:"rate_limit_burst"`
+	RateLimitRPS         float64 `mapstructure:"rate_limit_rps"`
+	RateLimitBurst       int     `mapstructure:"rate_limit_burst"`
+	TenantRateLimitRPS   float64 `mapstructure:"tenant_rate_limit_rps"`   // Per-tenant rate limit (requests per second)
+	TenantRateLimitBurst int     `mapstructure:"tenant_rate_limit_burst"` // Per-tenant burst limit
 	GRPCTLSEnabled    bool          `mapstructure:"grpc_tls_enabled"`
 	GRPCTLSCAFile     string        `mapstructure:"grpc_tls_ca_file"`
 	GRPCTLSSkipVerify bool          `mapstructure:"grpc_tls_skip_verify"`
@@ -73,6 +75,11 @@ type Config struct {
 
 	// Token replay protection
 	TokenTrackerDBPath string `mapstructure:"token_tracker_db_path"`
+
+	// Payload store configuration
+	PayloadStoreDBPath      string        `mapstructure:"payload_store_db_path"`
+	PayloadStoreTTL         time.Duration `mapstructure:"payload_store_ttl"`
+	PayloadStoreCleanupFreq time.Duration `mapstructure:"payload_store_cleanup_freq"`
 }
 
 // BackendConfig configures a single provisioning backend.
@@ -102,8 +109,10 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("api_listen_addr", ":8080")
 	v.SetDefault("withdraw_interval", "1h")
 	v.SetDefault("bech32_prefix", "manifest")
-	v.SetDefault("rate_limit_rps", 10.0) // 10 requests per second
-	v.SetDefault("rate_limit_burst", 20) // burst of 20 requests
+	v.SetDefault("rate_limit_rps", 10.0)          // 10 requests per second (global)
+	v.SetDefault("rate_limit_burst", 20)          // burst of 20 requests (global)
+	v.SetDefault("tenant_rate_limit_rps", 5.0)    // 5 requests per second per tenant
+	v.SetDefault("tenant_rate_limit_burst", 10)   // burst of 10 requests per tenant
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
@@ -136,6 +145,10 @@ func Load(configPath string) (*Config, error) {
 
 	// Reconciliation defaults
 	v.SetDefault("reconciliation_interval", "5m")
+
+	// Payload store defaults
+	v.SetDefault("payload_store_ttl", "1h")
+	v.SetDefault("payload_store_cleanup_freq", "10m")
 
 	// Environment variable support
 	v.SetEnvPrefix("PROVIDER")
@@ -193,6 +206,12 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimitBurst <= 0 {
 		return fmt.Errorf("rate_limit_burst must be positive")
+	}
+	if c.TenantRateLimitRPS < 0 {
+		return fmt.Errorf("tenant_rate_limit_rps cannot be negative")
+	}
+	if c.TenantRateLimitBurst < 0 {
+		return fmt.Errorf("tenant_rate_limit_burst cannot be negative")
 	}
 	if c.GasLimit == 0 {
 		return fmt.Errorf("gas_limit must be positive")

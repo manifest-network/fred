@@ -7,9 +7,12 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // LeaseEventType represents the type of lease event.
@@ -25,10 +28,10 @@ const (
 )
 
 const (
-	// eventChannelCapacity is the buffer size for the lease events channel.
+	// DefaultEventChannelCapacity is the default buffer size for subscriber channels.
 	// If the channel fills up, events will be dropped with a warning log.
-	// Increase this value if you observe "event channel full" warnings.
-	eventChannelCapacity = 100
+	// Monitor fred_events_dropped_total metric for capacity issues.
+	DefaultEventChannelCapacity = 1000
 
 	// invalidMsgThreshold is the count at which invalid message logging escalates to warning.
 	invalidMsgThreshold = 10
@@ -58,6 +61,7 @@ type EventSubscriber struct {
 	pingInterval     time.Duration
 	reconnectInitial time.Duration
 	reconnectMax     time.Duration
+	channelCapacity  int
 	conn             *websocket.Conn
 	done             chan struct{}
 	mu               sync.Mutex
@@ -66,6 +70,14 @@ type EventSubscriber struct {
 	subscribers   map[chan LeaseEvent]struct{}
 	subscribersMu sync.RWMutex
 	nextSubID     int // For logging/debugging
+
+	// closed is set to 1 when Close() is called to prevent races between
+	// broadcast() and Close(). Using atomic to avoid lock contention.
+	closed atomic.Int32
+
+	// broadcastWg tracks in-flight broadcasts so Close() can wait for them
+	// to complete before closing channels. This prevents sending to closed channels.
+	broadcastWg sync.WaitGroup
 
 	// Track invalid messages for escalated logging
 	invalidMsgCount    int
@@ -79,6 +91,7 @@ type EventSubscriberConfig struct {
 	PingInterval     time.Duration
 	ReconnectInitial time.Duration
 	ReconnectMax     time.Duration
+	ChannelCapacity  int // Buffer size for subscriber channels (default: 1000)
 }
 
 // NewEventSubscriber creates a new event subscriber.
@@ -96,6 +109,10 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 	if reconnectMax == 0 {
 		reconnectMax = 60 * time.Second
 	}
+	channelCapacity := cfg.ChannelCapacity
+	if channelCapacity <= 0 {
+		channelCapacity = DefaultEventChannelCapacity
+	}
 
 	return &EventSubscriber{
 		url:              cfg.URL,
@@ -103,6 +120,7 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 		pingInterval:     pingInterval,
 		reconnectInitial: reconnectInitial,
 		reconnectMax:     reconnectMax,
+		channelCapacity:  channelCapacity,
 		done:             make(chan struct{}),
 		subscribers:      make(map[chan LeaseEvent]struct{}),
 	}, nil
@@ -111,16 +129,29 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 // Subscribe creates a new subscription and returns a channel that receives all events.
 // Each subscriber gets its own buffered channel. Call Unsubscribe when done to avoid leaks.
 // Returns a bidirectional channel so it can be passed to Unsubscribe for cleanup.
+// Returns nil if the subscriber has been closed.
 func (s *EventSubscriber) Subscribe() chan LeaseEvent {
-	ch := make(chan LeaseEvent, eventChannelCapacity)
+	// Check closed state before subscribing
+	if s.closed.Load() != 0 {
+		slog.Warn("attempted to subscribe to closed event subscriber")
+		return nil
+	}
+
+	ch := make(chan LeaseEvent, s.channelCapacity)
 
 	s.subscribersMu.Lock()
+	// Double-check closed state under lock
+	if s.closed.Load() != 0 {
+		s.subscribersMu.Unlock()
+		slog.Warn("attempted to subscribe to closed event subscriber")
+		return nil
+	}
 	s.subscribers[ch] = struct{}{}
 	s.nextSubID++
 	subID := s.nextSubID
 	s.subscribersMu.Unlock()
 
-	slog.Debug("new event subscriber registered", "subscriber_id", subID)
+	slog.Debug("new event subscriber registered", "subscriber_id", subID, "channel_capacity", s.channelCapacity)
 	return ch
 }
 
@@ -144,18 +175,64 @@ func (s *EventSubscriber) Unsubscribe(ch chan LeaseEvent) {
 // broadcast sends an event to all subscribers. Non-blocking: if a subscriber's
 // channel is full, the event is dropped for that subscriber with a warning.
 func (s *EventSubscriber) broadcast(event LeaseEvent) {
-	s.subscribersMu.RLock()
-	defer s.subscribersMu.RUnlock()
+	// CRITICAL: Add to WaitGroup FIRST, before any closed check.
+	// This ensures Close().Wait() will block until we're done.
+	// The sequence must be:
+	//   1. broadcast() calls Add(1)
+	//   2. Close() sets closed=1
+	//   3. Close() calls Wait() - blocks because counter > 0
+	//   4. broadcast() checks closed, sees 1, returns (defer calls Done())
+	//   5. Wait() unblocks
+	// If we checked closed first, there's a race where Close() could finish
+	// before we call Add(), and we'd send to closed channels.
+	s.broadcastWg.Add(1)
+	defer s.broadcastWg.Done()
 
+	// Check if closed - if so, return early (Done() is deferred)
+	if s.closed.Load() != 0 {
+		return
+	}
+
+	// Collect subscriber channels under lock, then release lock before sending.
+	// This prevents deadlock if a subscriber's handler calls Unsubscribe(),
+	// and ensures we don't hold the lock during potentially slow operations.
+	s.subscribersMu.RLock()
+	// Make a snapshot of channels to send to
+	channels := make([]chan LeaseEvent, 0, len(s.subscribers))
 	for ch := range s.subscribers {
-		select {
-		case ch <- event:
-		default:
-			slog.Warn("subscriber channel full, dropping event",
+		channels = append(channels, ch)
+	}
+	s.subscribersMu.RUnlock()
+
+	// Send to all channels without holding the lock.
+	// Since we're tracked by broadcastWg, Close() will wait for us to finish
+	// before closing channels, so trySend() won't panic.
+	for _, ch := range channels {
+		s.trySend(ch, event)
+	}
+}
+
+// trySend attempts to send an event to a subscriber channel.
+// Non-blocking and panic-safe (handles closed channels gracefully).
+func (s *EventSubscriber) trySend(ch chan LeaseEvent, event LeaseEvent) {
+	// Recover from panic if channel was closed (defensive programming)
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("recovered from send on closed channel",
 				"event_type", event.Type,
 				"lease_uuid", event.LeaseUUID,
 			)
 		}
+	}()
+
+	select {
+	case ch <- event:
+	default:
+		metrics.EventsDroppedTotal.WithLabelValues(string(event.Type)).Inc()
+		slog.Warn("subscriber channel full, dropping event",
+			"event_type", event.Type,
+			"lease_uuid", event.LeaseUUID,
+		)
 	}
 }
 
@@ -485,7 +562,14 @@ func getEventAttribute(events map[string][]string, key string) string {
 }
 
 // Close shuts down the event subscriber and closes all subscriber channels.
+// Safe to call multiple times - subsequent calls are no-ops.
 func (s *EventSubscriber) Close() {
+	// Set closed flag first to stop any new broadcasts from starting.
+	// Use CompareAndSwap to ensure Close() is idempotent.
+	if !s.closed.CompareAndSwap(0, 1) {
+		return // Already closed
+	}
+
 	close(s.done)
 
 	s.mu.Lock()
@@ -496,7 +580,13 @@ func (s *EventSubscriber) Close() {
 	}
 	s.mu.Unlock()
 
-	// Close all subscriber channels
+	// Wait for any in-flight broadcasts to complete before closing channels.
+	// This prevents sending to closed channels and eliminates the need for
+	// panic recovery in trySend(). The closed flag ensures no NEW broadcasts
+	// will call Add() after this Wait() starts.
+	s.broadcastWg.Wait()
+
+	// Now safe to close all subscriber channels - no broadcasts are in flight.
 	s.subscribersMu.Lock()
 	for ch := range s.subscribers {
 		close(ch)

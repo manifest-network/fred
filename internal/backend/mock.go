@@ -185,6 +185,11 @@ func (m *MockBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, erro
 	return result, nil
 }
 
+// Health always returns nil (healthy) for mock backend.
+func (m *MockBackend) Health(ctx context.Context) error {
+	return nil
+}
+
 // GetProvision returns a specific provision (for testing).
 func (m *MockBackend) GetProvision(leaseUUID string) (*mockProvision, bool) {
 	m.mu.Lock()

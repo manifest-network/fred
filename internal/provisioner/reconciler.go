@@ -13,6 +13,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // errLeaseAlreadyInFlight indicates the lease is already being provisioned.
@@ -91,7 +92,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 // | ACTIVE      | Provisioned | Nothing (healthy) |
 // | ACTIVE      | Not provisioned | Anomaly: Log + provision |
 // | Not found   | Provisioned | Orphan: Deprovision |
-func (r *Reconciler) ReconcileAll(ctx context.Context) error {
+func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// Use atomic flag to prevent concurrent reconciliation without blocking.
 	// If reconciliation is already in progress, skip this run.
 	if !r.reconciling.CompareAndSwap(false, true) {
@@ -104,6 +105,15 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	// Track reconciliation duration and outcome
+	startTime := time.Now()
+	defer func() {
+		metrics.ReconciliationDuration.Observe(time.Since(startTime).Seconds())
+		if retErr != nil && retErr != context.Canceled {
+			metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeError).Inc()
+		}
+	}()
 
 	slog.Info("starting reconciliation", "provider_uuid", r.providerUUID)
 
@@ -337,6 +347,23 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 		}
 	}
 
+	// Record action metrics
+	if provisioned > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionProvisioned).Add(float64(provisioned))
+	}
+	if acknowledged > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAcknowledged).Add(float64(acknowledged))
+	}
+	if anomalies > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAnomaly).Add(float64(anomalies))
+	}
+	if orphans > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionDeprovisioned).Add(float64(orphans))
+	}
+
+	// Record outcome
+	metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
+
 	slog.Info("reconciliation complete",
 		"provisioned", provisioned,
 		"acknowledged", acknowledged,
@@ -377,6 +404,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// both may try to provision the same lease concurrently.
 	if r.manager != nil {
 		if !r.manager.TryTrackInFlight(lease.Uuid, lease.Tenant, sku, backendClient.Name()) {
+			metrics.ReconciliationConflictsTotal.Inc()
 			return errLeaseAlreadyInFlight
 		}
 	}
@@ -390,9 +418,10 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		CallbackURL:  BuildCallbackURL(r.callbackBaseURL),
 	}
 
-	// Pop the payload from the store if requested
+	// Get the payload from the store WITHOUT removing it yet.
+	// We only delete after Provision() succeeds to allow retries.
 	if withPayload && r.manager != nil {
-		req.Payload = r.manager.PayloadStore().Pop(lease.Uuid)
+		req.Payload = r.manager.PayloadStore().Get(lease.Uuid)
 		if len(lease.MetaHash) > 0 {
 			req.PayloadHash = hex.EncodeToString(lease.MetaHash)
 		}
@@ -400,11 +429,17 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 
 	err := backendClient.Provision(ctx, req)
 	if err != nil {
-		// Clean up in-flight on error
+		// Clean up in-flight on error.
+		// Keep payload in store so next reconciliation can retry with it.
 		if r.manager != nil {
 			r.manager.UntrackInFlight(lease.Uuid)
 		}
 		return err
+	}
+
+	// Provision succeeded - now safe to delete the payload from store
+	if withPayload && r.manager != nil && req.Payload != nil {
+		r.manager.PayloadStore().Delete(lease.Uuid)
 	}
 
 	if withPayload {

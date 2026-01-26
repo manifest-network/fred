@@ -5,12 +5,15 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 const (
@@ -23,6 +26,13 @@ type CallbackPublisher interface {
 	PublishCallback(callback backend.CallbackPayload) error
 }
 
+// StatusChecker provides status information about provisioning.
+// Typically implemented by the provisioner.Manager.
+type StatusChecker interface {
+	HasPayload(leaseUUID string) bool
+	IsInFlight(leaseUUID string) bool
+}
+
 
 // Server is the HTTP API server.
 type Server struct {
@@ -32,11 +42,14 @@ type Server struct {
 	payloadHandler        *PayloadHandler
 	tokenTracker          *TokenTracker
 	providerUUID          string
+	bech32Prefix          string
 	tlsCertFile           string
 	tlsKeyFile            string
 	rateLimiter           *RateLimiter
+	tenantRateLimiter     *TenantRateLimiter
 	callbackPublisher     CallbackPublisher
 	callbackAuthenticator *CallbackAuthenticator
+	statusChecker         StatusChecker
 }
 
 // ServerConfig holds configuration for the API server.
@@ -48,6 +61,8 @@ type ServerConfig struct {
 	TLSKeyFile         string
 	RateLimitRPS       float64
 	RateLimitBurst     int
+	TenantRateLimitRPS   float64 // Per-tenant rate limit (requests per second), 0 = disabled
+	TenantRateLimitBurst int     // Per-tenant burst limit
 	ReadTimeout        time.Duration
 	WriteTimeout       time.Duration
 	IdleTimeout        time.Duration
@@ -58,7 +73,7 @@ type ServerConfig struct {
 
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher) (*Server, error) {
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker) (*Server, error) {
 	// Create token tracker if path is configured (enables replay protection)
 	var tokenTracker *TokenTracker
 	if cfg.TokenTrackerDBPath != "" {
@@ -75,8 +90,18 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		slog.Warn("token replay protection disabled (no TokenTrackerDBPath configured)")
 	}
 
-	handlers := NewHandlers(client, backendRouter, tokenTracker, cfg.ProviderUUID, cfg.Bech32Prefix)
+	handlers := NewHandlers(client, backendRouter, tokenTracker, statusChecker, cfg.ProviderUUID, cfg.Bech32Prefix)
 	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+
+	// Create per-tenant rate limiter if configured
+	var tenantRateLimiter *TenantRateLimiter
+	if cfg.TenantRateLimitRPS > 0 {
+		tenantRateLimiter = NewTenantRateLimiter(cfg.TenantRateLimitRPS, cfg.TenantRateLimitBurst)
+		slog.Info("per-tenant rate limiting enabled",
+			"rps", cfg.TenantRateLimitRPS,
+			"burst", cfg.TenantRateLimitBurst,
+		)
+	}
 
 	// Apply default for max request body size
 	maxBodySize := cfg.MaxRequestBodySize
@@ -104,20 +129,33 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		payloadHandler:        payloadHandler,
 		tokenTracker:          tokenTracker,
 		providerUUID:          cfg.ProviderUUID,
+		bech32Prefix:          cfg.Bech32Prefix,
 		tlsCertFile:           cfg.TLSCertFile,
 		tlsKeyFile:            cfg.TLSKeyFile,
 		rateLimiter:           rateLimiter,
+		tenantRateLimiter:     tenantRateLimiter,
 		callbackPublisher:     callbackPublisher,
 		callbackAuthenticator: callbackAuth,
+		statusChecker:         statusChecker,
 	}
 
-	// Register routes
+	// Register routes - unauthenticated endpoints
 	router.HandleFunc("/health", handlers.HealthCheck).Methods("GET")
-	router.HandleFunc("/v1/leases/{lease_uuid}/connection", handlers.GetLeaseConnection).Methods("GET")
-	router.HandleFunc("/v1/leases/{lease_uuid}/data", s.handlePayloadUpload).Methods("POST")
+	router.Handle("/metrics", promhttp.Handler()).Methods("GET")
 	router.HandleFunc("/callbacks/provision", s.handleProvisionCallback).Methods("POST")
 
-	// Add middleware (order matters: rate limit first, then body size, then logging)
+	// Create a subrouter for authenticated endpoints with tenant rate limiting
+	authRouter := router.PathPrefix("/v1").Subrouter()
+	authRouter.HandleFunc("/leases/{lease_uuid}/connection", handlers.GetLeaseConnection).Methods("GET")
+	authRouter.HandleFunc("/leases/{lease_uuid}/status", handlers.GetLeaseStatus).Methods("GET")
+	authRouter.HandleFunc("/leases/{lease_uuid}/data", s.handlePayloadUpload).Methods("POST")
+
+	// Apply tenant rate limiting to authenticated endpoints only
+	if tenantRateLimiter != nil {
+		authRouter.Use(tenantRateLimiter.Middleware(cfg.Bech32Prefix))
+	}
+
+	// Add global middleware (order matters: rate limit first, then body size, then logging)
 	router.Use(rateLimiter.Middleware)
 	router.Use(maxBodySizeMiddleware(maxBodySize))
 	router.Use(loggingMiddleware)
@@ -177,6 +215,19 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 
 	if callback.Status != backend.CallbackStatusSuccess && callback.Status != backend.CallbackStatusFailed {
 		writeError(w, "status must be 'success' or 'failed'", http.StatusBadRequest)
+		return
+	}
+
+	// Idempotency check: if the lease is no longer in-flight, this is a duplicate callback.
+	// Return 200 OK immediately to prevent duplicate Watermill messages.
+	// This handles the case where a backend retries a callback after we've already processed it.
+	if s.statusChecker != nil && !s.statusChecker.IsInFlight(callback.LeaseUUID) {
+		slog.Debug("ignoring duplicate callback for processed lease",
+			"lease_uuid", callback.LeaseUUID,
+			"status", callback.Status,
+		)
+		metrics.DuplicateCallbacksTotal.Inc()
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
@@ -272,7 +323,7 @@ func maxBodySizeMiddleware(maxBytes int64) func(http.Handler) http.Handler {
 	}
 }
 
-// loggingMiddleware logs incoming HTTP requests.
+// loggingMiddleware logs incoming HTTP requests and records metrics.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -282,14 +333,43 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(wrapped, r)
 
+		duration := time.Since(start)
+		statusStr := strconv.Itoa(wrapped.statusCode)
+
+		// Normalize path for metrics to avoid high cardinality
+		// Replace UUIDs with placeholder
+		path := normalizePath(r.URL.Path)
+
+		// Record metrics
+		metrics.APIRequestDuration.WithLabelValues(r.Method, path, statusStr).Observe(duration.Seconds())
+		metrics.APIRequestsTotal.WithLabelValues(r.Method, path, statusStr).Inc()
+
 		slog.Info("http request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", wrapped.statusCode,
-			"duration", time.Since(start),
+			"duration", duration,
 			"remote_addr", r.RemoteAddr,
 		)
 	})
+}
+
+// normalizePath replaces dynamic path segments (UUIDs) with placeholders
+// to prevent high cardinality in metrics labels.
+func normalizePath(path string) string {
+	// Use mux to get the route template if available
+	// For now, use a simple approach based on known patterns
+	switch {
+	case len(path) > 12 && path[:12] == "/v1/leases/" && len(path) > 48:
+		// /v1/leases/{uuid}/connection or /v1/leases/{uuid}/status or /v1/leases/{uuid}/data
+		if len(path) > 48 {
+			suffix := path[48:] // After the UUID
+			return "/v1/leases/{uuid}" + suffix
+		}
+		return "/v1/leases/{uuid}"
+	default:
+		return path
+	}
 }
 
 // responseWriter wraps http.ResponseWriter to capture the status code.

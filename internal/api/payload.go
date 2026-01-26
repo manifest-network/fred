@@ -13,6 +13,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
 )
 
@@ -57,6 +58,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	token, err := h.extractPayloadToken(r)
 	if err != nil {
 		slog.Warn("invalid authorization", "error", err)
+		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
 		writeError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -64,6 +66,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	// Validate the token
 	if err := token.Validate(h.bech32Prefix); err != nil {
 		slog.Warn("token validation failed", "error", err)
+		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
 		writeError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -168,6 +171,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"expected_hash", hex.EncodeToString(lease.MetaHash),
 			"lease_uuid", leaseUUID,
 		)
+		metrics.PayloadUploadsTotal.WithLabelValues("hash_mismatch").Inc()
 		writeError(w, "payload hash does not match meta_hash", http.StatusBadRequest)
 		return
 	}
@@ -175,6 +179,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	// Store the payload (also serves as idempotency check)
 	if !h.publisher.StorePayload(leaseUUID, payload) {
 		slog.Warn("payload already received", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
 		writeError(w, "payload already received", http.StatusConflict)
 		return
 	}
@@ -190,9 +195,14 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		// Rollback: remove stored payload on publish failure to allow retry
 		h.publisher.DeletePayload(leaseUUID)
 		slog.Error("failed to publish payload event", "error", err, "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
 		writeError(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	// Record success metrics
+	metrics.PayloadUploadsTotal.WithLabelValues("success").Inc()
+	metrics.PayloadSizeBytes.Observe(float64(len(payload)))
 
 	slog.Info("payload received and validated",
 		"lease_uuid", leaseUUID,

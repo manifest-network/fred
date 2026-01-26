@@ -23,22 +23,31 @@ type ChainClient interface {
 	Ping(ctx context.Context) error
 }
 
+// ProvisioningStatusChecker provides status information about provisioning.
+type ProvisioningStatusChecker interface {
+	HasPayload(leaseUUID string) bool
+	IsInFlight(leaseUUID string) bool
+}
+
 // Handlers contains HTTP request handlers.
 type Handlers struct {
 	client        ChainClient
 	backendRouter *backend.Router
 	tokenTracker  *TokenTracker
+	statusChecker ProvisioningStatusChecker
 	providerUUID  string
 	bech32Prefix  string
 }
 
 // NewHandlers creates a new Handlers instance.
 // tokenTracker is optional but recommended for replay attack protection.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker *TokenTracker, providerUUID, bech32Prefix string) *Handlers {
+// statusChecker is optional but required for the /status endpoint.
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker *TokenTracker, statusChecker ProvisioningStatusChecker, providerUUID, bech32Prefix string) *Handlers {
 	return &Handlers{
 		client:        client,
 		backendRouter: backendRouter,
 		tokenTracker:  tokenTracker,
+		statusChecker: statusChecker,
 		providerUUID:  providerUUID,
 		bech32Prefix:  bech32Prefix,
 	}
@@ -199,6 +208,108 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, http.StatusOK)
 }
 
+// LeaseStatusResponse represents the response for lease status.
+type LeaseStatusResponse struct {
+	LeaseUUID           string `json:"lease_uuid"`
+	State               string `json:"state"`
+	RequiresPayload     bool   `json:"requires_payload"`
+	PayloadReceived     bool   `json:"payload_received"`
+	ProvisioningStarted bool   `json:"provisioning_started"`
+}
+
+// GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
+func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	leaseUUID := vars["lease_uuid"]
+
+	// Validate lease UUID format
+	if !config.IsValidUUID(leaseUUID) {
+		slog.Warn("invalid lease UUID format", "lease_uuid", leaseUUID)
+		writeError(w, "invalid lease UUID format", http.StatusBadRequest)
+		return
+	}
+
+	// Extract and validate bearer token
+	token, err := h.extractToken(r)
+	if err != nil {
+		slog.Warn("invalid authorization", "error", err)
+		writeError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Validate the token
+	if err := token.Validate(h.bech32Prefix); err != nil {
+		slog.Warn("token validation failed", "error", err)
+		writeError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify the token's lease UUID matches the request
+	if token.LeaseUUID != leaseUUID {
+		slog.Warn("lease UUID mismatch",
+			"token_lease_uuid", token.LeaseUUID,
+			"request_lease_uuid", leaseUUID,
+		)
+		writeError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Query the lease from chain
+	lease, err := h.client.GetLease(r.Context(), leaseUUID)
+	if err != nil {
+		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if lease == nil {
+		slog.Warn("lease not found", "lease_uuid", leaseUUID)
+		writeError(w, "lease not found", http.StatusNotFound)
+		return
+	}
+
+	// Verify the tenant matches
+	if lease.Tenant != token.Tenant {
+		slog.Warn("tenant mismatch",
+			"token_tenant", token.Tenant,
+			"lease_tenant", lease.Tenant,
+		)
+		writeError(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Verify the provider UUID matches
+	if lease.ProviderUuid != h.providerUUID {
+		slog.Warn("provider UUID mismatch",
+			"lease_provider_uuid", lease.ProviderUuid,
+			"our_provider_uuid", h.providerUUID,
+		)
+		writeError(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Build status response
+	response := LeaseStatusResponse{
+		LeaseUUID:       leaseUUID,
+		State:           lease.State.String(),
+		RequiresPayload: len(lease.MetaHash) > 0,
+	}
+
+	// Check provisioning status if checker is available
+	if h.statusChecker != nil {
+		response.PayloadReceived = h.statusChecker.HasPayload(leaseUUID)
+		response.ProvisioningStarted = h.statusChecker.IsInFlight(leaseUUID)
+	}
+
+	slog.Info("lease status served",
+		"lease_uuid", leaseUUID,
+		"tenant", token.Tenant,
+		"state", response.State,
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
 // HealthResponse represents the health check response.
 type HealthResponse struct {
 	Status       string                  `json:"status"`
@@ -229,6 +340,27 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 			checks["chain"] = &CheckResult{
 				Status: "healthy",
 			}
+		}
+	}
+
+	// Check all backends
+	if h.backendRouter != nil {
+		backendResults, backendsHealthy := h.backendRouter.HealthCheck(r.Context())
+		for _, result := range backendResults {
+			checkKey := "backend:" + result.Name
+			if result.Healthy {
+				checks[checkKey] = &CheckResult{
+					Status: "healthy",
+				}
+			} else {
+				checks[checkKey] = &CheckResult{
+					Status:  "unhealthy",
+					Message: result.Error,
+				}
+			}
+		}
+		if !backendsHealthy {
+			overallHealthy = false
 		}
 	}
 

@@ -64,6 +64,10 @@ func (m *mockReconcilerBackend) ListProvisions(ctx context.Context) ([]backend.P
 	return m.provisions, nil
 }
 
+func (m *mockReconcilerBackend) Health(ctx context.Context) error {
+	return nil
+}
+
 func TestNewReconciler_Validation(t *testing.T) {
 	mockChain := &chain.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
@@ -1264,6 +1268,10 @@ func (m *mockCancellingBackend) Deprovision(ctx context.Context, leaseUUID strin
 
 func (m *mockCancellingBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	return m.provisions, nil
+}
+
+func (m *mockCancellingBackend) Health(ctx context.Context) error {
+	return nil
 }
 
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {

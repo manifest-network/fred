@@ -53,6 +53,10 @@ func (m *mockManagerBackend) ListProvisions(ctx context.Context) ([]backend.Prov
 	return nil, nil
 }
 
+func (m *mockManagerBackend) Health(ctx context.Context) error {
+	return nil
+}
+
 func TestNewManager_Validation(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -1329,5 +1333,224 @@ func TestExtractPrimarySKU(t *testing.T) {
 				t.Errorf("ExtractPrimarySKU() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestManager_GetInFlightLeases(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Initially empty
+	leases := manager.GetInFlightLeases()
+	if len(leases) != 0 {
+		t.Errorf("GetInFlightLeases() returned %d leases, want 0", len(leases))
+	}
+
+	// Track some leases
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+	manager.TrackInFlight("lease-3", "tenant-3", "sku-3", "backend-3")
+
+	// Should return all 3
+	leases = manager.GetInFlightLeases()
+	if len(leases) != 3 {
+		t.Errorf("GetInFlightLeases() returned %d leases, want 3", len(leases))
+	}
+
+	// Verify all expected leases are present
+	leaseMap := make(map[string]bool)
+	for _, uuid := range leases {
+		leaseMap[uuid] = true
+	}
+
+	for _, expected := range []string{"lease-1", "lease-2", "lease-3"} {
+		if !leaseMap[expected] {
+			t.Errorf("GetInFlightLeases() missing %q", expected)
+		}
+	}
+
+	// Untrack one
+	manager.UntrackInFlight("lease-2")
+
+	leases = manager.GetInFlightLeases()
+	if len(leases) != 2 {
+		t.Errorf("GetInFlightLeases() after untrack returned %d leases, want 2", len(leases))
+	}
+}
+
+func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// No in-flight leases, should return immediately with 0
+	remaining := manager.WaitForDrain(context.Background(), 100*time.Millisecond)
+	if remaining != 0 {
+		t.Errorf("WaitForDrain() remaining = %d, want 0", remaining)
+	}
+}
+
+func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track some leases
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+
+	// Start a goroutine to drain the leases after a delay
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		manager.UntrackInFlight("lease-1")
+		manager.UntrackInFlight("lease-2")
+	}()
+
+	// Wait for drain with sufficient timeout
+	remaining := manager.WaitForDrain(context.Background(), 1*time.Second)
+	if remaining != 0 {
+		t.Errorf("WaitForDrain() remaining = %d, want 0", remaining)
+	}
+}
+
+func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track leases that won't be drained
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+
+	// Wait with short timeout - should return remaining count
+	remaining := manager.WaitForDrain(context.Background(), 100*time.Millisecond)
+	if remaining != 2 {
+		t.Errorf("WaitForDrain() remaining = %d, want 2", remaining)
+	}
+
+	// Clean up
+	manager.UntrackInFlight("lease-1")
+	manager.UntrackInFlight("lease-2")
+}
+
+func TestManager_WaitForDrain_ContextCancelled(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track leases that won't be drained
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+
+	// Create context that will be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after short delay
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	// Wait with long timeout but context will be cancelled first
+	remaining := manager.WaitForDrain(ctx, 5*time.Second)
+	if remaining != 1 {
+		t.Errorf("WaitForDrain() remaining = %d, want 1", remaining)
+	}
+
+	// Clean up
+	manager.UntrackInFlight("lease-1")
+}
+
+func TestManager_InFlightCount(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Initially 0
+	if manager.InFlightCount() != 0 {
+		t.Errorf("InFlightCount() = %d, want 0", manager.InFlightCount())
+	}
+
+	// Track some
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	if manager.InFlightCount() != 1 {
+		t.Errorf("InFlightCount() = %d, want 1", manager.InFlightCount())
+	}
+
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+	if manager.InFlightCount() != 2 {
+		t.Errorf("InFlightCount() = %d, want 2", manager.InFlightCount())
+	}
+
+	// Untrack one
+	manager.UntrackInFlight("lease-1")
+	if manager.InFlightCount() != 1 {
+		t.Errorf("InFlightCount() after untrack = %d, want 1", manager.InFlightCount())
+	}
+
+	// Untrack the other
+	manager.UntrackInFlight("lease-2")
+	if manager.InFlightCount() != 0 {
+		t.Errorf("InFlightCount() after all untracked = %d, want 0", manager.InFlightCount())
 	}
 }

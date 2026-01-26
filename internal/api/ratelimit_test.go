@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -267,5 +268,81 @@ func TestRateLimiter_GetVisitorReturnsExisting(t *testing.T) {
 
 	if limiter1 != limiter2 {
 		t.Error("getVisitor should return the same limiter for the same IP")
+	}
+}
+
+// TenantRateLimiter tests
+
+func TestTenantRateLimiter_AllowsWithinLimit(t *testing.T) {
+	tl := NewTenantRateLimiter(10, 10) // 10 requests per second, burst of 10
+
+	tenant := "manifest1abc123"
+	for i := range 10 {
+		if !tl.Allow(tenant) {
+			t.Errorf("Request %d was blocked, should be allowed", i)
+		}
+	}
+}
+
+func TestTenantRateLimiter_BlocksOverLimit(t *testing.T) {
+	tl := NewTenantRateLimiter(1, 1) // 1 request per second, burst of 1
+
+	tenant := "manifest1xyz789"
+
+	// First request should be allowed
+	if !tl.Allow(tenant) {
+		t.Error("First request was blocked, should be allowed")
+	}
+
+	// Second request should be blocked (no tokens left)
+	if tl.Allow(tenant) {
+		t.Error("Second request was allowed, should be blocked")
+	}
+}
+
+func TestTenantRateLimiter_PerTenantIsolation(t *testing.T) {
+	tl := NewTenantRateLimiter(1, 1)
+
+	tenant1 := "manifest1tenant1"
+	tenant2 := "manifest1tenant2"
+
+	// Exhaust limit for tenant1
+	tl.Allow(tenant1)
+
+	// tenant2 should still have its own limit
+	if !tl.Allow(tenant2) {
+		t.Error("Different tenant was blocked, should have separate limit")
+	}
+}
+
+func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
+	tl := NewTenantRateLimiter(10, 10)
+
+	tenant := "manifest1test"
+
+	// Get limiter first time
+	limiter1 := tl.getLimiter(tenant)
+
+	// Get limiter second time - should return the same one
+	limiter2 := tl.getLimiter(tenant)
+
+	if limiter1 != limiter2 {
+		t.Error("getLimiter should return the same limiter for the same tenant")
+	}
+}
+
+func TestContextWithTenant(t *testing.T) {
+	ctx := context.Background()
+	tenant := "manifest1test"
+
+	// Initially should return empty
+	if got := TenantFromContext(ctx); got != "" {
+		t.Errorf("TenantFromContext() = %q, want empty string", got)
+	}
+
+	// After adding tenant, should return it
+	ctx = ContextWithTenant(ctx, tenant)
+	if got := TenantFromContext(ctx); got != tenant {
+		t.Errorf("TenantFromContext() = %q, want %q", got, tenant)
 	}
 }
