@@ -26,18 +26,20 @@ type Watcher struct {
 	eventSubscriber *chain.EventSubscriber
 	providerUUID    string
 
-	activeTenants   map[string]struct{} // Tenants with active leases
-	mu              sync.Mutex
-	withdrawTrigger WithdrawTrigger // Called when cross-provider credit depletion is detected
+	// tenantLeaseCounts tracks the number of active leases per tenant.
+	// When the count reaches zero, the tenant is removed from tracking.
+	tenantLeaseCounts map[string]int
+	mu                sync.Mutex
+	withdrawTrigger   WithdrawTrigger // Called when cross-provider credit depletion is detected
 }
 
 // New creates a new lease watcher.
 func New(client ChainClient, eventSubscriber *chain.EventSubscriber, providerUUID string) *Watcher {
 	return &Watcher{
-		client:          client,
-		eventSubscriber: eventSubscriber,
-		providerUUID:    providerUUID,
-		activeTenants:   make(map[string]struct{}),
+		client:            client,
+		eventSubscriber:   eventSubscriber,
+		providerUUID:      providerUUID,
+		tenantLeaseCounts: make(map[string]int),
 	}
 }
 
@@ -48,7 +50,7 @@ func (w *Watcher) SetWithdrawTrigger(trigger WithdrawTrigger) {
 	w.withdrawTrigger = trigger
 }
 
-// loadActiveTenants populates the activeTenants set from current active leases.
+// loadActiveTenants populates the tenant lease counts from current active leases.
 func (w *Watcher) loadActiveTenants(ctx context.Context) error {
 	leases, err := w.client.GetActiveLeasesByProvider(ctx, w.providerUUID)
 	if err != nil {
@@ -58,11 +60,12 @@ func (w *Watcher) loadActiveTenants(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Count leases per tenant
 	for _, lease := range leases {
-		w.activeTenants[lease.Tenant] = struct{}{}
+		w.tenantLeaseCounts[lease.Tenant]++
 	}
 
-	slog.Info("loaded active tenants", "count", len(w.activeTenants))
+	slog.Info("loaded active tenants", "count", len(w.tenantLeaseCounts), "total_leases", len(leases))
 	return nil
 }
 
@@ -107,55 +110,81 @@ func (w *Watcher) handleEvent(event chain.LeaseEvent) {
 	switch event.Type {
 	case chain.LeaseAcknowledged:
 		// Track active tenants for cross-provider credit monitoring
-		w.addActiveTenant(event.Tenant)
-		slog.Info("lease acknowledged", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant)
+		// Only track leases for our provider
+		if event.ProviderUUID == w.providerUUID {
+			w.addActiveTenant(event.Tenant)
+			slog.Info("lease acknowledged", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant)
+		}
+
+	case chain.LeaseClosed, chain.LeaseExpired:
+		// Decrement lease count when our leases close or expire
+		if event.ProviderUUID == w.providerUUID {
+			w.removeActiveTenant(event.Tenant)
+		}
 
 	case chain.LeaseAutoClosed:
-		// Another provider's withdrawal caused a lease to auto-close due to credit exhaustion.
-		// Check if this tenant has active leases with us - if so, trigger a withdrawal
-		// to auto-close our leases too.
-		w.handleCrossProviderAutoClose(event.Tenant, event.ProviderUUID)
+		// Handle auto-close events
+		if event.ProviderUUID == w.providerUUID {
+			// Our own lease was auto-closed, decrement count
+			w.removeActiveTenant(event.Tenant)
+		} else {
+			// Another provider's withdrawal caused a lease to auto-close due to credit exhaustion.
+			// Check if this tenant has active leases with us - if so, trigger a withdrawal
+			// to auto-close our leases too.
+			w.handleCrossProviderAutoClose(event.Tenant, event.ProviderUUID)
+		}
 	}
 }
 
-// addActiveTenant adds a tenant to the active tenants set.
+// addActiveTenant increments the lease count for a tenant.
 func (w *Watcher) addActiveTenant(tenant string) {
 	if tenant == "" {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.activeTenants[tenant] = struct{}{}
+	w.tenantLeaseCounts[tenant]++
+}
+
+// removeActiveTenant decrements the lease count for a tenant.
+// When the count reaches zero, the tenant is removed from tracking.
+func (w *Watcher) removeActiveTenant(tenant string) {
+	if tenant == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if count, exists := w.tenantLeaseCounts[tenant]; exists {
+		if count <= 1 {
+			delete(w.tenantLeaseCounts, tenant)
+		} else {
+			w.tenantLeaseCounts[tenant] = count - 1
+		}
+	}
 }
 
 // handleCrossProviderAutoClose handles lease_auto_closed events from other providers.
 // If the tenant has active leases with us, trigger a withdrawal to auto-close them.
 func (w *Watcher) handleCrossProviderAutoClose(tenant, eventProviderUUID string) {
-	// Ignore auto-close events from our own provider (we handle those normally)
-	if eventProviderUUID == w.providerUUID {
-		return
-	}
-
 	w.mu.Lock()
-	_, hasTenant := w.activeTenants[tenant]
+	leaseCount := w.tenantLeaseCounts[tenant]
 	trigger := w.withdrawTrigger
-	if !hasTenant {
-		w.mu.Unlock()
+	w.mu.Unlock()
+
+	if leaseCount == 0 {
 		slog.Debug("ignoring auto-close event for tenant without active leases",
 			"tenant", tenant,
 			"event_provider", eventProviderUUID,
 		)
 		return
 	}
-	w.mu.Unlock()
 
 	slog.Info("cross-provider credit depletion detected, triggering withdrawal",
 		"tenant", tenant,
 		"event_provider", eventProviderUUID,
+		"our_lease_count", leaseCount,
 	)
 
-	// trigger is captured while holding the lock; safe because SetWithdrawTrigger
-	// is only called once during startup before the watcher processes events.
 	if trigger != nil {
 		trigger()
 	}

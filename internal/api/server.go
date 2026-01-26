@@ -28,6 +28,7 @@ type Server struct {
 	addr                  string
 	server                *http.Server
 	handlers              *Handlers
+	tokenTracker          *TokenTracker
 	providerUUID          string
 	tlsCertFile           string
 	tlsKeyFile            string
@@ -50,11 +51,29 @@ type ServerConfig struct {
 	IdleTimeout        time.Duration
 	MaxRequestBodySize int64
 	CallbackSecret     string // HMAC secret for callback authentication
+	TokenTrackerDBPath string // Path to token tracker database (enables replay protection)
 }
 
 // NewServer creates a new API server.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher) *Server {
-	handlers := NewHandlers(client, backendRouter, cfg.ProviderUUID, cfg.Bech32Prefix)
+// Returns an error if token tracker initialization fails.
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher) (*Server, error) {
+	// Create token tracker if path is configured (enables replay protection)
+	var tokenTracker *TokenTracker
+	if cfg.TokenTrackerDBPath != "" {
+		var err error
+		tokenTracker, err = NewTokenTracker(TokenTrackerConfig{
+			DBPath: cfg.TokenTrackerDBPath,
+			MaxAge: MaxTokenAge,
+		})
+		if err != nil {
+			return nil, err
+		}
+		slog.Info("token replay protection enabled", "db_path", cfg.TokenTrackerDBPath)
+	} else {
+		slog.Warn("token replay protection disabled (no TokenTrackerDBPath configured)")
+	}
+
+	handlers := NewHandlers(client, backendRouter, tokenTracker, cfg.ProviderUUID, cfg.Bech32Prefix)
 	rateLimiter := NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	// Apply default for max request body size
@@ -74,6 +93,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	s := &Server{
 		addr:                  cfg.Addr,
 		handlers:              handlers,
+		tokenTracker:          tokenTracker,
 		providerUUID:          cfg.ProviderUUID,
 		tlsCertFile:           cfg.TLSCertFile,
 		tlsKeyFile:            cfg.TLSKeyFile,
@@ -100,7 +120,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		IdleTimeout:  cfg.IdleTimeout,
 	}
 
-	return s
+	return s, nil
 }
 
 // handleProvisionCallback handles POST /callbacks/provision from backends.
@@ -203,7 +223,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, serverShutdownTimeout)
 	defer cancel()
 
-	return s.server.Shutdown(shutdownCtx)
+	// Shutdown HTTP server first
+	if err := s.server.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+
+	// Close token tracker
+	if s.tokenTracker != nil {
+		if err := s.tokenTracker.Close(); err != nil {
+			slog.Error("failed to close token tracker", "error", err)
+			return err
+		}
+	}
+
+	return nil
 }
 
 // maxBodySizeMiddleware limits the size of request bodies.

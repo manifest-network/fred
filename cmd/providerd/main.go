@@ -182,7 +182,7 @@ func run(cmd *cobra.Command, args []string) error {
 	leaseWatcher := watcher.New(chainClient, eventSub, cfg.ProviderUUID)
 
 	// Initialize API server
-	apiServer := api.NewServer(api.ServerConfig{
+	apiServer, err := api.NewServer(api.ServerConfig{
 		Addr:               cfg.APIListenAddr,
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
@@ -195,7 +195,11 @@ func run(cmd *cobra.Command, args []string) error {
 		IdleTimeout:        cfg.HTTPIdleTimeout,
 		MaxRequestBodySize: cfg.MaxRequestBodySize,
 		CallbackSecret:     cfg.CallbackSecret,
+		TokenTrackerDBPath: cfg.TokenTrackerDBPath,
 	}, chainClient, backendRouter, provisionMgr)
+	if err != nil {
+		return fmt.Errorf("failed to create API server: %w", err)
+	}
 
 	// Initialize withdrawal scheduler
 	withdrawScheduler := scheduler.NewWithdrawScheduler(chainClient, scheduler.WithdrawSchedulerConfig{

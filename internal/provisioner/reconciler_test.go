@@ -724,8 +724,9 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 
 func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 	// Setup: Pending lease on chain, provisioning failed on backend
-	// Expected: Log warning, wait for expiry (no retry in reconciler)
-	var acknowledgeCount int
+	// Expected: Reject the lease so tenant's credit is released
+	var rejectedLeases []string
+	var rejectedReason string
 	var mu sync.Mutex
 
 	mockChain := &chain.MockClient{
@@ -734,10 +735,11 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
 			}, nil
 		},
-		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			acknowledgeCount += len(leaseUUIDs)
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
 			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 		},
 	}
@@ -764,24 +766,30 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 		t.Errorf("ReconcileAll() error = %v", err)
 	}
 
-	// Verify no actions were taken (lease will expire naturally)
+	// Verify no provisioning or deprovisioning
 	mockBackend.mu.Lock()
 	provisionCount := len(mockBackend.provisionCalls)
 	deprovisionCount := len(mockBackend.deprovisionCalls)
 	mockBackend.mu.Unlock()
 
-	mu.Lock()
-	ackCount := acknowledgeCount
-	mu.Unlock()
-
 	if provisionCount != 0 {
-		t.Errorf("expected 0 provision calls (failed, waiting for expiry), got %d", provisionCount)
+		t.Errorf("expected 0 provision calls, got %d", provisionCount)
 	}
 	if deprovisionCount != 0 {
 		t.Errorf("expected 0 deprovision calls, got %d", deprovisionCount)
 	}
-	if ackCount != 0 {
-		t.Errorf("expected 0 acknowledge calls (failed provisioning), got %d", ackCount)
+
+	// Verify lease was rejected
+	mu.Lock()
+	defer mu.Unlock()
+	if len(rejectedLeases) != 1 {
+		t.Errorf("expected 1 rejected lease, got %d", len(rejectedLeases))
+	}
+	if len(rejectedLeases) > 0 && rejectedLeases[0] != "lease-1" {
+		t.Errorf("expected lease-1 to be rejected, got %s", rejectedLeases[0])
+	}
+	if rejectedReason != "provisioning failed" {
+		t.Errorf("expected rejection reason 'provisioning failed', got %q", rejectedReason)
 	}
 }
 
@@ -1101,5 +1109,249 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	}
 	if err := reconciler.ReconcileAll(context.Background()); err != nil {
 		t.Errorf("subsequent ReconcileAll() error = %v", err)
+	}
+}
+
+func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
+	// Test that context cancellation during the reconciliation loop is handled gracefully.
+	// This tests the context checks we added within the loop iterations.
+	var callCount int
+	var mu sync.Mutex
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+				{Uuid: "lease-2", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_PENDING},
+				{Uuid: "lease-3", Tenant: "tenant-3", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+
+	// Use a backend that cancels context after first provision
+	mockBackend := &mockCancellingBackend{
+		name: "test",
+		onProvision: func() {
+			mu.Lock()
+			callCount++
+			currentCount := callCount
+			mu.Unlock()
+			if currentCount == 1 {
+				cancel()
+			}
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	err = reconciler.ReconcileAll(ctx)
+
+	// Should return context.Canceled
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
+	}
+
+	// Should have processed at most 2 leases before detecting cancellation
+	// (map iteration order is non-deterministic, so we may get 1 or 2)
+	mu.Lock()
+	finalCount := callCount
+	mu.Unlock()
+
+	// Due to map iteration, we should have stopped early but may have processed 1-2 items
+	if finalCount > 2 {
+		t.Errorf("expected at most 2 provision calls before cancellation, got %d", finalCount)
+	}
+}
+
+func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) {
+	// Test that context cancellation during orphan cleanup loop is handled gracefully.
+	ctx, cancel := context.WithCancel(context.Background())
+	var deprovisionCount int
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		// No leases - all provisions are orphans
+	}
+
+	// Use a backend that cancels context after first deprovision
+	mockBackend := &mockCancellingBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "orphan-1", Status: backend.ProvisionStatusReady},
+			{LeaseUUID: "orphan-2", Status: backend.ProvisionStatusReady},
+			{LeaseUUID: "orphan-3", Status: backend.ProvisionStatusReady},
+		},
+		onDeprovision: func() {
+			mu.Lock()
+			deprovisionCount++
+			currentCount := deprovisionCount
+			mu.Unlock()
+			if currentCount == 1 {
+				cancel()
+			}
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	err = reconciler.ReconcileAll(ctx)
+
+	// Should return context.Canceled
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
+	}
+
+	// Should have processed at most 2 orphans before detecting cancellation
+	mu.Lock()
+	finalCount := deprovisionCount
+	mu.Unlock()
+
+	if finalCount > 2 {
+		t.Errorf("expected at most 2 deprovision calls before cancellation, got %d", finalCount)
+	}
+}
+
+// mockCancellingBackend is a test backend with callback hooks for testing cancellation behavior.
+type mockCancellingBackend struct {
+	name          string
+	provisions    []backend.ProvisionInfo
+	onProvision   func()
+	onDeprovision func()
+}
+
+func (m *mockCancellingBackend) Name() string {
+	return m.name
+}
+
+func (m *mockCancellingBackend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
+	if m.onProvision != nil {
+		m.onProvision()
+	}
+	return nil
+}
+
+func (m *mockCancellingBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
+	return nil, nil
+}
+
+func (m *mockCancellingBackend) Deprovision(ctx context.Context, leaseUUID string) error {
+	if m.onDeprovision != nil {
+		m.onDeprovision()
+	}
+	return nil
+}
+
+func (m *mockCancellingBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
+	return m.provisions, nil
+}
+
+func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
+	// Test that leases are routed to the correct backend based on SKU
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				// GPU lease should go to gpu-backend
+				{
+					Uuid:   "gpu-lease",
+					Tenant: "tenant-1",
+					State:  billingtypes.LEASE_STATE_PENDING,
+					Items:  []billingtypes.LeaseItem{{SkuUuid: "gpu-a100-4x", Quantity: 1}},
+				},
+				// K8s lease should go to k8s-backend (default)
+				{
+					Uuid:   "k8s-lease",
+					Tenant: "tenant-2",
+					State:  billingtypes.LEASE_STATE_PENDING,
+					Items:  []billingtypes.LeaseItem{{SkuUuid: "k8s-small", Quantity: 1}},
+				},
+				// Unknown SKU should go to default backend
+				{
+					Uuid:   "unknown-lease",
+					Tenant: "tenant-3",
+					State:  billingtypes.LEASE_STATE_PENDING,
+					Items:  []billingtypes.LeaseItem{{SkuUuid: "unknown-sku", Quantity: 1}},
+				},
+			}, nil
+		},
+	}
+
+	gpuBackend := &mockReconcilerBackend{name: "gpu-backend", provisions: []backend.ProvisionInfo{}}
+	k8sBackend := &mockReconcilerBackend{name: "k8s-backend", provisions: []backend.ProvisionInfo{}}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	// Verify GPU lease went to GPU backend
+	gpuBackend.mu.Lock()
+	gpuCalls := gpuBackend.provisionCalls
+	gpuBackend.mu.Unlock()
+
+	if len(gpuCalls) != 1 {
+		t.Errorf("expected 1 provision call to GPU backend, got %d", len(gpuCalls))
+	}
+	if len(gpuCalls) > 0 && gpuCalls[0].LeaseUUID != "gpu-lease" {
+		t.Errorf("expected gpu-lease, got %s", gpuCalls[0].LeaseUUID)
+	}
+	if len(gpuCalls) > 0 && gpuCalls[0].SKU != "gpu-a100-4x" {
+		t.Errorf("expected SKU gpu-a100-4x, got %s", gpuCalls[0].SKU)
+	}
+
+	// Verify K8s and unknown leases went to K8s backend (default)
+	k8sBackend.mu.Lock()
+	k8sCalls := k8sBackend.provisionCalls
+	k8sBackend.mu.Unlock()
+
+	if len(k8sCalls) != 2 {
+		t.Errorf("expected 2 provision calls to K8s backend (k8s + unknown), got %d", len(k8sCalls))
+	}
+
+	// Verify the SKUs are passed correctly
+	skus := make(map[string]bool)
+	for _, call := range k8sCalls {
+		skus[call.SKU] = true
+	}
+	if !skus["k8s-small"] {
+		t.Error("expected k8s-small SKU in K8s backend calls")
+	}
+	if !skus["unknown-sku"] {
+		t.Error("expected unknown-sku in K8s backend calls (routed to default)")
 	}
 }

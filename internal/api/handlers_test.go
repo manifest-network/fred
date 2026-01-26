@@ -665,6 +665,236 @@ func TestExtractConnectionDetails(t *testing.T) {
 	}
 }
 
+// TestGetLeaseConnection_TokenReplayProtection tests the token replay protection.
+func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	// Mock chain client that returns an active lease
+	chainClient := &mockChainClient{
+		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	t.Run("replayed_token_rejected", func(t *testing.T) {
+		dbPath := t.TempDir() + "/tokens.db"
+		tokenTracker, err := NewTokenTracker(TokenTrackerConfig{
+			DBPath: dbPath,
+			MaxAge: 1 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("NewTokenTracker() error = %v", err)
+		}
+		defer tokenTracker.Close()
+
+		// Create a backend server
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "test.example.com",
+				"port":     8443,
+				"protocol": "https",
+			})
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create router: %v", err)
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			tokenTracker:  tokenTracker,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		// Create a valid token
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+		// First request should succeed
+		req1 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req1.Header.Set("Authorization", "Bearer "+validToken)
+		req1 = mux.SetURLVars(req1, map[string]string{"lease_uuid": leaseUUID})
+
+		rec1 := httptest.NewRecorder()
+		h.GetLeaseConnection(rec1, req1)
+
+		if rec1.Code != http.StatusOK {
+			t.Errorf("first request status = %d, want %d; body: %s", rec1.Code, http.StatusOK, rec1.Body.String())
+		}
+
+		// Second request with same token should be rejected
+		req2 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req2.Header.Set("Authorization", "Bearer "+validToken)
+		req2 = mux.SetURLVars(req2, map[string]string{"lease_uuid": leaseUUID})
+
+		rec2 := httptest.NewRecorder()
+		h.GetLeaseConnection(rec2, req2)
+
+		if rec2.Code != http.StatusUnauthorized {
+			t.Errorf("second request (replay) status = %d, want %d", rec2.Code, http.StatusUnauthorized)
+		}
+
+		var errResp ErrorResponse
+		if err := json.NewDecoder(rec2.Body).Decode(&errResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if errResp.Error != "unauthorized" {
+			t.Errorf("error = %q, want %q", errResp.Error, "unauthorized")
+		}
+	})
+
+	t.Run("different_tokens_both_succeed", func(t *testing.T) {
+		dbPath := t.TempDir() + "/tokens.db"
+		tokenTracker, err := NewTokenTracker(TokenTrackerConfig{
+			DBPath: dbPath,
+			MaxAge: 1 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("NewTokenTracker() error = %v", err)
+		}
+		defer tokenTracker.Close()
+
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "test.example.com",
+				"port":     8443,
+				"protocol": "https",
+			})
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create router: %v", err)
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			tokenTracker:  tokenTracker,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		// Create two different tokens (different timestamps = different signatures)
+		// Timestamps are Unix seconds, so we need different seconds for different signatures
+		now := time.Now()
+		token1 := testutil.CreateTestToken(kp, leaseUUID, now)
+		token2 := testutil.CreateTestToken(kp, leaseUUID, now.Add(1*time.Second))
+
+		// Both requests should succeed since they're different tokens
+		req1 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req1.Header.Set("Authorization", "Bearer "+token1)
+		req1 = mux.SetURLVars(req1, map[string]string{"lease_uuid": leaseUUID})
+
+		rec1 := httptest.NewRecorder()
+		h.GetLeaseConnection(rec1, req1)
+
+		if rec1.Code != http.StatusOK {
+			t.Errorf("first token status = %d, want %d; body: %s", rec1.Code, http.StatusOK, rec1.Body.String())
+		}
+
+		req2 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req2.Header.Set("Authorization", "Bearer "+token2)
+		req2 = mux.SetURLVars(req2, map[string]string{"lease_uuid": leaseUUID})
+
+		rec2 := httptest.NewRecorder()
+		h.GetLeaseConnection(rec2, req2)
+
+		if rec2.Code != http.StatusOK {
+			t.Errorf("second token status = %d, want %d; body: %s", rec2.Code, http.StatusOK, rec2.Body.String())
+		}
+	})
+
+	t.Run("no_tracker_allows_replay", func(t *testing.T) {
+		// When no token tracker is configured, replays should be allowed
+		// (graceful degradation)
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "test.example.com",
+				"port":     8443,
+				"protocol": "https",
+			})
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create router: %v", err)
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			tokenTracker:  nil, // No tracker
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+		// Both requests should succeed without tracker
+		for i := 0; i < 2; i++ {
+			req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+			req.Header.Set("Authorization", "Bearer "+validToken)
+			req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+			rec := httptest.NewRecorder()
+			h.GetLeaseConnection(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("request %d status = %d, want %d; body: %s", i+1, rec.Code, http.StatusOK, rec.Body.String())
+			}
+		}
+	})
+}
+
 // TestGetLeaseConnection_ChainErrors tests chain-related error paths.
 func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")

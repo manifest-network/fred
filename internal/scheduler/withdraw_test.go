@@ -387,6 +387,80 @@ func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 			elapsed:     0,
 			wantZero:    true,
 		},
+		// Multi-denom test cases
+		{
+			name: "multi-denom - umfx depletes first",
+			prevBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(600)),  // Burns 100/min -> 6 min remaining
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(1000)), // Burns 50/min -> 20 min remaining
+			),
+			currBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(500)),  // Burned 100 in 1 min
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(950)), // Burned 50 in 1 min
+			),
+			elapsed:      time.Minute,
+			wantZero:     false,
+			minRemaining: 4 * time.Minute, // umfx: 500 / (100/60s) = 300s = 5min
+			maxRemaining: 6 * time.Minute,
+		},
+		{
+			name: "multi-denom - uatom depletes first",
+			prevBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(10000)), // Burns 100/min -> 100 min remaining
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(500)),  // Burns 100/min -> 5 min remaining
+			),
+			currBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(9900)), // Burned 100 in 1 min
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(400)), // Burned 100 in 1 min
+			),
+			elapsed:      time.Minute,
+			wantZero:     false,
+			minRemaining: 3 * time.Minute, // uatom: 400 / (100/60s) = 240s = 4min
+			maxRemaining: 5 * time.Minute,
+		},
+		{
+			name: "multi-denom - one increases (deposit) one decreases",
+			prevBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(500)),  // Will increase (deposit)
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(1000)), // Burns normally
+			),
+			currBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(1000)),  // Increased - should be ignored
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(900)), // Burned 100 in 1 min
+			),
+			elapsed:      time.Minute,
+			wantZero:     false,
+			minRemaining: 8 * time.Minute, // uatom: 900 / (100/60s) = 540s = 9min
+			maxRemaining: 10 * time.Minute,
+		},
+		{
+			name: "multi-denom - both increase (deposits)",
+			prevBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(500)),
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(500)),
+			),
+			currBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(1000)),
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(1000)),
+			),
+			elapsed:  time.Minute,
+			wantZero: true, // Both increased, no depletion estimate
+		},
+		{
+			name: "multi-denom - one empty, one burning",
+			prevBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(0)),    // Empty - should be skipped
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(1000)), // Burns normally
+			),
+			currBalance: sdktypes.NewCoins(
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(0)),   // Still empty
+				sdktypes.NewCoin("uatom", sdkmath.NewInt(900)), // Burned 100 in 1 min
+			),
+			elapsed:      time.Minute,
+			wantZero:     false,
+			minRemaining: 8 * time.Minute, // uatom: 900 / (100/60s) = 540s = 9min
+			maxRemaining: 10 * time.Minute,
+		},
 	}
 
 	for _, tt := range tests {
@@ -599,4 +673,173 @@ func generateTestAddress(t *testing.T, prefix string) string {
 		t.Fatalf("failed to generate test address: %v", err)
 	}
 	return addr
+}
+
+// generateTestAddressN creates a unique valid bech32 address for testing.
+func generateTestAddressN(t *testing.T, prefix string, n int) string {
+	t.Helper()
+	addrBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, byte(n)}
+	addr, err := bech32.ConvertAndEncode(prefix, addrBytes)
+	if err != nil {
+		t.Fatalf("failed to generate test address: %v", err)
+	}
+	return addr
+}
+
+func TestWithdrawScheduler_CheckCreditsAndClose_ContextCancellation(t *testing.T) {
+	// Test that checkCreditsAndClose respects context cancellation during iteration
+	ctx, cancel := context.WithCancel(context.Background())
+	var getCreditCallCount int32
+
+	// Generate multiple test tenants
+	tenant1 := generateTestAddressN(t, "manifest", 1)
+	tenant2 := generateTestAddressN(t, "manifest", 2)
+	tenant3 := generateTestAddressN(t, "manifest", 3)
+
+	client := &mockChainClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: tenant1, ProviderUuid: "test-uuid"},
+				{Uuid: "lease-2", Tenant: tenant2, ProviderUuid: "test-uuid"},
+				{Uuid: "lease-3", Tenant: tenant3, ProviderUuid: "test-uuid"},
+			}, nil
+		},
+		GetCreditAccountFunc: func(ctx context.Context, tenant string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+			count := atomic.AddInt32(&getCreditCallCount, 1)
+			// Cancel after first credit check
+			if count == 1 {
+				cancel()
+			}
+			// Check if context is cancelled
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			return &billingtypes.CreditAccount{}, sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000000))), nil
+		},
+	}
+
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID: "test-uuid",
+		Interval:     time.Minute,
+	})
+
+	// Should return early when context is cancelled
+	s.checkCreditsAndClose(ctx)
+
+	// Verify we stopped iterating when context was cancelled
+	// Due to map iteration order being non-deterministic, we may get 1-2 calls
+	finalCount := atomic.LoadInt32(&getCreditCallCount)
+	if finalCount > 2 {
+		t.Errorf("expected at most 2 GetCreditAccount calls before cancellation, got %d", finalCount)
+	}
+}
+
+func TestWithdrawScheduler_CheckCreditsAndClose_CloseLeasesContextCheck(t *testing.T) {
+	// Test that CloseLeases is not called when context is cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	var closeCalled bool
+
+	tenant := generateTestAddress(t, "manifest")
+
+	client := &mockChainClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: tenant, ProviderUuid: "test-uuid"},
+			}, nil
+		},
+		GetCreditAccountFunc: func(ctx context.Context, t string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+			// Cancel context after checking credit
+			cancel()
+			// Return depleted balance (normally would trigger CloseLeases)
+			return &billingtypes.CreditAccount{}, sdktypes.Coins{}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			closeCalled = true
+			return uint64(len(leaseUUIDs)), []string{"txhash"}, nil
+		},
+	}
+
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID: "test-uuid",
+		Interval:     time.Minute,
+	})
+
+	s.checkCreditsAndClose(ctx)
+
+	// CloseLeases should NOT be called because context was cancelled
+	if closeCalled {
+		t.Error("CloseLeases should not be called when context is cancelled")
+	}
+}
+
+func TestWithdrawScheduler_EstimateDepletionTime_HighPrecision(t *testing.T) {
+	// Test that burn rate calculation handles various time intervals correctly
+	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
+		ProviderUUID: "test-uuid",
+		Interval:     time.Minute,
+	})
+
+	now := time.Now()
+
+	tests := []struct {
+		name         string
+		prevBalance  sdktypes.Coins
+		currBalance  sdktypes.Coins
+		elapsed      time.Duration
+		wantZero     bool
+		minRemaining time.Duration
+		maxRemaining time.Duration
+	}{
+		{
+			name:         "short interval - 10 seconds",
+			prevBalance:  sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))),
+			currBalance:  sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(990))),
+			elapsed:      10 * time.Second,
+			wantZero:     false,
+			minRemaining: 15 * time.Minute, // 990 / (10/10s) = 990s = ~16.5min
+			maxRemaining: 18 * time.Minute,
+		},
+		{
+			name:         "long interval - 10 minutes",
+			prevBalance:  sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(10000))),
+			currBalance:  sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(9000))),
+			elapsed:      10 * time.Minute,
+			wantZero:     false,
+			minRemaining: 85 * time.Minute, // 9000 / (1000/600s) = 5400s = 90min
+			maxRemaining: 95 * time.Minute,
+		},
+		{
+			name:        "very small burn - micro amount",
+			prevBalance: sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000000))),
+			currBalance: sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(999999))), // Burned 1 in 1 min
+			elapsed:     time.Minute,
+			wantZero:    false,
+			// burn rate = 1 per 60 seconds = 1/60 per second
+			// time remaining = 999999 / (1/60) seconds = 999999 * 60 seconds = ~694 days
+			minRemaining: 690 * 24 * time.Hour,
+			maxRemaining: 700 * 24 * time.Hour,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			depletion := s.estimateDepletionTime(tt.prevBalance, tt.currBalance, tt.elapsed, now)
+
+			if tt.wantZero {
+				if !depletion.IsZero() {
+					t.Errorf("estimateDepletionTime() = %v, want zero time", depletion)
+				}
+				return
+			}
+
+			if depletion.IsZero() {
+				t.Fatal("estimateDepletionTime() returned zero time, want non-zero")
+			}
+
+			remaining := depletion.Sub(now)
+			if remaining < tt.minRemaining || remaining > tt.maxRemaining {
+				t.Errorf("estimated remaining = %v, want between %v and %v", remaining, tt.minRemaining, tt.maxRemaining)
+			}
+		})
+	}
 }
