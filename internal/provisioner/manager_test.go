@@ -340,24 +340,10 @@ func TestManager_PopInFlight(t *testing.T) {
 	}
 }
 
-func TestManager_CallbackURL(t *testing.T) {
-	mockBackend := &mockManagerBackend{name: "test"}
-	router, _ := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
-	})
-	mockChain := &chain.MockClient{}
-
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
-	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
-
+func TestBuildCallbackURL(t *testing.T) {
 	expected := "http://localhost:8080/callbacks/provision"
-	if got := manager.callbackURL(); got != expected {
-		t.Errorf("callbackURL() = %q, want %q", got, expected)
+	if got := BuildCallbackURL("http://localhost:8080"); got != expected {
+		t.Errorf("BuildCallbackURL() = %q, want %q", got, expected)
 	}
 }
 

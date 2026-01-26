@@ -177,6 +177,11 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 	)
 
 	for leaseUUID, lease := range chainLeases {
+		// Check for context cancellation between iterations to allow graceful shutdown
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		provision, isProvisioned := allProvisions[leaseUUID]
 
 		switch {
@@ -261,6 +266,11 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 	// interfering with other providers sharing the same backend.
 	var orphans int
 	for leaseUUID, provision := range allProvisions {
+		// Check for context cancellation between iterations
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		// Skip provisions that belong to a different provider
 		if provision.ProviderUUID != "" && provision.ProviderUUID != r.providerUUID {
 			slog.Debug("reconcile: skipping provision owned by different provider",
@@ -318,11 +328,8 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 	// Extract SKU for routing
 	sku := ExtractPrimarySKU(&lease)
 
-	// Route to appropriate backend based on SKU
+	// Route to appropriate backend based on SKU (Route already falls back to default)
 	backendClient := r.backendRouter.Route(sku)
-	if backendClient == nil {
-		backendClient = r.backendRouter.Default()
-	}
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}
@@ -341,7 +348,7 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 		Tenant:       lease.Tenant,
 		ProviderUUID: r.providerUUID,
 		SKU:          sku,
-		CallbackURL:  r.callbackURL(),
+		CallbackURL:  BuildCallbackURL(r.callbackBaseURL),
 	})
 	if err != nil {
 		// Clean up in-flight on error
@@ -432,9 +439,4 @@ func (r *Reconciler) Start(ctx context.Context) error {
 // RunOnce performs a single reconciliation. Use this at startup.
 func (r *Reconciler) RunOnce(ctx context.Context) error {
 	return r.ReconcileAll(ctx)
-}
-
-// callbackURL returns the callback URL for backend provisioning.
-func (r *Reconciler) callbackURL() string {
-	return r.callbackBaseURL + CallbackPath
 }

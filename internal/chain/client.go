@@ -320,7 +320,10 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 	ticker := time.NewTicker(c.txPollInterval)
 	defer ticker.Stop()
 
-	timeout := time.After(c.txTimeout)
+	// Use NewTimer instead of time.After to avoid timer leak on early return
+	timeoutTimer := time.NewTimer(c.txTimeout)
+	defer timeoutTimer.Stop()
+
 	var consecutiveErrors int
 	var lastErr error
 
@@ -328,7 +331,7 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-timeout:
+		case <-timeoutTimer.C:
 			if lastErr != nil {
 				return nil, fmt.Errorf("timeout waiting for tx %s (last error: %v)", txHash, lastErr)
 			}

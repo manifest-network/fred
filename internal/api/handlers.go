@@ -162,10 +162,12 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	// Extract SKU for routing (use first item's SKU - all items share same provider)
 	sku := provisioner.ExtractPrimarySKU(lease)
 
-	// Route to appropriate backend based on SKU
+	// Route to appropriate backend based on SKU (Route already falls back to default)
 	backendClient := h.backendRouter.Route(sku)
 	if backendClient == nil {
-		backendClient = h.backendRouter.Default()
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
 	}
 	info, err := backendClient.GetInfo(r.Context(), leaseUUID)
 	if err != nil {

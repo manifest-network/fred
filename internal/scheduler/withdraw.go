@@ -302,6 +302,11 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 
 	// Check each tenant's credit balance
 	for tenant, leaseUUIDs := range tenantLeases {
+		// Check for context cancellation between iterations
+		if ctx.Err() != nil {
+			break
+		}
+
 		_, balances, err := s.client.GetCreditAccount(ctx, tenant)
 		if err != nil {
 			// Track consecutive errors - if we consistently can't check, schedule earlier retry
@@ -380,6 +385,11 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 	}
 
 	s.mu.Unlock()
+
+	// Check for context cancellation before making chain call
+	if ctx.Err() != nil {
+		return defaultNextCheck
+	}
 
 	// Close depleted leases (outside the lock to avoid blocking)
 	if len(leasesToClose) > 0 {

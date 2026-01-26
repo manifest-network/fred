@@ -95,9 +95,11 @@ type HTTPClient struct {
 
 // HTTPClientConfig configures an HTTP backend client.
 type HTTPClientConfig struct {
-	Name    string
-	BaseURL string
-	Timeout time.Duration
+	Name               string
+	BaseURL            string
+	Timeout            time.Duration
+	MaxIdleConns       int // Max idle connections across all hosts (default: 100)
+	MaxIdleConnsPerHost int // Max idle connections per host (default: 10)
 }
 
 // NewHTTPClient creates a new HTTP backend client.
@@ -107,11 +109,28 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		timeout = 30 * time.Second
 	}
 
+	maxIdleConns := cfg.MaxIdleConns
+	if maxIdleConns == 0 {
+		maxIdleConns = 100
+	}
+
+	maxIdleConnsPerHost := cfg.MaxIdleConnsPerHost
+	if maxIdleConnsPerHost == 0 {
+		maxIdleConnsPerHost = 10 // Higher than default (2) for better concurrency
+	}
+
+	transport := &http.Transport{
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
 	return &HTTPClient{
 		name:    cfg.Name,
 		baseURL: cfg.BaseURL,
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: transport,
 		},
 	}
 }
