@@ -196,7 +196,7 @@ func run(cmd *cobra.Command, args []string) error {
 		MaxRequestBodySize: cfg.MaxRequestBodySize,
 		CallbackSecret:     cfg.CallbackSecret,
 		TokenTrackerDBPath: cfg.TokenTrackerDBPath,
-	}, chainClient, backendRouter, provisionMgr)
+	}, chainClient, backendRouter, provisionMgr, provisionMgr)
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
 	}

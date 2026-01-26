@@ -59,6 +59,7 @@ const (
 	TopicLeaseClosed     = "events.lease.closed"
 	TopicLeaseExpired    = "events.lease.expired"
 	TopicBackendCallback = "events.backend.callback"
+	TopicPayloadReceived = "events.payload.received"
 )
 
 // CallbackPath is the path suffix for backend provision callbacks.
@@ -84,6 +85,7 @@ type Manager struct {
 	chainClient     ChainClient
 	publisher       message.Publisher
 	wmRouter        *message.Router
+	payloadStore    *PayloadStore
 
 	// Track in-flight provisions (ephemeral - recovered via reconciliation)
 	inFlight   map[string]inFlightProvision
@@ -220,6 +222,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		chainClient:     chainClient,
 		publisher:       pubSub,
 		wmRouter:        wmRouter,
+		payloadStore:    NewPayloadStore(),
 		inFlight:        make(map[string]inFlightProvision),
 	}
 
@@ -250,6 +253,13 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		TopicBackendCallback,
 		pubSub,
 		m.handleBackendCallback,
+	)
+
+	wmRouter.AddNoPublisherHandler(
+		"handle_payload_received",
+		TopicPayloadReceived,
+		pubSub,
+		m.handlePayloadReceived,
 	)
 
 	return m, nil
@@ -342,6 +352,22 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 			"error", err,
 		)
 		return fmt.Errorf("failed to fetch lease %s: %w", event.LeaseUUID, err)
+	}
+	if lease == nil {
+		slog.Warn("lease not found, skipping",
+			"lease_uuid", event.LeaseUUID,
+		)
+		return nil
+	}
+
+	// Check if lease requires a payload (has MetaHash)
+	// If so, skip immediate provisioning - wait for payload upload
+	if len(lease.MetaHash) > 0 {
+		slog.Info("lease has meta_hash, awaiting payload upload",
+			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
+		)
+		return nil // Don't provision yet - wait for payload
 	}
 
 	// Extract primary SKU from lease items for routing
@@ -568,6 +594,149 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 			"status", callback.Status,
 		)
 	}
+
+	return nil
+}
+
+// PublishPayload publishes a payload received event to Watermill.
+// This is called by the API server when it receives a valid payload upload.
+func (m *Manager) PublishPayload(event PayloadEvent) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal payload event: %w", err)
+	}
+
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+	return m.publisher.Publish(TopicPayloadReceived, msg)
+}
+
+// StorePayload stores a payload in the payload store.
+// Returns false if a payload already exists for this lease (conflict).
+func (m *Manager) StorePayload(leaseUUID string, payload []byte) bool {
+	return m.payloadStore.Store(leaseUUID, payload)
+}
+
+// HasPayload checks if a payload exists for a lease.
+func (m *Manager) HasPayload(leaseUUID string) bool {
+	return m.payloadStore.Has(leaseUUID)
+}
+
+// DeletePayload removes a payload from the store.
+// Used for rollback when publish fails after store succeeds.
+func (m *Manager) DeletePayload(leaseUUID string) {
+	m.payloadStore.Delete(leaseUUID)
+}
+
+// PayloadStore returns the payload store for reconciliation access.
+func (m *Manager) PayloadStore() *PayloadStore {
+	return m.payloadStore
+}
+
+// handlePayloadReceived processes payload upload events.
+// This triggers provisioning for leases that were waiting for a payload.
+func (m *Manager) handlePayloadReceived(msg *message.Message) error {
+	var event PayloadEvent
+	if err := json.Unmarshal(msg.Payload, &event); err != nil {
+		slog.Error("failed to unmarshal payload event",
+			"error", err,
+			"error_type", ErrMalformedMessage,
+		)
+		return nil // Don't retry malformed messages
+	}
+
+	slog.Info("processing payload received",
+		"lease_uuid", event.LeaseUUID,
+		"tenant", event.Tenant,
+	)
+
+	// Fetch lease details from chain to get SKU for routing
+	lease, err := m.chainClient.GetLease(msg.Context(), event.LeaseUUID)
+	if err != nil {
+		slog.Error("failed to fetch lease details",
+			"lease_uuid", event.LeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("failed to fetch lease %s: %w", event.LeaseUUID, err)
+	}
+	if lease == nil {
+		slog.Warn("lease not found, cleaning up payload",
+			"lease_uuid", event.LeaseUUID,
+		)
+		m.payloadStore.Delete(event.LeaseUUID)
+		return nil
+	}
+
+	// Verify lease is still pending
+	if lease.State != billingtypes.LEASE_STATE_PENDING {
+		slog.Warn("lease is no longer pending, skipping provisioning",
+			"lease_uuid", event.LeaseUUID,
+			"state", lease.State.String(),
+		)
+		// Clean up the stored payload
+		m.payloadStore.Delete(event.LeaseUUID)
+		return nil
+	}
+
+	// Extract primary SKU for routing
+	sku := ExtractPrimarySKU(lease)
+
+	// Route to appropriate backend based on SKU
+	backendClient := m.router.Route(sku)
+	if backendClient == nil {
+		slog.Error("no backend available for provisioning",
+			"lease_uuid", event.LeaseUUID,
+			"sku", sku,
+		)
+		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
+	}
+
+	// Atomically track in-flight BEFORE calling Provision
+	if !m.TryTrackInFlight(event.LeaseUUID, event.Tenant, sku, backendClient.Name()) {
+		slog.Debug("lease already in-flight, skipping",
+			"lease_uuid", event.LeaseUUID,
+		)
+		return nil
+	}
+
+	// Pop the payload from the store
+	payload := m.payloadStore.Pop(event.LeaseUUID)
+	if payload == nil {
+		// This shouldn't happen in normal operation since payload is stored
+		// before publishing the event, but handle it gracefully
+		slog.Warn("payload not found in store, proceeding without payload",
+			"lease_uuid", event.LeaseUUID,
+		)
+	}
+
+	// Start provisioning with payload
+	err = backendClient.Provision(msg.Context(), backend.ProvisionRequest{
+		LeaseUUID:    event.LeaseUUID,
+		Tenant:       event.Tenant,
+		ProviderUUID: m.providerUUID,
+		SKU:          sku,
+		CallbackURL:  BuildCallbackURL(m.callbackBaseURL),
+		Payload:      payload,
+		PayloadHash:  event.MetaHashHex,
+	})
+	if err != nil {
+		// Clean up in-flight tracking on failure
+		m.UntrackInFlight(event.LeaseUUID)
+
+		slog.Error("failed to start provisioning",
+			"lease_uuid", event.LeaseUUID,
+			"sku", sku,
+			"backend", backendClient.Name(),
+			"error", err,
+		)
+		return fmt.Errorf("%w: %w", ErrProvisioningFailed, err)
+	}
+
+	slog.Info("provisioning started with payload",
+		"lease_uuid", event.LeaseUUID,
+		"sku", sku,
+		"backend", backendClient.Name(),
+		"payload_size", len(payload),
+	)
 
 	return nil
 }

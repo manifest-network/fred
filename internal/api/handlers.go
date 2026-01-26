@@ -18,6 +18,7 @@ import (
 
 // ChainClient defines the chain operations needed by handlers.
 type ChainClient interface {
+	GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	Ping(ctx context.Context) error
 }

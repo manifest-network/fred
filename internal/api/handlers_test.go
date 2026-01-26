@@ -217,8 +217,16 @@ func TestConnectionResponse_JSON(t *testing.T) {
 
 // mockChainClient implements ChainClient for testing.
 type mockChainClient struct {
+	getLeaseFunc       func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	getActiveLeaseFunc func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	pingFunc           func(ctx context.Context) error
+}
+
+func (m *mockChainClient) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+	if m.getLeaseFunc != nil {
+		return m.getLeaseFunc(ctx, leaseUUID)
+	}
+	return nil, nil
 }
 
 func (m *mockChainClient) GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {

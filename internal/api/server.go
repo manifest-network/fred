@@ -23,11 +23,13 @@ type CallbackPublisher interface {
 	PublishCallback(callback backend.CallbackPayload) error
 }
 
+
 // Server is the HTTP API server.
 type Server struct {
 	addr                  string
 	server                *http.Server
 	handlers              *Handlers
+	payloadHandler        *PayloadHandler
 	tokenTracker          *TokenTracker
 	providerUUID          string
 	tlsCertFile           string
@@ -56,7 +58,7 @@ type ServerConfig struct {
 
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher) (*Server, error) {
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher) (*Server, error) {
 	// Create token tracker if path is configured (enables replay protection)
 	var tokenTracker *TokenTracker
 	if cfg.TokenTrackerDBPath != "" {
@@ -88,11 +90,18 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		callbackAuth = NewCallbackAuthenticator(cfg.CallbackSecret)
 	}
 
+	// Create payload handler if publisher is provided
+	var payloadHandler *PayloadHandler
+	if payloadPublisher != nil {
+		payloadHandler = NewPayloadHandler(client, payloadPublisher, cfg.ProviderUUID, cfg.Bech32Prefix)
+	}
+
 	router := mux.NewRouter()
 
 	s := &Server{
 		addr:                  cfg.Addr,
 		handlers:              handlers,
+		payloadHandler:        payloadHandler,
 		tokenTracker:          tokenTracker,
 		providerUUID:          cfg.ProviderUUID,
 		tlsCertFile:           cfg.TLSCertFile,
@@ -105,6 +114,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	// Register routes
 	router.HandleFunc("/health", handlers.HealthCheck).Methods("GET")
 	router.HandleFunc("/v1/leases/{lease_uuid}/connection", handlers.GetLeaseConnection).Methods("GET")
+	router.HandleFunc("/v1/leases/{lease_uuid}/data", s.handlePayloadUpload).Methods("POST")
 	router.HandleFunc("/callbacks/provision", s.handleProvisionCallback).Methods("POST")
 
 	// Add middleware (order matters: rate limit first, then body size, then logging)
@@ -182,6 +192,17 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// handlePayloadUpload handles POST /v1/leases/{lease_uuid}/data from tenants.
+func (s *Server) handlePayloadUpload(w http.ResponseWriter, r *http.Request) {
+	if s.payloadHandler == nil {
+		slog.Error("payload handler not configured")
+		writeError(w, "service not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	s.payloadHandler.HandlePayloadUpload(w, r)
 }
 
 // Start begins serving HTTP requests.

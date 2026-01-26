@@ -352,7 +352,19 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       "tenant-1",
+				ProviderUuid: "provider-1",
+				State:        billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{
+					{SkuUuid: "sku-1"},
+				},
+			}, nil
+		},
+	}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -408,7 +420,17 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       "tenant-1",
+				ProviderUuid: "provider-1",
+				State:        billingtypes.LEASE_STATE_PENDING,
+				Items:        []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+			}, nil
+		},
+	}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
