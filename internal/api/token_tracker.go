@@ -36,8 +36,8 @@ type TokenTracker struct {
 
 	// For graceful shutdown
 	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	closeOnce sync.Once
+	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
+	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
 }
 
 // TokenTrackerConfig configures the token tracker.
@@ -86,6 +86,8 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 		maxAge:          maxAge,
 		cleanupInterval: cleanupInterval,
 		cancel:          cancel,
+		wg:              &sync.WaitGroup{},
+		closeOnce:       &sync.Once{},
 	}
 
 	// Start background cleanup

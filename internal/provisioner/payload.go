@@ -47,7 +47,7 @@ type PayloadStore struct {
 
 	// For graceful shutdown
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	wg     *sync.WaitGroup // Pointer to avoid copy-by-value issues
 }
 
 // PayloadStoreConfig configures the payload store.
@@ -101,6 +101,7 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 		ttl:             ttl,
 		cleanupInterval: cleanupInterval,
 		cancel:          cancel,
+		wg:              &sync.WaitGroup{},
 	}
 
 	// Start background cleanup

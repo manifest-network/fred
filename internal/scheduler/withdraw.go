@@ -66,7 +66,7 @@ type WithdrawScheduler struct {
 	ctxMu  sync.RWMutex
 
 	// wg tracks spawned goroutines for graceful shutdown
-	wg sync.WaitGroup
+	wg *sync.WaitGroup // Pointer to avoid copy-by-value issues
 }
 
 // WithdrawSchedulerConfig holds configuration for the withdrawal scheduler.
@@ -109,6 +109,7 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 		tenants:                   make(map[string]*tenantState),
 		ctx:                       ctx,
 		cancel:                    cancel,
+		wg:                        &sync.WaitGroup{},
 	}
 }
 
