@@ -1018,16 +1018,22 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 		)
 	}
 
-	// Start provisioning with payload
-	err = backendClient.Provision(msg.Context(), backend.ProvisionRequest{
+	// Build provision request - only include PayloadHash when we have the actual payload.
+	// This ensures backends never receive a hash without the corresponding data.
+	req := backend.ProvisionRequest{
 		LeaseUUID:    event.LeaseUUID,
 		Tenant:       event.Tenant,
 		ProviderUUID: m.providerUUID,
 		SKU:          sku,
 		CallbackURL:  BuildCallbackURL(m.callbackBaseURL),
 		Payload:      payload,
-		PayloadHash:  event.MetaHashHex,
-	})
+	}
+	if payload != nil && event.MetaHashHex != "" {
+		req.PayloadHash = event.MetaHashHex
+	}
+
+	// Start provisioning with payload
+	err = backendClient.Provision(msg.Context(), req)
 	if err != nil {
 		// Clean up in-flight tracking on failure.
 		// Keep payload in store so reconciliation can retry with it.

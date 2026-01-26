@@ -374,8 +374,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	return nil
 }
 
-// startProvisioning initiates provisioning for a lease, optionally with a payload.
-// If withPayload is true and the manager has a stored payload, it will be included.
+// startProvisioning initiates provisioning for a lease without a payload.
 // Returns errLeaseAlreadyInFlight if the lease is already being provisioned by
 // the event-driven path (this is not a real error, just a signal to skip).
 func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.Lease) error {
@@ -420,9 +419,11 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 
 	// Get the payload from the store WITHOUT removing it yet.
 	// We only delete after Provision() succeeds to allow retries.
+	// Only include PayloadHash when we have the actual payload - this ensures
+	// backends never receive a hash without the corresponding data.
 	if withPayload && r.manager != nil {
 		req.Payload = r.manager.PayloadStore().Get(lease.Uuid)
-		if len(lease.MetaHash) > 0 {
+		if req.Payload != nil && len(lease.MetaHash) > 0 {
 			req.PayloadHash = hex.EncodeToString(lease.MetaHash)
 		}
 	}
