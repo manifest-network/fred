@@ -179,8 +179,9 @@ func (c *Client) GetPendingLeases(ctx context.Context, providerUUID string) ([]b
 	return leases, nil
 }
 
-// GetActiveLease returns an active lease by UUID, or nil if not found or not active.
-func (c *Client) GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+// GetLease returns a lease by UUID regardless of state.
+// Returns nil if the lease is not found.
+func (c *Client) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 	resp, err := c.billingQuery.Lease(ctx, &billingtypes.QueryLeaseRequest{
 		LeaseUuid: leaseUUID,
 	})
@@ -188,11 +189,21 @@ func (c *Client) GetActiveLease(ctx context.Context, leaseUUID string) (*billing
 		return nil, fmt.Errorf("failed to query lease: %w", err)
 	}
 
-	if resp.Lease.State != billingtypes.LEASE_STATE_ACTIVE {
+	return &resp.Lease, nil
+}
+
+// GetActiveLease returns an active lease by UUID, or nil if not found or not active.
+func (c *Client) GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+	lease, err := c.GetLease(ctx, leaseUUID)
+	if err != nil {
+		return nil, err
+	}
+
+	if lease.State != billingtypes.LEASE_STATE_ACTIVE {
 		return nil, nil
 	}
 
-	return &resp.Lease, nil
+	return lease, nil
 }
 
 // GetProvider returns provider details by UUID.
@@ -376,6 +387,37 @@ func (c *Client) GetProviderWithdrawable(ctx context.Context, providerUUID strin
 	}
 
 	return resp.Amounts, nil
+}
+
+// RejectLeases rejects the given pending leases with an optional reason.
+// Returns the number of leases rejected and tx hashes.
+// This is used when provisioning fails and the provider cannot fulfill the lease.
+func (c *Client) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	if len(leaseUUIDs) == 0 {
+		return 0, nil, nil
+	}
+
+	var totalRejected uint64
+	var txHashes []string
+
+	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
+		msg := &billingtypes.MsgRejectLease{
+			Sender:     c.signer.Address(),
+			LeaseUuids: batch,
+			Reason:     reason,
+		}
+
+		txHash, err := c.broadcastTx(ctx, msg)
+		if err != nil {
+			return totalRejected, txHashes, fmt.Errorf("failed to reject leases: %w", err)
+		}
+
+		slog.Info("rejected leases", "count", len(batch), "reason", reason, "tx_hash", txHash)
+		txHashes = append(txHashes, txHash)
+		totalRejected += uint64(len(batch))
+	}
+
+	return totalRejected, txHashes, nil
 }
 
 // CloseLeases closes the given leases with an optional reason. Returns the number of leases closed and tx hashes.

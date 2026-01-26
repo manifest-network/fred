@@ -23,6 +23,7 @@ type ReconcilerChainClient interface {
 	GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
+	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
 
 // Reconciler performs level-triggered reconciliation between chain state and backend state.
@@ -217,12 +218,17 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 			)
 
 		case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusFailed:
-			// Provisioning failed - lease will eventually expire
-			// TODO(phase-3): Consider calling RejectLease here
-			slog.Warn("reconcile: lease provisioning failed, waiting for expiry",
+			// Provisioning failed - reject the lease so tenant's credit is released
+			slog.Warn("reconcile: lease provisioning failed, rejecting",
 				"lease_uuid", leaseUUID,
 				"tenant", lease.Tenant,
 			)
+			if err := r.rejectLease(ctx, leaseUUID, "provisioning failed"); err != nil {
+				slog.Error("reconcile: failed to reject lease",
+					"lease_uuid", leaseUUID,
+					"error", err,
+				)
+			}
 
 		case lease.State == billingtypes.LEASE_STATE_ACTIVE && !isProvisioned:
 			// Anomaly: Lease is active but not provisioned
@@ -309,9 +315,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 // Returns errLeaseAlreadyInFlight if the lease is already being provisioned by
 // the event-driven path (this is not a real error, just a signal to skip).
 func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.Lease) error {
-	// TODO(phase-3): Use SKU-based routing when implemented
-	// backendClient := r.backendRouter.Route(lease.Sku)
-	backendClient := r.backendRouter.Default()
+	// Extract SKU for routing
+	sku := ExtractPrimarySKU(&lease)
+
+	// Route to appropriate backend based on SKU
+	backendClient := r.backendRouter.Route(sku)
+	if backendClient == nil {
+		backendClient = r.backendRouter.Default()
+	}
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}
@@ -320,8 +331,7 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 	// This prevents TOCTOU race between the reconciler and event-driven path:
 	// both may try to provision the same lease concurrently.
 	if r.manager != nil {
-		// TODO(phase-3): Extract SKU from lease.Items for routing
-		if !r.manager.TryTrackInFlight(lease.Uuid, lease.Tenant, "", backendClient.Name()) {
+		if !r.manager.TryTrackInFlight(lease.Uuid, lease.Tenant, sku, backendClient.Name()) {
 			return errLeaseAlreadyInFlight
 		}
 	}
@@ -330,8 +340,8 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 		LeaseUUID:    lease.Uuid,
 		Tenant:       lease.Tenant,
 		ProviderUUID: r.providerUUID,
-		// TODO(phase-3): Extract SKU from lease.Items for routing
-		CallbackURL: r.callbackURL(),
+		SKU:          sku,
+		CallbackURL:  r.callbackURL(),
 	})
 	if err != nil {
 		// Clean up in-flight on error
@@ -344,6 +354,7 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 	slog.Info("reconcile: started provisioning",
 		"lease_uuid", lease.Uuid,
 		"tenant", lease.Tenant,
+		"sku", sku,
 		"backend", backendClient.Name(),
 	)
 
@@ -361,6 +372,23 @@ func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) err
 		"lease_uuid", leaseUUID,
 		"acknowledged", acknowledged,
 		"tx_hashes", txHashes,
+	)
+
+	return nil
+}
+
+// rejectLease rejects a lease on chain with a reason.
+func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) error {
+	rejected, txHashes, err := r.chainClient.RejectLeases(ctx, []string{leaseUUID}, reason)
+	if err != nil {
+		return err
+	}
+
+	slog.Info("reconcile: rejected lease",
+		"lease_uuid", leaseUUID,
+		"rejected", rejected,
+		"tx_hashes", txHashes,
+		"reason", reason,
 	)
 
 	return nil

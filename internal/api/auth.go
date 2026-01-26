@@ -15,7 +15,8 @@ import (
 
 const (
 	// MaxTokenAge is the maximum age of a valid authentication token.
-	MaxTokenAge = 5 * time.Minute
+	// Kept short (30 seconds) to limit replay attack window.
+	MaxTokenAge = 30 * time.Second
 )
 
 // AuthToken represents the bearer token for tenant authentication.

@@ -66,7 +66,9 @@ const CallbackPath = "/callbacks/provision"
 
 // ChainClient defines the chain operations needed by the provisioner.
 type ChainClient interface {
+	GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
+	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
 
 // Manager handles the provisioning lifecycle using Watermill for event routing.
@@ -317,15 +319,28 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 		"tenant", event.Tenant,
 	)
 
-	// TODO(phase-3): Implement SKU-based routing.
-	// Currently we always use the default backend. To route by SKU prefix
-	// (as documented in config), we need to fetch lease details from chain
-	// to get the SKU, then call m.router.Route(sku). For now, all leases
-	// go to the default backend regardless of sku_prefix configuration.
-	backendClient := m.router.Default()
+	// Fetch lease details from chain to get SKU for routing
+	lease, err := m.chainClient.GetLease(msg.Context(), event.LeaseUUID)
+	if err != nil {
+		slog.Error("failed to fetch lease details",
+			"lease_uuid", event.LeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("failed to fetch lease %s: %w", event.LeaseUUID, err)
+	}
+
+	// Extract primary SKU from lease items for routing
+	sku := ExtractPrimarySKU(lease)
+
+	// Route to appropriate backend based on SKU
+	backendClient := m.router.Route(sku)
+	if backendClient == nil {
+		backendClient = m.router.Default()
+	}
 	if backendClient == nil {
 		slog.Error("no backend available for provisioning",
 			"lease_uuid", event.LeaseUUID,
+			"sku", sku,
 		)
 		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
 	}
@@ -333,7 +348,7 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 	// Atomically track in-flight BEFORE calling Provision to prevent:
 	// 1. Race with reconciler (TOCTOU between IsInFlight check and TrackInFlight)
 	// 2. Race with fast backend response (callback arriving before tracking)
-	if !m.TryTrackInFlight(event.LeaseUUID, event.Tenant, "", backendClient.Name()) {
+	if !m.TryTrackInFlight(event.LeaseUUID, event.Tenant, sku, backendClient.Name()) {
 		slog.Debug("lease already in-flight, skipping",
 			"lease_uuid", event.LeaseUUID,
 		)
@@ -341,10 +356,11 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 	}
 
 	// Start provisioning (async - backend will call back)
-	err := backendClient.Provision(msg.Context(), backend.ProvisionRequest{
+	err = backendClient.Provision(msg.Context(), backend.ProvisionRequest{
 		LeaseUUID:    event.LeaseUUID,
 		Tenant:       event.Tenant,
 		ProviderUUID: m.providerUUID,
+		SKU:          sku,
 		CallbackURL:  m.callbackURL(),
 	})
 	if err != nil {
@@ -353,19 +369,30 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) error {
 
 		slog.Error("failed to start provisioning",
 			"lease_uuid", event.LeaseUUID,
+			"sku", sku,
 			"backend", backendClient.Name(),
 			"error", err,
 		)
-		// Watermill will retry; TODO(phase-3): Add lease rejection after max retries
 		return fmt.Errorf("%w: %v", ErrProvisioningFailed, err)
 	}
 
 	slog.Info("provisioning started",
 		"lease_uuid", event.LeaseUUID,
+		"sku", sku,
 		"backend", backendClient.Name(),
 	)
 
 	return nil
+}
+
+// ExtractPrimarySKU returns the SKU UUID from the first lease item.
+// For multi-SKU leases, we route based on the first SKU (all SKUs in a lease
+// must belong to the same provider, so routing by the first is sufficient).
+func ExtractPrimarySKU(lease *billingtypes.Lease) string {
+	if lease == nil || len(lease.Items) == 0 {
+		return ""
+	}
+	return lease.Items[0].SkuUuid
 }
 
 // handleLeaseClosed processes lease closure events.
@@ -497,12 +524,26 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 		// Remove from in-flight - this is a terminal state, no retry needed
 		m.UntrackInFlight(callback.LeaseUUID)
 
-		// TODO(phase-3): Add RejectLease to chain client to reject failed provisions
-		// For now, just log the failure; the lease will eventually expire
-		slog.Warn("provisioning failed",
-			"lease_uuid", callback.LeaseUUID,
-			"error", callback.Error,
-		)
+		// Reject the lease on chain so tenant's credit is released immediately
+		reason := callback.Error
+		if reason == "" {
+			reason = "provisioning failed"
+		}
+		rejected, txHashes, err := m.chainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, reason)
+		if err != nil {
+			// Log but don't retry - the lease will eventually expire if rejection fails
+			slog.Error("failed to reject lease after provisioning failure",
+				"lease_uuid", callback.LeaseUUID,
+				"error", err,
+			)
+		} else {
+			slog.Info("lease rejected after provisioning failure",
+				"lease_uuid", callback.LeaseUUID,
+				"rejected", rejected,
+				"tx_hashes", txHashes,
+				"reason", reason,
+			)
+		}
 
 	default:
 		// Unknown status is treated as terminal to prevent leases from being stuck

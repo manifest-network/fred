@@ -70,6 +70,9 @@ type Config struct {
 
 	// Reconciliation configuration
 	ReconciliationInterval time.Duration `mapstructure:"reconciliation_interval"`
+
+	// Token replay protection
+	TokenTrackerDBPath string `mapstructure:"token_tracker_db_path"`
 }
 
 // BackendConfig configures a single provisioning backend.

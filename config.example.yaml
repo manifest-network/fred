@@ -62,9 +62,9 @@ rate_limit_burst: 20
 # At least one backend must be configured. Backends handle the actual
 # provisioning of resources when leases are created.
 #
-# NOTE: SKU-based routing (sku_prefix) is not yet implemented. Currently all
-# leases are routed to the default backend. Multi-backend routing is planned
-# for a future release.
+# SKU-based routing: Use sku_prefix to route leases to specific backends based
+# on the SKU prefix. Leases with SKUs that don't match any prefix are routed
+# to the default backend.
 backends:
   # Mock backend for testing (run with: make run-mock)
   - name: mock
@@ -133,3 +133,10 @@ credit_check_retry_interval: "30s"
 # How often to run level-triggered reconciliation (compares chain state vs backend state)
 # This provides crash recovery and consistency checks
 reconciliation_interval: "5m"
+
+# Token replay protection (optional but recommended)
+# Path to bbolt database for tracking used authentication tokens.
+# Enables protection against replay attacks on the connection info endpoint.
+# Tokens are tracked for 30 seconds (the token lifetime).
+# If not set, replay protection is disabled (a warning will be logged).
+token_tracker_db_path: "/var/lib/fred/tokens.db"

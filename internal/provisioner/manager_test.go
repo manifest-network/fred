@@ -11,6 +11,8 @@ import (
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 )
@@ -1075,5 +1077,249 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 	}
 	if mockBackend.deprovisionCalls[0] != "lease-1" {
 		t.Errorf("deprovision leaseUUID = %q, want %q", mockBackend.deprovisionCalls[0], "lease-1")
+	}
+}
+
+func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
+	// Test that leases are routed to the correct backend based on SKU
+	gpuBackend := &mockManagerBackend{name: "gpu-backend"}
+	k8sBackend := &mockManagerBackend{name: "k8s-backend"}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			// Return lease with GPU SKU
+			return &billingtypes.Lease{
+				Uuid:   leaseUUID,
+				Tenant: "tenant-1",
+				State:  billingtypes.LEASE_STATE_PENDING,
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "gpu-a100-4x", Quantity: 1}},
+			}, nil
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Create a lease event message
+	event := chain.LeaseEvent{
+		Type:      chain.LeaseCreated,
+		LeaseUUID: "gpu-lease-1",
+		Tenant:    "tenant-1",
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Handle the message
+	err = manager.handleLeaseCreated(msg)
+	if err != nil {
+		t.Errorf("handleLeaseCreated() error = %v", err)
+	}
+
+	// Verify GPU backend received the provision call
+	gpuBackend.mu.Lock()
+	gpuCalls := gpuBackend.provisionCalls
+	gpuBackend.mu.Unlock()
+
+	if len(gpuCalls) != 1 {
+		t.Fatalf("expected 1 provision call to GPU backend, got %d", len(gpuCalls))
+	}
+	if gpuCalls[0].LeaseUUID != "gpu-lease-1" {
+		t.Errorf("provision LeaseUUID = %q, want %q", gpuCalls[0].LeaseUUID, "gpu-lease-1")
+	}
+	if gpuCalls[0].SKU != "gpu-a100-4x" {
+		t.Errorf("provision SKU = %q, want %q", gpuCalls[0].SKU, "gpu-a100-4x")
+	}
+
+	// Verify K8s backend did NOT receive any calls
+	k8sBackend.mu.Lock()
+	k8sCalls := k8sBackend.provisionCalls
+	k8sBackend.mu.Unlock()
+
+	if len(k8sCalls) != 0 {
+		t.Errorf("expected 0 provision calls to K8s backend, got %d", len(k8sCalls))
+	}
+
+	// Verify in-flight tracking includes the correct backend
+	provision, exists := manager.GetInFlight("gpu-lease-1")
+	if !exists {
+		t.Fatal("lease should be in-flight")
+	}
+	if provision.Backend != "gpu-backend" {
+		t.Errorf("in-flight Backend = %q, want %q", provision.Backend, "gpu-backend")
+	}
+	if provision.SKU != "gpu-a100-4x" {
+		t.Errorf("in-flight SKU = %q, want %q", provision.SKU, "gpu-a100-4x")
+	}
+}
+
+func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
+	// Test that failed callbacks trigger lease rejection
+	var rejectedLeases []string
+	var rejectedReason string
+	var mu sync.Mutex
+
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track the lease first
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "test")
+
+	// Send failed callback with error message
+	callback := backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusFailed,
+		Error:     "out of GPU resources",
+	}
+	payload, _ := json.Marshal(callback)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	err = manager.handleBackendCallback(msg)
+	if err != nil {
+		t.Errorf("handleBackendCallback() error = %v", err)
+	}
+
+	// Verify lease was rejected
+	mu.Lock()
+	defer mu.Unlock()
+	if len(rejectedLeases) != 1 {
+		t.Fatalf("expected 1 rejected lease, got %d", len(rejectedLeases))
+	}
+	if rejectedLeases[0] != "lease-1" {
+		t.Errorf("rejected lease = %q, want %q", rejectedLeases[0], "lease-1")
+	}
+	if rejectedReason != "out of GPU resources" {
+		t.Errorf("rejection reason = %q, want %q", rejectedReason, "out of GPU resources")
+	}
+
+	// Verify removed from in-flight
+	if manager.IsInFlight("lease-1") {
+		t.Error("lease should not be in-flight after failed callback")
+	}
+}
+
+func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
+	// Test that failed callbacks without error message use default reason
+	var rejectedReason string
+	var mu sync.Mutex
+
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track the lease first
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "test")
+
+	// Send failed callback WITHOUT error message
+	callback := backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusFailed,
+		Error:     "", // Empty error
+	}
+	payload, _ := json.Marshal(callback)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	err = manager.handleBackendCallback(msg)
+	if err != nil {
+		t.Errorf("handleBackendCallback() error = %v", err)
+	}
+
+	// Verify default reason was used
+	mu.Lock()
+	defer mu.Unlock()
+	if rejectedReason != "provisioning failed" {
+		t.Errorf("rejection reason = %q, want %q", rejectedReason, "provisioning failed")
+	}
+}
+
+func TestExtractPrimarySKU(t *testing.T) {
+	tests := []struct {
+		name  string
+		lease *billingtypes.Lease
+		want  string
+	}{
+		{
+			name:  "nil lease",
+			lease: nil,
+			want:  "",
+		},
+		{
+			name:  "empty items",
+			lease: &billingtypes.Lease{Items: []billingtypes.LeaseItem{}},
+			want:  "",
+		},
+		{
+			name: "single item",
+			lease: &billingtypes.Lease{
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-123", Quantity: 1}},
+			},
+			want: "sku-123",
+		},
+		{
+			name: "multiple items - returns first",
+			lease: &billingtypes.Lease{
+				Items: []billingtypes.LeaseItem{
+					{SkuUuid: "first-sku", Quantity: 1},
+					{SkuUuid: "second-sku", Quantity: 2},
+				},
+			},
+			want: "first-sku",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractPrimarySKU(tt.lease)
+			if got != tt.want {
+				t.Errorf("ExtractPrimarySKU() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

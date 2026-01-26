@@ -13,6 +13,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/provisioner"
 )
 
 // ChainClient defines the chain operations needed by handlers.
@@ -25,15 +26,18 @@ type ChainClient interface {
 type Handlers struct {
 	client        ChainClient
 	backendRouter *backend.Router
+	tokenTracker  *TokenTracker
 	providerUUID  string
 	bech32Prefix  string
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, providerUUID, bech32Prefix string) *Handlers {
+// tokenTracker is optional but recommended for replay attack protection.
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker *TokenTracker, providerUUID, bech32Prefix string) *Handlers {
 	return &Handlers{
 		client:        client,
 		backendRouter: backendRouter,
+		tokenTracker:  tokenTracker,
 		providerUUID:  providerUUID,
 		bech32Prefix:  bech32Prefix,
 	}
@@ -88,6 +92,22 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for token replay attack (if tracker is configured)
+	if h.tokenTracker != nil {
+		if err := h.tokenTracker.TryUse(token.Signature); err != nil {
+			if errors.Is(err, ErrTokenAlreadyUsed) {
+				slog.Warn("token replay detected",
+					"lease_uuid", leaseUUID,
+					"tenant", token.Tenant,
+				)
+				writeError(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			// Database error - log but don't block the request
+			slog.Error("token tracker error", "error", err)
+		}
+	}
+
 	// Verify the token's lease UUID matches the request
 	if token.LeaseUUID != leaseUUID {
 		slog.Warn("lease UUID mismatch",
@@ -139,12 +159,14 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get lease info from backend
-	// TODO(phase-3): Implement SKU-based routing.
-	// Currently we always use the default backend. To route by SKU prefix,
-	// we should call h.backendRouter.Route(lease.Sku). For now, tenants whose
-	// leases were provisioned on a non-default backend may get 404/incorrect info.
-	backendClient := h.backendRouter.Default()
+	// Extract SKU for routing (use first item's SKU - all items share same provider)
+	sku := provisioner.ExtractPrimarySKU(lease)
+
+	// Route to appropriate backend based on SKU
+	backendClient := h.backendRouter.Route(sku)
+	if backendClient == nil {
+		backendClient = h.backendRouter.Default()
+	}
 	info, err := backendClient.GetInfo(r.Context(), leaseUUID)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
