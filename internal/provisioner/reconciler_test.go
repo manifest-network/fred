@@ -1112,6 +1112,160 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	}
 }
 
+func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
+	// Test that context cancellation during the reconciliation loop is handled gracefully.
+	// This tests the context checks we added within the loop iterations.
+	var callCount int
+	var mu sync.Mutex
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+				{Uuid: "lease-2", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_PENDING},
+				{Uuid: "lease-3", Tenant: "tenant-3", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+
+	// Use a backend that cancels context after first provision
+	mockBackend := &mockCancellingBackend{
+		name: "test",
+		onProvision: func() {
+			mu.Lock()
+			callCount++
+			currentCount := callCount
+			mu.Unlock()
+			if currentCount == 1 {
+				cancel()
+			}
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	err = reconciler.ReconcileAll(ctx)
+
+	// Should return context.Canceled
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
+	}
+
+	// Should have processed at most 2 leases before detecting cancellation
+	// (map iteration order is non-deterministic, so we may get 1 or 2)
+	mu.Lock()
+	finalCount := callCount
+	mu.Unlock()
+
+	// Due to map iteration, we should have stopped early but may have processed 1-2 items
+	if finalCount > 2 {
+		t.Errorf("expected at most 2 provision calls before cancellation, got %d", finalCount)
+	}
+}
+
+func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) {
+	// Test that context cancellation during orphan cleanup loop is handled gracefully.
+	ctx, cancel := context.WithCancel(context.Background())
+	var deprovisionCount int
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		// No leases - all provisions are orphans
+	}
+
+	// Use a backend that cancels context after first deprovision
+	mockBackend := &mockCancellingBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "orphan-1", Status: backend.ProvisionStatusReady},
+			{LeaseUUID: "orphan-2", Status: backend.ProvisionStatusReady},
+			{LeaseUUID: "orphan-3", Status: backend.ProvisionStatusReady},
+		},
+		onDeprovision: func() {
+			mu.Lock()
+			deprovisionCount++
+			currentCount := deprovisionCount
+			mu.Unlock()
+			if currentCount == 1 {
+				cancel()
+			}
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	err = reconciler.ReconcileAll(ctx)
+
+	// Should return context.Canceled
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
+	}
+
+	// Should have processed at most 2 orphans before detecting cancellation
+	mu.Lock()
+	finalCount := deprovisionCount
+	mu.Unlock()
+
+	if finalCount > 2 {
+		t.Errorf("expected at most 2 deprovision calls before cancellation, got %d", finalCount)
+	}
+}
+
+// mockCancellingBackend is a test backend with callback hooks for testing cancellation behavior.
+type mockCancellingBackend struct {
+	name          string
+	provisions    []backend.ProvisionInfo
+	onProvision   func()
+	onDeprovision func()
+}
+
+func (m *mockCancellingBackend) Name() string {
+	return m.name
+}
+
+func (m *mockCancellingBackend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
+	if m.onProvision != nil {
+		m.onProvision()
+	}
+	return nil
+}
+
+func (m *mockCancellingBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
+	return nil, nil
+}
+
+func (m *mockCancellingBackend) Deprovision(ctx context.Context, leaseUUID string) error {
+	if m.onDeprovision != nil {
+		m.onDeprovision()
+	}
+	return nil
+}
+
+func (m *mockCancellingBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
+	return m.provisions, nil
+}
+
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
 	mockChain := &chain.MockClient{
