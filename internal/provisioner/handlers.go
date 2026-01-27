@@ -63,11 +63,6 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 		return nil // Don't retry malformed messages
 	}
 
-	slog.Info("processing lease created",
-		"lease_uuid", event.LeaseUUID,
-		"tenant", event.Tenant,
-	)
-
 	// Fetch lease details from chain to get SKU for routing
 	lease, err := m.chainClient.GetLease(msg.Context(), event.LeaseUUID)
 	if err != nil {
@@ -84,12 +79,23 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 		return nil
 	}
 
+	// Log lease details for debugging
+	hasMetaHash := len(lease.MetaHash) > 0
+	slog.Info("processing lease created",
+		"lease_uuid", event.LeaseUUID,
+		"tenant", event.Tenant,
+		"has_meta_hash", hasMetaHash,
+		"meta_hash_len", len(lease.MetaHash),
+	)
+
 	// Check if lease requires a payload (has MetaHash)
 	// If so, skip immediate provisioning - wait for payload upload
-	if len(lease.MetaHash) > 0 {
-		slog.Info("lease has meta_hash, awaiting payload upload",
+	if hasMetaHash {
+		metrics.LeasesAwaitingPayloadTotal.Inc()
+		slog.Info("lease requires payload, awaiting upload",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
+			"meta_hash_hex", fmt.Sprintf("%x", lease.MetaHash),
 		)
 		return nil // Don't provision yet - wait for payload
 	}
@@ -162,6 +168,19 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 	}
 
 	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID)
+
+	// Clean up any stored payload for this lease.
+	// This handles the case where a tenant uploaded a payload but cancelled the lease
+	// before provisioning started, or any other scenario where payload exists but
+	// the lease is no longer valid.
+	if m.payloadStore != nil {
+		if m.payloadStore.Has(event.LeaseUUID) {
+			m.payloadStore.Delete(event.LeaseUUID)
+			slog.Info("cleaned up stored payload for closed lease",
+				"lease_uuid", event.LeaseUUID,
+			)
+		}
+	}
 
 	// Remove from in-flight if present (atomic check-and-delete)
 	provision, wasInFlight := m.PopInFlight(event.LeaseUUID)

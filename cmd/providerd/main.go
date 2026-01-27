@@ -190,7 +190,6 @@ func run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create payload store: %w", err)
 		}
-		slog.Info("payload store initialized", "db_path", cfg.PayloadStoreDBPath)
 	} else {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}

@@ -1,152 +1,377 @@
-# Manifest Provider Daemon Configuration
+# =============================================================================
+# Manifest Provider Daemon (fred) Configuration
+# =============================================================================
 #
 # This file contains all configuration options for providerd.
-# You can also set these via environment variables with PROVIDER_ prefix.
-# Example: PROVIDER_CHAIN_ID=manifest-1
+#
+# ENVIRONMENT VARIABLES:
+#   All settings can be overridden via environment variables with PROVIDER_ prefix.
+#   Example: PROVIDER_CHAIN_ID=manifest-1
+#   Nested keys use underscores: PROVIDER_GRPC_TLS_ENABLED=true
+#
+# DURATION FORMAT:
+#   Duration values use Go's duration format: "1h", "30m", "5s", "500ms"
+#   Examples: "1h30m" (1.5 hours), "30s" (30 seconds), "100ms" (100 milliseconds)
+#
+# =============================================================================
 
-# Chain configuration
+# =============================================================================
+# CHAIN CONNECTION
+# =============================================================================
+# Settings for connecting to the Manifest blockchain.
+
+# The chain ID to connect to. Must match the chain you're connecting to.
+# Find this in the chain's genesis file or by querying: manifestd status
 chain_id: "manifest-1"
+
+# gRPC endpoint for querying chain state and broadcasting transactions.
+# This is typically port 9090 on your node or a public gRPC endpoint.
+# Format: "host:port" (no protocol prefix)
 grpc_endpoint: "localhost:9090"
+
+# WebSocket endpoint for subscribing to real-time chain events (new blocks, txs).
+# This is typically port 26657 on your node with /websocket path.
+# Format: "ws://host:port/websocket" or "wss://host:port/websocket" for TLS
 websocket_url: "ws://localhost:26657/websocket"
 
-# gRPC TLS configuration (optional)
-# Enable TLS for chain gRPC connection
+# -----------------------------------------------------------------------------
+# gRPC TLS Configuration (optional)
+# -----------------------------------------------------------------------------
+# Enable TLS if your gRPC endpoint requires encrypted connections.
+# Public endpoints often require TLS; local nodes typically don't.
+
+# Set to true to enable TLS for gRPC connections.
 grpc_tls_enabled: false
-# Path to CA certificate file (optional, uses system CAs if empty)
+
+# Path to a custom CA certificate file for verifying the gRPC server.
+# Leave empty to use system CA certificates.
+# Only needed if your endpoint uses a private/self-signed certificate.
 grpc_tls_ca_file: ""
-# Skip certificate verification (for testing only, not recommended for production)
+
+# DANGER: Skip TLS certificate verification. Only use for local testing!
+# Never enable this in production - it makes connections vulnerable to MITM attacks.
 grpc_tls_skip_verify: false
 
-# Provider identification
-# Your provider UUID (must be registered on-chain)
+# =============================================================================
+# PROVIDER IDENTITY
+# =============================================================================
+# Your provider's on-chain identity. These must match your registration.
+
+# Your provider's UUID as registered on-chain.
+# This is a UUIDv7 assigned when you registered as a provider.
+# Query yours with: manifestd query billing provider <your-address>
 provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
-# Your provider's management address
+
+# Your provider's management address (bech32 format).
+# This address is used to sign transactions (acknowledge leases, withdraw funds).
+# Must have the corresponding private key in the keyring.
 provider_address: "manifest1..."
 
-# Keyring configuration
-# Backend options: file, os, test
+# =============================================================================
+# KEYRING CONFIGURATION
+# =============================================================================
+# Settings for accessing your signing keys.
+
+# Keyring backend type. Options:
+#   - "file": Encrypted file-based keyring (recommended for production)
+#   - "os": Operating system's native keyring (macOS Keychain, Windows Credential Manager)
+#   - "test": Unencrypted file storage (for testing only - keys stored in plaintext!)
 keyring_backend: "file"
-# Directory containing the keyring
+
+# Directory containing the keyring files.
+# For "file" backend, this contains encrypted key files.
+# Typically ~/.manifest/ or the directory where you ran `manifestd keys add`.
 keyring_dir: "/home/provider/.manifest"
-# Name of the key to use for signing
+
+# Name of the key to use for signing transactions.
+# This is the name you used when creating the key: `manifestd keys add <name>`
+# The key must correspond to provider_address above.
 key_name: "provider"
 
-# API server configuration
-# Address to listen on for tenant connections
+# =============================================================================
+# API SERVER
+# =============================================================================
+# Settings for the HTTP API that tenants connect to.
+
+# Address and port to listen on for incoming API requests.
+# Format: "host:port" or ":port" (listen on all interfaces)
+# Examples:
+#   ":8080"           - Listen on all interfaces, port 8080
+#   "127.0.0.1:8080"  - Listen only on localhost
+#   "0.0.0.0:8080"    - Listen on all interfaces (same as ":8080")
 api_listen_addr: ":8080"
 
-# TLS configuration (optional, enables HTTPS)
-# Leave empty for HTTP
+# -----------------------------------------------------------------------------
+# TLS Configuration (optional but recommended for production)
+# -----------------------------------------------------------------------------
+# Enable HTTPS by providing certificate and key files.
+# Leave both empty to serve HTTP (not recommended for production).
+
+# Path to TLS certificate file (PEM format).
+# For production, use a certificate from Let's Encrypt or another CA.
+# For testing, generate self-signed: openssl req -x509 -newkey rsa:4096 -nodes \
+#   -keyout key.pem -out cert.pem -days 365 -subj '/CN=localhost'
 tls_cert_file: ""
+
+# Path to TLS private key file (PEM format).
+# Must correspond to the certificate above. Keep this file secure!
 tls_key_file: ""
-# Example with self-signed cert:
-# tls_cert_file: "/path/to/cert.pem"
-# tls_key_file: "/path/to/key.pem"
 
-# Withdrawal configuration
-# How often to withdraw accumulated fees
-# Supports Go duration format: 1h, 30m, 24h, etc.
-withdraw_interval: "1h"
+# =============================================================================
+# RATE LIMITING
+# =============================================================================
+# Protect your API from abuse with per-IP rate limiting.
 
-# Bech32 prefix for address validation
-# This should match the chain's address prefix (e.g., "manifest", "cosmos", "osmo")
-bech32_prefix: "manifest"
-
-# Rate limiting configuration
-# Requests per second allowed per IP address
+# Maximum sustained requests per second allowed from a single IP address.
+# Requests exceeding this rate receive HTTP 429 (Too Many Requests).
 rate_limit_rps: 10
-# Maximum burst size (requests allowed in a burst before rate limiting kicks in)
+
+# Maximum burst size - requests allowed in a short burst before rate limiting.
+# This allows brief spikes above rate_limit_rps. Set equal to rate_limit_rps
+# for strict limiting, or higher to allow bursts.
 rate_limit_burst: 20
 
-# Trusted proxies for X-Forwarded-For header (optional)
-# SECURITY: Only configure this if fred runs behind a reverse proxy (nginx, Traefik, etc.)
-# Without this, clients could spoof their IP by setting X-Forwarded-For headers.
-# Accepts IP addresses or CIDR blocks.
+# -----------------------------------------------------------------------------
+# Trusted Proxies (optional)
+# -----------------------------------------------------------------------------
+# SECURITY WARNING: Only configure if fred runs behind a reverse proxy!
+#
+# When configured, fred trusts X-Forwarded-For headers from these IPs to
+# determine the real client IP for rate limiting. Without this, all requests
+# appear to come from the proxy's IP.
+#
+# If NOT behind a proxy, leave this commented out. Otherwise, attackers could
+# spoof their IP by setting X-Forwarded-For headers.
+#
 # trusted_proxies:
-#   - "127.0.0.1"           # Localhost
-#   - "10.0.0.0/8"          # Private network
-#   - "172.16.0.0/12"       # Docker default
+#   - "127.0.0.1"           # Localhost proxy
+#   - "10.0.0.0/8"          # Private network (AWS, etc.)
+#   - "172.16.0.0/12"       # Docker default bridge
 #   - "192.168.0.0/16"      # Private network
 
-# Backend configuration (required)
-# At least one backend must be configured. Backends handle the actual
-# provisioning of resources when leases are created.
+# =============================================================================
+# BACKEND CONFIGURATION (required)
+# =============================================================================
+# Backends handle the actual provisioning of resources when leases are created.
+# At least one backend must be configured with default: true.
 #
-# SKU-based routing: Use sku_prefix to route leases to specific backends based
-# on the SKU prefix. Leases with SKUs that don't match any prefix are routed
-# to the default backend.
-backends:
-  # Mock backend for testing (run with: make run-mock)
-  - name: mock
-    url: "http://localhost:9000"
-    timeout: 30s
-    default: true  # This backend is used for SKUs that don't match any prefix
+# ROUTING:
+#   Leases are routed to backends based on SKU prefix matching:
+#   - If a lease's SKU starts with a backend's sku_prefix, use that backend
+#   - Otherwise, use the backend marked as default: true
+#
+# BACKEND API:
+#   Backends must implement the Provider Backend API:
+#   - POST /provision      - Start provisioning a resource
+#   - GET  /info/{uuid}    - Get connection details for a provisioned resource
+#   - POST /deprovision    - Remove a provisioned resource
+#   - GET  /provisions     - List all provisioned resources (for reconciliation)
 
-  # Example: Kubernetes backend for k8s-* SKUs
+backends:
+  # Default backend - receives all leases that don't match other prefixes
+  - name: mock
+    url: "http://localhost:9000"    # Backend API base URL
+    timeout: 30s                     # Request timeout for backend API calls
+    default: true                    # Mark as default (exactly one required)
+
+  # Example: Route kubernetes workloads to a dedicated backend
   # - name: kubernetes
   #   url: "http://k8s-backend:9000"
   #   timeout: 30s
-  #   sku_prefix: "k8s-"
+  #   sku_prefix: "k8s-"             # Routes SKUs like "k8s-small", "k8s-large"
 
-  # Example: GPU backend for gpu-* SKUs
+  # Example: Route GPU workloads (may need longer timeout for heavy provisioning)
   # - name: gpu
   #   url: "http://gpu-backend:9000"
   #   timeout: 60s
-  #   sku_prefix: "gpu-"
+  #   sku_prefix: "gpu-"             # Routes SKUs like "gpu-a100", "gpu-v100"
 
-  # Example: VM backend for vm-* SKUs
+  # Example: Route VM provisioning
   # - name: vm
   #   url: "http://vm-backend:9000"
   #   timeout: 30s
-  #   sku_prefix: "vm-"
+  #   sku_prefix: "vm-"              # Routes SKUs like "vm-small", "vm-medium"
 
-# Callback URL (required when backends are configured)
-# This is the URL backends will call to report provisioning status.
-# Must be reachable from your backends.
+# =============================================================================
+# CALLBACK CONFIGURATION (required)
+# =============================================================================
+# Backends call back to fred to report provisioning results.
+
+# URL that backends will call to report provisioning status.
+# Must be reachable from all your backends. Include protocol (http/https).
+# Format: "http(s)://host:port" - the /callbacks/provision path is added automatically.
 callback_base_url: "http://localhost:8080"
 
-# Callback secret (required)
-# HMAC-SHA256 secret for authenticating callbacks from backends.
-# Must be at least 32 characters. Generate with: openssl rand -hex 32
+# Shared secret for HMAC-SHA256 authentication of callback requests.
+# Backends sign their callbacks with this secret; fred verifies the signature.
+# SECURITY: Use a strong random value. Generate with: openssl rand -hex 32
+# Must be at least 32 characters. Must match the secret configured in your backends.
 callback_secret: "your-secret-key-at-least-32-characters-long"
 
-# Advanced timeout configuration (optional)
-# HTTP server timeouts
-http_read_timeout: "15s"
-http_write_timeout: "15s"
-http_idle_timeout: "60s"
+# =============================================================================
+# WITHDRAWAL CONFIGURATION
+# =============================================================================
+# Settings for automated withdrawal of accumulated lease payments.
 
-# WebSocket configuration
-websocket_ping_interval: "30s"
-websocket_reconnect_initial: "1s"
-websocket_reconnect_max: "60s"
+# How often to check for and withdraw accumulated funds from active leases.
+# The daemon automatically withdraws available funds at this interval.
+# Shorter intervals mean more frequent (smaller) withdrawals.
+withdraw_interval: "1h"
 
-# Transaction configuration
-tx_poll_interval: "500ms"
-tx_timeout: "30s"
-gas_limit: 500000
-gas_price: 25
-fee_denom: "umfx"
+# =============================================================================
+# RECONCILIATION
+# =============================================================================
+# Level-triggered reconciliation ensures consistency between chain and backends.
 
-# Query and pagination limits
-query_page_limit: 100
-max_withdraw_iterations: 100
-
-# API limits
-max_request_body_size: 1048576  # 1MB
-
-# Credit check configuration
-credit_check_error_threshold: 3
-credit_check_retry_interval: "30s"
-
-# Reconciliation configuration
-# How often to run level-triggered reconciliation (compares chain state vs backend state)
-# This provides crash recovery and consistency checks
+# How often to run full reconciliation.
+# Reconciliation compares chain state (leases) vs backend state (provisions) and:
+#   - Provisions resources for PENDING leases not yet provisioned
+#   - Acknowledges leases that are provisioned but not yet acknowledged
+#   - Deprovisions orphaned resources (provisioned but lease closed/expired)
+#   - Logs anomalies (active lease but not provisioned)
+#
+# This provides crash recovery - if fred restarts, reconciliation catches up.
+# Shorter intervals = faster recovery but more chain/backend queries.
 reconciliation_interval: "5m"
 
-# Token replay protection (optional but recommended)
-# Path to bbolt database for tracking used authentication tokens.
-# Enables protection against replay attacks on the connection info endpoint.
-# Tokens are tracked for 30 seconds (the token lifetime).
-# If not set, replay protection is disabled (a warning will be logged).
+# =============================================================================
+# ADDRESS VALIDATION
+# =============================================================================
+
+# Bech32 prefix for validating tenant addresses in authentication tokens.
+# Must match the chain's address prefix (check genesis or manifestd config).
+# Common values: "manifest", "cosmos", "osmo", "akash"
+bech32_prefix: "manifest"
+
+# =============================================================================
+# TOKEN REPLAY PROTECTION (recommended)
+# =============================================================================
+# Prevents replay attacks on authenticated endpoints.
+
+# Path to bbolt database file for tracking used authentication tokens.
+# Each token can only be used once; subsequent uses are rejected.
+# Tokens are tracked for their lifetime (30 seconds) then automatically cleaned.
+#
+# If not set, replay protection is DISABLED and a warning is logged.
+# SECURITY: Always enable in production to prevent token replay attacks.
+#
+# The database file is created automatically. Ensure the directory exists
+# and fred has write permissions.
 token_tracker_db_path: "/var/lib/fred/tokens.db"
+
+# =============================================================================
+# PAYLOAD STORE (required for deployment manifests)
+# =============================================================================
+# Stores tenant-uploaded payloads (deployment manifests) awaiting provisioning.
+
+# Path to bbolt database file for storing payloads.
+# Payloads are stored temporarily until the lease is provisioned, then deleted.
+#
+# If not set, the payload upload endpoint rejects all uploads.
+# Tenants creating leases with meta_hash won't be able to upload their manifests.
+#
+# The database file is created automatically. Ensure the directory exists
+# and fred has write permissions.
+payload_store_db_path: "/var/lib/fred/payloads.db"
+
+# Maximum time to keep payloads before automatic cleanup.
+# Payloads older than this are deleted even if not yet provisioned.
+# This prevents unbounded storage growth from abandoned uploads.
+# Should be longer than your chain's lease acknowledgment timeout.
+payload_store_ttl: "1h"
+
+# How often to scan for and delete stale payloads.
+# Stale = older than payload_store_ttl and not yet provisioned.
+payload_store_cleanup_freq: "10m"
+
+# =============================================================================
+# ADVANCED: HTTP SERVER TIMEOUTS
+# =============================================================================
+# Fine-tune HTTP server behavior. Defaults are suitable for most deployments.
+
+# Maximum duration for reading the entire request (headers + body).
+# Increase if tenants upload large payloads over slow connections.
+http_read_timeout: "15s"
+
+# Maximum duration for writing the response.
+# Increase if responses are large or clients have slow connections.
+http_write_timeout: "15s"
+
+# Maximum duration to keep idle keep-alive connections open.
+# Lower values free resources faster; higher values reduce connection overhead.
+http_idle_timeout: "60s"
+
+# Maximum allowed request body size in bytes.
+# Requests exceeding this receive HTTP 413 (Payload Too Large).
+# Default 1MB is suitable for most deployment manifests.
+max_request_body_size: 1048576  # 1MB = 1024 * 1024 bytes
+
+# =============================================================================
+# ADVANCED: WEBSOCKET CONFIGURATION
+# =============================================================================
+# Settings for the WebSocket connection to the chain.
+
+# Interval between WebSocket ping frames to keep the connection alive.
+# Prevents idle timeouts from firewalls/proxies.
+websocket_ping_interval: "30s"
+
+# Initial delay before attempting to reconnect after a WebSocket disconnect.
+# Uses exponential backoff up to websocket_reconnect_max.
+websocket_reconnect_initial: "1s"
+
+# Maximum delay between WebSocket reconnection attempts.
+# Backoff stops increasing once this value is reached.
+websocket_reconnect_max: "60s"
+
+# =============================================================================
+# ADVANCED: TRANSACTION CONFIGURATION
+# =============================================================================
+# Settings for broadcasting transactions to the chain.
+
+# How often to poll for transaction confirmation after broadcast.
+# Lower values = faster confirmation detection but more RPC calls.
+tx_poll_interval: "500ms"
+
+# Maximum time to wait for a transaction to be confirmed.
+# If exceeded, the transaction is considered failed (may still confirm later).
+tx_timeout: "30s"
+
+# Gas limit for transactions.
+# Higher values allow more complex transactions but cost more on failure.
+# If transactions fail with "out of gas", increase this value.
+gas_limit: 500000
+
+# Gas price in minimal denomination (e.g., umfx).
+# Total fee = gas_limit * gas_price. Higher prices = faster inclusion.
+gas_price: 25
+
+# Fee denomination for transaction fees.
+# Must match the chain's fee token (check genesis or manifestd config).
+fee_denom: "umfx"
+
+# =============================================================================
+# ADVANCED: QUERY CONFIGURATION
+# =============================================================================
+# Settings for querying chain state.
+
+# Maximum items per page when querying paginated chain data.
+# Higher values = fewer requests but larger responses.
+query_page_limit: 100
+
+# Maximum withdrawal iterations per withdrawal cycle.
+# Limits how many leases are processed in a single withdrawal run.
+# Prevents very long withdrawal operations if you have many active leases.
+max_withdraw_iterations: 100
+
+# =============================================================================
+# ADVANCED: CREDIT CHECK CONFIGURATION
+# =============================================================================
+# Settings for monitoring tenant credit on active leases.
+
+# Number of consecutive credit check errors before taking action.
+# Prevents premature lease termination due to transient RPC errors.
+credit_check_error_threshold: 3
+
+# How long to wait before retrying after a credit check error.
+# Applies when errors occur, not between normal checks.
+credit_check_retry_interval: "30s"

@@ -287,11 +287,15 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// Record outcome
 	metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
 
+	// 5. Clean up orphaned payloads (payloads for leases that are no longer pending)
+	orphanedPayloads := r.cleanupOrphanedPayloads(ctx, chainLeases)
+
 	slog.Info("reconciliation complete",
 		"provisioned", provisionedCount,
 		"acknowledged", acknowledgedCount,
 		"anomalies", anomaliesCount,
 		"orphans", orphansCount,
+		"orphaned_payloads_cleaned", orphanedPayloads,
 	)
 
 	return nil
@@ -515,6 +519,7 @@ func (r *Reconciler) processLease(
 				slog.Debug("reconcile: lease awaiting payload upload",
 					"lease_uuid", leaseUUID,
 					"tenant", lease.Tenant,
+					"meta_hash_hex", fmt.Sprintf("%x", lease.MetaHash),
 				)
 			}
 		} else {
@@ -638,6 +643,60 @@ func (r *Reconciler) processOrphan(
 			"error", err,
 		)
 	}
+}
+
+// cleanupOrphanedPayloads removes stored payloads for leases that are no longer pending.
+// This handles the case where fred was down when a lease was cancelled, so the
+// handleLeaseClosed event was missed and the payload wasn't cleaned up.
+//
+// Returns the number of orphaned payloads cleaned up.
+func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases map[string]billingtypes.Lease) int {
+	// Skip if no payload store is available
+	if r.tracker == nil {
+		return 0
+	}
+	payloadStore := r.tracker.PayloadStore()
+	if payloadStore == nil {
+		return 0
+	}
+
+	// Get all lease UUIDs that have stored payloads
+	storedPayloadUUIDs := payloadStore.List()
+	if len(storedPayloadUUIDs) == 0 {
+		return 0
+	}
+
+	cleaned := 0
+	for _, leaseUUID := range storedPayloadUUIDs {
+		// Check context for cancellation
+		if ctx.Err() != nil {
+			break
+		}
+
+		// Check if the lease exists and is still pending
+		lease, exists := chainLeases[leaseUUID]
+		if !exists {
+			// Lease doesn't exist on chain - orphaned payload
+			payloadStore.Delete(leaseUUID)
+			cleaned++
+			slog.Info("reconcile: cleaned up orphaned payload (lease not found)",
+				"lease_uuid", leaseUUID,
+			)
+			continue
+		}
+
+		if lease.State != billingtypes.LEASE_STATE_PENDING {
+			// Lease is no longer pending - orphaned payload
+			payloadStore.Delete(leaseUUID)
+			cleaned++
+			slog.Info("reconcile: cleaned up orphaned payload (lease no longer pending)",
+				"lease_uuid", leaseUUID,
+				"lease_state", lease.State.String(),
+			)
+		}
+	}
+
+	return cleaned
 }
 
 // Start begins periodic reconciliation.

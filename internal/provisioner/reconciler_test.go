@@ -1722,3 +1722,124 @@ func (m *mockConcurrencyBackend) ListProvisions(ctx context.Context) ([]backend.
 func (m *mockConcurrencyBackend) Health(ctx context.Context) error {
 	return nil
 }
+
+// mockInFlightTracker implements InFlightTracker for testing orphaned payload cleanup.
+type mockInFlightTracker struct {
+	payloadStore *PayloadStore
+	inFlight     map[string]bool
+	mu           sync.Mutex
+}
+
+func newMockInFlightTracker(payloadStore *PayloadStore) *mockInFlightTracker {
+	return &mockInFlightTracker{
+		payloadStore: payloadStore,
+		inFlight:     make(map[string]bool),
+	}
+}
+
+func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant, sku, backendName string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.inFlight[leaseUUID] {
+		return false
+	}
+	m.inFlight[leaseUUID] = true
+	return true
+}
+
+func (m *mockInFlightTracker) UntrackInFlight(leaseUUID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.inFlight, leaseUUID)
+}
+
+func (m *mockInFlightTracker) HasPayload(leaseUUID string) bool {
+	if m.payloadStore == nil {
+		return false
+	}
+	return m.payloadStore.Has(leaseUUID)
+}
+
+func (m *mockInFlightTracker) PayloadStore() *PayloadStore {
+	return m.payloadStore
+}
+
+func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
+	// Create a temp dir for the payload store
+	tmpDir := t.TempDir()
+	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tmpDir + "/payloads.db",
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer payloadStore.Close()
+
+	// Store payloads for various leases
+	// pending-awaiting: pending lease with MetaHash but hasn't uploaded payload yet - simulates
+	// a lease that's still waiting for payload (payload won't be in store, so nothing to clean)
+	payloadStore.Store("closed-lease", []byte("closed payload"))        // Will be cleaned (lease is closed)
+	payloadStore.Store("nonexistent-lease", []byte("orphan payload"))   // Will be cleaned (lease doesn't exist)
+	payloadStore.Store("active-lease", []byte("active payload"))        // Will be cleaned (lease is active, not pending)
+
+	// Verify all payloads are stored
+	if count := payloadStore.Count(); count != 3 {
+		t.Fatalf("expected 3 payloads stored, got %d", count)
+	}
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				// Pending lease without payload (no MetaHash) - will be provisioned without payload
+				{Uuid: "pending-no-payload", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "active-lease", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_ACTIVE},
+				// Note: "closed-lease" and "nonexistent-lease" are not returned (not pending or active)
+			}, nil
+		},
+	}
+
+	mockBackend := &mockReconcilerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	mockTracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, mockTracker)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Fatalf("ReconcileAll() error = %v", err)
+	}
+
+	// Verify orphaned payloads were cleaned up
+	// active-lease: payload should be cleaned (lease is active, not pending)
+	if payloadStore.Has("active-lease") {
+		t.Error("expected active-lease payload to be cleaned up (lease is no longer pending)")
+	}
+
+	// closed-lease: payload should be cleaned (lease doesn't exist in chain query results)
+	if payloadStore.Has("closed-lease") {
+		t.Error("expected closed-lease payload to be cleaned up (lease not found)")
+	}
+
+	// nonexistent-lease: payload should be cleaned (lease doesn't exist)
+	if payloadStore.Has("nonexistent-lease") {
+		t.Error("expected nonexistent-lease payload to be cleaned up (lease not found)")
+	}
+
+	// Verify count - all orphaned payloads should be cleaned
+	if count := payloadStore.Count(); count != 0 {
+		t.Errorf("expected 0 payloads remaining (all orphans cleaned), got %d", count)
+	}
+}

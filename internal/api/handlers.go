@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -250,6 +251,7 @@ type LeaseStatusResponse struct {
 	LeaseUUID           string `json:"lease_uuid"`
 	State               string `json:"state"`
 	RequiresPayload     bool   `json:"requires_payload"`
+	MetaHashHex         string `json:"meta_hash_hex,omitempty"` // For debugging - shows the expected payload hash
 	PayloadReceived     bool   `json:"payload_received"`
 	ProvisioningStarted bool   `json:"provisioning_started"`
 }
@@ -267,10 +269,14 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build status response
+	hasMetaHash := len(auth.Lease.MetaHash) > 0
 	response := LeaseStatusResponse{
 		LeaseUUID:       leaseUUID,
 		State:           auth.Lease.State.String(),
-		RequiresPayload: len(auth.Lease.MetaHash) > 0,
+		RequiresPayload: hasMetaHash,
+	}
+	if hasMetaHash {
+		response.MetaHashHex = hex.EncodeToString(auth.Lease.MetaHash)
 	}
 
 	// Check provisioning status if checker is available

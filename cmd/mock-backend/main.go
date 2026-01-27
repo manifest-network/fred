@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -170,13 +171,24 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	slog.Info("provision request",
+	// Log provision request with payload details
+	logAttrs := []any{
 		"lease_uuid", req.LeaseUUID,
 		"tenant", req.Tenant,
 		"sku", req.SKU,
 		"callback_url", req.CallbackURL,
 		"has_payload", len(req.Payload) > 0,
-	)
+	}
+	if len(req.Payload) > 0 {
+		logAttrs = append(logAttrs,
+			"payload_size", len(req.Payload),
+			"payload_base64", base64.StdEncoding.EncodeToString(req.Payload),
+		)
+		if req.PayloadHash != "" {
+			logAttrs = append(logAttrs, "payload_hash", req.PayloadHash)
+		}
+	}
+	slog.Info("provision request", logAttrs...)
 
 	// Validate callback URL format and store for this lease (thread-safe)
 	parsedURL, err := url.Parse(req.CallbackURL)

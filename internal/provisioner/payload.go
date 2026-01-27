@@ -347,6 +347,28 @@ func (s *PayloadStore) Count() int {
 	return count
 }
 
+// List returns all lease UUIDs that have stored payloads.
+// This is used by the reconciler to check for orphaned payloads.
+func (s *PayloadStore) List() []string {
+	var leaseUUIDs []string
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(payloadBucketName)
+		c := b.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			leaseUUIDs = append(leaseUUIDs, string(k))
+		}
+		return nil
+	})
+
+	if err != nil {
+		slog.Error("failed to list payloads", "error", err)
+		return nil
+	}
+
+	return leaseUUIDs
+}
+
 // Close shuts down the payload store gracefully.
 // It waits for all pending writes to complete before closing the database.
 func (s *PayloadStore) Close() error {
