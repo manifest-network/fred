@@ -81,6 +81,9 @@ type ChainClient interface {
 	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
 
+// Compile-time check that Manager implements InFlightTracker.
+var _ InFlightTracker = (*Manager)(nil)
+
 // Manager handles the provisioning lifecycle using Watermill for event routing.
 type Manager struct {
 	providerUUID    string

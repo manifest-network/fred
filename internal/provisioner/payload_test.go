@@ -388,3 +388,209 @@ func TestPayloadStore_InvalidDBPath(t *testing.T) {
 		t.Error("NewPayloadStore() with invalid path should return error")
 	}
 }
+
+func TestPayloadStore_BatchingDefaults(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: dbPath,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	// Verify batching defaults were applied
+	if store.batchSize != DefaultBatchSize {
+		t.Errorf("batchSize = %d, want %d", store.batchSize, DefaultBatchSize)
+	}
+	if store.flushInterval != DefaultFlushInterval {
+		t.Errorf("flushInterval = %v, want %v", store.flushInterval, DefaultFlushInterval)
+	}
+}
+
+func TestPayloadStore_BatchingCustomConfig(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	customBatchSize := 25
+	customFlushInterval := 100 * time.Millisecond
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		BatchSize:     customBatchSize,
+		FlushInterval: customFlushInterval,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	if store.batchSize != customBatchSize {
+		t.Errorf("batchSize = %d, want %d", store.batchSize, customBatchSize)
+	}
+	if store.flushInterval != customFlushInterval {
+		t.Errorf("flushInterval = %v, want %v", store.flushInterval, customFlushInterval)
+	}
+}
+
+func TestPayloadStore_FlushOnClose(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	// Create store with short flush interval
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		FlushInterval: 10 * time.Millisecond,
+		BatchSize:     50,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+
+	// Store multiple items
+	for i := 0; i < 20; i++ {
+		key := string(rune('a' + i))
+		store.Store(key, []byte("data"))
+	}
+
+	// Close should wait for all operations to complete and flush
+	store.Close()
+
+	// Reopen and verify all data was persisted
+	store2, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: dbPath,
+		TTL:    1 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() reopen error = %v", err)
+	}
+	defer store2.Close()
+
+	count := store2.Count()
+	if count != 20 {
+		t.Errorf("After reopen, Count() = %d, want 20", count)
+	}
+}
+
+func TestPayloadStore_BatchingConcurrentWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	const numWrites = 100
+	var wg sync.WaitGroup
+	wg.Add(numWrites)
+
+	// Concurrent writes with unique keys
+	for i := 0; i < numWrites; i++ {
+		go func(id int) {
+			defer wg.Done()
+			// Generate unique key using format: "batch-NNN"
+			key := "batch-" + string(rune('0'+id/100)) + string(rune('0'+(id/10)%10)) + string(rune('0'+id%10))
+			store.Store(key, []byte("data"))
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify all writes completed
+	count := store.Count()
+	if count != numWrites {
+		t.Errorf("Count() = %d, want %d", count, numWrites)
+	}
+}
+
+func TestPayloadStore_BatchingMixedOperations(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		BatchSize:     5,
+		FlushInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	// Store multiple items
+	for i := 0; i < 10; i++ {
+		key := string(rune('a' + i))
+		store.Store(key, []byte("initial"))
+	}
+
+	// Mix of operations
+	var wg sync.WaitGroup
+	wg.Add(30)
+
+	// 10 stores
+	for i := 10; i < 20; i++ {
+		go func(id int) {
+			defer wg.Done()
+			key := string(rune('a' + id))
+			store.Store(key, []byte("new"))
+		}(i)
+	}
+
+	// 10 pops
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			defer wg.Done()
+			key := string(rune('a' + id))
+			store.Pop(key)
+		}(i)
+	}
+
+	// 10 deletes (of non-existent keys - should be safe)
+	for i := 20; i < 30; i++ {
+		go func(id int) {
+			defer wg.Done()
+			key := string(rune('a' + id))
+			store.Delete(key)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify: 10 new stores - 10 pops = 10 remaining
+	count := store.Count()
+	if count != 10 {
+		t.Errorf("Count() = %d, want 10", count)
+	}
+}
+
+func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		BatchSize:     1000,                   // Large batch so it won't trigger by size
+		FlushInterval: 25 * time.Millisecond, // Short interval
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	// Store a single item (won't trigger batch size)
+	store.Store("interval-test", []byte("data"))
+
+	// Wait for flush interval
+	time.Sleep(100 * time.Millisecond)
+
+	// Data should be written
+	if !store.Has("interval-test") {
+		t.Error("Has() = false after flush interval")
+	}
+}

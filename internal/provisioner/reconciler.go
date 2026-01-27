@@ -32,6 +32,25 @@ const (
 // This is not a real error - the caller should not treat it as a failure.
 var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
 
+// InFlightTracker provides methods for tracking in-flight provisions and payloads.
+// This interface decouples the Reconciler from the concrete Manager implementation,
+// enabling easier testing and reducing coupling between components.
+type InFlightTracker interface {
+	// TryTrackInFlight atomically checks if a lease is already in-flight and tracks it if not.
+	// Returns true if the lease was successfully tracked (was not already in-flight).
+	TryTrackInFlight(leaseUUID, tenant, sku, backendName string) bool
+
+	// UntrackInFlight removes a lease from the in-flight tracking.
+	UntrackInFlight(leaseUUID string)
+
+	// HasPayload checks if a payload exists for a lease.
+	HasPayload(leaseUUID string) bool
+
+	// PayloadStore returns the payload store for direct access.
+	// May return nil if payload store is not configured.
+	PayloadStore() *PayloadStore
+}
+
 // ReconcilerChainClient defines the chain operations needed by the reconciler.
 type ReconcilerChainClient interface {
 	GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
@@ -47,7 +66,7 @@ type Reconciler struct {
 	callbackBaseURL string
 	chainClient     ReconcilerChainClient
 	backendRouter   *backend.Router
-	manager         *Manager // For tracking in-flight provisions (shared state with event-driven path)
+	tracker         InFlightTracker // For tracking in-flight provisions (shared state with event-driven path)
 
 	interval    time.Duration
 	maxWorkers  int         // Maximum concurrent workers for lease processing
@@ -63,7 +82,8 @@ type ReconcilerConfig struct {
 }
 
 // NewReconciler creates a new reconciler.
-func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, manager *Manager) (*Reconciler, error) {
+// The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
+func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker InFlightTracker) (*Reconciler, error) {
 	if chainClient == nil {
 		return nil, fmt.Errorf("chainClient is required")
 	}
@@ -94,7 +114,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 		callbackBaseURL: cfg.CallbackBaseURL,
 		chainClient:     chainClient,
 		backendRouter:   backendRouter,
-		manager:         manager,
+		tracker:         tracker,
 		interval:        interval,
 		maxWorkers:      maxWorkers,
 	}, nil
@@ -311,8 +331,8 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// Atomically track in manager's in-flight map if manager is available.
 	// This prevents TOCTOU race between the reconciler and event-driven path:
 	// both may try to provision the same lease concurrently.
-	if r.manager != nil {
-		if !r.manager.TryTrackInFlight(lease.Uuid, lease.Tenant, sku, backendClient.Name()) {
+	if r.tracker != nil {
+		if !r.tracker.TryTrackInFlight(lease.Uuid, lease.Tenant, sku, backendClient.Name()) {
 			metrics.ReconciliationConflictsTotal.Inc()
 			return errLeaseAlreadyInFlight
 		}
@@ -331,17 +351,17 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// We only delete after Provision() succeeds to allow retries.
 	// Only include PayloadHash when we have the actual payload - this ensures
 	// backends never receive a hash without the corresponding data.
-	if withPayload && r.manager != nil {
-		req.Payload = r.manager.PayloadStore().Get(lease.Uuid)
+	if withPayload && r.tracker != nil {
+		req.Payload = r.tracker.PayloadStore().Get(lease.Uuid)
 		if req.Payload != nil && len(lease.MetaHash) > 0 {
 			// Re-verify payload hash before provisioning to catch any corruption.
 			// The payload was validated on upload, but disk corruption could occur.
 			actualHash := sha256.Sum256(req.Payload)
 			if subtle.ConstantTimeCompare(actualHash[:], lease.MetaHash) != 1 {
 				// Payload is corrupted - delete it and fail
-				r.manager.PayloadStore().Delete(lease.Uuid)
-				if r.manager != nil {
-					r.manager.UntrackInFlight(lease.Uuid)
+				r.tracker.PayloadStore().Delete(lease.Uuid)
+				if r.tracker != nil {
+					r.tracker.UntrackInFlight(lease.Uuid)
 				}
 				slog.Error("reconcile: payload hash mismatch - possible corruption",
 					"lease_uuid", lease.Uuid,
@@ -359,15 +379,15 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	if err != nil {
 		// Clean up in-flight on error.
 		// Keep payload in store so next reconciliation can retry with it.
-		if r.manager != nil {
-			r.manager.UntrackInFlight(lease.Uuid)
+		if r.tracker != nil {
+			r.tracker.UntrackInFlight(lease.Uuid)
 		}
 		return err
 	}
 
 	// Provision succeeded - now safe to delete the payload from store
-	if withPayload && r.manager != nil && req.Payload != nil {
-		r.manager.PayloadStore().Delete(lease.Uuid)
+	if withPayload && r.tracker != nil && req.Payload != nil {
+		r.tracker.PayloadStore().Delete(lease.Uuid)
 	}
 
 	if withPayload {
@@ -487,7 +507,7 @@ func (r *Reconciler) processLease(
 		// Check if lease requires a payload (has MetaHash)
 		if len(lease.MetaHash) > 0 {
 			// Lease needs a payload - check if we have one stored
-			if r.manager != nil && r.manager.HasPayload(leaseUUID) {
+			if r.tracker != nil && r.tracker.HasPayload(leaseUUID) {
 				// We have the payload - start provisioning with it
 				if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
 					if errors.Is(err, errLeaseAlreadyInFlight) {

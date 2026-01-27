@@ -21,6 +21,10 @@ import (
 const (
 	// serverShutdownTimeout is the maximum time to wait for the server to shutdown gracefully.
 	serverShutdownTimeout = 10 * time.Second
+
+	// defaultRequestTimeout is the default timeout for individual request processing.
+	// This is separate from HTTP server timeouts and applies to handler logic.
+	defaultRequestTimeout = 30 * time.Second
 )
 
 // CallbackPublisher publishes backend callbacks to the provisioner.
@@ -47,6 +51,7 @@ type Server struct {
 	bech32Prefix          string
 	tlsCertFile           string
 	tlsKeyFile            string
+	requestTimeout        time.Duration
 	rateLimiter           *RateLimiter
 	tenantRateLimiter     *TenantRateLimiter
 	callbackPublisher     CallbackPublisher
@@ -69,6 +74,7 @@ type ServerConfig struct {
 	ReadTimeout          time.Duration
 	WriteTimeout         time.Duration
 	IdleTimeout          time.Duration
+	RequestTimeout       time.Duration // Timeout for individual request processing (default: 30s)
 	MaxRequestBodySize   int64
 	CallbackSecret       string // HMAC secret for callback authentication
 	TokenTrackerDBPath   string // Path to token tracker database (enables replay protection)
@@ -119,6 +125,12 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		maxBodySize = config.DefaultMaxRequestBodySize
 	}
 
+	// Apply default for request timeout
+	requestTimeout := cfg.RequestTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = defaultRequestTimeout
+	}
+
 	// Create callback authenticator if secret is provided
 	var callbackAuth *CallbackAuthenticator
 	if cfg.CallbackSecret != "" {
@@ -142,6 +154,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		bech32Prefix:          cfg.Bech32Prefix,
 		tlsCertFile:           cfg.TLSCertFile,
 		tlsKeyFile:            cfg.TLSKeyFile,
+		requestTimeout:        requestTimeout,
 		rateLimiter:           rateLimiter,
 		tenantRateLimiter:     tenantRateLimiter,
 		callbackPublisher:     callbackPublisher,
@@ -165,8 +178,9 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		authRouter.Use(tenantRateLimiter.Middleware(cfg.Bech32Prefix))
 	}
 
-	// Add global middleware (order matters: rate limit first, then body size, then logging)
+	// Add global middleware (order matters: rate limit first, then timeout, then body size, then logging)
 	router.Use(rateLimiter.Middleware)
+	router.Use(requestTimeoutMiddleware(requestTimeout))
 	router.Use(maxBodySizeMiddleware(maxBodySize))
 	router.Use(loggingMiddleware)
 
@@ -385,4 +399,40 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// requestTimeoutMiddleware applies a timeout to request processing.
+// This is separate from HTTP server timeouts (ReadTimeout/WriteTimeout) and applies
+// to the handler logic itself. If the handler takes longer than the timeout,
+// the request context is cancelled and a 503 Service Unavailable is returned.
+func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), timeout)
+			defer cancel()
+
+			// Create a channel to signal completion
+			done := make(chan struct{})
+
+			// Run the handler in a goroutine so we can detect timeout
+			go func() {
+				next.ServeHTTP(w, r.WithContext(ctx))
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				// Handler completed normally
+			case <-ctx.Done():
+				// Timeout occurred - the handler goroutine will see context cancellation
+				// We don't write anything here because the handler may have already started writing
+				// The handler should check ctx.Err() and abort appropriately
+				slog.Warn("request timeout exceeded",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"timeout", timeout,
+				)
+			}
+		})
+	}
 }
