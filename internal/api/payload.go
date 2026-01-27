@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -49,7 +52,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {
 		slog.Warn("invalid lease UUID format", "lease_uuid", leaseUUID)
-		writeError(w, "invalid lease UUID format", http.StatusBadRequest)
+		writeError(w, errMsgInvalidLeaseUUID, http.StatusBadRequest)
 		return
 	}
 
@@ -58,7 +61,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		slog.Warn("invalid authorization", "error", err)
 		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -66,7 +69,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	if err := token.Validate(h.bech32Prefix); err != nil {
 		slog.Warn("token validation failed", "error", err)
 		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -76,7 +79,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"token_lease_uuid", token.LeaseUUID,
 			"request_lease_uuid", leaseUUID,
 		)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -84,13 +87,13 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	lease, err := h.client.GetLease(r.Context(), leaseUUID)
 	if err != nil {
 		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 
 	if lease == nil {
 		slog.Warn("lease not found", "lease_uuid", leaseUUID)
-		writeError(w, "lease not found", http.StatusNotFound)
+		writeError(w, errMsgLeaseNotFound, http.StatusNotFound)
 		return
 	}
 
@@ -110,7 +113,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"token_tenant", token.Tenant,
 			"lease_tenant", lease.Tenant,
 		)
-		writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, errMsgForbidden, http.StatusForbidden)
 		return
 	}
 
@@ -120,7 +123,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"lease_provider_uuid", lease.ProviderUuid,
 			"our_provider_uuid", h.providerUUID,
 		)
-		writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, errMsgForbidden, http.StatusForbidden)
 		return
 	}
 
@@ -136,7 +139,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	tokenMetaHashBytes, err := hex.DecodeString(token.MetaHash)
 	if err != nil {
 		slog.Warn("invalid token meta_hash hex", "error", err)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -145,13 +148,25 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"token_meta_hash", token.MetaHash,
 			"lease_meta_hash", hex.EncodeToString(lease.MetaHash),
 		)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
-	// Read the payload body
-	payload, err := io.ReadAll(r.Body)
+	// Read the payload body with context awareness
+	// This allows the read to be aborted if the request times out
+	payload, err := readBodyWithContext(r.Context(), r.Body)
 	if err != nil {
+		if r.Context().Err() != nil {
+			if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+				// Server-side timeout - write a proper error response
+				slog.Warn("payload read timeout", "error", err, "lease_uuid", leaseUUID)
+				writeError(w, "request timeout", http.StatusGatewayTimeout)
+				return
+			}
+			// context.Canceled - likely client disconnect, don't write response
+			slog.Warn("payload read cancelled", "error", err, "lease_uuid", leaseUUID)
+			return
+		}
 		slog.Error("failed to read payload body", "error", err)
 		writeError(w, "failed to read request body", http.StatusBadRequest)
 		return
@@ -195,7 +210,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		h.publisher.DeletePayload(leaseUUID)
 		slog.Error("failed to publish payload event", "error", err, "lease_uuid", leaseUUID)
 		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
-		writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 
@@ -219,4 +234,33 @@ func (h *PayloadHandler) extractPayloadToken(r *http.Request) (*PayloadAuthToken
 		return nil, err
 	}
 	return ParsePayloadAuthToken(tokenStr)
+}
+
+// readBodyWithContext reads the request body while respecting context cancellation.
+// Unlike io.ReadAll, this checks the context between chunk reads, allowing the read
+// to be aborted if the request times out.
+func readBodyWithContext(ctx context.Context, body io.Reader) ([]byte, error) {
+	const chunkSize = 32 * 1024 // 32KB chunks
+
+	var buf bytes.Buffer
+	chunk := make([]byte, chunkSize)
+
+	for {
+		// Check context before each read
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		n, err := body.Read(chunk)
+		if n > 0 {
+			buf.Write(chunk[:n])
+		}
+
+		if err == io.EOF {
+			return buf.Bytes(), nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }

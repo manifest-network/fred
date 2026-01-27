@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -420,18 +419,3 @@ func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
 	}
 }
 
-func TestContextWithTenant(t *testing.T) {
-	ctx := context.Background()
-	tenant := "manifest1test"
-
-	// Initially should return empty
-	if got := TenantFromContext(ctx); got != "" {
-		t.Errorf("TenantFromContext() = %q, want empty string", got)
-	}
-
-	// After adding tenant, should return it
-	ctx = ContextWithTenant(ctx, tenant)
-	if got := TenantFromContext(ctx); got != tenant {
-		t.Errorf("TenantFromContext() = %q, want %q", got, tenant)
-	}
-}

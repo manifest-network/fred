@@ -1,8 +1,11 @@
 package provisioner
 
 import (
+	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -386,5 +389,461 @@ func TestPayloadStore_InvalidDBPath(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("NewPayloadStore() with invalid path should return error")
+	}
+}
+
+func TestPayloadStore_BatchingDefaults(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: dbPath,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	// Verify batching defaults were applied
+	if store.batchSize != DefaultBatchSize {
+		t.Errorf("batchSize = %d, want %d", store.batchSize, DefaultBatchSize)
+	}
+	if store.flushInterval != DefaultFlushInterval {
+		t.Errorf("flushInterval = %v, want %v", store.flushInterval, DefaultFlushInterval)
+	}
+}
+
+func TestPayloadStore_BatchingCustomConfig(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	customBatchSize := 25
+	customFlushInterval := 100 * time.Millisecond
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		BatchSize:     customBatchSize,
+		FlushInterval: customFlushInterval,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	if store.batchSize != customBatchSize {
+		t.Errorf("batchSize = %d, want %d", store.batchSize, customBatchSize)
+	}
+	if store.flushInterval != customFlushInterval {
+		t.Errorf("flushInterval = %v, want %v", store.flushInterval, customFlushInterval)
+	}
+}
+
+func TestPayloadStore_FlushOnClose(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	// Create store with short flush interval
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		FlushInterval: 10 * time.Millisecond,
+		BatchSize:     50,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+
+	// Store multiple items
+	for i := 0; i < 20; i++ {
+		key := string(rune('a' + i))
+		store.Store(key, []byte("data"))
+	}
+
+	// Close should wait for all operations to complete and flush
+	store.Close()
+
+	// Reopen and verify all data was persisted
+	store2, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: dbPath,
+		TTL:    1 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() reopen error = %v", err)
+	}
+	defer store2.Close()
+
+	count := store2.Count()
+	if count != 20 {
+		t.Errorf("After reopen, Count() = %d, want 20", count)
+	}
+}
+
+func TestPayloadStore_BatchingConcurrentWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	const numWrites = 100
+	var wg sync.WaitGroup
+	wg.Add(numWrites)
+
+	// Concurrent writes with unique keys
+	for i := 0; i < numWrites; i++ {
+		go func(id int) {
+			defer wg.Done()
+			// Generate unique key using format: "batch-NNN"
+			key := "batch-" + string(rune('0'+id/100)) + string(rune('0'+(id/10)%10)) + string(rune('0'+id%10))
+			store.Store(key, []byte("data"))
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify all writes completed
+	count := store.Count()
+	if count != numWrites {
+		t.Errorf("Count() = %d, want %d", count, numWrites)
+	}
+}
+
+func TestPayloadStore_BatchingMixedOperations(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		BatchSize:     5,
+		FlushInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	// Store multiple items
+	for i := 0; i < 10; i++ {
+		key := string(rune('a' + i))
+		store.Store(key, []byte("initial"))
+	}
+
+	// Mix of operations
+	var wg sync.WaitGroup
+	wg.Add(30)
+
+	// 10 stores
+	for i := 10; i < 20; i++ {
+		go func(id int) {
+			defer wg.Done()
+			key := string(rune('a' + id))
+			store.Store(key, []byte("new"))
+		}(i)
+	}
+
+	// 10 pops
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			defer wg.Done()
+			key := string(rune('a' + id))
+			store.Pop(key)
+		}(i)
+	}
+
+	// 10 deletes (of non-existent keys - should be safe)
+	for i := 20; i < 30; i++ {
+		go func(id int) {
+			defer wg.Done()
+			key := string(rune('a' + id))
+			store.Delete(key)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify: 10 new stores - 10 pops = 10 remaining
+	count := store.Count()
+	if count != 10 {
+		t.Errorf("Count() = %d, want 10", count)
+	}
+}
+
+func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		BatchSize:     1000,                   // Large batch so it won't trigger by size
+		FlushInterval: 25 * time.Millisecond, // Short interval
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer store.Close()
+
+	// Store a single item (won't trigger batch size)
+	store.Store("interval-test", []byte("data"))
+
+	// Wait for flush interval
+	time.Sleep(100 * time.Millisecond)
+
+	// Data should be written
+	if !store.Has("interval-test") {
+		t.Error("Has() = false after flush interval")
+	}
+}
+
+// Tests for VerifyPayloadHash and VerifyPayloadHashHex
+
+func TestVerifyPayloadHash_ValidHash(t *testing.T) {
+	payload := []byte("test payload data")
+	// Compute SHA-256 of payload
+	expectedHash := sha256.Sum256(payload)
+
+	err := VerifyPayloadHash(payload, expectedHash[:])
+	if err != nil {
+		t.Errorf("VerifyPayloadHash() error = %v, want nil", err)
+	}
+}
+
+func TestVerifyPayloadHash_Mismatch(t *testing.T) {
+	payload := []byte("test payload data")
+	// Wrong hash (all zeros)
+	wrongHash := make([]byte, 32)
+
+	err := VerifyPayloadHash(payload, wrongHash)
+	if err == nil {
+		t.Fatal("VerifyPayloadHash() error = nil, want HashMismatchError")
+	}
+
+	var mismatchErr *HashMismatchError
+	if !errors.As(err, &mismatchErr) {
+		t.Errorf("VerifyPayloadHash() error type = %T, want *HashMismatchError", err)
+	}
+}
+
+func TestVerifyPayloadHash_EmptyExpectedHash(t *testing.T) {
+	payload := []byte("test payload data")
+
+	err := VerifyPayloadHash(payload, []byte{})
+	if err == nil {
+		t.Fatal("VerifyPayloadHash() error = nil, want error for empty hash")
+	}
+	if err.Error() != "expected hash is empty" {
+		t.Errorf("VerifyPayloadHash() error = %q, want %q", err.Error(), "expected hash is empty")
+	}
+}
+
+func TestVerifyPayloadHash_NilExpectedHash(t *testing.T) {
+	payload := []byte("test payload data")
+
+	err := VerifyPayloadHash(payload, nil)
+	if err == nil {
+		t.Fatal("VerifyPayloadHash() error = nil, want error for nil hash")
+	}
+	if err.Error() != "expected hash is empty" {
+		t.Errorf("VerifyPayloadHash() error = %q, want %q", err.Error(), "expected hash is empty")
+	}
+}
+
+func TestVerifyPayloadHash_EmptyPayload(t *testing.T) {
+	payload := []byte{}
+	// SHA-256 of empty string: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+	expectedHash := []byte{
+		0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+		0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+		0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+		0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+	}
+
+	err := VerifyPayloadHash(payload, expectedHash)
+	if err != nil {
+		t.Errorf("VerifyPayloadHash() error = %v, want nil for empty payload", err)
+	}
+}
+
+func TestVerifyPayloadHash_NilPayload(t *testing.T) {
+	// SHA-256 of empty/nil is same as empty string
+	expectedHash := []byte{
+		0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+		0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+		0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+		0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+	}
+
+	err := VerifyPayloadHash(nil, expectedHash)
+	if err != nil {
+		t.Errorf("VerifyPayloadHash() error = %v, want nil for nil payload", err)
+	}
+}
+
+func TestVerifyPayloadHash_WrongLengthHash(t *testing.T) {
+	payload := []byte("test payload data")
+	// Hash with wrong length (not 32 bytes)
+	wrongLengthHash := []byte{0x01, 0x02, 0x03}
+
+	err := VerifyPayloadHash(payload, wrongLengthHash)
+	if err == nil {
+		t.Fatal("VerifyPayloadHash() error = nil, want HashMismatchError for wrong length hash")
+	}
+
+	var mismatchErr *HashMismatchError
+	if !errors.As(err, &mismatchErr) {
+		t.Errorf("VerifyPayloadHash() error type = %T, want *HashMismatchError", err)
+	}
+}
+
+func TestVerifyPayloadHashHex_ValidHash(t *testing.T) {
+	payload := []byte("hello world")
+	// SHA-256("hello world") = b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+	expectedHashHex := "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+
+	err := VerifyPayloadHashHex(payload, expectedHashHex)
+	if err != nil {
+		t.Errorf("VerifyPayloadHashHex() error = %v, want nil", err)
+	}
+}
+
+func TestVerifyPayloadHashHex_Mismatch(t *testing.T) {
+	payload := []byte("hello world")
+	// Wrong hash (all zeros in hex)
+	wrongHashHex := "0000000000000000000000000000000000000000000000000000000000000000"
+
+	err := VerifyPayloadHashHex(payload, wrongHashHex)
+	if err == nil {
+		t.Fatal("VerifyPayloadHashHex() error = nil, want HashMismatchError")
+	}
+
+	var mismatchErr *HashMismatchError
+	if !errors.As(err, &mismatchErr) {
+		t.Errorf("VerifyPayloadHashHex() error type = %T, want *HashMismatchError", err)
+	}
+}
+
+func TestVerifyPayloadHashHex_InvalidHex(t *testing.T) {
+	payload := []byte("hello world")
+
+	testCases := []struct {
+		name    string
+		hexStr  string
+		wantErr string
+	}{
+		{
+			name:    "invalid characters",
+			hexStr:  "xyz123notvalidhex!@#$%^&*()",
+			wantErr: "invalid expected hash hex",
+		},
+		{
+			name:    "odd length hex",
+			hexStr:  "abc",
+			wantErr: "invalid expected hash hex",
+		},
+		{
+			name:    "spaces in hex",
+			hexStr:  "b94d 27b9 934d",
+			wantErr: "invalid expected hash hex",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyPayloadHashHex(payload, tc.hexStr)
+			if err == nil {
+				t.Fatal("VerifyPayloadHashHex() error = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("VerifyPayloadHashHex() error = %q, want to contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyPayloadHashHex_EmptyHex(t *testing.T) {
+	payload := []byte("hello world")
+
+	err := VerifyPayloadHashHex(payload, "")
+	if err == nil {
+		t.Fatal("VerifyPayloadHashHex() error = nil, want error for empty hex")
+	}
+	// Empty hex decodes to empty []byte, which triggers "expected hash is empty"
+	if err.Error() != "expected hash is empty" {
+		t.Errorf("VerifyPayloadHashHex() error = %q, want %q", err.Error(), "expected hash is empty")
+	}
+}
+
+func TestVerifyPayloadHashHex_EmptyPayload(t *testing.T) {
+	payload := []byte{}
+	// SHA-256 of empty string in hex
+	expectedHashHex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	err := VerifyPayloadHashHex(payload, expectedHashHex)
+	if err != nil {
+		t.Errorf("VerifyPayloadHashHex() error = %v, want nil for empty payload", err)
+	}
+}
+
+func TestVerifyPayloadHashHex_CaseInsensitive(t *testing.T) {
+	payload := []byte("hello world")
+	// SHA-256("hello world") in uppercase
+	expectedHashHexUpper := "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9"
+
+	err := VerifyPayloadHashHex(payload, expectedHashHexUpper)
+	if err != nil {
+		t.Errorf("VerifyPayloadHashHex() error = %v, want nil (hex should be case-insensitive)", err)
+	}
+}
+
+func TestHashMismatchError_Error(t *testing.T) {
+	err := &HashMismatchError{
+		Expected: []byte{0x01, 0x02, 0x03},
+		Actual:   []byte{0x04, 0x05, 0x06},
+	}
+
+	msg := err.Error()
+	if !strings.Contains(msg, "010203") {
+		t.Errorf("HashMismatchError.Error() = %q, want to contain expected hash hex", msg)
+	}
+	if !strings.Contains(msg, "040506") {
+		t.Errorf("HashMismatchError.Error() = %q, want to contain actual hash hex", msg)
+	}
+	if !strings.Contains(msg, "payload hash mismatch") {
+		t.Errorf("HashMismatchError.Error() = %q, want to contain 'payload hash mismatch'", msg)
+	}
+}
+
+func TestVerifyPayloadHash_LargePayload(t *testing.T) {
+	// Test with a larger payload to ensure no issues with size
+	payload := make([]byte, 1024*1024) // 1MB
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	// Compute expected hash
+	hash := sha256.Sum256(payload)
+
+	err := VerifyPayloadHash(payload, hash[:])
+	if err != nil {
+		t.Errorf("VerifyPayloadHash() error = %v, want nil for large payload", err)
+	}
+}
+
+func TestVerifyPayloadHash_BinaryPayload(t *testing.T) {
+	// Test with binary payload containing all byte values
+	payload := make([]byte, 256)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	// Compute expected hash
+	hash := sha256.Sum256(payload)
+
+	err := VerifyPayloadHash(payload, hash[:])
+	if err != nil {
+		t.Errorf("VerifyPayloadHash() error = %v, want nil for binary payload", err)
 	}
 }

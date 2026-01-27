@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -298,6 +299,11 @@ func (c *Config) Validate() error {
 	// TLS file validation - if one is set, both must be set
 	if (c.TLSCertFile != "") != (c.TLSKeyFile != "") {
 		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
+	}
+
+	// Security warning for gRPC TLS skip verify
+	if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
+		slog.Warn("SECURITY WARNING: grpc_tls_skip_verify is enabled - TLS certificate verification is disabled, vulnerable to MITM attacks")
 	}
 
 	// Backend validation - at least one backend is required

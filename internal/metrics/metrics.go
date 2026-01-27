@@ -92,6 +92,14 @@ var (
 		Help:      "Size of uploaded payloads in bytes",
 		Buckets:   prometheus.ExponentialBuckets(1024, 2, 14), // 1KB to ~16MB
 	})
+
+	// LeasesAwaitingPayloadTotal tracks leases that are waiting for payload upload.
+	LeasesAwaitingPayloadTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "payload",
+		Name:      "leases_awaiting_total",
+		Help:      "Total number of leases seen that require payload upload",
+	})
 )
 
 // Backend metrics

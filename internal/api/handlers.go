@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -53,6 +54,107 @@ func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker
 	}
 }
 
+// AuthenticatedRequest contains the result of a successful authentication.
+type AuthenticatedRequest struct {
+	Token *AuthToken
+	Lease *billingtypes.Lease
+}
+
+// AuthenticateLeaseRequest performs common authentication and authorization for lease endpoints.
+// It extracts and validates the bearer token, optionally checks for replay attacks,
+// queries the lease from chain, and verifies tenant and provider ownership.
+//
+// Parameters:
+//   - r: the HTTP request
+//   - leaseUUID: the lease UUID from the URL path
+//   - checkReplay: whether to check for token replay (set false for idempotent/read-heavy endpoints like status)
+//   - requireActive: if true, only ACTIVE leases are accepted; if false, any state is allowed
+//
+// Returns AuthenticatedRequest on success, or an error with the appropriate HTTP status code.
+func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, checkReplay bool, requireActive bool) (*AuthenticatedRequest, int, error) {
+	// Validate lease UUID format
+	if !config.IsValidUUID(leaseUUID) {
+		return nil, http.StatusBadRequest, errors.New(errMsgInvalidLeaseUUID)
+	}
+
+	// Extract and validate bearer token
+	token, err := h.extractToken(r)
+	if err != nil {
+		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
+	}
+
+	// Validate the token
+	if err := token.Validate(h.bech32Prefix); err != nil {
+		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
+	}
+
+	// Check for token replay attack (if tracker is configured and checkReplay is true)
+	if checkReplay && h.tokenTracker != nil {
+		if err := h.tokenTracker.TryUse(token.Signature); err != nil {
+			if errors.Is(err, ErrTokenAlreadyUsed) {
+				slog.Warn("token replay detected",
+					"lease_uuid", leaseUUID,
+					"tenant", token.Tenant,
+				)
+				return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
+			}
+			// Database error - log but don't block the request
+			slog.Error("token tracker error", "error", err)
+		}
+	}
+
+	// Verify the token's lease UUID matches the request
+	if token.LeaseUUID != leaseUUID {
+		slog.Warn("lease UUID mismatch",
+			"token_lease_uuid", token.LeaseUUID,
+			"request_lease_uuid", leaseUUID,
+		)
+		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
+	}
+
+	// Query the lease from chain
+	var lease *billingtypes.Lease
+	if requireActive {
+		lease, err = h.client.GetActiveLease(r.Context(), leaseUUID)
+	} else {
+		lease, err = h.client.GetLease(r.Context(), leaseUUID)
+	}
+	if err != nil {
+		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
+		return nil, http.StatusInternalServerError, errors.New(errMsgInternalServerError)
+	}
+
+	if lease == nil {
+		if requireActive {
+			return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound + " or not active")
+		}
+		return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound)
+	}
+
+	// Verify the tenant matches
+	if lease.Tenant != token.Tenant {
+		slog.Warn("tenant mismatch",
+			"token_tenant", token.Tenant,
+			"lease_tenant", lease.Tenant,
+		)
+		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
+	}
+
+	// Verify the provider UUID matches
+	if lease.ProviderUuid != h.providerUUID {
+		slog.Warn("provider UUID mismatch",
+			"lease_provider_uuid", lease.ProviderUuid,
+			"our_provider_uuid", h.providerUUID,
+		)
+		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
+	}
+
+	return &AuthenticatedRequest{
+		Token: token,
+		Lease: lease,
+	}, http.StatusOK, nil
+}
+
 // ConnectionResponse represents the response for connection details.
 type ConnectionResponse struct {
 	LeaseUUID    string            `json:"lease_uuid"`
@@ -75,90 +177,26 @@ type ErrorResponse struct {
 	Code  int    `json:"code"`
 }
 
+// Common error messages for API responses.
+// These constants ensure consistency across handlers and simplify testing.
+const (
+	errMsgUnauthorized         = "unauthorized"
+	errMsgForbidden            = "forbidden"
+	errMsgInternalServerError  = "internal server error"
+	errMsgServiceNotConfigured = "service not configured"
+	errMsgInvalidLeaseUUID     = "invalid lease UUID format"
+	errMsgLeaseNotFound        = "lease not found"
+)
+
 // GetLeaseConnection handles GET /v1/leases/{lease_uuid}/connection
 func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	leaseUUID := vars["lease_uuid"]
 
-	// Validate lease UUID format
-	if !config.IsValidUUID(leaseUUID) {
-		slog.Warn("invalid lease UUID format", "lease_uuid", leaseUUID)
-		writeError(w, "invalid lease UUID format", http.StatusBadRequest)
-		return
-	}
-
-	// Extract and validate bearer token
-	token, err := h.extractToken(r)
+	// Authenticate and authorize the request (requires active lease, checks replay)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
 	if err != nil {
-		slog.Warn("invalid authorization", "error", err)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Validate the token
-	if err := token.Validate(h.bech32Prefix); err != nil {
-		slog.Warn("token validation failed", "error", err)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Check for token replay attack (if tracker is configured)
-	if h.tokenTracker != nil {
-		if err := h.tokenTracker.TryUse(token.Signature); err != nil {
-			if errors.Is(err, ErrTokenAlreadyUsed) {
-				slog.Warn("token replay detected",
-					"lease_uuid", leaseUUID,
-					"tenant", token.Tenant,
-				)
-				writeError(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			// Database error - log but don't block the request
-			slog.Error("token tracker error", "error", err)
-		}
-	}
-
-	// Verify the token's lease UUID matches the request
-	if token.LeaseUUID != leaseUUID {
-		slog.Warn("lease UUID mismatch",
-			"token_lease_uuid", token.LeaseUUID,
-			"request_lease_uuid", leaseUUID,
-		)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Query the lease from chain to verify it's active and tenant matches
-	lease, err := h.client.GetActiveLease(r.Context(), leaseUUID)
-	if err != nil {
-		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, "internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	if lease == nil {
-		slog.Warn("lease not found or not active", "lease_uuid", leaseUUID)
-		writeError(w, "lease not found or not active", http.StatusNotFound)
-		return
-	}
-
-	// Verify the tenant matches
-	if lease.Tenant != token.Tenant {
-		slog.Warn("tenant mismatch",
-			"token_tenant", token.Tenant,
-			"lease_tenant", lease.Tenant,
-		)
-		writeError(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	// Verify the provider UUID matches
-	if lease.ProviderUuid != h.providerUUID {
-		slog.Warn("provider UUID mismatch",
-			"lease_provider_uuid", lease.ProviderUuid,
-			"our_provider_uuid", h.providerUUID,
-		)
-		writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, err.Error(), status)
 		return
 	}
 
@@ -170,7 +208,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract SKU for routing (use first item's SKU - all items share same provider)
-	sku := provisioner.ExtractPrimarySKU(lease)
+	sku := provisioner.ExtractPrimarySKU(auth.Lease)
 
 	// Route to appropriate backend based on SKU (Route already falls back to default)
 	backendClient := h.backendRouter.Route(sku)
@@ -187,21 +225,21 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("failed to get info from backend", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 
 	// Build response with lease info from backend
 	response := ConnectionResponse{
 		LeaseUUID:    leaseUUID,
-		Tenant:       lease.Tenant,
+		Tenant:       auth.Lease.Tenant,
 		ProviderUUID: h.providerUUID,
 		Connection:   extractConnectionDetails(*info),
 	}
 
 	slog.Info("lease info served",
 		"lease_uuid", leaseUUID,
-		"tenant", token.Tenant,
+		"tenant", auth.Token.Tenant,
 		"backend", backendClient.Name(),
 	)
 
@@ -213,6 +251,7 @@ type LeaseStatusResponse struct {
 	LeaseUUID           string `json:"lease_uuid"`
 	State               string `json:"state"`
 	RequiresPayload     bool   `json:"requires_payload"`
+	MetaHashHex         string `json:"meta_hash_hex,omitempty"` // For debugging - shows the expected payload hash
 	PayloadReceived     bool   `json:"payload_received"`
 	ProvisioningStarted bool   `json:"provisioning_started"`
 }
@@ -222,77 +261,22 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	leaseUUID := vars["lease_uuid"]
 
-	// Validate lease UUID format
-	if !config.IsValidUUID(leaseUUID) {
-		slog.Warn("invalid lease UUID format", "lease_uuid", leaseUUID)
-		writeError(w, "invalid lease UUID format", http.StatusBadRequest)
-		return
-	}
-
-	// Extract and validate bearer token
-	token, err := h.extractToken(r)
+	// Authenticate and authorize the request (any lease state, no replay check for read-heavy endpoint)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
 	if err != nil {
-		slog.Warn("invalid authorization", "error", err)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Validate the token
-	if err := token.Validate(h.bech32Prefix); err != nil {
-		slog.Warn("token validation failed", "error", err)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Verify the token's lease UUID matches the request
-	if token.LeaseUUID != leaseUUID {
-		slog.Warn("lease UUID mismatch",
-			"token_lease_uuid", token.LeaseUUID,
-			"request_lease_uuid", leaseUUID,
-		)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Query the lease from chain
-	lease, err := h.client.GetLease(r.Context(), leaseUUID)
-	if err != nil {
-		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, "internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	if lease == nil {
-		slog.Warn("lease not found", "lease_uuid", leaseUUID)
-		writeError(w, "lease not found", http.StatusNotFound)
-		return
-	}
-
-	// Verify the tenant matches
-	if lease.Tenant != token.Tenant {
-		slog.Warn("tenant mismatch",
-			"token_tenant", token.Tenant,
-			"lease_tenant", lease.Tenant,
-		)
-		writeError(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	// Verify the provider UUID matches
-	if lease.ProviderUuid != h.providerUUID {
-		slog.Warn("provider UUID mismatch",
-			"lease_provider_uuid", lease.ProviderUuid,
-			"our_provider_uuid", h.providerUUID,
-		)
-		writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, err.Error(), status)
 		return
 	}
 
 	// Build status response
+	hasMetaHash := len(auth.Lease.MetaHash) > 0
 	response := LeaseStatusResponse{
 		LeaseUUID:       leaseUUID,
-		State:           lease.State.String(),
-		RequiresPayload: len(lease.MetaHash) > 0,
+		State:           auth.Lease.State.String(),
+		RequiresPayload: hasMetaHash,
+	}
+	if hasMetaHash {
+		response.MetaHashHex = hex.EncodeToString(auth.Lease.MetaHash)
 	}
 
 	// Check provisioning status if checker is available
@@ -303,7 +287,7 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("lease status served",
 		"lease_uuid", leaseUUID,
-		"tenant", token.Tenant,
+		"tenant", auth.Token.Tenant,
 		"state", response.State,
 	)
 
@@ -405,11 +389,6 @@ func writeError(w http.ResponseWriter, message string, status int) {
 		Code:  status,
 	}
 	writeJSON(w, response, status)
-}
-
-// decodeJSON decodes a JSON request body.
-func decodeJSON(r *http.Request, v interface{}) error {
-	return json.NewDecoder(r.Body).Decode(v)
 }
 
 // decodeJSONBytes decodes JSON from a byte slice.

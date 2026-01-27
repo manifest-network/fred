@@ -1,9 +1,7 @@
 package api
 
 import (
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 
 	"github.com/manifest-network/fred/internal/auth"
@@ -22,17 +20,7 @@ type PayloadAuthToken struct {
 
 // ParsePayloadAuthToken parses a base64-encoded payload authentication token.
 func ParsePayloadAuthToken(encoded string) (*PayloadAuthToken, error) {
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode token: %w", err)
-	}
-
-	var token PayloadAuthToken
-	if err := json.Unmarshal(decoded, &token); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal token: %w", err)
-	}
-
-	return &token, nil
+	return parseBase64Token[PayloadAuthToken](encoded)
 }
 
 // Validate verifies the token's timestamp and ADR-036 signature.

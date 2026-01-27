@@ -190,7 +190,6 @@ func run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create payload store: %w", err)
 		}
-		slog.Info("payload store initialized", "db_path", cfg.PayloadStoreDBPath)
 	} else {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
@@ -363,6 +362,10 @@ func run(cmd *cobra.Command, args []string) error {
 	// Signal all components to stop via context cancellation.
 	// This triggers ctx.Done() in all component loops.
 	cancel()
+
+	// Stop withdrawal scheduler and wait for any in-flight withdrawal to complete.
+	// This ensures we don't interrupt a withdrawal transaction mid-flight.
+	withdrawScheduler.Stop()
 
 	// Close event subscriber to unblock any components waiting on events.
 	// Components check ctx.Done() first, so they'll exit cleanly.

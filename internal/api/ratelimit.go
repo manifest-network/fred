@@ -212,13 +212,6 @@ func ContextWithTenant(ctx context.Context, tenant string) context.Context {
 	return context.WithValue(ctx, tenantKey{}, tenant)
 }
 
-// TenantFromContext extracts the tenant from the context.
-// Returns empty string if not set.
-func TenantFromContext(ctx context.Context) string {
-	tenant, _ := ctx.Value(tenantKey{}).(string)
-	return tenant
-}
-
 // TenantRateLimitMiddleware returns middleware that applies per-tenant rate limiting.
 // It extracts the tenant from the Authorization header and applies the limit.
 // If tenant cannot be extracted, the request proceeds without tenant-based limiting.

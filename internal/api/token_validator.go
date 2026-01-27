@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -10,6 +11,22 @@ import (
 
 	"github.com/manifest-network/fred/internal/adr036"
 )
+
+// parseBase64Token decodes a base64-encoded JSON token into the specified type.
+// This generic helper consolidates the common parsing logic used by all token types.
+func parseBase64Token[T any](encoded string) (*T, error) {
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode token: %w", err)
+	}
+
+	var token T
+	if err := json.Unmarshal(decoded, &token); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal token: %w", err)
+	}
+
+	return &token, nil
+}
 
 // tokenValidator provides common validation logic for authentication tokens.
 // This is used by both AuthToken and PayloadAuthToken to avoid code duplication.

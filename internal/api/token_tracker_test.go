@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/manifest-network/fred/internal/util"
 )
 
 func TestNewTokenTracker(t *testing.T) {
@@ -153,40 +155,6 @@ func TestTokenTracker_TryUse(t *testing.T) {
 	})
 }
 
-func TestTokenTracker_Stats(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "tokens.db")
-	tracker, err := NewTokenTracker(TokenTrackerConfig{
-		DBPath: dbPath,
-		MaxAge: 1 * time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("NewTokenTracker() error = %v", err)
-	}
-	defer tracker.Close()
-
-	// Initially empty
-	count, err := tracker.Stats()
-	if err != nil {
-		t.Fatalf("Stats() error = %v", err)
-	}
-	if count != 0 {
-		t.Errorf("Stats() initial count = %d, want 0", count)
-	}
-
-	// Add some tokens
-	tracker.TryUse("token-1")
-	tracker.TryUse("token-2")
-	tracker.TryUse("token-3")
-
-	count, err = tracker.Stats()
-	if err != nil {
-		t.Fatalf("Stats() error = %v", err)
-	}
-	if count != 3 {
-		t.Errorf("Stats() count = %d, want 3", count)
-	}
-}
-
 func TestTokenTracker_Cleanup(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "tokens.db")
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
@@ -203,9 +171,9 @@ func TestTokenTracker_Cleanup(t *testing.T) {
 	tracker.TryUse("token-1")
 	tracker.TryUse("token-2")
 
-	count, _ := tracker.Stats()
-	if count != 2 {
-		t.Fatalf("Stats() before cleanup = %d, want 2", count)
+	// Verify tokens are tracked (replay should fail)
+	if err := tracker.TryUse("token-1"); err != ErrTokenAlreadyUsed {
+		t.Fatalf("TryUse() before expiry error = %v, want ErrTokenAlreadyUsed", err)
 	}
 
 	// Wait for expiry
@@ -217,10 +185,12 @@ func TestTokenTracker_Cleanup(t *testing.T) {
 		t.Fatalf("cleanup() error = %v", err)
 	}
 
-	// Should be empty now
-	count, _ = tracker.Stats()
-	if count != 0 {
-		t.Errorf("Stats() after cleanup = %d, want 0", count)
+	// After cleanup, tokens should be reusable (they were cleaned up)
+	if err := tracker.TryUse("token-1"); err != nil {
+		t.Errorf("TryUse() after cleanup error = %v, want nil (token should be reusable)", err)
+	}
+	if err := tracker.TryUse("token-2"); err != nil {
+		t.Errorf("TryUse() after cleanup error = %v, want nil (token should be reusable)", err)
 	}
 }
 
@@ -312,8 +282,8 @@ func TestTokenTracker_Close(t *testing.T) {
 func TestTimeConversion(t *testing.T) {
 	// Test round-trip conversion
 	original := time.Now()
-	bytes := timeToBytes(original)
-	restored := bytesToTime(bytes)
+	bytes := util.TimeToBytes(original)
+	restored := util.BytesToTime(bytes)
 
 	// UnixNano precision
 	if original.UnixNano() != restored.UnixNano() {
@@ -323,8 +293,8 @@ func TestTimeConversion(t *testing.T) {
 
 func TestBytesToTime_InvalidInput(t *testing.T) {
 	// Invalid length should return zero time
-	result := bytesToTime([]byte{1, 2, 3}) // Only 3 bytes, need 8
+	result := util.BytesToTime([]byte{1, 2, 3}) // Only 3 bytes, need 8
 	if !result.IsZero() {
-		t.Errorf("bytesToTime(short) = %v, want zero time", result)
+		t.Errorf("BytesToTime(short) = %v, want zero time", result)
 	}
 }
