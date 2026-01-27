@@ -276,6 +276,63 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 }
 ```
 
+### Get Lease Status
+
+```
+GET /v1/leases/{lease_uuid}/status
+Authorization: Bearer <token>
+```
+
+Returns the current provisioning status of a lease. Useful for checking if provisioning is in progress or complete.
+
+**Response:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "chain_state": "PENDING",
+  "provisioning_status": "in_flight",
+  "has_payload": true
+}
+```
+
+**Provisioning Status Values:**
+- `in_flight` - Provisioning is in progress
+- `provisioned` - Resource is provisioned (lease should be ACTIVE)
+- `pending` - Awaiting provisioning (may be waiting for payload)
+
+### Upload Payload
+
+```
+POST /v1/leases/{lease_uuid}/data
+Authorization: Bearer <token>
+Content-Type: application/octet-stream
+
+<raw payload bytes>
+```
+
+Upload deployment configuration for a lease that was created with a `meta_hash`. The payload is validated against the on-chain hash before provisioning starts.
+
+**Token Format** (base64-encoded JSON):
+```json
+{
+  "tenant": "manifest1...",
+  "lease_uuid": "...",
+  "meta_hash": "abc123...",
+  "timestamp": 1234567890,
+  "pub_key": "<base64-encoded-pubkey>",
+  "signature": "<base64-encoded-signature>"
+}
+```
+
+The signed message format is: `manifest lease data {lease_uuid} {meta_hash_hex} {unix_timestamp}`
+
+**Response Codes:**
+- `202 Accepted` - Payload received, provisioning started
+- `400 Bad Request` - Invalid payload or hash mismatch
+- `401 Unauthorized` - Invalid signature or token
+- `404 Not Found` - Lease not found or not PENDING
+- `409 Conflict` - Payload already received
+
 ### Provision Callback (Backend -> Fred)
 
 ```
@@ -546,16 +603,65 @@ internal/
 └── watcher/            # Cross-provider event detection
 ```
 
+## Reconciliation
+
+Fred uses **level-triggered reconciliation** to ensure consistency between chain state and backend state. This provides crash recovery without requiring durable event queues.
+
+### How It Works
+
+Instead of replaying missed events (edge-triggered), reconciliation queries current state:
+
+```
+Chain State (leases)     Backend State (provisions)
+        │                          │
+        └──────────┬───────────────┘
+                   │
+                   ▼
+            Reconciler compares
+                   │
+        ┌──────────┼──────────┐
+        ▼          ▼          ▼
+    PENDING     ACTIVE      CLOSED
+    + not      + not       + still
+    provisioned provisioned provisioned
+        │          │          │
+        ▼          ▼          ▼
+     Start      Anomaly:   Deprovision
+   provisioning  log &      (orphan
+                provision   cleanup)
+```
+
+### Reconciliation Triggers
+
+1. **Startup**: Full reconciliation runs immediately on startup
+2. **Periodic**: Runs every `reconciliation_interval` (default: 5 minutes)
+3. **Cross-provider credit depletion**: Triggers withdrawal which may close leases
+
+### State Matrix
+
+| Chain State | Backend State | Action |
+|-------------|---------------|--------|
+| PENDING + meta_hash | Not provisioned | Await payload upload |
+| PENDING (no hash) | Not provisioned | Start provisioning |
+| PENDING | Provisioned + ready | Acknowledge lease |
+| ACTIVE | Provisioned | Healthy - no action |
+| ACTIVE | Not provisioned | Anomaly: provision |
+| CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
+| Not found | Provisioned | Orphan: deprovision |
+
 ## Security Features
 
-- **Rate Limiting**: Per-IP token bucket rate limiting (configurable RPS and burst)
+- **Rate Limiting**: Per-IP and per-tenant token bucket rate limiting (configurable RPS and burst)
 - **Request Size Limits**: Configurable max request body size (default 1MB)
 - **Input Validation**: UUID format validation on all inputs
 - **Error Sanitization**: Generic error messages to clients, detailed logs server-side
 - **TLS Support**: Optional HTTPS for API and TLS for gRPC
 - **ADR-036 Authentication**: Cryptographic signature verification for tenant access
-- **Token Expiry**: 5-minute validity window on authentication tokens
+- **Token Expiry**: 30-second validity window on authentication tokens
+- **Token Replay Protection**: Used tokens tracked in persistent database to prevent replay attacks
 - **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
+- **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
+- **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses
 
 ## Dependencies
 
