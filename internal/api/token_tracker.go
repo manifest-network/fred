@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"log/slog"
 	"sync"
@@ -10,6 +9,8 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Retry configuration for bbolt operations under contention.
@@ -128,7 +129,7 @@ func (t *TokenTracker) TryUse(key string) error {
 			existing := b.Get(keyBytes)
 			if existing != nil {
 				// Token exists - check if it's still valid (not expired)
-				storedExpiry := bytesToTime(existing)
+				storedExpiry := util.BytesToTime(existing)
 				if now.Before(storedExpiry) {
 					return ErrTokenAlreadyUsed
 				}
@@ -136,7 +137,7 @@ func (t *TokenTracker) TryUse(key string) error {
 			}
 
 			// Store token with expiry time
-			return b.Put(keyBytes, timeToBytes(expiresAt))
+			return b.Put(keyBytes, util.TimeToBytes(expiresAt))
 		})
 
 		// Don't retry for application-level errors (token already used)
@@ -213,7 +214,7 @@ func (t *TokenTracker) cleanup() error {
 		// Collect keys to delete (can't delete while iterating)
 		var toDelete [][]byte
 		for k, v := c.First(); k != nil; k, v = c.Next() {
-			expiresAt := bytesToTime(v)
+			expiresAt := util.BytesToTime(v)
 			if now.After(expiresAt) {
 				// Make a copy of the key since cursor reuses the slice
 				keyCopy := make([]byte, len(k))
@@ -250,18 +251,3 @@ func (t *TokenTracker) Stats() (total int, err error) {
 	return
 }
 
-// timeToBytes converts a time.Time to bytes for storage.
-func timeToBytes(t time.Time) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, uint64(t.UnixNano()))
-	return b
-}
-
-// bytesToTime converts bytes back to time.Time.
-func bytesToTime(b []byte) time.Time {
-	if len(b) != 8 {
-		return time.Time{}
-	}
-	nano := int64(binary.BigEndian.Uint64(b))
-	return time.Unix(0, nano)
-}

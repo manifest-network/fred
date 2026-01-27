@@ -2,7 +2,6 @@ package provisioner
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -261,6 +260,3 @@ func (b *AckBatcher) acknowledgeIndividually(ctx context.Context, requests []ack
 		}
 	}
 }
-
-// ErrBatcherNotStarted is returned when Acknowledge is called before Start.
-var ErrBatcherNotStarted = errors.New("ack batcher not started")

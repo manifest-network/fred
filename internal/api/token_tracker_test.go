@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/manifest-network/fred/internal/util"
 )
 
 func TestNewTokenTracker(t *testing.T) {
@@ -312,8 +314,8 @@ func TestTokenTracker_Close(t *testing.T) {
 func TestTimeConversion(t *testing.T) {
 	// Test round-trip conversion
 	original := time.Now()
-	bytes := timeToBytes(original)
-	restored := bytesToTime(bytes)
+	bytes := util.TimeToBytes(original)
+	restored := util.BytesToTime(bytes)
 
 	// UnixNano precision
 	if original.UnixNano() != restored.UnixNano() {
@@ -323,8 +325,8 @@ func TestTimeConversion(t *testing.T) {
 
 func TestBytesToTime_InvalidInput(t *testing.T) {
 	// Invalid length should return zero time
-	result := bytesToTime([]byte{1, 2, 3}) // Only 3 bytes, need 8
+	result := util.BytesToTime([]byte{1, 2, 3}) // Only 3 bytes, need 8
 	if !result.IsZero() {
-		t.Errorf("bytesToTime(short) = %v, want zero time", result)
+		t.Errorf("BytesToTime(short) = %v, want zero time", result)
 	}
 }
