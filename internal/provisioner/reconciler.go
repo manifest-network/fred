@@ -2,6 +2,9 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +15,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // errLeaseAlreadyInFlight indicates the lease is already being provisioned.
@@ -90,7 +94,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 // | ACTIVE      | Provisioned | Nothing (healthy) |
 // | ACTIVE      | Not provisioned | Anomaly: Log + provision |
 // | Not found   | Provisioned | Orphan: Deprovision |
-func (r *Reconciler) ReconcileAll(ctx context.Context) error {
+func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// Use atomic flag to prevent concurrent reconciliation without blocking.
 	// If reconciliation is already in progress, skip this run.
 	if !r.reconciling.CompareAndSwap(false, true) {
@@ -103,6 +107,15 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	// Track reconciliation duration and outcome
+	startTime := time.Now()
+	defer func() {
+		metrics.ReconciliationDuration.Observe(time.Since(startTime).Seconds())
+		if retErr != nil && retErr != context.Canceled {
+			metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeError).Inc()
+		}
+	}()
 
 	slog.Info("starting reconciliation", "provider_uuid", r.providerUUID)
 
@@ -186,23 +199,48 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 
 		switch {
 		case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:
-			// TODO(phase-4): Check for meta_hash and await payload upload
-			// before starting provisioning. For now, start immediately.
-			if err := r.startProvisioning(ctx, lease); err != nil {
-				// errLeaseAlreadyInFlight is not a real error - the event-driven
-				// path is handling this lease, so we just skip it.
-				if errors.Is(err, errLeaseAlreadyInFlight) {
-					slog.Debug("reconcile: lease already in-flight, skipping",
-						"lease_uuid", leaseUUID,
-					)
+			// Check if lease requires a payload (has MetaHash)
+			if len(lease.MetaHash) > 0 {
+				// Lease needs a payload - check if we have one stored
+				if r.manager != nil && r.manager.HasPayload(leaseUUID) {
+					// We have the payload - start provisioning with it
+					if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
+						if errors.Is(err, errLeaseAlreadyInFlight) {
+							slog.Debug("reconcile: lease already in-flight, skipping",
+								"lease_uuid", leaseUUID,
+							)
+						} else {
+							slog.Error("reconcile: failed to start provisioning with payload",
+								"lease_uuid", leaseUUID,
+								"error", err,
+							)
+						}
+					} else {
+						provisioned++
+					}
 				} else {
-					slog.Error("reconcile: failed to start provisioning",
+					// No payload yet - wait for tenant to upload
+					slog.Debug("reconcile: lease awaiting payload upload",
 						"lease_uuid", leaseUUID,
-						"error", err,
+						"tenant", lease.Tenant,
 					)
 				}
 			} else {
-				provisioned++
+				// No MetaHash - start provisioning immediately
+				if err := r.startProvisioning(ctx, lease); err != nil {
+					if errors.Is(err, errLeaseAlreadyInFlight) {
+						slog.Debug("reconcile: lease already in-flight, skipping",
+							"lease_uuid", leaseUUID,
+						)
+					} else {
+						slog.Error("reconcile: failed to start provisioning",
+							"lease_uuid", leaseUUID,
+							"error", err,
+						)
+					}
+				} else {
+					provisioned++
+				}
 			}
 
 		case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusReady:
@@ -311,6 +349,23 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 		}
 	}
 
+	// Record action metrics
+	if provisioned > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionProvisioned).Add(float64(provisioned))
+	}
+	if acknowledged > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAcknowledged).Add(float64(acknowledged))
+	}
+	if anomalies > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAnomaly).Add(float64(anomalies))
+	}
+	if orphans > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionDeprovisioned).Add(float64(orphans))
+	}
+
+	// Record outcome
+	metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
+
 	slog.Info("reconciliation complete",
 		"provisioned", provisioned,
 		"acknowledged", acknowledged,
@@ -321,10 +376,21 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 	return nil
 }
 
-// startProvisioning initiates provisioning for a lease.
+// startProvisioning initiates provisioning for a lease without a payload.
 // Returns errLeaseAlreadyInFlight if the lease is already being provisioned by
 // the event-driven path (this is not a real error, just a signal to skip).
 func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.Lease) error {
+	return r.doStartProvisioning(ctx, lease, false)
+}
+
+// startProvisioningWithPayload initiates provisioning for a lease that requires a payload.
+// Returns errLeaseAlreadyInFlight if the lease is already being provisioned.
+func (r *Reconciler) startProvisioningWithPayload(ctx context.Context, lease billingtypes.Lease) error {
+	return r.doStartProvisioning(ctx, lease, true)
+}
+
+// doStartProvisioning is the common implementation for provisioning with or without payload.
+func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes.Lease, withPayload bool) error {
 	// Extract SKU for routing
 	sku := ExtractPrimarySKU(&lease)
 
@@ -339,31 +405,79 @@ func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.L
 	// both may try to provision the same lease concurrently.
 	if r.manager != nil {
 		if !r.manager.TryTrackInFlight(lease.Uuid, lease.Tenant, sku, backendClient.Name()) {
+			metrics.ReconciliationConflictsTotal.Inc()
 			return errLeaseAlreadyInFlight
 		}
 	}
 
-	err := backendClient.Provision(ctx, backend.ProvisionRequest{
+	// Build provision request
+	req := backend.ProvisionRequest{
 		LeaseUUID:    lease.Uuid,
 		Tenant:       lease.Tenant,
 		ProviderUUID: r.providerUUID,
 		SKU:          sku,
 		CallbackURL:  BuildCallbackURL(r.callbackBaseURL),
-	})
+	}
+
+	// Get the payload from the store WITHOUT removing it yet.
+	// We only delete after Provision() succeeds to allow retries.
+	// Only include PayloadHash when we have the actual payload - this ensures
+	// backends never receive a hash without the corresponding data.
+	if withPayload && r.manager != nil {
+		req.Payload = r.manager.PayloadStore().Get(lease.Uuid)
+		if req.Payload != nil && len(lease.MetaHash) > 0 {
+			// Re-verify payload hash before provisioning to catch any corruption.
+			// The payload was validated on upload, but disk corruption could occur.
+			actualHash := sha256.Sum256(req.Payload)
+			if subtle.ConstantTimeCompare(actualHash[:], lease.MetaHash) != 1 {
+				// Payload is corrupted - delete it and fail
+				r.manager.PayloadStore().Delete(lease.Uuid)
+				if r.manager != nil {
+					r.manager.UntrackInFlight(lease.Uuid)
+				}
+				slog.Error("reconcile: payload hash mismatch - possible corruption",
+					"lease_uuid", lease.Uuid,
+					"expected_hash", hex.EncodeToString(lease.MetaHash),
+					"actual_hash", hex.EncodeToString(actualHash[:]),
+				)
+				return fmt.Errorf("payload hash mismatch: expected %s, got %s",
+					hex.EncodeToString(lease.MetaHash), hex.EncodeToString(actualHash[:]))
+			}
+			req.PayloadHash = hex.EncodeToString(lease.MetaHash)
+		}
+	}
+
+	err := backendClient.Provision(ctx, req)
 	if err != nil {
-		// Clean up in-flight on error
+		// Clean up in-flight on error.
+		// Keep payload in store so next reconciliation can retry with it.
 		if r.manager != nil {
 			r.manager.UntrackInFlight(lease.Uuid)
 		}
 		return err
 	}
 
-	slog.Info("reconcile: started provisioning",
-		"lease_uuid", lease.Uuid,
-		"tenant", lease.Tenant,
-		"sku", sku,
-		"backend", backendClient.Name(),
-	)
+	// Provision succeeded - now safe to delete the payload from store
+	if withPayload && r.manager != nil && req.Payload != nil {
+		r.manager.PayloadStore().Delete(lease.Uuid)
+	}
+
+	if withPayload {
+		slog.Info("reconcile: started provisioning with payload",
+			"lease_uuid", lease.Uuid,
+			"tenant", lease.Tenant,
+			"sku", sku,
+			"backend", backendClient.Name(),
+			"payload_size", len(req.Payload),
+		)
+	} else {
+		slog.Info("reconcile: started provisioning",
+			"lease_uuid", lease.Uuid,
+			"tenant", lease.Tenant,
+			"sku", sku,
+			"backend", backendClient.Name(),
+		)
+	}
 
 	return nil
 }

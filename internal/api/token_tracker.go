@@ -8,7 +8,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	bolt "go.etcd.io/bbolt"
+)
+
+// Retry configuration for bbolt operations under contention.
+const (
+	bboltMaxRetries     = 3
+	bboltInitialBackoff = 10 * time.Millisecond
+	bboltMaxBackoff     = 100 * time.Millisecond
 )
 
 var (
@@ -27,8 +35,9 @@ type TokenTracker struct {
 	cleanupInterval time.Duration
 
 	// For graceful shutdown
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	cancel    context.CancelFunc
+	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
+	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
 }
 
 // TokenTrackerConfig configures the token tracker.
@@ -77,6 +86,8 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 		maxAge:          maxAge,
 		cleanupInterval: cleanupInterval,
 		cancel:          cancel,
+		wg:              &sync.WaitGroup{},
+		closeOnce:       &sync.Once{},
 	}
 
 	// Start background cleanup
@@ -100,32 +111,75 @@ func (t *TokenTracker) TryUse(key string) error {
 	now := time.Now()
 	expiresAt := now.Add(t.maxAge)
 
-	err := t.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketName)
+	// Configure exponential backoff for database contention
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = bboltInitialBackoff
+	bo.MaxInterval = bboltMaxBackoff
+	bo.MaxElapsedTime = 0 // We control max retries via WithMaxRetries
 
-		// Check if token already exists
-		existing := b.Get(keyBytes)
-		if existing != nil {
-			// Token exists - check if it's still valid (not expired)
-			storedExpiry := bytesToTime(existing)
-			if now.Before(storedExpiry) {
-				return ErrTokenAlreadyUsed
+	// Wrap with max retries
+	boWithRetries := backoff.WithMaxRetries(bo, bboltMaxRetries-1) // -1 because first attempt doesn't count
+
+	operation := func() error {
+		err := t.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(bucketName)
+
+			// Check if token already exists
+			existing := b.Get(keyBytes)
+			if existing != nil {
+				// Token exists - check if it's still valid (not expired)
+				storedExpiry := bytesToTime(existing)
+				if now.Before(storedExpiry) {
+					return ErrTokenAlreadyUsed
+				}
+				// Token expired, allow reuse (will be overwritten)
 			}
-			// Token expired, allow reuse (will be overwritten)
+
+			// Store token with expiry time
+			return b.Put(keyBytes, timeToBytes(expiresAt))
+		})
+
+		// Don't retry for application-level errors (token already used)
+		if err == nil || errors.Is(err, ErrTokenAlreadyUsed) {
+			return backoff.Permanent(err)
 		}
 
-		// Store token with expiry time
-		return b.Put(keyBytes, timeToBytes(expiresAt))
-	})
+		// Only retry on timeout errors (database locked)
+		if errors.Is(err, bolt.ErrTimeout) || errors.Is(err, bolt.ErrDatabaseNotOpen) {
+			slog.Debug("bbolt timeout, will retry", "error", err)
+			return err
+		}
+
+		// Other errors are not retryable
+		return backoff.Permanent(err)
+	}
+
+	err := backoff.Retry(operation, boWithRetries)
+
+	// Unwrap permanent errors to return the original error
+	var permanentErr *backoff.PermanentError
+	if errors.As(err, &permanentErr) {
+		return permanentErr.Unwrap()
+	}
 
 	return err
 }
 
 // Close shuts down the token tracker gracefully.
+// Close is idempotent and safe to call multiple times.
 func (t *TokenTracker) Close() error {
-	t.cancel()
-	t.wg.Wait()
-	return t.db.Close()
+	var closeErr error
+	t.closeOnce.Do(func() {
+		// Signal cleanup goroutine to stop
+		t.cancel()
+
+		// Wait for cleanup goroutine to finish
+		t.wg.Wait()
+
+		// Close the database
+		closeErr = t.db.Close()
+	})
+	return closeErr
 }
 
 // cleanupLoop periodically removes expired tokens.

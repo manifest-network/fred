@@ -6,10 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
-	sdktypes "github.com/cosmos/cosmos-sdk/types"
-
-	"github.com/manifest-network/fred/internal/adr036"
 	"github.com/manifest-network/fred/internal/auth"
 )
 
@@ -46,66 +42,23 @@ func ParseAuthToken(encoded string) (*AuthToken, error) {
 // Validate verifies the token's timestamp and ADR-036 signature.
 // The bech32Prefix is used to verify the tenant address matches the public key.
 func (t *AuthToken) Validate(bech32Prefix string) error {
-	// Check timestamp
-	tokenTime := time.Unix(t.Timestamp, 0)
-	if time.Since(tokenTime) > MaxTokenAge {
-		return fmt.Errorf("token expired: issued at %v", tokenTime)
-	}
-	if time.Until(tokenTime) > MaxTokenAge {
-		return fmt.Errorf("token timestamp is in the future: %v", tokenTime)
+	// Validate required fields
+	if t.LeaseUUID == "" {
+		return fmt.Errorf("lease_uuid is required")
 	}
 
-	// Decode public key
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(t.PubKey)
-	if err != nil {
-		return fmt.Errorf("failed to decode public key: %w", err)
+	// Use common validation logic
+	v := &tokenValidator{
+		tenant:    t.Tenant,
+		timestamp: t.Timestamp,
+		pubKey:    t.PubKey,
+		signature: t.Signature,
 	}
 
-	// Decode signature
-	sigBytes, err := base64.StdEncoding.DecodeString(t.Signature)
-	if err != nil {
-		return fmt.Errorf("failed to decode signature: %w", err)
-	}
-
-	// Create the sign data (message to be signed)
-	signData := t.createSignData()
-
-	// Verify ADR-036 signature
-	if err := adr036.VerifySignature(pubKeyBytes, signData, sigBytes, t.Tenant); err != nil {
-		return fmt.Errorf("signature verification failed: %w", err)
-	}
-
-	// Verify the public key corresponds to the tenant address
-	if err := t.verifyAddress(pubKeyBytes, bech32Prefix); err != nil {
-		return fmt.Errorf("address verification failed: %w", err)
-	}
-
-	return nil
+	return v.validateCommon(t.createSignData(), bech32Prefix)
 }
 
 // createSignData creates the message data to be signed.
 func (t *AuthToken) createSignData() []byte {
 	return auth.FormatSignData(t.Tenant, t.LeaseUUID, t.Timestamp)
-}
-
-// verifyAddress verifies that the public key corresponds to the tenant address.
-func (t *AuthToken) verifyAddress(pubKeyBytes []byte, bech32Prefix string) error {
-	if len(pubKeyBytes) != 33 {
-		return fmt.Errorf("invalid public key length")
-	}
-
-	pubKey := &secp256k1.PubKey{Key: pubKeyBytes}
-	addr := pubKey.Address()
-
-	// Convert to bech32 address with configured prefix
-	expectedAddr, err := sdktypes.Bech32ifyAddressBytes(bech32Prefix, addr.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to convert address to bech32: %w", err)
-	}
-
-	if expectedAddr != t.Tenant {
-		return fmt.Errorf("public key does not match tenant address: expected %s, got %s", t.Tenant, expectedAddr)
-	}
-
-	return nil
 }

@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"context"
+	"errors"
 	"testing"
 )
 
@@ -228,5 +230,169 @@ func TestRouter_NilBackend(t *testing.T) {
 				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// unhealthyMockBackend is a mock backend that returns an error on Health check.
+type unhealthyMockBackend struct {
+	*MockBackend
+	healthErr error
+}
+
+func (u *unhealthyMockBackend) Health(ctx context.Context) error {
+	return u.healthErr
+}
+
+func TestRouter_HealthCheck_AllHealthy(t *testing.T) {
+	backend1 := NewMockBackend(MockBackendConfig{Name: "backend-1"})
+	backend2 := NewMockBackend(MockBackendConfig{Name: "backend-2"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backend1, IsDefault: true},
+			{Backend: backend2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+
+	results, allHealthy := router.HealthCheck(context.Background())
+
+	if !allHealthy {
+		t.Error("HealthCheck() allHealthy = false, want true")
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("HealthCheck() returned %d results, want 2", len(results))
+	}
+
+	for _, result := range results {
+		if !result.Healthy {
+			t.Errorf("Backend %q should be healthy", result.Name)
+		}
+		if result.Error != "" {
+			t.Errorf("Backend %q should have no error, got %q", result.Name, result.Error)
+		}
+	}
+}
+
+func TestRouter_HealthCheck_OneUnhealthy(t *testing.T) {
+	healthyBackend := NewMockBackend(MockBackendConfig{Name: "healthy"})
+	unhealthyBackend := &unhealthyMockBackend{
+		MockBackend: NewMockBackend(MockBackendConfig{Name: "unhealthy"}),
+		healthErr:   errors.New("connection refused"),
+	}
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: healthyBackend, IsDefault: true},
+			{Backend: unhealthyBackend},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+
+	results, allHealthy := router.HealthCheck(context.Background())
+
+	if allHealthy {
+		t.Error("HealthCheck() allHealthy = true, want false (one backend unhealthy)")
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("HealthCheck() returned %d results, want 2", len(results))
+	}
+
+	// Find the unhealthy result
+	var foundUnhealthy bool
+	for _, result := range results {
+		if result.Name == "unhealthy" {
+			foundUnhealthy = true
+			if result.Healthy {
+				t.Error("Unhealthy backend should have Healthy = false")
+			}
+			if result.Error != "connection refused" {
+				t.Errorf("Unhealthy backend Error = %q, want %q", result.Error, "connection refused")
+			}
+		} else if result.Name == "healthy" {
+			if !result.Healthy {
+				t.Error("Healthy backend should have Healthy = true")
+			}
+		}
+	}
+
+	if !foundUnhealthy {
+		t.Error("Did not find unhealthy backend in results")
+	}
+}
+
+func TestRouter_HealthCheck_AllUnhealthy(t *testing.T) {
+	backend1 := &unhealthyMockBackend{
+		MockBackend: NewMockBackend(MockBackendConfig{Name: "backend-1"}),
+		healthErr:   errors.New("timeout"),
+	}
+	backend2 := &unhealthyMockBackend{
+		MockBackend: NewMockBackend(MockBackendConfig{Name: "backend-2"}),
+		healthErr:   errors.New("service unavailable"),
+	}
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backend1, IsDefault: true},
+			{Backend: backend2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+
+	results, allHealthy := router.HealthCheck(context.Background())
+
+	if allHealthy {
+		t.Error("HealthCheck() allHealthy = true, want false (all backends unhealthy)")
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("HealthCheck() returned %d results, want 2", len(results))
+	}
+
+	for _, result := range results {
+		if result.Healthy {
+			t.Errorf("Backend %q should be unhealthy", result.Name)
+		}
+		if result.Error == "" {
+			t.Errorf("Backend %q should have an error message", result.Name)
+		}
+	}
+}
+
+func TestRouter_HealthCheck_ContextCancellation(t *testing.T) {
+	backend := NewMockBackend(MockBackendConfig{Name: "test"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backend, IsDefault: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+
+	// Use already-cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// MockBackend.Health ignores context, so this should still work
+	// But we're testing the API accepts a context
+	results, allHealthy := router.HealthCheck(ctx)
+
+	// MockBackend always returns healthy since it doesn't check context
+	if !allHealthy {
+		t.Error("HealthCheck() allHealthy = false, want true (mock ignores context)")
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("HealthCheck() returned %d results, want 1", len(results))
 	}
 }

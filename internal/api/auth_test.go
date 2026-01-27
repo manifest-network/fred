@@ -115,6 +115,38 @@ func TestValidate_InvalidPubKeyLength(t *testing.T) {
 	}
 }
 
+func TestValidate_MissingLeaseUUID(t *testing.T) {
+	// Create a token with empty lease_uuid
+	tokenData := AuthToken{
+		Tenant:    "manifest1test",
+		LeaseUUID: "", // Empty
+		Timestamp: time.Now().Unix(),
+		PubKey:    "dummy",
+		Signature: "dummy",
+	}
+
+	err := tokenData.Validate("manifest")
+	if err == nil {
+		t.Error("Validate() = nil, want error for missing lease_uuid")
+	}
+}
+
+func TestValidate_MissingTenant(t *testing.T) {
+	// Create a token with empty tenant
+	tokenData := AuthToken{
+		Tenant:    "", // Empty
+		LeaseUUID: testutil.ValidUUID1,
+		Timestamp: time.Now().Unix(),
+		PubKey:    "dummy",
+		Signature: "dummy",
+	}
+
+	err := tokenData.Validate("manifest")
+	if err == nil {
+		t.Error("Validate() = nil, want error for missing tenant")
+	}
+}
+
 func TestValidate_ValidToken(t *testing.T) {
 	kp := testutil.NewTestKeyPair("auth-test-4")
 	leaseUUID := testutil.ValidUUID1
@@ -154,11 +186,11 @@ func TestValidate_WrongBech32Prefix(t *testing.T) {
 func TestVerifyAddress_Valid(t *testing.T) {
 	kp := testutil.NewTestKeyPair("address-test-1")
 
-	token := &AuthToken{
-		Tenant: kp.Address,
+	v := &tokenValidator{
+		tenant: kp.Address,
 	}
 
-	err := token.verifyAddress(kp.PubKey.Bytes(), "manifest")
+	err := v.verifyAddress(kp.PubKey.Bytes(), "manifest")
 	if err != nil {
 		t.Errorf("verifyAddress() error = %v, want nil", err)
 	}
@@ -168,23 +200,23 @@ func TestVerifyAddress_Mismatch(t *testing.T) {
 	kp1 := testutil.NewTestKeyPair("address-test-2")
 	kp2 := testutil.NewTestKeyPair("address-test-3")
 
-	// Token with kp1's address but kp2's public key
-	token := &AuthToken{
-		Tenant: kp1.Address,
+	// Validator with kp1's address but kp2's public key
+	v := &tokenValidator{
+		tenant: kp1.Address,
 	}
 
-	err := token.verifyAddress(kp2.PubKey.Bytes(), "manifest")
+	err := v.verifyAddress(kp2.PubKey.Bytes(), "manifest")
 	if err == nil {
 		t.Error("verifyAddress() = nil, want error for mismatched address")
 	}
 }
 
 func TestVerifyAddress_InvalidPubKeyLength(t *testing.T) {
-	token := &AuthToken{
-		Tenant: "manifest1test",
+	v := &tokenValidator{
+		tenant: "manifest1test",
 	}
 
-	err := token.verifyAddress([]byte("short"), "manifest")
+	err := v.verifyAddress([]byte("short"), "manifest")
 	if err == nil {
 		t.Error("verifyAddress() = nil, want error for invalid pub key length")
 	}

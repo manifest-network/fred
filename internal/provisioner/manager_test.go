@@ -2,6 +2,8 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -16,6 +18,12 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 )
+
+// hashPayload computes the SHA-256 hash of a payload and returns it as a hex string.
+func hashPayload(payload []byte) string {
+	h := sha256.Sum256(payload)
+	return hex.EncodeToString(h[:])
+}
 
 // mockManagerBackend implements backend.Backend for manager tests.
 type mockManagerBackend struct {
@@ -51,6 +59,10 @@ func (m *mockManagerBackend) Deprovision(ctx context.Context, leaseUUID string) 
 
 func (m *mockManagerBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	return nil, nil
+}
+
+func (m *mockManagerBackend) Health(ctx context.Context) error {
+	return nil
 }
 
 func TestNewManager_Validation(t *testing.T) {
@@ -352,7 +364,19 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       "tenant-1",
+				ProviderUuid: "provider-1",
+				State:        billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{
+					{SkuUuid: "sku-1"},
+				},
+			}, nil
+		},
+	}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -408,7 +432,17 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       "tenant-1",
+				ProviderUuid: "provider-1",
+				State:        billingtypes.LEASE_STATE_PENDING,
+				Items:        []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+			}, nil
+		},
+	}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -1307,5 +1341,867 @@ func TestExtractPrimarySKU(t *testing.T) {
 				t.Errorf("ExtractPrimarySKU() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestManager_GetInFlightLeases(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Initially empty
+	leases := manager.GetInFlightLeases()
+	if len(leases) != 0 {
+		t.Errorf("GetInFlightLeases() returned %d leases, want 0", len(leases))
+	}
+
+	// Track some leases
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+	manager.TrackInFlight("lease-3", "tenant-3", "sku-3", "backend-3")
+
+	// Should return all 3
+	leases = manager.GetInFlightLeases()
+	if len(leases) != 3 {
+		t.Errorf("GetInFlightLeases() returned %d leases, want 3", len(leases))
+	}
+
+	// Verify all expected leases are present
+	leaseMap := make(map[string]bool)
+	for _, uuid := range leases {
+		leaseMap[uuid] = true
+	}
+
+	for _, expected := range []string{"lease-1", "lease-2", "lease-3"} {
+		if !leaseMap[expected] {
+			t.Errorf("GetInFlightLeases() missing %q", expected)
+		}
+	}
+
+	// Untrack one
+	manager.UntrackInFlight("lease-2")
+
+	leases = manager.GetInFlightLeases()
+	if len(leases) != 2 {
+		t.Errorf("GetInFlightLeases() after untrack returned %d leases, want 2", len(leases))
+	}
+}
+
+func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// No in-flight leases, should return immediately with 0
+	remaining := manager.WaitForDrain(context.Background(), 100*time.Millisecond)
+	if remaining != 0 {
+		t.Errorf("WaitForDrain() remaining = %d, want 0", remaining)
+	}
+}
+
+func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track some leases
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+
+	// Start a goroutine to drain the leases after a delay
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		manager.UntrackInFlight("lease-1")
+		manager.UntrackInFlight("lease-2")
+	}()
+
+	// Wait for drain with sufficient timeout
+	remaining := manager.WaitForDrain(context.Background(), 1*time.Second)
+	if remaining != 0 {
+		t.Errorf("WaitForDrain() remaining = %d, want 0", remaining)
+	}
+}
+
+func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track leases that won't be drained
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+
+	// Wait with short timeout - should return remaining count
+	remaining := manager.WaitForDrain(context.Background(), 100*time.Millisecond)
+	if remaining != 2 {
+		t.Errorf("WaitForDrain() remaining = %d, want 2", remaining)
+	}
+
+	// Clean up
+	manager.UntrackInFlight("lease-1")
+	manager.UntrackInFlight("lease-2")
+}
+
+func TestManager_WaitForDrain_ContextCancelled(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Track leases that won't be drained
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+
+	// Create context that will be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after short delay
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	// Wait with long timeout but context will be cancelled first
+	remaining := manager.WaitForDrain(ctx, 5*time.Second)
+	if remaining != 1 {
+		t.Errorf("WaitForDrain() remaining = %d, want 1", remaining)
+	}
+
+	// Clean up
+	manager.UntrackInFlight("lease-1")
+}
+
+func TestManager_InFlightCount(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Initially 0
+	if manager.InFlightCount() != 0 {
+		t.Errorf("InFlightCount() = %d, want 0", manager.InFlightCount())
+	}
+
+	// Track some
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "backend-1")
+	if manager.InFlightCount() != 1 {
+		t.Errorf("InFlightCount() = %d, want 1", manager.InFlightCount())
+	}
+
+	manager.TrackInFlight("lease-2", "tenant-2", "sku-2", "backend-2")
+	if manager.InFlightCount() != 2 {
+		t.Errorf("InFlightCount() = %d, want 2", manager.InFlightCount())
+	}
+
+	// Untrack one
+	manager.UntrackInFlight("lease-1")
+	if manager.InFlightCount() != 1 {
+		t.Errorf("InFlightCount() after untrack = %d, want 1", manager.InFlightCount())
+	}
+
+	// Untrack the other
+	manager.UntrackInFlight("lease-2")
+	if manager.InFlightCount() != 0 {
+		t.Errorf("InFlightCount() after all untracked = %d, want 0", manager.InFlightCount())
+	}
+}
+
+// mockPayloadStore implements a simple in-memory payload store for testing.
+type mockPayloadStore struct {
+	mu       sync.Mutex
+	payloads map[string][]byte
+}
+
+func newMockPayloadStore() *mockPayloadStore {
+	return &mockPayloadStore{
+		payloads: make(map[string][]byte),
+	}
+}
+
+func (m *mockPayloadStore) Store(leaseUUID string, payload []byte) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.payloads[leaseUUID]; exists {
+		return false // Already exists
+	}
+	m.payloads[leaseUUID] = payload
+	return true
+}
+
+func (m *mockPayloadStore) Get(leaseUUID string) []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.payloads[leaseUUID]
+}
+
+func (m *mockPayloadStore) Has(leaseUUID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, exists := m.payloads[leaseUUID]
+	return exists
+}
+
+func (m *mockPayloadStore) Delete(leaseUUID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.payloads, leaseUUID)
+}
+
+func TestManager_HandlePayloadReceived(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       "tenant-1",
+				ProviderUuid: "provider-1",
+				State:        billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{
+					{SkuUuid: "sku-1"},
+				},
+				MetaHash: []byte("somehash"),
+			}, nil
+		},
+	}
+
+	// Create a real PayloadStore using temp directory
+	tempDir := t.TempDir()
+	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Store a payload first
+	testPayload := []byte("deployment manifest data")
+	testPayloadHash := hashPayload(testPayload)
+	payloadStore.Store("lease-1", testPayload)
+
+	// Create a payload event message
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: testPayloadHash,
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Handle the message
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v", err)
+	}
+
+	// Verify provisioning was called with payload
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 1 {
+		t.Fatalf("expected 1 provision call, got %d", len(mockBackend.provisionCalls))
+	}
+	if mockBackend.provisionCalls[0].LeaseUUID != "lease-1" {
+		t.Errorf("provision LeaseUUID = %q, want %q", mockBackend.provisionCalls[0].LeaseUUID, "lease-1")
+	}
+	if string(mockBackend.provisionCalls[0].Payload) != string(testPayload) {
+		t.Errorf("provision Payload = %q, want %q", mockBackend.provisionCalls[0].Payload, testPayload)
+	}
+	if mockBackend.provisionCalls[0].PayloadHash != testPayloadHash {
+		t.Errorf("provision PayloadHash = %q, want %q", mockBackend.provisionCalls[0].PayloadHash, testPayloadHash)
+	}
+
+	// Verify in-flight tracking
+	if !manager.IsInFlight("lease-1") {
+		t.Error("lease should be in-flight after handlePayloadReceived")
+	}
+
+	// Verify payload was deleted from store after successful provisioning
+	if payloadStore.Has("lease-1") {
+		t.Error("payload should be deleted from store after successful provisioning")
+	}
+}
+
+func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	// Create manager WITHOUT payload store
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    nil, // No payload store
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: "abc123",
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should return nil (no retry) when payload store is not configured
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v, want nil for missing payload store", err)
+	}
+
+	// Verify no provisioning was attempted
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 0 {
+		t.Errorf("expected 0 provision calls when payload store is nil, got %d", len(mockBackend.provisionCalls))
+	}
+}
+
+func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Send invalid JSON
+	msg := message.NewMessage(watermill.NewUUID(), []byte("invalid json"))
+
+	// Handle should return nil (don't retry malformed messages)
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v, want nil for malformed message", err)
+	}
+
+	// Verify no provisioning was attempted
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 0 {
+		t.Errorf("expected 0 provision calls for malformed message, got %d", len(mockBackend.provisionCalls))
+	}
+}
+
+func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return nil, nil // Lease not found
+		},
+	}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Store a payload
+	payloadStore.Store("lease-1", []byte("payload data"))
+
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: "abc123",
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should return nil (lease not found, clean up payload)
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v, want nil for lease not found", err)
+	}
+
+	// Verify payload was cleaned up
+	if payloadStore.Has("lease-1") {
+		t.Error("payload should be deleted when lease not found")
+	}
+
+	// Verify no provisioning was attempted
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 0 {
+		t.Errorf("expected 0 provision calls for lease not found, got %d", len(mockBackend.provisionCalls))
+	}
+}
+
+func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:   leaseUUID,
+				Tenant: "tenant-1",
+				State:  billingtypes.LEASE_STATE_ACTIVE, // Not PENDING
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+			}, nil
+		},
+	}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Store a payload
+	payloadStore.Store("lease-1", []byte("payload data"))
+
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: "abc123",
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should return nil (lease not pending, skip provisioning)
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v, want nil for non-pending lease", err)
+	}
+
+	// Verify payload was cleaned up
+	if payloadStore.Has("lease-1") {
+		t.Error("payload should be deleted when lease is not pending")
+	}
+
+	// Verify no provisioning was attempted
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 0 {
+		t.Errorf("expected 0 provision calls for non-pending lease, got %d", len(mockBackend.provisionCalls))
+	}
+}
+
+func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	chainErr := errors.New("chain unavailable")
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return nil, chainErr
+		},
+	}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: "abc123",
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should return error for retry
+	err = manager.handlePayloadReceived(msg)
+	if err == nil {
+		t.Error("handlePayloadReceived() error = nil, want error for chain error")
+	}
+}
+
+func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
+	provisionErr := errors.New("backend unavailable")
+	mockBackend := &mockManagerBackend{name: "test", provisionErr: provisionErr}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:   leaseUUID,
+				Tenant: "tenant-1",
+				State:  billingtypes.LEASE_STATE_PENDING,
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+			}, nil
+		},
+	}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Store payload
+	testPayload := []byte("payload data")
+	testPayloadHash := hashPayload(testPayload)
+	payloadStore.Store("lease-1", testPayload)
+
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: testPayloadHash,
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should return error for retry
+	err = manager.handlePayloadReceived(msg)
+	if err == nil {
+		t.Error("handlePayloadReceived() error = nil, want error")
+	}
+	if !errors.Is(err, ErrProvisioningFailed) {
+		t.Errorf("handlePayloadReceived() error = %v, want ErrProvisioningFailed", err)
+	}
+
+	// Verify lease was untracked after error
+	if manager.IsInFlight("lease-1") {
+		t.Error("lease should not be in-flight after provision error")
+	}
+
+	// Verify payload was NOT deleted (kept for retry)
+	if !payloadStore.Has("lease-1") {
+		t.Error("payload should be kept for retry after provision error")
+	}
+}
+
+func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:   leaseUUID,
+				Tenant: "tenant-1",
+				State:  billingtypes.LEASE_STATE_PENDING,
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+			}, nil
+		},
+	}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Pre-track the lease (simulating concurrent processing)
+	manager.TrackInFlight("lease-1", "tenant-1", "sku-1", "test")
+
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: "abc123",
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should return nil (skip already in-flight lease)
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v, want nil for already in-flight", err)
+	}
+
+	// Verify no provisioning was attempted (already being processed)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 0 {
+		t.Errorf("expected 0 provision calls for already in-flight lease, got %d", len(mockBackend.provisionCalls))
+	}
+}
+
+func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:   leaseUUID,
+				Tenant: "tenant-1",
+				State:  billingtypes.LEASE_STATE_PENDING,
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+			}, nil
+		},
+	}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// DON'T store a payload - simulate race where payload was cleaned up
+
+	event := PayloadEvent{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: "abc123",
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	// Should succeed (proceeds without payload with warning)
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v, want nil when payload missing from store", err)
+	}
+
+	// Verify provisioning was called (with nil payload and no hash)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	if len(mockBackend.provisionCalls) != 1 {
+		t.Fatalf("expected 1 provision call, got %d", len(mockBackend.provisionCalls))
+	}
+	if mockBackend.provisionCalls[0].Payload != nil {
+		t.Errorf("provision Payload = %v, want nil", mockBackend.provisionCalls[0].Payload)
+	}
+	// PayloadHash should be empty when payload is missing - backends should never
+	// receive a hash without the corresponding payload data
+	if mockBackend.provisionCalls[0].PayloadHash != "" {
+		t.Errorf("provision PayloadHash = %q, want empty when payload is missing", mockBackend.provisionCalls[0].PayloadHash)
+	}
+}
+
+func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
+	gpuBackend := &mockManagerBackend{name: "gpu-backend"}
+	k8sBackend := &mockManagerBackend{name: "k8s-backend"}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:   leaseUUID,
+				Tenant: "tenant-1",
+				State:  billingtypes.LEASE_STATE_PENDING,
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "gpu-a100", Quantity: 1}},
+			}, nil
+		},
+	}
+
+	tempDir := t.TempDir()
+	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tempDir + "/payloads.db",
+		TTL:    time.Hour,
+	})
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Store payload
+	testPayload := []byte("gpu deployment")
+	testPayloadHash := hashPayload(testPayload)
+	payloadStore.Store("gpu-lease-1", testPayload)
+
+	event := PayloadEvent{
+		LeaseUUID:   "gpu-lease-1",
+		Tenant:      "tenant-1",
+		MetaHashHex: testPayloadHash,
+	}
+	payload, _ := json.Marshal(event)
+	msg := message.NewMessage(watermill.NewUUID(), payload)
+
+	err = manager.handlePayloadReceived(msg)
+	if err != nil {
+		t.Errorf("handlePayloadReceived() error = %v", err)
+	}
+
+	// Verify GPU backend received the call
+	gpuBackend.mu.Lock()
+	gpuCalls := gpuBackend.provisionCalls
+	gpuBackend.mu.Unlock()
+
+	if len(gpuCalls) != 1 {
+		t.Fatalf("expected 1 provision call to GPU backend, got %d", len(gpuCalls))
+	}
+	if gpuCalls[0].SKU != "gpu-a100" {
+		t.Errorf("provision SKU = %q, want %q", gpuCalls[0].SKU, "gpu-a100")
+	}
+
+	// Verify K8s backend did NOT receive any calls
+	k8sBackend.mu.Lock()
+	k8sCalls := k8sBackend.provisionCalls
+	k8sBackend.mu.Unlock()
+
+	if len(k8sCalls) != 0 {
+		t.Errorf("expected 0 provision calls to K8s backend, got %d", len(k8sCalls))
+	}
+
+	// Verify in-flight tracking has correct backend
+	provision, exists := manager.GetInFlight("gpu-lease-1")
+	if !exists {
+		t.Fatal("lease should be in-flight")
+	}
+	if provision.Backend != "gpu-backend" {
+		t.Errorf("in-flight Backend = %q, want %q", provision.Backend, "gpu-backend")
 	}
 }

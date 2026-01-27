@@ -217,8 +217,16 @@ func TestConnectionResponse_JSON(t *testing.T) {
 
 // mockChainClient implements ChainClient for testing.
 type mockChainClient struct {
+	getLeaseFunc       func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	getActiveLeaseFunc func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	pingFunc           func(ctx context.Context) error
+}
+
+func (m *mockChainClient) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+	if m.getLeaseFunc != nil {
+		return m.getLeaseFunc(ctx, leaseUUID)
+	}
+	return nil, nil
 }
 
 func (m *mockChainClient) GetActiveLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
@@ -1015,4 +1023,470 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
 		}
 	})
+}
+
+// mockStatusChecker implements ProvisioningStatusChecker for testing.
+type mockStatusChecker struct {
+	hasPayload  map[string]bool
+	isInFlight  map[string]bool
+}
+
+func (m *mockStatusChecker) HasPayload(leaseUUID string) bool {
+	if m.hasPayload == nil {
+		return false
+	}
+	return m.hasPayload[leaseUUID]
+}
+
+func (m *mockStatusChecker) IsInFlight(leaseUUID string) bool {
+	if m.isInFlight == nil {
+		return false
+	}
+	return m.isInFlight[leaseUUID]
+}
+
+// TestGetLeaseStatus tests the GetLeaseStatus endpoint.
+func TestGetLeaseStatus(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	t.Run("pending_without_meta_hash", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_PENDING,
+						MetaHash:     nil, // No payload required
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			statusChecker: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var response LeaseStatusResponse
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if response.LeaseUUID != leaseUUID {
+			t.Errorf("LeaseUUID = %q, want %q", response.LeaseUUID, leaseUUID)
+		}
+		if response.State != "LEASE_STATE_PENDING" {
+			t.Errorf("State = %q, want %q", response.State, "LEASE_STATE_PENDING")
+		}
+		if response.RequiresPayload {
+			t.Errorf("RequiresPayload = %v, want false", response.RequiresPayload)
+		}
+	})
+
+	t.Run("pending_with_meta_hash_no_payload", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_PENDING,
+						MetaHash:     []byte{1, 2, 3, 4}, // Has meta hash - requires payload
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		statusChecker := &mockStatusChecker{
+			hasPayload: map[string]bool{leaseUUID: false},
+			isInFlight: map[string]bool{leaseUUID: false},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			statusChecker: statusChecker,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var response LeaseStatusResponse
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if !response.RequiresPayload {
+			t.Errorf("RequiresPayload = %v, want true", response.RequiresPayload)
+		}
+		if response.PayloadReceived {
+			t.Errorf("PayloadReceived = %v, want false", response.PayloadReceived)
+		}
+		if response.ProvisioningStarted {
+			t.Errorf("ProvisioningStarted = %v, want false", response.ProvisioningStarted)
+		}
+	})
+
+	t.Run("pending_with_payload_received", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_PENDING,
+						MetaHash:     []byte{1, 2, 3, 4},
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		statusChecker := &mockStatusChecker{
+			hasPayload: map[string]bool{leaseUUID: true},
+			isInFlight: map[string]bool{leaseUUID: true},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			statusChecker: statusChecker,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var response LeaseStatusResponse
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if !response.PayloadReceived {
+			t.Errorf("PayloadReceived = %v, want true", response.PayloadReceived)
+		}
+		if !response.ProvisioningStarted {
+			t.Errorf("ProvisioningStarted = %v, want true", response.ProvisioningStarted)
+		}
+	})
+
+	t.Run("active_lease", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_ACTIVE,
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			statusChecker: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		var response LeaseStatusResponse
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if response.State != "LEASE_STATE_ACTIVE" {
+			t.Errorf("State = %q, want %q", response.State, "LEASE_STATE_ACTIVE")
+		}
+	})
+
+	t.Run("invalid_uuid_returns_400", func(t *testing.T) {
+		h := &Handlers{
+			client:       nil,
+			providerUUID: providerUUID,
+			bech32Prefix: "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/not-a-uuid/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": "not-a-uuid"})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("missing_auth_returns_401", func(t *testing.T) {
+		h := &Handlers{
+			client:       nil,
+			providerUUID: providerUUID,
+			bech32Prefix: "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		// No Authorization header
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("lease_uuid_mismatch_returns_401", func(t *testing.T) {
+		// Token is for different lease UUID
+		differentLeaseToken := testutil.CreateTestToken(kp, testutil.ValidUUID3, time.Now())
+
+		h := &Handlers{
+			client:       nil,
+			providerUUID: providerUUID,
+			bech32Prefix: "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+differentLeaseToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("lease_not_found_returns_404", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return nil, nil // Lease not found
+			},
+		}
+
+		h := &Handlers{
+			client:       chainClient,
+			providerUUID: providerUUID,
+			bech32Prefix: "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("tenant_mismatch_returns_403", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       "manifest1different",
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			},
+		}
+
+		h := &Handlers{
+			client:       chainClient,
+			providerUUID: providerUUID,
+			bech32Prefix: "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
+
+	t.Run("provider_mismatch_returns_403", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: testutil.ValidUUID3, // Different provider
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			},
+		}
+
+		h := &Handlers{
+			client:       chainClient,
+			providerUUID: providerUUID,
+			bech32Prefix: "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
+
+	t.Run("chain_error_returns_500", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				return nil, fmt.Errorf("chain unavailable")
+			},
+		}
+
+		h := &Handlers{
+			client:       chainClient,
+			providerUUID: providerUUID,
+			bech32Prefix: "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	})
+}
+
+func TestNormalizePath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			name: "lease connection endpoint",
+			path: "/v1/leases/550e8400-e29b-41d4-a716-446655440000/connection",
+			want: "/v1/leases/{uuid}/connection",
+		},
+		{
+			name: "lease status endpoint",
+			path: "/v1/leases/550e8400-e29b-41d4-a716-446655440000/status",
+			want: "/v1/leases/{uuid}/status",
+		},
+		{
+			name: "lease data endpoint",
+			path: "/v1/leases/550e8400-e29b-41d4-a716-446655440000/data",
+			want: "/v1/leases/{uuid}/data",
+		},
+		{
+			name: "health endpoint (no UUID)",
+			path: "/health",
+			want: "/health",
+		},
+		{
+			name: "metrics endpoint (no UUID)",
+			path: "/metrics",
+			want: "/metrics",
+		},
+		{
+			name: "callbacks endpoint with UUID",
+			path: "/callbacks/provision",
+			want: "/callbacks/provision",
+		},
+		{
+			name: "multiple UUIDs in path",
+			path: "/v1/providers/550e8400-e29b-41d4-a716-446655440000/leases/123e4567-e89b-12d3-a456-426614174000",
+			want: "/v1/providers/{uuid}/leases/{uuid}",
+		},
+		{
+			name: "uppercase UUID",
+			path: "/v1/leases/550E8400-E29B-41D4-A716-446655440000/connection",
+			want: "/v1/leases/{uuid}/connection",
+		},
+		{
+			name: "root path",
+			path: "/",
+			want: "/",
+		},
+		{
+			name: "empty path",
+			path: "",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizePath(tt.path)
+			if got != tt.want {
+				t.Errorf("normalizePath(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
 }

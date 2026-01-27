@@ -58,6 +58,16 @@ rate_limit_rps: 10
 # Maximum burst size (requests allowed in a burst before rate limiting kicks in)
 rate_limit_burst: 20
 
+# Trusted proxies for X-Forwarded-For header (optional)
+# SECURITY: Only configure this if fred runs behind a reverse proxy (nginx, Traefik, etc.)
+# Without this, clients could spoof their IP by setting X-Forwarded-For headers.
+# Accepts IP addresses or CIDR blocks.
+# trusted_proxies:
+#   - "127.0.0.1"           # Localhost
+#   - "10.0.0.0/8"          # Private network
+#   - "172.16.0.0/12"       # Docker default
+#   - "192.168.0.0/16"      # Private network
+
 # Backend configuration (required)
 # At least one backend must be configured. Backends handle the actual
 # provisioning of resources when leases are created.

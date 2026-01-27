@@ -4,15 +4,19 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"slices"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
@@ -21,11 +25,34 @@ import (
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	skutypes "github.com/manifest-network/manifest-ledger/x/sku/types"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 const (
 	// maxLeasesPerBatch is the maximum number of leases to process in a single transaction.
 	maxLeasesPerBatch = 100
+
+	// txMaxRetries is the maximum number of retries for failed transactions.
+	txMaxRetries = 3
+
+	// txInitialBackoff is the initial backoff duration between retries.
+	txInitialBackoff = 500 * time.Millisecond
+
+	// txMaxBackoff is the maximum backoff duration between retries.
+	txMaxBackoff = 5 * time.Second
+
+	// txPollInitialInterval is the initial polling interval for tx confirmation.
+	txPollInitialInterval = 500 * time.Millisecond
+
+	// txPollMaxInterval is the maximum polling interval (for exponential backoff).
+	txPollMaxInterval = 5 * time.Second
+
+	// txPollBackoffFactor is the multiplier for exponential backoff.
+	txPollBackoffFactor = 1.5
+
+	// defaultTxTimeout is the default timeout for waiting for tx inclusion.
+	defaultTxTimeout = 60 * time.Second
 )
 
 // Client provides methods to query and submit transactions to the chain.
@@ -79,7 +106,7 @@ func NewClient(cfg ClientConfig, signer *Signer) (*Client, error) {
 	}
 	txTimeout := cfg.TxTimeout
 	if txTimeout == 0 {
-		txTimeout = 30 * time.Second
+		txTimeout = defaultTxTimeout
 	}
 	queryPageLimit := cfg.QueryPageLimit
 	if queryPageLimit <= 0 {
@@ -128,6 +155,21 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// recordQueryMetrics records duration for a chain query.
+func recordQueryMetrics(queryName string, start time.Time, err error) {
+	duration := time.Since(start).Seconds()
+	metrics.ChainQueryDuration.WithLabelValues(queryName).Observe(duration)
+}
+
+// recordTxMetrics records outcome for a chain transaction.
+func recordTxMetrics(txType string, err error) {
+	outcome := metrics.OutcomeSuccess
+	if err != nil {
+		outcome = metrics.OutcomeError
+	}
+	metrics.ChainTxTotal.WithLabelValues(txType, outcome).Inc()
+}
+
 // Ping checks if the chain connection is healthy by querying the signer's account.
 // Returns nil if healthy, otherwise returns the error.
 func (c *Client) Ping(ctx context.Context) error {
@@ -172,7 +214,9 @@ func (c *Client) getLeasesByProviderWithState(ctx context.Context, providerUUID 
 
 // GetPendingLeases returns all pending leases for a provider.
 func (c *Client) GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+	start := time.Now()
 	leases, err := c.getLeasesByProviderWithState(ctx, providerUUID, billingtypes.LEASE_STATE_PENDING)
+	recordQueryMetrics("get_pending_leases", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending leases: %w", err)
 	}
@@ -182,9 +226,11 @@ func (c *Client) GetPendingLeases(ctx context.Context, providerUUID string) ([]b
 // GetLease returns a lease by UUID regardless of state.
 // Returns nil if the lease is not found.
 func (c *Client) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+	start := time.Now()
 	resp, err := c.billingQuery.Lease(ctx, &billingtypes.QueryLeaseRequest{
 		LeaseUuid: leaseUUID,
 	})
+	recordQueryMetrics("get_lease", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query lease: %w", err)
 	}
@@ -234,6 +280,7 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 		}
 
 		txHash, err := c.broadcastTx(ctx, msg)
+		recordTxMetrics("acknowledge", err)
 		if err != nil {
 			return totalAcknowledged, txHashes, fmt.Errorf("failed to acknowledge leases: %w", err)
 		}
@@ -256,6 +303,7 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (s
 	}
 
 	txHash, err := c.broadcastTx(ctx, msg)
+	recordTxMetrics("withdraw", err)
 	if err != nil {
 		return "", fmt.Errorf("failed to withdraw: %w", err)
 	}
@@ -265,7 +313,127 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (s
 }
 
 // broadcastTx signs and broadcasts a transaction, waits for execution, returns tx hash.
+// It automatically retries on transient errors and sequence mismatches with exponential backoff.
 func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
+	var txHash string
+
+	// Configure exponential backoff with jitter
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = txInitialBackoff
+	bo.MaxInterval = txMaxBackoff
+	bo.MaxElapsedTime = 0 // We control max retries via WithMaxRetries
+
+	// Wrap with context and max retries
+	boCtx := backoff.WithContext(
+		backoff.WithMaxRetries(bo, txMaxRetries-1), // -1 because first attempt doesn't count as retry
+		ctx,
+	)
+
+	operation := func() error {
+		var err error
+		txHash, err = c.doBroadcastTx(ctx, msg)
+		if err == nil {
+			return nil
+		}
+
+		// Check if error is retryable
+		if !c.isRetryableTxError(err) {
+			return backoff.Permanent(err)
+		}
+
+		slog.Warn("transaction failed, will retry",
+			"error", err,
+		)
+		return err
+	}
+
+	if err := backoff.Retry(operation, boCtx); err != nil {
+		return "", fmt.Errorf("transaction failed: %w", err)
+	}
+
+	return txHash, nil
+}
+
+// isRetryableTxError checks if a transaction error is retryable.
+// Uses proper gRPC status codes instead of brittle string matching.
+func (c *Client) isRetryableTxError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for ChainTxError to see if it's a sequence mismatch
+	if chainErr, ok := err.(*ChainTxError); ok {
+		// Code 32 is "incorrect account sequence" in SDK
+		// Codespace "sdk" with code 32 = ErrWrongSequence
+		if chainErr.Codespace == "sdk" && chainErr.Code == 32 {
+			return true
+		}
+		// Other chain errors are generally not retryable
+		return false
+	}
+
+	// Check for context errors (deadline exceeded, canceled)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	// Check for retryable gRPC status codes
+	// Extract the gRPC status from the error (works with wrapped errors)
+	st, ok := status.FromError(err)
+	if ok {
+		switch st.Code() {
+		case codes.Unavailable:
+			// Server temporarily unavailable (connection refused, reset, etc.)
+			return true
+		case codes.DeadlineExceeded:
+			// Request timed out
+			return true
+		case codes.ResourceExhausted:
+			// Rate limited or resource exhausted - may recover
+			return true
+		case codes.Aborted:
+			// Operation was aborted (e.g., concurrency conflict) - may succeed on retry
+			return true
+		case codes.Internal:
+			// Internal server error - transient issues may resolve
+			return true
+		case codes.Unknown:
+			// Unknown error - could be transient network issue
+			return true
+		default:
+			// Other codes (InvalidArgument, NotFound, PermissionDenied, etc.)
+			// are not retryable as they indicate client errors or permanent failures
+			return false
+		}
+	}
+
+	// If we can't extract a gRPC status, check the error chain for wrapped gRPC errors
+	// by unwrapping and checking each level
+	var unwrapped error = err
+	for unwrapped != nil {
+		if st, ok := status.FromError(unwrapped); ok && st.Code() != codes.OK {
+			// Found a gRPC status in the chain - recursively check
+			return c.isRetryableGRPCCode(st.Code())
+		}
+		unwrapped = errors.Unwrap(unwrapped)
+	}
+
+	return false
+}
+
+// isRetryableGRPCCode returns true if the gRPC status code indicates a retryable error.
+func (c *Client) isRetryableGRPCCode(code codes.Code) bool {
+	switch code {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted,
+		codes.Aborted, codes.Internal, codes.Unknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// doBroadcastTx performs a single broadcast attempt.
+func (c *Client) doBroadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
 	// Get account info for sequence/account number
 	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
 		Address: c.signer.Address(),
@@ -316,9 +484,13 @@ func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, err
 }
 
 // waitForTx polls for a transaction until it's included in a block.
+// Uses exponential backoff to handle slow chain indexing.
 func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxResponse, error) {
-	ticker := time.NewTicker(c.txPollInterval)
-	defer ticker.Stop()
+	// Start with initial poll interval, then use exponential backoff
+	currentInterval := c.txPollInterval
+	if currentInterval == 0 {
+		currentInterval = txPollInitialInterval
+	}
 
 	// Use NewTimer instead of time.After to avoid timer leak on early return
 	timeoutTimer := time.NewTimer(c.txTimeout)
@@ -326,17 +498,24 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 
 	var consecutiveErrors int
 	var lastErr error
+	var pollAttempts int
 
 	for {
+		// Create timer for current poll interval
+		pollTimer := time.NewTimer(currentInterval)
+
 		select {
 		case <-ctx.Done():
+			pollTimer.Stop()
 			return nil, ctx.Err()
 		case <-timeoutTimer.C:
+			pollTimer.Stop()
 			if lastErr != nil {
-				return nil, fmt.Errorf("timeout waiting for tx %s (last error: %v)", txHash, lastErr)
+				return nil, fmt.Errorf("timeout waiting for tx %s after %d attempts (last error: %v)", txHash, pollAttempts, lastErr)
 			}
-			return nil, fmt.Errorf("timeout waiting for tx %s", txHash)
-		case <-ticker.C:
+			return nil, fmt.Errorf("timeout waiting for tx %s after %d attempts", txHash, pollAttempts)
+		case <-pollTimer.C:
+			pollAttempts++
 			resp, err := c.txService.GetTx(ctx, &tx.GetTxRequest{Hash: txHash})
 			if err != nil {
 				consecutiveErrors++
@@ -346,11 +525,26 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 					slog.Warn("repeated errors polling for tx",
 						"tx_hash", txHash,
 						"consecutive_errors", consecutiveErrors,
+						"current_interval", currentInterval,
 						"last_error", err,
 					)
 				}
+
+				// Apply exponential backoff for next poll
+				currentInterval = time.Duration(float64(currentInterval) * txPollBackoffFactor)
+				if currentInterval > txPollMaxInterval {
+					currentInterval = txPollMaxInterval
+				}
+
 				// Keep polling - tx may not be indexed yet
 				continue
+			}
+
+			if pollAttempts > 1 {
+				slog.Debug("tx confirmed after polling",
+					"tx_hash", txHash,
+					"attempts", pollAttempts,
+				)
 			}
 			return resp, nil
 		}
@@ -359,7 +553,9 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 
 // GetActiveLeasesByProvider returns all active leases for a provider.
 func (c *Client) GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+	start := time.Now()
 	leases, err := c.getLeasesByProviderWithState(ctx, providerUUID, billingtypes.LEASE_STATE_ACTIVE)
+	recordQueryMetrics("get_active_leases", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active leases: %w", err)
 	}
@@ -411,6 +607,7 @@ func (c *Client) RejectLeases(ctx context.Context, leaseUUIDs []string, reason s
 		}
 
 		txHash, err := c.broadcastTx(ctx, msg)
+		recordTxMetrics("reject", err)
 		if err != nil {
 			return totalRejected, txHashes, fmt.Errorf("failed to reject leases: %w", err)
 		}
@@ -440,6 +637,7 @@ func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string, reason st
 		}
 
 		txHash, err := c.broadcastTx(ctx, msg)
+		recordTxMetrics("close", err)
 		if err != nil {
 			return totalClosed, txHashes, fmt.Errorf("failed to close leases: %w", err)
 		}

@@ -66,7 +66,7 @@ type WithdrawScheduler struct {
 	ctxMu  sync.RWMutex
 
 	// wg tracks spawned goroutines for graceful shutdown
-	wg sync.WaitGroup
+	wg *sync.WaitGroup // Pointer to avoid copy-by-value issues
 }
 
 // WithdrawSchedulerConfig holds configuration for the withdrawal scheduler.
@@ -94,6 +94,11 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 		retryInterval = 30 * time.Second
 	}
 
+	// Create initial context that can be cancelled on shutdown.
+	// This ensures TriggerWithdraw works correctly even before Start() is called.
+	// Start() will replace this with a context derived from the passed-in context.
+	ctx, cancel := context.WithCancel(context.Background())
+
 	return &WithdrawScheduler{
 		client:                    client,
 		providerUUID:              cfg.ProviderUUID,
@@ -102,6 +107,9 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 		creditCheckErrorThreshold: errorThreshold,
 		creditCheckRetryInterval:  retryInterval,
 		tenants:                   make(map[string]*tenantState),
+		ctx:                       ctx,
+		cancel:                    cancel,
+		wg:                        &sync.WaitGroup{},
 	}
 }
 
@@ -119,14 +127,15 @@ func (s *WithdrawScheduler) WithdrawOnce(ctx context.Context) {
 func (s *WithdrawScheduler) TriggerWithdraw() {
 	slog.Info("withdrawal triggered by cross-provider credit depletion")
 
-	// Get context under read lock
+	// Get context under read lock - always valid since initialized in NewWithdrawScheduler
 	s.ctxMu.RLock()
 	ctx := s.ctx
 	s.ctxMu.RUnlock()
 
-	// Use background context if scheduler hasn't started yet
-	if ctx == nil {
-		ctx = context.Background()
+	// Check if context is already cancelled (scheduler stopped)
+	if ctx.Err() != nil {
+		slog.Debug("ignoring TriggerWithdraw, scheduler context cancelled")
+		return
 	}
 
 	// Track the goroutine for graceful shutdown
@@ -137,19 +146,62 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 	}()
 }
 
+// Stop cancels the scheduler's internal context, stopping all operations.
+// This is useful for testing or for cases where you want to stop the scheduler
+// without cancelling the parent context passed to Start().
+// After Stop() is called, TriggerWithdraw() calls will be ignored.
+func (s *WithdrawScheduler) Stop() {
+	s.ctxMu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.ctxMu.Unlock()
+
+	// Wait for any in-flight operations to complete
+	s.wg.Wait()
+	slog.Info("withdrawal scheduler stopped via Stop()")
+}
+
 // Start begins the periodic withdrawal and credit checking process.
 // Note: Call WithdrawOnce() before Start() if you need an initial withdrawal
 // that must complete before other operations.
+//
+// Context inheritance: Start() creates an internal context derived from the passed ctx.
+// When ctx is cancelled, the internal context is also cancelled, which stops any
+// TriggerWithdraw goroutines that were spawned during operation.
 func (s *WithdrawScheduler) Start(ctx context.Context) error {
 	slog.Info("starting withdrawal scheduler",
 		"provider_uuid", s.providerUUID,
 		"interval", s.interval,
 	)
 
-	// Store context for use by TriggerWithdraw (protected by mutex)
+	// Replace context for use by TriggerWithdraw (protected by mutex).
+	// IMPORTANT: Create the new context BEFORE cancelling the old one to avoid a race
+	// where TriggerWithdraw() reads a cancelled context. The sequence is:
+	// 1. Create new context
+	// 2. Atomically swap the context and cancel function
+	// 3. Cancel old context (any TriggerWithdraw reading context will get the new one)
+	newCtx, newCancel := context.WithCancel(ctx)
 	s.ctxMu.Lock()
-	s.ctx, s.cancel = context.WithCancel(ctx)
+	oldCancel := s.cancel
+	s.ctx = newCtx
+	s.cancel = newCancel
 	s.ctxMu.Unlock()
+	// Cancel old context AFTER releasing lock - this ensures TriggerWithdraw()
+	// always reads the new valid context, never the cancelled old one.
+	if oldCancel != nil {
+		oldCancel()
+	}
+
+	// Ensure internal context is cancelled when Start() returns for any reason.
+	// This handles edge cases where Start() might return due to an error.
+	defer func() {
+		s.ctxMu.Lock()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.ctxMu.Unlock()
+	}()
 
 	// Set initial next check time
 	s.mu.Lock()
@@ -175,7 +227,9 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 				default:
 				}
 			}
-			// Wait for any TriggerWithdraw goroutines to complete
+			// Wait for any TriggerWithdraw goroutines to complete.
+			// Since s.ctx is a child of ctx, it's already cancelled,
+			// so TriggerWithdraw goroutines should exit promptly.
 			s.wg.Wait()
 			slog.Info("withdrawal scheduler stopped")
 			return ctx.Err()

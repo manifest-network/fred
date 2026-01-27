@@ -96,29 +96,32 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 	delay := m.provisionDelay
 	m.mu.Unlock()
 
-	// Simulate async provisioning
-	go func() {
-		if delay > 0 {
-			time.Sleep(delay)
-		}
+	// Only auto-transition to "ready" if delay or callback is configured.
+	// This allows tests to verify the "provisioning" state when neither is set.
+	if delay > 0 || callbackFn != nil {
+		go func() {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 
-		m.mu.Lock()
-		p, exists := m.provisions[req.LeaseUUID]
-		if !exists {
+			m.mu.Lock()
+			p, exists := m.provisions[req.LeaseUUID]
+			if !exists {
+				m.mu.Unlock()
+				return // Deprovisioned while provisioning
+			}
+			p.Status = "ready"
 			m.mu.Unlock()
-			return // Deprovisioned while provisioning
-		}
-		p.Status = "ready"
-		m.mu.Unlock()
 
-		// Send callback
-		if callbackFn != nil {
-			callbackFn(CallbackPayload{
-				LeaseUUID: req.LeaseUUID,
-				Status:    "success",
-			})
-		}
-	}()
+			// Send callback
+			if callbackFn != nil {
+				callbackFn(CallbackPayload{
+					LeaseUUID: req.LeaseUUID,
+					Status:    "success",
+				})
+			}
+		}()
+	}
 
 	return nil
 }
@@ -183,6 +186,11 @@ func (m *MockBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, erro
 	}
 
 	return result, nil
+}
+
+// Health always returns nil (healthy) for mock backend.
+func (m *MockBackend) Health(ctx context.Context) error {
+	return nil
 }
 
 // GetProvision returns a specific provision (for testing).

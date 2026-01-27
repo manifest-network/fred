@@ -4,6 +4,7 @@ package testutil
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -103,3 +104,51 @@ const (
 	InvalidUUID2 = "01234567-89ab-cdef-0123"
 	InvalidUUID3 = "01234567-89ab-cdef-0123-456789abcdefg"
 )
+
+// TestPayloadAuthToken creates a test payload authentication token.
+type TestPayloadAuthToken struct {
+	Tenant    string `json:"tenant"`
+	LeaseUUID string `json:"lease_uuid"`
+	MetaHash  string `json:"meta_hash"`
+	Timestamp int64  `json:"timestamp"`
+	PubKey    string `json:"pub_key"`
+	Signature string `json:"signature"`
+}
+
+// CreateTestPayloadToken creates a valid payload auth token for testing.
+func CreateTestPayloadToken(kp *TestKeyPair, leaseUUID, metaHashHex string, timestamp time.Time) string {
+	token := TestPayloadAuthToken{
+		Tenant:    kp.Address,
+		LeaseUUID: leaseUUID,
+		MetaHash:  metaHashHex,
+		Timestamp: timestamp.Unix(),
+		PubKey:    kp.PubKeyB64,
+	}
+
+	// Create sign data using the payload-specific format
+	signData := auth.FormatPayloadSignData(token.LeaseUUID, token.MetaHash, token.Timestamp)
+	token.Signature = kp.Sign(signData)
+
+	// Encode to base64
+	jsonBytes, err := json.Marshal(token)
+	if err != nil {
+		panic(fmt.Sprintf("failed to marshal token: %v", err))
+	}
+	return base64.StdEncoding.EncodeToString(jsonBytes)
+}
+
+// CreateExpiredPayloadToken creates an expired payload auth token for testing.
+func CreateExpiredPayloadToken(kp *TestKeyPair, leaseUUID, metaHashHex string) string {
+	return CreateTestPayloadToken(kp, leaseUUID, metaHashHex, time.Now().Add(-10*time.Minute))
+}
+
+// CreateFuturePayloadToken creates a future-dated payload auth token for testing.
+func CreateFuturePayloadToken(kp *TestKeyPair, leaseUUID, metaHashHex string) string {
+	return CreateTestPayloadToken(kp, leaseUUID, metaHashHex, time.Now().Add(10*time.Minute))
+}
+
+// ComputePayloadHash computes the SHA-256 hash of a payload and returns it as hex.
+func ComputePayloadHash(payload []byte) string {
+	hash := sha256.Sum256(payload)
+	return hex.EncodeToString(hash[:])
+}

@@ -262,20 +262,51 @@ func TestTokenTracker_Persistence(t *testing.T) {
 }
 
 func TestTokenTracker_Close(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "tokens.db")
-	tracker, err := NewTokenTracker(TokenTrackerConfig{
-		DBPath: dbPath,
-		MaxAge: 1 * time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("NewTokenTracker() error = %v", err)
-	}
+	t.Run("closes_without_error", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "tokens.db")
+		tracker, err := NewTokenTracker(TokenTrackerConfig{
+			DBPath: dbPath,
+			MaxAge: 1 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("NewTokenTracker() error = %v", err)
+		}
 
-	// Close should not error
-	err = tracker.Close()
-	if err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
+		// Close should not error
+		err = tracker.Close()
+		if err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	t.Run("close_is_idempotent", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "tokens.db")
+		tracker, err := NewTokenTracker(TokenTrackerConfig{
+			DBPath: dbPath,
+			MaxAge: 1 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("NewTokenTracker() error = %v", err)
+		}
+
+		// First close
+		err = tracker.Close()
+		if err != nil {
+			t.Errorf("Close() first call error = %v", err)
+		}
+
+		// Second close should not error (idempotent)
+		err = tracker.Close()
+		if err != nil {
+			t.Errorf("Close() second call error = %v", err)
+		}
+
+		// Third close should also be fine
+		err = tracker.Close()
+		if err != nil {
+			t.Errorf("Close() third call error = %v", err)
+		}
+	})
 }
 
 func TestTimeConversion(t *testing.T) {
