@@ -1,8 +1,6 @@
 package api
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -26,17 +24,7 @@ type AuthToken struct {
 
 // ParseAuthToken parses a base64-encoded authentication token.
 func ParseAuthToken(encoded string) (*AuthToken, error) {
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode token: %w", err)
-	}
-
-	var token AuthToken
-	if err := json.Unmarshal(decoded, &token); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal token: %w", err)
-	}
-
-	return &token, nil
+	return parseBase64Token[AuthToken](encoded)
 }
 
 // Validate verifies the token's timestamp and ADR-036 signature.

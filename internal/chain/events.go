@@ -97,6 +97,11 @@ type EventSubscriberConfig struct {
 
 // NewEventSubscriber creates a new event subscriber.
 func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
+	// Validate provider UUID to prevent query injection (defense in depth)
+	if cfg.ProviderUUID == "" {
+		return nil, fmt.Errorf("provider UUID is required")
+	}
+
 	// Apply defaults
 	pingInterval := cfg.PingInterval
 	if pingInterval == 0 {

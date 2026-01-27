@@ -51,7 +51,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {
 		slog.Warn("invalid lease UUID format", "lease_uuid", leaseUUID)
-		writeError(w, "invalid lease UUID format", http.StatusBadRequest)
+		writeError(w, errMsgInvalidLeaseUUID, http.StatusBadRequest)
 		return
 	}
 
@@ -60,7 +60,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		slog.Warn("invalid authorization", "error", err)
 		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -68,7 +68,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	if err := token.Validate(h.bech32Prefix); err != nil {
 		slog.Warn("token validation failed", "error", err)
 		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -78,7 +78,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"token_lease_uuid", token.LeaseUUID,
 			"request_lease_uuid", leaseUUID,
 		)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -86,13 +86,13 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	lease, err := h.client.GetLease(r.Context(), leaseUUID)
 	if err != nil {
 		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 
 	if lease == nil {
 		slog.Warn("lease not found", "lease_uuid", leaseUUID)
-		writeError(w, "lease not found", http.StatusNotFound)
+		writeError(w, errMsgLeaseNotFound, http.StatusNotFound)
 		return
 	}
 
@@ -112,7 +112,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"token_tenant", token.Tenant,
 			"lease_tenant", lease.Tenant,
 		)
-		writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, errMsgForbidden, http.StatusForbidden)
 		return
 	}
 
@@ -122,7 +122,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"lease_provider_uuid", lease.ProviderUuid,
 			"our_provider_uuid", h.providerUUID,
 		)
-		writeError(w, "forbidden", http.StatusForbidden)
+		writeError(w, errMsgForbidden, http.StatusForbidden)
 		return
 	}
 
@@ -138,7 +138,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	tokenMetaHashBytes, err := hex.DecodeString(token.MetaHash)
 	if err != nil {
 		slog.Warn("invalid token meta_hash hex", "error", err)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -147,7 +147,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"token_meta_hash", token.MetaHash,
 			"lease_meta_hash", hex.EncodeToString(lease.MetaHash),
 		)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -203,7 +203,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		h.publisher.DeletePayload(leaseUUID)
 		slog.Error("failed to publish payload event", "error", err, "lease_uuid", leaseUUID)
 		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
-		writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 

@@ -178,7 +178,8 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		authRouter.Use(tenantRateLimiter.Middleware(cfg.Bech32Prefix))
 	}
 
-	// Add global middleware (order matters: rate limit first, then timeout, then body size, then logging)
+	// Add global middleware (order matters: security headers, rate limit, timeout, body size, logging)
+	router.Use(securityHeadersMiddleware)
 	router.Use(rateLimiter.Middleware)
 	router.Use(requestTimeoutMiddleware(requestTimeout))
 	router.Use(maxBodySizeMiddleware(maxBodySize))
@@ -199,14 +200,14 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request) {
 	if s.callbackPublisher == nil {
 		slog.Error("callback publisher not configured")
-		writeError(w, "service not configured", http.StatusServiceUnavailable)
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
 		return
 	}
 
 	// Verify callback authentication
 	if s.callbackAuthenticator == nil {
 		slog.Error("callback authenticator not configured")
-		writeError(w, "service not configured", http.StatusServiceUnavailable)
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -216,7 +217,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 			"error", err,
 			"remote_addr", r.RemoteAddr,
 		)
-		writeError(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
 
@@ -262,7 +263,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 
 	if err := s.callbackPublisher.PublishCallback(callback); err != nil {
 		slog.Error("failed to publish callback", "error", err)
-		writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 
@@ -273,7 +274,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 func (s *Server) handlePayloadUpload(w http.ResponseWriter, r *http.Request) {
 	if s.payloadHandler == nil {
 		slog.Error("payload handler not configured")
-		writeError(w, "service not configured", http.StatusServiceUnavailable)
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -435,4 +436,24 @@ func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Han
 			}
 		})
 	}
+}
+
+// securityHeadersMiddleware adds security headers to all responses.
+// These headers provide defense-in-depth against common web attacks.
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Prevent MIME type sniffing
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// Prevent clickjacking (API shouldn't be framed)
+		w.Header().Set("X-Frame-Options", "DENY")
+
+		// Enable XSS filtering (legacy, but still useful for older browsers)
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
+		// Prevent caching of sensitive data
+		w.Header().Set("Cache-Control", "no-store")
+
+		next.ServeHTTP(w, r)
+	})
 }

@@ -73,18 +73,18 @@ type AuthenticatedRequest struct {
 func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, checkReplay bool, requireActive bool) (*AuthenticatedRequest, int, error) {
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {
-		return nil, http.StatusBadRequest, errors.New("invalid lease UUID format")
+		return nil, http.StatusBadRequest, errors.New(errMsgInvalidLeaseUUID)
 	}
 
 	// Extract and validate bearer token
 	token, err := h.extractToken(r)
 	if err != nil {
-		return nil, http.StatusUnauthorized, errors.New("unauthorized")
+		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
 	}
 
 	// Validate the token
 	if err := token.Validate(h.bech32Prefix); err != nil {
-		return nil, http.StatusUnauthorized, errors.New("unauthorized")
+		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
 	}
 
 	// Check for token replay attack (if tracker is configured and checkReplay is true)
@@ -95,7 +95,7 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 					"lease_uuid", leaseUUID,
 					"tenant", token.Tenant,
 				)
-				return nil, http.StatusUnauthorized, errors.New("unauthorized")
+				return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
 			}
 			// Database error - log but don't block the request
 			slog.Error("token tracker error", "error", err)
@@ -108,7 +108,7 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 			"token_lease_uuid", token.LeaseUUID,
 			"request_lease_uuid", leaseUUID,
 		)
-		return nil, http.StatusUnauthorized, errors.New("unauthorized")
+		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
 	}
 
 	// Query the lease from chain
@@ -120,14 +120,14 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 	}
 	if err != nil {
 		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		return nil, http.StatusInternalServerError, errors.New("internal server error")
+		return nil, http.StatusInternalServerError, errors.New(errMsgInternalServerError)
 	}
 
 	if lease == nil {
 		if requireActive {
-			return nil, http.StatusNotFound, errors.New("lease not found or not active")
+			return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound + " or not active")
 		}
-		return nil, http.StatusNotFound, errors.New("lease not found")
+		return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound)
 	}
 
 	// Verify the tenant matches
@@ -136,7 +136,7 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 			"token_tenant", token.Tenant,
 			"lease_tenant", lease.Tenant,
 		)
-		return nil, http.StatusForbidden, errors.New("forbidden")
+		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
 	}
 
 	// Verify the provider UUID matches
@@ -145,7 +145,7 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 			"lease_provider_uuid", lease.ProviderUuid,
 			"our_provider_uuid", h.providerUUID,
 		)
-		return nil, http.StatusForbidden, errors.New("forbidden")
+		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
 	}
 
 	return &AuthenticatedRequest{
@@ -175,6 +175,17 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 	Code  int    `json:"code"`
 }
+
+// Common error messages for API responses.
+// These constants ensure consistency across handlers and simplify testing.
+const (
+	errMsgUnauthorized         = "unauthorized"
+	errMsgForbidden            = "forbidden"
+	errMsgInternalServerError  = "internal server error"
+	errMsgServiceNotConfigured = "service not configured"
+	errMsgInvalidLeaseUUID     = "invalid lease UUID format"
+	errMsgLeaseNotFound        = "lease not found"
+)
 
 // GetLeaseConnection handles GET /v1/leases/{lease_uuid}/connection
 func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +224,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("failed to get info from backend", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, "internal server error", http.StatusInternalServerError)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 
