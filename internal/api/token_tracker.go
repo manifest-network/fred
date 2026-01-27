@@ -186,20 +186,7 @@ func (t *TokenTracker) Close() error {
 // cleanupLoop periodically removes expired tokens.
 func (t *TokenTracker) cleanupLoop(ctx context.Context) {
 	defer t.wg.Done()
-
-	ticker := time.NewTicker(t.cleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := t.cleanup(); err != nil {
-				slog.Error("token cleanup failed", "error", err)
-			}
-		}
-	}
+	util.StartCleanupLoop(ctx, t.cleanupInterval, t.cleanup, "token")
 }
 
 // cleanup removes expired tokens from the database.

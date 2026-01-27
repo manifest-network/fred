@@ -505,20 +505,7 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 // cleanupLoop periodically removes stale payloads.
 func (s *PayloadStore) cleanupLoop(ctx context.Context) {
 	defer s.wg.Done()
-
-	ticker := time.NewTicker(s.cleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := s.cleanupDirect(); err != nil {
-				slog.Error("payload cleanup failed", "error", err)
-			}
-		}
-	}
+	util.StartCleanupLoop(ctx, s.cleanupInterval, s.cleanupDirect, "payload")
 }
 
 // cleanupDirect removes stale payloads from the database.
