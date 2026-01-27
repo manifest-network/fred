@@ -2,8 +2,6 @@ package provisioner
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -218,8 +216,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	g.SetLimit(r.maxWorkers)
 
 	for leaseUUID, lease := range chainLeases {
-		leaseUUID := leaseUUID // capture for goroutine
-		lease := lease
 		provision, isProvisioned := allProvisions[leaseUUID]
 
 		g.Go(func() error {
@@ -253,9 +249,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	og.SetLimit(r.maxWorkers)
 
 	for leaseUUID, provision := range allProvisions {
-		leaseUUID := leaseUUID // capture for goroutine
-		provision := provision
-
 		og.Go(func() error {
 			r.processOrphan(ogctx, leaseUUID, provision, &orphans)
 			return nil // Don't fail fast - continue processing other orphans
@@ -356,20 +349,15 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		if req.Payload != nil && len(lease.MetaHash) > 0 {
 			// Re-verify payload hash before provisioning to catch any corruption.
 			// The payload was validated on upload, but disk corruption could occur.
-			actualHash := sha256.Sum256(req.Payload)
-			if subtle.ConstantTimeCompare(actualHash[:], lease.MetaHash) != 1 {
+			if err := VerifyPayloadHash(req.Payload, lease.MetaHash); err != nil {
 				// Payload is corrupted - delete it and fail
 				r.tracker.PayloadStore().Delete(lease.Uuid)
-				if r.tracker != nil {
-					r.tracker.UntrackInFlight(lease.Uuid)
-				}
+				r.tracker.UntrackInFlight(lease.Uuid)
 				slog.Error("reconcile: payload hash mismatch - possible corruption",
 					"lease_uuid", lease.Uuid,
-					"expected_hash", hex.EncodeToString(lease.MetaHash),
-					"actual_hash", hex.EncodeToString(actualHash[:]),
+					"error", err,
 				)
-				return fmt.Errorf("payload hash mismatch: expected %s, got %s",
-					hex.EncodeToString(lease.MetaHash), hex.EncodeToString(actualHash[:]))
+				return err
 			}
 			req.PayloadHash = hex.EncodeToString(lease.MetaHash)
 		}
@@ -454,7 +442,6 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 	allProvisions := make(map[string]backend.ProvisionInfo)
 
 	for _, b := range backends {
-		b := b // capture for goroutine
 		g.Go(func() error {
 			provisions, err := b.ListProvisions(gctx)
 			if err != nil {

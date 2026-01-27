@@ -374,11 +374,6 @@ func writeError(w http.ResponseWriter, message string, status int) {
 	writeJSON(w, response, status)
 }
 
-// decodeJSON decodes a JSON request body.
-func decodeJSON(r *http.Request, v interface{}) error {
-	return json.NewDecoder(r.Body).Decode(v)
-}
-
 // decodeJSONBytes decodes JSON from a byte slice.
 func decodeJSONBytes(data []byte, v interface{}) error {
 	return json.Unmarshal(data, v)

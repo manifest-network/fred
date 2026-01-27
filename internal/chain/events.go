@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/gorilla/websocket"
 
 	"github.com/manifest-network/fred/internal/metrics"
@@ -39,9 +39,10 @@ const (
 	// readGoroutineCleanupTimeout is how long to wait for the read goroutine to finish during cleanup.
 	readGoroutineCleanupTimeout = 5 * time.Second
 
-	// backoffJitterDivisor controls the jitter range (1/N of backoff duration).
-	// A value of 4 means jitter is 0-25% of the backoff duration.
-	backoffJitterDivisor = 4
+	// WebSocket JSON-RPC subscription IDs.
+	// These are used to identify different event subscriptions in the CometBFT WebSocket.
+	subscriptionIDProviderLeases = 1 // Provider-specific lease events (created, closed, etc.)
+	subscriptionIDAutoClose      = 2 // Cross-provider lease auto-close events (credit exhaustion)
 )
 
 // LeaseEvent represents a lease-related event from the chain.
@@ -238,7 +239,14 @@ func (s *EventSubscriber) trySend(ch chan LeaseEvent, event LeaseEvent) {
 
 // Start begins listening for events. It will automatically reconnect on failure.
 func (s *EventSubscriber) Start(ctx context.Context) error {
-	backoff := s.reconnectInitial
+	// Configure exponential backoff with jitter using cenkalti/backoff
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.InitialInterval = s.reconnectInitial
+	expBackoff.MaxInterval = s.reconnectMax
+	expBackoff.MaxElapsedTime = 0 // Never stop retrying
+	expBackoff.RandomizationFactor = 0.25
+	expBackoff.Multiplier = 2.0
+	expBackoff.Reset()
 
 	for {
 		select {
@@ -264,24 +272,17 @@ func (s *EventSubscriber) Start(ctx context.Context) error {
 		default:
 		}
 
-		// Wait before reconnecting
-		slog.Info("reconnecting websocket", "backoff", backoff)
+		// Get next backoff duration (includes jitter)
+		wait := expBackoff.NextBackOff()
+		slog.Info("reconnecting websocket", "backoff", wait)
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.done:
 			return nil
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
-
-		// Exponential backoff with jitter, capped at max
-		backoff = backoff * 2
-		if backoff > s.reconnectMax {
-			backoff = s.reconnectMax
-		}
-		// Add jitter: random value between 0 and 25% of backoff to prevent thundering herd
-		jitter := time.Duration(rand.Int64N(int64(backoff) / backoffJitterDivisor))
-		backoff = backoff + jitter
 	}
 }
 
@@ -334,14 +335,14 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 
 	// Subscribe to lease events for this provider
 	query := fmt.Sprintf("tm.event='Tx' AND lease_created.provider_uuid='%s'", s.providerUUID)
-	if err := s.subscribe(conn, query, 1); err != nil {
+	if err := s.subscribe(conn, query, subscriptionIDProviderLeases); err != nil {
 		return fmt.Errorf("failed to subscribe to provider events: %w", err)
 	}
 	slog.Info("subscribed to provider lease events", "provider_uuid", s.providerUUID)
 
 	// Subscribe to ALL lease_auto_closed events (any provider) to detect cross-provider credit depletion
 	autoCloseQuery := "tm.event='Tx' AND lease_auto_closed.reason='credit_exhausted'"
-	if err := s.subscribe(conn, autoCloseQuery, 2); err != nil {
+	if err := s.subscribe(conn, autoCloseQuery, subscriptionIDAutoClose); err != nil {
 		return fmt.Errorf("failed to subscribe to auto-close events: %w", err)
 	}
 	slog.Info("subscribed to lease auto-close events")

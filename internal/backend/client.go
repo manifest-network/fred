@@ -98,6 +98,12 @@ const (
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
+// isCircuitBreakerError checks if the error is a circuit breaker error
+// (either open state or too many requests in half-open state).
+func isCircuitBreakerError(err error) bool {
+	return errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests)
+}
+
 // HTTPClient implements Backend using HTTP calls to a backend service.
 type HTTPClient struct {
 	name       string
@@ -235,7 +241,7 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 		return nil, nil
 	})
 
-	if errors.Is(cbErr, gobreaker.ErrOpenState) || errors.Is(cbErr, gobreaker.ErrTooManyRequests) {
+	if isCircuitBreakerError(cbErr) {
 		return ErrCircuitOpen
 	}
 	return cbErr
@@ -277,7 +283,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 		return &info, nil
 	})
 
-	if errors.Is(cbErr, gobreaker.ErrOpenState) || errors.Is(cbErr, gobreaker.ErrTooManyRequests) {
+	if isCircuitBreakerError(cbErr) {
 		return nil, ErrCircuitOpen
 	}
 	if cbErr != nil {
@@ -317,7 +323,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		return nil, nil
 	})
 
-	if errors.Is(cbErr, gobreaker.ErrOpenState) || errors.Is(cbErr, gobreaker.ErrTooManyRequests) {
+	if isCircuitBreakerError(cbErr) {
 		return ErrCircuitOpen
 	}
 	return cbErr
@@ -355,7 +361,7 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		return result.Provisions, nil
 	})
 
-	if errors.Is(cbErr, gobreaker.ErrOpenState) || errors.Is(cbErr, gobreaker.ErrTooManyRequests) {
+	if isCircuitBreakerError(cbErr) {
 		return nil, ErrCircuitOpen
 	}
 	if cbErr != nil {
