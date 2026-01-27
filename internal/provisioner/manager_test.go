@@ -2,6 +2,8 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -16,6 +18,12 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 )
+
+// hashPayload computes the SHA-256 hash of a payload and returns it as a hex string.
+func hashPayload(payload []byte) string {
+	h := sha256.Sum256(payload)
+	return hex.EncodeToString(h[:])
+}
 
 // mockManagerBackend implements backend.Backend for manager tests.
 type mockManagerBackend struct {
@@ -1638,13 +1646,14 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 
 	// Store a payload first
 	testPayload := []byte("deployment manifest data")
+	testPayloadHash := hashPayload(testPayload)
 	payloadStore.Store("lease-1", testPayload)
 
 	// Create a payload event message
 	event := PayloadEvent{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
-		MetaHashHex: "abc123",
+		MetaHashHex: testPayloadHash,
 	}
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -1667,8 +1676,8 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	if string(mockBackend.provisionCalls[0].Payload) != string(testPayload) {
 		t.Errorf("provision Payload = %q, want %q", mockBackend.provisionCalls[0].Payload, testPayload)
 	}
-	if mockBackend.provisionCalls[0].PayloadHash != "abc123" {
-		t.Errorf("provision PayloadHash = %q, want %q", mockBackend.provisionCalls[0].PayloadHash, "abc123")
+	if mockBackend.provisionCalls[0].PayloadHash != testPayloadHash {
+		t.Errorf("provision PayloadHash = %q, want %q", mockBackend.provisionCalls[0].PayloadHash, testPayloadHash)
 	}
 
 	// Verify in-flight tracking
@@ -1957,12 +1966,14 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	}
 
 	// Store payload
-	payloadStore.Store("lease-1", []byte("payload data"))
+	testPayload := []byte("payload data")
+	testPayloadHash := hashPayload(testPayload)
+	payloadStore.Store("lease-1", testPayload)
 
 	event := PayloadEvent{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
-		MetaHashHex: "abc123",
+		MetaHashHex: testPayloadHash,
 	}
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -2147,12 +2158,14 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	}
 
 	// Store payload
-	payloadStore.Store("gpu-lease-1", []byte("gpu deployment"))
+	testPayload := []byte("gpu deployment")
+	testPayloadHash := hashPayload(testPayload)
+	payloadStore.Store("gpu-lease-1", testPayload)
 
 	event := PayloadEvent{
 		LeaseUUID:   "gpu-lease-1",
 		Tenant:      "tenant-1",
-		MetaHashHex: "abc123",
+		MetaHashHex: testPayloadHash,
 	}
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)

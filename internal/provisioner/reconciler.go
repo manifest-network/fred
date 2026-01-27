@@ -2,6 +2,8 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -424,6 +426,23 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	if withPayload && r.manager != nil {
 		req.Payload = r.manager.PayloadStore().Get(lease.Uuid)
 		if req.Payload != nil && len(lease.MetaHash) > 0 {
+			// Re-verify payload hash before provisioning to catch any corruption.
+			// The payload was validated on upload, but disk corruption could occur.
+			actualHash := sha256.Sum256(req.Payload)
+			if subtle.ConstantTimeCompare(actualHash[:], lease.MetaHash) != 1 {
+				// Payload is corrupted - delete it and fail
+				r.manager.PayloadStore().Delete(lease.Uuid)
+				if r.manager != nil {
+					r.manager.UntrackInFlight(lease.Uuid)
+				}
+				slog.Error("reconcile: payload hash mismatch - possible corruption",
+					"lease_uuid", lease.Uuid,
+					"expected_hash", hex.EncodeToString(lease.MetaHash),
+					"actual_hash", hex.EncodeToString(actualHash[:]),
+				)
+				return fmt.Errorf("payload hash mismatch: expected %s, got %s",
+					hex.EncodeToString(lease.MetaHash), hex.EncodeToString(actualHash[:]))
+			}
 			req.PayloadHash = hex.EncodeToString(lease.MetaHash)
 		}
 	}

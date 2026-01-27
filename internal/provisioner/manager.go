@@ -2,6 +2,9 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,6 +90,7 @@ type Manager struct {
 	publisher       message.Publisher
 	wmRouter        *message.Router
 	payloadStore    *PayloadStore
+	ackBatcher      *AckBatcher
 
 	// Track in-flight provisions (ephemeral - recovered via reconciliation)
 	inFlight   map[string]inFlightProvision
@@ -188,6 +192,8 @@ type ManagerConfig struct {
 	PayloadStore         *PayloadStore // Optional external payload store (if nil, manager won't handle payloads)
 	CallbackTimeout      time.Duration // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
 	TimeoutCheckInterval time.Duration // How often to check for timeouts (default: 1 minute)
+	AckBatchInterval     time.Duration // How long to wait before flushing ack batch (default: 500ms)
+	AckBatchSize         int           // Maximum acks to batch before flushing (default: 50)
 }
 
 // NewManager creates a new provision manager with Watermill routing.
@@ -255,6 +261,14 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		timeoutCheckInterval: timeoutCheckInterval,
 	}
 
+	// Create and start ack batcher to prevent sequence mismatch errors.
+	// Started here (not in Start()) so handlers work even when tested directly.
+	m.ackBatcher = NewAckBatcher(chainClient, AckBatcherConfig{
+		BatchInterval: cfg.AckBatchInterval,
+		BatchSize:     cfg.AckBatchSize,
+	})
+	m.ackBatcher.Start(context.Background())
+
 	// Register handlers
 	wmRouter.AddNoPublisherHandler(
 		"handle_lease_created",
@@ -295,6 +309,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 }
 
 // Start begins the Watermill router and callback timeout checker.
+// Note: The ack batcher is started in NewManager.
 func (m *Manager) Start(ctx context.Context) error {
 	slog.Info("starting provision manager",
 		"callback_timeout", m.callbackTimeout,
@@ -304,6 +319,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Start callback timeout checker in background
 	go m.runTimeoutChecker(ctx)
 
+	// Run Watermill router (blocks until ctx cancelled)
 	return m.wmRouter.Run(ctx)
 }
 
@@ -393,6 +409,11 @@ func (m *Manager) Close() error {
 			"count", count,
 			"note", "these will be recovered by reconciliation on restart",
 		)
+	}
+
+	// Stop ack batcher first to flush pending acks
+	if m.ackBatcher != nil {
+		m.ackBatcher.Stop()
 	}
 
 	// Close Watermill router
@@ -802,8 +823,8 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 
 	switch callback.Status {
 	case backend.CallbackStatusSuccess:
-		// Acknowledge the lease on chain
-		acknowledged, txHashes, err := m.chainClient.AcknowledgeLeases(msg.Context(), []string{callback.LeaseUUID})
+		// Acknowledge the lease on chain via batcher to avoid sequence mismatch errors
+		acknowledged, txHash, err := m.ackBatcher.Acknowledge(msg.Context(), callback.LeaseUUID)
 		if err != nil {
 			// Check if this is a terminal error (e.g., lease already acknowledged)
 			if isTerminalAcknowledgeError(err) {
@@ -835,7 +856,7 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
 			"acknowledged", acknowledged,
-			"tx_hashes", txHashes,
+			"tx_hash", txHash,
 		)
 
 	case backend.CallbackStatusFailed:
@@ -1016,6 +1037,33 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 		slog.Warn("payload not found in store, proceeding without payload",
 			"lease_uuid", event.LeaseUUID,
 		)
+	} else if event.MetaHashHex != "" {
+		// Re-verify payload hash before provisioning to catch any corruption.
+		// The payload was validated on upload, but disk corruption could occur.
+		expectedHash, err := hex.DecodeString(event.MetaHashHex)
+		if err != nil {
+			m.UntrackInFlight(event.LeaseUUID)
+			slog.Error("invalid meta hash hex in event",
+				"lease_uuid", event.LeaseUUID,
+				"meta_hash_hex", event.MetaHashHex,
+				"error", err,
+			)
+			return fmt.Errorf("invalid meta hash: %w", err)
+		}
+
+		actualHash := sha256.Sum256(payload)
+		if subtle.ConstantTimeCompare(actualHash[:], expectedHash) != 1 {
+			// Payload is corrupted - delete it and fail
+			m.payloadStore.Delete(event.LeaseUUID)
+			m.UntrackInFlight(event.LeaseUUID)
+			slog.Error("payload hash mismatch - possible corruption",
+				"lease_uuid", event.LeaseUUID,
+				"expected_hash", event.MetaHashHex,
+				"actual_hash", hex.EncodeToString(actualHash[:]),
+			)
+			return fmt.Errorf("payload hash mismatch: expected %s, got %s",
+				event.MetaHashHex, hex.EncodeToString(actualHash[:]))
+		}
 	}
 
 	// Build provision request - only include PayloadHash when we have the actual payload.

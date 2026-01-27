@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -365,19 +367,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 // normalizePath replaces dynamic path segments (UUIDs) with placeholders
 // to prevent high cardinality in metrics labels.
 func normalizePath(path string) string {
-	// Use mux to get the route template if available
-	// For now, use a simple approach based on known patterns
-	switch {
-	case len(path) > 12 && path[:12] == "/v1/leases/" && len(path) > 48:
-		// /v1/leases/{uuid}/connection or /v1/leases/{uuid}/status or /v1/leases/{uuid}/data
-		if len(path) > 48 {
-			suffix := path[48:] // After the UUID
-			return "/v1/leases/{uuid}" + suffix
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		if _, err := uuid.Parse(segment); err == nil {
+			segments[i] = "{uuid}"
 		}
-		return "/v1/leases/{uuid}"
-	default:
-		return path
 	}
+	return strings.Join(segments, "/")
 }
 
 // responseWriter wraps http.ResponseWriter to capture the status code.

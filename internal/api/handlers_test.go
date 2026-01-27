@@ -1422,3 +1422,71 @@ func TestGetLeaseStatus(t *testing.T) {
 		}
 	})
 }
+
+func TestNormalizePath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			name: "lease connection endpoint",
+			path: "/v1/leases/550e8400-e29b-41d4-a716-446655440000/connection",
+			want: "/v1/leases/{uuid}/connection",
+		},
+		{
+			name: "lease status endpoint",
+			path: "/v1/leases/550e8400-e29b-41d4-a716-446655440000/status",
+			want: "/v1/leases/{uuid}/status",
+		},
+		{
+			name: "lease data endpoint",
+			path: "/v1/leases/550e8400-e29b-41d4-a716-446655440000/data",
+			want: "/v1/leases/{uuid}/data",
+		},
+		{
+			name: "health endpoint (no UUID)",
+			path: "/health",
+			want: "/health",
+		},
+		{
+			name: "metrics endpoint (no UUID)",
+			path: "/metrics",
+			want: "/metrics",
+		},
+		{
+			name: "callbacks endpoint with UUID",
+			path: "/callbacks/provision",
+			want: "/callbacks/provision",
+		},
+		{
+			name: "multiple UUIDs in path",
+			path: "/v1/providers/550e8400-e29b-41d4-a716-446655440000/leases/123e4567-e89b-12d3-a456-426614174000",
+			want: "/v1/providers/{uuid}/leases/{uuid}",
+		},
+		{
+			name: "uppercase UUID",
+			path: "/v1/leases/550E8400-E29B-41D4-A716-446655440000/connection",
+			want: "/v1/leases/{uuid}/connection",
+		},
+		{
+			name: "root path",
+			path: "/",
+			want: "/",
+		},
+		{
+			name: "empty path",
+			path: "",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizePath(tt.path)
+			if got != tt.want {
+				t.Errorf("normalizePath(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}

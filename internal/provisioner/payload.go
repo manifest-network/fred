@@ -371,7 +371,7 @@ func (s *PayloadStore) cleanup() error {
 	cutoff := now.Add(-s.ttl)
 	var staleCount int
 
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := retryBboltUpdate(s.db, func(tx *bolt.Tx) error {
 		payloadBucket := tx.Bucket(payloadBucketName)
 		metaBucket := tx.Bucket(payloadMetaBucketName)
 		c := metaBucket.Cursor()
