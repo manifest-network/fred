@@ -160,6 +160,22 @@ var (
 		Help:      "Chain query duration in seconds",
 		Buckets:   prometheus.DefBuckets,
 	}, []string{"query"})
+
+	// LeaseCacheHits tracks the number of lease cache hits.
+	LeaseCacheHits = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "chain",
+		Name:      "lease_cache_hits_total",
+		Help:      "Total number of lease cache hits",
+	})
+
+	// LeaseCacheMisses tracks the number of lease cache misses.
+	LeaseCacheMisses = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "chain",
+		Name:      "lease_cache_misses_total",
+		Help:      "Total number of lease cache misses",
+	})
 )
 
 // Watermill metrics

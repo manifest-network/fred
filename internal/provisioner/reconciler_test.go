@@ -1151,9 +1151,11 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
+	// Use MaxWorkers=1 to ensure sequential processing for this cancellation test
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
+		MaxWorkers:      1,
 	}, mockChain, router, nil)
 	if err != nil {
 		t.Fatalf("NewReconciler() error = %v", err)
@@ -1166,15 +1168,14 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
 	}
 
-	// Should have processed at most 2 leases before detecting cancellation
-	// (map iteration order is non-deterministic, so we may get 1 or 2)
+	// With sequential processing (MaxWorkers=1), should process exactly 1 before cancellation
 	mu.Lock()
 	finalCount := callCount
 	mu.Unlock()
 
-	// Due to map iteration, we should have stopped early but may have processed 1-2 items
-	if finalCount > 2 {
-		t.Errorf("expected at most 2 provision calls before cancellation, got %d", finalCount)
+	// First provision triggers cancel, second should see cancelled context
+	if finalCount != 1 {
+		t.Errorf("expected exactly 1 provision call before cancellation, got %d", finalCount)
 	}
 }
 
@@ -1211,9 +1212,11 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
+	// Use MaxWorkers=1 to ensure sequential processing for this cancellation test
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
+		MaxWorkers:      1,
 	}, mockChain, router, nil)
 	if err != nil {
 		t.Fatalf("NewReconciler() error = %v", err)
@@ -1226,13 +1229,14 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
 	}
 
-	// Should have processed at most 2 orphans before detecting cancellation
+	// With sequential processing (MaxWorkers=1), should process exactly 1 before cancellation
 	mu.Lock()
 	finalCount := deprovisionCount
 	mu.Unlock()
 
-	if finalCount > 2 {
-		t.Errorf("expected at most 2 deprovision calls before cancellation, got %d", finalCount)
+	// First deprovision triggers cancel, second should see cancelled context
+	if finalCount != 1 {
+		t.Errorf("expected exactly 1 deprovision call before cancellation, got %d", finalCount)
 	}
 }
 
@@ -1362,4 +1366,359 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	if !skus["unknown-sku"] {
 		t.Error("expected unknown-sku in K8s backend calls (routed to default)")
 	}
+}
+
+func TestReconciler_MaxWorkers_Default(t *testing.T) {
+	// Test that default MaxWorkers is applied
+	mockChain := &chain.MockClient{}
+
+	mockBackend := &mockReconcilerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		// MaxWorkers not set - should use default
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	if reconciler.maxWorkers != DefaultReconcileWorkers {
+		t.Errorf("maxWorkers = %d, want %d (default)", reconciler.maxWorkers, DefaultReconcileWorkers)
+	}
+}
+
+func TestReconciler_MaxWorkers_Custom(t *testing.T) {
+	// Test that custom MaxWorkers is respected
+	mockChain := &chain.MockClient{}
+
+	mockBackend := &mockReconcilerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		MaxWorkers:      5,
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	if reconciler.maxWorkers != 5 {
+		t.Errorf("maxWorkers = %d, want 5", reconciler.maxWorkers)
+	}
+}
+
+func TestReconciler_ParallelProcessing(t *testing.T) {
+	// Test that leases are processed in parallel
+	var (
+		mu             sync.Mutex
+		concurrentMax  int
+		currentWorkers int
+		totalProcessed int
+	)
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			// Create enough leases to test parallelism
+			leases := make([]billingtypes.Lease, 20)
+			for i := range leases {
+				leases[i] = billingtypes.Lease{
+					Uuid:   "lease-" + string(rune('a'+i)),
+					Tenant: "tenant",
+					State:  billingtypes.LEASE_STATE_PENDING,
+				}
+			}
+			return leases, nil
+		},
+	}
+
+	// Backend that tracks concurrent workers
+	mockBackend := &mockConcurrencyBackend{
+		name: "test",
+		onProvision: func() {
+			mu.Lock()
+			currentWorkers++
+			if currentWorkers > concurrentMax {
+				concurrentMax = currentWorkers
+			}
+			mu.Unlock()
+
+			// Simulate some work
+			time.Sleep(10 * time.Millisecond)
+
+			mu.Lock()
+			currentWorkers--
+			totalProcessed++
+			mu.Unlock()
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		MaxWorkers:      5, // Limit to 5 concurrent workers
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Verify all leases were processed
+	if totalProcessed != 20 {
+		t.Errorf("totalProcessed = %d, want 20", totalProcessed)
+	}
+
+	// Verify parallel processing occurred (more than 1 concurrent worker)
+	if concurrentMax < 2 {
+		t.Errorf("concurrentMax = %d, expected parallel processing (> 1)", concurrentMax)
+	}
+
+	// Verify MaxWorkers limit was respected
+	if concurrentMax > 5 {
+		t.Errorf("concurrentMax = %d, exceeded MaxWorkers limit of 5", concurrentMax)
+	}
+}
+
+func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
+	// Test that orphans are processed in parallel
+	var (
+		mu             sync.Mutex
+		concurrentMax  int
+		currentWorkers int
+		totalProcessed int
+	)
+
+	mockChain := &chain.MockClient{
+		// No leases - all provisions are orphans
+	}
+
+	// Create many orphan provisions
+	provisions := make([]backend.ProvisionInfo, 15)
+	for i := range provisions {
+		provisions[i] = backend.ProvisionInfo{
+			LeaseUUID: "orphan-" + string(rune('a'+i)),
+			Status:    backend.ProvisionStatusReady,
+		}
+	}
+
+	mockBackend := &mockConcurrencyBackend{
+		name:       "test",
+		provisions: provisions,
+		onDeprovision: func() {
+			mu.Lock()
+			currentWorkers++
+			if currentWorkers > concurrentMax {
+				concurrentMax = currentWorkers
+			}
+			mu.Unlock()
+
+			// Simulate some work
+			time.Sleep(10 * time.Millisecond)
+
+			mu.Lock()
+			currentWorkers--
+			totalProcessed++
+			mu.Unlock()
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		MaxWorkers:      4, // Limit to 4 concurrent workers
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Verify all orphans were processed
+	if totalProcessed != 15 {
+		t.Errorf("totalProcessed = %d, want 15", totalProcessed)
+	}
+
+	// Verify parallel processing occurred
+	if concurrentMax < 2 {
+		t.Errorf("concurrentMax = %d, expected parallel processing (> 1)", concurrentMax)
+	}
+
+	// Verify MaxWorkers limit was respected
+	if concurrentMax > 4 {
+		t.Errorf("concurrentMax = %d, exceeded MaxWorkers limit of 4", concurrentMax)
+	}
+}
+
+func TestReconciler_ParallelBackendFetching(t *testing.T) {
+	// Test that backend provisions are fetched in parallel
+	var (
+		mu             sync.Mutex
+		concurrentMax  int
+		currentWorkers int
+		fetchCount     int
+	)
+
+	mockChain := &chain.MockClient{}
+
+	// Create multiple backends that track concurrent fetches
+	backend1 := &mockConcurrencyBackend{
+		name: "backend-1",
+		onListProvisions: func() {
+			mu.Lock()
+			currentWorkers++
+			fetchCount++
+			if currentWorkers > concurrentMax {
+				concurrentMax = currentWorkers
+			}
+			mu.Unlock()
+
+			// Simulate network latency
+			time.Sleep(20 * time.Millisecond)
+
+			mu.Lock()
+			currentWorkers--
+			mu.Unlock()
+		},
+	}
+
+	backend2 := &mockConcurrencyBackend{
+		name: "backend-2",
+		onListProvisions: func() {
+			mu.Lock()
+			currentWorkers++
+			fetchCount++
+			if currentWorkers > concurrentMax {
+				concurrentMax = currentWorkers
+			}
+			mu.Unlock()
+
+			time.Sleep(20 * time.Millisecond)
+
+			mu.Lock()
+			currentWorkers--
+			mu.Unlock()
+		},
+	}
+
+	backend3 := &mockConcurrencyBackend{
+		name: "backend-3",
+		onListProvisions: func() {
+			mu.Lock()
+			currentWorkers++
+			fetchCount++
+			if currentWorkers > concurrentMax {
+				concurrentMax = currentWorkers
+			}
+			mu.Unlock()
+
+			time.Sleep(20 * time.Millisecond)
+
+			mu.Lock()
+			currentWorkers--
+			mu.Unlock()
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backend1, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: backend2, Match: backend.MatchCriteria{SKUPrefix: "vm-"}},
+			{Backend: backend3, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() error = %v", err)
+	}
+
+	ctx := context.Background()
+	if err := reconciler.ReconcileAll(ctx); err != nil {
+		t.Errorf("ReconcileAll() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Verify all backends were fetched
+	if fetchCount != 3 {
+		t.Errorf("fetchCount = %d, want 3", fetchCount)
+	}
+
+	// Verify parallel fetching occurred (all 3 should run concurrently)
+	if concurrentMax < 2 {
+		t.Errorf("concurrentMax = %d, expected parallel backend fetching (> 1)", concurrentMax)
+	}
+}
+
+// mockConcurrencyBackend is a test backend for verifying parallel execution.
+type mockConcurrencyBackend struct {
+	name             string
+	provisions       []backend.ProvisionInfo
+	onProvision      func()
+	onDeprovision    func()
+	onListProvisions func()
+}
+
+func (m *mockConcurrencyBackend) Name() string {
+	return m.name
+}
+
+func (m *mockConcurrencyBackend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
+	if m.onProvision != nil {
+		m.onProvision()
+	}
+	return nil
+}
+
+func (m *mockConcurrencyBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
+	return nil, nil
+}
+
+func (m *mockConcurrencyBackend) Deprovision(ctx context.Context, leaseUUID string) error {
+	if m.onDeprovision != nil {
+		m.onDeprovision()
+	}
+	return nil
+}
+
+func (m *mockConcurrencyBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
+	if m.onListProvisions != nil {
+		m.onListProvisions()
+	}
+	return m.provisions, nil
+}
+
+func (m *mockConcurrencyBackend) Health(ctx context.Context) error {
+	return nil
 }

@@ -9,13 +9,23 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+)
+
+// Default concurrency limits for reconciliation.
+const (
+	// DefaultReconcileWorkers is the default number of concurrent workers for
+	// processing leases and orphans during reconciliation.
+	DefaultReconcileWorkers = 10
 )
 
 // errLeaseAlreadyInFlight indicates the lease is already being provisioned.
@@ -40,6 +50,7 @@ type Reconciler struct {
 	manager         *Manager // For tracking in-flight provisions (shared state with event-driven path)
 
 	interval    time.Duration
+	maxWorkers  int         // Maximum concurrent workers for lease processing
 	reconciling atomic.Bool // Non-blocking flag to prevent concurrent reconciliation
 }
 
@@ -48,6 +59,7 @@ type ReconcilerConfig struct {
 	ProviderUUID    string
 	CallbackBaseURL string
 	Interval        time.Duration // How often to run periodic reconciliation
+	MaxWorkers      int           // Maximum concurrent workers (default: 10)
 }
 
 // NewReconciler creates a new reconciler.
@@ -71,6 +83,12 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 		interval = 5 * time.Minute
 	}
 
+	// Default max workers
+	maxWorkers := cfg.MaxWorkers
+	if maxWorkers <= 0 {
+		maxWorkers = DefaultReconcileWorkers
+	}
+
 	return &Reconciler{
 		providerUUID:    cfg.ProviderUUID,
 		callbackBaseURL: cfg.CallbackBaseURL,
@@ -78,6 +96,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 		backendRouter:   backendRouter,
 		manager:         manager,
 		interval:        interval,
+		maxWorkers:      maxWorkers,
 	}, nil
 }
 
@@ -149,30 +168,10 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		"active", len(activeLeases),
 	)
 
-	// 2. Get provisions from ALL backends
-	allProvisions := make(map[string]backend.ProvisionInfo)
-	for _, b := range r.backendRouter.Backends() {
-		provisions, err := b.ListProvisions(ctx)
-		if err != nil {
-			slog.Error("failed to list provisions from backend",
-				"backend", b.Name(),
-				"error", err,
-			)
-			// Continue with other backends - partial reconciliation is better than none
-			continue
-		}
-
-		for _, p := range provisions {
-			// Create an enriched copy with backend name (p is already a copy since
-			// ProvisionInfo is a value type; we're not modifying the original slice)
-			p.BackendName = b.Name()
-			allProvisions[p.LeaseUUID] = p
-		}
-
-		slog.Debug("fetched backend provisions",
-			"backend", b.Name(),
-			"count", len(provisions),
-		)
+	// 2. Get provisions from ALL backends (in parallel)
+	allProvisions, err := r.fetchAllProvisions(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch provisions: %w", err)
 	}
 
 	slog.Info("fetched backend provisions", "total", len(allProvisions))
@@ -182,195 +181,104 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	// 3. Reconcile each chain lease
+	// 3. Reconcile each chain lease (with bounded concurrency)
+	// First, collect all lease UUIDs to identify orphans after processing
+	processedLeases := make(map[string]struct{}, len(chainLeases))
+	for leaseUUID := range chainLeases {
+		processedLeases[leaseUUID] = struct{}{}
+	}
+
 	var (
-		provisioned  int
-		acknowledged int
-		anomalies    int
+		provisioned  atomic.Int32
+		acknowledged atomic.Int32
+		anomalies    atomic.Int32
 	)
 
-	for leaseUUID, lease := range chainLeases {
-		// Check for context cancellation between iterations to allow graceful shutdown
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(r.maxWorkers)
 
+	for leaseUUID, lease := range chainLeases {
+		leaseUUID := leaseUUID // capture for goroutine
+		lease := lease
 		provision, isProvisioned := allProvisions[leaseUUID]
 
-		switch {
-		case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:
-			// Check if lease requires a payload (has MetaHash)
-			if len(lease.MetaHash) > 0 {
-				// Lease needs a payload - check if we have one stored
-				if r.manager != nil && r.manager.HasPayload(leaseUUID) {
-					// We have the payload - start provisioning with it
-					if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
-						if errors.Is(err, errLeaseAlreadyInFlight) {
-							slog.Debug("reconcile: lease already in-flight, skipping",
-								"lease_uuid", leaseUUID,
-							)
-						} else {
-							slog.Error("reconcile: failed to start provisioning with payload",
-								"lease_uuid", leaseUUID,
-								"error", err,
-							)
-						}
-					} else {
-						provisioned++
-					}
-				} else {
-					// No payload yet - wait for tenant to upload
-					slog.Debug("reconcile: lease awaiting payload upload",
-						"lease_uuid", leaseUUID,
-						"tenant", lease.Tenant,
-					)
-				}
-			} else {
-				// No MetaHash - start provisioning immediately
-				if err := r.startProvisioning(ctx, lease); err != nil {
-					if errors.Is(err, errLeaseAlreadyInFlight) {
-						slog.Debug("reconcile: lease already in-flight, skipping",
-							"lease_uuid", leaseUUID,
-						)
-					} else {
-						slog.Error("reconcile: failed to start provisioning",
-							"lease_uuid", leaseUUID,
-							"error", err,
-						)
-					}
-				} else {
-					provisioned++
-				}
-			}
+		g.Go(func() error {
+			r.processLease(gctx, leaseUUID, lease, provision, isProvisioned,
+				&provisioned, &acknowledged, &anomalies)
+			return nil // Don't fail fast - continue processing other leases
+		})
+	}
 
-		case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusReady:
-			// Provisioned but not acknowledged - acknowledge now
-			if err := r.acknowledgeLease(ctx, leaseUUID); err != nil {
-				slog.Error("reconcile: failed to acknowledge lease",
-					"lease_uuid", leaseUUID,
-					"error", err,
-				)
-			} else {
-				acknowledged++
-			}
+	// Wait for all lease processing to complete
+	if err := g.Wait(); err != nil {
+		return err
+	}
 
-		case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusProvisioning:
-			// Provisioning in progress - wait for callback
-			slog.Debug("reconcile: lease provisioning in progress",
-				"lease_uuid", leaseUUID,
-			)
+	// Check for context cancellation after lease processing
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
-		case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusFailed:
-			// Provisioning failed - reject the lease so tenant's credit is released
-			slog.Warn("reconcile: lease provisioning failed, rejecting",
-				"lease_uuid", leaseUUID,
-				"tenant", lease.Tenant,
-			)
-			if err := r.rejectLease(ctx, leaseUUID, "provisioning failed"); err != nil {
-				slog.Error("reconcile: failed to reject lease",
-					"lease_uuid", leaseUUID,
-					"error", err,
-				)
-			}
-
-		case lease.State == billingtypes.LEASE_STATE_ACTIVE && !isProvisioned:
-			// Anomaly: Lease is active but not provisioned
-			// This shouldn't happen in normal operation
-			slog.Warn("reconcile: anomaly - active lease not provisioned",
-				"lease_uuid", leaseUUID,
-				"tenant", lease.Tenant,
-			)
-			anomalies++
-			// Attempt to provision
-			if err := r.startProvisioning(ctx, lease); err != nil {
-				if !errors.Is(err, errLeaseAlreadyInFlight) {
-					slog.Error("reconcile: failed to provision anomalous lease",
-						"lease_uuid", leaseUUID,
-						"error", err,
-					)
-				}
-			}
-
-		case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned:
-			// Healthy state - nothing to do
-		}
-
-		// Remove from allProvisions to track orphans
+	// Remove processed leases from allProvisions to identify orphans
+	for leaseUUID := range processedLeases {
 		delete(allProvisions, leaseUUID)
 	}
 
-	// 4. Remaining provisions have no lease - check for orphans
+	// 4. Remaining provisions have no lease - check for orphans (with bounded concurrency)
 	// Only deprovision orphans that belong to this provider to avoid
 	// interfering with other providers sharing the same backend.
-	var orphans int
+	var orphans atomic.Int32
+
+	og, ogctx := errgroup.WithContext(ctx)
+	og.SetLimit(r.maxWorkers)
+
 	for leaseUUID, provision := range allProvisions {
-		// Check for context cancellation between iterations
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+		leaseUUID := leaseUUID // capture for goroutine
+		provision := provision
 
-		// Skip provisions that belong to a different provider
-		if provision.ProviderUUID != "" && provision.ProviderUUID != r.providerUUID {
-			slog.Debug("reconcile: skipping provision owned by different provider",
-				"lease_uuid", leaseUUID,
-				"provision_provider", provision.ProviderUUID,
-				"our_provider", r.providerUUID,
-			)
-			continue
-		}
+		og.Go(func() error {
+			r.processOrphan(ogctx, leaseUUID, provision, &orphans)
+			return nil // Don't fail fast - continue processing other orphans
+		})
+	}
 
-		// Look up the backend that originally provisioned this resource.
-		// We must use the same backend for deprovisioning - falling back to a
-		// different backend would fail since it doesn't have the resource.
-		b := r.backendRouter.GetBackendByName(provision.BackendName)
-		if b == nil {
-			// Backend is no longer configured. This orphan requires manual cleanup.
-			// Do NOT fall back to default backend - it can't deprovision resources
-			// from a different backend system.
-			slog.Error("reconcile: orphan provision on unconfigured backend - MANUAL CLEANUP REQUIRED",
-				"lease_uuid", leaseUUID,
-				"backend", provision.BackendName,
-			)
-			continue
-		}
+	// Wait for all orphan processing to complete
+	if err := og.Wait(); err != nil {
+		return err
+	}
 
-		orphans++
-		slog.Warn("reconcile: orphan provision found, deprovisioning",
-			"lease_uuid", leaseUUID,
-			"backend", provision.BackendName,
-		)
-
-		if err := b.Deprovision(ctx, leaseUUID); err != nil {
-			slog.Error("reconcile: failed to deprovision orphan",
-				"lease_uuid", leaseUUID,
-				"backend", b.Name(),
-				"error", err,
-			)
-		}
+	// Check for context cancellation after orphan processing
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	// Record action metrics
-	if provisioned > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionProvisioned).Add(float64(provisioned))
+	provisionedCount := provisioned.Load()
+	acknowledgedCount := acknowledged.Load()
+	anomaliesCount := anomalies.Load()
+	orphansCount := orphans.Load()
+
+	if provisionedCount > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionProvisioned).Add(float64(provisionedCount))
 	}
-	if acknowledged > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAcknowledged).Add(float64(acknowledged))
+	if acknowledgedCount > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAcknowledged).Add(float64(acknowledgedCount))
 	}
-	if anomalies > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAnomaly).Add(float64(anomalies))
+	if anomaliesCount > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAnomaly).Add(float64(anomaliesCount))
 	}
-	if orphans > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionDeprovisioned).Add(float64(orphans))
+	if orphansCount > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionDeprovisioned).Add(float64(orphansCount))
 	}
 
 	// Record outcome
 	metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
 
 	slog.Info("reconciliation complete",
-		"provisioned", provisioned,
-		"acknowledged", acknowledged,
-		"anomalies", anomalies,
-		"orphans", orphans,
+		"provisioned", provisionedCount,
+		"acknowledged", acknowledgedCount,
+		"anomalies", anomaliesCount,
+		"orphans", orphansCount,
 	)
 
 	return nil
@@ -513,6 +421,216 @@ func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) 
 	)
 
 	return nil
+}
+
+// fetchAllProvisions retrieves provisions from all backends in parallel.
+func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend.ProvisionInfo, error) {
+	backends := r.backendRouter.Backends()
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(len(backends)) // Query all backends concurrently
+
+	var mu sync.Mutex
+	allProvisions := make(map[string]backend.ProvisionInfo)
+
+	for _, b := range backends {
+		b := b // capture for goroutine
+		g.Go(func() error {
+			provisions, err := b.ListProvisions(gctx)
+			if err != nil {
+				slog.Error("failed to list provisions from backend",
+					"backend", b.Name(),
+					"error", err,
+				)
+				// Don't fail - partial reconciliation is better than none
+				return nil
+			}
+
+			mu.Lock()
+			for _, p := range provisions {
+				p.BackendName = b.Name()
+				allProvisions[p.LeaseUUID] = p
+			}
+			mu.Unlock()
+
+			slog.Debug("fetched backend provisions",
+				"backend", b.Name(),
+				"count", len(provisions),
+			)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return allProvisions, nil
+}
+
+// processLease handles reconciliation logic for a single lease.
+func (r *Reconciler) processLease(
+	ctx context.Context,
+	leaseUUID string,
+	lease billingtypes.Lease,
+	provision backend.ProvisionInfo,
+	isProvisioned bool,
+	provisioned, acknowledged, anomalies *atomic.Int32,
+) {
+	// Check context before doing any work to respect cancellation
+	if ctx.Err() != nil {
+		return
+	}
+
+	switch {
+	case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:
+		// Check if lease requires a payload (has MetaHash)
+		if len(lease.MetaHash) > 0 {
+			// Lease needs a payload - check if we have one stored
+			if r.manager != nil && r.manager.HasPayload(leaseUUID) {
+				// We have the payload - start provisioning with it
+				if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
+					if errors.Is(err, errLeaseAlreadyInFlight) {
+						slog.Debug("reconcile: lease already in-flight, skipping",
+							"lease_uuid", leaseUUID,
+						)
+					} else {
+						slog.Error("reconcile: failed to start provisioning with payload",
+							"lease_uuid", leaseUUID,
+							"error", err,
+						)
+					}
+				} else {
+					provisioned.Add(1)
+				}
+			} else {
+				// No payload yet - wait for tenant to upload
+				slog.Debug("reconcile: lease awaiting payload upload",
+					"lease_uuid", leaseUUID,
+					"tenant", lease.Tenant,
+				)
+			}
+		} else {
+			// No MetaHash - start provisioning immediately
+			if err := r.startProvisioning(ctx, lease); err != nil {
+				if errors.Is(err, errLeaseAlreadyInFlight) {
+					slog.Debug("reconcile: lease already in-flight, skipping",
+						"lease_uuid", leaseUUID,
+					)
+				} else {
+					slog.Error("reconcile: failed to start provisioning",
+						"lease_uuid", leaseUUID,
+						"error", err,
+					)
+				}
+			} else {
+				provisioned.Add(1)
+			}
+		}
+
+	case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusReady:
+		// Provisioned but not acknowledged - acknowledge now
+		if err := r.acknowledgeLease(ctx, leaseUUID); err != nil {
+			slog.Error("reconcile: failed to acknowledge lease",
+				"lease_uuid", leaseUUID,
+				"error", err,
+			)
+		} else {
+			acknowledged.Add(1)
+		}
+
+	case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusProvisioning:
+		// Provisioning in progress - wait for callback
+		slog.Debug("reconcile: lease provisioning in progress",
+			"lease_uuid", leaseUUID,
+		)
+
+	case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusFailed:
+		// Provisioning failed - reject the lease so tenant's credit is released
+		slog.Warn("reconcile: lease provisioning failed, rejecting",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+		)
+		if err := r.rejectLease(ctx, leaseUUID, "provisioning failed"); err != nil {
+			slog.Error("reconcile: failed to reject lease",
+				"lease_uuid", leaseUUID,
+				"error", err,
+			)
+		}
+
+	case lease.State == billingtypes.LEASE_STATE_ACTIVE && !isProvisioned:
+		// Anomaly: Lease is active but not provisioned
+		// This shouldn't happen in normal operation
+		slog.Warn("reconcile: anomaly - active lease not provisioned",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+		)
+		anomalies.Add(1)
+		// Attempt to provision
+		if err := r.startProvisioning(ctx, lease); err != nil {
+			if !errors.Is(err, errLeaseAlreadyInFlight) {
+				slog.Error("reconcile: failed to provision anomalous lease",
+					"lease_uuid", leaseUUID,
+					"error", err,
+				)
+			}
+		}
+
+	case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned:
+		// Healthy state - nothing to do
+	}
+}
+
+// processOrphan handles deprovisioning of an orphan provision.
+func (r *Reconciler) processOrphan(
+	ctx context.Context,
+	leaseUUID string,
+	provision backend.ProvisionInfo,
+	orphans *atomic.Int32,
+) {
+	// Check context before doing any work to respect cancellation
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Skip provisions that belong to a different provider
+	if provision.ProviderUUID != "" && provision.ProviderUUID != r.providerUUID {
+		slog.Debug("reconcile: skipping provision owned by different provider",
+			"lease_uuid", leaseUUID,
+			"provision_provider", provision.ProviderUUID,
+			"our_provider", r.providerUUID,
+		)
+		return
+	}
+
+	// Look up the backend that originally provisioned this resource.
+	// We must use the same backend for deprovisioning - falling back to a
+	// different backend would fail since it doesn't have the resource.
+	b := r.backendRouter.GetBackendByName(provision.BackendName)
+	if b == nil {
+		// Backend is no longer configured. This orphan requires manual cleanup.
+		// Do NOT fall back to default backend - it can't deprovision resources
+		// from a different backend system.
+		slog.Error("reconcile: orphan provision on unconfigured backend - MANUAL CLEANUP REQUIRED",
+			"lease_uuid", leaseUUID,
+			"backend", provision.BackendName,
+		)
+		return
+	}
+
+	orphans.Add(1)
+	slog.Warn("reconcile: orphan provision found, deprovisioning",
+		"lease_uuid", leaseUUID,
+		"backend", provision.BackendName,
+	)
+
+	if err := b.Deprovision(ctx, leaseUUID); err != nil {
+		slog.Error("reconcile: failed to deprovision orphan",
+			"lease_uuid", leaseUUID,
+			"backend", b.Name(),
+			"error", err,
+		)
+	}
 }
 
 // Start begins periodic reconciliation.
