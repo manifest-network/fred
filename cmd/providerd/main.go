@@ -364,6 +364,10 @@ func run(cmd *cobra.Command, args []string) error {
 	// This triggers ctx.Done() in all component loops.
 	cancel()
 
+	// Stop withdrawal scheduler and wait for any in-flight withdrawal to complete.
+	// This ensures we don't interrupt a withdrawal transaction mid-flight.
+	withdrawScheduler.Stop()
+
 	// Close event subscriber to unblock any components waiting on events.
 	// Components check ctx.Done() first, so they'll exit cleanly.
 	eventSub.Close()

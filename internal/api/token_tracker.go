@@ -240,14 +240,3 @@ func (t *TokenTracker) cleanup() error {
 
 	return err
 }
-
-// Stats returns current statistics about the token tracker.
-func (t *TokenTracker) Stats() (total int, err error) {
-	err = t.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketName)
-		total = b.Stats().KeyN
-		return nil
-	})
-	return
-}
-
