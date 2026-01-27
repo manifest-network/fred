@@ -15,19 +15,23 @@ All tests use mock backends to isolate Fred's event processing performance from 
 
 ### Burst Traffic Tests
 
-Tests publish all events as fast as possible, then measure processing time.
+Tests publish all events as fast as possible, then measure total processing time.
 
-| Test | Events | Goroutines | Publishing Rate | Processing Rate | Success | Total Time |
-|------|--------|------------|-----------------|-----------------|---------|------------|
-| 10K | 10,000 | 50 | 147,921/sec | 100% | 100% | < 1s |
-| 50K | 50,000 | 100 | 148,318/sec | 100% | 100% | ~1s |
-| 100K | 100,000 | 200 | 143,552/sec | 58,890/sec | 100% | ~2s |
-| 500K | 500,000 | 500 | ~150,000/sec | ~95,000/sec | 100% | 8.7s |
-| 1M | 1,000,000 | 1,000 | 147,166/sec | ~90,000/sec | 100% | 17.7s |
+| Test | Events | Goroutines | Publishing Rate | Throughput | Success | Total Time |
+|------|--------|------------|-----------------|------------|---------|------------|
+| 10K | 10,000 | 50 | 147,921/sec | * | 100% | < 1s |
+| 50K | 50,000 | 100 | 148,318/sec | * | 100% | < 1s |
+| 100K | 100,000 | 200 | 143,552/sec | 58,890/sec | 100% | 1.7s |
+| 500K | 500,000 | 500 | ~147,000/sec | ~57,000/sec | 100% | 8.7s |
+| 1M | 1,000,000 | 1,000 | 147,166/sec | 56,400/sec | 100% | 17.7s |
+
+*Throughput = Events / Total Time (end-to-end including publish + process)*
+*\* Tests completed too quickly to measure precise throughput separately from publishing*
 
 **Key Findings:**
 - Publishing rate consistently hits **~147,000 events/sec**
-- End-to-end processing sustains **90,000+ events/sec**
+- End-to-end throughput sustains **56,000+ events/sec** (including all overhead)
+- Instantaneous processing rate during tests reaches **90,000+ events/sec**
 - 100% success rate across all tests
 - No event loss under burst conditions
 
@@ -95,12 +99,11 @@ Tests simulate realistic backend response times to verify concurrent processing.
 
 | Metric | Fred | K8s Operators (Kubeflow) |
 |--------|------|--------------------------|
-| Event processing | 90,000+/sec | ~17/sec (1000/min) |
+| Event throughput | 56,000+/sec | ~17/sec (1000/min) |
 | Default queue rate | N/A (async) | 50 items/sec |
-| Controller workers | Concurrent handlers | 10-30 |
-| API latency under load | < 1ms | 600ms+ |
+| Handler model | Concurrent goroutines | 10-30 workers |
 
-Fred processes events **~5,000x faster** than typical Kubernetes operators. Note that K8s operators perform real API calls, while these benchmarks use mock backends.
+Fred processes events **~3,000x faster** than typical Kubernetes operators. Note that K8s operators perform real API calls to the Kubernetes control plane, while these benchmarks use mock backends with no I/O.
 
 ### Fred vs Watermill Claims
 
@@ -114,7 +117,7 @@ In production, the limiting factors will be:
 2. **Backend provisioning time** (seconds to minutes) - real work takes time
 3. **Network latency** - round-trip to backends and chain
 
-Fred's 90,000+ events/sec capacity far exceeds realistic chain event rates, ensuring **Fred will never be the bottleneck**.
+Fred's 56,000+ events/sec throughput far exceeds realistic chain event rates, ensuring **Fred will never be the bottleneck**.
 
 ## Running Benchmarks
 
@@ -169,7 +172,7 @@ go test -bench=. ./internal/provisioner/ -run=^$ -bench=PayloadStore
 
 Based on benchmark results:
 
-1. **Watermill GoChannel buffer**: Default 256 is sufficient for most workloads
+1. **Watermill GoChannel buffer**: Production uses unbuffered (default), benchmarks use 1000-10000
 2. **Handler concurrency**: Watermill handles this automatically with goroutines
 3. **Batch acknowledgments**: Ack batcher (50 items / 500ms) reduces chain transactions
 4. **PayloadStore batch size**: 100-200 provides good write throughput

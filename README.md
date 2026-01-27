@@ -698,6 +698,19 @@ Chain State (leases)     Backend State (provisions)
 - **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
 - **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses
 
+## Performance
+
+Fred's event processing pipeline has been extensively benchmarked:
+
+| Metric | Result |
+|--------|--------|
+| Publishing rate | 147,000 events/sec |
+| End-to-end throughput | 56,000+ events/sec |
+| Sustained load | 5,000 events/sec (30s, 100% success) |
+| 1M event test | 17.7 seconds, 100% processed |
+
+See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test results, and comparison with other solutions.
+
 ## Dependencies
 
 - Go 1.24+ (uses `sync.WaitGroup.Go()`, `range` over integers)
