@@ -13,8 +13,11 @@ import (
 
 // mockAckChainClient implements ChainClient for ack batcher tests
 type mockAckChainClient struct {
-	acknowledgeFunc func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
-	getLeaseFunc    func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
+	acknowledgeFunc      func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
+	getLeaseFunc         func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
+	getPendingLeasesFunc func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
+	// pendingLeases is used when getPendingLeasesFunc is not set
+	pendingLeases []string
 }
 
 func (m *mockAckChainClient) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
@@ -35,15 +38,34 @@ func (m *mockAckChainClient) GetLease(ctx context.Context, leaseUUID string) (*b
 	}, nil
 }
 
+func (m *mockAckChainClient) GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+	if m.getPendingLeasesFunc != nil {
+		return m.getPendingLeasesFunc(ctx, providerUUID)
+	}
+	// Default: return leases from pendingLeases list, or treat all as pending if not set
+	var leases []billingtypes.Lease
+	for _, uuid := range m.pendingLeases {
+		leases = append(leases, billingtypes.Lease{
+			Uuid:  uuid,
+			State: billingtypes.LEASE_STATE_PENDING,
+		})
+	}
+	return leases, nil
+}
+
 func (m *mockAckChainClient) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 	return 0, nil, nil
 }
+
+const testProviderUUID = "01234567-89ab-cdef-0123-456789abcdef"
 
 func TestAckBatcher_BatchesMultipleRequests(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
 
 	client := &mockAckChainClient{
+		// All requested leases are pending
+		pendingLeases: []string{"lease-a", "lease-b", "lease-c", "lease-d", "lease-e"},
 		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			mu.Lock()
 			batches = append(batches, leaseUUIDs)
@@ -53,6 +75,7 @@ func TestAckBatcher_BatchesMultipleRequests(t *testing.T) {
 	}
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
 		BatchInterval: 100 * time.Millisecond,
 		BatchSize:     10,
 	})
@@ -107,6 +130,7 @@ func TestAckBatcher_FallsBackToIndividualOnBatchFailure(t *testing.T) {
 	var individualCalls []string
 
 	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-a", "lease-b", "lease-c"},
 		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			count := callCount.Add(1)
 
@@ -124,6 +148,7 @@ func TestAckBatcher_FallsBackToIndividualOnBatchFailure(t *testing.T) {
 	}
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
 		BatchInterval: 50 * time.Millisecond,
 		BatchSize:     10,
 	})
@@ -174,6 +199,7 @@ func TestAckBatcher_FlushesOnBatchSizeReached(t *testing.T) {
 	var batches [][]string
 
 	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-a", "lease-b", "lease-c"},
 		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			mu.Lock()
 			batches = append(batches, leaseUUIDs)
@@ -183,6 +209,7 @@ func TestAckBatcher_FlushesOnBatchSizeReached(t *testing.T) {
 	}
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
 		BatchInterval: 10 * time.Second, // Long interval so only batch size triggers flush
 		BatchSize:     3,
 	})
@@ -220,6 +247,7 @@ func TestAckBatcher_FlushesOnBatchSizeReached(t *testing.T) {
 
 func TestAckBatcher_ContextCancellation(t *testing.T) {
 	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-1"},
 		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			// Simulate slow acknowledgment
 			select {
@@ -232,6 +260,7 @@ func TestAckBatcher_ContextCancellation(t *testing.T) {
 	}
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
 		BatchInterval: 10 * time.Second,
 		BatchSize:     100,
 	})
@@ -270,18 +299,10 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 	var ackCalls [][]string
 
 	client := &mockAckChainClient{
-		getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-			// lease-a and lease-c are already ACTIVE (already acknowledged)
-			// lease-b is still PENDING (needs acknowledgment)
-			if leaseUUID == "lease-a" || leaseUUID == "lease-c" {
-				return &billingtypes.Lease{
-					Uuid:  leaseUUID,
-					State: billingtypes.LEASE_STATE_ACTIVE,
-				}, nil
-			}
-			return &billingtypes.Lease{
-				Uuid:  leaseUUID,
-				State: billingtypes.LEASE_STATE_PENDING,
+		// Only lease-b is pending; lease-a and lease-c are already acknowledged
+		getPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-b", State: billingtypes.LEASE_STATE_PENDING},
 			}, nil
 		},
 		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
@@ -293,6 +314,7 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 	}
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
 		BatchInterval: 50 * time.Millisecond,
 		BatchSize:     10,
 	})
@@ -363,9 +385,9 @@ func TestAckBatcher_SkipsNotFoundLeases(t *testing.T) {
 	var ackCalled atomic.Bool
 
 	client := &mockAckChainClient{
-		getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-			// Lease doesn't exist
-			return nil, nil
+		// Return empty list - no pending leases exist
+		getPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{}, nil
 		},
 		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			ackCalled.Store(true)
@@ -374,6 +396,7 @@ func TestAckBatcher_SkipsNotFoundLeases(t *testing.T) {
 	}
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
 		BatchInterval: 50 * time.Millisecond,
 		BatchSize:     10,
 	})

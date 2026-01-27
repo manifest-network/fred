@@ -377,7 +377,10 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 		// Collect results to send after transaction commits
 		results := make([]writeResult, len(batch))
 
-		// Process all operations in a single transaction
+		// Process all operations in a single transaction.
+		// Individual operation errors are recorded per-result but don't cause
+		// transaction rollback - each lease's payload is independent, so one
+		// failed operation shouldn't block unrelated operations in the batch.
 		err := s.db.Update(func(tx *bolt.Tx) error {
 			payloadBucket := tx.Bucket(payloadBucketName)
 			metaBucket := tx.Bucket(payloadMetaBucketName)

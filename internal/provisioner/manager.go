@@ -59,6 +59,7 @@ func BuildCallbackURL(baseURL string) string {
 // ChainClient defines the chain operations needed by the provisioner.
 type ChainClient interface {
 	GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
+	GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
 	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
@@ -157,6 +158,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	}
 
 	ackBatcher := NewAckBatcher(chainClient, AckBatcherConfig{
+		ProviderUUID:  cfg.ProviderUUID,
 		BatchInterval: ackBatchInterval,
 		BatchSize:     ackBatchSize,
 	})

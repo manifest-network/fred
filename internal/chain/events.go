@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"github.com/manifest-network/fred/internal/metrics"
@@ -97,9 +98,11 @@ type EventSubscriberConfig struct {
 
 // NewEventSubscriber creates a new event subscriber.
 func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
-	// Validate provider UUID to prevent query injection (defense in depth)
-	if cfg.ProviderUUID == "" {
-		return nil, fmt.Errorf("provider UUID is required")
+	// Validate provider UUID format to prevent query injection (defense in depth)
+	// The UUID is interpolated into WebSocket subscription queries, so we must ensure
+	// it contains only valid UUID characters (hex digits and dashes) to prevent injection.
+	if _, err := uuid.Parse(cfg.ProviderUUID); err != nil {
+		return nil, fmt.Errorf("invalid provider UUID format: %w", err)
 	}
 
 	// Apply defaults

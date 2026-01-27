@@ -176,11 +176,42 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `api_listen_addr` | API server listen address | `:8080` |
 | `withdraw_interval` | How often to withdraw funds | `1h` |
 | `bech32_prefix` | Address prefix for validation | `manifest` |
-| `rate_limit_rps` | API rate limit (requests/second) | `10` |
-| `rate_limit_burst` | Rate limit burst size | `20` |
+| `rate_limit_rps` | Global API rate limit (requests/second) | `10` |
+| `rate_limit_burst` | Global rate limit burst size | `20` |
+| `tenant_rate_limit_rps` | Per-tenant rate limit (requests/second) | `5` |
+| `tenant_rate_limit_burst` | Per-tenant burst size | `10` |
+| `trusted_proxies` | CIDR blocks of trusted proxies for X-Forwarded-For | `[]` |
 | `backends` | List of backend configurations | (required) |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
 | `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
+| `reconciliation_interval` | How often to run reconciliation | `5m` |
+| `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional) |
+| `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
+| `payload_store_ttl` | TTL for stored payloads | `1h` |
+| `payload_store_cleanup_freq` | How often to clean up expired payloads | `10m` |
+| `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
+
+### Advanced Configuration
+
+These options have sensible defaults but can be tuned for specific environments:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `http_read_timeout` | HTTP server read timeout | `15s` |
+| `http_write_timeout` | HTTP server write timeout | `15s` |
+| `http_idle_timeout` | HTTP server idle timeout | `60s` |
+| `websocket_ping_interval` | WebSocket ping interval | `30s` |
+| `websocket_reconnect_initial` | Initial WebSocket reconnect delay | `1s` |
+| `websocket_reconnect_max` | Maximum WebSocket reconnect delay | `60s` |
+| `tx_poll_interval` | Transaction confirmation poll interval | `500ms` |
+| `tx_timeout` | Transaction confirmation timeout | `30s` |
+| `query_page_limit` | Page size for chain queries | `100` |
+| `max_withdraw_iterations` | Max iterations for withdrawal batching | `100` |
+| `gas_limit` | Gas limit for transactions | `500000` |
+| `gas_price` | Gas price (in smallest denom) | `25` |
+| `fee_denom` | Fee denomination | `umfx` |
+| `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |
+| `credit_check_retry_interval` | Retry interval after credit check errors | `30s` |
 
 ### TLS Configuration
 
@@ -289,16 +320,18 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "chain_state": "PENDING",
-  "provisioning_status": "in_flight",
-  "has_payload": true
+  "state": "PENDING",
+  "requires_payload": true,
+  "payload_received": false,
+  "provisioning_started": false
 }
 ```
 
-**Provisioning Status Values:**
-- `in_flight` - Provisioning is in progress
-- `provisioned` - Resource is provisioned (lease should be ACTIVE)
-- `pending` - Awaiting provisioning (may be waiting for payload)
+**Fields:**
+- `state` - Chain lease state (PENDING, ACTIVE, CLOSED, EXPIRED)
+- `requires_payload` - True if lease has meta_hash (expects payload upload)
+- `payload_received` - True if payload has been uploaded
+- `provisioning_started` - True if provisioning is in progress
 
 ### Upload Payload
 
@@ -595,11 +628,13 @@ internal/
 │   └── mock.go         # In-memory mock for unit tests
 ├── chain/              # gRPC client, WebSocket subscriber, signer
 ├── config/             # Configuration loading and validation
+├── metrics/            # Prometheus metrics definitions
 ├── provisioner/        # Provision lifecycle management
 │   ├── manager.go      # Watermill handlers
 │   └── bridge.go       # Chain events -> Watermill
 ├── scheduler/          # Periodic withdrawal and credit monitoring
 ├── testutil/           # Test fixtures and helpers
+├── util/               # Shared utility functions
 └── watcher/            # Cross-provider event detection
 ```
 
@@ -665,7 +700,7 @@ Chain State (leases)     Backend State (provisions)
 
 ## Dependencies
 
-- Go 1.25+ (uses `sync.WaitGroup.Go()`, `range` over integers)
+- Go 1.24+ (uses `sync.WaitGroup.Go()`, `range` over integers)
 - Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x

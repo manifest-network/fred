@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -156,8 +157,14 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	payload, err := readBodyWithContext(r.Context(), r.Body)
 	if err != nil {
 		if r.Context().Err() != nil {
+			if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+				// Server-side timeout - write a proper error response
+				slog.Warn("payload read timeout", "error", err, "lease_uuid", leaseUUID)
+				writeError(w, "request timeout", http.StatusGatewayTimeout)
+				return
+			}
+			// context.Canceled - likely client disconnect, don't write response
 			slog.Warn("payload read cancelled", "error", err, "lease_uuid", leaseUUID)
-			// Don't write response - context cancelled means client likely disconnected
 			return
 		}
 		slog.Error("failed to read payload body", "error", err)

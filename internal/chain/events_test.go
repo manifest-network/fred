@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// Test UUIDs - valid RFC 4122 format
+const (
+	testProviderUUID  = "01234567-89ab-cdef-0123-456789abcdef"
+	testProviderUUID2 = "abcdef01-2345-6789-abcd-ef0123456789"
+)
+
 func TestNewEventSubscriber(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -21,7 +27,7 @@ func TestNewEventSubscriber(t *testing.T) {
 		{
 			name:             "with defaults",
 			url:              "ws://localhost:26657/websocket",
-			providerUUID:     "test-uuid",
+			providerUUID:     testProviderUUID,
 			pingInterval:     0,
 			reconnectInitial: 0,
 			reconnectMax:     0,
@@ -32,7 +38,7 @@ func TestNewEventSubscriber(t *testing.T) {
 		{
 			name:             "with custom values",
 			url:              "wss://example.com/websocket",
-			providerUUID:     "custom-uuid",
+			providerUUID:     testProviderUUID2,
 			pingInterval:     15 * time.Second,
 			reconnectInitial: 2 * time.Second,
 			reconnectMax:     120 * time.Second,
@@ -82,10 +88,35 @@ func TestNewEventSubscriber(t *testing.T) {
 	}
 }
 
+func TestNewEventSubscriber_InvalidUUID(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerUUID string
+	}{
+		{name: "empty UUID", providerUUID: ""},
+		{name: "invalid format", providerUUID: "not-a-uuid"},
+		{name: "too short", providerUUID: "12345678"},
+		{name: "injection attempt", providerUUID: "test' OR '1'='1"},
+		{name: "special characters", providerUUID: "abc123; DROP TABLE"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewEventSubscriber(EventSubscriberConfig{
+				URL:          "ws://localhost:26657/websocket",
+				ProviderUUID: tt.providerUUID,
+			})
+			if err == nil {
+				t.Errorf("NewEventSubscriber() should reject invalid UUID %q", tt.providerUUID)
+			}
+		})
+	}
+}
+
 func TestEventSubscriber_Subscribe(t *testing.T) {
 	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: "test-uuid",
+		ProviderUUID: testProviderUUID,
 	})
 	if err != nil {
 		t.Fatalf("NewEventSubscriber() error = %v", err)
@@ -171,10 +202,9 @@ func TestGetEventAttribute(t *testing.T) {
 }
 
 func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
-	providerUUID := "provider-uuid-123"
 	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: providerUUID,
+		ProviderUUID: testProviderUUID,
 	})
 	if err != nil {
 		t.Fatalf("NewEventSubscriber() error = %v", err)
@@ -189,13 +219,13 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 			name: "lease_created event",
 			events: map[string][]string{
 				"lease_created.lease_uuid":    {"lease-uuid-1"},
-				"lease_created.provider_uuid": {providerUUID},
+				"lease_created.provider_uuid": {testProviderUUID},
 				"lease_created.tenant":        {"tenant-addr"},
 			},
 			want: &LeaseEvent{
 				Type:         LeaseCreated,
 				LeaseUUID:    "lease-uuid-1",
-				ProviderUUID: providerUUID,
+				ProviderUUID: testProviderUUID,
 				Tenant:       "tenant-addr",
 			},
 		},
@@ -203,13 +233,13 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 			name: "lease_acknowledged event",
 			events: map[string][]string{
 				"lease_acknowledged.lease_uuid":    {"lease-uuid-2"},
-				"lease_acknowledged.provider_uuid": {providerUUID},
+				"lease_acknowledged.provider_uuid": {testProviderUUID},
 				"lease_acknowledged.tenant":        {"tenant-addr"},
 			},
 			want: &LeaseEvent{
 				Type:         LeaseAcknowledged,
 				LeaseUUID:    "lease-uuid-2",
-				ProviderUUID: providerUUID,
+				ProviderUUID: testProviderUUID,
 				Tenant:       "tenant-addr",
 			},
 		},
@@ -273,10 +303,9 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 }
 
 func TestEventSubscriber_HandleMessage(t *testing.T) {
-	providerUUID := "provider-uuid-123"
 	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: providerUUID,
+		ProviderUUID: testProviderUUID,
 	})
 	if err != nil {
 		t.Fatalf("NewEventSubscriber() error = %v", err)
@@ -302,7 +331,7 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 					ID:      1,
 					Result: makeResultJSON(map[string][]string{
 						"lease_created.lease_uuid":    {"lease-uuid-1"},
-						"lease_created.provider_uuid": {providerUUID},
+						"lease_created.provider_uuid": {testProviderUUID},
 						"lease_created.tenant":        {"tenant-addr"},
 					}),
 				}
@@ -379,7 +408,7 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
 	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: "test-uuid",
+		ProviderUUID: testProviderUUID,
 	})
 	if err != nil {
 		t.Fatalf("NewEventSubscriber() error = %v", err)
@@ -402,7 +431,7 @@ func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
 func TestEventSubscriber_Close(t *testing.T) {
 	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: "test-uuid",
+		ProviderUUID: testProviderUUID,
 	})
 	if err != nil {
 		t.Fatalf("NewEventSubscriber() error = %v", err)

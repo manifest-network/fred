@@ -405,7 +405,8 @@ func (rw *responseWriter) WriteHeader(code int) {
 // requestTimeoutMiddleware applies a timeout to request processing.
 // This is separate from HTTP server timeouts (ReadTimeout/WriteTimeout) and applies
 // to the handler logic itself. If the handler takes longer than the timeout,
-// the request context is cancelled and a 503 Service Unavailable is returned.
+// the request context is cancelled and handlers should check ctx.Err() to detect
+// DeadlineExceeded and write an appropriate error response.
 func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -425,14 +426,15 @@ func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Han
 			case <-done:
 				// Handler completed normally
 			case <-ctx.Done():
-				// Timeout occurred - the handler goroutine will see context cancellation
-				// We don't write anything here because the handler may have already started writing
-				// The handler should check ctx.Err() and abort appropriately
+				// Timeout occurred - log it and wait for handler to finish
+				// The handler should detect context.DeadlineExceeded and write an error response
 				slog.Warn("request timeout exceeded",
 					"method", r.Method,
 					"path", r.URL.Path,
 					"timeout", timeout,
 				)
+				// Wait for handler goroutine to finish to avoid races with ResponseWriter
+				<-done
 			}
 		})
 	}

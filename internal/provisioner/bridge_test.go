@@ -38,7 +38,7 @@ func (m *mockEventPublisher) getEvents() []chain.LeaseEvent {
 func TestNewEventBridge(t *testing.T) {
 	subscriber, _ := chain.NewEventSubscriber(chain.EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: "provider-1",
+		ProviderUUID: "01234567-89ab-cdef-0123-456789abcdef",
 	})
 	publisher := &mockEventPublisher{}
 
@@ -58,7 +58,7 @@ func TestNewEventBridge(t *testing.T) {
 func TestEventBridge_Start_ForwardsEvents(t *testing.T) {
 	subscriber, _ := chain.NewEventSubscriber(chain.EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: "provider-1",
+		ProviderUUID: "01234567-89ab-cdef-0123-456789abcdef",
 	})
 	publisher := &mockEventPublisher{}
 	bridge := NewEventBridge(subscriber, publisher)
@@ -97,7 +97,7 @@ func TestEventBridge_Start_ForwardsEvents(t *testing.T) {
 func TestEventBridge_Start_ChannelClosed(t *testing.T) {
 	subscriber, _ := chain.NewEventSubscriber(chain.EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: "provider-1",
+		ProviderUUID: "01234567-89ab-cdef-0123-456789abcdef",
 	})
 	publisher := &mockEventPublisher{}
 	bridge := NewEventBridge(subscriber, publisher)
@@ -133,7 +133,7 @@ func TestEventBridge_Start_PublishError(t *testing.T) {
 	// This test verifies that publish errors are logged but don't stop the bridge
 	subscriber, _ := chain.NewEventSubscriber(chain.EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
-		ProviderUUID: "provider-1",
+		ProviderUUID: "01234567-89ab-cdef-0123-456789abcdef",
 	})
 	publisher := &mockEventPublisher{
 		publishErr: errors.New("publish failed"),
