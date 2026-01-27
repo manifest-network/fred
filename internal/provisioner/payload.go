@@ -26,6 +26,10 @@ const (
 	DefaultFlushInterval = 50 * time.Millisecond
 
 	// writeChannelSize is the buffer size for the write operation channel.
+	// When the buffer is full, write operations (Store, Pop, Delete) will block
+	// until space is available, providing backpressure under extreme load.
+	// With DefaultBatchSize=50 and DefaultFlushInterval=50ms, the theoretical
+	// throughput is ~1000 ops/sec, so this buffer handles short bursts well.
 	writeChannelSize = 1000
 )
 
@@ -191,6 +195,11 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 
 // Store stores a payload for a lease.
 // Returns false if a payload already exists for this lease (conflict).
+//
+// Note: This method blocks until the write completes. If the internal write queue
+// is full (>1000 pending operations), it will block until space is available.
+// This provides backpressure under extreme load. Callers should not hold locks
+// when calling this method.
 func (s *PayloadStore) Store(leaseUUID string, payload []byte) bool {
 	resultCh := make(chan writeResult, 1)
 
@@ -244,6 +253,11 @@ func (s *PayloadStore) Get(leaseUUID string) []byte {
 
 // Pop retrieves and removes a payload for a lease.
 // Returns nil if no payload exists.
+//
+// Note: This method blocks until the write completes. If the internal write queue
+// is full (>1000 pending operations), it will block until space is available.
+// This provides backpressure under extreme load. Callers should not hold locks
+// when calling this method.
 func (s *PayloadStore) Pop(leaseUUID string) []byte {
 	resultCh := make(chan writeResult, 1)
 
@@ -288,6 +302,11 @@ func (s *PayloadStore) Has(leaseUUID string) bool {
 }
 
 // Delete removes a payload for a lease.
+//
+// Note: This method blocks until the write completes. If the internal write queue
+// is full (>1000 pending operations), it will block until space is available.
+// This provides backpressure under extreme load. Callers should not hold locks
+// when calling this method.
 func (s *PayloadStore) Delete(leaseUUID string) {
 	resultCh := make(chan writeResult, 1)
 

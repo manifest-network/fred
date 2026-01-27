@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -149,9 +151,15 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Read the payload body
-	payload, err := io.ReadAll(r.Body)
+	// Read the payload body with context awareness
+	// This allows the read to be aborted if the request times out
+	payload, err := readBodyWithContext(r.Context(), r.Body)
 	if err != nil {
+		if r.Context().Err() != nil {
+			slog.Warn("payload read cancelled", "error", err, "lease_uuid", leaseUUID)
+			// Don't write response - context cancelled means client likely disconnected
+			return
+		}
 		slog.Error("failed to read payload body", "error", err)
 		writeError(w, "failed to read request body", http.StatusBadRequest)
 		return
@@ -219,4 +227,33 @@ func (h *PayloadHandler) extractPayloadToken(r *http.Request) (*PayloadAuthToken
 		return nil, err
 	}
 	return ParsePayloadAuthToken(tokenStr)
+}
+
+// readBodyWithContext reads the request body while respecting context cancellation.
+// Unlike io.ReadAll, this checks the context between chunk reads, allowing the read
+// to be aborted if the request times out.
+func readBodyWithContext(ctx context.Context, body io.Reader) ([]byte, error) {
+	const chunkSize = 32 * 1024 // 32KB chunks
+
+	var buf bytes.Buffer
+	chunk := make([]byte, chunkSize)
+
+	for {
+		// Check context before each read
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		n, err := body.Read(chunk)
+		if n > 0 {
+			buf.Write(chunk[:n])
+		}
+
+		if err == io.EOF {
+			return buf.Bytes(), nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
