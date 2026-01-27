@@ -14,6 +14,7 @@ import (
 // mockAckChainClient implements ChainClient for ack batcher tests
 type mockAckChainClient struct {
 	acknowledgeFunc func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
+	getLeaseFunc    func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 }
 
 func (m *mockAckChainClient) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
@@ -24,7 +25,14 @@ func (m *mockAckChainClient) AcknowledgeLeases(ctx context.Context, leaseUUIDs [
 }
 
 func (m *mockAckChainClient) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-	return nil, nil
+	if m.getLeaseFunc != nil {
+		return m.getLeaseFunc(ctx, leaseUUID)
+	}
+	// Default: return a PENDING lease so acknowledgment proceeds
+	return &billingtypes.Lease{
+		Uuid:  leaseUUID,
+		State: billingtypes.LEASE_STATE_PENDING,
+	}, nil
 }
 
 func (m *mockAckChainClient) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
@@ -254,5 +262,141 @@ func TestAckBatcher_ContextCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("Acknowledge did not return after context cancellation")
+	}
+}
+
+func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
+	var mu sync.Mutex
+	var ackCalls [][]string
+
+	client := &mockAckChainClient{
+		getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			// lease-a and lease-c are already ACTIVE (already acknowledged)
+			// lease-b is still PENDING (needs acknowledgment)
+			if leaseUUID == "lease-a" || leaseUUID == "lease-c" {
+				return &billingtypes.Lease{
+					Uuid:  leaseUUID,
+					State: billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return &billingtypes.Lease{
+				Uuid:  leaseUUID,
+				State: billingtypes.LEASE_STATE_PENDING,
+			}, nil
+		},
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			mu.Lock()
+			ackCalls = append(ackCalls, leaseUUIDs)
+			mu.Unlock()
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	// Send requests for all three leases
+	var wg sync.WaitGroup
+	results := make([]bool, 3)
+	errs := make([]error, 3)
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			leaseUUID := "lease-" + string(rune('a'+i))
+			results[i], _, errs[i] = batcher.Acknowledge(ctx, leaseUUID)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All should report success (including already-acknowledged ones)
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("Acknowledge[%d] error = %v, want nil", i, err)
+		}
+		if !results[i] {
+			t.Errorf("Acknowledge[%d] acked = false, want true", i)
+		}
+	}
+
+	// Only lease-b should have been sent to AcknowledgeLeases
+	mu.Lock()
+	defer mu.Unlock()
+
+	totalAcked := 0
+	for _, batch := range ackCalls {
+		totalAcked += len(batch)
+	}
+
+	if totalAcked != 1 {
+		t.Errorf("total acknowledged = %d, want 1 (only lease-b should need ack)", totalAcked)
+	}
+
+	// Verify lease-b was in the ack call
+	found := false
+	for _, batch := range ackCalls {
+		for _, uuid := range batch {
+			if uuid == "lease-b" {
+				found = true
+			}
+			if uuid == "lease-a" || uuid == "lease-c" {
+				t.Errorf("already-acknowledged lease %s was sent to AcknowledgeLeases", uuid)
+			}
+		}
+	}
+	if !found && totalAcked > 0 {
+		t.Error("lease-b was not in any ack batch")
+	}
+}
+
+func TestAckBatcher_SkipsNotFoundLeases(t *testing.T) {
+	var ackCalled atomic.Bool
+
+	client := &mockAckChainClient{
+		getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			// Lease doesn't exist
+			return nil, nil
+		},
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			ackCalled.Store(true)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	// Try to acknowledge a non-existent lease
+	acked, _, err := batcher.Acknowledge(ctx, "non-existent-lease")
+
+	// Should report success (lease doesn't exist, nothing to do)
+	if err != nil {
+		t.Errorf("Acknowledge() error = %v, want nil", err)
+	}
+	if !acked {
+		t.Error("Acknowledge() acked = false, want true")
+	}
+
+	// AcknowledgeLeases should NOT have been called
+	if ackCalled.Load() {
+		t.Error("AcknowledgeLeases was called for non-existent lease")
 	}
 }

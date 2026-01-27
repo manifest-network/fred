@@ -339,3 +339,198 @@ func TestCachedClient_Concurrent(t *testing.T) {
 		t.Errorf("call count = %d, expected much less due to caching", callCount)
 	}
 }
+
+// mockFullClient implements all Client methods needed for testing cache invalidation.
+type mockFullClient struct {
+	*mockLeaseGetter
+	acknowledgeCalled []string
+	rejectCalled      []string
+	closeCalled       []string
+	mu                sync.Mutex
+}
+
+func newMockFullClient() *mockFullClient {
+	return &mockFullClient{
+		mockLeaseGetter: newMockLeaseGetter(),
+	}
+}
+
+func (m *mockFullClient) AcknowledgeLeases(_ context.Context, leaseUUIDs []string) (uint64, []string, error) {
+	m.mu.Lock()
+	m.acknowledgeCalled = append(m.acknowledgeCalled, leaseUUIDs...)
+	m.mu.Unlock()
+	return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+}
+
+func (m *mockFullClient) RejectLeases(_ context.Context, leaseUUIDs []string, _ string) (uint64, []string, error) {
+	m.mu.Lock()
+	m.rejectCalled = append(m.rejectCalled, leaseUUIDs...)
+	m.mu.Unlock()
+	return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+}
+
+func (m *mockFullClient) CloseLeases(_ context.Context, leaseUUIDs []string, _ string) (uint64, []string, error) {
+	m.mu.Lock()
+	m.closeCalled = append(m.closeCalled, leaseUUIDs...)
+	m.mu.Unlock()
+	return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+}
+
+// testFullCachedClient wraps CachedClient for testing with full mock support.
+type testFullCachedClient struct {
+	*CachedClient
+	mock *mockFullClient
+}
+
+func newTestFullCachedClient(size int, ttl time.Duration) *testFullCachedClient {
+	mock := newMockFullClient()
+	cached := NewCachedClient(nil, size, ttl)
+
+	return &testFullCachedClient{
+		CachedClient: cached,
+		mock:         mock,
+	}
+}
+
+func (c *testFullCachedClient) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+	if lease, ok := c.cache.Get(leaseUUID); ok {
+		return lease, nil
+	}
+	lease, err := c.mock.GetLease(ctx, leaseUUID)
+	if err != nil {
+		return nil, err
+	}
+	c.cache.Add(leaseUUID, lease)
+	return lease, nil
+}
+
+func (c *testFullCachedClient) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+	acknowledged, txHashes, err := c.mock.AcknowledgeLeases(ctx, leaseUUIDs)
+	if err == nil {
+		c.InvalidateLeases(leaseUUIDs)
+	}
+	return acknowledged, txHashes, err
+}
+
+func (c *testFullCachedClient) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	rejected, txHashes, err := c.mock.RejectLeases(ctx, leaseUUIDs, reason)
+	if err == nil {
+		c.InvalidateLeases(leaseUUIDs)
+	}
+	return rejected, txHashes, err
+}
+
+func (c *testFullCachedClient) CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	closed, txHashes, err := c.mock.CloseLeases(ctx, leaseUUIDs, reason)
+	if err == nil {
+		c.InvalidateLeases(leaseUUIDs)
+	}
+	return closed, txHashes, err
+}
+
+func TestCachedClient_AcknowledgeInvalidatesCache(t *testing.T) {
+	client := newTestFullCachedClient(100, time.Minute)
+
+	// Setup lease as PENDING
+	client.mock.setLease("lease-1", &billingtypes.Lease{
+		Uuid:  "lease-1",
+		State: billingtypes.LEASE_STATE_PENDING,
+	})
+
+	// Fetch lease - should be cached
+	_, err := client.GetLease(context.Background(), "lease-1")
+	if err != nil {
+		t.Fatalf("GetLease() error = %v", err)
+	}
+	if client.Len() != 1 {
+		t.Errorf("cache length = %d, want 1", client.Len())
+	}
+
+	// Acknowledge the lease - should invalidate cache
+	_, _, err = client.AcknowledgeLeases(context.Background(), []string{"lease-1"})
+	if err != nil {
+		t.Fatalf("AcknowledgeLeases() error = %v", err)
+	}
+
+	// Cache should be empty now
+	if client.Len() != 0 {
+		t.Errorf("cache length = %d, want 0 (should be invalidated after ack)", client.Len())
+	}
+
+	// Next GetLease should hit the mock again
+	initialCallCount := client.mock.getCallCount()
+	_, _ = client.GetLease(context.Background(), "lease-1")
+	if client.mock.getCallCount() != initialCallCount+1 {
+		t.Error("GetLease should have called mock after cache invalidation")
+	}
+}
+
+func TestCachedClient_RejectInvalidatesCache(t *testing.T) {
+	client := newTestFullCachedClient(100, time.Minute)
+
+	client.mock.setLease("lease-1", &billingtypes.Lease{
+		Uuid:  "lease-1",
+		State: billingtypes.LEASE_STATE_PENDING,
+	})
+
+	// Fetch and cache
+	_, _ = client.GetLease(context.Background(), "lease-1")
+	if client.Len() != 1 {
+		t.Errorf("cache length = %d, want 1", client.Len())
+	}
+
+	// Reject - should invalidate
+	_, _, _ = client.RejectLeases(context.Background(), []string{"lease-1"}, "test")
+
+	if client.Len() != 0 {
+		t.Errorf("cache length = %d, want 0 (should be invalidated after reject)", client.Len())
+	}
+}
+
+func TestCachedClient_CloseInvalidatesCache(t *testing.T) {
+	client := newTestFullCachedClient(100, time.Minute)
+
+	client.mock.setLease("lease-1", &billingtypes.Lease{
+		Uuid:  "lease-1",
+		State: billingtypes.LEASE_STATE_ACTIVE,
+	})
+
+	// Fetch and cache
+	_, _ = client.GetLease(context.Background(), "lease-1")
+	if client.Len() != 1 {
+		t.Errorf("cache length = %d, want 1", client.Len())
+	}
+
+	// Close - should invalidate
+	_, _, _ = client.CloseLeases(context.Background(), []string{"lease-1"}, "test")
+
+	if client.Len() != 0 {
+		t.Errorf("cache length = %d, want 0 (should be invalidated after close)", client.Len())
+	}
+}
+
+func TestCachedClient_BatchInvalidation(t *testing.T) {
+	client := newTestFullCachedClient(100, time.Minute)
+
+	// Setup multiple leases
+	for i := 0; i < 5; i++ {
+		uuid := "lease-" + string(rune('a'+i))
+		client.mock.setLease(uuid, &billingtypes.Lease{
+			Uuid:  uuid,
+			State: billingtypes.LEASE_STATE_PENDING,
+		})
+		_, _ = client.GetLease(context.Background(), uuid)
+	}
+
+	if client.Len() != 5 {
+		t.Errorf("cache length = %d, want 5", client.Len())
+	}
+
+	// Acknowledge some leases
+	_, _, _ = client.AcknowledgeLeases(context.Background(), []string{"lease-a", "lease-c", "lease-e"})
+
+	// Only non-acknowledged leases should remain cached
+	if client.Len() != 2 {
+		t.Errorf("cache length = %d, want 2 (lease-b and lease-d should remain)", client.Len())
+	}
+}

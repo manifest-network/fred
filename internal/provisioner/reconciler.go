@@ -83,16 +83,16 @@ type ReconcilerConfig struct {
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
 func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker InFlightTracker) (*Reconciler, error) {
 	if chainClient == nil {
-		return nil, fmt.Errorf("chainClient is required")
+		return nil, fmt.Errorf("chain client is required")
 	}
 	if backendRouter == nil {
-		return nil, fmt.Errorf("backendRouter is required")
+		return nil, fmt.Errorf("backend router is required")
 	}
 	if cfg.ProviderUUID == "" {
-		return nil, fmt.Errorf("ProviderUUID is required")
+		return nil, fmt.Errorf("provider UUID is required")
 	}
 	if cfg.CallbackBaseURL == "" {
-		return nil, fmt.Errorf("CallbackBaseURL is required")
+		return nil, fmt.Errorf("callback base URL is required")
 	}
 
 	// Default interval

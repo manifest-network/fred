@@ -594,6 +594,13 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			// Return PENDING lease so ack batcher attempts acknowledgment
+			return &billingtypes.Lease{
+				Uuid:  leaseUUID,
+				State: billingtypes.LEASE_STATE_PENDING,
+			}, nil
+		},
 		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -716,6 +723,13 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			// Return PENDING lease so ack batcher attempts acknowledgment
+			return &billingtypes.Lease{
+				Uuid:  leaseUUID,
+				State: billingtypes.LEASE_STATE_PENDING,
+			}, nil
+		},
 		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			return 0, nil, acknowledgeErr
 		},
@@ -757,6 +771,8 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 	// Test that ErrLeaseNotPending errors are treated as terminal (success)
 	// This prevents infinite retry loops when the lease is already acknowledged.
 	// Code 22 is ErrLeaseNotPending in the billing module.
+	// This simulates a race condition where GetLease returns PENDING but the lease
+	// gets acknowledged by another process before our AcknowledgeLeases call.
 	terminalErr := &chain.ChainTxError{Code: 22, Codespace: "billing", RawLog: "lease not in pending state"}
 
 	mockBackend := &mockManagerBackend{name: "test"}
@@ -764,6 +780,14 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			// Return PENDING so ack batcher attempts acknowledgment
+			// (simulates race condition where state changes between check and ack)
+			return &billingtypes.Lease{
+				Uuid:  leaseUUID,
+				State: billingtypes.LEASE_STATE_PENDING,
+			}, nil
+		},
 		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			return 0, nil, terminalErr
 		},

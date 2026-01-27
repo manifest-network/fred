@@ -106,7 +106,7 @@ type PayloadStoreConfig struct {
 // NewPayloadStore creates a new payload store with bbolt persistence.
 func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 	if cfg.DBPath == "" {
-		return nil, errors.New("DBPath is required")
+		return nil, errors.New("db path is required")
 	}
 
 	// Apply defaults

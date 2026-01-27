@@ -51,7 +51,7 @@ type TokenTrackerConfig struct {
 // NewTokenTracker creates a new token tracker with bbolt persistence.
 func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 	if cfg.DBPath == "" {
-		return nil, errors.New("DBPath is required")
+		return nil, errors.New("db path is required")
 	}
 
 	// Apply defaults

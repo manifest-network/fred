@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
 
 const (
@@ -135,15 +137,67 @@ func (b *AckBatcher) batchLoop(ctx context.Context) {
 			return
 		}
 
-		// Collect lease UUIDs
-		leaseUUIDs := make([]string, len(pending))
-		for i, req := range pending {
+		slog.Debug("flushing ack batch", "count", len(pending))
+
+		// Filter out leases that are not in PENDING state to avoid wasting tx fees.
+		// This queries each lease's status before attempting acknowledgment.
+		var pendingLeases []ackRequest
+		for _, req := range pending {
+			lease, err := b.chainClient.GetLease(ctx, req.leaseUUID)
+			if err != nil {
+				slog.Warn("failed to query lease status, will attempt ack anyway",
+					"lease_uuid", req.leaseUUID,
+					"error", err,
+				)
+				pendingLeases = append(pendingLeases, req)
+				continue
+			}
+
+			if lease == nil {
+				// Lease doesn't exist - notify caller with success (nothing to ack)
+				slog.Debug("lease not found, skipping acknowledgment",
+					"lease_uuid", req.leaseUUID,
+				)
+				select {
+				case req.resultCh <- ackResult{acknowledged: true, txHash: ""}:
+				default:
+				}
+				continue
+			}
+
+			if lease.State != billingtypes.LEASE_STATE_PENDING {
+				// Lease is already acknowledged or in another state - notify success
+				slog.Debug("lease already acknowledged, skipping",
+					"lease_uuid", req.leaseUUID,
+					"state", lease.State.String(),
+				)
+				select {
+				case req.resultCh <- ackResult{acknowledged: true, txHash: ""}:
+				default:
+				}
+				continue
+			}
+
+			// Lease is PENDING - add to batch for acknowledgment
+			pendingLeases = append(pendingLeases, req)
+		}
+
+		// Clear the original batch
+		pending = pending[:0]
+
+		// If no leases need acknowledgment, we're done
+		if len(pendingLeases) == 0 {
+			slog.Debug("all leases already acknowledged, no tx needed")
+			return
+		}
+
+		// Collect lease UUIDs for the batch
+		leaseUUIDs := make([]string, len(pendingLeases))
+		for i, req := range pendingLeases {
 			leaseUUIDs[i] = req.leaseUUID
 		}
 
-		slog.Debug("flushing ack batch", "count", len(leaseUUIDs))
-
-		// Try batched acknowledgment first
+		// Try batched acknowledgment
 		acknowledged, txHashes, err := b.chainClient.AcknowledgeLeases(ctx, leaseUUIDs)
 
 		if err == nil {
@@ -153,7 +207,7 @@ func (b *AckBatcher) batchLoop(ctx context.Context) {
 				txHash = txHashes[0]
 			}
 
-			for _, req := range pending {
+			for _, req := range pendingLeases {
 				select {
 				case req.resultCh <- ackResult{acknowledged: true, txHash: txHash}:
 				default:
@@ -171,11 +225,8 @@ func (b *AckBatcher) batchLoop(ctx context.Context) {
 				"count", len(leaseUUIDs),
 				"error", err,
 			)
-			b.acknowledgeIndividually(ctx, pending)
+			b.acknowledgeIndividually(ctx, pendingLeases)
 		}
-
-		// Clear the batch
-		pending = pending[:0]
 	}
 
 	for {
@@ -219,6 +270,7 @@ func (b *AckBatcher) batchLoop(ctx context.Context) {
 
 // acknowledgeIndividually processes each request one at a time.
 // This is the fallback when batch acknowledgment fails.
+// It re-checks lease status before each ack to avoid wasting tx fees.
 func (b *AckBatcher) acknowledgeIndividually(ctx context.Context, requests []ackRequest) {
 	for _, req := range requests {
 		if ctx.Err() != nil {
@@ -229,6 +281,39 @@ func (b *AckBatcher) acknowledgeIndividually(ctx context.Context, requests []ack
 			continue
 		}
 
+		// Re-check lease status before attempting individual ack.
+		// State may have changed since the batch check (e.g., reconciler acked it).
+		lease, err := b.chainClient.GetLease(ctx, req.leaseUUID)
+		if err != nil {
+			slog.Warn("failed to query lease status for individual ack",
+				"lease_uuid", req.leaseUUID,
+				"error", err,
+			)
+			// Continue with ack attempt - it will fail if not PENDING
+		} else if lease == nil {
+			// Lease doesn't exist - treat as success
+			slog.Debug("lease not found during individual ack, skipping",
+				"lease_uuid", req.leaseUUID,
+			)
+			select {
+			case req.resultCh <- ackResult{acknowledged: true, txHash: ""}:
+			default:
+			}
+			continue
+		} else if lease.State != billingtypes.LEASE_STATE_PENDING {
+			// Lease is already acknowledged - treat as success
+			slog.Debug("lease already acknowledged during individual ack, skipping",
+				"lease_uuid", req.leaseUUID,
+				"state", lease.State.String(),
+			)
+			select {
+			case req.resultCh <- ackResult{acknowledged: true, txHash: ""}:
+			default:
+			}
+			continue
+		}
+
+		// Lease is PENDING - attempt acknowledgment
 		acknowledged, txHashes, err := b.chainClient.AcknowledgeLeases(ctx, []string{req.leaseUUID})
 
 		var txHash string

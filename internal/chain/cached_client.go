@@ -106,3 +106,34 @@ func (c *CachedClient) InvalidateAll() {
 func (c *CachedClient) Len() int {
 	return c.cache.Len()
 }
+
+// AcknowledgeLeases acknowledges leases and invalidates them from cache.
+// This ensures subsequent GetLease calls fetch fresh state from chain.
+func (c *CachedClient) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+	acknowledged, txHashes, err := c.Client.AcknowledgeLeases(ctx, leaseUUIDs)
+	if err == nil {
+		// Invalidate cache for all leases that were part of the request,
+		// regardless of how many were actually acknowledged.
+		// This ensures we don't serve stale state.
+		c.InvalidateLeases(leaseUUIDs)
+	}
+	return acknowledged, txHashes, err
+}
+
+// RejectLeases rejects leases and invalidates them from cache.
+func (c *CachedClient) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	rejected, txHashes, err := c.Client.RejectLeases(ctx, leaseUUIDs, reason)
+	if err == nil {
+		c.InvalidateLeases(leaseUUIDs)
+	}
+	return rejected, txHashes, err
+}
+
+// CloseLeases closes leases and invalidates them from cache.
+func (c *CachedClient) CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	closed, txHashes, err := c.Client.CloseLeases(ctx, leaseUUIDs, reason)
+	if err == nil {
+		c.InvalidateLeases(leaseUUIDs)
+	}
+	return closed, txHashes, err
+}
