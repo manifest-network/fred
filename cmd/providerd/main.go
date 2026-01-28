@@ -342,14 +342,9 @@ func run(cmd *cobra.Command, args []string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
-	// Shutdown API server first (stops accepting new requests)
-	if err := apiServer.Shutdown(shutdownCtx); err != nil {
-		slog.Error("failed to shutdown API server gracefully", "error", err)
-	}
-
-	// Wait for in-flight provisions to drain before stopping event processing.
-	// This allows pending backend callbacks to complete.
-	// Use half of the shutdown timeout for draining, leaving time for cleanup.
+	// Wait for in-flight provisions to drain BEFORE shutting down the API server.
+	// Backends send completion callbacks via HTTP, so the API server must remain
+	// running to receive them during the drain period.
 	drainTimeout := shutdownTimeout / 2
 	remaining := provisionMgr.WaitForDrain(shutdownCtx, drainTimeout)
 	if remaining > 0 {
@@ -357,6 +352,11 @@ func run(cmd *cobra.Command, args []string) error {
 			"remaining", remaining,
 			"note", "these will be recovered by reconciliation on restart",
 		)
+	}
+
+	// Shutdown API server (stops accepting new requests, drains active connections)
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		slog.Error("failed to shutdown API server gracefully", "error", err)
 	}
 
 	// Signal all components to stop via context cancellation.
