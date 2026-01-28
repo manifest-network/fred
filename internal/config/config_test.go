@@ -964,7 +964,7 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 				c.GRPCTLSSkipVerify = true
 				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
 			},
-			wantErr: "production_mode: grpc_tls_skip_verify cannot be enabled",
+			wantErr: "production_mode: grpc_tls_skip_verify cannot be enabled with grpc_tls_enabled",
 		},
 		{
 			name: "production mode requires token tracker",
@@ -972,7 +972,7 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 				c.ProductionMode = true
 				c.TokenTrackerDBPath = ""
 			},
-			wantErr: "production_mode: token_tracker_db_path is required",
+			wantErr: "production_mode: token_tracker_db_path is required for replay protection",
 		},
 		{
 			name: "production mode allows valid secure config",
@@ -983,6 +983,16 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
 			},
 			wantErr: "",
+		},
+		{
+			name: "production mode allows skip verify when tls is disabled",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.GRPCTLSEnabled = false
+				c.GRPCTLSSkipVerify = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+			},
+			wantErr: "", // skip_verify is meaningless when TLS is disabled
 		},
 		{
 			name: "non-production mode allows tls skip verify",

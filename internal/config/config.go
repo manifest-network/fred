@@ -307,6 +307,8 @@ func (c *Config) Validate() error {
 
 	// Production mode security enforcement
 	if c.ProductionMode {
+		// Only block skip_verify when TLS is actually enabled; if TLS is
+		// disabled the flag is meaningless and not a security concern.
 		if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
 			return fmt.Errorf("production_mode: grpc_tls_skip_verify cannot be enabled with grpc_tls_enabled")
 		}
