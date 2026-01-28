@@ -945,8 +945,8 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
-			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
-			CallbackBaseURL:           "http://localhost:8080",
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://10.0.0.1:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://10.0.0.1:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
@@ -1008,6 +1008,96 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			modify: func(c *Config) {
 				c.ProductionMode = false
 				c.TokenTrackerDBPath = ""
+			},
+			wantErr: "",
+		},
+		{
+			name: "production mode blocks loopback callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://127.0.0.1:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use a loopback address",
+		},
+		{
+			name: "production mode blocks localhost callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use localhost",
+		},
+		{
+			name: "production mode blocks link-local callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://169.254.169.254"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use a link-local address",
+		},
+		{
+			name: "production mode blocks loopback backend URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://127.0.0.1:9000", IsDefault: true}}
+			},
+			wantErr: "production_mode: backends[0].url: URL must not use a loopback address",
+		},
+		{
+			name: "production mode blocks unspecified callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://0.0.0.0:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use an unspecified address",
+		},
+		{
+			name: "production mode blocks IPv6 loopback callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://[::1]:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use a loopback address",
+		},
+		{
+			name: "production mode blocks IPv6 link-local callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://[fe80::1]:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use a link-local address",
+		},
+		{
+			name: "production mode blocks IPv6 unspecified callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://[::]:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use an unspecified address",
+		},
+		{
+			name: "production mode blocks uppercase Localhost callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://Localhost:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use localhost",
+		},
+		{
+			name: "non-production mode allows loopback URLs",
+			modify: func(c *Config) {
+				c.ProductionMode = false
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://127.0.0.1:9000", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
 			},
 			wantErr: "",
 		},

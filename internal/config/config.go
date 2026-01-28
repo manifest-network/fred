@@ -305,18 +305,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
 	}
 
-	// Production mode security enforcement
-	if c.ProductionMode {
-		// Only block skip_verify when TLS is actually enabled; if TLS is
-		// disabled the flag is meaningless and not a security concern.
-		if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
-			return fmt.Errorf("production_mode: grpc_tls_skip_verify cannot be enabled with grpc_tls_enabled")
-		}
-		if c.TokenTrackerDBPath == "" {
-			return fmt.Errorf("production_mode: token_tracker_db_path is required for replay protection")
-		}
-	}
-
 	// Security warning for gRPC TLS skip verify (non-production mode)
 	if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
 		slog.Warn("SECURITY WARNING: grpc_tls_skip_verify is enabled - TLS certificate verification is disabled, vulnerable to MITM attacks")
@@ -372,6 +360,28 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("callback_secret must be at least 32 characters")
 	}
 
+	// Production mode security enforcement (runs after all basic validation)
+	if c.ProductionMode {
+		// Only block skip_verify when TLS is actually enabled; if TLS is
+		// disabled the flag is meaningless and not a security concern.
+		if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
+			return fmt.Errorf("production_mode: grpc_tls_skip_verify cannot be enabled with grpc_tls_enabled")
+		}
+		if c.TokenTrackerDBPath == "" {
+			return fmt.Errorf("production_mode: token_tracker_db_path is required for replay protection")
+		}
+
+		// SSRF protection: block loopback, link-local, and unspecified addresses
+		if err := validateExternalURL(c.CallbackBaseURL); err != nil {
+			return fmt.Errorf("production_mode: callback_base_url: %w", err)
+		}
+		for i, b := range c.Backends {
+			if err := validateExternalURL(b.URL); err != nil {
+				return fmt.Errorf("production_mode: backends[%d].url: %w", i, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -393,5 +403,40 @@ func validateHTTPURL(rawURL string) error {
 	if parsed.Host == "" {
 		return fmt.Errorf("URL must have a host")
 	}
+	return nil
+}
+
+// validateExternalURL rejects URLs that point to loopback, link-local, or
+// unspecified addresses. Only IP literals and the hostname "localhost" are
+// checked; other hostnames are allowed through (no DNS resolution).
+func validateExternalURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+
+	hostname := parsed.Hostname() // strips port and IPv6 brackets
+
+	// Block "localhost" hostname (case-insensitive)
+	if strings.EqualFold(hostname, "localhost") {
+		return fmt.Errorf("URL must not use localhost")
+	}
+
+	// Parse as IP literal; non-IP hostnames pass through
+	ip := net.ParseIP(hostname)
+	if ip == nil {
+		return nil
+	}
+
+	if ip.IsLoopback() {
+		return fmt.Errorf("URL must not use a loopback address")
+	}
+	if ip.IsLinkLocalUnicast() {
+		return fmt.Errorf("URL must not use a link-local address")
+	}
+	if ip.IsUnspecified() {
+		return fmt.Errorf("URL must not use an unspecified address")
+	}
+
 	return nil
 }
