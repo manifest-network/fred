@@ -370,9 +370,20 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 	slog.Info("callback sent successfully", "lease_uuid", payload.LeaseUUID)
 }
 
-// computeSignature computes the HMAC-SHA256 signature for a payload.
+// computeSignature computes the HMAC-SHA256 signature for a payload with timestamp.
+// Format: "t=<unix-timestamp>,sha256=<hex-encoded-hmac>"
+// The HMAC is computed over "<timestamp>.<payload>" to bind the timestamp to the signature.
+//
+// NOTE: This implementation is intentionally standalone (not imported from internal/api)
+// because this file serves as a reference for external backend implementers who cannot
+// import Fred's internal packages. See BACKEND_GUIDE.md for the portable implementation.
 func (s *MockBackendServer) computeSignature(payload []byte) string {
+	timestamp := time.Now().Unix()
+	signedPayload := fmt.Sprintf("%d.%s", timestamp, payload)
+
 	mac := hmac.New(sha256.New, []byte(s.callbackSecret))
-	mac.Write(payload)
-	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	mac.Write([]byte(signedPayload))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
 }
