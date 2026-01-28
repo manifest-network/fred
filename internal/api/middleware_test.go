@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -110,13 +111,17 @@ func TestRequestTimeoutMiddleware_ContextCancellationPropagation(t *testing.T) {
 
 	wrapped.ServeHTTP(rec, req)
 
-	// Give handler goroutine time to store the error
-	time.Sleep(20 * time.Millisecond)
-
-	err := contextErr.Load()
-	if err == nil {
-		t.Fatal("context error was not captured")
+	// Poll for handler goroutine to store the error
+	deadline := time.After(2 * time.Second)
+	for contextErr.Load() == nil {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for context error")
+		default:
+			runtime.Gosched()
+		}
 	}
+	err := contextErr.Load()
 
 	if err != context.DeadlineExceeded {
 		t.Errorf("context error = %v, want %v", err, context.DeadlineExceeded)
@@ -154,11 +159,15 @@ func TestRequestTimeoutMiddleware_ZeroTimeout(t *testing.T) {
 		t.Errorf("request took %v, expected to return quickly with zero timeout", duration)
 	}
 
-	// Give handler time to check context
-	time.Sleep(20 * time.Millisecond)
-
-	if !contextCancelled.Load() {
-		t.Error("context was not cancelled with zero timeout")
+	// Poll for handler to check context
+	deadline := time.After(2 * time.Second)
+	for !contextCancelled.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for context cancellation")
+		default:
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -192,11 +201,15 @@ func TestRequestTimeoutMiddleware_NegativeTimeout(t *testing.T) {
 		t.Errorf("request took %v, expected quick return with negative timeout", duration)
 	}
 
-	// Give handler time to check context
-	time.Sleep(20 * time.Millisecond)
-
-	if !contextCancelled.Load() {
-		t.Error("context was not cancelled with negative timeout")
+	// Poll for handler to check context
+	deadline := time.After(2 * time.Second)
+	for !contextCancelled.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for context cancellation")
+		default:
+			runtime.Gosched()
+		}
 	}
 }
 

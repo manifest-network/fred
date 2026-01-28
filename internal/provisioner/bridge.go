@@ -17,6 +17,7 @@ type EventPublisher interface {
 type EventBridge struct {
 	subscriber *chain.EventSubscriber
 	publisher  EventPublisher
+	ready      chan struct{}
 }
 
 // NewEventBridge creates a new event bridge.
@@ -24,17 +25,19 @@ func NewEventBridge(subscriber *chain.EventSubscriber, publisher EventPublisher)
 	return &EventBridge{
 		subscriber: subscriber,
 		publisher:  publisher,
+		ready:      make(chan struct{}),
 	}
 }
 
 // Start begins forwarding events from the chain subscriber to Watermill.
-// This should be run in a goroutine.
+// It must be called exactly once and should be run in a goroutine.
 func (b *EventBridge) Start(ctx context.Context) error {
 	slog.Info("starting event bridge")
 
 	// Subscribe to receive events (fan-out: each subscriber gets all events)
 	events := b.subscriber.Subscribe()
 	defer b.subscriber.Unsubscribe(events)
+	close(b.ready)
 
 	for {
 		select {
@@ -56,4 +59,10 @@ func (b *EventBridge) Start(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// Ready returns a channel that is closed when the bridge has subscribed and is
+// ready to forward events.
+func (b *EventBridge) Ready() <-chan struct{} {
+	return b.ready
 }

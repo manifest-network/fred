@@ -72,13 +72,12 @@ func TestEventBridge_Start_ForwardsEvents(t *testing.T) {
 		errCh <- bridge.Start(ctx)
 	}()
 
-	// Give bridge time to subscribe
-	time.Sleep(50 * time.Millisecond)
-
-	// Get a channel to send events (simulating what EventSubscriber.Subscribe returns)
-	// Since we can't directly inject events, we need to use the subscriber's Subscribe
-	// But in a real test, the EventSubscriber would receive events from websocket
-	// For this test, we'll verify the bridge handles context cancellation properly
+	// Wait for bridge to subscribe
+	select {
+	case <-bridge.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("bridge did not start")
+	}
 
 	// Cancel context
 	cancel()
@@ -111,8 +110,12 @@ func TestEventBridge_Start_ChannelClosed(t *testing.T) {
 		errCh <- bridge.Start(ctx)
 	}()
 
-	// Give bridge time to subscribe
-	time.Sleep(50 * time.Millisecond)
+	// Wait for bridge to subscribe
+	select {
+	case <-bridge.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("bridge did not start")
+	}
 
 	// Close the subscriber (simulates shutdown)
 	subscriber.Close()
@@ -149,8 +152,12 @@ func TestEventBridge_Start_PublishError(t *testing.T) {
 		errCh <- bridge.Start(ctx)
 	}()
 
-	// Give bridge time to subscribe
-	time.Sleep(50 * time.Millisecond)
+	// Wait for bridge to subscribe
+	select {
+	case <-bridge.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("bridge did not start")
+	}
 
 	// Cancel context to stop
 	cancel()

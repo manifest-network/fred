@@ -1055,8 +1055,12 @@ func TestManager_StartAndClose(t *testing.T) {
 		errCh <- manager.Start(ctx)
 	}()
 
-	// Give it time to start
-	time.Sleep(50 * time.Millisecond)
+	// Wait for manager to be ready
+	select {
+	case <-manager.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager did not start")
+	}
 
 	// Close should stop the router
 	if err := manager.Close(); err != nil {
