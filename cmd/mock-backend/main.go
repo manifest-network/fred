@@ -1,3 +1,26 @@
+// Mock Backend for Fred
+//
+// This is a testing/development backend that simulates resource provisioning.
+// It implements the full backend HTTP API but does NOT actually provision any
+// real resources.
+//
+// IMPORTANT: The mock backend ignores the SKU field entirely. All provision
+// requests create identical fake resources regardless of SKU. Connection
+// details are deterministically generated from the lease UUID using SHA-256.
+//
+// For implementing a real backend, see BACKEND_GUIDE.md in the repository root.
+//
+// Usage:
+//
+//	MOCK_BACKEND_CALLBACK_SECRET="your-32-char-secret" ./mock-backend
+//
+// Environment Variables:
+//
+//	MOCK_BACKEND_ADDR             - Listen address (default: ":9000")
+//	MOCK_BACKEND_NAME             - Backend name for logging (default: "mock-backend")
+//	MOCK_BACKEND_DELAY            - Simulated provisioning delay (default: "0s")
+//	MOCK_BACKEND_CALLBACK_SECRET  - HMAC secret for callbacks (required, min 32 chars)
+//	MOCK_BACKEND_TLS_SKIP_VERIFY  - Skip TLS verification for callbacks (default: "false")
 package main
 
 import (

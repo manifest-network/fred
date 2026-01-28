@@ -396,7 +396,7 @@ Status must be either `"success"` or `"failed"`.
 
 ## Backend API Specification
 
-Any backend must implement these HTTP endpoints:
+Any backend must implement these HTTP endpoints. For a comprehensive implementation guide including SKU handling, callback signing, state management, and reconciliation, see [BACKEND_GUIDE.md](BACKEND_GUIDE.md).
 
 ### POST /provision
 
@@ -475,6 +475,8 @@ List all provisions (for reconciliation).
 ## Running E2E Tests with Mock Backend
 
 The mock backend allows you to test fred's provisioning flow without a real backend. It supports concurrent provisions with per-lease callback routing.
+
+**Note:** The mock backend ignores the SKU field entirely - all provisions create identical fake resources regardless of SKU. Connection details are deterministically generated from the lease UUID. For implementing a real backend that interprets SKUs, see [BACKEND_GUIDE.md](BACKEND_GUIDE.md).
 
 ### 1. Start the Mock Backend
 
