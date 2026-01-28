@@ -180,14 +180,31 @@ func (r *Results) Print() {
 
 	fmt.Printf("\nDuration: %v\n", r.Duration)
 	fmt.Printf("Total Requests: %d\n", r.TotalRequests)
-	fmt.Printf("Successful: %d (%.1f%%)\n", r.SuccessCount, float64(r.SuccessCount)/float64(r.TotalRequests)*100)
-	fmt.Printf("Failed: %d (%.1f%%)\n", r.ErrorCount, float64(r.ErrorCount)/float64(r.TotalRequests)*100)
-	fmt.Printf("Requests/sec: %.2f\n", float64(r.TotalRequests)/r.Duration.Seconds())
+
+	if r.TotalRequests > 0 {
+		fmt.Printf("Successful: %d (%.1f%%)\n", r.SuccessCount, float64(r.SuccessCount)/float64(r.TotalRequests)*100)
+		fmt.Printf("Failed: %d (%.1f%%)\n", r.ErrorCount, float64(r.ErrorCount)/float64(r.TotalRequests)*100)
+	} else {
+		fmt.Printf("Successful: %d (N/A)\n", r.SuccessCount)
+		fmt.Printf("Failed: %d (N/A)\n", r.ErrorCount)
+	}
+
+	durationSecs := r.Duration.Seconds()
+	if durationSecs > 0 {
+		fmt.Printf("Requests/sec: %.2f\n", float64(r.TotalRequests)/durationSecs)
+	} else {
+		fmt.Printf("Requests/sec: N/A\n")
+	}
 
 	// Throughput
 	fmt.Printf("\nThroughput:\n")
-	fmt.Printf("  Sent: %.2f MB (%.2f MB/s)\n", float64(r.BytesSent)/1024/1024, float64(r.BytesSent)/1024/1024/r.Duration.Seconds())
-	fmt.Printf("  Received: %.2f MB (%.2f MB/s)\n", float64(r.BytesReceived)/1024/1024, float64(r.BytesReceived)/1024/1024/r.Duration.Seconds())
+	if durationSecs > 0 {
+		fmt.Printf("  Sent: %.2f MB (%.2f MB/s)\n", float64(r.BytesSent)/1024/1024, float64(r.BytesSent)/1024/1024/durationSecs)
+		fmt.Printf("  Received: %.2f MB (%.2f MB/s)\n", float64(r.BytesReceived)/1024/1024, float64(r.BytesReceived)/1024/1024/durationSecs)
+	} else {
+		fmt.Printf("  Sent: %.2f MB\n", float64(r.BytesSent)/1024/1024)
+		fmt.Printf("  Received: %.2f MB\n", float64(r.BytesReceived)/1024/1024)
+	}
 
 	// Status codes
 	fmt.Printf("\nStatus Codes:\n")

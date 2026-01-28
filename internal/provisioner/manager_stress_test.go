@@ -93,7 +93,11 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 	}()
 
 	// Wait for router to be ready
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for manager to start")
+	}
 
 	// Collect memory stats before
 	var memBefore runtime.MemStats
@@ -223,7 +227,11 @@ func TestManager_SustainedLoad(t *testing.T) {
 		mgr.Start(ctx)
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for manager to start")
+	}
 
 	// Sustained load: 1000 events/sec for 10 seconds
 	const (
@@ -369,7 +377,11 @@ func TestManager_WithBackendLatency(t *testing.T) {
 				mgr.Start(ctx)
 			}()
 
-			time.Sleep(200 * time.Millisecond)
+			select {
+			case <-mgr.Running():
+			case <-time.After(5 * time.Second):
+				t.Fatal("timeout waiting for manager to start")
+			}
 
 			const numEvents = 1000
 			start := time.Now()
@@ -482,7 +494,11 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 		mgr.Start(ctx)
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for manager to start")
+	}
 
 	// Sustained high concurrency: 5000 events/sec for 30 seconds
 	const (
@@ -629,7 +645,11 @@ func BenchmarkManager_EndToEnd(b *testing.B) {
 		mgr.Start(ctx)
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		b.Fatal("timeout waiting for manager to start")
+	}
 
 	b.ResetTimer()
 

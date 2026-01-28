@@ -10,6 +10,19 @@ import (
 	"time"
 )
 
+// waitForFlush polls until the specified key is visible in the store.
+// This is more reliable than time.Sleep for synchronization.
+func waitForFlush(t testing.TB, store *PayloadStore, key string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if store.Get(key) != nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for key %q to be flushed", key)
+}
+
 // BenchmarkPayloadStore_Write benchmarks single payload writes.
 func BenchmarkPayloadStore_Write(b *testing.B) {
 	dir := b.TempDir()
@@ -83,10 +96,12 @@ func BenchmarkPayloadStore_Read(b *testing.B) {
 	const numEntries = 1000
 	payload := make([]byte, 1024)
 	rand.Read(payload)
+	lastKey := ""
 	for i := 0; i < numEntries; i++ {
-		store.Store(fmt.Sprintf("lease-%d", i), payload)
+		lastKey = fmt.Sprintf("lease-%d", i)
+		store.Store(lastKey, payload)
 	}
-	time.Sleep(10 * time.Millisecond) // Let batch flush
+	waitForFlush(b, store, lastKey, time.Second)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -114,10 +129,12 @@ func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
 	const numEntries = 1000
 	payload := make([]byte, 1024)
 	rand.Read(payload)
+	lastKey := ""
 	for i := 0; i < numEntries; i++ {
-		store.Store(fmt.Sprintf("lease-%d", i), payload)
+		lastKey = fmt.Sprintf("lease-%d", i)
+		store.Store(lastKey, payload)
 	}
-	time.Sleep(10 * time.Millisecond)
+	waitForFlush(b, store, lastKey, time.Second)
 
 	var counter atomic.Int64
 
@@ -226,10 +243,12 @@ func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
 	const numEntries = 500
 	payload := make([]byte, 1024)
 	rand.Read(payload)
+	lastKey := ""
 	for i := 0; i < numEntries; i++ {
-		store.Store(fmt.Sprintf("lease-%d", i), payload)
+		lastKey = fmt.Sprintf("lease-%d", i)
+		store.Store(lastKey, payload)
 	}
-	time.Sleep(10 * time.Millisecond)
+	waitForFlush(b, store, lastKey, time.Second)
 
 	var writeCounter atomic.Int64
 

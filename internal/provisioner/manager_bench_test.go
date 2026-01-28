@@ -190,7 +190,11 @@ func TestManager_HighThroughput(t *testing.T) {
 	}()
 
 	// Wait for router to be ready
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for manager to start")
+	}
 
 	const (
 		numEvents     = 1000
@@ -284,7 +288,11 @@ func TestManager_BurstTraffic(t *testing.T) {
 	}()
 
 	// Wait for router to be ready
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for manager to start")
+	}
 
 	const (
 		numBursts      = 5
