@@ -293,9 +293,51 @@ func TestCallbackAuthenticator_ReplayProtection(t *testing.T) {
 	}
 }
 
+func TestNewCallbackAuthenticatorWithMaxAge_Validation(t *testing.T) {
+	secret := "test-secret-that-is-at-least-32-chars"
+
+	tests := []struct {
+		name    string
+		maxAge  time.Duration
+		wantErr bool
+	}{
+		{"valid - 1 second", time.Second, false},
+		{"valid - 1 minute", time.Minute, false},
+		{"valid - 30 minutes", 30 * time.Minute, false},
+		{"valid - exactly 1 hour", time.Hour, false},
+		{"invalid - zero", 0, true},
+		{"invalid - negative", -time.Minute, true},
+		{"invalid - exceeds max", 2 * time.Hour, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth, err := NewCallbackAuthenticatorWithMaxAge(secret, tt.maxAge)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				if auth != nil {
+					t.Error("expected nil authenticator on error")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if auth == nil {
+					t.Error("expected authenticator, got nil")
+				}
+			}
+		})
+	}
+}
+
 func TestCallbackAuthenticator_CustomMaxAge(t *testing.T) {
 	// Create authenticator with 1 minute max age
-	auth := NewCallbackAuthenticatorWithMaxAge("test-secret-that-is-at-least-32-chars", time.Minute)
+	auth, err := NewCallbackAuthenticatorWithMaxAge("test-secret-that-is-at-least-32-chars", time.Minute)
+	if err != nil {
+		t.Fatalf("NewCallbackAuthenticatorWithMaxAge() error = %v", err)
+	}
 
 	payload := []byte(`{"test":"data"}`)
 	signedAt := time.Now()
@@ -379,8 +421,14 @@ func TestHandleProvisionCallback_Authentication(t *testing.T) {
 
 func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	secret := "test-secret-that-is-at-least-32-chars"
-	// Use 1 second max age for faster testing
-	auth := NewCallbackAuthenticatorWithMaxAge(secret, time.Second)
+
+	// Use injectable time for deterministic testing (no time.Sleep needed)
+	currentTime := time.Now()
+	auth, err := NewCallbackAuthenticatorWithMaxAge(secret, time.Minute)
+	if err != nil {
+		t.Fatalf("NewCallbackAuthenticatorWithMaxAge() error = %v", err)
+	}
+	auth.nowFunc = func() time.Time { return currentTime }
 
 	publishedCallback := &mockCallbackPublisher{}
 	server := &Server{
@@ -390,10 +438,10 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 
 	body := `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`
 
-	// Create a signature now
-	signature := auth.ComputeSignature([]byte(body))
+	// Create a signature at the current time
+	signature := auth.ComputeSignatureWithTime([]byte(body), currentTime)
 
-	// First request should succeed
+	// First request should succeed (time hasn't advanced)
 	req1 := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
 	req1.Header.Set("Content-Type", "application/json")
 	req1.Header.Set(CallbackSignatureHeader, signature)
@@ -401,13 +449,13 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	server.handleProvisionCallback(rr1, req1)
 
 	if rr1.Code != http.StatusOK {
-		t.Errorf("first request should succeed, got status %d", rr1.Code)
+		t.Errorf("first request should succeed, got status %d: %s", rr1.Code, rr1.Body.String())
 	}
 
-	// Wait for signature to expire
-	time.Sleep(2 * time.Second)
+	// Advance time past the max age (deterministic, no sleep)
+	currentTime = currentTime.Add(2 * time.Minute)
 
-	// Replay attempt should fail
+	// Replay attempt should fail (signature is now expired)
 	publishedCallback.reset()
 	req2 := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
 	req2.Header.Set("Content-Type", "application/json")
@@ -416,7 +464,7 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	server.handleProvisionCallback(rr2, req2)
 
 	if rr2.Code != http.StatusUnauthorized {
-		t.Errorf("replay attack should be rejected, got status %d", rr2.Code)
+		t.Errorf("replay attack should be rejected, got status %d: %s", rr2.Code, rr2.Body.String())
 	}
 }
 
@@ -461,9 +509,11 @@ func TestParseSignature(t *testing.T) {
 			wantOK:    false,
 		},
 		{
-			name:      "too many parts",
-			signature: "t=1700000000,sha256=abc,extra=data",
-			wantOK:    false,
+			name:          "extra data after signature",
+			signature:     "t=1700000000,sha256=abc,extra=data",
+			wantTimestamp: 1700000000,
+			wantSig:       "abc,extra=data", // Cut only splits at first comma; hex decode will fail later
+			wantOK:        true,
 		},
 	}
 

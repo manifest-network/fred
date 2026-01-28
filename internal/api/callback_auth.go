@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,10 @@ const (
 	// Callbacks older than this are rejected to prevent replay attacks.
 	DefaultCallbackMaxAge = 5 * time.Minute
 
+	// MaxCallbackMaxAge is the maximum allowed value for callback max age.
+	// Values larger than this would undermine replay protection.
+	MaxCallbackMaxAge = 1 * time.Hour
+
 	// callbackClockSkewTolerance is the maximum allowed clock skew for future timestamps.
 	// This allows for minor clock differences between backend and Fred servers.
 	callbackClockSkewTolerance = 1 * time.Minute
@@ -28,26 +33,43 @@ const (
 
 // CallbackAuthenticator verifies HMAC signatures on backend callbacks.
 // It includes timestamp-based replay protection following the Stripe pattern.
+//
+// Performance note: The current implementation uses fmt.Sprintf to build the signed
+// payload, which allocates an intermediate string. This is acceptable because callback
+// payloads are small by design (~100 bytes: lease_uuid, status, error). The large
+// Payload field (potentially megabytes) is in ProvisionRequest going TO backends,
+// not in CallbackPayload coming back. If signing large data becomes necessary,
+// consider writing to the HMAC incrementally to avoid copying the payload.
 type CallbackAuthenticator struct {
-	secret []byte
-	maxAge time.Duration
+	secret  []byte
+	maxAge  time.Duration
+	nowFunc func() time.Time // For testing; defaults to time.Now
 }
 
 // NewCallbackAuthenticator creates a new callback authenticator with the given secret.
 // Uses DefaultCallbackMaxAge for replay protection.
 func NewCallbackAuthenticator(secret string) *CallbackAuthenticator {
 	return &CallbackAuthenticator{
-		secret: []byte(secret),
-		maxAge: DefaultCallbackMaxAge,
+		secret:  []byte(secret),
+		maxAge:  DefaultCallbackMaxAge,
+		nowFunc: time.Now,
 	}
 }
 
 // NewCallbackAuthenticatorWithMaxAge creates a callback authenticator with a custom max age.
-func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) *CallbackAuthenticator {
-	return &CallbackAuthenticator{
-		secret: []byte(secret),
-		maxAge: maxAge,
+// Returns an error if maxAge is not positive or exceeds MaxCallbackMaxAge.
+func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*CallbackAuthenticator, error) {
+	if maxAge <= 0 {
+		return nil, errors.New("callback max age must be positive")
 	}
+	if maxAge > MaxCallbackMaxAge {
+		return nil, fmt.Errorf("callback max age %v exceeds maximum allowed %v", maxAge, MaxCallbackMaxAge)
+	}
+	return &CallbackAuthenticator{
+		secret:  []byte(secret),
+		maxAge:  maxAge,
+		nowFunc: time.Now,
+	}, nil
 }
 
 // ComputeSignature computes the HMAC-SHA256 signature for a payload with timestamp.
@@ -68,11 +90,19 @@ func (a *CallbackAuthenticator) ComputeSignatureWithTime(payload []byte, t time.
 	return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
 }
 
+// now returns the current time, using the injected time function if set.
+func (a *CallbackAuthenticator) now() time.Time {
+	if a.nowFunc != nil {
+		return a.nowFunc()
+	}
+	return time.Now()
+}
+
 // VerifySignature verifies that the provided signature matches the payload.
 // The signature should be in the format "t=<timestamp>,sha256=<hex>".
 // Returns false if the signature is invalid or the timestamp is too old.
 func (a *CallbackAuthenticator) VerifySignature(payload []byte, signature string) bool {
-	return a.VerifySignatureWithTime(payload, signature, time.Now())
+	return a.VerifySignatureWithTime(payload, signature, a.now())
 }
 
 // VerifySignatureWithTime verifies the signature against a reference time (for testing).
@@ -83,26 +113,27 @@ func (a *CallbackAuthenticator) VerifySignatureWithTime(payload []byte, signatur
 // parseSignature parses "t=<timestamp>,sha256=<hex>" format.
 // Returns timestamp, signature hex, and success flag.
 func parseSignature(signature string) (int64, string, bool) {
-	// Split into parts
-	parts := strings.Split(signature, ",")
-	if len(parts) != 2 {
+	// Split at first comma only (avoids issues if signature hex somehow contains commas)
+	timestampPart, sigPart, ok := strings.Cut(signature, ",")
+	if !ok {
 		return 0, "", false
 	}
 
-	// Parse timestamp
-	if !strings.HasPrefix(parts[0], "t=") {
+	// Parse timestamp: "t=<unix-timestamp>"
+	timestampStr, ok := strings.CutPrefix(timestampPart, "t=")
+	if !ok {
 		return 0, "", false
 	}
-	timestamp, err := strconv.ParseInt(strings.TrimPrefix(parts[0], "t="), 10, 64)
+	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
 		return 0, "", false
 	}
 
-	// Parse signature
-	if !strings.HasPrefix(parts[1], "sha256=") {
+	// Parse signature: "sha256=<hex>"
+	sigHex, ok := strings.CutPrefix(sigPart, "sha256=")
+	if !ok {
 		return 0, "", false
 	}
-	sigHex := strings.TrimPrefix(parts[1], "sha256=")
 
 	return timestamp, sigHex, true
 }
@@ -120,7 +151,7 @@ func (a *CallbackAuthenticator) VerifyRequest(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
 
-	if err := a.verifySignatureWithError(body, signature, time.Now()); err != nil {
+	if err := a.verifySignatureWithError(body, signature, a.now()); err != nil {
 		return nil, err
 	}
 
