@@ -81,13 +81,16 @@ func (a *CallbackAuthenticator) ComputeSignature(payload []byte) string {
 // ComputeSignatureWithTime computes the signature with a specific timestamp (for testing).
 func (a *CallbackAuthenticator) ComputeSignatureWithTime(payload []byte, t time.Time) string {
 	timestamp := t.Unix()
-	signedPayload := fmt.Sprintf("%d.%s", timestamp, payload)
+	sig := a.computeMAC(timestamp, payload)
+	return fmt.Sprintf("t=%d,sha256=%s", timestamp, hex.EncodeToString(sig))
+}
 
+// computeMAC computes the HMAC-SHA256 for the given timestamp and payload.
+func (a *CallbackAuthenticator) computeMAC(timestamp int64, payload []byte) []byte {
+	signedPayload := fmt.Sprintf("%d.%s", timestamp, payload)
 	mac := hmac.New(sha256.New, a.secret)
 	mac.Write([]byte(signedPayload))
-	sig := hex.EncodeToString(mac.Sum(nil))
-
-	return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
+	return mac.Sum(nil)
 }
 
 // now returns the current time, using the injected time function if set.
@@ -183,11 +186,7 @@ func (a *CallbackAuthenticator) verifySignatureWithError(payload []byte, signatu
 		return fmt.Errorf("invalid signature encoding: %w", err)
 	}
 
-	signedPayload := fmt.Sprintf("%d.%s", timestamp, payload)
-	mac := hmac.New(sha256.New, a.secret)
-	mac.Write([]byte(signedPayload))
-	expectedSig := mac.Sum(nil)
-
+	expectedSig := a.computeMAC(timestamp, payload)
 	if !hmac.Equal(providedSig, expectedSig) {
 		return fmt.Errorf("signature mismatch")
 	}
