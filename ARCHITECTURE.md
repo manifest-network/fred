@@ -326,10 +326,16 @@ Common test data in `internal/testutil/fixtures.go`:
 
 ### Callback Authentication
 
+Callbacks use HMAC-SHA256 with timestamp-based replay protection (following the Stripe pattern):
+
 ```
-1. Backend computes HMAC-SHA256(body, shared_secret)
-2. Backend sends X-Fred-Signature: sha256=<hex>
-3. Fred recomputes and compares (constant-time)
+1. Backend computes timestamp and signed payload: "<timestamp>.<body>"
+2. Backend computes HMAC-SHA256(signed_payload, shared_secret)
+3. Backend sends X-Fred-Signature: t=<timestamp>,sha256=<hex>
+4. Fred parses timestamp and signature
+5. Fred rejects if timestamp > 5 minutes old (replay protection)
+6. Fred rejects if timestamp > 1 minute in future (clock skew limit)
+7. Fred recomputes signature and compares (constant-time)
 ```
 
 ### Defense in Depth

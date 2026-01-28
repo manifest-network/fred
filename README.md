@@ -371,13 +371,23 @@ The signed message format is: `manifest lease data {lease_uuid} {meta_hash_hex} 
 ```
 POST /callbacks/provision
 Content-Type: application/json
-X-Fred-Signature: sha256=<hmac-sha256-hex>
+X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
 ```
 
-Called by backends to report provisioning status. Requires HMAC-SHA256 authentication.
+Called by backends to report provisioning status. Requires HMAC-SHA256 authentication with timestamp-based replay protection.
 
 **Authentication:**
-The `X-Fred-Signature` header must contain an HMAC-SHA256 signature of the request body, using the shared `callback_secret`. Format: `sha256=<hex-encoded-signature>`.
+The `X-Fred-Signature` header contains a timestamped HMAC-SHA256 signature. Format: `t=<unix-timestamp>,sha256=<hex>`.
+
+The HMAC is computed over `<timestamp>.<body>` to bind the timestamp to the signature:
+```
+signedPayload = fmt.Sprintf("%d.%s", timestamp, body)
+signature = HMAC-SHA256(signedPayload, callback_secret)
+```
+
+**Replay Protection:**
+- Callbacks older than 5 minutes are rejected
+- Timestamps up to 1 minute in the future are accepted (clock skew tolerance)
 
 **Request:**
 ```json

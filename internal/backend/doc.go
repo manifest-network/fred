@@ -39,8 +39,12 @@
 // After async provisioning completes, backends call fred's callback URL:
 //
 //	POST {callback_url}
-//	X-Fred-Signature: sha256=<hmac-sha256-hex>
+//	X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
 //	Content-Type: application/json
 //
 //	{"lease_uuid": "...", "status": "success"|"failed", "error": "..."}
+//
+// The HMAC is computed over "<timestamp>.<body>" to bind the timestamp to
+// the signature. Callbacks older than 5 minutes are rejected (replay protection).
+// Timestamps up to 1 minute in the future are accepted (clock skew tolerance).
 package backend

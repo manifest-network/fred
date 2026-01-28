@@ -201,7 +201,7 @@ When provisioning completes (success or failure), POST to the `callback_url` fro
 ```http
 POST {callback_url}
 Content-Type: application/json
-X-Fred-Signature: sha256=<hex-encoded-hmac>
+X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -210,25 +210,38 @@ X-Fred-Signature: sha256=<hex-encoded-hmac>
 }
 ```
 
+**Note:** The timestamp must be the current Unix time when sending the request. Callbacks with timestamps older than 5 minutes or more than 1 minute in the future are rejected.
+
 **Fields:**
 - `status`: Either `"success"` or `"failed"`
 - `error`: Error message if status is `"failed"`, empty otherwise
 
-### HMAC Signature
+### HMAC Signature with Replay Protection
 
-Fred verifies callbacks using HMAC-SHA256. You must sign the request body:
+Fred verifies callbacks using HMAC-SHA256 with timestamp-based replay protection (following the Stripe pattern). Callbacks older than 5 minutes are rejected.
+
+**Signature format:** `t=<unix-timestamp>,sha256=<hex-encoded-hmac>`
+
+The HMAC is computed over `<timestamp>.<body>` to bind the timestamp to the signature:
 
 ```go
 import (
     "crypto/hmac"
     "crypto/sha256"
     "encoding/hex"
+    "fmt"
+    "time"
 )
 
 func computeSignature(body []byte, secret string) string {
+    timestamp := time.Now().Unix()
+    signedPayload := fmt.Sprintf("%d.%s", timestamp, body)
+
     mac := hmac.New(sha256.New, []byte(secret))
-    mac.Write(body)
-    return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+    mac.Write([]byte(signedPayload))
+    sig := hex.EncodeToString(mac.Sum(nil))
+
+    return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
 }
 
 // Usage:
@@ -238,6 +251,12 @@ req.Header.Set("X-Fred-Signature", signature)
 ```
 
 The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration.
+
+### Security Notes
+
+- **Replay protection**: Callbacks older than 5 minutes are rejected
+- **Clock skew tolerance**: Timestamps up to 1 minute in the future are accepted
+- **Industry standard**: Follows the same pattern as Stripe, GitHub, and Slack webhooks
 
 ## State Management
 
