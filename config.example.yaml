@@ -16,6 +16,17 @@
 # =============================================================================
 
 # =============================================================================
+# PRODUCTION MODE
+# =============================================================================
+# When enabled, enforces security requirements that are only warnings/optional
+# in development mode. Startup will fail if insecure settings are detected.
+#
+# Enforces:
+#   - grpc_tls_skip_verify must be false when grpc_tls_enabled is true
+#   - token_tracker_db_path must be configured (replay protection)
+production_mode: false
+
+# =============================================================================
 # CHAIN CONNECTION
 # =============================================================================
 # Settings for connecting to the Manifest blockchain.

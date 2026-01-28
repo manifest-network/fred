@@ -75,6 +75,9 @@ type Config struct {
 	// Reconciliation configuration
 	ReconciliationInterval time.Duration `mapstructure:"reconciliation_interval"`
 
+	// Production mode enforces security requirements at startup
+	ProductionMode bool `mapstructure:"production_mode"`
+
 	// Token replay protection
 	TokenTrackerDBPath string `mapstructure:"token_tracker_db_path"`
 
@@ -104,6 +107,7 @@ func Load(configPath string) (*Config, error) {
 	v := viper.New()
 
 	// Set defaults
+	v.SetDefault("production_mode", false)
 	v.SetDefault("chain_id", "manifest-1")
 	v.SetDefault("grpc_endpoint", "localhost:9090")
 	v.SetDefault("websocket_url", "ws://localhost:26657/websocket")
@@ -301,7 +305,19 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
 	}
 
-	// Security warning for gRPC TLS skip verify
+	// Production mode security enforcement
+	if c.ProductionMode {
+		// Only block skip_verify when TLS is actually enabled; if TLS is
+		// disabled the flag is meaningless and not a security concern.
+		if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
+			return fmt.Errorf("production_mode: grpc_tls_skip_verify cannot be enabled with grpc_tls_enabled")
+		}
+		if c.TokenTrackerDBPath == "" {
+			return fmt.Errorf("production_mode: token_tracker_db_path is required for replay protection")
+		}
+	}
+
+	// Security warning for gRPC TLS skip verify (non-production mode)
 	if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
 		slog.Warn("SECURITY WARNING: grpc_tls_skip_verify is enabled - TLS certificate verification is disabled, vulnerable to MITM attacks")
 	}
