@@ -75,7 +75,7 @@ func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*C
 // ComputeSignature computes the HMAC-SHA256 signature for a payload with timestamp.
 // Returns the signature in the format "t=<timestamp>,sha256=<hex>".
 func (a *CallbackAuthenticator) ComputeSignature(payload []byte) string {
-	return a.ComputeSignatureWithTime(payload, time.Now())
+	return a.ComputeSignatureWithTime(payload, a.now())
 }
 
 // ComputeSignatureWithTime computes the signature with a specific timestamp (for testing).
@@ -112,12 +112,17 @@ func (a *CallbackAuthenticator) VerifySignatureWithTime(payload []byte, signatur
 
 // parseSignature parses "t=<timestamp>,sha256=<hex>" format.
 // Returns timestamp, signature hex, and success flag.
+// Tolerates optional whitespace around the comma for interoperability.
 func parseSignature(signature string) (int64, string, bool) {
 	// Split at first comma only (avoids issues if signature hex somehow contains commas)
 	timestampPart, sigPart, ok := strings.Cut(signature, ",")
 	if !ok {
 		return 0, "", false
 	}
+
+	// Trim whitespace for interoperability (e.g., "t=123, sha256=abc")
+	timestampPart = strings.TrimSpace(timestampPart)
+	sigPart = strings.TrimSpace(sigPart)
 
 	// Parse timestamp: "t=<unix-timestamp>"
 	timestampStr, ok := strings.CutPrefix(timestampPart, "t=")

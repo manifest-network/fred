@@ -106,6 +106,20 @@ func TestCallbackAuthenticator_VerifySignature(t *testing.T) {
 			wantValid: true,
 		},
 		{
+			name:      "valid signature - whitespace after comma",
+			payload:   payload,
+			signature: strings.Replace(validSignature, ",sha256=", ", sha256=", 1),
+			refTime:   now,
+			wantValid: true,
+		},
+		{
+			name:      "valid signature - whitespace around comma",
+			payload:   payload,
+			signature: strings.Replace(validSignature, ",sha256=", " , sha256=", 1),
+			refTime:   now,
+			wantValid: true,
+		},
+		{
 			name:      "invalid signature - wrong hash",
 			payload:   payload,
 			signature: "t=1700000000,sha256=0000000000000000000000000000000000000000000000000000000000000000",

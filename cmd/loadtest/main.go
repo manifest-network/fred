@@ -15,7 +15,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -33,6 +32,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/manifest-network/fred/internal/api"
 )
 
 func main() {
@@ -74,13 +74,18 @@ func main() {
 	)
 
 	// Create load tester
+	var callbackAuth *api.CallbackAuthenticator
+	if *callbackSecret != "" {
+		callbackAuth = api.NewCallbackAuthenticator(*callbackSecret)
+	}
+
 	lt := &LoadTester{
-		target:         *target,
-		duration:       *duration,
-		concurrency:    *concurrency,
-		payloadSize:    *payloadSize,
-		rampUp:         *rampUp,
-		callbackSecret: *callbackSecret,
+		target:       *target,
+		duration:     *duration,
+		concurrency:  *concurrency,
+		payloadSize:  *payloadSize,
+		rampUp:       *rampUp,
+		callbackAuth: callbackAuth,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -113,13 +118,13 @@ func main() {
 
 // LoadTester performs load testing against fred.
 type LoadTester struct {
-	target         string
-	duration       time.Duration
-	concurrency    int
-	payloadSize    int
-	rampUp         time.Duration
-	callbackSecret string
-	client         *http.Client
+	target       string
+	duration     time.Duration
+	concurrency  int
+	payloadSize  int
+	rampUp       time.Duration
+	callbackAuth *api.CallbackAuthenticator
+	client       *http.Client
 }
 
 // Results holds load test results.
@@ -490,7 +495,7 @@ func (lt *LoadTester) RunMixedTest() *Results {
 					case 4, 5, 6, 7, 8: // 50% connection checks
 						lt.doConnectionRequest(results)
 					case 9: // 10% callbacks (if secret provided)
-						if lt.callbackSecret != "" {
+						if lt.callbackAuth != nil {
 							lt.doCallbackRequest(results)
 						} else {
 							lt.doConnectionRequest(results)
@@ -534,9 +539,7 @@ func (lt *LoadTester) generateAuthToken(leaseUUID, metaHash string) string {
 	return base64.StdEncoding.EncodeToString(tokenBytes)
 }
 
-// signCallback signs a callback payload with HMAC.
+// signCallback signs a callback payload using the CallbackAuthenticator.
 func (lt *LoadTester) signCallback(payload []byte) string {
-	mac := hmac.New(sha256.New, []byte(lt.callbackSecret))
-	mac.Write(payload)
-	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	return lt.callbackAuth.ComputeSignature(payload)
 }
