@@ -1,0 +1,196 @@
+package api
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// freePort binds :0, extracts the port, and returns "127.0.0.1:<port>".
+func freePort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
+}
+
+// newTestServer creates a Server with minimal mock deps for lifecycle tests.
+func newTestServer(t *testing.T, addr string) *Server {
+	t.Helper()
+
+	s, err := NewServer(
+		ServerConfig{
+			Addr:           addr,
+			ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
+			Bech32Prefix:   "manifest",
+			RateLimitRPS:   100,
+			RateLimitBurst: 200,
+			ReadTimeout:    5 * time.Second,
+			WriteTimeout:   5 * time.Second,
+			IdleTimeout:    30 * time.Second,
+			RequestTimeout: 5 * time.Second,
+		},
+		&mockChainClient{},
+		nil, // no backend router
+		&mockCallbackPublisher{},
+		nil, // no payload publisher
+		&mockStatusChecker{},
+	)
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+	return s
+}
+
+// startAndWaitForServer starts the server in a goroutine and polls /health
+// until it responds. Returns the HTTP client for subsequent requests.
+func startAndWaitForServer(t *testing.T, s *Server, addr string) *http.Client {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Start(ctx)
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	healthURL := fmt.Sprintf("http://%s/health", addr)
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for server to start")
+		case err := <-errCh:
+			t.Fatalf("server exited unexpectedly: %v", err)
+		default:
+		}
+
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			return client
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestServer_StartAndHealth(t *testing.T) {
+	addr := freePort(t)
+	s := newTestServer(t, addr)
+
+	client := startAndWaitForServer(t, s, addr)
+
+	resp, err := client.Get(fmt.Sprintf("http://%s/health", addr))
+	if err != nil {
+		t.Fatalf("health check request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("health check status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Errorf("Shutdown() error = %v", err)
+	}
+}
+
+func TestServer_GracefulShutdown(t *testing.T) {
+	addr := freePort(t)
+	s := newTestServer(t, addr)
+
+	client := startAndWaitForServer(t, s, addr)
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	// Subsequent requests should fail
+	_, err := client.Get(fmt.Sprintf("http://%s/health", addr))
+	if err == nil {
+		t.Error("request after shutdown should fail")
+	}
+}
+
+func TestServer_RoutesRegistered(t *testing.T) {
+	addr := freePort(t)
+	s := newTestServer(t, addr)
+
+	client := startAndWaitForServer(t, s, addr)
+	defer s.Shutdown(context.Background())
+
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/health"},
+		{"GET", "/metrics"},
+		{"POST", "/callbacks/provision"},
+		{"GET", "/v1/leases/01234567-89ab-cdef-0123-456789abcdef/status"},
+	}
+
+	for _, route := range routes {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			url := fmt.Sprintf("http://%s%s", addr, route.path)
+			req, _ := http.NewRequest(route.method, url, nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode == http.StatusNotFound {
+				t.Errorf("route %s %s returned 404, expected route to be registered", route.method, route.path)
+			}
+		})
+	}
+}
+
+func TestServer_ShutdownClosesTokenTracker(t *testing.T) {
+	addr := freePort(t)
+	dbPath := filepath.Join(t.TempDir(), "tokens.db")
+
+	s, err := NewServer(
+		ServerConfig{
+			Addr:               addr,
+			ProviderUUID:       "01234567-89ab-cdef-0123-456789abcdef",
+			Bech32Prefix:       "manifest",
+			RateLimitRPS:       100,
+			RateLimitBurst:     200,
+			ReadTimeout:        5 * time.Second,
+			WriteTimeout:       5 * time.Second,
+			IdleTimeout:        30 * time.Second,
+			RequestTimeout:     5 * time.Second,
+			TokenTrackerDBPath: dbPath,
+		},
+		&mockChainClient{},
+		nil,
+		&mockCallbackPublisher{},
+		nil,
+		&mockStatusChecker{},
+	)
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	if s.tokenTracker == nil {
+		t.Fatal("expected token tracker to be configured")
+	}
+
+	startAndWaitForServer(t, s, addr)
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Errorf("Shutdown() error = %v", err)
+	}
+}

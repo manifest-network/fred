@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -285,8 +286,16 @@ func TestPayloadStore_CleanupExpiredPayloads(t *testing.T) {
 		t.Errorf("Count() = %d, want 1", store.Count())
 	}
 
-	// Wait for TTL + cleanup interval
-	time.Sleep(150 * time.Millisecond)
+	// Poll until cleanup removes the data
+	deadline := time.After(5 * time.Second)
+	for store.Count() != 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for cleanup")
+		default:
+			runtime.Gosched()
+		}
+	}
 
 	// Data should be cleaned up
 	if store.Count() != 0 {
@@ -589,8 +598,16 @@ func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
 	// Store a single item (won't trigger batch size)
 	store.Store("interval-test", []byte("data"))
 
-	// Wait for flush interval
-	time.Sleep(100 * time.Millisecond)
+	// Poll until flush interval writes the data
+	deadline := time.After(5 * time.Second)
+	for !store.Has("interval-test") {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for flush")
+		default:
+			runtime.Gosched()
+		}
+	}
 
 	// Data should be written
 	if !store.Has("interval-test") {
