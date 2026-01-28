@@ -408,16 +408,18 @@ func validateHTTPURL(rawURL string) error {
 
 // validateExternalURL rejects URLs that point to loopback, link-local, or
 // unspecified addresses. Private IPs (RFC 1918) are allowed since backends
-// commonly run on private networks. Only IP literals and the hostname
-// "localhost" are checked; other hostnames are allowed through (no DNS
-// resolution).
+// commonly run on private networks. Multicast and broadcast addresses are
+// not checked because TCP (required by HTTP) does not support them. Only IP
+// literals and the hostname "localhost" are checked; other hostnames are
+// allowed through (no DNS resolution).
 func validateExternalURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 
-	hostname := parsed.Hostname() // strips port and IPv6 brackets
+	hostname := parsed.Hostname()            // strips port and IPv6 brackets
+	hostname = strings.TrimSuffix(hostname, ".") // normalize FQDN notation
 
 	// Block "localhost" hostname (case-insensitive)
 	if strings.EqualFold(hostname, "localhost") {

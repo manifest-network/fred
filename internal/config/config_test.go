@@ -1021,6 +1021,15 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			wantErr: "production_mode: callback_base_url: URL must not use a loopback address",
 		},
 		{
+			name: "production mode blocks alternate loopback callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://127.0.0.2:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use a loopback address",
+		},
+		{
 			name: "production mode blocks localhost callback URL",
 			modify: func(c *Config) {
 				c.ProductionMode = true
@@ -1066,6 +1075,15 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			wantErr: "production_mode: callback_base_url: URL must not use a loopback address",
 		},
 		{
+			name: "production mode blocks IPv4-mapped IPv6 loopback callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://[::ffff:127.0.0.1]:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use a loopback address",
+		},
+		{
 			name: "production mode blocks IPv6 link-local callback URL",
 			modify: func(c *Config) {
 				c.ProductionMode = true
@@ -1089,6 +1107,15 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 				c.ProductionMode = true
 				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
 				c.CallbackBaseURL = "http://Localhost:8080"
+			},
+			wantErr: "production_mode: callback_base_url: URL must not use localhost",
+		},
+		{
+			name: "production mode blocks FQDN localhost callback URL",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://localhost.:8080"
 			},
 			wantErr: "production_mode: callback_base_url: URL must not use localhost",
 		},
