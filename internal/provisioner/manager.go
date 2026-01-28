@@ -235,6 +235,12 @@ func (m *Manager) Start(ctx context.Context) error {
 	return m.wmRouter.Run(ctx)
 }
 
+// Running returns a channel that is closed when the router is running.
+// This can be used to wait for the manager to be ready before publishing events.
+func (m *Manager) Running() chan struct{} {
+	return m.wmRouter.Running()
+}
+
 // Close shuts down the provision manager.
 func (m *Manager) Close() error {
 	// Log in-flight provisions to help operators understand state during shutdown
