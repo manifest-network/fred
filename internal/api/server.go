@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -222,7 +223,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 	}
 
 	var callback backend.CallbackPayload
-	if err := decodeJSONBytes(body, &callback); err != nil {
+	if err := json.Unmarshal(body, &callback); err != nil {
 		slog.Warn("invalid callback payload", "error", err)
 		writeError(w, "invalid request body", http.StatusBadRequest)
 		return

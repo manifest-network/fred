@@ -83,17 +83,10 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Query the lease from chain
-	lease, err := h.client.GetLease(r.Context(), leaseUUID)
+	// Query the lease from chain and verify ownership
+	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, false)
 	if err != nil {
-		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
-		return
-	}
-
-	if lease == nil {
-		slog.Warn("lease not found", "lease_uuid", leaseUUID)
-		writeError(w, errMsgLeaseNotFound, http.StatusNotFound)
+		writeError(w, err.Error(), status)
 		return
 	}
 
@@ -104,26 +97,6 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"state", lease.State.String(),
 		)
 		writeError(w, "lease not pending", http.StatusNotFound)
-		return
-	}
-
-	// Verify the tenant matches
-	if lease.Tenant != token.Tenant {
-		slog.Warn("tenant mismatch",
-			"token_tenant", token.Tenant,
-			"lease_tenant", lease.Tenant,
-		)
-		writeError(w, errMsgForbidden, http.StatusForbidden)
-		return
-	}
-
-	// Verify the provider UUID matches
-	if lease.ProviderUuid != h.providerUUID {
-		slog.Warn("provider UUID mismatch",
-			"lease_provider_uuid", lease.ProviderUuid,
-			"our_provider_uuid", h.providerUUID,
-		)
-		writeError(w, errMsgForbidden, http.StatusForbidden)
 		return
 	}
 
