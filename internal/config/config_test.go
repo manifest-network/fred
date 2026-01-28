@@ -917,6 +917,114 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_ProductionMode(t *testing.T) {
+	baseConfig := func() Config {
+		return Config{
+			ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+			ProviderAddress:           "manifest1abc",
+			KeyName:                   "provider",
+			KeyringDir:                "/home/provider/.manifest",
+			Bech32Prefix:              "manifest",
+			WithdrawInterval:          time.Hour,
+			RateLimitRPS:              10,
+			RateLimitBurst:            20,
+			GasLimit:                  500000,
+			GasPrice:                  25,
+			FeeDenom:                  "umfx",
+			HTTPReadTimeout:           15 * time.Second,
+			HTTPWriteTimeout:          15 * time.Second,
+			HTTPIdleTimeout:           60 * time.Second,
+			WebSocketPingInterval:     30 * time.Second,
+			TxPollInterval:            500 * time.Millisecond,
+			TxTimeout:                 30 * time.Second,
+			QueryPageLimit:            100,
+			MaxWithdrawIterations:     100,
+			WebSocketReconnectInitial: time.Second,
+			WebSocketReconnectMax:     60 * time.Second,
+			MaxRequestBodySize:        1 << 20,
+			CreditCheckErrorThreshold: 3,
+			CreditCheckRetryInterval:  30 * time.Second,
+			ReconciliationInterval:    5 * time.Minute,
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://localhost:8080",
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+		}
+	}
+
+	tests := []struct {
+		name    string
+		modify  func(*Config)
+		wantErr string
+	}{
+		{
+			name: "production mode blocks tls skip verify",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.GRPCTLSEnabled = true
+				c.GRPCTLSSkipVerify = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+			},
+			wantErr: "production_mode: grpc_tls_skip_verify cannot be enabled",
+		},
+		{
+			name: "production mode requires token tracker",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = ""
+			},
+			wantErr: "production_mode: token_tracker_db_path is required",
+		},
+		{
+			name: "production mode allows valid secure config",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.GRPCTLSEnabled = true
+				c.GRPCTLSSkipVerify = false
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+			},
+			wantErr: "",
+		},
+		{
+			name: "non-production mode allows tls skip verify",
+			modify: func(c *Config) {
+				c.ProductionMode = false
+				c.GRPCTLSEnabled = true
+				c.GRPCTLSSkipVerify = true
+			},
+			wantErr: "",
+		},
+		{
+			name: "non-production mode allows missing token tracker",
+			modify: func(c *Config) {
+				c.ProductionMode = false
+				c.TokenTrackerDBPath = ""
+			},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			tt.modify(&cfg)
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
+				return
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoad_ConfigFile(t *testing.T) {
 	// Create a temp config file
 	tmpDir := t.TempDir()

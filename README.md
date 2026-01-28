@@ -165,6 +165,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `production_mode` | Enforce security requirements at startup | `false` |
 | `chain_id` | Chain identifier | `manifest-1` |
 | `grpc_endpoint` | Chain gRPC endpoint | `localhost:9090` |
 | `websocket_url` | CometBFT WebSocket URL | `ws://localhost:26657/websocket` |
@@ -185,7 +186,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `callback_base_url` | Base URL for backend callbacks | (required) |
 | `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
-| `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional) |
+| `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
 | `payload_store_ttl` | TTL for stored payloads | `1h` |
 | `payload_store_cleanup_freq` | How often to clean up expired payloads | `10m` |
@@ -709,6 +710,7 @@ Chain State (leases)     Backend State (provisions)
 - **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
 - **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
 - **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses
+- **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection)
 
 ## Performance
 
