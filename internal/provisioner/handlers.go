@@ -49,18 +49,30 @@ func recordWatermillMetrics(topic string, err error) {
 	metrics.WatermillMessagesTotal.WithLabelValues(topic, outcome).Inc()
 }
 
+// unmarshalMessagePayload unmarshals a Watermill message payload into the given type.
+// On failure it records a malformed message metric, logs the error, and returns false.
+// Callers should return nil (skip retry) when ok is false.
+func unmarshalMessagePayload[T any](msg *message.Message, topic string) (T, bool) {
+	var v T
+	if err := json.Unmarshal(msg.Payload, &v); err != nil {
+		metrics.MalformedMessagesTotal.WithLabelValues(topic).Inc()
+		slog.Error("failed to unmarshal message",
+			"topic", topic,
+			"error", err,
+			"error_type", ErrMalformedMessage,
+		)
+		return v, false
+	}
+	return v, true
+}
+
 // handleLeaseCreated processes new lease events.
 func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 	defer func() { recordWatermillMetrics(TopicLeaseCreated, err) }()
 
-	var event chain.LeaseEvent
-	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		metrics.MalformedMessagesTotal.WithLabelValues(TopicLeaseCreated).Inc()
-		slog.Error("failed to unmarshal lease created event",
-			"error", err,
-			"error_type", ErrMalformedMessage,
-		)
-		return nil // Don't retry malformed messages
+	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseCreated)
+	if !ok {
+		return nil
 	}
 
 	// Fetch lease details from chain to get SKU for routing
@@ -157,14 +169,9 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 	defer func() { recordWatermillMetrics(TopicLeaseClosed, err) }()
 
-	var event chain.LeaseEvent
-	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		metrics.MalformedMessagesTotal.WithLabelValues(TopicLeaseClosed).Inc()
-		slog.Error("failed to unmarshal lease closed event",
-			"error", err,
-			"error_type", ErrMalformedMessage,
-		)
-		return nil // Don't retry malformed messages
+	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseClosed)
+	if !ok {
+		return nil
 	}
 
 	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID)
@@ -292,14 +299,9 @@ func (m *Manager) handleLeaseExpired(msg *message.Message) error {
 func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 	defer func() { recordWatermillMetrics(TopicBackendCallback, err) }()
 
-	var callback backend.CallbackPayload
-	if err := json.Unmarshal(msg.Payload, &callback); err != nil {
-		metrics.MalformedMessagesTotal.WithLabelValues(TopicBackendCallback).Inc()
-		slog.Error("failed to unmarshal backend callback",
-			"error", err,
-			"error_type", ErrMalformedMessage,
-		)
-		return nil // Don't retry malformed messages
+	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, TopicBackendCallback)
+	if !ok {
+		return nil
 	}
 
 	// Check if this lease is in-flight (idempotency check)
@@ -424,14 +426,9 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 		return nil // Don't retry - configuration issue
 	}
 
-	var event PayloadEvent
-	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		metrics.MalformedMessagesTotal.WithLabelValues(TopicPayloadReceived).Inc()
-		slog.Error("failed to unmarshal payload event",
-			"error", err,
-			"error_type", ErrMalformedMessage,
-		)
-		return nil // Don't retry malformed messages
+	event, ok := unmarshalMessagePayload[PayloadEvent](msg, TopicPayloadReceived)
+	if !ok {
+		return nil
 	}
 
 	slog.Info("processing payload received",
