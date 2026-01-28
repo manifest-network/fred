@@ -112,41 +112,9 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
 	}
 
-	// Query the lease from chain
-	var lease *billingtypes.Lease
-	if requireActive {
-		lease, err = h.client.GetActiveLease(r.Context(), leaseUUID)
-	} else {
-		lease, err = h.client.GetLease(r.Context(), leaseUUID)
-	}
+	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, requireActive)
 	if err != nil {
-		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
-		return nil, http.StatusInternalServerError, errors.New(errMsgInternalServerError)
-	}
-
-	if lease == nil {
-		if requireActive {
-			return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound + " or not active")
-		}
-		return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound)
-	}
-
-	// Verify the tenant matches
-	if lease.Tenant != token.Tenant {
-		slog.Warn("tenant mismatch",
-			"token_tenant", token.Tenant,
-			"lease_tenant", lease.Tenant,
-		)
-		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
-	}
-
-	// Verify the provider UUID matches
-	if lease.ProviderUuid != h.providerUUID {
-		slog.Warn("provider UUID mismatch",
-			"lease_provider_uuid", lease.ProviderUuid,
-			"our_provider_uuid", h.providerUUID,
-		)
-		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
+		return nil, status, err
 	}
 
 	return &AuthenticatedRequest{
@@ -364,6 +332,36 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, httpStatus)
 }
 
+// verifyLeaseAccess queries a lease from chain and verifies tenant and provider ownership.
+func verifyLeaseAccess(ctx context.Context, client ChainClient, providerUUID, leaseUUID, tenant string, requireActive bool) (*billingtypes.Lease, int, error) {
+	var lease *billingtypes.Lease
+	var err error
+	if requireActive {
+		lease, err = client.GetActiveLease(ctx, leaseUUID)
+	} else {
+		lease, err = client.GetLease(ctx, leaseUUID)
+	}
+	if err != nil {
+		slog.Error("failed to query lease", "error", err, "lease_uuid", leaseUUID)
+		return nil, http.StatusInternalServerError, errors.New(errMsgInternalServerError)
+	}
+	if lease == nil {
+		if requireActive {
+			return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound + " or not active")
+		}
+		return nil, http.StatusNotFound, errors.New(errMsgLeaseNotFound)
+	}
+	if lease.Tenant != tenant {
+		slog.Warn("tenant mismatch", "token_tenant", tenant, "lease_tenant", lease.Tenant)
+		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
+	}
+	if lease.ProviderUuid != providerUUID {
+		slog.Warn("provider UUID mismatch", "lease_provider_uuid", lease.ProviderUuid, "our_provider_uuid", providerUUID)
+		return nil, http.StatusForbidden, errors.New(errMsgForbidden)
+	}
+	return lease, http.StatusOK, nil
+}
+
 // extractToken extracts and parses the bearer token from the Authorization header.
 func (h *Handlers) extractToken(r *http.Request) (*AuthToken, error) {
 	tokenStr, err := extractBearerToken(r)
@@ -374,7 +372,7 @@ func (h *Handlers) extractToken(r *http.Request) (*AuthToken, error) {
 }
 
 // writeJSON writes a JSON response.
-func writeJSON(w http.ResponseWriter, data interface{}, status int) {
+func writeJSON(w http.ResponseWriter, data any, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
@@ -389,11 +387,6 @@ func writeError(w http.ResponseWriter, message string, status int) {
 		Code:  status,
 	}
 	writeJSON(w, response, status)
-}
-
-// decodeJSONBytes decodes JSON from a byte slice.
-func decodeJSONBytes(data []byte, v interface{}) error {
-	return json.Unmarshal(data, v)
 }
 
 // extractConnectionDetails extracts ConnectionDetails from a backend LeaseInfo map.
