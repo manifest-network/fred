@@ -165,7 +165,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `production_mode` | Enforce security requirements at startup | `false` |
+| `production_mode` | Enforce security requirements at startup (TLS, replay protection, SSRF) | `false` |
 | `chain_id` | Chain identifier | `manifest-1` |
 | `grpc_endpoint` | Chain gRPC endpoint | `localhost:9090` |
 | `websocket_url` | CometBFT WebSocket URL | `ws://localhost:26657/websocket` |
@@ -710,7 +710,7 @@ Chain State (leases)     Backend State (provisions)
 - **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
 - **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
 - **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses
-- **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection)
+- **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection, loopback/link-local/unspecified URLs). SSRF checks validate IP literals and the `localhost` hostname only — private IPs (RFC 1918) are allowed since backends commonly run on private networks. DNS resolution is not performed, so hostnames resolving to blocked addresses are not caught. Use network-level controls for defense in depth.
 
 ## Performance
 
