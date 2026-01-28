@@ -201,7 +201,7 @@ When provisioning completes (success or failure), POST to the `callback_url` fro
 ```http
 POST {callback_url}
 Content-Type: application/json
-X-Fred-Signature: t=1672531200,sha256=<hex-encoded-hmac>
+X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -209,6 +209,8 @@ X-Fred-Signature: t=1672531200,sha256=<hex-encoded-hmac>
   "error": ""
 }
 ```
+
+**Note:** The timestamp must be the current Unix time when sending the request. Callbacks with timestamps older than 5 minutes or more than 1 minute in the future are rejected.
 
 **Fields:**
 - `status`: Either `"success"` or `"failed"`
