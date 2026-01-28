@@ -26,6 +26,12 @@
 #   - token_tracker_db_path must be configured (replay protection)
 #   - callback_base_url and backend URLs must not use loopback, link-local,
 #     or unspecified addresses (SSRF protection)
+#
+# Note: SSRF checks only block IP literals (e.g. 127.0.0.1, [::1], 169.254.169.254)
+# and the hostname "localhost". Private IPs (10.x, 172.16.x, 192.168.x) are allowed
+# since backends commonly run on private networks. DNS resolution is not performed,
+# so hostnames that resolve to blocked addresses will pass validation. Use
+# network-level controls (firewalls, egress rules) for comprehensive SSRF protection.
 production_mode: false
 
 # =============================================================================

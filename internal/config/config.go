@@ -407,8 +407,10 @@ func validateHTTPURL(rawURL string) error {
 }
 
 // validateExternalURL rejects URLs that point to loopback, link-local, or
-// unspecified addresses. Only IP literals and the hostname "localhost" are
-// checked; other hostnames are allowed through (no DNS resolution).
+// unspecified addresses. Private IPs (RFC 1918) are allowed since backends
+// commonly run on private networks. Only IP literals and the hostname
+// "localhost" are checked; other hostnames are allowed through (no DNS
+// resolution).
 func validateExternalURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {

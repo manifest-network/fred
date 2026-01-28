@@ -1093,6 +1093,16 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			wantErr: "production_mode: callback_base_url: URL must not use localhost",
 		},
 		{
+			name: "production mode allows non-IP hostnames",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "https://callback.example.com"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example.com:9000", IsDefault: true}}
+			},
+			wantErr: "",
+		},
+		{
 			name: "non-production mode allows loopback URLs",
 			modify: func(c *Config) {
 				c.ProductionMode = false

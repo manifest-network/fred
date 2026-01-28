@@ -710,7 +710,7 @@ Chain State (leases)     Backend State (provisions)
 - **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
 - **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
 - **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses
-- **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection, loopback/link-local/unspecified URLs)
+- **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection, loopback/link-local/unspecified URLs). SSRF checks validate IP literals and the `localhost` hostname only — private IPs (RFC 1918) are allowed since backends commonly run on private networks. DNS resolution is not performed, so hostnames resolving to blocked addresses are not caught. Use network-level controls for defense in depth.
 
 ## Performance
 
