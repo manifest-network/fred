@@ -43,7 +43,7 @@ func main() {
 		scenario    = flag.String("scenario", "mixed", "Test scenario: payload, connection, callback, mixed")
 		payloadSize = flag.Int("payload-size", 1024, "Payload size in bytes")
 		rampUp      = flag.Duration("ramp-up", 5*time.Second, "Ramp-up time to reach full concurrency")
-		callbackSecret = flag.String("callback-secret", "", "HMAC secret for callback signing (required for callback scenario)")
+		callbackSecret = flag.String("callback-secret", "", "HMAC secret for callback signing (min 32 chars, required for callback scenario)")
 		verbose     = flag.Bool("verbose", false, "Verbose output")
 	)
 	flag.Parse()

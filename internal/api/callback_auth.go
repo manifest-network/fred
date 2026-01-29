@@ -50,12 +50,20 @@ type CallbackAuthenticator struct {
 	nowFunc func() time.Time // For testing; defaults to time.Now
 }
 
+// validateCallbackSecret checks that the secret meets minimum length requirements.
+func validateCallbackSecret(secret string) error {
+	if len(secret) < MinCallbackSecretLength {
+		return fmt.Errorf("callback secret must be at least %d bytes, got %d", MinCallbackSecretLength, len(secret))
+	}
+	return nil
+}
+
 // NewCallbackAuthenticator creates a new callback authenticator with the given secret.
 // Uses DefaultCallbackMaxAge for replay protection.
 // Returns an error if the secret is shorter than MinCallbackSecretLength bytes.
 func NewCallbackAuthenticator(secret string) (*CallbackAuthenticator, error) {
-	if len(secret) < MinCallbackSecretLength {
-		return nil, fmt.Errorf("callback secret must be at least %d bytes, got %d", MinCallbackSecretLength, len(secret))
+	if err := validateCallbackSecret(secret); err != nil {
+		return nil, err
 	}
 	return &CallbackAuthenticator{
 		secret:  []byte(secret),
@@ -68,8 +76,8 @@ func NewCallbackAuthenticator(secret string) (*CallbackAuthenticator, error) {
 // Returns an error if the secret is shorter than MinCallbackSecretLength bytes,
 // maxAge is not positive, or maxAge exceeds MaxCallbackMaxAge.
 func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*CallbackAuthenticator, error) {
-	if len(secret) < MinCallbackSecretLength {
-		return nil, fmt.Errorf("callback secret must be at least %d bytes, got %d", MinCallbackSecretLength, len(secret))
+	if err := validateCallbackSecret(secret); err != nil {
+		return nil, err
 	}
 	if maxAge <= 0 {
 		return nil, errors.New("callback max age must be positive")
