@@ -587,7 +587,7 @@ func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:        dbPath,
 		TTL:           1 * time.Hour,
-		BatchSize:     1000,                   // Large batch so it won't trigger by size
+		BatchSize:     1000,                  // Large batch so it won't trigger by size
 		FlushInterval: 25 * time.Millisecond, // Short interval
 	})
 	if err != nil {

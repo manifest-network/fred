@@ -32,19 +32,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/manifest-network/fred/internal/api"
 )
 
 func main() {
 	var (
-		target      = flag.String("target", "http://localhost:8080", "Target fred URL")
-		duration    = flag.Duration("duration", 30*time.Second, "Test duration")
-		concurrency = flag.Int("concurrency", 50, "Number of concurrent workers")
-		scenario    = flag.String("scenario", "mixed", "Test scenario: payload, connection, callback, mixed")
-		payloadSize = flag.Int("payload-size", 1024, "Payload size in bytes")
-		rampUp      = flag.Duration("ramp-up", 5*time.Second, "Ramp-up time to reach full concurrency")
+		target         = flag.String("target", "http://localhost:8080", "Target fred URL")
+		duration       = flag.Duration("duration", 30*time.Second, "Test duration")
+		concurrency    = flag.Int("concurrency", 50, "Number of concurrent workers")
+		scenario       = flag.String("scenario", "mixed", "Test scenario: payload, connection, callback, mixed")
+		payloadSize    = flag.Int("payload-size", 1024, "Payload size in bytes")
+		rampUp         = flag.Duration("ramp-up", 5*time.Second, "Ramp-up time to reach full concurrency")
 		callbackSecret = flag.String("callback-secret", "", "HMAC secret for callback signing (min 32 bytes, required for callback scenario)")
-		verbose     = flag.Bool("verbose", false, "Verbose output")
+		verbose        = flag.Bool("verbose", false, "Verbose output")
 	)
 	flag.Parse()
 
@@ -134,15 +135,15 @@ type LoadTester struct {
 
 // Results holds load test results.
 type Results struct {
-	Duration       time.Duration
-	TotalRequests  int64
-	SuccessCount   int64
-	ErrorCount     int64
-	StatusCodes    map[int]int64
-	Latencies      []time.Duration
-	Errors         map[string]int64
-	BytesSent      int64
-	BytesReceived  int64
+	Duration      time.Duration
+	TotalRequests int64
+	SuccessCount  int64
+	ErrorCount    int64
+	StatusCodes   map[int]int64
+	Latencies     []time.Duration
+	Errors        map[string]int64
+	BytesSent     int64
+	BytesReceived int64
 
 	mu sync.Mutex
 }

@@ -137,7 +137,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 				return
 			}
 			// context.Canceled - likely client disconnect, don't write response
-			slog.Warn("payload read cancelled", "error", err, "lease_uuid", leaseUUID)
+			slog.Warn("payload read canceled", "error", err, "lease_uuid", leaseUUID)
 			return
 		}
 		slog.Error("failed to read payload body", "error", err)

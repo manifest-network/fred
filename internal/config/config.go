@@ -19,30 +19,30 @@ const (
 
 // Config holds all configuration for the provider daemon.
 type Config struct {
-	ChainID           string        `mapstructure:"chain_id"`
-	GRPCEndpoint      string        `mapstructure:"grpc_endpoint"`
-	WebSocketURL      string        `mapstructure:"websocket_url"`
-	ProviderUUID      string        `mapstructure:"provider_uuid"`
-	ProviderAddress   string        `mapstructure:"provider_address"`
-	KeyringBackend    string        `mapstructure:"keyring_backend"`
-	KeyringDir        string        `mapstructure:"keyring_dir"`
-	KeyName           string        `mapstructure:"key_name"`
-	APIListenAddr     string        `mapstructure:"api_listen_addr"`
-	WithdrawInterval  time.Duration `mapstructure:"withdraw_interval"`
-	TLSCertFile       string        `mapstructure:"tls_cert_file"`
-	TLSKeyFile        string        `mapstructure:"tls_key_file"`
-	Bech32Prefix      string        `mapstructure:"bech32_prefix"`
-	RateLimitRPS         float64  `mapstructure:"rate_limit_rps"`
-	RateLimitBurst       int      `mapstructure:"rate_limit_burst"`
-	TenantRateLimitRPS   float64  `mapstructure:"tenant_rate_limit_rps"`   // Per-tenant rate limit (requests per second)
-	TenantRateLimitBurst int      `mapstructure:"tenant_rate_limit_burst"` // Per-tenant burst limit
-	TrustedProxies       []string `mapstructure:"trusted_proxies"`         // CIDR blocks of trusted proxies for X-Forwarded-For
-	GRPCTLSEnabled    bool          `mapstructure:"grpc_tls_enabled"`
-	GRPCTLSCAFile     string        `mapstructure:"grpc_tls_ca_file"`
-	GRPCTLSSkipVerify bool          `mapstructure:"grpc_tls_skip_verify"`
-	GasLimit          uint64        `mapstructure:"gas_limit"`
-	GasPrice          int64         `mapstructure:"gas_price"`
-	FeeDenom          string        `mapstructure:"fee_denom"`
+	ChainID              string        `mapstructure:"chain_id"`
+	GRPCEndpoint         string        `mapstructure:"grpc_endpoint"`
+	WebSocketURL         string        `mapstructure:"websocket_url"`
+	ProviderUUID         string        `mapstructure:"provider_uuid"`
+	ProviderAddress      string        `mapstructure:"provider_address"`
+	KeyringBackend       string        `mapstructure:"keyring_backend"`
+	KeyringDir           string        `mapstructure:"keyring_dir"`
+	KeyName              string        `mapstructure:"key_name"`
+	APIListenAddr        string        `mapstructure:"api_listen_addr"`
+	WithdrawInterval     time.Duration `mapstructure:"withdraw_interval"`
+	TLSCertFile          string        `mapstructure:"tls_cert_file"`
+	TLSKeyFile           string        `mapstructure:"tls_key_file"`
+	Bech32Prefix         string        `mapstructure:"bech32_prefix"`
+	RateLimitRPS         float64       `mapstructure:"rate_limit_rps"`
+	RateLimitBurst       int           `mapstructure:"rate_limit_burst"`
+	TenantRateLimitRPS   float64       `mapstructure:"tenant_rate_limit_rps"`   // Per-tenant rate limit (requests per second)
+	TenantRateLimitBurst int           `mapstructure:"tenant_rate_limit_burst"` // Per-tenant burst limit
+	TrustedProxies       []string      `mapstructure:"trusted_proxies"`         // CIDR blocks of trusted proxies for X-Forwarded-For
+	GRPCTLSEnabled       bool          `mapstructure:"grpc_tls_enabled"`
+	GRPCTLSCAFile        string        `mapstructure:"grpc_tls_ca_file"`
+	GRPCTLSSkipVerify    bool          `mapstructure:"grpc_tls_skip_verify"`
+	GasLimit             uint64        `mapstructure:"gas_limit"`
+	GasPrice             int64         `mapstructure:"gas_price"`
+	FeeDenom             string        `mapstructure:"fee_denom"`
 
 	// Timeout configuration
 	HTTPReadTimeout       time.Duration `mapstructure:"http_read_timeout"`
@@ -118,10 +118,10 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("api_listen_addr", ":8080")
 	v.SetDefault("withdraw_interval", "1h")
 	v.SetDefault("bech32_prefix", "manifest")
-	v.SetDefault("rate_limit_rps", 10.0)          // 10 requests per second (global)
-	v.SetDefault("rate_limit_burst", 20)          // burst of 20 requests (global)
-	v.SetDefault("tenant_rate_limit_rps", 5.0)    // 5 requests per second per tenant
-	v.SetDefault("tenant_rate_limit_burst", 10)   // burst of 10 requests per tenant
+	v.SetDefault("rate_limit_rps", 10.0)        // 10 requests per second (global)
+	v.SetDefault("rate_limit_burst", 20)        // burst of 20 requests (global)
+	v.SetDefault("tenant_rate_limit_rps", 5.0)  // 5 requests per second per tenant
+	v.SetDefault("tenant_rate_limit_burst", 10) // burst of 10 requests per tenant
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
@@ -429,7 +429,7 @@ func validateExternalURL(rawURL string) error {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 
-	hostname := parsed.Hostname()            // strips port and IPv6 brackets
+	hostname := parsed.Hostname()                // strips port and IPv6 brackets
 	hostname = strings.TrimSuffix(hostname, ".") // normalize FQDN notation
 
 	// Block "localhost" hostname (case-insensitive)

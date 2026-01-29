@@ -155,6 +155,7 @@ func TestManager_HighThroughput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping high throughput test in short mode")
 	}
+	suppressLogs(t)
 
 	var provisionCount atomic.Int64
 	mockBackend := &mockBenchBackend{name: "test", count: &provisionCount}

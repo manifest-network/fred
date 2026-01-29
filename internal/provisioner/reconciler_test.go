@@ -1778,9 +1778,9 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	// Store payloads for various leases
 	// pending-awaiting: pending lease with MetaHash but hasn't uploaded payload yet - simulates
 	// a lease that's still waiting for payload (payload won't be in store, so nothing to clean)
-	payloadStore.Store("closed-lease", []byte("closed payload"))        // Will be cleaned (lease is closed)
-	payloadStore.Store("nonexistent-lease", []byte("orphan payload"))   // Will be cleaned (lease doesn't exist)
-	payloadStore.Store("active-lease", []byte("active payload"))        // Will be cleaned (lease is active, not pending)
+	payloadStore.Store("closed-lease", []byte("closed payload"))      // Will be cleaned (lease is closed)
+	payloadStore.Store("nonexistent-lease", []byte("orphan payload")) // Will be cleaned (lease doesn't exist)
+	payloadStore.Store("active-lease", []byte("active payload"))      // Will be cleaned (lease is active, not pending)
 
 	// Verify all payloads are stored
 	if count := payloadStore.Count(); count != 3 {

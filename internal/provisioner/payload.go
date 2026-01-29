@@ -65,7 +65,7 @@ type writeOp struct {
 	opType   writeOpType
 	key      string
 	payload  []byte
-	time     time.Time    // For store operations
+	time     time.Time // For store operations
 	resultCh chan writeResult
 }
 
@@ -149,7 +149,7 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 		return nil
 	})
 	if err != nil {
-		db.Close()
+		_ = db.Close() // Best effort cleanup on init failure
 		return nil, err
 	}
 

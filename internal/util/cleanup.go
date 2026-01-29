@@ -9,7 +9,7 @@ import (
 // CleanupFunc is a function that performs cleanup and returns an error if it fails.
 type CleanupFunc func() error
 
-// StartCleanupLoop runs a cleanup function periodically until the context is cancelled.
+// StartCleanupLoop runs a cleanup function periodically until the context is canceled.
 // It logs errors using slog with the provided component name.
 // The caller is responsible for calling wg.Done() if using a WaitGroup.
 //

@@ -77,7 +77,7 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 		return err
 	})
 	if err != nil {
-		db.Close()
+		_ = db.Close() // Best effort cleanup on init failure
 		return nil, err
 	}
 

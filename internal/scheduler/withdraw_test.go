@@ -391,7 +391,7 @@ func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 		{
 			name: "multi-denom - umfx depletes first",
 			prevBalance: sdktypes.NewCoins(
-				sdktypes.NewCoin("umfx", sdkmath.NewInt(600)),  // Burns 100/min -> 6 min remaining
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(600)),   // Burns 100/min -> 6 min remaining
 				sdktypes.NewCoin("uatom", sdkmath.NewInt(1000)), // Burns 50/min -> 20 min remaining
 			),
 			currBalance: sdktypes.NewCoins(
@@ -421,11 +421,11 @@ func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 		{
 			name: "multi-denom - one increases (deposit) one decreases",
 			prevBalance: sdktypes.NewCoins(
-				sdktypes.NewCoin("umfx", sdkmath.NewInt(500)),  // Will increase (deposit)
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(500)),   // Will increase (deposit)
 				sdktypes.NewCoin("uatom", sdkmath.NewInt(1000)), // Burns normally
 			),
 			currBalance: sdktypes.NewCoins(
-				sdktypes.NewCoin("umfx", sdkmath.NewInt(1000)),  // Increased - should be ignored
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(1000)), // Increased - should be ignored
 				sdktypes.NewCoin("uatom", sdkmath.NewInt(900)), // Burned 100 in 1 min
 			),
 			elapsed:      time.Minute,
@@ -449,11 +449,11 @@ func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 		{
 			name: "multi-denom - one empty, one burning",
 			prevBalance: sdktypes.NewCoins(
-				sdktypes.NewCoin("umfx", sdkmath.NewInt(0)),    // Empty - should be skipped
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(0)),     // Empty - should be skipped
 				sdktypes.NewCoin("uatom", sdkmath.NewInt(1000)), // Burns normally
 			),
 			currBalance: sdktypes.NewCoins(
-				sdktypes.NewCoin("umfx", sdkmath.NewInt(0)),   // Still empty
+				sdktypes.NewCoin("umfx", sdkmath.NewInt(0)),    // Still empty
 				sdktypes.NewCoin("uatom", sdkmath.NewInt(900)), // Burned 100 in 1 min
 			),
 			elapsed:      time.Minute,

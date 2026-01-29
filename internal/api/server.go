@@ -41,7 +41,6 @@ type StatusChecker interface {
 	IsInFlight(leaseUUID string) bool
 }
 
-
 // Server is the HTTP API server.
 type Server struct {
 	addr                  string
@@ -420,7 +419,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 // requestTimeoutMiddleware applies a timeout to request processing.
 // This is separate from HTTP server timeouts (ReadTimeout/WriteTimeout) and applies
 // to the handler logic itself. If the handler takes longer than the timeout,
-// the request context is cancelled and handlers should check ctx.Err() to detect
+// the request context is canceled and handlers should check ctx.Err() to detect
 // DeadlineExceeded and write an appropriate error response.
 func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

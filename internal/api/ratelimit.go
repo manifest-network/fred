@@ -27,9 +27,9 @@ func NewTrustedProxyConfig(cidrs []string) *TrustedProxyConfig {
 		// Handle bare IPs by converting to CIDR notation
 		if !strings.Contains(cidr, "/") {
 			if strings.Contains(cidr, ":") {
-				cidr = cidr + "/128" // IPv6
+				cidr += "/128" // IPv6
 			} else {
-				cidr = cidr + "/32" // IPv4
+				cidr += "/32" // IPv4
 			}
 		}
 		_, ipNet, err := net.ParseCIDR(cidr)
