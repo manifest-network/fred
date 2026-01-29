@@ -419,3 +419,37 @@ func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
 	}
 }
 
+func TestCalcRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		name string
+		rate float64
+		want string
+	}{
+		{"10 RPS", 10.0, "1"},
+		{"1 RPS", 1.0, "1"},
+		{"0.5 RPS (2 second refill)", 0.5, "2"},
+		{"0.1 RPS (10 second refill)", 0.1, "10"},
+		{"0.33 RPS (rounds up to 4)", 0.33, "4"},
+		{"zero rate", 0, "1"},
+		{"negative rate", -1, "1"},
+		{"100 RPS", 100.0, "1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rl := NewRateLimiter(tt.rate, 1, nil)
+			got := rl.retryAfterSeconds()
+			if got != tt.want {
+				t.Errorf("retryAfterSeconds() = %q, want %q", got, tt.want)
+			}
+
+			// Also test TenantRateLimiter
+			tl := NewTenantRateLimiter(tt.rate, 1)
+			got = tl.retryAfterSeconds()
+			if got != tt.want {
+				t.Errorf("TenantRateLimiter.retryAfterSeconds() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+

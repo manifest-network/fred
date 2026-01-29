@@ -23,10 +23,6 @@ import (
 	"github.com/manifest-network/fred/internal/watcher"
 )
 
-const (
-	// shutdownTimeout is the maximum time to wait for graceful shutdown
-	shutdownTimeout = 30 * time.Second
-)
 
 // safeGo runs a function in a goroutine with panic recovery.
 // If the function panics, the panic is converted to an error and sent to errChan.
@@ -339,13 +335,13 @@ func run(cmd *cobra.Command, args []string) error {
 	slog.Info("shutting down...")
 
 	// Create shutdown context with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
 
 	// Wait for in-flight provisions to drain BEFORE shutting down the API server.
 	// Backends send completion callbacks via HTTP, so the API server must remain
 	// running to receive them during the drain period.
-	drainTimeout := shutdownTimeout / 2
+	drainTimeout := cfg.ShutdownTimeout / 2
 	remaining := provisionMgr.WaitForDrain(shutdownCtx, drainTimeout)
 	if remaining > 0 {
 		slog.Warn("proceeding with shutdown despite pending provisions",
