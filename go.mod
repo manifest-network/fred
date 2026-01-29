@@ -18,6 +18,7 @@ require (
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.19.0
 	go.etcd.io/bbolt v1.4.0-alpha.0.0.20240404170359-43604f3112c5
+	golang.org/x/sync v0.18.0
 	golang.org/x/time v0.14.0
 	google.golang.org/grpc v1.71.0
 )
@@ -151,7 +152,6 @@ require (
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/term v0.37.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
@@ -171,7 +171,7 @@ replace (
 	// Match manifest-ledger replace directives
 	cosmossdk.io/core => cosmossdk.io/core v0.11.3
 	github.com/cosmos/cosmos-sdk => github.com/manifest-network/cosmos-sdk v0.50.14-liftedinit.1
-	github.com/manifest-network/manifest-ledger => /home/fmorency/dev/manifest-ledger
+	github.com/manifest-network/manifest-ledger => github.com/fmorency/manifest-ledger v0.0.0-20260129184127-3fb9ef5c5e9c
 	github.com/spf13/viper => github.com/spf13/viper v1.17.0
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 )
