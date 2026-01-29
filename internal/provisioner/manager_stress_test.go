@@ -3,6 +3,8 @@ package provisioner
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -14,6 +16,17 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 )
+
+// suppressLogs replaces the default logger with a no-op logger for the duration of the test.
+// Returns a cleanup function that restores the original logger.
+func suppressLogs(t testing.TB) {
+	t.Helper()
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(original)
+	})
+}
 
 // TestManager_StressTest_10K pushes 10,000 events through the system.
 func TestManager_StressTest_10K(t *testing.T) {
@@ -56,6 +69,8 @@ func TestManager_StressTest_1M(t *testing.T) {
 }
 
 func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
+	suppressLogs(t)
+
 	var provisionCount atomic.Int64
 	var getLeaseCount atomic.Int64
 
@@ -612,6 +627,8 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 
 // BenchmarkManager_EndToEnd benchmarks the full event processing flow.
 func BenchmarkManager_EndToEnd(b *testing.B) {
+	suppressLogs(b)
+
 	var provisionCount atomic.Int64
 	mockBackend := &mockBenchBackend{name: "test", count: &provisionCount}
 
