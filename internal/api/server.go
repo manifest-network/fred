@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	// serverShutdownTimeout is the maximum time to wait for the server to shutdown gracefully.
-	serverShutdownTimeout = 10 * time.Second
+	// defaultShutdownTimeout is the default maximum time to wait for the server to shutdown gracefully.
+	defaultShutdownTimeout = 30 * time.Second
 
 	// defaultRequestTimeout is the default timeout for individual request processing.
 	// This is separate from HTTP server timeouts and applies to handler logic.
@@ -54,6 +54,7 @@ type Server struct {
 	tlsCertFile           string
 	tlsKeyFile            string
 	requestTimeout        time.Duration
+	shutdownTimeout       time.Duration
 	rateLimiter           *RateLimiter
 	tenantRateLimiter     *TenantRateLimiter
 	callbackPublisher     CallbackPublisher
@@ -77,6 +78,7 @@ type ServerConfig struct {
 	WriteTimeout         time.Duration
 	IdleTimeout          time.Duration
 	RequestTimeout       time.Duration // Timeout for individual request processing (default: 30s)
+	ShutdownTimeout      time.Duration // Timeout for graceful shutdown (default: 30s)
 	MaxRequestBodySize   int64
 	CallbackSecret       string // HMAC secret for callback authentication
 	TokenTrackerDBPath   string // Path to token tracker database (enables replay protection)
@@ -133,6 +135,12 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		requestTimeout = defaultRequestTimeout
 	}
 
+	// Apply default for shutdown timeout
+	shutdownTimeout := cfg.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = defaultShutdownTimeout
+	}
+
 	// Create callback authenticator if secret is provided
 	var callbackAuth *CallbackAuthenticator
 	if cfg.CallbackSecret != "" {
@@ -161,6 +169,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		tlsCertFile:           cfg.TLSCertFile,
 		tlsKeyFile:            cfg.TLSKeyFile,
 		requestTimeout:        requestTimeout,
+		shutdownTimeout:       shutdownTimeout,
 		rateLimiter:           rateLimiter,
 		tenantRateLimiter:     tenantRateLimiter,
 		callbackPublisher:     callbackPublisher,
@@ -323,7 +332,7 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down API server")
 
-	shutdownCtx, cancel := context.WithTimeout(ctx, serverShutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(ctx, s.shutdownTimeout)
 	defer cancel()
 
 	// Shutdown HTTP server first

@@ -226,6 +226,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ReadTimeout:          cfg.HTTPReadTimeout,
 		WriteTimeout:         cfg.HTTPWriteTimeout,
 		IdleTimeout:          cfg.HTTPIdleTimeout,
+		ShutdownTimeout:      cfg.ShutdownTimeout,
 		MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		CallbackSecret:       cfg.CallbackSecret,
 		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,

@@ -420,6 +420,9 @@ func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
 }
 
 func TestCalcRetryAfterSeconds(t *testing.T) {
+	// Note: Only testing realistic values that could come from config validation.
+	// Config validation ensures rate > 0, and viper/YAML parsing cannot produce
+	// NaN/Inf, so those edge cases are not tested here.
 	tests := []struct {
 		name string
 		rate float64
@@ -430,8 +433,8 @@ func TestCalcRetryAfterSeconds(t *testing.T) {
 		{"0.5 RPS (2 second refill)", 0.5, "2"},
 		{"0.1 RPS (10 second refill)", 0.1, "10"},
 		{"0.33 RPS (rounds up to 4)", 0.33, "4"},
-		{"zero rate", 0, "1"},
-		{"negative rate", -1, "1"},
+		{"zero rate fallback", 0, "1"},
+		{"negative rate fallback", -1, "1"},
 		{"100 RPS", 100.0, "1"},
 	}
 
