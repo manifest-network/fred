@@ -269,8 +269,8 @@ func (c *Client) GetProvider(ctx context.Context, providerUUID string) (*skutype
 // for each batch using msgFactory, broadcasting it, and recording metrics.
 //
 // Parameters:
-//   - metricType: label for metrics (e.g., "acknowledge", "reject", "close")
-//   - opName: past tense operation name for logging (e.g., "acknowledged", "rejected")
+//   - metricType: base verb for metrics and errors (e.g., "acknowledge", "reject", "close")
+//   - opName: operation name for structured log field (e.g., "acknowledged", "rejected", "closed")
 //   - msgFactory: creates the appropriate message type for each batch
 //   - extraLogAttrs: additional key-value pairs to include in log output
 //
@@ -297,14 +297,14 @@ func (c *Client) broadcastBatchedMsgs(
 		txHash, err := c.broadcastTx(ctx, msg)
 		recordTxMetrics(metricType, err)
 		if err != nil {
-			return totalProcessed, txHashes, fmt.Errorf("failed to %s leases: %w", opName, err)
+			return totalProcessed, txHashes, fmt.Errorf("failed to %s leases: %w", metricType, err)
 		}
 
-		// Build log attributes: count, extra attrs, tx_hash (last for readability)
-		attrs := []any{"count", len(batch)}
+		// Build log attributes: operation, count, extra attrs, tx_hash
+		attrs := []any{"operation", opName, "count", len(batch)}
 		attrs = append(attrs, extraLogAttrs...)
 		attrs = append(attrs, "tx_hash", txHash)
-		slog.Info(opName+" leases", attrs...)
+		slog.Info("lease batch processed", attrs...)
 
 		txHashes = append(txHashes, txHash)
 		totalProcessed += uint64(len(batch))
