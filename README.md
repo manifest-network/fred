@@ -1,4 +1,4 @@
-# fred - Manifest Provider Daemon
+# FRED - Flexible Resource Execution Daemon
 
 A Go daemon for Manifest Network providers that manages the complete lease lifecycle with pluggable backend integration, event-driven provisioning, and automatic resource management.
 
