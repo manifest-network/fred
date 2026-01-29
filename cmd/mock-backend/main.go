@@ -77,6 +77,10 @@ func main() {
 			slog.Error("invalid MOCK_BACKEND_DELAY", "error", err)
 			os.Exit(1)
 		}
+		if delay < 0 {
+			slog.Error("MOCK_BACKEND_DELAY cannot be negative", "value", delayStr)
+			os.Exit(1)
+		}
 	}
 
 	// Parse timeout configurations with defaults
@@ -399,6 +403,7 @@ func (s *MockBackendServer) computeSignature(payload []byte) string {
 }
 
 // parseDurationEnv parses a duration from an environment variable with a default fallback.
+// Non-positive values are rejected to prevent accidentally disabling timeouts.
 func parseDurationEnv(key string, defaultVal time.Duration) time.Duration {
 	val := os.Getenv(key)
 	if val == "" {
@@ -407,6 +412,10 @@ func parseDurationEnv(key string, defaultVal time.Duration) time.Duration {
 	d, err := time.ParseDuration(val)
 	if err != nil {
 		slog.Error("invalid duration", "env", key, "value", val, "error", err)
+		os.Exit(1)
+	}
+	if d <= 0 {
+		slog.Error("duration must be positive", "env", key, "value", val)
 		os.Exit(1)
 	}
 	return d
