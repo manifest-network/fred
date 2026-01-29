@@ -261,9 +261,9 @@ func TestIsRetryableTxError(t *testing.T) {
 	client := &Client{}
 
 	tests := []struct {
-		name       string
-		err        error
-		wantRetry  bool
+		name      string
+		err       error
+		wantRetry bool
 	}{
 		{
 			name:      "nil error",
