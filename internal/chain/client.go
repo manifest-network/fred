@@ -264,33 +264,65 @@ func (c *Client) GetProvider(ctx context.Context, providerUUID string) (*skutype
 	return &resp.Provider, nil
 }
 
-// AcknowledgeLeases acknowledges the given leases. Returns the number of leases acknowledged and tx hashes.
-func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+// broadcastBatchedMsgs broadcasts messages in batches for lease operations.
+// It processes leaseUUIDs in chunks of maxLeasesPerBatch, creating a message
+// for each batch using msgFactory, broadcasting it, and recording metrics.
+//
+// Parameters:
+//   - metricType: label for metrics (e.g., "acknowledge", "reject", "close")
+//   - opName: past tense operation name for logging (e.g., "acknowledged", "rejected")
+//   - msgFactory: creates the appropriate message type for each batch
+//   - extraLogAttrs: additional key-value pairs to include in log output
+//
+// Returns the total number of leases processed, transaction hashes, and any error.
+// On error, returns partial results (leases processed before the error occurred).
+func (c *Client) broadcastBatchedMsgs(
+	ctx context.Context,
+	leaseUUIDs []string,
+	metricType string,
+	opName string,
+	msgFactory func(batch []string) sdktypes.Msg,
+	extraLogAttrs ...any,
+) (uint64, []string, error) {
 	if len(leaseUUIDs) == 0 {
 		return 0, nil, nil
 	}
 
-	var totalAcknowledged uint64
+	var totalProcessed uint64
 	var txHashes []string
 
 	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
-		msg := &billingtypes.MsgAcknowledgeLease{
-			Sender:     c.signer.Address(),
-			LeaseUuids: batch,
-		}
+		msg := msgFactory(batch)
 
 		txHash, err := c.broadcastTx(ctx, msg)
-		recordTxMetrics("acknowledge", err)
+		recordTxMetrics(metricType, err)
 		if err != nil {
-			return totalAcknowledged, txHashes, fmt.Errorf("failed to acknowledge leases: %w", err)
+			return totalProcessed, txHashes, fmt.Errorf("failed to %s leases: %w", opName, err)
 		}
 
-		slog.Info("acknowledged leases", "count", len(batch), "tx_hash", txHash)
+		// Build log attributes: count, extra attrs, tx_hash (last for readability)
+		attrs := []any{"count", len(batch)}
+		attrs = append(attrs, extraLogAttrs...)
+		attrs = append(attrs, "tx_hash", txHash)
+		slog.Info(opName+" leases", attrs...)
+
 		txHashes = append(txHashes, txHash)
-		totalAcknowledged += uint64(len(batch))
+		totalProcessed += uint64(len(batch))
 	}
 
-	return totalAcknowledged, txHashes, nil
+	return totalProcessed, txHashes, nil
+}
+
+// AcknowledgeLeases acknowledges the given leases. Returns the number of leases acknowledged and tx hashes.
+func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "acknowledge", "acknowledged",
+		func(batch []string) sdktypes.Msg {
+			return &billingtypes.MsgAcknowledgeLease{
+				Sender:     c.signer.Address(),
+				LeaseUuids: batch,
+			}
+		},
+	)
 }
 
 // WithdrawByProvider withdraws funds from all active leases for a provider.
@@ -362,7 +394,8 @@ func (c *Client) isRetryableTxError(err error) bool {
 	}
 
 	// Check for ChainTxError to see if it's a sequence mismatch
-	if chainErr, ok := err.(*ChainTxError); ok {
+	var chainErr *ChainTxError
+	if errors.As(err, &chainErr) {
 		// Code 32 is "incorrect account sequence" in SDK
 		// Codespace "sdk" with code 32 = ErrWrongSequence
 		if chainErr.Codespace == "sdk" && chainErr.Code == 32 {
@@ -592,60 +625,28 @@ func (c *Client) GetProviderWithdrawable(ctx context.Context, providerUUID strin
 // Returns the number of leases rejected and tx hashes.
 // This is used when provisioning fails and the provider cannot fulfill the lease.
 func (c *Client) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
-	if len(leaseUUIDs) == 0 {
-		return 0, nil, nil
-	}
-
-	var totalRejected uint64
-	var txHashes []string
-
-	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
-		msg := &billingtypes.MsgRejectLease{
-			Sender:     c.signer.Address(),
-			LeaseUuids: batch,
-			Reason:     reason,
-		}
-
-		txHash, err := c.broadcastTx(ctx, msg)
-		recordTxMetrics("reject", err)
-		if err != nil {
-			return totalRejected, txHashes, fmt.Errorf("failed to reject leases: %w", err)
-		}
-
-		slog.Info("rejected leases", "count", len(batch), "reason", reason, "tx_hash", txHash)
-		txHashes = append(txHashes, txHash)
-		totalRejected += uint64(len(batch))
-	}
-
-	return totalRejected, txHashes, nil
+	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "reject", "rejected",
+		func(batch []string) sdktypes.Msg {
+			return &billingtypes.MsgRejectLease{
+				Sender:     c.signer.Address(),
+				LeaseUuids: batch,
+				Reason:     reason,
+			}
+		},
+		"reason", reason,
+	)
 }
 
 // CloseLeases closes the given leases with an optional reason. Returns the number of leases closed and tx hashes.
 func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
-	if len(leaseUUIDs) == 0 {
-		return 0, nil, nil
-	}
-
-	var totalClosed uint64
-	var txHashes []string
-
-	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
-		msg := &billingtypes.MsgCloseLease{
-			Sender:     c.signer.Address(),
-			LeaseUuids: batch,
-			Reason:     reason,
-		}
-
-		txHash, err := c.broadcastTx(ctx, msg)
-		recordTxMetrics("close", err)
-		if err != nil {
-			return totalClosed, txHashes, fmt.Errorf("failed to close leases: %w", err)
-		}
-
-		slog.Info("closed leases", "count", len(batch), "reason", reason, "tx_hash", txHash)
-		txHashes = append(txHashes, txHash)
-		totalClosed += uint64(len(batch))
-	}
-
-	return totalClosed, txHashes, nil
+	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "close", "closed",
+		func(batch []string) sdktypes.Msg {
+			return &billingtypes.MsgCloseLease{
+				Sender:     c.signer.Address(),
+				LeaseUuids: batch,
+				Reason:     reason,
+			}
+		},
+		"reason", reason,
+	)
 }
