@@ -235,8 +235,8 @@ func TestTokenTracker_HighContention(t *testing.T) {
 	defer tracker.Close()
 
 	const (
-		numGoroutines = 200
-		opsPerRoutine = 500
+		numGoroutines   = 200
+		opsPerRoutine   = 500
 		numSharedTokens = 10 // Very few tokens = high contention
 	)
 

@@ -646,7 +646,7 @@ func (r *Reconciler) processOrphan(
 }
 
 // cleanupOrphanedPayloads removes stored payloads for leases that are no longer pending.
-// This handles the case where fred was down when a lease was cancelled, so the
+// This handles the case where fred was down when a lease was canceled, so the
 // handleLeaseClosed event was missed and the payload wasn't cleaned up.
 //
 // Returns the number of orphaned payloads cleaned up.

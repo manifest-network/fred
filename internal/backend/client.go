@@ -231,7 +231,7 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 		if err != nil {
 			return nil, fmt.Errorf("provision request failed: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusAccepted {
 			bodyBytes, _ := io.ReadAll(resp.Body)
@@ -264,7 +264,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 		if err != nil {
 			return nil, fmt.Errorf("get info request failed: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, ErrNotProvisioned
@@ -313,7 +313,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		if err != nil {
 			return nil, fmt.Errorf("deprovision request failed: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
@@ -344,7 +344,7 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		if err != nil {
 			return nil, fmt.Errorf("list provisions request failed: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
@@ -383,7 +383,7 @@ func (c *HTTPClient) Health(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("backend unhealthy: status %d", resp.StatusCode)

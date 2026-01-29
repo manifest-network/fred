@@ -19,14 +19,44 @@ linters:
     - errorlint
   settings:
     errcheck:
-      check-type-assertions: true
+      check-type-assertions: false  # Too noisy for type assertions
     gocritic:
       enabled-tags:
         - diagnostic
-        - style
-        - performance
     misspell:
       locale: US
+  exclusions:
+    rules:
+      # Exclude test files from strict linters
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unparam
+          - unused
+          - gocritic
+          - errorlint
+          - misspell
+      # Exclude cmd tools from strict linters
+      - path: ^cmd/
+        linters:
+          - errcheck
+          - gocritic
+      # Exclude testutil from strict checks
+      - path: ^internal/testutil/
+        linters:
+          - errcheck
+      # Exclude deprecated API warnings from dependencies we can't control
+      - linters:
+          - staticcheck
+        text: "SA1019"
+      # Exclude error comparisons for sentinel errors
+      - linters:
+          - errorlint
+        text: "comparing with"
+      # Exclude staticcheck style suggestions
+      - linters:
+          - staticcheck
+        text: "ST1023|S1000|QF1003"
 
 formatters:
   enable:

@@ -23,7 +23,6 @@ import (
 	"github.com/manifest-network/fred/internal/watcher"
 )
 
-
 // safeGo runs a function in a goroutine with panic recovery.
 // If the function panics, the panic is converted to an error and sent to errChan.
 // The component name is included in the error for debugging.

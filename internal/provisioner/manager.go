@@ -231,7 +231,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Start callback timeout checker in background
 	go m.runTimeoutChecker(ctx)
 
-	// Run Watermill router (blocks until ctx cancelled)
+	// Run Watermill router (blocks until ctx canceled)
 	return m.wmRouter.Run(ctx)
 }
 

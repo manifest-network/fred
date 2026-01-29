@@ -250,9 +250,9 @@ func TestManager_SustainedLoad(t *testing.T) {
 
 	// Sustained load: 1000 events/sec for 10 seconds
 	const (
-		targetRPS   = 1000
-		duration    = 10 * time.Second
-		numWorkers  = 10
+		targetRPS  = 1000
+		duration   = 10 * time.Second
+		numWorkers = 10
 	)
 
 	eventsPerWorkerPerSec := targetRPS / numWorkers

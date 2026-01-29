@@ -177,7 +177,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID)
 
 	// Clean up any stored payload for this lease.
-	// This handles the case where a tenant uploaded a payload but cancelled the lease
+	// This handles the case where a tenant uploaded a payload but canceled the lease
 	// before provisioning started, or any other scenario where payload exists but
 	// the lease is no longer valid.
 	if m.payloadStore != nil {

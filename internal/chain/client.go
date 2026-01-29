@@ -156,7 +156,7 @@ func (c *Client) Close() error {
 }
 
 // recordQueryMetrics records duration for a chain query.
-func recordQueryMetrics(queryName string, start time.Time, err error) {
+func recordQueryMetrics(queryName string, start time.Time, _ error) {
 	duration := time.Since(start).Seconds()
 	metrics.ChainQueryDuration.WithLabelValues(queryName).Observe(duration)
 }
@@ -442,7 +442,7 @@ func (c *Client) isRetryableTxError(err error) bool {
 
 	// If we can't extract a gRPC status, check the error chain for wrapped gRPC errors
 	// by unwrapping and checking each level
-	var unwrapped error = err
+	unwrapped := err
 	for unwrapped != nil {
 		if st, ok := status.FromError(unwrapped); ok && st.Code() != codes.OK {
 			// Found a gRPC status in the chain - recursively check
@@ -544,7 +544,7 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 		case <-timeoutTimer.C:
 			pollTimer.Stop()
 			if lastErr != nil {
-				return nil, fmt.Errorf("timeout waiting for tx %s after %d attempts (last error: %v)", txHash, pollAttempts, lastErr)
+				return nil, fmt.Errorf("timeout waiting for tx %s after %d attempts: %w", txHash, pollAttempts, lastErr)
 			}
 			return nil, fmt.Errorf("timeout waiting for tx %s after %d attempts", txHash, pollAttempts)
 		case <-pollTimer.C:

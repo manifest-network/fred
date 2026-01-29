@@ -94,7 +94,7 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 		retryInterval = 30 * time.Second
 	}
 
-	// Create initial context that can be cancelled on shutdown.
+	// Create initial context that can be canceled on shutdown.
 	// This ensures TriggerWithdraw works correctly even before Start() is called.
 	// Start() will replace this with a context derived from the passed-in context.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -123,7 +123,7 @@ func (s *WithdrawScheduler) WithdrawOnce(ctx context.Context) {
 
 // TriggerWithdraw triggers an immediate withdrawal cycle.
 // This can be called from event handlers when cross-provider credit depletion is detected.
-// Uses the scheduler's context so it can be cancelled on shutdown.
+// Uses the scheduler's context so it can be canceled on shutdown.
 func (s *WithdrawScheduler) TriggerWithdraw() {
 	slog.Info("withdrawal triggered by cross-provider credit depletion")
 
@@ -132,9 +132,9 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 	ctx := s.ctx
 	s.ctxMu.RUnlock()
 
-	// Check if context is already cancelled (scheduler stopped)
+	// Check if context is already canceled (scheduler stopped)
 	if ctx.Err() != nil {
-		slog.Debug("ignoring TriggerWithdraw, scheduler context cancelled")
+		slog.Debug("ignoring TriggerWithdraw, scheduler context canceled")
 		return
 	}
 
@@ -148,7 +148,7 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 
 // Stop cancels the scheduler's internal context, stopping all operations.
 // This is useful for testing or for cases where you want to stop the scheduler
-// without cancelling the parent context passed to Start().
+// without canceling the parent context passed to Start().
 // After Stop() is called, TriggerWithdraw() calls will be ignored.
 func (s *WithdrawScheduler) Stop() {
 	s.ctxMu.Lock()
@@ -167,7 +167,7 @@ func (s *WithdrawScheduler) Stop() {
 // that must complete before other operations.
 //
 // Context inheritance: Start() creates an internal context derived from the passed ctx.
-// When ctx is cancelled, the internal context is also cancelled, which stops any
+// When ctx is canceled, the internal context is also canceled, which stops any
 // TriggerWithdraw goroutines that were spawned during operation.
 func (s *WithdrawScheduler) Start(ctx context.Context) error {
 	slog.Info("starting withdrawal scheduler",
@@ -176,8 +176,8 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 	)
 
 	// Replace context for use by TriggerWithdraw (protected by mutex).
-	// IMPORTANT: Create the new context BEFORE cancelling the old one to avoid a race
-	// where TriggerWithdraw() reads a cancelled context. The sequence is:
+	// IMPORTANT: Create the new context BEFORE canceling the old one to avoid a race
+	// where TriggerWithdraw() reads a canceled context. The sequence is:
 	// 1. Create new context
 	// 2. Atomically swap the context and cancel function
 	// 3. Cancel old context (any TriggerWithdraw reading context will get the new one)
@@ -188,12 +188,12 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 	s.cancel = newCancel
 	s.ctxMu.Unlock()
 	// Cancel old context AFTER releasing lock - this ensures TriggerWithdraw()
-	// always reads the new valid context, never the cancelled old one.
+	// always reads the new valid context, never the canceled old one.
 	if oldCancel != nil {
 		oldCancel()
 	}
 
-	// Ensure internal context is cancelled when Start() returns for any reason.
+	// Ensure internal context is canceled when Start() returns for any reason.
 	// This handles edge cases where Start() might return due to an error.
 	defer func() {
 		s.ctxMu.Lock()
@@ -228,7 +228,7 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 				}
 			}
 			// Wait for any TriggerWithdraw goroutines to complete.
-			// Since s.ctx is a child of ctx, it's already cancelled,
+			// Since s.ctx is a child of ctx, it's already canceled,
 			// so TriggerWithdraw goroutines should exit promptly.
 			s.wg.Wait()
 			slog.Info("withdrawal scheduler stopped")

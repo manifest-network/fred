@@ -1027,8 +1027,8 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 
 // mockStatusChecker implements StatusChecker for testing.
 type mockStatusChecker struct {
-	hasPayload  map[string]bool
-	isInFlight  map[string]bool
+	hasPayload map[string]bool
+	isInFlight map[string]bool
 }
 
 func (m *mockStatusChecker) HasPayload(leaseUUID string) bool {

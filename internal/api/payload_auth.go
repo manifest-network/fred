@@ -57,4 +57,3 @@ func (t *PayloadAuthToken) Validate(bech32Prefix string) error {
 func (t *PayloadAuthToken) createSignData() []byte {
 	return auth.FormatPayloadSignData(t.LeaseUUID, t.MetaHash, t.Timestamp)
 }
-

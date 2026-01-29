@@ -15,7 +15,7 @@ type mockBenchBackend struct {
 	name string
 }
 
-func (m *mockBenchBackend) Name() string                                           { return m.name }
+func (m *mockBenchBackend) Name() string                                              { return m.name }
 func (m *mockBenchBackend) Provision(ctx context.Context, req ProvisionRequest) error { return nil }
 func (m *mockBenchBackend) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo, error) {
 	info := LeaseInfo{"host": "10.0.0.1", "port": 8080}
@@ -290,7 +290,7 @@ func TestHTTPClient_HighThroughput(t *testing.T) {
 	})
 
 	const (
-		numGoroutines = 100
+		numGoroutines  = 100
 		reqsPerRoutine = 100
 	)
 
