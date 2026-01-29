@@ -1,6 +1,7 @@
 package api
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -420,9 +421,6 @@ func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
 }
 
 func TestCalcRetryAfterSeconds(t *testing.T) {
-	// Note: Only testing realistic values that could come from config validation.
-	// Config validation ensures rate > 0, and viper/YAML parsing cannot produce
-	// NaN/Inf, so those edge cases are not tested here.
 	tests := []struct {
 		name string
 		rate float64
@@ -436,6 +434,11 @@ func TestCalcRetryAfterSeconds(t *testing.T) {
 		{"zero rate fallback", 0, "1"},
 		{"negative rate fallback", -1, "1"},
 		{"100 RPS", 100.0, "1"},
+		// Non-finite edge cases: strconv.ParseFloat("NaN") succeeds and NaN
+		// comparisons are always false, so explicit guards are needed.
+		{"positive infinity", math.Inf(1), "1"},
+		{"negative infinity", math.Inf(-1), "1"},
+		{"NaN", math.NaN(), "1"},
 	}
 
 	for _, tt := range tests {

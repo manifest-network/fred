@@ -73,16 +73,15 @@ const (
 
 // calcRetryAfterSeconds calculates the Retry-After header value from a rate limit.
 // Returns the time until one token is available (1/rate), rounded up to at least 1 second.
-//
-// Note: This function assumes r is a valid positive rate. Edge cases like NaN, Inf,
-// or extremely small values are not handled because config validation ensures
-// RateLimitRPS and TenantRateLimitRPS are positive, and viper/YAML parsing cannot
-// produce non-finite floats from configuration files or environment variables.
 func calcRetryAfterSeconds(r rate.Limit) string {
-	if r <= 0 {
+	rf := float64(r)
+	if rf <= 0 || math.IsNaN(rf) || math.IsInf(rf, 0) {
 		return "1"
 	}
-	seconds := int(math.Ceil(1.0 / float64(r)))
+	seconds := int(math.Ceil(1.0 / rf))
+	if seconds < 1 {
+		return "1"
+	}
 	return strconv.Itoa(seconds)
 }
 
