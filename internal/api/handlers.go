@@ -24,18 +24,12 @@ type ChainClient interface {
 	Ping(ctx context.Context) error
 }
 
-// ProvisioningStatusChecker provides status information about provisioning.
-type ProvisioningStatusChecker interface {
-	HasPayload(leaseUUID string) bool
-	IsInFlight(leaseUUID string) bool
-}
-
 // Handlers contains HTTP request handlers.
 type Handlers struct {
 	client        ChainClient
 	backendRouter *backend.Router
 	tokenTracker  *TokenTracker
-	statusChecker ProvisioningStatusChecker
+	statusChecker StatusChecker
 	providerUUID  string
 	bech32Prefix  string
 }
@@ -43,7 +37,7 @@ type Handlers struct {
 // NewHandlers creates a new Handlers instance.
 // tokenTracker is optional but recommended for replay attack protection.
 // statusChecker is optional but required for the /status endpoint.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker *TokenTracker, statusChecker ProvisioningStatusChecker, providerUUID, bech32Prefix string) *Handlers {
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker *TokenTracker, statusChecker StatusChecker, providerUUID, bech32Prefix string) *Handlers {
 	return &Handlers{
 		client:        client,
 		backendRouter: backendRouter,
