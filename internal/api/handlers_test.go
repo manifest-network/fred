@@ -1025,7 +1025,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 	})
 }
 
-// mockStatusChecker implements ProvisioningStatusChecker for testing.
+// mockStatusChecker implements StatusChecker for testing.
 type mockStatusChecker struct {
 	hasPayload  map[string]bool
 	isInFlight  map[string]bool
