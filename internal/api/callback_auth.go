@@ -27,7 +27,7 @@ const (
 	MaxCallbackMaxAge = 1 * time.Hour
 
 	// MinCallbackSecretLength is the minimum required length for callback secrets.
-	// HMAC-SHA256 requires at least 32 bytes for full security.
+	// For full 256-bit security with HMAC-SHA256, use at least 32 bytes.
 	MinCallbackSecretLength = 32
 
 	// callbackClockSkewTolerance is the maximum allowed clock skew for future timestamps.

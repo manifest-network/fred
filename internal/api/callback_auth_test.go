@@ -13,8 +13,8 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-// testCallbackSecret is a valid secret for testing (>= 32 bytes).
-const testCallbackSecret = "test-secret-that-is-at-least-32-chars"
+// testCallbackSecret is a valid secret for testing (>= 32 bytes, ASCII).
+const testCallbackSecret = "test-secret-that-is-at-least-32-bytes"
 
 // newTestCallbackAuthenticator creates a CallbackAuthenticator for testing.
 // It fails the test if creation fails.
