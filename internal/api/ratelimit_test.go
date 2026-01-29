@@ -439,6 +439,9 @@ func TestCalcRetryAfterSeconds(t *testing.T) {
 		{"positive infinity", math.Inf(1), "1"},
 		{"negative infinity", math.Inf(-1), "1"},
 		{"NaN", math.NaN(), "1"},
+		// Extremely small rates would overflow int; cap at 1 day.
+		{"tiny rate capped at 1 day", 1e-10, "86400"},
+		{"very small rate capped at 1 day", 1e-20, "86400"},
 	}
 
 	for _, tt := range tests {

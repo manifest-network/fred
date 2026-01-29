@@ -386,6 +386,20 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			},
 			wantErr: "fee_denom is required",
 		},
+		{
+			name: "zero shutdown_timeout",
+			modify: func(c *Config) {
+				c.ShutdownTimeout = 0
+			},
+			wantErr: "shutdown_timeout must be positive",
+		},
+		{
+			name: "negative shutdown_timeout",
+			modify: func(c *Config) {
+				c.ShutdownTimeout = -time.Second
+			},
+			wantErr: "shutdown_timeout must be positive",
+		},
 	}
 
 	for _, tt := range tests {

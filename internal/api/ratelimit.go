@@ -71,18 +71,28 @@ const (
 	tenantTTL = 5 * time.Minute
 )
 
+// maxRetryAfterSeconds caps the Retry-After header to prevent overflow when
+// converting float64 to int for extremely small rates, and to provide a
+// practical upper bound (no client would wait longer than a day).
+const maxRetryAfterSeconds = 86400 // 1 day
+
 // calcRetryAfterSeconds calculates the Retry-After header value from a rate limit.
-// Returns the time until one token is available (1/rate), rounded up to at least 1 second.
+// Returns the per-token refill interval (1/rate), rounded up to at least 1 second,
+// capped at maxRetryAfterSeconds. This is a conservative estimate; the actual wait
+// time may be shorter if the bucket is partially refilled.
 func calcRetryAfterSeconds(r rate.Limit) string {
 	rf := float64(r)
 	if rf <= 0 || math.IsNaN(rf) || math.IsInf(rf, 0) {
 		return "1"
 	}
-	seconds := int(math.Ceil(1.0 / rf))
+	seconds := math.Ceil(1.0 / rf)
+	if seconds > maxRetryAfterSeconds {
+		return strconv.Itoa(maxRetryAfterSeconds)
+	}
 	if seconds < 1 {
 		return "1"
 	}
-	return strconv.Itoa(seconds)
+	return strconv.Itoa(int(seconds))
 }
 
 // RateLimiter implements per-IP rate limiting using a token bucket algorithm.
@@ -122,8 +132,9 @@ func (rl *RateLimiter) getVisitor(ip string) *rate.Limiter {
 	return limiter
 }
 
-// retryAfterSeconds calculates the Retry-After header value in seconds.
-// Returns the time until one token is available, rounded up to at least 1 second.
+// retryAfterSeconds returns the Retry-After header value in seconds.
+// This is the per-token refill interval, a conservative estimate of when
+// the client may retry.
 func (rl *RateLimiter) retryAfterSeconds() string {
 	return calcRetryAfterSeconds(rl.rate)
 }
@@ -226,8 +237,9 @@ func (tl *TenantRateLimiter) Allow(tenant string) bool {
 	return tl.getLimiter(tenant).Allow()
 }
 
-// retryAfterSeconds calculates the Retry-After header value in seconds.
-// Returns the time until one token is available, rounded up to at least 1 second.
+// retryAfterSeconds returns the Retry-After header value in seconds.
+// This is the per-token refill interval, a conservative estimate of when
+// the client may retry.
 func (tl *TenantRateLimiter) retryAfterSeconds() string {
 	return calcRetryAfterSeconds(tl.rate)
 }
