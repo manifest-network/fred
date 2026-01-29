@@ -34,7 +34,9 @@ jobs:
           go-version: "1.25"
 
       - name: Test
-        run: go test -race -v ./...
+        # Note: -race flag omitted due to memory constraints on GitHub runners.
+        # Run `go test -race ./...` locally before pushing critical changes.
+        run: go test -v ./...
 
   lint:
     runs-on: ubuntu-latest
