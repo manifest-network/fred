@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -53,17 +54,27 @@ func TestManager_StressTest_100K(t *testing.T) {
 }
 
 // TestManager_StressTest_500K pushes 500,000 events through the system.
+// Skipped by default due to high resource requirements.
+// Run with: STRESS_TEST_LARGE=1 go test -run TestManager_StressTest_500K
 func TestManager_StressTest_500K(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in short mode")
+	}
+	if os.Getenv("STRESS_TEST_LARGE") == "" {
+		t.Skip("skipping large stress test; set STRESS_TEST_LARGE=1 to run")
 	}
 	runManagerStressTest(t, 500_000, 500)
 }
 
 // TestManager_StressTest_1M pushes 1,000,000 events through the system.
+// Skipped by default due to high resource requirements.
+// Run with: STRESS_TEST_LARGE=1 go test -run TestManager_StressTest_1M
 func TestManager_StressTest_1M(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in short mode")
+	}
+	if os.Getenv("STRESS_TEST_LARGE") == "" {
+		t.Skip("skipping large stress test; set STRESS_TEST_LARGE=1 to run")
 	}
 	runManagerStressTest(t, 1_000_000, 1000)
 }
@@ -209,6 +220,7 @@ func TestManager_SustainedLoad(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping sustained load test in short mode")
 	}
+	suppressLogs(t)
 
 	var provisionCount atomic.Int64
 	mockBackend := &mockBenchBackend{name: "test", count: &provisionCount}
@@ -476,6 +488,7 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping high concurrency test in short mode")
 	}
+	suppressLogs(t)
 
 	var provisionCount atomic.Int64
 	mockBackend := &mockBenchBackend{name: "test", count: &provisionCount}
