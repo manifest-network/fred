@@ -1,6 +1,7 @@
 package api
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -416,6 +417,48 @@ func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
 
 	if limiter1 != limiter2 {
 		t.Error("getLimiter should return the same limiter for the same tenant")
+	}
+}
+
+func TestCalcRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		name string
+		rate float64
+		want string
+	}{
+		{"10 RPS", 10.0, "1"},
+		{"1 RPS", 1.0, "1"},
+		{"0.5 RPS (2 second refill)", 0.5, "2"},
+		{"0.1 RPS (10 second refill)", 0.1, "10"},
+		{"0.33 RPS (rounds up to 4)", 0.33, "4"},
+		{"zero rate fallback", 0, "1"},
+		{"negative rate fallback", -1, "1"},
+		{"100 RPS", 100.0, "1"},
+		// Non-finite edge cases: strconv.ParseFloat("NaN") succeeds and NaN
+		// comparisons are always false, so explicit guards are needed.
+		{"positive infinity", math.Inf(1), "1"},
+		{"negative infinity", math.Inf(-1), "1"},
+		{"NaN", math.NaN(), "1"},
+		// Extremely small rates would overflow int; cap at 1 day.
+		{"tiny rate capped at 1 day", 1e-10, "86400"},
+		{"very small rate capped at 1 day", 1e-20, "86400"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rl := NewRateLimiter(tt.rate, 1, nil)
+			got := rl.retryAfterSeconds()
+			if got != tt.want {
+				t.Errorf("retryAfterSeconds() = %q, want %q", got, tt.want)
+			}
+
+			// Also test TenantRateLimiter
+			tl := NewTenantRateLimiter(tt.rate, 1)
+			got = tl.retryAfterSeconds()
+			if got != tt.want {
+				t.Errorf("TenantRateLimiter.retryAfterSeconds() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

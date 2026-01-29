@@ -85,6 +85,9 @@ type Config struct {
 	PayloadStoreDBPath      string        `mapstructure:"payload_store_db_path"`
 	PayloadStoreTTL         time.Duration `mapstructure:"payload_store_ttl"`
 	PayloadStoreCleanupFreq time.Duration `mapstructure:"payload_store_cleanup_freq"`
+
+	// Shutdown configuration
+	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
 }
 
 // BackendConfig configures a single provisioning backend.
@@ -155,6 +158,9 @@ func Load(configPath string) (*Config, error) {
 	// Payload store defaults
 	v.SetDefault("payload_store_ttl", "1h")
 	v.SetDefault("payload_store_cleanup_freq", "10m")
+
+	// Shutdown defaults
+	v.SetDefault("shutdown_timeout", "30s")
 
 	// Environment variable support
 	v.SetEnvPrefix("PROVIDER")
@@ -281,6 +287,11 @@ func (c *Config) Validate() error {
 	// Reconciliation validations
 	if c.ReconciliationInterval <= 0 {
 		return fmt.Errorf("reconciliation_interval must be positive")
+	}
+
+	// Shutdown validations
+	if c.ShutdownTimeout <= 0 {
+		return fmt.Errorf("shutdown_timeout must be positive")
 	}
 
 	// URL/endpoint validations

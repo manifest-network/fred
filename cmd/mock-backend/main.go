@@ -21,6 +21,10 @@
 //	MOCK_BACKEND_DELAY            - Simulated provisioning delay (default: "0s")
 //	MOCK_BACKEND_CALLBACK_SECRET  - HMAC secret for callbacks (required, min 32 chars)
 //	MOCK_BACKEND_TLS_SKIP_VERIFY  - Skip TLS verification for callbacks (default: "false")
+//	MOCK_BACKEND_CLIENT_TIMEOUT   - HTTP client timeout for callbacks (default: "10s")
+//	MOCK_BACKEND_READ_TIMEOUT     - HTTP server read timeout (default: "15s")
+//	MOCK_BACKEND_WRITE_TIMEOUT    - HTTP server write timeout (default: "15s")
+//	MOCK_BACKEND_IDLE_TIMEOUT     - HTTP server idle timeout (default: "60s")
 package main
 
 import (
@@ -73,7 +77,17 @@ func main() {
 			slog.Error("invalid MOCK_BACKEND_DELAY", "error", err)
 			os.Exit(1)
 		}
+		if delay < 0 {
+			slog.Error("MOCK_BACKEND_DELAY cannot be negative", "value", delayStr)
+			os.Exit(1)
+		}
 	}
+
+	// Parse timeout configurations with defaults
+	clientTimeout := parseDurationEnv("MOCK_BACKEND_CLIENT_TIMEOUT", 10*time.Second)
+	readTimeout := parseDurationEnv("MOCK_BACKEND_READ_TIMEOUT", 15*time.Second)
+	writeTimeout := parseDurationEnv("MOCK_BACKEND_WRITE_TIMEOUT", 15*time.Second)
+	idleTimeout := parseDurationEnv("MOCK_BACKEND_IDLE_TIMEOUT", 60*time.Second)
 
 	// Create mock backend
 	mockBackend := backend.NewMockBackend(backend.MockBackendConfig{
@@ -85,7 +99,7 @@ func main() {
 	// By default, TLS verification is enabled. Set MOCK_BACKEND_TLS_SKIP_VERIFY=true
 	// to skip verification (e.g., for self-signed certs in local testing).
 	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: clientTimeout,
 	}
 
 	tlsSkipVerify := os.Getenv("MOCK_BACKEND_TLS_SKIP_VERIFY")
@@ -132,9 +146,9 @@ func main() {
 	httpServer := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
 	}
 
 	// Start server
@@ -386,4 +400,23 @@ func (s *MockBackendServer) computeSignature(payload []byte) string {
 	sig := hex.EncodeToString(mac.Sum(nil))
 
 	return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
+}
+
+// parseDurationEnv parses a duration from an environment variable with a default fallback.
+// Non-positive values are rejected to prevent accidentally disabling timeouts.
+func parseDurationEnv(key string, defaultVal time.Duration) time.Duration {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		slog.Error("invalid duration", "env", key, "value", val, "error", err)
+		os.Exit(1)
+	}
+	if d <= 0 {
+		slog.Error("duration must be positive", "env", key, "value", val)
+		os.Exit(1)
+	}
+	return d
 }

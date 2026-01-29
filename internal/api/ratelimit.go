@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +71,30 @@ const (
 	tenantTTL = 5 * time.Minute
 )
 
+// maxRetryAfterSeconds caps the Retry-After header to prevent overflow when
+// converting float64 to int for extremely small rates, and to provide a
+// practical upper bound (no client would wait longer than a day).
+const maxRetryAfterSeconds = 86400 // 1 day
+
+// calcRetryAfterSeconds calculates the Retry-After header value from a rate limit.
+// Returns the per-token refill interval (1/rate), rounded up to at least 1 second,
+// capped at maxRetryAfterSeconds. This is a conservative estimate; the actual wait
+// time may be shorter if the bucket is partially refilled.
+func calcRetryAfterSeconds(r rate.Limit) string {
+	rf := float64(r)
+	if rf <= 0 || math.IsNaN(rf) || math.IsInf(rf, 0) {
+		return "1"
+	}
+	seconds := math.Ceil(1.0 / rf)
+	if seconds > maxRetryAfterSeconds {
+		return strconv.Itoa(maxRetryAfterSeconds)
+	}
+	if seconds < 1 {
+		return "1"
+	}
+	return strconv.Itoa(int(seconds))
+}
+
 // RateLimiter implements per-IP rate limiting using a token bucket algorithm.
 type RateLimiter struct {
 	visitors       *lru.LRU[string, *rate.Limiter]
@@ -106,6 +132,13 @@ func (rl *RateLimiter) getVisitor(ip string) *rate.Limiter {
 	return limiter
 }
 
+// retryAfterSeconds returns the Retry-After header value in seconds.
+// This is the per-token refill interval, a conservative estimate of when
+// the client may retry.
+func (rl *RateLimiter) retryAfterSeconds() string {
+	return calcRetryAfterSeconds(rl.rate)
+}
+
 // Middleware returns an HTTP middleware that enforces rate limiting.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -114,7 +147,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		limiter := rl.getVisitor(ip)
 		if !limiter.Allow() {
 			slog.Warn("rate limit exceeded", "ip", ip, "path", r.URL.Path)
-			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Retry-After", rl.retryAfterSeconds())
 			writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -204,6 +237,13 @@ func (tl *TenantRateLimiter) Allow(tenant string) bool {
 	return tl.getLimiter(tenant).Allow()
 }
 
+// retryAfterSeconds returns the Retry-After header value in seconds.
+// This is the per-token refill interval, a conservative estimate of when
+// the client may retry.
+func (tl *TenantRateLimiter) retryAfterSeconds() string {
+	return calcRetryAfterSeconds(tl.rate)
+}
+
 // TenantKey is the context key type for storing tenant info.
 type tenantKey struct{}
 
@@ -233,7 +273,7 @@ func (tl *TenantRateLimiter) Middleware(bech32Prefix string) func(http.Handler) 
 					"tenant", tenant,
 					"path", r.URL.Path,
 				)
-				w.Header().Set("Retry-After", "1")
+				w.Header().Set("Retry-After", tl.retryAfterSeconds())
 				writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}

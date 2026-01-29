@@ -148,6 +148,7 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		CreditCheckErrorThreshold: 3,
 		CreditCheckRetryInterval:  30 * time.Second,
 		ReconciliationInterval:    5 * time.Minute,
+		ShutdownTimeout:           30 * time.Second,
 		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 		CallbackBaseURL:           "http://localhost:8080",
 		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
@@ -185,6 +186,7 @@ func TestConfig_Validate_NoBackends(t *testing.T) {
 		CreditCheckErrorThreshold: 3,
 		CreditCheckRetryInterval:  30 * time.Second,
 		ReconciliationInterval:    5 * time.Minute,
+		ShutdownTimeout:           30 * time.Second,
 		// No backends configured
 	}
 
@@ -226,6 +228,7 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 		}
@@ -308,6 +311,7 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
@@ -382,6 +386,20 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			},
 			wantErr: "fee_denom is required",
 		},
+		{
+			name: "zero shutdown_timeout",
+			modify: func(c *Config) {
+				c.ShutdownTimeout = 0
+			},
+			wantErr: "shutdown_timeout must be positive",
+		},
+		{
+			name: "negative shutdown_timeout",
+			modify: func(c *Config) {
+				c.ShutdownTimeout = -time.Second
+			},
+			wantErr: "shutdown_timeout must be positive",
+		},
 	}
 
 	for _, tt := range tests {
@@ -428,6 +446,7 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
@@ -526,6 +545,7 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
@@ -743,6 +763,7 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
@@ -868,6 +889,7 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 		}
 	}
@@ -945,6 +967,7 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			CreditCheckErrorThreshold: 3,
 			CreditCheckRetryInterval:  30 * time.Second,
 			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://10.0.0.1:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://10.0.0.1:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
