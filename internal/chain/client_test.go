@@ -298,6 +298,24 @@ func TestIsRetryableTxError(t *testing.T) {
 			wantRetry: false,
 		},
 		{
+			name: "wrapped sequence mismatch error",
+			err: fmt.Errorf("broadcast failed: %w", &ChainTxError{
+				Code:      32,
+				Codespace: "sdk",
+				RawLog:    "account sequence mismatch",
+			}),
+			wantRetry: true,
+		},
+		{
+			name: "wrapped non-retryable chain error",
+			err: fmt.Errorf("tx error: %w", &ChainTxError{
+				Code:      1,
+				Codespace: "billing",
+				RawLog:    "lease not found",
+			}),
+			wantRetry: false,
+		},
+		{
 			name:      "gRPC unavailable error",
 			err:       status.Error(codes.Unavailable, "connection refused"),
 			wantRetry: true,
