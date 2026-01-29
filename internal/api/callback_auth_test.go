@@ -13,8 +13,77 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 )
 
+// testCallbackSecret is a valid secret for testing (>= 32 bytes).
+const testCallbackSecret = "test-secret-that-is-at-least-32-chars"
+
+// newTestCallbackAuthenticator creates a CallbackAuthenticator for testing.
+// It fails the test if creation fails.
+func newTestCallbackAuthenticator(t *testing.T, secret string) *CallbackAuthenticator {
+	t.Helper()
+	auth, err := NewCallbackAuthenticator(secret)
+	if err != nil {
+		t.Fatalf("NewCallbackAuthenticator() error = %v", err)
+	}
+	return auth
+}
+
+func TestNewCallbackAuthenticator_SecretValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		secret    string
+		wantError bool
+	}{
+		{
+			name:      "valid secret - exactly 32 bytes",
+			secret:    "12345678901234567890123456789012",
+			wantError: false,
+		},
+		{
+			name:      "valid secret - more than 32 bytes",
+			secret:    testCallbackSecret,
+			wantError: false,
+		},
+		{
+			name:      "invalid secret - 31 bytes",
+			secret:    "1234567890123456789012345678901",
+			wantError: true,
+		},
+		{
+			name:      "invalid secret - empty",
+			secret:    "",
+			wantError: true,
+		},
+		{
+			name:      "invalid secret - short",
+			secret:    "short",
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth, err := NewCallbackAuthenticator(tt.secret)
+			if tt.wantError {
+				if err == nil {
+					t.Error("NewCallbackAuthenticator() error = nil, want error")
+				}
+				if auth != nil {
+					t.Error("NewCallbackAuthenticator() returned non-nil auth with error")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("NewCallbackAuthenticator() error = %v, want nil", err)
+				}
+				if auth == nil {
+					t.Error("NewCallbackAuthenticator() returned nil auth without error")
+				}
+			}
+		})
+	}
+}
+
 func TestCallbackAuthenticator_ComputeSignature(t *testing.T) {
-	auth := NewCallbackAuthenticator("test-secret-that-is-at-least-32-chars")
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 	signature := auth.ComputeSignature(payload)
@@ -36,7 +105,7 @@ func TestCallbackAuthenticator_ComputeSignature(t *testing.T) {
 }
 
 func TestCallbackAuthenticator_ComputeSignatureWithTime(t *testing.T) {
-	auth := NewCallbackAuthenticator("test-secret-that-is-at-least-32-chars")
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 	fixedTime := time.Unix(1700000000, 0)
@@ -56,8 +125,7 @@ func TestCallbackAuthenticator_ComputeSignatureWithTime(t *testing.T) {
 }
 
 func TestCallbackAuthenticator_VerifySignature(t *testing.T) {
-	secret := "test-secret-that-is-at-least-32-chars"
-	auth := NewCallbackAuthenticator(secret)
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 	now := time.Now()
@@ -188,8 +256,7 @@ func TestCallbackAuthenticator_VerifySignature(t *testing.T) {
 }
 
 func TestCallbackAuthenticator_VerifyRequest(t *testing.T) {
-	secret := "test-secret-that-is-at-least-32-chars"
-	auth := NewCallbackAuthenticator(secret)
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 	validSignature := auth.ComputeSignature(payload)
@@ -254,8 +321,8 @@ func TestCallbackAuthenticator_VerifyRequest(t *testing.T) {
 }
 
 func TestCallbackAuthenticator_DifferentSecrets(t *testing.T) {
-	auth1 := NewCallbackAuthenticator("secret-one-that-is-at-least-32-chars")
-	auth2 := NewCallbackAuthenticator("secret-two-that-is-at-least-32-chars")
+	auth1 := newTestCallbackAuthenticator(t, "secret-one-that-is-at-least-32-chars")
+	auth2 := newTestCallbackAuthenticator(t, "secret-two-that-is-at-least-32-chars")
 
 	payload := []byte(`{"test":"data"}`)
 	now := time.Now()
@@ -278,7 +345,7 @@ func TestCallbackAuthenticator_DifferentSecrets(t *testing.T) {
 }
 
 func TestCallbackAuthenticator_ReplayProtection(t *testing.T) {
-	auth := NewCallbackAuthenticator("test-secret-that-is-at-least-32-chars")
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 
@@ -308,25 +375,27 @@ func TestCallbackAuthenticator_ReplayProtection(t *testing.T) {
 }
 
 func TestNewCallbackAuthenticatorWithMaxAge_Validation(t *testing.T) {
-	secret := "test-secret-that-is-at-least-32-chars"
-
 	tests := []struct {
 		name    string
+		secret  string
 		maxAge  time.Duration
 		wantErr bool
 	}{
-		{"valid - 1 second", time.Second, false},
-		{"valid - 1 minute", time.Minute, false},
-		{"valid - 30 minutes", 30 * time.Minute, false},
-		{"valid - exactly 1 hour", time.Hour, false},
-		{"invalid - zero", 0, true},
-		{"invalid - negative", -time.Minute, true},
-		{"invalid - exceeds max", 2 * time.Hour, true},
+		{"valid", testCallbackSecret, time.Minute, false},
+		{"valid - 1 second", testCallbackSecret, time.Second, false},
+		{"valid - 30 minutes", testCallbackSecret, 30 * time.Minute, false},
+		{"valid - exactly 1 hour", testCallbackSecret, time.Hour, false},
+		{"invalid - zero maxAge", testCallbackSecret, 0, true},
+		{"invalid - negative maxAge", testCallbackSecret, -time.Minute, true},
+		{"invalid - exceeds max maxAge", testCallbackSecret, 2 * time.Hour, true},
+		{"invalid - short secret", "short", time.Minute, true},
+		{"invalid - empty secret", "", time.Minute, true},
+		{"invalid - 31 byte secret", "1234567890123456789012345678901", time.Minute, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			auth, err := NewCallbackAuthenticatorWithMaxAge(secret, tt.maxAge)
+			auth, err := NewCallbackAuthenticatorWithMaxAge(tt.secret, tt.maxAge)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("expected error, got nil")
@@ -369,8 +438,7 @@ func TestCallbackAuthenticator_CustomMaxAge(t *testing.T) {
 }
 
 func TestHandleProvisionCallback_Authentication(t *testing.T) {
-	secret := "test-secret-that-is-at-least-32-chars"
-	auth := NewCallbackAuthenticator(secret)
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 
 	publishedCallback := &mockCallbackPublisher{}
 
@@ -567,7 +635,11 @@ func (m *mockCallbackPublisher) reset() {
 
 // Example showing the signature format
 func ExampleCallbackAuthenticator_ComputeSignature() {
-	auth := NewCallbackAuthenticator("my-secret-key-at-least-32-characters")
+	auth, err := NewCallbackAuthenticator("my-secret-key-at-least-32-characters")
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 	signature := auth.ComputeSignature(payload)
 	// Output format: t=<unix-timestamp>,sha256=<hex-encoded-hmac>

@@ -26,6 +26,10 @@ const (
 	// Values larger than this would undermine replay protection.
 	MaxCallbackMaxAge = 1 * time.Hour
 
+	// MinCallbackSecretLength is the minimum required length for callback secrets.
+	// HMAC-SHA256 requires at least 32 bytes for full security.
+	MinCallbackSecretLength = 32
+
 	// callbackClockSkewTolerance is the maximum allowed clock skew for future timestamps.
 	// This allows for minor clock differences between backend and Fred servers.
 	callbackClockSkewTolerance = 1 * time.Minute
@@ -48,17 +52,25 @@ type CallbackAuthenticator struct {
 
 // NewCallbackAuthenticator creates a new callback authenticator with the given secret.
 // Uses DefaultCallbackMaxAge for replay protection.
-func NewCallbackAuthenticator(secret string) *CallbackAuthenticator {
+// Returns an error if the secret is shorter than MinCallbackSecretLength bytes.
+func NewCallbackAuthenticator(secret string) (*CallbackAuthenticator, error) {
+	if len(secret) < MinCallbackSecretLength {
+		return nil, fmt.Errorf("callback secret must be at least %d bytes, got %d", MinCallbackSecretLength, len(secret))
+	}
 	return &CallbackAuthenticator{
 		secret:  []byte(secret),
 		maxAge:  DefaultCallbackMaxAge,
 		nowFunc: time.Now,
-	}
+	}, nil
 }
 
 // NewCallbackAuthenticatorWithMaxAge creates a callback authenticator with a custom max age.
-// Returns an error if maxAge is not positive or exceeds MaxCallbackMaxAge.
+// Returns an error if the secret is shorter than MinCallbackSecretLength bytes,
+// maxAge is not positive, or maxAge exceeds MaxCallbackMaxAge.
 func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*CallbackAuthenticator, error) {
+	if len(secret) < MinCallbackSecretLength {
+		return nil, fmt.Errorf("callback secret must be at least %d bytes, got %d", MinCallbackSecretLength, len(secret))
+	}
 	if maxAge <= 0 {
 		return nil, errors.New("callback max age must be positive")
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -135,7 +136,11 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	// Create callback authenticator if secret is provided
 	var callbackAuth *CallbackAuthenticator
 	if cfg.CallbackSecret != "" {
-		callbackAuth = NewCallbackAuthenticator(cfg.CallbackSecret)
+		var err error
+		callbackAuth, err = NewCallbackAuthenticator(cfg.CallbackSecret)
+		if err != nil {
+			return nil, fmt.Errorf("create callback authenticator: %w", err)
+		}
 	}
 
 	// Create payload handler if publisher is provided

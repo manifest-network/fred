@@ -76,7 +76,12 @@ func main() {
 	// Create load tester
 	var callbackAuth *api.CallbackAuthenticator
 	if *callbackSecret != "" {
-		callbackAuth = api.NewCallbackAuthenticator(*callbackSecret)
+		var err error
+		callbackAuth, err = api.NewCallbackAuthenticator(*callbackSecret)
+		if err != nil {
+			slog.Error("invalid callback secret", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	lt := &LoadTester{
