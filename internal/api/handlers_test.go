@@ -51,6 +51,220 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
+// TestHealthCheck_ChainUnavailable tests health check when chain ping fails.
+func TestHealthCheck_ChainUnavailable(t *testing.T) {
+	chainClient := &mockChainClient{
+		pingFunc: func(ctx context.Context) error {
+			return fmt.Errorf("connection refused")
+		},
+	}
+
+	h := &Handlers{
+		client:       chainClient,
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	// Should return 503 Service Unavailable
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "unhealthy" {
+		t.Errorf("status = %q, want %q", response.Status, "unhealthy")
+	}
+
+	// Check that chain check shows unhealthy with error message
+	chainCheck, ok := response.Checks["chain"]
+	if !ok {
+		t.Fatal("missing chain check in response")
+	}
+	if chainCheck.Status != "unhealthy" {
+		t.Errorf("chain check status = %q, want %q", chainCheck.Status, "unhealthy")
+	}
+	if chainCheck.Message != "connection refused" {
+		t.Errorf("chain check message = %q, want %q", chainCheck.Message, "connection refused")
+	}
+}
+
+// TestHealthCheck_ChainHealthy tests health check when chain is available.
+func TestHealthCheck_ChainHealthy(t *testing.T) {
+	chainClient := &mockChainClient{
+		pingFunc: func(ctx context.Context) error {
+			return nil // Healthy
+		},
+	}
+
+	h := &Handlers{
+		client:       chainClient,
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "healthy" {
+		t.Errorf("status = %q, want %q", response.Status, "healthy")
+	}
+
+	chainCheck, ok := response.Checks["chain"]
+	if !ok {
+		t.Fatal("missing chain check in response")
+	}
+	if chainCheck.Status != "healthy" {
+		t.Errorf("chain check status = %q, want %q", chainCheck.Status, "healthy")
+	}
+}
+
+// TestHealthCheck_BackendUnhealthy tests health check when a backend is unavailable.
+func TestHealthCheck_BackendUnhealthy(t *testing.T) {
+	// Create a backend server that returns unhealthy
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("backend down"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backendClient, IsDefault: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	h := &Handlers{
+		client:        nil, // No chain client
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	// Should return 503 due to unhealthy backend
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "unhealthy" {
+		t.Errorf("status = %q, want %q", response.Status, "unhealthy")
+	}
+
+	// Check backend health status
+	backendCheck, ok := response.Checks["backend:test-backend"]
+	if !ok {
+		t.Fatalf("missing backend check in response, got: %v", response.Checks)
+	}
+	if backendCheck.Status != "unhealthy" {
+		t.Errorf("backend check status = %q, want %q", backendCheck.Status, "unhealthy")
+	}
+}
+
+// TestHealthCheck_AllHealthy tests health check when both chain and backend are healthy.
+func TestHealthCheck_AllHealthy(t *testing.T) {
+	chainClient := &mockChainClient{
+		pingFunc: func(ctx context.Context) error {
+			return nil
+		},
+	}
+
+	// Create a healthy backend
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "healthy-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backendClient, IsDefault: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	h := &Handlers{
+		client:        chainClient,
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "healthy" {
+		t.Errorf("status = %q, want %q", response.Status, "healthy")
+	}
+
+	// Both checks should be healthy
+	if response.Checks["chain"].Status != "healthy" {
+		t.Errorf("chain status = %q, want %q", response.Checks["chain"].Status, "healthy")
+	}
+	if response.Checks["backend:healthy-backend"].Status != "healthy" {
+		t.Errorf("backend status = %q, want %q", response.Checks["backend:healthy-backend"].Status, "healthy")
+	}
+}
+
 func TestWriteError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeError(rec, "test error", http.StatusBadRequest)

@@ -2230,3 +2230,255 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 		t.Errorf("in-flight Backend = %q, want %q", provision.Backend, "gpu-backend")
 	}
 }
+
+// TestManager_CheckCallbackTimeouts tests the timeout detection and rejection logic.
+func TestManager_CheckCallbackTimeouts(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	var mu sync.Mutex
+	var rejectedLeases []string
+	var rejectReason string
+
+	mockChain := &chain.MockClient{
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:         "provider-1",
+		CallbackBaseURL:      "http://localhost:8080",
+		CallbackTimeout:      100 * time.Millisecond, // Short timeout for testing
+		TimeoutCheckInterval: 50 * time.Millisecond,
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	t.Run("detects_timed_out_provisions", func(t *testing.T) {
+		mu.Lock()
+		rejectedLeases = nil
+		mu.Unlock()
+
+		// Track a lease with an artificial old start time
+		manager.inFlightMu.Lock()
+		manager.inFlight["timeout-lease"] = inFlightProvision{
+			LeaseUUID: "timeout-lease",
+			Tenant:    "tenant-1",
+			SKU:       "test-sku",
+			Backend:   "test",
+			StartTime: time.Now().Add(-1 * time.Hour), // Very old
+		}
+		manager.inFlightMu.Unlock()
+
+		// Run timeout check
+		manager.checkCallbackTimeouts(context.Background())
+
+		// Verify lease was rejected
+		mu.Lock()
+		defer mu.Unlock()
+		if len(rejectedLeases) != 1 {
+			t.Fatalf("expected 1 rejected lease, got %d", len(rejectedLeases))
+		}
+		if rejectedLeases[0] != "timeout-lease" {
+			t.Errorf("rejected lease = %q, want %q", rejectedLeases[0], "timeout-lease")
+		}
+		if rejectReason != "callback timeout" {
+			t.Errorf("reject reason = %q, want %q", rejectReason, "callback timeout")
+		}
+
+		// Verify removed from in-flight
+		if manager.IsInFlight("timeout-lease") {
+			t.Error("timed-out lease should be removed from in-flight")
+		}
+	})
+
+	t.Run("ignores_recent_provisions", func(t *testing.T) {
+		mu.Lock()
+		rejectedLeases = nil
+		mu.Unlock()
+
+		// Track a fresh lease
+		manager.TrackInFlight("fresh-lease", "tenant-1", "test-sku", "test")
+
+		// Run timeout check
+		manager.checkCallbackTimeouts(context.Background())
+
+		// Verify lease was NOT rejected
+		mu.Lock()
+		rejected := len(rejectedLeases)
+		mu.Unlock()
+
+		if rejected != 0 {
+			t.Errorf("expected 0 rejected leases, got %d", rejected)
+		}
+
+		// Verify still in-flight
+		if !manager.IsInFlight("fresh-lease") {
+			t.Error("fresh lease should still be in-flight")
+		}
+
+		// Cleanup
+		manager.UntrackInFlight("fresh-lease")
+	})
+
+	t.Run("handles_context_cancellation", func(t *testing.T) {
+		mu.Lock()
+		rejectedLeases = nil
+		mu.Unlock()
+
+		// Track multiple old leases
+		manager.inFlightMu.Lock()
+		for i := range 5 {
+			leaseID := "cancel-lease-" + string(rune('a'+i))
+			manager.inFlight[leaseID] = inFlightProvision{
+				LeaseUUID: leaseID,
+				Tenant:    "tenant-1",
+				SKU:       "test-sku",
+				Backend:   "test",
+				StartTime: time.Now().Add(-1 * time.Hour),
+			}
+		}
+		manager.inFlightMu.Unlock()
+
+		// Cancel context immediately
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// Run timeout check with cancelled context
+		manager.checkCallbackTimeouts(ctx)
+
+		// May have processed 0 or 1 lease before noticing cancellation
+		mu.Lock()
+		rejected := len(rejectedLeases)
+		mu.Unlock()
+
+		// Should have stopped early due to cancellation
+		if rejected >= 5 {
+			t.Errorf("expected less than 5 rejected leases with cancelled context, got %d", rejected)
+		}
+
+		// Cleanup remaining
+		manager.inFlightMu.Lock()
+		for leaseID := range manager.inFlight {
+			delete(manager.inFlight, leaseID)
+		}
+		manager.inFlightMu.Unlock()
+	})
+
+	t.Run("handles_chain_reject_error", func(t *testing.T) {
+		// Create manager with failing chain client
+		failingChain := &chain.MockClient{
+			RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+				return 0, nil, errors.New("chain unavailable")
+			},
+		}
+
+		failManager, err := NewManager(ManagerConfig{
+			ProviderUUID:         "provider-1",
+			CallbackBaseURL:      "http://localhost:8080",
+			CallbackTimeout:      100 * time.Millisecond,
+			TimeoutCheckInterval: 50 * time.Millisecond,
+		}, router, failingChain)
+		if err != nil {
+			t.Fatalf("NewManager() error = %v", err)
+		}
+
+		// Track an old lease
+		failManager.inFlightMu.Lock()
+		failManager.inFlight["fail-lease"] = inFlightProvision{
+			LeaseUUID: "fail-lease",
+			Tenant:    "tenant-1",
+			SKU:       "test-sku",
+			Backend:   "test",
+			StartTime: time.Now().Add(-1 * time.Hour),
+		}
+		failManager.inFlightMu.Unlock()
+
+		// Run timeout check - should not panic
+		failManager.checkCallbackTimeouts(context.Background())
+
+		// Lease should be removed from in-flight even on chain error
+		// (metrics recorded, reconciler will pick up later)
+		if failManager.IsInFlight("fail-lease") {
+			t.Error("lease should be removed from in-flight even on chain reject error")
+		}
+	})
+}
+
+// TestManager_RunTimeoutChecker tests the background timeout checker goroutine.
+func TestManager_RunTimeoutChecker(t *testing.T) {
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	var mu sync.Mutex
+	var rejectedLeases []string
+
+	mockChain := &chain.MockClient{
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:         "provider-1",
+		CallbackBaseURL:      "http://localhost:8080",
+		CallbackTimeout:      50 * time.Millisecond,  // Short for testing
+		TimeoutCheckInterval: 25 * time.Millisecond, // Check frequently
+	}, router, mockChain)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Start the timeout checker
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manager.runTimeoutChecker(ctx)
+
+	// Track a lease that will timeout
+	manager.inFlightMu.Lock()
+	manager.inFlight["auto-timeout-lease"] = inFlightProvision{
+		LeaseUUID: "auto-timeout-lease",
+		Tenant:    "tenant-1",
+		SKU:       "test-sku",
+		Backend:   "test",
+		StartTime: time.Now().Add(-1 * time.Second), // Already old
+	}
+	manager.inFlightMu.Unlock()
+
+	// Wait for timeout checker to run
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the lease was rejected
+	mu.Lock()
+	found := false
+	for _, lease := range rejectedLeases {
+		if lease == "auto-timeout-lease" {
+			found = true
+			break
+		}
+	}
+	mu.Unlock()
+
+	if !found {
+		t.Error("timeout checker should have rejected the timed-out lease")
+	}
+
+	// Verify removed from in-flight
+	if manager.IsInFlight("auto-timeout-lease") {
+		t.Error("lease should be removed from in-flight after timeout")
+	}
+}
