@@ -302,6 +302,7 @@ func (s *Server) handlePayloadUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // Start begins serving HTTP requests and blocks until context is canceled or error.
+// When the context is canceled, the server is gracefully shut down before returning.
 func (s *Server) Start(ctx context.Context) error {
 	errChan, err := s.StartBackground()
 	if err != nil {
@@ -310,6 +311,16 @@ func (s *Server) Start(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// Context canceled - initiate graceful shutdown
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+		defer cancel()
+
+		if err := s.server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("error during server shutdown", "error", err)
+		}
+
+		// Wait for serve goroutine to exit
+		<-errChan
 		return ctx.Err()
 	case err := <-errChan:
 		return err

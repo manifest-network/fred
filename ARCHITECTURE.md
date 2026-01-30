@@ -69,7 +69,7 @@ Manifest Network requires chain events to trigger provisioning:
 Manifest: Tenant ──tx──> Chain ──event──> Fred ──> Provision
 ```
 
-The tenant shouldn't need to call fred directly - provisioning should happen automatically when a lease is created on-chain.
+The tenant shouldn't need to call Fred directly - provisioning should happen automatically when a lease is created on-chain.
 
 ## Component Architecture
 
@@ -211,7 +211,7 @@ The startup order is critical to avoid race conditions:
    - Periodic reconciler
 ```
 
-**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to fred's API. If the API server isn't listening yet, callbacks fail with "connection refused".
+**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to Fred's API. If the API server isn't listening yet, callbacks fail with "connection refused".
 
 ### State Protection
 

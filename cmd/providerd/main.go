@@ -269,8 +269,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// that need to reach our callback endpoint.
 	apiErrChan, err := apiServer.StartBackground()
 	if err != nil {
-		slog.Error("failed to start API server", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to start API server: %w", err)
 	}
 
 	// Forward API server errors to the main error channel.
