@@ -173,6 +173,11 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			return counts.ConsecutiveFailures >= cbFailureThresh
 		},
+		IsSuccessful: func(err error) bool {
+			// ErrNotProvisioned (404 from GetInfo) is a valid response, not a backend failure.
+			// It shouldn't count toward the circuit breaker failure threshold.
+			return err == nil || errors.Is(err, ErrNotProvisioned)
+		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
 				"backend", name,

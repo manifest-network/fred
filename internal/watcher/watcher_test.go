@@ -580,7 +580,8 @@ func TestWatcher_Start(t *testing.T) {
 	})
 
 	t.Run("returns_nil_on_channel_close", func(t *testing.T) {
-		// Test that Start returns when the event channel is closed
+		// Test that Start returns nil when the event channel is closed
+		// (as opposed to context.Canceled when context is cancelled)
 		client := &mockChainClient{
 			getActiveLeasesByProviderFunc: func(ctx context.Context, uuid string) ([]billingtypes.Lease, error) {
 				return []billingtypes.Lease{}, nil
@@ -590,27 +591,28 @@ func TestWatcher_Start(t *testing.T) {
 		eventSub := newTestEventSubscriber(t)
 		w := New(client, eventSub, providerUUID)
 
-		ctx, cancel := context.WithCancel(context.Background())
+		// Use a non-cancellable context - we want to test channel close, not context cancellation
+		ctx := context.Background()
 
 		errCh := make(chan error, 1)
 		go func() {
 			errCh <- w.Start(ctx)
 		}()
 
-		// Give it time to start
+		// Give it time to start and subscribe
 		time.Sleep(10 * time.Millisecond)
 
-		// Cancel to trigger shutdown
-		cancel()
+		// Close the EventSubscriber - this closes all subscriber channels
+		eventSub.Close()
 
 		select {
 		case err := <-errCh:
-			// Either context.Canceled or nil is acceptable
-			if err != nil && err != context.Canceled {
-				t.Errorf("Start() error = %v, want nil or context.Canceled", err)
+			// Should return nil (not context.Canceled) when channel is closed
+			if err != nil {
+				t.Errorf("Start() error = %v, want nil", err)
 			}
 		case <-time.After(time.Second):
-			t.Error("Start() did not return")
+			t.Error("Start() did not return after channel close")
 		}
 	})
 }
