@@ -679,6 +679,55 @@ func (m *mockIdempotencyStatusChecker) IsInFlight(leaseUUID string) bool {
 	return m.isInFlight[leaseUUID]
 }
 
+// TestCallbackAuthenticator_VerifySignature_Standalone tests the VerifySignature method
+// that uses the injected time function (now()).
+func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+
+	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
+
+	t.Run("uses_injected_time", func(t *testing.T) {
+		// Inject a fixed time
+		fixedTime := time.Unix(1700000000, 0)
+		auth.nowFunc = func() time.Time { return fixedTime }
+
+		// Create signature at that time
+		signature := auth.ComputeSignatureWithTime(payload, fixedTime)
+
+		// VerifySignature should use the injected time and succeed
+		if !auth.VerifySignature(payload, signature) {
+			t.Error("VerifySignature() should return true for valid signature with injected time")
+		}
+	})
+
+	t.Run("rejects_expired_signature", func(t *testing.T) {
+		// Create signature at old time
+		oldTime := time.Unix(1600000000, 0)
+		signature := auth.ComputeSignatureWithTime(payload, oldTime)
+
+		// Set current time to much later
+		auth.nowFunc = func() time.Time { return time.Unix(1700000000, 0) }
+
+		// Should reject - signature is too old
+		if auth.VerifySignature(payload, signature) {
+			t.Error("VerifySignature() should return false for expired signature")
+		}
+	})
+
+	t.Run("accepts_valid_current_signature", func(t *testing.T) {
+		// Reset to real time
+		auth.nowFunc = nil
+
+		// Create a fresh signature
+		signature := auth.ComputeSignature(payload)
+
+		// Should accept
+		if !auth.VerifySignature(payload, signature) {
+			t.Error("VerifySignature() should return true for valid current signature")
+		}
+	})
+}
+
 func TestParseSignature(t *testing.T) {
 	tests := []struct {
 		name          string

@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/manifest-network/fred/internal/provisioner"
 )
 
 // freePort binds :0, extracts the port, and returns "127.0.0.1:<port>".
@@ -193,4 +196,105 @@ func TestServer_ShutdownClosesTokenTracker(t *testing.T) {
 	if err := s.Shutdown(context.Background()); err != nil {
 		t.Errorf("Shutdown() error = %v", err)
 	}
+}
+
+// testPayloadPublisher implements PayloadPublisher for server lifecycle tests.
+type testPayloadPublisher struct{}
+
+func (m *testPayloadPublisher) PublishPayload(event provisioner.PayloadEvent) error {
+	return nil
+}
+
+func (m *testPayloadPublisher) StorePayload(leaseUUID string, payload []byte) bool {
+	return true
+}
+
+func (m *testPayloadPublisher) DeletePayload(leaseUUID string) {}
+
+func TestServer_HandlePayloadUpload(t *testing.T) {
+	t.Run("returns_503_when_handler_not_configured", func(t *testing.T) {
+		addr := freePort(t)
+		s, err := NewServer(
+			ServerConfig{
+				Addr:           addr,
+				ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
+				Bech32Prefix:   "manifest",
+				RateLimitRPS:   100,
+				RateLimitBurst: 200,
+				ReadTimeout:    5 * time.Second,
+				WriteTimeout:   5 * time.Second,
+				IdleTimeout:    30 * time.Second,
+				RequestTimeout: 5 * time.Second,
+			},
+			&mockChainClient{},
+			nil,
+			&mockCallbackPublisher{},
+			nil, // No payload publisher - handler won't be set
+			&mockStatusChecker{},
+		)
+		if err != nil {
+			t.Fatalf("NewServer() error = %v", err)
+		}
+
+		// Directly test the handler
+		req := httptest.NewRequest(http.MethodPost, "/v1/leases/test-uuid/data", nil)
+		rec := httptest.NewRecorder()
+
+		s.handlePayloadUpload(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+
+		// Verify error message
+		body := rec.Body.String()
+		if body == "" {
+			t.Error("expected error response body")
+		}
+	})
+
+	t.Run("delegates_to_configured_handler", func(t *testing.T) {
+		addr := freePort(t)
+		payloadPub := &testPayloadPublisher{}
+
+		s, err := NewServer(
+			ServerConfig{
+				Addr:           addr,
+				ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
+				Bech32Prefix:   "manifest",
+				RateLimitRPS:   100,
+				RateLimitBurst: 200,
+				ReadTimeout:    5 * time.Second,
+				WriteTimeout:   5 * time.Second,
+				IdleTimeout:    30 * time.Second,
+				RequestTimeout: 5 * time.Second,
+			},
+			&mockChainClient{},
+			nil,
+			&mockCallbackPublisher{},
+			payloadPub, // Provide publisher so handler is configured
+			&mockStatusChecker{},
+		)
+		if err != nil {
+			t.Fatalf("NewServer() error = %v", err)
+		}
+
+		// Verify handler was configured
+		if s.payloadHandler == nil {
+			t.Fatal("expected payload handler to be configured")
+		}
+
+		// The handler is configured - actual payload upload testing
+		// is done in payload_test.go. Here we just verify the delegation path.
+		req := httptest.NewRequest(http.MethodPost, "/v1/leases/test-uuid/data", nil)
+		rec := httptest.NewRecorder()
+
+		// This will fail auth but proves the handler is called
+		s.handlePayloadUpload(rec, req)
+
+		// Should get auth error (401), not service unavailable (503)
+		if rec.Code == http.StatusServiceUnavailable {
+			t.Error("handler should be configured and called, not return 503")
+		}
+	})
 }
