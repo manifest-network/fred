@@ -358,7 +358,7 @@ tx_timeout: "30s"
 # Gas limit for transactions.
 # Higher values allow more complex transactions but cost more on failure.
 # If transactions fail with "out of gas", increase this value.
-gas_limit: 500000
+gas_limit: 1500000
 
 # Gas price in minimal denomination (e.g., umfx).
 # Total fee = gas_limit * gas_price. Higher prices = faster inclusion.
