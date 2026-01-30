@@ -439,4 +439,45 @@ func TestServer_StartBackground(t *testing.T) {
 			t.Error("expected error when port is already in use")
 		}
 	})
+
+	t.Run("returns_error_for_invalid_tls_certs", func(t *testing.T) {
+		addr := freePort(t)
+
+		s, err := NewServer(
+			ServerConfig{
+				Addr:           addr,
+				ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
+				Bech32Prefix:   "manifest",
+				RateLimitRPS:   100,
+				RateLimitBurst: 200,
+				ReadTimeout:    5 * time.Second,
+				WriteTimeout:   5 * time.Second,
+				IdleTimeout:    30 * time.Second,
+				RequestTimeout: 5 * time.Second,
+				TLSCertFile:    "/nonexistent/cert.pem",
+				TLSKeyFile:     "/nonexistent/key.pem",
+			},
+			&mockChainClient{},
+			nil,
+			&mockCallbackPublisher{},
+			nil,
+			&mockStatusChecker{},
+		)
+		if err != nil {
+			t.Fatalf("NewServer() error = %v", err)
+		}
+
+		_, err = s.StartBackground()
+		if err == nil {
+			t.Error("expected error for invalid TLS certificates")
+		}
+
+		// Verify the port is free (listener was properly closed on error)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Errorf("port should be free after TLS cert error, but got: %v", err)
+		} else {
+			ln.Close()
+		}
+	})
 }

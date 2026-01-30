@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -340,11 +341,20 @@ func (s *Server) StartBackground() (<-chan error, error) {
 	errChan := make(chan error, 1)
 
 	if tlsEnabled {
+		// Validate TLS certificates synchronously before starting the goroutine.
+		// This ensures we fail fast on bad certs and don't leak the listener.
+		// (ServeTLS does not close the listener if cert loading fails.)
+		if _, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile); err != nil {
+			_ = ln.Close()
+			return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
+		}
+
 		slog.Info("starting API server with TLS", "addr", ln.Addr().String())
 
 		go func() {
 			// ServeTLS wraps the listener with TLS and configures HTTP/2 automatically.
 			// We pass the pre-created TCP listener so we can return immediately once listening.
+			// Certs were already validated above, so this should not fail on cert loading.
 			err := s.server.ServeTLS(ln, s.tlsCertFile, s.tlsKeyFile)
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errChan <- err
