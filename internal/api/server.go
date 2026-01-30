@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -338,35 +337,31 @@ func (s *Server) StartBackground() (<-chan error, error) {
 		return nil, fmt.Errorf("failed to listen on %s: %w", s.addr, err)
 	}
 
+	errChan := make(chan error, 1)
+
 	if tlsEnabled {
 		slog.Info("starting API server with TLS", "addr", ln.Addr().String())
 
-		// Load TLS config
-		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
-		if err != nil {
-			_ = ln.Close()
-			return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
-		}
-
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-		ln = tls.NewListener(ln, tlsConfig)
+		go func() {
+			// ServeTLS wraps the listener with TLS and configures HTTP/2 automatically.
+			// We pass the pre-created TCP listener so we can return immediately once listening.
+			err := s.server.ServeTLS(ln, s.tlsCertFile, s.tlsKeyFile)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errChan <- err
+			}
+			close(errChan)
+		}()
 	} else {
 		slog.Info("starting API server", "addr", ln.Addr().String())
+
+		go func() {
+			err := s.server.Serve(ln)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errChan <- err
+			}
+			close(errChan)
+		}()
 	}
-
-	errChan := make(chan error, 1)
-
-	go func() {
-		// Serve uses the provided listener - it's already listening
-		err := s.server.Serve(ln)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errChan <- err
-		}
-		close(errChan)
-	}()
 
 	return errChan, nil
 }
