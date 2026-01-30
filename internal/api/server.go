@@ -311,11 +311,9 @@ func (s *Server) Start(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		// Context canceled - initiate graceful shutdown
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
-		defer cancel()
-
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
+		// Context canceled - initiate graceful shutdown.
+		// Use Shutdown() for full cleanup (HTTP server + token tracker).
+		if err := s.Shutdown(context.Background()); err != nil {
 			slog.Error("error during server shutdown", "error", err)
 		}
 

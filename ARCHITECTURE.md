@@ -223,8 +223,9 @@ The startup order is critical to avoid race conditions:
 
 ```
 1. Receive SIGINT/SIGTERM
-2. Stop API server (stop accepting new requests)
-3. Wait for in-flight provisions to drain (with timeout)
+2. Wait for in-flight provisions to drain (with timeout)
+   └─ API server stays running to receive backend callbacks
+3. Stop API server (stop accepting new requests)
 4. Cancel context (signals all components)
 5. Stop withdrawal scheduler (wait for in-flight tx)
 6. Close event subscriber
