@@ -69,7 +69,7 @@ Manifest Network requires chain events to trigger provisioning:
 Manifest: Tenant ──tx──> Chain ──event──> Fred ──> Provision
 ```
 
-The tenant shouldn't need to call fred directly - provisioning should happen automatically when a lease is created on-chain.
+The tenant shouldn't need to call Fred directly - provisioning should happen automatically when a lease is created on-chain.
 
 ## Component Architecture
 
@@ -192,6 +192,27 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 }
 ```
 
+### Startup Sequence
+
+The startup order is critical to avoid race conditions:
+
+```
+1. Start API server (wait for it to be listening)
+   └─ Must be ready before reconciliation triggers callbacks
+2. Perform initial withdrawal
+3. Perform startup reconciliation
+   └─ May provision leases, triggering backend callbacks
+4. Start remaining components in parallel:
+   - Event subscriber
+   - Provision manager
+   - Event bridge
+   - Lease watcher
+   - Withdrawal scheduler
+   - Periodic reconciler
+```
+
+**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to Fred's API. If the API server isn't listening yet, callbacks fail with "connection refused".
+
 ### State Protection
 
 - **In-flight map**: Protected by `sync.RWMutex`
@@ -202,8 +223,9 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 
 ```
 1. Receive SIGINT/SIGTERM
-2. Stop API server (stop accepting new requests)
-3. Wait for in-flight provisions to drain (with timeout)
+2. Wait for in-flight provisions to drain (with timeout)
+   └─ API server stays running to receive backend callbacks
+3. Stop API server (stop accepting new requests)
 4. Cancel context (signals all components)
 5. Stop withdrawal scheduler (wait for in-flight tx)
 6. Close event subscriber

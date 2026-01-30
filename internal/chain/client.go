@@ -30,7 +30,8 @@ import (
 )
 
 const (
-	// maxLeasesPerBatch is the maximum number of leases to process in a single transaction.
+	// maxLeasesPerBatch is the maximum number of leases to acknowledge in a single transaction.
+	// Used by AcknowledgeLeases to batch acknowledgements.
 	maxLeasesPerBatch = 100
 
 	// txMaxRetries is the maximum number of retries for failed transactions.
@@ -327,11 +328,13 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 
 // WithdrawByProvider withdraws funds from all active leases for a provider.
 // Returns the transaction hash on success.
+// It uses Limit: 0 to let the chain use its configured DefaultProviderWithdrawLimit,
+// which matches the behavior of the CLI's `manifestd tx billing withdraw --provider` command.
 func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (string, error) {
 	msg := &billingtypes.MsgWithdraw{
 		Sender:       c.signer.Address(),
 		ProviderUuid: providerUUID,
-		Limit:        maxLeasesPerBatch,
+		Limit:        0, // Use chain's default limit
 	}
 
 	txHash, err := c.broadcastTx(ctx, msg)

@@ -298,3 +298,186 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 		}
 	})
 }
+
+func TestServer_Start_ContextCancellation(t *testing.T) {
+	addr := freePort(t)
+	s := newTestServer(t, addr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Start(ctx)
+	}()
+
+	// Wait for server to be ready
+	client := &http.Client{Timeout: 2 * time.Second}
+	healthURL := fmt.Sprintf("http://%s/health", addr)
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for server to start")
+		default:
+		}
+
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Cancel context - this should trigger graceful shutdown
+	cancel()
+
+	// Start should return with context.Canceled
+	select {
+	case err := <-errCh:
+		if err != context.Canceled {
+			t.Errorf("Start() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Start to return after context cancellation")
+	}
+
+	// Server should be shut down - port should be free
+	// Verify by successfully binding to the same port
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Errorf("port should be free after context cancellation, but got: %v", err)
+	} else {
+		ln.Close()
+	}
+}
+
+func TestServer_StartBackground(t *testing.T) {
+	t.Run("returns_immediately_when_listening", func(t *testing.T) {
+		addr := freePort(t)
+		s := newTestServer(t, addr)
+
+		errChan, err := s.StartBackground()
+		if err != nil {
+			t.Fatalf("StartBackground() error = %v", err)
+		}
+		defer s.Shutdown(context.Background())
+
+		// Server should be immediately ready to accept connections
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get(fmt.Sprintf("http://%s/health", addr))
+		if err != nil {
+			t.Fatalf("health check failed immediately after StartBackground: %v", err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("health check status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+
+		// Error channel should not have any errors yet
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Errorf("unexpected error from errChan: %v", err)
+			}
+		default:
+			// Expected - no error yet
+		}
+	})
+
+	t.Run("error_channel_closed_on_shutdown", func(t *testing.T) {
+		addr := freePort(t)
+		s := newTestServer(t, addr)
+
+		errChan, err := s.StartBackground()
+		if err != nil {
+			t.Fatalf("StartBackground() error = %v", err)
+		}
+
+		// Shutdown the server
+		if err := s.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+
+		// Error channel should close without error (graceful shutdown)
+		select {
+		case err, ok := <-errChan:
+			if ok && err != nil {
+				t.Errorf("expected channel to close cleanly, got error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for error channel to close")
+		}
+	})
+
+	t.Run("returns_error_for_invalid_address", func(t *testing.T) {
+		s := newTestServer(t, "invalid:address:format")
+
+		_, err := s.StartBackground()
+		if err == nil {
+			t.Error("expected error for invalid address")
+		}
+	})
+
+	t.Run("returns_error_for_port_in_use", func(t *testing.T) {
+		addr := freePort(t)
+
+		// Start first server
+		s1 := newTestServer(t, addr)
+		_, err := s1.StartBackground()
+		if err != nil {
+			t.Fatalf("first StartBackground() error = %v", err)
+		}
+		defer s1.Shutdown(context.Background())
+
+		// Try to start second server on same port
+		s2 := newTestServer(t, addr)
+		_, err = s2.StartBackground()
+		if err == nil {
+			t.Error("expected error when port is already in use")
+		}
+	})
+
+	t.Run("returns_error_for_invalid_tls_certs", func(t *testing.T) {
+		addr := freePort(t)
+
+		s, err := NewServer(
+			ServerConfig{
+				Addr:           addr,
+				ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
+				Bech32Prefix:   "manifest",
+				RateLimitRPS:   100,
+				RateLimitBurst: 200,
+				ReadTimeout:    5 * time.Second,
+				WriteTimeout:   5 * time.Second,
+				IdleTimeout:    30 * time.Second,
+				RequestTimeout: 5 * time.Second,
+				TLSCertFile:    "/nonexistent/cert.pem",
+				TLSKeyFile:     "/nonexistent/key.pem",
+			},
+			&mockChainClient{},
+			nil,
+			&mockCallbackPublisher{},
+			nil,
+			&mockStatusChecker{},
+		)
+		if err != nil {
+			t.Fatalf("NewServer() error = %v", err)
+		}
+
+		_, err = s.StartBackground()
+		if err == nil {
+			t.Error("expected error for invalid TLS certificates")
+		}
+
+		// Verify the port is free (listener was properly closed on error)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Errorf("port should be free after TLS cert error, but got: %v", err)
+		} else {
+			ln.Close()
+		}
+	})
+}
