@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,220 @@ func TestHealthCheck(t *testing.T) {
 	// Check Content-Type header
 	if rec.Header().Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type = %q, want %q", rec.Header().Get("Content-Type"), "application/json")
+	}
+}
+
+// TestHealthCheck_ChainUnavailable tests health check when chain ping fails.
+func TestHealthCheck_ChainUnavailable(t *testing.T) {
+	chainClient := &mockChainClient{
+		pingFunc: func(ctx context.Context) error {
+			return fmt.Errorf("connection refused")
+		},
+	}
+
+	h := &Handlers{
+		client:       chainClient,
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	// Should return 503 Service Unavailable
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "unhealthy" {
+		t.Errorf("status = %q, want %q", response.Status, "unhealthy")
+	}
+
+	// Check that chain check shows unhealthy with error message
+	chainCheck, ok := response.Checks["chain"]
+	if !ok {
+		t.Fatal("missing chain check in response")
+	}
+	if chainCheck.Status != "unhealthy" {
+		t.Errorf("chain check status = %q, want %q", chainCheck.Status, "unhealthy")
+	}
+	if chainCheck.Message != "connection refused" {
+		t.Errorf("chain check message = %q, want %q", chainCheck.Message, "connection refused")
+	}
+}
+
+// TestHealthCheck_ChainHealthy tests health check when chain is available.
+func TestHealthCheck_ChainHealthy(t *testing.T) {
+	chainClient := &mockChainClient{
+		pingFunc: func(ctx context.Context) error {
+			return nil // Healthy
+		},
+	}
+
+	h := &Handlers{
+		client:       chainClient,
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "healthy" {
+		t.Errorf("status = %q, want %q", response.Status, "healthy")
+	}
+
+	chainCheck, ok := response.Checks["chain"]
+	if !ok {
+		t.Fatal("missing chain check in response")
+	}
+	if chainCheck.Status != "healthy" {
+		t.Errorf("chain check status = %q, want %q", chainCheck.Status, "healthy")
+	}
+}
+
+// TestHealthCheck_BackendUnhealthy tests health check when a backend is unavailable.
+func TestHealthCheck_BackendUnhealthy(t *testing.T) {
+	// Create a backend server that returns unhealthy
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("backend down"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backendClient, IsDefault: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	h := &Handlers{
+		client:        nil, // No chain client
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	// Should return 503 due to unhealthy backend
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "unhealthy" {
+		t.Errorf("status = %q, want %q", response.Status, "unhealthy")
+	}
+
+	// Check backend health status
+	backendCheck, ok := response.Checks["backend:test-backend"]
+	if !ok {
+		t.Fatalf("missing backend check in response, got: %v", response.Checks)
+	}
+	if backendCheck.Status != "unhealthy" {
+		t.Errorf("backend check status = %q, want %q", backendCheck.Status, "unhealthy")
+	}
+}
+
+// TestHealthCheck_AllHealthy tests health check when both chain and backend are healthy.
+func TestHealthCheck_AllHealthy(t *testing.T) {
+	chainClient := &mockChainClient{
+		pingFunc: func(ctx context.Context) error {
+			return nil
+		},
+	}
+
+	// Create a healthy backend
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "healthy-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backendClient, IsDefault: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	h := &Handlers{
+		client:        chainClient,
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var response HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Status != "healthy" {
+		t.Errorf("status = %q, want %q", response.Status, "healthy")
+	}
+
+	// Both checks should be healthy
+	if response.Checks["chain"].Status != "healthy" {
+		t.Errorf("chain status = %q, want %q", response.Checks["chain"].Status, "healthy")
+	}
+	if response.Checks["backend:healthy-backend"].Status != "healthy" {
+		t.Errorf("backend status = %q, want %q", response.Checks["backend:healthy-backend"].Status, "healthy")
 	}
 }
 
@@ -1421,6 +1636,257 @@ func TestGetLeaseStatus(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
 		}
 	})
+}
+
+// mockTokenTracker implements a mock TokenTracker for testing.
+type mockTokenTracker struct {
+	tryUseFunc func(signature string) error
+}
+
+func (m *mockTokenTracker) TryUse(signature string) error {
+	if m.tryUseFunc != nil {
+		return m.tryUseFunc(signature)
+	}
+	return nil
+}
+
+func (m *mockTokenTracker) Close() error {
+	return nil
+}
+
+// TestTokenTracker_FailClosed tests that database errors result in 503 Service Unavailable.
+func TestTokenTracker_FailClosed(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"host":     "test.example.com",
+			"port":     8443,
+			"protocol": "https",
+		})
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backendClient, IsDefault: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create router: %v", err)
+	}
+
+	t.Run("database_error_returns_503", func(t *testing.T) {
+		// Create a mock token tracker that returns a database error
+		mockTracker := &mockTokenTracker{
+			tryUseFunc: func(signature string) error {
+				return fmt.Errorf("bbolt: database not open")
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			tokenTracker:  mockTracker,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+
+		var errResp ErrorResponse
+		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if errResp.Error != "service temporarily unavailable" {
+			t.Errorf("error = %q, want %q", errResp.Error, "service temporarily unavailable")
+		}
+	})
+
+	t.Run("replay_detected_returns_401", func(t *testing.T) {
+		// Ensure replay detection still returns 401, not 503
+		mockTracker := &mockTokenTracker{
+			tryUseFunc: func(signature string) error {
+				return ErrTokenAlreadyUsed
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			tokenTracker:  mockTracker,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+
+		var errResp ErrorResponse
+		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if errResp.Error != "unauthorized" {
+			t.Errorf("error = %q, want %q", errResp.Error, "unauthorized")
+		}
+	})
+
+	t.Run("success_returns_200", func(t *testing.T) {
+		// Ensure successful token use still works
+		mockTracker := &mockTokenTracker{
+			tryUseFunc: func(signature string) error {
+				return nil // Success
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			tokenTracker:  mockTracker,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("various_database_errors_return_503", func(t *testing.T) {
+		dbErrors := []error{
+			fmt.Errorf("bbolt: database not open"),
+			fmt.Errorf("disk full"),
+			fmt.Errorf("i/o timeout"),
+			fmt.Errorf("database is locked"),
+		}
+
+		for _, dbErr := range dbErrors {
+			t.Run(dbErr.Error(), func(t *testing.T) {
+				mockTracker := &mockTokenTracker{
+					tryUseFunc: func(signature string) error {
+						return dbErr
+					},
+				}
+
+				h := &Handlers{
+					client:        chainClient,
+					backendRouter: router,
+					tokenTracker:  mockTracker,
+					providerUUID:  providerUUID,
+					bech32Prefix:  "manifest",
+				}
+
+				validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+				req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+				req.Header.Set("Authorization", "Bearer "+validToken)
+				req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+
+				rec := httptest.NewRecorder()
+				h.GetLeaseConnection(rec, req)
+
+				if rec.Code != http.StatusServiceUnavailable {
+					t.Errorf("status = %d, want %d for error %q", rec.Code, http.StatusServiceUnavailable, dbErr)
+				}
+			})
+		}
+	})
+}
+
+// TestCallbackResponse_JSON tests the CallbackResponse type serialization.
+func TestCallbackResponse_JSON(t *testing.T) {
+	response := CallbackResponse{
+		Status:  "already_processed",
+		Message: "callback for this lease was already handled",
+	}
+
+	jsonBytes, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	var decoded CallbackResponse
+	if err := json.Unmarshal(jsonBytes, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	if decoded.Status != response.Status {
+		t.Errorf("Status = %q, want %q", decoded.Status, response.Status)
+	}
+	if decoded.Message != response.Message {
+		t.Errorf("Message = %q, want %q", decoded.Message, response.Message)
+	}
+}
+
+// TestCallbackResponse_OmitEmptyMessage tests that empty message is omitted.
+func TestCallbackResponse_OmitEmptyMessage(t *testing.T) {
+	response := CallbackResponse{
+		Status:  "ok",
+		Message: "", // Should be omitted
+	}
+
+	jsonBytes, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	jsonStr := string(jsonBytes)
+	if strings.Contains(jsonStr, "message") {
+		t.Errorf("JSON should not contain 'message' when empty, got %s", jsonStr)
+	}
 }
 
 func TestNormalizePath(t *testing.T) {

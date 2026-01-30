@@ -20,6 +20,11 @@
 //   - The timestamp is within 30 seconds (prevents replay)
 //   - The token hasn't been used before (replay protection via TokenTracker)
 //
+// The token tracker uses fail-closed semantics: if the database is unavailable,
+// requests are rejected with 503 Service Unavailable rather than proceeding
+// without replay protection. Since token lifetime is short (30 seconds), clients
+// can safely retry with a fresh token.
+//
 // Backend callbacks use HMAC-SHA256 authentication with a shared secret
 // configured via callback_secret.
 //

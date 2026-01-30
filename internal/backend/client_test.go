@@ -363,3 +363,125 @@ func TestHTTPClient_Health_ContextCancellation(t *testing.T) {
 		t.Error("Health() should return error when context is cancelled")
 	}
 }
+
+// TestHTTPClient_CircuitBreaker_NotProvisioned_DoesNotTrip verifies that 404 responses
+// from GetInfo (ErrNotProvisioned) do not count toward the circuit breaker failure threshold.
+// This is important because "lease not provisioned" is a valid response, not a backend failure.
+func TestHTTPClient_CircuitBreaker_NotProvisioned_DoesNotTrip(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		// Always return 404 - lease not provisioned
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	// Configure circuit breaker to trip after 3 failures
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-cb-404",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: 3,
+		CBTimeout:       100 * time.Millisecond,
+	})
+
+	// Make 10 requests that all return 404 (ErrNotProvisioned)
+	for i := range 10 {
+		_, err := client.GetInfo(context.Background(), "nonexistent-lease")
+		if err != ErrNotProvisioned {
+			t.Fatalf("GetInfo() call %d error = %v, want ErrNotProvisioned", i+1, err)
+		}
+	}
+
+	// All 10 requests should have reached the server (circuit never opened)
+	if requestCount != 10 {
+		t.Errorf("Server received %d requests, want 10 (circuit should not have opened)", requestCount)
+	}
+
+	// Verify circuit is still closed by making another request
+	_, err := client.GetInfo(context.Background(), "another-lease")
+	if err == ErrCircuitOpen {
+		t.Error("Circuit breaker should not have opened from 404 responses")
+	}
+	if err != ErrNotProvisioned {
+		t.Errorf("GetInfo() error = %v, want ErrNotProvisioned", err)
+	}
+}
+
+// TestHTTPClient_CircuitBreaker_404sResetFailureCount verifies that 404 responses
+// reset the consecutive failure count (since they're valid responses).
+// This means intermixed 404s and 500s won't trip the breaker unless there are
+// enough consecutive 500s.
+func TestHTTPClient_CircuitBreaker_404sResetFailureCount(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		// Alternate: 404, 500, 404, 500... - never 3 consecutive 500s
+		if requestCount%2 == 0 {
+			http.Error(w, "server error", http.StatusInternalServerError)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-cb-mixed",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: 3,
+		CBTimeout:       100 * time.Millisecond,
+	})
+
+	// Make 10 requests - circuit should NOT open because 404s reset consecutive failure count
+	for i := range 10 {
+		_, err := client.GetInfo(context.Background(), "test-lease")
+		if err == ErrCircuitOpen {
+			t.Fatalf("Circuit should not have opened at request %d - 404s should reset failure count", i+1)
+		}
+	}
+
+	// All 10 requests should have gone through
+	if requestCount != 10 {
+		t.Errorf("Server received %d requests, want 10", requestCount)
+	}
+}
+
+// TestHTTPClient_CircuitBreaker_ConsecutiveFailuresTrip verifies that consecutive
+// real errors (500s) still trip the circuit breaker.
+func TestHTTPClient_CircuitBreaker_ConsecutiveFailuresTrip(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		// Always return 500
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-cb-consecutive",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: 3,
+		CBTimeout:       100 * time.Millisecond,
+	})
+
+	// First 3 calls should go through and fail
+	for i := range 3 {
+		_, err := client.GetInfo(context.Background(), "test-lease")
+		if err == ErrCircuitOpen {
+			t.Fatalf("Circuit should not be open yet at call %d", i+1)
+		}
+	}
+
+	// 4th call should fail with circuit open
+	_, err := client.GetInfo(context.Background(), "test-lease")
+	if err != ErrCircuitOpen {
+		t.Errorf("Circuit should be open after 3 consecutive failures, got %v", err)
+	}
+
+	// Server should have received exactly 3 requests
+	if requestCount != 3 {
+		t.Errorf("Server received %d requests, want 3", requestCount)
+	}
+}

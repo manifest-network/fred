@@ -24,11 +24,18 @@ type ChainClient interface {
 	Ping(ctx context.Context) error
 }
 
+// TokenTrackerInterface defines the interface for token replay protection.
+// This interface allows for testing with mock implementations.
+type TokenTrackerInterface interface {
+	TryUse(signature string) error
+	Close() error
+}
+
 // Handlers contains HTTP request handlers.
 type Handlers struct {
 	client        ChainClient
 	backendRouter *backend.Router
-	tokenTracker  *TokenTracker
+	tokenTracker  TokenTrackerInterface
 	statusChecker StatusChecker
 	providerUUID  string
 	bech32Prefix  string
@@ -37,7 +44,7 @@ type Handlers struct {
 // NewHandlers creates a new Handlers instance.
 // tokenTracker is optional but recommended for replay attack protection.
 // statusChecker is optional but required for the /status endpoint.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker *TokenTracker, statusChecker StatusChecker, providerUUID, bech32Prefix string) *Handlers {
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, providerUUID, bech32Prefix string) *Handlers {
 	return &Handlers{
 		client:        client,
 		backendRouter: backendRouter,
@@ -92,8 +99,10 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 				)
 				return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
 			}
-			// Database error - log but don't block the request
-			slog.Error("token tracker error", "error", err)
+			// Database error - fail closed to prevent potential replay attacks.
+			// Token lifetime is short (30s), so clients can retry with a fresh token.
+			slog.Error("token tracker unavailable", "error", err)
+			return nil, http.StatusServiceUnavailable, errors.New(errMsgServiceUnavailable)
 		}
 	}
 
@@ -139,6 +148,13 @@ type ErrorResponse struct {
 	Code  int    `json:"code"`
 }
 
+// CallbackResponse represents the response for backend callbacks.
+// Used to provide debugging information to authenticated backends.
+type CallbackResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
 // Common error messages for API responses.
 // These constants ensure consistency across handlers and simplify testing.
 const (
@@ -146,6 +162,7 @@ const (
 	errMsgForbidden            = "forbidden"
 	errMsgInternalServerError  = "internal server error"
 	errMsgServiceNotConfigured = "service not configured"
+	errMsgServiceUnavailable   = "service temporarily unavailable"
 	errMsgInvalidLeaseUUID     = "invalid lease UUID format"
 	errMsgLeaseNotFound        = "lease not found"
 )

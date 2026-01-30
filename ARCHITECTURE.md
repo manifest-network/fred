@@ -245,6 +245,15 @@ States: Closed → Open → Half-Open → Closed
 
 When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather than waiting for timeouts.
 
+**What counts as a failure:**
+- Network errors (connection refused, timeout)
+- HTTP 5xx errors (server errors)
+
+**What does NOT count as a failure:**
+- HTTP 404 from `GetInfo` (`ErrNotProvisioned`) - this is a valid "lease not found" response
+
+This ensures that tenant requests for unprovisioned leases don't accidentally trip the circuit breaker and block backend operations.
+
 ## Data Flow
 
 ### Payload Store

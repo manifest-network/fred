@@ -1,10 +1,14 @@
 package api
 
 import (
+	"context"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 func TestRateLimiter_AllowsWithinLimit(t *testing.T) {
@@ -418,6 +422,218 @@ func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
 	if limiter1 != limiter2 {
 		t.Error("getLimiter should return the same limiter for the same tenant")
 	}
+}
+
+func TestTenantRateLimiter_Middleware(t *testing.T) {
+	tl := NewTenantRateLimiter(1, 1) // 1 request per second, burst of 1
+
+	// Create a handler that verifies tenant was set in context
+	var capturedTenant string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tenant, ok := r.Context().Value(tenantKey{}).(string); ok {
+			capturedTenant = tenant
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	middleware := tl.Middleware("manifest")(handler)
+
+	t.Run("rate_limits_per_tenant", func(t *testing.T) {
+		// Create a valid auth token for testing
+		kp := testutil.NewTestKeyPair("test-tenant")
+		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
+
+		// First request should pass
+		req1 := httptest.NewRequest("GET", "/test", nil)
+		req1.Header.Set("Authorization", "Bearer "+token)
+		rec1 := httptest.NewRecorder()
+		middleware.ServeHTTP(rec1, req1)
+
+		if rec1.Code != http.StatusOK {
+			t.Errorf("First request status = %d, want %d", rec1.Code, http.StatusOK)
+		}
+
+		// Second request with same tenant should be rate limited
+		// Need a new token (different timestamp) but same tenant
+		token2 := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now().Add(time.Second))
+		req2 := httptest.NewRequest("GET", "/test", nil)
+		req2.Header.Set("Authorization", "Bearer "+token2)
+		rec2 := httptest.NewRecorder()
+		middleware.ServeHTTP(rec2, req2)
+
+		if rec2.Code != http.StatusTooManyRequests {
+			t.Errorf("Second request status = %d, want %d", rec2.Code, http.StatusTooManyRequests)
+		}
+
+		// Check Retry-After header
+		if rec2.Header().Get("Retry-After") != "1" {
+			t.Errorf("Retry-After header = %q, want %q", rec2.Header().Get("Retry-After"), "1")
+		}
+	})
+
+	t.Run("different_tenants_independent", func(t *testing.T) {
+		// Use fresh rate limiter
+		tl2 := NewTenantRateLimiter(1, 1)
+		middleware2 := tl2.Middleware("manifest")(handler)
+
+		// Create tokens for two different tenants
+		kp1 := testutil.NewTestKeyPair("tenant-1")
+		kp2 := testutil.NewTestKeyPair("tenant-2")
+		token1 := testutil.CreateTestToken(kp1, testutil.ValidUUID1, time.Now())
+		token2 := testutil.CreateTestToken(kp2, testutil.ValidUUID1, time.Now())
+
+		// Exhaust limit for tenant1
+		req1 := httptest.NewRequest("GET", "/test", nil)
+		req1.Header.Set("Authorization", "Bearer "+token1)
+		rec1 := httptest.NewRecorder()
+		middleware2.ServeHTTP(rec1, req1)
+
+		if rec1.Code != http.StatusOK {
+			t.Errorf("Tenant1 first request status = %d, want %d", rec1.Code, http.StatusOK)
+		}
+
+		// Tenant2 should still be allowed
+		req2 := httptest.NewRequest("GET", "/test", nil)
+		req2.Header.Set("Authorization", "Bearer "+token2)
+		rec2 := httptest.NewRecorder()
+		middleware2.ServeHTTP(rec2, req2)
+
+		if rec2.Code != http.StatusOK {
+			t.Errorf("Tenant2 request status = %d, want %d (should have separate limit)", rec2.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("sets_tenant_in_context", func(t *testing.T) {
+		tl3 := NewTenantRateLimiter(10, 10)
+		capturedTenant = "" // Reset
+
+		contextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if tenant, ok := r.Context().Value(tenantKey{}).(string); ok {
+				capturedTenant = tenant
+			}
+			w.WriteHeader(http.StatusOK)
+		})
+		middleware3 := tl3.Middleware("manifest")(contextHandler)
+
+		kp := testutil.NewTestKeyPair("context-test")
+		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
+
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		middleware3.ServeHTTP(rec, req)
+
+		if capturedTenant != kp.Address {
+			t.Errorf("Captured tenant = %q, want %q", capturedTenant, kp.Address)
+		}
+	})
+
+	t.Run("no_auth_header_proceeds_without_tenant_limiting", func(t *testing.T) {
+		tl4 := NewTenantRateLimiter(1, 1)
+		middleware4 := tl4.Middleware("manifest")(handler)
+
+		// Request without auth header should proceed (IP limiting still applies separately)
+		req := httptest.NewRequest("GET", "/test", nil)
+		rec := httptest.NewRecorder()
+		middleware4.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("No-auth request status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("invalid_token_proceeds_without_tenant_limiting", func(t *testing.T) {
+		tl5 := NewTenantRateLimiter(1, 1)
+		middleware5 := tl5.Middleware("manifest")(handler)
+
+		// Request with invalid token should proceed (tenant extraction fails gracefully)
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer invalid-token-data")
+		rec := httptest.NewRecorder()
+		middleware5.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("Invalid-token request status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+}
+
+func TestContextWithTenant(t *testing.T) {
+	ctx := context.Background()
+	tenant := "manifest1test123"
+
+	newCtx := ContextWithTenant(ctx, tenant)
+
+	// Verify tenant can be retrieved
+	got, ok := newCtx.Value(tenantKey{}).(string)
+	if !ok {
+		t.Fatal("tenant not found in context")
+	}
+	if got != tenant {
+		t.Errorf("tenant = %q, want %q", got, tenant)
+	}
+}
+
+func TestExtractTenantFromAuth(t *testing.T) {
+	t.Run("valid_token_returns_tenant", func(t *testing.T) {
+		kp := testutil.NewTestKeyPair("extract-test")
+		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
+
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		tenant := extractTenantFromAuth(req, "manifest")
+		if tenant != kp.Address {
+			t.Errorf("tenant = %q, want %q", tenant, kp.Address)
+		}
+	})
+
+	t.Run("missing_auth_returns_empty", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/test", nil)
+
+		tenant := extractTenantFromAuth(req, "manifest")
+		if tenant != "" {
+			t.Errorf("tenant = %q, want empty string", tenant)
+		}
+	})
+
+	t.Run("invalid_token_returns_empty", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer not-valid-base64-json")
+
+		tenant := extractTenantFromAuth(req, "manifest")
+		if tenant != "" {
+			t.Errorf("tenant = %q, want empty string", tenant)
+		}
+	})
+
+	t.Run("wrong_prefix_returns_empty", func(t *testing.T) {
+		kp := testutil.NewTestKeyPair("prefix-test")
+		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
+
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		// Use wrong prefix - validation should fail
+		tenant := extractTenantFromAuth(req, "cosmos")
+		if tenant != "" {
+			t.Errorf("tenant = %q, want empty string (wrong prefix)", tenant)
+		}
+	})
+
+	t.Run("expired_token_returns_empty", func(t *testing.T) {
+		kp := testutil.NewTestKeyPair("expired-test")
+		// Create token with old timestamp
+		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now().Add(-1*time.Hour))
+
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		tenant := extractTenantFromAuth(req, "manifest")
+		if tenant != "" {
+			t.Errorf("tenant = %q, want empty string (expired token)", tenant)
+		}
+	})
 }
 
 func TestCalcRetryAfterSeconds(t *testing.T) {
