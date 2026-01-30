@@ -192,6 +192,27 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 }
 ```
 
+### Startup Sequence
+
+The startup order is critical to avoid race conditions:
+
+```
+1. Start API server (wait for it to be listening)
+   └─ Must be ready before reconciliation triggers callbacks
+2. Perform initial withdrawal
+3. Perform startup reconciliation
+   └─ May provision leases, triggering backend callbacks
+4. Start remaining components in parallel:
+   - Event subscriber
+   - Provision manager
+   - Event bridge
+   - Lease watcher
+   - Withdrawal scheduler
+   - Periodic reconciler
+```
+
+**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to fred's API. If the API server isn't listening yet, callbacks fail with "connection refused".
+
 ### State Protection
 
 - **In-flight map**: Protected by `sync.RWMutex`

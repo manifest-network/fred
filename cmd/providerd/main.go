@@ -258,6 +258,27 @@ func run(cmd *cobra.Command, args []string) error {
 	// to auto-close our leases for that tenant
 	leaseWatcher.SetWithdrawTrigger(withdrawScheduler.TriggerWithdraw)
 
+	// Start background components with WaitGroup for graceful shutdown.
+	// Each component is wrapped with panic recovery via safeGo() to prevent
+	// silent crashes and convert panics to errors.
+	var wg sync.WaitGroup
+	errChan := make(chan error, 7)
+
+	// Start API server FIRST and wait for it to be listening.
+	// This is critical because startup reconciliation may trigger backend callbacks
+	// that need to reach our callback endpoint.
+	apiErrChan, err := apiServer.StartBackground()
+	if err != nil {
+		slog.Error("failed to start API server", "error", err)
+		os.Exit(1)
+	}
+
+	// Forward API server errors to the main error channel.
+	// Channel sends at most one error then closes; receive returns nil if closed without error.
+	safeGo(&wg, errChan, "api server", func() error {
+		return <-apiErrChan
+	})
+
 	// Perform startup operations sequentially to avoid same-block transaction conflicts
 	// WithdrawOnce waits for block inclusion before returning, ensuring the next tx is in a different block
 	slog.Info("performing initial withdrawal")
@@ -265,17 +286,12 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Run startup reconciliation to recover from any crash
 	// This compares chain state vs backend state and fixes inconsistencies
+	// Note: API server is already listening, so callbacks can be received
 	slog.Info("performing startup reconciliation")
 	if err := reconciler.RunOnce(ctx); err != nil {
 		slog.Error("startup reconciliation failed", "error", err)
 		// Continue anyway - periodic reconciliation will retry
 	}
-
-	// Start background components with WaitGroup for graceful shutdown.
-	// Each component is wrapped with panic recovery via safeGo() to prevent
-	// silent crashes and convert panics to errors.
-	var wg sync.WaitGroup
-	errChan := make(chan error, 7)
 
 	// Start event subscriber (single reader, multiple consumers via Subscribe())
 	safeGo(&wg, errChan, "event subscriber", func() error {
@@ -295,11 +311,6 @@ func run(cmd *cobra.Command, args []string) error {
 	// Start watcher for cross-provider events (subscribes to eventSub)
 	safeGo(&wg, errChan, "watcher", func() error {
 		return leaseWatcher.Start(ctx)
-	})
-
-	// Start API server
-	safeGo(&wg, errChan, "api server", func() error {
-		return apiServer.Start(ctx)
 	})
 
 	// Start withdrawal scheduler

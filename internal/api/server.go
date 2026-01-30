@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -299,29 +301,12 @@ func (s *Server) handlePayloadUpload(w http.ResponseWriter, r *http.Request) {
 	s.payloadHandler.HandlePayloadUpload(w, r)
 }
 
-// Start begins serving HTTP requests.
+// Start begins serving HTTP requests and blocks until context is canceled or error.
 func (s *Server) Start(ctx context.Context) error {
-	tlsEnabled := s.tlsCertFile != "" && s.tlsKeyFile != ""
-
-	if tlsEnabled {
-		slog.Info("starting API server with TLS", "addr", s.addr)
-	} else {
-		slog.Info("starting API server", "addr", s.addr)
+	errChan, err := s.StartBackground()
+	if err != nil {
+		return err
 	}
-
-	errChan := make(chan error, 1)
-
-	go func() {
-		var err error
-		if tlsEnabled {
-			err = s.server.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
-		} else {
-			err = s.server.ListenAndServe()
-		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errChan <- err
-		}
-	}()
 
 	select {
 	case <-ctx.Done():
@@ -329,6 +314,52 @@ func (s *Server) Start(ctx context.Context) error {
 	case err := <-errChan:
 		return err
 	}
+}
+
+// StartBackground starts the server in the background and returns immediately once
+// the server is listening. Returns an error channel that will receive any server
+// errors. This is useful when you need to ensure the server is ready before
+// proceeding with other startup tasks (e.g., reconciliation that triggers callbacks).
+func (s *Server) StartBackground() (<-chan error, error) {
+	tlsEnabled := s.tlsCertFile != "" && s.tlsKeyFile != ""
+
+	// Create listener first so we know when we're ready to accept connections
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on %s: %w", s.addr, err)
+	}
+
+	if tlsEnabled {
+		slog.Info("starting API server with TLS", "addr", ln.Addr().String())
+
+		// Load TLS config
+		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
+		if err != nil {
+			_ = ln.Close()
+			return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		ln = tls.NewListener(ln, tlsConfig)
+	} else {
+		slog.Info("starting API server", "addr", ln.Addr().String())
+	}
+
+	errChan := make(chan error, 1)
+
+	go func() {
+		// Serve uses the provided listener - it's already listening
+		err := s.server.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errChan <- err
+		}
+		close(errChan)
+	}()
+
+	return errChan, nil
 }
 
 // Shutdown gracefully shuts down the server.
