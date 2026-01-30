@@ -402,8 +402,22 @@ signature = HMAC-SHA256(signedPayload, callback_secret)
 Status must be either `"success"` or `"failed"`.
 
 **Response Codes:**
-- `200 OK` - Callback processed successfully
+- `200 OK` - Callback processed successfully (or already processed)
 - `401 Unauthorized` - Missing or invalid signature
+
+**Idempotency:**
+If a callback is received for a lease that has already been processed (no longer in-flight),
+the server returns `200 OK` with a body indicating the duplicate status:
+
+```json
+{
+  "status": "already_processed",
+  "message": "callback for this lease was already handled"
+}
+```
+
+This allows backends to distinguish between successful processing and duplicate callbacks
+for debugging purposes, while maintaining idempotent semantics.
 
 ## Backend API Specification
 
@@ -706,7 +720,7 @@ Chain State (leases)     Backend State (provisions)
 - **TLS Support**: Optional HTTPS for API and TLS for gRPC
 - **ADR-036 Authentication**: Cryptographic signature verification for tenant access
 - **Token Expiry**: 30-second validity window on authentication tokens
-- **Token Replay Protection**: Used tokens tracked in persistent database to prevent replay attacks
+- **Token Replay Protection**: Used tokens tracked in persistent database to prevent replay attacks. Uses fail-closed semantics: database errors result in 503 Service Unavailable rather than proceeding without protection
 - **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
 - **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
 - **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -548,6 +549,134 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	if rr2.Code != http.StatusUnauthorized {
 		t.Errorf("replay attack should be rejected, got status %d: %s", rr2.Code, rr2.Body.String())
 	}
+}
+
+// TestHandleProvisionCallback_IdempotencyResponse tests that duplicate callbacks
+// for already-processed leases return a helpful response body.
+func TestHandleProvisionCallback_IdempotencyResponse(t *testing.T) {
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+
+	publishedCallback := &mockCallbackPublisher{}
+
+	// Create status checker that says the lease is NOT in-flight (already processed)
+	statusChecker := &mockIdempotencyStatusChecker{
+		isInFlight: map[string]bool{
+			"01234567-89ab-cdef-0123-456789abcdef": false, // Already processed
+			"11111111-1111-1111-1111-111111111111": true,  // Still in-flight
+		},
+	}
+
+	server := &Server{
+		callbackPublisher:     publishedCallback,
+		callbackAuthenticator: auth,
+		statusChecker:         statusChecker,
+	}
+
+	t.Run("already_processed_returns_helpful_body", func(t *testing.T) {
+		publishedCallback.reset()
+
+		body := `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`
+		signature := auth.ComputeSignature([]byte(body))
+
+		req := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(CallbackSignatureHeader, signature)
+
+		rr := httptest.NewRecorder()
+		server.handleProvisionCallback(rr, req)
+
+		// Should still return 200 OK for idempotency
+		if rr.Code != http.StatusOK {
+			t.Errorf("status code = %d, want %d", rr.Code, http.StatusOK)
+		}
+
+		// But now with a helpful body
+		var response CallbackResponse
+		if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+			t.Fatalf("failed to decode response: %v, body: %s", err, rr.Body.String())
+		}
+
+		if response.Status != "already_processed" {
+			t.Errorf("Status = %q, want %q", response.Status, "already_processed")
+		}
+		if response.Message != "callback for this lease was already handled" {
+			t.Errorf("Message = %q, want %q", response.Message, "callback for this lease was already handled")
+		}
+
+		// Callback should NOT be published for already-processed leases
+		if publishedCallback.called {
+			t.Error("callback should not be published for already-processed lease")
+		}
+	})
+
+	t.Run("in_flight_lease_is_published", func(t *testing.T) {
+		publishedCallback.reset()
+
+		body := `{"lease_uuid":"11111111-1111-1111-1111-111111111111","status":"success"}`
+		signature := auth.ComputeSignature([]byte(body))
+
+		req := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(CallbackSignatureHeader, signature)
+
+		rr := httptest.NewRecorder()
+		server.handleProvisionCallback(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("status code = %d, want %d", rr.Code, http.StatusOK)
+		}
+
+		// Callback should be published for in-flight leases
+		if !publishedCallback.called {
+			t.Error("callback should be published for in-flight lease")
+		}
+	})
+
+	t.Run("no_status_checker_publishes_all", func(t *testing.T) {
+		// Server without status checker should publish all callbacks
+		serverNoChecker := &Server{
+			callbackPublisher:     publishedCallback,
+			callbackAuthenticator: auth,
+			statusChecker:         nil,
+		}
+
+		publishedCallback.reset()
+
+		body := `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`
+		signature := auth.ComputeSignature([]byte(body))
+
+		req := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(CallbackSignatureHeader, signature)
+
+		rr := httptest.NewRecorder()
+		serverNoChecker.handleProvisionCallback(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("status code = %d, want %d", rr.Code, http.StatusOK)
+		}
+
+		// Without status checker, callback should be published
+		if !publishedCallback.called {
+			t.Error("callback should be published when no status checker")
+		}
+	})
+}
+
+// mockIdempotencyStatusChecker implements StatusChecker for idempotency testing.
+type mockIdempotencyStatusChecker struct {
+	isInFlight map[string]bool
+}
+
+func (m *mockIdempotencyStatusChecker) HasPayload(leaseUUID string) bool {
+	return false
+}
+
+func (m *mockIdempotencyStatusChecker) IsInFlight(leaseUUID string) bool {
+	if m.isInFlight == nil {
+		return true // Default to in-flight
+	}
+	return m.isInFlight[leaseUUID]
 }
 
 func TestParseSignature(t *testing.T) {

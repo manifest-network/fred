@@ -260,13 +260,17 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 	// Idempotency check: if the lease is no longer in-flight, this is a duplicate callback.
 	// Return 200 OK immediately to prevent duplicate Watermill messages.
 	// This handles the case where a backend retries a callback after we've already processed it.
+	// Since callbacks are HMAC-authenticated, returning status details is safe.
 	if s.statusChecker != nil && !s.statusChecker.IsInFlight(callback.LeaseUUID) {
 		slog.Debug("ignoring duplicate callback for processed lease",
 			"lease_uuid", callback.LeaseUUID,
 			"status", callback.Status,
 		)
 		metrics.DuplicateCallbacksTotal.Inc()
-		w.WriteHeader(http.StatusOK)
+		writeJSON(w, CallbackResponse{
+			Status:  "already_processed",
+			Message: "callback for this lease was already handled",
+		}, http.StatusOK)
 		return
 	}
 
