@@ -2435,7 +2435,7 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:         "provider-1",
 		CallbackBaseURL:      "http://localhost:8080",
-		CallbackTimeout:      50 * time.Millisecond,  // Short for testing
+		CallbackTimeout:      50 * time.Millisecond, // Short for testing
 		TimeoutCheckInterval: 25 * time.Millisecond, // Check frequently
 	}, router, mockChain)
 	if err != nil {
