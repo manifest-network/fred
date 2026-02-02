@@ -124,21 +124,24 @@ Get connection details for a provisioned resource.
 ```json
 {
   "host": "192.168.1.100",
-  "port": 32768,
-  "protocol": "tcp",
-  "credentials": {
-    "username": "admin",
-    "password": "generated-password"
+  "ports": {
+    "80/tcp": {
+      "host_ip": "0.0.0.0",
+      "host_port": "32768"
+    },
+    "443/tcp": {
+      "host_ip": "0.0.0.0",
+      "host_port": "32769"
+    }
   },
-  "metadata": {
-    "container_id": "abc123",
-    "image": "nginx:latest",
-    "backend": "docker"
-  }
+  "protocol": "tcp",
+  "container_id": "abc123def456",
+  "image": "nginx:latest",
+  "status": "running"
 }
 ```
 
-The response format is flexible - return whatever fields are relevant to your resource type. Fred passes this directly to tenants.
+The response format is flexible - return whatever fields are relevant to your resource type. Fred passes this directly to tenants. The `ports` field maps container ports (e.g., `80/tcp`) to host bindings.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned or not ready yet
@@ -191,6 +194,28 @@ Simple health check endpoint.
 **Response:** `200 OK`
 
 Return 200 if your backend can accept requests. Fred uses this for health monitoring.
+
+### GET /stats (Optional)
+
+Return resource capacity and usage statistics. Useful for UI display and monitoring.
+
+**Response:** `200 OK`
+```json
+{
+  "total_cpu_cores": 8.0,
+  "total_memory_mb": 16384,
+  "total_disk_mb": 102400,
+  "allocated_cpu_cores": 4.5,
+  "allocated_memory_mb": 4608,
+  "allocated_disk_mb": 9216,
+  "available_cpu_cores": 3.5,
+  "available_memory_mb": 11776,
+  "available_disk_mb": 93184,
+  "active_containers": 4
+}
+```
+
+This endpoint is optional but recommended for production backends.
 
 ## Callback Protocol
 
@@ -449,12 +474,13 @@ curl -X POST http://localhost:9001/deprovision \
 
 Before deploying your backend:
 
-- [ ] All 5 HTTP endpoints implemented
+- [ ] All 5 required HTTP endpoints implemented (`/provision`, `/info/{uuid}`, `/deprovision`, `/provisions`, `/health`)
 - [ ] Provision returns 202 and works asynchronously
-- [ ] Callbacks signed with HMAC-SHA256
+- [ ] Callbacks signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent
 - [ ] ListProvisions returns all managed resources
 - [ ] State protected with mutex for concurrent access
 - [ ] Callback URLs stored per-lease (not globally)
 - [ ] Health endpoint returns 200 when operational
 - [ ] Graceful shutdown (finish in-flight provisions)
+- [ ] (Optional) `/stats` endpoint for resource monitoring

@@ -2,6 +2,7 @@ package backend
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,15 +43,47 @@ type Backend interface {
 	Name() string
 }
 
+// LeaseItem represents a single SKU with its quantity in a lease.
+type LeaseItem struct {
+	SKU      string `json:"sku"`
+	Quantity int    `json:"quantity"`
+}
+
 // ProvisionRequest contains the data needed to provision a resource.
 type ProvisionRequest struct {
-	LeaseUUID    string `json:"lease_uuid"`
-	Tenant       string `json:"tenant"`
-	ProviderUUID string `json:"provider_uuid"`
-	SKU          string `json:"sku"`
-	CallbackURL  string `json:"callback_url"`
-	Payload      []byte `json:"payload,omitempty"`
-	PayloadHash  string `json:"payload_hash,omitempty"`
+	LeaseUUID    string      `json:"lease_uuid"`
+	Tenant       string      `json:"tenant"`
+	ProviderUUID string      `json:"provider_uuid"`
+	Items        []LeaseItem `json:"items"`
+	CallbackURL  string      `json:"callback_url"`
+	Payload      []byte      `json:"payload,omitempty"`
+	PayloadHash  string      `json:"payload_hash,omitempty"`
+}
+
+// RoutingSKU returns the SKU of the first item for backend routing decisions.
+//
+// Why this exists: A lease may contain multiple items with different SKUs
+// (e.g., [{sku: "docker-micro", qty: 2}, {sku: "docker-large", qty: 1}]).
+// However, all items in a single lease are guaranteed to belong to the same
+// provider - this is enforced by the chain. Therefore, any SKU from the lease
+// can be used to determine which backend should handle the request.
+//
+// This method returns the first SKU purely for routing. It should NOT be used
+// to determine resource allocation - use Items directly for that.
+func (r ProvisionRequest) RoutingSKU() string {
+	if len(r.Items) == 0 {
+		return ""
+	}
+	return r.Items[0].SKU
+}
+
+// TotalQuantity returns the sum of quantities across all items.
+func (r ProvisionRequest) TotalQuantity() int {
+	total := 0
+	for _, item := range r.Items {
+		total += item.Quantity
+	}
+	return total
 }
 
 // ProvisionResponse is returned by the backend after accepting a provision request.
@@ -60,8 +93,20 @@ type ProvisionResponse struct {
 
 // LeaseInfo contains backend-specific information about a provisioned lease.
 // The structure is flexible to allow different backends to return different data.
-// Common fields include: host, port, protocol, credentials, metadata.
+// For single-instance leases, fields are at the top level.
+// For multi-instance leases, use the "instances" key with an array of instance info.
+// Common fields include: host, ports, protocol, status, container_id, image.
 type LeaseInfo map[string]any
+
+// InstanceInfo represents information about a single provisioned instance.
+// Used when a lease has multiple containers/pods/allocations.
+type InstanceInfo struct {
+	ID       string            `json:"id"`                 // Instance identifier (e.g., container ID)
+	Host     string            `json:"host"`               // Host address
+	Ports    map[string]any    `json:"ports,omitempty"`    // Port mappings
+	Status   string            `json:"status"`             // Instance status
+	Metadata map[string]string `json:"metadata,omitempty"` // Additional metadata
+}
 
 // ProvisionInfo describes a single provisioned resource.
 type ProvisionInfo struct {
@@ -70,6 +115,11 @@ type ProvisionInfo struct {
 	Status       string    `json:"status"` // "provisioning", "ready", "failed"
 	CreatedAt    time.Time `json:"created_at"`
 	BackendName  string    `json:"-"` // Set by reconciler, not from backend
+}
+
+// ListProvisionsResponse is the response from the /provisions endpoint.
+type ListProvisionsResponse struct {
+	Provisions []ProvisionInfo `json:"provisions"`
 }
 
 // CallbackPayload is sent by backends to fred's callback endpoint.
@@ -81,6 +131,9 @@ type CallbackPayload struct {
 
 // ErrNotProvisioned is returned when a lease is not yet provisioned.
 var ErrNotProvisioned = errors.New("lease not provisioned")
+
+// ErrAlreadyProvisioned is returned when attempting to provision an already provisioned lease.
+var ErrAlreadyProvisioned = errors.New("lease already provisioned")
 
 // Provision status constants.
 const (
@@ -129,34 +182,15 @@ type HTTPClientConfig struct {
 
 // NewHTTPClient creates a new HTTP backend client.
 func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
-	timeout := cfg.Timeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
-
-	maxIdleConns := cfg.MaxIdleConns
-	if maxIdleConns == 0 {
-		maxIdleConns = 100
-	}
-
-	maxIdleConnsPerHost := cfg.MaxIdleConnsPerHost
-	if maxIdleConnsPerHost == 0 {
-		maxIdleConnsPerHost = 10 // Higher than default (2) for better concurrency
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	timeout := cmp.Or(cfg.Timeout, 30*time.Second)
+	maxIdleConns := cmp.Or(cfg.MaxIdleConns, 100)
+	maxIdleConnsPerHost := cmp.Or(cfg.MaxIdleConnsPerHost, 10) // Higher than default (2)
 
 	// Circuit breaker defaults
-	cbMaxRequests := cfg.CBMaxRequests
-	if cbMaxRequests == 0 {
-		cbMaxRequests = 1
-	}
-	cbTimeout := cfg.CBTimeout
-	if cbTimeout == 0 {
-		cbTimeout = 60 * time.Second
-	}
-	cbFailureThresh := cfg.CBFailureThresh
-	if cbFailureThresh == 0 {
-		cbFailureThresh = 5
-	}
+	cbMaxRequests := cmp.Or(cfg.CBMaxRequests, uint32(1))
+	cbTimeout := cmp.Or(cfg.CBTimeout, 60*time.Second)
+	cbFailureThresh := cmp.Or(cfg.CBFailureThresh, uint32(5))
 
 	transport := &http.Transport{
 		MaxIdleConns:        maxIdleConns,

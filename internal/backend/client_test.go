@@ -43,7 +43,7 @@ func TestHTTPClient_Provision(t *testing.T) {
 		LeaseUUID:    "lease-uuid-1",
 		Tenant:       "tenant-1",
 		ProviderUUID: "provider-1",
-		SKU:          "gpu-a100",
+		Items:        []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
 		CallbackURL:  "http://fred/callback",
 	})
 
@@ -54,8 +54,8 @@ func TestHTTPClient_Provision(t *testing.T) {
 	if receivedReq.LeaseUUID != "lease-uuid-1" {
 		t.Errorf("LeaseUUID = %q, want %q", receivedReq.LeaseUUID, "lease-uuid-1")
 	}
-	if receivedReq.SKU != "gpu-a100" {
-		t.Errorf("SKU = %q, want %q", receivedReq.SKU, "gpu-a100")
+	if receivedReq.RoutingSKU() != "gpu-a100" {
+		t.Errorf("PrimarySKU() = %q, want %q", receivedReq.RoutingSKU(), "gpu-a100")
 	}
 }
 

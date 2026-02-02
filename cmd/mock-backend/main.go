@@ -36,13 +36,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -158,7 +158,7 @@ func main() {
 			"name", name,
 			"delay", delay,
 		)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
 		}
@@ -207,12 +207,17 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "callback_url is required", http.StatusBadRequest)
 		return
 	}
+	if len(req.Items) == 0 {
+		http.Error(w, "items is required", http.StatusBadRequest)
+		return
+	}
 
 	// Log provision request with payload details
 	logAttrs := []any{
 		"lease_uuid", req.LeaseUUID,
 		"tenant", req.Tenant,
-		"sku", req.SKU,
+		"sku", req.RoutingSKU(),
+		"quantity", req.TotalQuantity(),
 		"callback_url", req.CallbackURL,
 		"has_payload", len(req.Payload) > 0,
 	}
@@ -243,7 +248,7 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		delete(s.callbackURLs, req.LeaseUUID)
 		s.callbackURLsMu.Unlock()
 
-		if strings.Contains(err.Error(), "already provisioned") {
+		if errors.Is(err, backend.ErrAlreadyProvisioned) {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
@@ -251,6 +256,7 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	if err := json.NewEncoder(w).Encode(backend.ProvisionResponse{
 		ProvisionID: req.LeaseUUID,
@@ -267,11 +273,11 @@ func (s *MockBackendServer) handleGetInfo(w http.ResponseWriter, r *http.Request
 	}
 
 	info, err := s.backend.GetInfo(r.Context(), leaseUUID)
-	if err == backend.ErrNotProvisioned {
-		http.Error(w, "not provisioned", http.StatusNotFound)
-		return
-	}
 	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			http.Error(w, "not provisioned", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -303,7 +309,9 @@ func (s *MockBackendServer) handleDeprovision(w http.ResponseWriter, r *http.Req
 	delete(s.callbackURLs, req.LeaseUUID)
 	s.callbackURLsMu.Unlock()
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.Request) {
@@ -314,16 +322,17 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
-		"provisions": provisions,
+	if err := json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
+		Provisions: provisions,
 	}); err != nil {
 		slog.Error("failed to encode provisions response", "error", err)
 	}
 }
 
 func (s *MockBackendServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
 }
 
 // handleCallback is called by MockBackend when provisioning completes.

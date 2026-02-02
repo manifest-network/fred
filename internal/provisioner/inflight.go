@@ -3,8 +3,11 @@ package provisioner
 import (
 	"context"
 	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
@@ -12,20 +15,34 @@ import (
 type inFlightProvision struct {
 	LeaseUUID string
 	Tenant    string
-	SKU       string
+	Items     []backend.LeaseItem // All items being provisioned
 	Backend   string
 	StartTime time.Time // For duration metrics
 }
 
+// RoutingSKU returns the first SKU for backend routing decisions.
+//
+// Used during deprovision when we need to determine which backend handled
+// a lease but only have the in-flight tracking data. Since all items in a
+// lease belong to the same provider, any SKU works for routing.
+//
+// This should NOT be used for resource calculations - use Items directly.
+func (p inFlightProvision) RoutingSKU() string {
+	if len(p.Items) == 0 {
+		return ""
+	}
+	return p.Items[0].SKU
+}
+
 // TrackInFlight registers a lease as being provisioned.
 // This allows the manager to handle callbacks for this lease.
-func (m *Manager) TrackInFlight(leaseUUID, tenant, sku, backendName string) {
+func (m *Manager) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
 	m.inFlightMu.Lock()
 	defer m.inFlightMu.Unlock()
 	m.inFlight[leaseUUID] = inFlightProvision{
 		LeaseUUID: leaseUUID,
 		Tenant:    tenant,
-		SKU:       sku,
+		Items:     items,
 		Backend:   backendName,
 		StartTime: time.Now(),
 	}
@@ -36,7 +53,7 @@ func (m *Manager) TrackInFlight(leaseUUID, tenant, sku, backendName string) {
 // Returns true if the lease was successfully tracked (was not already in-flight),
 // false if the lease was already being provisioned.
 // This prevents TOCTOU races between checking and tracking.
-func (m *Manager) TryTrackInFlight(leaseUUID, tenant, sku, backendName string) bool {
+func (m *Manager) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
 	m.inFlightMu.Lock()
 	defer m.inFlightMu.Unlock()
 	if _, exists := m.inFlight[leaseUUID]; exists {
@@ -45,7 +62,7 @@ func (m *Manager) TryTrackInFlight(leaseUUID, tenant, sku, backendName string) b
 	m.inFlight[leaseUUID] = inFlightProvision{
 		LeaseUUID: leaseUUID,
 		Tenant:    tenant,
-		SKU:       sku,
+		Items:     items,
 		Backend:   backendName,
 		StartTime: time.Now(),
 	}
@@ -106,11 +123,7 @@ func (m *Manager) GetInFlightLeases() []string {
 	m.inFlightMu.RLock()
 	defer m.inFlightMu.RUnlock()
 
-	leases := make([]string, 0, len(m.inFlight))
-	for uuid := range m.inFlight {
-		leases = append(leases, uuid)
-	}
-	return leases
+	return slices.Collect(maps.Keys(m.inFlight))
 }
 
 // WaitForDrain waits for all in-flight provisions to complete, up to the given timeout.

@@ -69,11 +69,14 @@ func BenchmarkWatermill_Publish(b *testing.B) {
 	payload, _ := json.Marshal(event)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		msg := message.NewMessage(fmt.Sprintf("msg-%d", i), payload)
 		if err := pubSub.Publish("test-topic", msg); err != nil {
 			b.Fatal(err)
 		}
+		i++
 	}
 }
 
@@ -141,9 +144,12 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 	payload, _ := json.Marshal(event)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		msg := message.NewMessage(fmt.Sprintf("msg-%d", i), payload)
 		pubSub.Publish("test-topic", msg)
+		i++
 	}
 
 	<-done

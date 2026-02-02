@@ -290,7 +290,7 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 }
 ```
 
-**Response:**
+**Response (single instance):**
 ```json
 {
   "lease_uuid": "...",
@@ -298,7 +298,10 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   "provider_uuid": "...",
   "connection": {
     "host": "compute-alpha.example.com",
-    "port": 8443,
+    "ports": {
+      "8080/tcp": {"host_ip": "0.0.0.0", "host_port": 32768},
+      "443/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}
+    },
     "protocol": "https",
     "metadata": {
       "region": "us-east-1",
@@ -307,6 +310,40 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   }
 }
 ```
+
+**Response (multi-instance lease):**
+```json
+{
+  "lease_uuid": "...",
+  "tenant": "manifest1...",
+  "provider_uuid": "...",
+  "connection": {
+    "host": "compute-alpha.example.com",
+    "instances": [
+      {
+        "instance_index": 0,
+        "container_id": "abc123",
+        "image": "nginx:latest",
+        "status": "running",
+        "ports": {"80/tcp": {"host_ip": "0.0.0.0", "host_port": 32768}}
+      },
+      {
+        "instance_index": 1,
+        "container_id": "def456",
+        "image": "redis:alpine",
+        "status": "running",
+        "ports": {"6379/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}}
+      }
+    ],
+    "metadata": {"backend": "docker"}
+  }
+}
+```
+
+**Fields:**
+- `ports` - Map of container port to host binding (e.g., "8080/tcp" → host_port 32768)
+- `instances` - Array of per-instance details for multi-container leases (each with its own ports)
+- `metadata` - Additional backend-specific data
 
 ### Get Lease Status
 
@@ -433,12 +470,20 @@ Start provisioning a resource (async).
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
-  "sku": "k8s-small",
+  "items": [
+    {"sku": "k8s-small", "quantity": 2},
+    {"sku": "k8s-large", "quantity": 1}
+  ],
   "callback_url": "http://fred.example.com:8080/callbacks/provision",
   "payload": "<base64-encoded-bytes>",
   "payload_hash": "abc123..."
 }
 ```
+
+**Fields:**
+- `items` - Array of lease items with SKU and quantity. All items belong to the same provider.
+- `payload` - Optional base64-encoded deployment payload (only present if lease has meta_hash)
+- `payload_hash` - Optional hex-encoded SHA-256 hash of payload (only present with payload)
 
 **Response:** `202 Accepted`
 ```json
@@ -455,15 +500,23 @@ Get lease information for a provisioned resource.
 ```json
 {
   "host": "10.0.0.1",
-  "port": 8080,
+  "ports": {
+    "8080/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"},
+    "443/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}
+  },
   "protocol": "https",
-  "credentials": {"token": "..."},
   "metadata": {"region": "us-east-1"},
   "custom_field": "any additional backend-specific data"
 }
 ```
 
-The response can contain any JSON fields the backend wants to return.
+**Known Fields** (extracted by fred into structured response):
+- `host` - Hostname or IP for connecting to the resource
+- `ports` - Map of container ports to host bindings
+- `protocol` - Connection protocol (e.g., "https", "ssh")
+- `metadata` - Additional key-value metadata
+
+Any additional fields are passed through to the tenant in the `metadata` section.
 
 **Response:** `404 Not Found` if not provisioned.
 
@@ -741,7 +794,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test result
 
 ## Dependencies
 
-- Go 1.24+ (uses `sync.WaitGroup.Go()`, `range` over integers)
+- Go 1.25+ (uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
 - Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x

@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -36,7 +37,7 @@ var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
 type InFlightTracker interface {
 	// TryTrackInFlight atomically checks if a lease is already in-flight and tracks it if not.
 	// Returns true if the lease was successfully tracked (was not already in-flight).
-	TryTrackInFlight(leaseUUID, tenant, sku, backendName string) bool
+	TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
 
 	// UntrackInFlight removes a lease from the in-flight tracking.
 	UntrackInFlight(leaseUUID string)
@@ -95,17 +96,9 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 		return nil, fmt.Errorf("callback base URL is required")
 	}
 
-	// Default interval
-	interval := cfg.Interval
-	if interval == 0 {
-		interval = 5 * time.Minute
-	}
-
-	// Default max workers
-	maxWorkers := cfg.MaxWorkers
-	if maxWorkers <= 0 {
-		maxWorkers = DefaultReconcileWorkers
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	interval := cmp.Or(cfg.Interval, 5*time.Minute)
+	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
 
 	return &Reconciler{
 		providerUUID:    cfg.ProviderUUID,
@@ -317,7 +310,7 @@ func (r *Reconciler) startProvisioningWithPayload(ctx context.Context, lease bil
 // doStartProvisioning is the common implementation for provisioning with or without payload.
 func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes.Lease, withPayload bool) error {
 	// Extract SKU for routing
-	sku := ExtractPrimarySKU(&lease)
+	sku := ExtractRoutingSKU(&lease)
 
 	// Route to appropriate backend based on SKU (Route already falls back to default)
 	backendClient := r.backendRouter.Route(sku)
@@ -328,8 +321,9 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// Atomically track in manager's in-flight map if manager is available.
 	// This prevents TOCTOU race between the reconciler and event-driven path:
 	// both may try to provision the same lease concurrently.
+	items := ExtractLeaseItems(&lease)
 	if r.tracker != nil {
-		if !r.tracker.TryTrackInFlight(lease.Uuid, lease.Tenant, sku, backendClient.Name()) {
+		if !r.tracker.TryTrackInFlight(lease.Uuid, lease.Tenant, items, backendClient.Name()) {
 			metrics.ReconciliationConflictsTotal.Inc()
 			return errLeaseAlreadyInFlight
 		}
@@ -340,7 +334,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		LeaseUUID:    lease.Uuid,
 		Tenant:       lease.Tenant,
 		ProviderUUID: r.providerUUID,
-		SKU:          sku,
+		Items:        ExtractLeaseItems(&lease),
 		CallbackURL:  BuildCallbackURL(r.callbackBaseURL),
 	}
 
@@ -377,10 +371,9 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		return err
 	}
 
-	// Provision succeeded - now safe to delete the payload from store
-	if withPayload && r.tracker != nil && req.Payload != nil {
-		r.tracker.PayloadStore().Delete(lease.Uuid)
-	}
+	// Note: Payload is NOT deleted here. It will be deleted by handleBackendCallback
+	// after the backend reports success or failure. This ensures the payload remains
+	// available for retry if the backend fails or crashes before sending a callback.
 
 	if withPayload {
 		slog.Info("reconcile: started provisioning with payload",

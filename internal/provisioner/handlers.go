@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,14 +31,47 @@ func isTerminalAcknowledgeError(err error) bool {
 		errors.Is(err, billingtypes.ErrLeaseNotFound)
 }
 
-// ExtractPrimarySKU returns the SKU UUID from the first lease item.
-// For multi-SKU leases, we route based on the first SKU (all SKUs in a lease
-// must belong to the same provider, so routing by the first is sufficient).
-func ExtractPrimarySKU(lease *billingtypes.Lease) string {
+// ExtractRoutingSKU returns a SKU UUID from the lease for backend routing.
+//
+// Why this exists: A lease may contain multiple items with different SKUs,
+// but all items are guaranteed to belong to the same provider (enforced by
+// the chain). Therefore, any SKU can be used to determine which backend
+// should handle the request. We use the first item's SKU by convention.
+//
+// This should NOT be used for resource allocation - use ExtractLeaseItems()
+// to get the full list of items with their quantities.
+func ExtractRoutingSKU(lease *billingtypes.Lease) string {
 	if lease == nil || len(lease.Items) == 0 {
 		return ""
 	}
 	return lease.Items[0].SkuUuid
+}
+
+// ExtractLeaseItems converts chain lease items to backend lease items.
+func ExtractLeaseItems(lease *billingtypes.Lease) []backend.LeaseItem {
+	if lease == nil || len(lease.Items) == 0 {
+		return nil
+	}
+	items := make([]backend.LeaseItem, len(lease.Items))
+	for i, item := range lease.Items {
+		items[i] = backend.LeaseItem{
+			SKU:      item.SkuUuid,
+			Quantity: int(item.Quantity),
+		}
+	}
+	return items
+}
+
+// TotalLeaseQuantity returns the total quantity across all lease items.
+func TotalLeaseQuantity(lease *billingtypes.Lease) int {
+	if lease == nil {
+		return 0
+	}
+	total := 0
+	for _, item := range lease.Items {
+		total += int(item.Quantity)
+	}
+	return total
 }
 
 // recordWatermillMetrics records the outcome of a Watermill message handler.
@@ -66,6 +100,94 @@ func unmarshalMessagePayload[T any](msg *message.Message, topic string) (T, bool
 	return v, true
 }
 
+// provisionOpts contains optional parameters for startProvisioning.
+type provisionOpts struct {
+	payload     []byte // Optional deployment payload
+	payloadHash string // Optional hex-encoded SHA-256 hash of payload
+}
+
+// startProvisioning handles the common provisioning flow for both lease creation
+// and payload-triggered provisioning. It routes to the appropriate backend,
+// tracks the provision in-flight, and initiates the async provisioning call.
+//
+// Returns nil if provisioning was started successfully or the lease is already in-flight.
+// Returns an error if routing fails or the backend call fails.
+func (m *Manager) startProvisioning(ctx context.Context, lease *billingtypes.Lease, opts provisionOpts) error {
+	// Extract lease items and primary SKU for routing
+	items := ExtractLeaseItems(lease)
+	sku := ExtractRoutingSKU(lease)
+	totalQuantity := TotalLeaseQuantity(lease)
+
+	// Route to appropriate backend based on SKU (Route already falls back to default)
+	backendClient := m.router.Route(sku)
+	if backendClient == nil {
+		slog.Error("no backend available for provisioning",
+			"lease_uuid", lease.Uuid,
+			"sku", sku,
+		)
+		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, lease.Uuid)
+	}
+
+	// Atomically track in-flight BEFORE calling Provision to prevent:
+	// 1. Race with reconciler (TOCTOU between IsInFlight check and TrackInFlight)
+	// 2. Race with fast backend response (callback arriving before tracking)
+	if !m.TryTrackInFlight(lease.Uuid, lease.Tenant, items, backendClient.Name()) {
+		slog.Debug("lease already in-flight, skipping",
+			"lease_uuid", lease.Uuid,
+		)
+		return nil
+	}
+
+	// Build provision request
+	req := backend.ProvisionRequest{
+		LeaseUUID:    lease.Uuid,
+		Tenant:       lease.Tenant,
+		ProviderUUID: m.providerUUID,
+		Items:        items,
+		CallbackURL:  BuildCallbackURL(m.callbackBaseURL),
+		Payload:      opts.payload,
+	}
+	// Only include PayloadHash when we have the actual payload
+	if opts.payload != nil && opts.payloadHash != "" {
+		req.PayloadHash = opts.payloadHash
+	}
+
+	// Start provisioning (async - backend will call back)
+	if err := backendClient.Provision(ctx, req); err != nil {
+		// Clean up in-flight tracking on failure
+		m.UntrackInFlight(lease.Uuid)
+
+		slog.Error("failed to start provisioning",
+			"lease_uuid", lease.Uuid,
+			"sku", sku,
+			"total_quantity", totalQuantity,
+			"backend", backendClient.Name(),
+			"error", err,
+		)
+		return fmt.Errorf("%w: %w", ErrProvisioningFailed, err)
+	}
+
+	// Log success with appropriate detail level
+	if opts.payload != nil {
+		slog.Info("provisioning started with payload",
+			"lease_uuid", lease.Uuid,
+			"sku", sku,
+			"total_quantity", totalQuantity,
+			"backend", backendClient.Name(),
+			"payload_size", len(opts.payload),
+		)
+	} else {
+		slog.Info("provisioning started",
+			"lease_uuid", lease.Uuid,
+			"sku", sku,
+			"total_quantity", totalQuantity,
+			"backend", backendClient.Name(),
+		)
+	}
+
+	return nil
+}
+
 // handleLeaseCreated processes new lease events.
 func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 	defer func() { recordWatermillMetrics(TopicLeaseCreated, err) }()
@@ -91,18 +213,9 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 		return nil
 	}
 
-	// Log lease details for debugging
-	hasMetaHash := len(lease.MetaHash) > 0
-	slog.Info("processing lease created",
-		"lease_uuid", event.LeaseUUID,
-		"tenant", event.Tenant,
-		"has_meta_hash", hasMetaHash,
-		"meta_hash_len", len(lease.MetaHash),
-	)
-
 	// Check if lease requires a payload (has MetaHash)
 	// If so, skip immediate provisioning - wait for payload upload
-	if hasMetaHash {
+	if len(lease.MetaHash) > 0 {
 		metrics.LeasesAwaitingPayloadTotal.Inc()
 		slog.Info("lease requires payload, awaiting upload",
 			"lease_uuid", event.LeaseUUID,
@@ -112,57 +225,8 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 		return nil // Don't provision yet - wait for payload
 	}
 
-	// Extract primary SKU from lease items for routing
-	sku := ExtractPrimarySKU(lease)
-
-	// Route to appropriate backend based on SKU (Route already falls back to default)
-	backendClient := m.router.Route(sku)
-	if backendClient == nil {
-		slog.Error("no backend available for provisioning",
-			"lease_uuid", event.LeaseUUID,
-			"sku", sku,
-		)
-		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
-	}
-
-	// Atomically track in-flight BEFORE calling Provision to prevent:
-	// 1. Race with reconciler (TOCTOU between IsInFlight check and TrackInFlight)
-	// 2. Race with fast backend response (callback arriving before tracking)
-	if !m.TryTrackInFlight(event.LeaseUUID, event.Tenant, sku, backendClient.Name()) {
-		slog.Debug("lease already in-flight, skipping",
-			"lease_uuid", event.LeaseUUID,
-		)
-		return nil
-	}
-
-	// Start provisioning (async - backend will call back)
-	err = backendClient.Provision(msg.Context(), backend.ProvisionRequest{
-		LeaseUUID:    event.LeaseUUID,
-		Tenant:       event.Tenant,
-		ProviderUUID: m.providerUUID,
-		SKU:          sku,
-		CallbackURL:  BuildCallbackURL(m.callbackBaseURL),
-	})
-	if err != nil {
-		// Clean up in-flight tracking on failure
-		m.UntrackInFlight(event.LeaseUUID)
-
-		slog.Error("failed to start provisioning",
-			"lease_uuid", event.LeaseUUID,
-			"sku", sku,
-			"backend", backendClient.Name(),
-			"error", err,
-		)
-		return fmt.Errorf("%w: %w", ErrProvisioningFailed, err)
-	}
-
-	slog.Info("provisioning started",
-		"lease_uuid", event.LeaseUUID,
-		"sku", sku,
-		"backend", backendClient.Name(),
-	)
-
-	return nil
+	// Start provisioning without payload
+	return m.startProvisioning(msg.Context(), lease, provisionOpts{})
 }
 
 // handleLeaseClosed processes lease closure events.
@@ -211,10 +275,10 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 	}
 
 	if backendClient == nil {
-		// Case 2: Try to route by SKU (fetch from chain if we have SKU, or query lease)
+		// Case 2: Try to route by SKU (fetch from chain if we have items, or query lease)
 		var sku string
-		if wasInFlight && provision.SKU != "" {
-			sku = provision.SKU
+		if wasInFlight && len(provision.Items) > 0 {
+			sku = provision.RoutingSKU()
 		} else {
 			// Fetch lease details from chain to get SKU for routing
 			// This ensures consistency with the provisioning path
@@ -226,7 +290,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 				)
 				// Fall through to deprovision from all backends
 			} else if lease != nil {
-				sku = ExtractPrimarySKU(lease)
+				sku = ExtractRoutingSKU(lease)
 			}
 		}
 
@@ -363,6 +427,11 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 		recordDuration()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
 
+		// Clean up payload now that provisioning is confirmed successful
+		if m.payloadStore != nil {
+			m.payloadStore.Delete(callback.LeaseUUID)
+		}
+
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
 			"acknowledged", acknowledged,
@@ -374,6 +443,11 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 		m.UntrackInFlight(callback.LeaseUUID)
 		recordDuration()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+
+		// Clean up payload - no point keeping it after terminal failure
+		if m.payloadStore != nil {
+			m.payloadStore.Delete(callback.LeaseUUID)
+		}
 
 		// Reject the lease on chain so tenant's credit is released immediately
 		reason := callback.Error
@@ -464,29 +538,11 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 		return nil
 	}
 
-	// Extract primary SKU for routing
-	sku := ExtractPrimarySKU(lease)
-
-	// Route to appropriate backend based on SKU
-	backendClient := m.router.Route(sku)
-	if backendClient == nil {
-		slog.Error("no backend available for provisioning",
-			"lease_uuid", event.LeaseUUID,
-			"sku", sku,
-		)
-		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, event.LeaseUUID)
-	}
-
-	// Atomically track in-flight BEFORE calling Provision
-	if !m.TryTrackInFlight(event.LeaseUUID, event.Tenant, sku, backendClient.Name()) {
-		slog.Debug("lease already in-flight, skipping",
-			"lease_uuid", event.LeaseUUID,
-		)
-		return nil
-	}
-
 	// Get the payload from the store WITHOUT removing it yet.
 	// We only delete after Provision() succeeds to allow retries.
+	// Note: Payload is NOT deleted here. It will be deleted by handleBackendCallback
+	// after the backend reports success or failure. This ensures the payload remains
+	// available for retry if the backend fails or crashes before sending a callback.
 	payload := m.payloadStore.Get(event.LeaseUUID)
 	if payload == nil {
 		// This shouldn't happen in normal operation since payload is stored
@@ -498,9 +554,7 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 		// Re-verify payload hash before provisioning to catch any corruption.
 		// The payload was validated on upload, but disk corruption could occur.
 		if err := VerifyPayloadHashHex(payload, event.MetaHashHex); err != nil {
-			// Payload is corrupted - delete it and fail
 			m.payloadStore.Delete(event.LeaseUUID)
-			m.UntrackInFlight(event.LeaseUUID)
 			slog.Error("payload hash mismatch - possible corruption",
 				"lease_uuid", event.LeaseUUID,
 				"error", err,
@@ -509,47 +563,9 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 		}
 	}
 
-	// Build provision request - only include PayloadHash when we have the actual payload.
-	// This ensures backends never receive a hash without the corresponding data.
-	req := backend.ProvisionRequest{
-		LeaseUUID:    event.LeaseUUID,
-		Tenant:       event.Tenant,
-		ProviderUUID: m.providerUUID,
-		SKU:          sku,
-		CallbackURL:  BuildCallbackURL(m.callbackBaseURL),
-		Payload:      payload,
-	}
-	if payload != nil && event.MetaHashHex != "" {
-		req.PayloadHash = event.MetaHashHex
-	}
-
 	// Start provisioning with payload
-	err = backendClient.Provision(msg.Context(), req)
-	if err != nil {
-		// Clean up in-flight tracking on failure.
-		// Keep payload in store so reconciliation can retry with it.
-		m.UntrackInFlight(event.LeaseUUID)
-
-		slog.Error("failed to start provisioning",
-			"lease_uuid", event.LeaseUUID,
-			"sku", sku,
-			"backend", backendClient.Name(),
-			"error", err,
-		)
-		return fmt.Errorf("%w: %w", ErrProvisioningFailed, err)
-	}
-
-	// Provision succeeded - now safe to delete the payload from store
-	if payload != nil {
-		m.payloadStore.Delete(event.LeaseUUID)
-	}
-
-	slog.Info("provisioning started with payload",
-		"lease_uuid", event.LeaseUUID,
-		"sku", sku,
-		"backend", backendClient.Name(),
-		"payload_size", len(payload),
-	)
-
-	return nil
+	return m.startProvisioning(msg.Context(), lease, provisionOpts{
+		payload:     payload,
+		payloadHash: event.MetaHashHex,
+	})
 }

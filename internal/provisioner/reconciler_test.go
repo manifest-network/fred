@@ -588,7 +588,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, &chain.MockClient{})
-	manager.TrackInFlight("lease-1", "tenant-1", "", "test")
+	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
@@ -999,7 +999,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 
 			// Simulate the atomic check-and-provision pattern used by both
 			// manager.handleLeaseCreated and reconciler.startProvisioning
-			if manager.TryTrackInFlight(leaseUUID, "tenant-1", "", "test") {
+			if manager.TryTrackInFlight(leaseUUID, "tenant-1", testItems(""), "test") {
 				// Only provision if we successfully tracked
 				_ = mockBackend.Provision(context.Background(), backend.ProvisionRequest{
 					LeaseUUID:    leaseUUID,
@@ -1342,8 +1342,8 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	if len(gpuCalls) > 0 && gpuCalls[0].LeaseUUID != "gpu-lease" {
 		t.Errorf("expected gpu-lease, got %s", gpuCalls[0].LeaseUUID)
 	}
-	if len(gpuCalls) > 0 && gpuCalls[0].SKU != "gpu-a100-4x" {
-		t.Errorf("expected SKU gpu-a100-4x, got %s", gpuCalls[0].SKU)
+	if len(gpuCalls) > 0 && gpuCalls[0].RoutingSKU() != "gpu-a100-4x" {
+		t.Errorf("expected SKU gpu-a100-4x, got %s", gpuCalls[0].RoutingSKU())
 	}
 
 	// Verify K8s and unknown leases went to K8s backend (default)
@@ -1358,7 +1358,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Verify the SKUs are passed correctly
 	skus := make(map[string]bool)
 	for _, call := range k8sCalls {
-		skus[call.SKU] = true
+		skus[call.RoutingSKU()] = true
 	}
 	if !skus["k8s-small"] {
 		t.Error("expected k8s-small SKU in K8s backend calls")
@@ -1737,7 +1737,7 @@ func newMockInFlightTracker(payloadStore *PayloadStore) *mockInFlightTracker {
 	}
 }
 
-func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant, sku, backendName string) bool {
+func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.inFlight[leaseUUID] {

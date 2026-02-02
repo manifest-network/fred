@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -94,8 +95,8 @@ type ManagerConfig struct {
 	PayloadStore         *PayloadStore // Optional external payload store (if nil, manager won't handle payloads)
 	CallbackTimeout      time.Duration // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
 	TimeoutCheckInterval time.Duration // How often to check for timeouts (default: 1 minute)
-	AckBatchInterval     time.Duration // How long to wait before flushing ack batch (default: 500ms)
-	AckBatchSize         int           // Maximum acks to batch before flushing (default: 50)
+	AckBatchInterval     time.Duration // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
+	AckBatchSize         int           // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
 }
 
 // NewManager creates a new provision manager with Watermill routing.
@@ -113,15 +114,9 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		return nil, errors.New("callback base URL is required")
 	}
 
-	// Apply defaults for callback timeout
-	callbackTimeout := cfg.CallbackTimeout
-	if callbackTimeout == 0 {
-		callbackTimeout = 10 * time.Minute
-	}
-	timeoutCheckInterval := cfg.TimeoutCheckInterval
-	if timeoutCheckInterval == 0 {
-		timeoutCheckInterval = 1 * time.Minute
-	}
+	// Apply defaults for callback timeout using cmp.Or
+	callbackTimeout := cmp.Or(cfg.CallbackTimeout, 10*time.Minute)
+	timeoutCheckInterval := cmp.Or(cfg.TimeoutCheckInterval, 1*time.Minute)
 
 	// Create Watermill logger adapter
 	wmLogger := watermill.NewSlogLogger(slog.Default())
@@ -147,20 +142,11 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		middleware.Recoverer,
 	)
 
-	// Create ack batcher
-	ackBatchInterval := cfg.AckBatchInterval
-	if ackBatchInterval == 0 {
-		ackBatchInterval = 500 * time.Millisecond
-	}
-	ackBatchSize := cfg.AckBatchSize
-	if ackBatchSize == 0 {
-		ackBatchSize = 50
-	}
-
+	// Create ack batcher (NewAckBatcher applies defaults internally via cmp.Or)
 	ackBatcher := NewAckBatcher(chainClient, AckBatcherConfig{
 		ProviderUUID:  cfg.ProviderUUID,
-		BatchInterval: ackBatchInterval,
-		BatchSize:     ackBatchSize,
+		BatchInterval: cfg.AckBatchInterval,
+		BatchSize:     cfg.AckBatchSize,
 	})
 	// Start ack batcher immediately so handlers can use it without waiting for Start()
 	// This uses a background context; Stop() will still properly shut it down.

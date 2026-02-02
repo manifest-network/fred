@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -54,15 +55,9 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 		return nil, errors.New("db path is required")
 	}
 
-	// Apply defaults
-	maxAge := cfg.MaxAge
-	if maxAge == 0 {
-		maxAge = MaxTokenAge
-	}
-	cleanupInterval := cfg.CleanupInterval
-	if cleanupInterval == 0 {
-		cleanupInterval = maxAge // Clean up at least as often as tokens expire
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	maxAge := cmp.Or(cfg.MaxAge, MaxTokenAge)
+	cleanupInterval := cmp.Or(cfg.CleanupInterval, maxAge) // Default: clean up as often as tokens expire
 
 	db, err := bolt.Open(cfg.DBPath, 0600, &bolt.Options{
 		Timeout: 5 * time.Second,
@@ -91,9 +86,8 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 		closeOnce:       &sync.Once{},
 	}
 
-	// Start background cleanup
-	t.wg.Add(1)
-	go t.cleanupLoop(ctx)
+	// Start background cleanup (using WaitGroup.Go for Go 1.25+)
+	t.wg.Go(func() { t.cleanupLoop(ctx) })
 
 	// Run initial cleanup to remove any expired entries from previous run
 	if err := t.cleanup(); err != nil {
@@ -184,8 +178,8 @@ func (t *TokenTracker) Close() error {
 }
 
 // cleanupLoop periodically removes expired tokens.
+// Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
 func (t *TokenTracker) cleanupLoop(ctx context.Context) {
-	defer t.wg.Done()
 	util.StartCleanupLoop(ctx, t.cleanupInterval, t.cleanup, "token")
 }
 

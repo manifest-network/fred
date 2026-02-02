@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -100,19 +101,10 @@ func NewClient(cfg ClientConfig, signer *Signer) (*Client, error) {
 		return nil, fmt.Errorf("failed to connect to gRPC endpoint: %w", err)
 	}
 
-	// Apply defaults for timeouts
-	txPollInterval := cfg.TxPollInterval
-	if txPollInterval == 0 {
-		txPollInterval = 500 * time.Millisecond
-	}
-	txTimeout := cfg.TxTimeout
-	if txTimeout == 0 {
-		txTimeout = defaultTxTimeout
-	}
-	queryPageLimit := cfg.QueryPageLimit
-	if queryPageLimit <= 0 {
-		queryPageLimit = 100
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	txPollInterval := cmp.Or(cfg.TxPollInterval, 500*time.Millisecond)
+	txTimeout := cmp.Or(cfg.TxTimeout, defaultTxTimeout)
+	queryPageLimit := cmp.Or(max(cfg.QueryPageLimit, 0), 100)
 
 	return &Client{
 		conn:           conn,

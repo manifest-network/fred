@@ -1,10 +1,13 @@
 package chain
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,23 +108,11 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 		return nil, fmt.Errorf("invalid provider UUID format: %w", err)
 	}
 
-	// Apply defaults
-	pingInterval := cfg.PingInterval
-	if pingInterval == 0 {
-		pingInterval = 30 * time.Second
-	}
-	reconnectInitial := cfg.ReconnectInitial
-	if reconnectInitial == 0 {
-		reconnectInitial = time.Second
-	}
-	reconnectMax := cfg.ReconnectMax
-	if reconnectMax == 0 {
-		reconnectMax = 60 * time.Second
-	}
-	channelCapacity := cfg.ChannelCapacity
-	if channelCapacity <= 0 {
-		channelCapacity = DefaultEventChannelCapacity
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	pingInterval := cmp.Or(cfg.PingInterval, 30*time.Second)
+	reconnectInitial := cmp.Or(cfg.ReconnectInitial, time.Second)
+	reconnectMax := cmp.Or(cfg.ReconnectMax, 60*time.Second)
+	channelCapacity := cmp.Or(max(cfg.ChannelCapacity, 0), DefaultEventChannelCapacity)
 
 	return &EventSubscriber{
 		url:              cfg.URL,
@@ -206,11 +197,7 @@ func (s *EventSubscriber) broadcast(event LeaseEvent) {
 	// This prevents deadlock if a subscriber's handler calls Unsubscribe(),
 	// and ensures we don't hold the lock during potentially slow operations.
 	s.subscribersMu.RLock()
-	// Make a snapshot of channels to send to
-	channels := make([]chan LeaseEvent, 0, len(s.subscribers))
-	for ch := range s.subscribers {
-		channels = append(channels, ch)
-	}
+	channels := slices.Collect(maps.Keys(s.subscribers))
 	s.subscribersMu.RUnlock()
 
 	// Send to all channels without holding the lock.
@@ -597,10 +584,10 @@ func (s *EventSubscriber) Close() {
 
 	// Now safe to close all subscriber channels - no broadcasts are in flight.
 	s.subscribersMu.Lock()
-	for ch := range s.subscribers {
+	for _, ch := range slices.Collect(maps.Keys(s.subscribers)) {
 		close(ch)
-		delete(s.subscribers, ch)
 	}
+	clear(s.subscribers)
 	s.subscribersMu.Unlock()
 }
 

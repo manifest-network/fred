@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -113,23 +114,12 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 		return nil, errors.New("db path is required")
 	}
 
-	// Apply defaults
-	ttl := cfg.TTL
-	if ttl == 0 {
-		ttl = DefaultPayloadTTL
-	}
-	cleanupInterval := cfg.CleanupInterval
-	if cleanupInterval == 0 {
-		cleanupInterval = DefaultPayloadCleanupInterval
-	}
-	batchSize := cfg.BatchSize
-	if batchSize <= 0 {
-		batchSize = DefaultBatchSize
-	}
-	flushInterval := cfg.FlushInterval
-	if flushInterval <= 0 {
-		flushInterval = DefaultFlushInterval
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	// For batchSize and flushInterval, use max() to convert negative values to 0
+	ttl := cmp.Or(cfg.TTL, DefaultPayloadTTL)
+	cleanupInterval := cmp.Or(cfg.CleanupInterval, DefaultPayloadCleanupInterval)
+	batchSize := cmp.Or(max(cfg.BatchSize, 0), DefaultBatchSize)
+	flushInterval := cmp.Or(max(cfg.FlushInterval, 0), DefaultFlushInterval)
 
 	db, err := bolt.Open(cfg.DBPath, 0600, &bolt.Options{
 		Timeout: 5 * time.Second,
@@ -165,13 +155,11 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 		wg:              &sync.WaitGroup{},
 	}
 
-	// Start the batching writer goroutine
-	s.wg.Add(1)
-	go s.writerLoop(ctx)
+	// Start the batching writer goroutine (using WaitGroup.Go for Go 1.25+)
+	s.wg.Go(func() { s.writerLoop(ctx) })
 
-	// Start background cleanup
-	s.wg.Add(1)
-	go s.cleanupLoop(ctx)
+	// Start background cleanup (using WaitGroup.Go for Go 1.25+)
+	s.wg.Go(func() { s.cleanupLoop(ctx) })
 
 	// Run initial cleanup to remove any stale entries from previous run
 	if err := s.cleanupDirect(); err != nil {
@@ -384,8 +372,8 @@ func (s *PayloadStore) Close() error {
 // writerLoop is the dedicated writer goroutine that batches write operations.
 // All write operations (Store, Pop, Delete) are serialized through this goroutine
 // to eliminate bbolt lock contention.
+// Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
 func (s *PayloadStore) writerLoop(ctx context.Context) {
-	defer s.wg.Done()
 
 	batch := make([]writeOp, 0, s.batchSize)
 	ticker := time.NewTicker(s.flushInterval)
@@ -503,8 +491,8 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 }
 
 // cleanupLoop periodically removes stale payloads.
+// Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
 func (s *PayloadStore) cleanupLoop(ctx context.Context) {
-	defer s.wg.Done()
 	util.StartCleanupLoop(ctx, s.cleanupInterval, s.cleanupDirect, "payload")
 }
 

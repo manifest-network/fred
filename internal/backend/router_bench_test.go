@@ -56,12 +56,15 @@ func BenchmarkRouter_Route(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		sku := skus[i%len(skus)]
 		backend := router.Route(sku)
 		if backend == nil {
 			b.Fatal("expected backend, got nil")
 		}
+		i++
 	}
 }
 
@@ -110,12 +113,15 @@ func BenchmarkRouter_GetBackendByName(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		name := names[i%len(names)]
 		backend := router.GetBackendByName(name)
 		if backend == nil {
 			b.Fatal("expected backend")
 		}
+		i++
 	}
 }
 
@@ -140,12 +146,13 @@ func BenchmarkHTTPClient_Provision(b *testing.B) {
 	ctx := context.Background()
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	for b.Loop() {
 		req := ProvisionRequest{
 			LeaseUUID:    "test-lease",
 			Tenant:       "manifest1test",
 			ProviderUUID: "provider-uuid",
-			SKU:          "test-sku",
+			Items:        []LeaseItem{{SKU: "test-sku", Quantity: 1}},
 			CallbackURL:  "http://localhost/callback",
 		}
 		err := client.Provision(ctx, req)
@@ -184,7 +191,7 @@ func BenchmarkHTTPClient_Provision_Parallel(b *testing.B) {
 				LeaseUUID:    "test-lease",
 				Tenant:       "manifest1test",
 				ProviderUUID: "provider-uuid",
-				SKU:          "test-sku",
+				Items:        []LeaseItem{{SKU: "test-sku", Quantity: 1}},
 				CallbackURL:  "http://localhost/callback",
 			}
 			err := client.Provision(ctx, req)
@@ -221,7 +228,8 @@ func BenchmarkHTTPClient_GetInfo(b *testing.B) {
 	ctx := context.Background()
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	for b.Loop() {
 		_, err := client.GetInfo(ctx, "test-lease")
 		if err != nil {
 			b.Fatal(err)
@@ -309,7 +317,7 @@ func TestHTTPClient_HighThroughput(t *testing.T) {
 					LeaseUUID:    "test-lease",
 					Tenant:       "manifest1test",
 					ProviderUUID: "provider-uuid",
-					SKU:          "test-sku",
+					Items:        []LeaseItem{{SKU: "test-sku", Quantity: 1}},
 					CallbackURL:  "http://localhost/callback",
 				}
 				if err := client.Provision(ctx, req); err != nil {

@@ -403,8 +403,10 @@ func TestConnectionResponse_JSON(t *testing.T) {
 		Tenant:       "manifest1abc",
 		ProviderUUID: testutil.ValidUUID2,
 		Connection: ConnectionDetails{
-			Host:     "compute-alpha.example.com",
-			Port:     8443,
+			Host: "compute-alpha.example.com",
+			Ports: map[string]PortMapping{
+				"443/tcp": {HostIP: "0.0.0.0", HostPort: 8443},
+			},
 			Protocol: "https",
 			Metadata: map[string]string{
 				"region": "us-east-1",
@@ -630,8 +632,10 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]any{
 					"host":     "compute-alpha.example.com",
-					"port":     8443,
 					"protocol": "https",
+					"ports": map[string]any{
+						"443/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "8443"},
+					},
 					"metadata": map[string]any{
 						"region":  "us-east-1",
 						"backend": "test-backend",
@@ -697,8 +701,8 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		if response.Connection.Host != "compute-alpha.example.com" {
 			t.Errorf("Connection.Host = %q, want %q", response.Connection.Host, "compute-alpha.example.com")
 		}
-		if response.Connection.Port != 8443 {
-			t.Errorf("Connection.Port = %d, want %d", response.Connection.Port, 8443)
+		if response.Connection.Ports["443/tcp"].HostPort != 8443 {
+			t.Errorf("Connection.Ports[443/tcp].HostPort = %d, want %d", response.Connection.Ports["443/tcp"].HostPort, 8443)
 		}
 		if response.Connection.Protocol != "https" {
 			t.Errorf("Connection.Protocol = %q, want %q", response.Connection.Protocol, "https")
@@ -711,13 +715,12 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("happy_path_with_int_port", func(t *testing.T) {
-		// Test that integer ports (not float64 from JSON) are handled correctly
+	t.Run("happy_path_with_multiple_ports", func(t *testing.T) {
+		// Test that multiple port mappings are handled correctly
 		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/info/"+leaseUUID && r.Method == "GET" {
-				// Return raw JSON to ensure port comes as float64 from json.Unmarshal
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`{"host":"test.example.com","port":9000,"protocol":"grpc"}`))
+				w.Write([]byte(`{"host":"test.example.com","ports":{"80/tcp":{"host_ip":"0.0.0.0","host_port":"8080"},"443/tcp":{"host_ip":"0.0.0.0","host_port":"8443"}},"protocol":"grpc"}`))
 				return
 			}
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -762,8 +765,14 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 			t.Fatalf("failed to decode response: %v", err)
 		}
 
-		if response.Connection.Port != 9000 {
-			t.Errorf("Connection.Port = %d, want %d", response.Connection.Port, 9000)
+		if len(response.Connection.Ports) != 2 {
+			t.Errorf("len(Connection.Ports) = %d, want 2", len(response.Connection.Ports))
+		}
+		if response.Connection.Ports["80/tcp"].HostPort != 8080 {
+			t.Errorf("Connection.Ports[80/tcp].HostPort = %d, want 8080", response.Connection.Ports["80/tcp"].HostPort)
+		}
+		if response.Connection.Ports["443/tcp"].HostPort != 8443 {
+			t.Errorf("Connection.Ports[443/tcp].HostPort = %d, want 8443", response.Connection.Ports["443/tcp"].HostPort)
 		}
 	})
 }
@@ -771,83 +780,64 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 // TestExtractConnectionDetails tests the extractConnectionDetails helper function.
 func TestExtractConnectionDetails(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    backend.LeaseInfo
-		expected ConnectionDetails
+		name              string
+		input             backend.LeaseInfo
+		expectedHost      string
+		expectedProto     string
+		expectedMeta      map[string]string
+		expectedPorts     map[string]PortMapping
+		expectedInstances []InstanceInfo
 	}{
 		{
-			name: "full info with string metadata",
+			name: "full info with ports and metadata",
 			input: backend.LeaseInfo{
 				"host":     "test.example.com",
-				"port":     float64(8080), // JSON numbers are float64
 				"protocol": "https",
+				"ports": map[string]map[string]string{
+					"80/tcp": {"host_ip": "0.0.0.0", "host_port": "8080"},
+				},
 				"metadata": map[string]string{"key": "value"},
 			},
-			expected: ConnectionDetails{
-				Host:     "test.example.com",
-				Port:     8080,
-				Protocol: "https",
-				Metadata: map[string]string{"key": "value"},
-			},
+			expectedHost:  "test.example.com",
+			expectedProto: "https",
+			expectedMeta:  map[string]string{"key": "value"},
+			expectedPorts: map[string]PortMapping{"80/tcp": {HostIP: "0.0.0.0", HostPort: 8080}},
 		},
 		{
-			name: "full info with any metadata",
-			input: backend.LeaseInfo{
-				"host":     "test.example.com",
-				"port":     float64(8080),
-				"protocol": "https",
-				"metadata": map[string]any{"key": "value", "number": 123},
-			},
-			expected: ConnectionDetails{
-				Host:     "test.example.com",
-				Port:     8080,
-				Protocol: "https",
-				Metadata: map[string]string{"key": "value"}, // non-string values filtered
-			},
-		},
-		{
-			name: "int port instead of float64",
+			name: "ports with any type values",
 			input: backend.LeaseInfo{
 				"host": "test.example.com",
-				"port": 9000, // int instead of float64
+				"ports": map[string]any{
+					"443/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "8443"},
+				},
 			},
-			expected: ConnectionDetails{
-				Host:     "test.example.com",
-				Port:     9000,
-				Metadata: map[string]string{},
-			},
+			expectedHost:  "test.example.com",
+			expectedMeta:  map[string]string{},
+			expectedPorts: map[string]PortMapping{"443/tcp": {HostIP: "0.0.0.0", HostPort: 8443}},
 		},
 		{
-			name:  "empty info",
-			input: backend.LeaseInfo{},
-			expected: ConnectionDetails{
-				Metadata: map[string]string{},
-			},
+			name:         "empty info",
+			input:        backend.LeaseInfo{},
+			expectedMeta: map[string]string{},
 		},
 		{
 			name: "missing optional fields",
 			input: backend.LeaseInfo{
 				"host": "test.example.com",
 			},
-			expected: ConnectionDetails{
-				Host:     "test.example.com",
-				Metadata: map[string]string{},
-			},
+			expectedHost: "test.example.com",
+			expectedMeta: map[string]string{},
 		},
 		{
 			name: "unknown string fields go to metadata",
 			input: backend.LeaseInfo{
 				"host":        "test.example.com",
-				"port":        float64(8080),
 				"region":      "us-east-1",
 				"backend":     "kubernetes",
 				"credentials": map[string]string{"token": "secret"}, // non-string, ignored
 			},
-			expected: ConnectionDetails{
-				Host:     "test.example.com",
-				Port:     8080,
-				Metadata: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
-			},
+			expectedHost: "test.example.com",
+			expectedMeta: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
 		},
 		{
 			name: "unknown fields merged with explicit metadata",
@@ -856,9 +846,149 @@ func TestExtractConnectionDetails(t *testing.T) {
 				"metadata": map[string]string{"key": "value"},
 				"region":   "us-west-2",
 			},
-			expected: ConnectionDetails{
-				Host:     "test.example.com",
-				Metadata: map[string]string{"key": "value", "region": "us-west-2"},
+			expectedHost: "test.example.com",
+			expectedMeta: map[string]string{"key": "value", "region": "us-west-2"},
+		},
+		{
+			name: "single instance with ports",
+			input: backend.LeaseInfo{
+				"host": "docker-host.example.com",
+				"instances": []any{
+					map[string]any{
+						"instance_index": float64(0),
+						"container_id":   "abc123def456",
+						"image":          "nginx:latest",
+						"status":         "running",
+						"ports": map[string]any{
+							"80/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "32768"},
+						},
+					},
+				},
+			},
+			expectedHost: "docker-host.example.com",
+			expectedMeta: map[string]string{},
+			expectedInstances: []InstanceInfo{
+				{
+					InstanceIndex: 0,
+					ContainerID:   "abc123def456",
+					Image:         "nginx:latest",
+					Status:        "running",
+					Ports:         map[string]PortMapping{"80/tcp": {HostIP: "0.0.0.0", HostPort: 32768}},
+				},
+			},
+		},
+		{
+			name: "multiple instances",
+			input: backend.LeaseInfo{
+				"host": "docker-host.example.com",
+				"instances": []any{
+					map[string]any{
+						"instance_index": float64(0),
+						"container_id":   "container1",
+						"image":          "nginx:latest",
+						"status":         "running",
+						"ports": map[string]any{
+							"80/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "32768"},
+						},
+					},
+					map[string]any{
+						"instance_index": float64(1),
+						"container_id":   "container2",
+						"image":          "redis:alpine",
+						"status":         "running",
+						"ports": map[string]any{
+							"6379/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "32769"},
+						},
+					},
+				},
+				"metadata": map[string]any{"backend": "docker"},
+			},
+			expectedHost: "docker-host.example.com",
+			expectedMeta: map[string]string{"backend": "docker"},
+			expectedInstances: []InstanceInfo{
+				{
+					InstanceIndex: 0,
+					ContainerID:   "container1",
+					Image:         "nginx:latest",
+					Status:        "running",
+					Ports:         map[string]PortMapping{"80/tcp": {HostIP: "0.0.0.0", HostPort: 32768}},
+				},
+				{
+					InstanceIndex: 1,
+					ContainerID:   "container2",
+					Image:         "redis:alpine",
+					Status:        "running",
+					Ports:         map[string]PortMapping{"6379/tcp": {HostIP: "0.0.0.0", HostPort: 32769}},
+				},
+			},
+		},
+		{
+			name: "instance with numeric host_port",
+			input: backend.LeaseInfo{
+				"host": "docker-host.example.com",
+				"instances": []any{
+					map[string]any{
+						"instance_index": float64(0),
+						"container_id":   "abc123",
+						"ports": map[string]any{
+							"8080/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": float64(32770)},
+						},
+					},
+				},
+			},
+			expectedHost: "docker-host.example.com",
+			expectedMeta: map[string]string{},
+			expectedInstances: []InstanceInfo{
+				{
+					InstanceIndex: 0,
+					ContainerID:   "abc123",
+					Ports:         map[string]PortMapping{"8080/tcp": {HostIP: "0.0.0.0", HostPort: 32770}},
+				},
+			},
+		},
+		{
+			name: "instance without ports",
+			input: backend.LeaseInfo{
+				"host": "docker-host.example.com",
+				"instances": []any{
+					map[string]any{
+						"instance_index": float64(0),
+						"container_id":   "abc123",
+						"image":          "busybox:latest",
+						"status":         "running",
+					},
+				},
+			},
+			expectedHost: "docker-host.example.com",
+			expectedMeta: map[string]string{},
+			expectedInstances: []InstanceInfo{
+				{
+					InstanceIndex: 0,
+					ContainerID:   "abc123",
+					Image:         "busybox:latest",
+					Status:        "running",
+				},
+			},
+		},
+		{
+			name: "instances field is not included in metadata",
+			input: backend.LeaseInfo{
+				"host": "docker-host.example.com",
+				"instances": []any{
+					map[string]any{
+						"instance_index": float64(0),
+						"container_id":   "abc123",
+					},
+				},
+				"region": "us-east-1",
+			},
+			expectedHost: "docker-host.example.com",
+			expectedMeta: map[string]string{"region": "us-east-1"},
+			expectedInstances: []InstanceInfo{
+				{
+					InstanceIndex: 0,
+					ContainerID:   "abc123",
+				},
 			},
 		},
 	}
@@ -867,21 +997,55 @@ func TestExtractConnectionDetails(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractConnectionDetails(tt.input)
 
-			if result.Host != tt.expected.Host {
-				t.Errorf("Host = %q, want %q", result.Host, tt.expected.Host)
+			if result.Host != tt.expectedHost {
+				t.Errorf("Host = %q, want %q", result.Host, tt.expectedHost)
 			}
-			if result.Port != tt.expected.Port {
-				t.Errorf("Port = %d, want %d", result.Port, tt.expected.Port)
+			if result.Protocol != tt.expectedProto {
+				t.Errorf("Protocol = %q, want %q", result.Protocol, tt.expectedProto)
 			}
-			if result.Protocol != tt.expected.Protocol {
-				t.Errorf("Protocol = %q, want %q", result.Protocol, tt.expected.Protocol)
+			if len(result.Metadata) != len(tt.expectedMeta) {
+				t.Errorf("Metadata length = %d, want %d", len(result.Metadata), len(tt.expectedMeta))
 			}
-			if len(result.Metadata) != len(tt.expected.Metadata) {
-				t.Errorf("Metadata length = %d, want %d", len(result.Metadata), len(tt.expected.Metadata))
-			}
-			for k, v := range tt.expected.Metadata {
+			for k, v := range tt.expectedMeta {
 				if result.Metadata[k] != v {
 					t.Errorf("Metadata[%q] = %q, want %q", k, result.Metadata[k], v)
+				}
+			}
+			if len(result.Ports) != len(tt.expectedPorts) {
+				t.Errorf("Ports length = %d, want %d", len(result.Ports), len(tt.expectedPorts))
+			}
+			for k, v := range tt.expectedPorts {
+				if result.Ports[k] != v {
+					t.Errorf("Ports[%q] = %+v, want %+v", k, result.Ports[k], v)
+				}
+			}
+
+			// Verify instances
+			if len(result.Instances) != len(tt.expectedInstances) {
+				t.Errorf("Instances length = %d, want %d", len(result.Instances), len(tt.expectedInstances))
+			} else {
+				for i, expected := range tt.expectedInstances {
+					actual := result.Instances[i]
+					if actual.InstanceIndex != expected.InstanceIndex {
+						t.Errorf("Instances[%d].InstanceIndex = %d, want %d", i, actual.InstanceIndex, expected.InstanceIndex)
+					}
+					if actual.ContainerID != expected.ContainerID {
+						t.Errorf("Instances[%d].ContainerID = %q, want %q", i, actual.ContainerID, expected.ContainerID)
+					}
+					if actual.Image != expected.Image {
+						t.Errorf("Instances[%d].Image = %q, want %q", i, actual.Image, expected.Image)
+					}
+					if actual.Status != expected.Status {
+						t.Errorf("Instances[%d].Status = %q, want %q", i, actual.Status, expected.Status)
+					}
+					if len(actual.Ports) != len(expected.Ports) {
+						t.Errorf("Instances[%d].Ports length = %d, want %d", i, len(actual.Ports), len(expected.Ports))
+					}
+					for k, v := range expected.Ports {
+						if actual.Ports[k] != v {
+							t.Errorf("Instances[%d].Ports[%q] = %+v, want %+v", i, k, actual.Ports[k], v)
+						}
+					}
 				}
 			}
 		})
@@ -924,8 +1088,13 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
-				"host":     "test.example.com",
-				"port":     8443,
+				"host": "test.example.com",
+				"ports": map[string]any{
+					"443/tcp": map[string]any{
+						"host_ip":   "0.0.0.0",
+						"host_port": "8443",
+					},
+				},
 				"protocol": "https",
 			})
 		}))
@@ -1004,8 +1173,13 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
-				"host":     "test.example.com",
-				"port":     8443,
+				"host": "test.example.com",
+				"ports": map[string]any{
+					"443/tcp": map[string]any{
+						"host_ip":   "0.0.0.0",
+						"host_port": "8443",
+					},
+				},
 				"protocol": "https",
 			})
 		}))
@@ -1070,8 +1244,13 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
-				"host":     "test.example.com",
-				"port":     8443,
+				"host": "test.example.com",
+				"ports": map[string]any{
+					"443/tcp": map[string]any{
+						"host_ip":   "0.0.0.0",
+						"host_port": "8443",
+					},
+				},
 				"protocol": "https",
 			})
 		}))
@@ -1677,8 +1856,13 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"host":     "test.example.com",
-			"port":     8443,
+			"host": "test.example.com",
+			"ports": map[string]any{
+				"443/tcp": map[string]any{
+					"host_ip":   "0.0.0.0",
+					"host_port": "8443",
+				},
+			},
 			"protocol": "https",
 		})
 	}))

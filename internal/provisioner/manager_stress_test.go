@@ -682,8 +682,9 @@ func BenchmarkManager_EndToEnd(b *testing.B) {
 	}
 
 	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		event := chain.LeaseEvent{
 			Type:         chain.LeaseCreated,
 			LeaseUUID:    fmt.Sprintf("bench-lease-%d", i),
@@ -691,6 +692,7 @@ func BenchmarkManager_EndToEnd(b *testing.B) {
 			Tenant:       "manifest1test",
 		}
 		mgr.PublishLeaseEvent(event)
+		i++
 	}
 
 	// Wait for all to be processed

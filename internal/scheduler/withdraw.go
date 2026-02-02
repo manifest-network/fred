@@ -138,12 +138,8 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 		return
 	}
 
-	// Track the goroutine for graceful shutdown
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.withdrawAndCheckCredits(ctx)
-	}()
+	// Track the goroutine for graceful shutdown (using WaitGroup.Go for Go 1.25+)
+	s.wg.Go(func() { s.withdrawAndCheckCredits(ctx) })
 }
 
 // Stop cancels the scheduler's internal context, stopping all operations.
