@@ -5,9 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -244,8 +244,11 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 // LeaseStatusResponse represents the response for lease status.
+// Includes tenant and provider_uuid for consistency with ConnectionResponse.
 type LeaseStatusResponse struct {
 	LeaseUUID           string `json:"lease_uuid"`
+	Tenant              string `json:"tenant"`
+	ProviderUUID        string `json:"provider_uuid"`
 	State               string `json:"state"`
 	RequiresPayload     bool   `json:"requires_payload"`
 	MetaHashHex         string `json:"meta_hash_hex,omitempty"` // For debugging - shows the expected payload hash
@@ -269,6 +272,8 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	hasMetaHash := len(auth.Lease.MetaHash) > 0
 	response := LeaseStatusResponse{
 		LeaseUUID:       leaseUUID,
+		Tenant:          auth.Token.Tenant,
+		ProviderUUID:    h.providerUUID,
 		State:           auth.Lease.State.String(),
 		RequiresPayload: hasMetaHash,
 	}
@@ -401,12 +406,20 @@ func (h *Handlers) extractToken(r *http.Request) (*AuthToken, error) {
 }
 
 // writeJSON writes a JSON response.
+// Pre-encodes to buffer to catch encoding errors before writing headers.
 func writeJSON(w http.ResponseWriter, data any, status int) {
+	// Encode first to catch errors before writing headers
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		slog.Error("failed to encode response", "error", err)
+		http.Error(w, `{"error":"internal encoding error"}`, http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		slog.Error("failed to encode response", "error", err)
-	}
+	_, _ = w.Write(encoded)
+	_, _ = w.Write([]byte("\n")) // Match json.Encoder behavior (adds newline)
 }
 
 // writeError writes an error response.
@@ -423,7 +436,9 @@ func writeError(w http.ResponseWriter, message string, status int) {
 func extractPortMapping(binding map[string]any) PortMapping {
 	var hostPort int
 	if hp, ok := binding["host_port"].(string); ok {
-		fmt.Sscanf(hp, "%d", &hostPort)
+		if parsed, err := strconv.Atoi(hp); err == nil {
+			hostPort = parsed
+		}
 	} else if hp, ok := binding["host_port"].(float64); ok {
 		hostPort = int(hp)
 	}
@@ -465,7 +480,9 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 		for containerPort, binding := range ports {
 			var hostPort int
 			if hp, ok := binding["host_port"]; ok {
-				fmt.Sscanf(hp, "%d", &hostPort)
+				if parsed, err := strconv.Atoi(hp); err == nil {
+					hostPort = parsed
+				}
 			}
 			details.Ports[containerPort] = PortMapping{
 				HostIP:   binding["host_ip"],

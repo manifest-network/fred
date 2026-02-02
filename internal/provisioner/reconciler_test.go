@@ -1843,3 +1843,81 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 		t.Errorf("expected 0 payloads remaining (all orphans cleaned), got %d", count)
 	}
 }
+
+// TestReconciler_ConcurrentReconcileAll tests that concurrent ReconcileAll calls
+// are properly serialized by the atomic flag.
+func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
+	// Create mock chain client that returns one pending lease
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+	}
+
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080/callbacks",
+		MaxWorkers:      2,
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() failed: %v", err)
+	}
+
+	// Start multiple concurrent ReconcileAll calls
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	start := make(chan struct{})
+	completed := make(chan struct{}, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+
+			_ = reconciler.ReconcileAll(context.Background())
+			completed <- struct{}{}
+		}()
+	}
+
+	// Start all goroutines simultaneously
+	close(start)
+	wg.Wait()
+	close(completed)
+
+	// Count how many completed
+	var completedCount int
+	for range completed {
+		completedCount++
+	}
+
+	// All should complete (either by running or skipping)
+	if completedCount != numGoroutines {
+		t.Errorf("expected %d goroutines to complete, got %d", numGoroutines, completedCount)
+	}
+
+	// At most ONE provision call should have been made
+	// (the atomic flag prevents concurrent reconciliation)
+	mockBackend.mu.Lock()
+	provisionCount := len(mockBackend.provisionCalls)
+	mockBackend.mu.Unlock()
+
+	if provisionCount > 1 {
+		t.Errorf("expected at most 1 provision call, got %d (concurrent reconciliation not prevented!)", provisionCount)
+	}
+}

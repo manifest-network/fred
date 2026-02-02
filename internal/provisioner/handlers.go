@@ -171,6 +171,7 @@ func (m *Manager) startProvisioning(ctx context.Context, lease *billingtypes.Lea
 	if opts.payload != nil {
 		slog.Info("provisioning started with payload",
 			"lease_uuid", lease.Uuid,
+			"tenant", lease.Tenant,
 			"sku", sku,
 			"total_quantity", totalQuantity,
 			"backend", backendClient.Name(),
@@ -179,6 +180,7 @@ func (m *Manager) startProvisioning(ctx context.Context, lease *billingtypes.Lea
 	} else {
 		slog.Info("provisioning started",
 			"lease_uuid", lease.Uuid,
+			"tenant", lease.Tenant,
 			"sku", sku,
 			"total_quantity", totalQuantity,
 			"backend", backendClient.Name(),
@@ -209,6 +211,7 @@ func (m *Manager) handleLeaseCreated(msg *message.Message) (err error) {
 	if lease == nil {
 		slog.Warn("lease not found, skipping",
 			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
 		)
 		return nil
 	}
@@ -238,7 +241,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 		return nil
 	}
 
-	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID)
+	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant)
 
 	// Clean up any stored payload for this lease.
 	// This handles the case where a tenant uploaded a payload but canceled the lease
@@ -249,6 +252,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 			m.payloadStore.Delete(event.LeaseUUID)
 			slog.Info("cleaned up stored payload for closed lease",
 				"lease_uuid", event.LeaseUUID,
+				"tenant", event.Tenant,
 			)
 		}
 	}
@@ -309,6 +313,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 		if err := backendClient.Deprovision(msg.Context(), event.LeaseUUID); err != nil {
 			slog.Error("failed to deprovision",
 				"lease_uuid", event.LeaseUUID,
+				"tenant", event.Tenant,
 				"backend", backendClient.Name(),
 				"error", err,
 			)
@@ -317,6 +322,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 
 		slog.Info("deprovisioned successfully",
 			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
 			"backend", backendClient.Name(),
 		)
 	} else {
@@ -324,6 +330,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 		// This ensures cleanup even if we can't determine the correct backend
 		slog.Warn("could not determine backend for deprovision, trying all backends",
 			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
 		)
 
 		var lastErr error
@@ -332,6 +339,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 			if err := b.Deprovision(msg.Context(), event.LeaseUUID); err != nil {
 				slog.Debug("deprovision from backend returned error",
 					"lease_uuid", event.LeaseUUID,
+					"tenant", event.Tenant,
 					"backend", b.Name(),
 					"error", err,
 				)
@@ -339,6 +347,7 @@ func (m *Manager) handleLeaseClosed(msg *message.Message) (err error) {
 			} else {
 				slog.Info("deprovisioned successfully",
 					"lease_uuid", event.LeaseUUID,
+					"tenant", event.Tenant,
 					"backend", b.Name(),
 				)
 				deprovisioned = true
@@ -383,6 +392,7 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 
 	slog.Info("processing backend callback",
 		"lease_uuid", callback.LeaseUUID,
+		"tenant", provision.Tenant,
 		"status", callback.Status,
 		"backend", provision.Backend,
 	)
@@ -410,12 +420,14 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 				metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
 				slog.Info("lease already acknowledged, skipping",
 					"lease_uuid", callback.LeaseUUID,
+					"tenant", provision.Tenant,
 				)
 				return nil
 			}
 
 			slog.Error("failed to acknowledge lease",
 				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
 				"error", err,
 			)
 			// Keep in-flight tracking for retry - Watermill will retry this message
@@ -434,6 +446,7 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
+			"tenant", provision.Tenant,
 			"acknowledged", acknowledged,
 			"tx_hash", txHash,
 		)
@@ -459,11 +472,13 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 			// Log but don't retry - the lease will eventually expire if rejection fails
 			slog.Error("failed to reject lease after provisioning failure",
 				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
 				"error", err,
 			)
 		} else {
 			slog.Info("lease rejected after provisioning failure",
 				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
 				"rejected", rejected,
 				"tx_hashes", txHashes,
 				"reason", reason,
@@ -480,6 +495,7 @@ func (m *Manager) handleBackendCallback(msg *message.Message) (err error) {
 
 		slog.Warn("unknown callback status, treating as terminal",
 			"lease_uuid", callback.LeaseUUID,
+			"tenant", provision.Tenant,
 			"status", callback.Status,
 		)
 	}
@@ -522,6 +538,7 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 	if lease == nil {
 		slog.Warn("lease not found, cleaning up payload",
 			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
 		)
 		m.payloadStore.Delete(event.LeaseUUID)
 		return nil
@@ -531,6 +548,7 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 	if lease.State != billingtypes.LEASE_STATE_PENDING {
 		slog.Warn("lease is no longer pending, skipping provisioning",
 			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
 			"state", lease.State.String(),
 		)
 		// Clean up the stored payload
@@ -549,6 +567,7 @@ func (m *Manager) handlePayloadReceived(msg *message.Message) (err error) {
 		// before publishing the event, but handle it gracefully
 		slog.Warn("payload not found in store, proceeding without payload",
 			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
 		)
 	} else if event.MetaHashHex != "" {
 		// Re-verify payload hash before provisioning to catch any corruption.

@@ -864,3 +864,64 @@ func TestVerifyPayloadHash_BinaryPayload(t *testing.T) {
 		t.Errorf("VerifyPayloadHash() error = %v, want nil for binary payload", err)
 	}
 }
+
+// TestPayloadStore_CloseDrainsPendingWrites tests that Close() properly drains
+// pending write operations so callers don't block forever.
+func TestPayloadStore_CloseDrainsPendingWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_drain.db")
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath:        dbPath,
+		TTL:           1 * time.Hour,
+		FlushInterval: 1 * time.Second, // Slow flush to ensure operations queue up
+		BatchSize:     100,             // Large batch size
+	})
+	if err != nil {
+		t.Fatalf("NewPayloadStore() error = %v", err)
+	}
+
+	// Start many concurrent writers
+	const numWriters = 50
+	var wg sync.WaitGroup
+	wg.Add(numWriters)
+
+	// Start writers that will queue up operations
+	for i := 0; i < numWriters; i++ {
+		go func(id int) {
+			defer wg.Done()
+			leaseUUID := strings.Repeat("a", 8) + "-" + string(rune('0'+id%10))
+			store.Store(leaseUUID, []byte("payload"))
+		}(i)
+	}
+
+	// Give writers a moment to start queueing
+	time.Sleep(10 * time.Millisecond)
+
+	// Close the store while writes are pending
+	// This should drain the queue and allow all writers to complete
+	closeDone := make(chan struct{})
+	go func() {
+		store.Close()
+		close(closeDone)
+	}()
+
+	// Wait for all writers with a timeout
+	writersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(writersDone)
+	}()
+
+	select {
+	case <-writersDone:
+		// Good - all writers completed
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for writers to complete - Close() did not drain pending operations")
+	}
+
+	select {
+	case <-closeDone:
+		// Good - Close completed
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for Close() to complete")
+	}
+}

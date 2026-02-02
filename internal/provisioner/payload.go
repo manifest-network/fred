@@ -474,7 +474,18 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Flush any pending operations before exiting
+			// Drain all remaining operations from channel before exiting.
+			// This prevents callers from blocking forever on resultCh.
+		drain:
+			for {
+				select {
+				case op := <-s.writeCh:
+					batch = append(batch, op)
+				default:
+					break drain
+				}
+			}
+			// Flush all collected operations (batch + drained from channel)
 			flush()
 			return
 
