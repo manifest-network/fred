@@ -73,7 +73,21 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 			return
 		}
 
-		// Remove from in-flight first
+		// Reject the lease on chain FIRST, before untracking.
+		// This prevents a race where the reconciler sees a PENDING lease that's
+		// not in-flight and tries to provision it again.
+		rejected, txHashes, err := c.rejecter.RejectLeases(ctx, []string{p.LeaseUUID}, "callback timeout")
+		if err != nil {
+			slog.Error("failed to reject timed-out lease, keeping in-flight to prevent re-provision",
+				"lease_uuid", p.LeaseUUID,
+				"error", err,
+			)
+			// Keep in-flight so reconciler doesn't try to re-provision.
+			// Next timeout check will retry the rejection.
+			continue
+		}
+
+		// Only untrack AFTER successful rejection
 		c.tracker.UntrackInFlight(p.LeaseUUID)
 		metrics.CallbackTimeoutsTotal.Inc()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend).Inc()
@@ -81,17 +95,6 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 		// Record duration (from start until timeout)
 		duration := now.Sub(p.StartTime).Seconds()
 		metrics.ProvisioningDuration.WithLabelValues(p.Backend).Observe(duration)
-
-		// Reject the lease on chain so tenant's credit is released
-		rejected, txHashes, err := c.rejecter.RejectLeases(ctx, []string{p.LeaseUUID}, "callback timeout")
-		if err != nil {
-			slog.Error("failed to reject timed-out lease",
-				"lease_uuid", p.LeaseUUID,
-				"error", err,
-			)
-			// Continue with next - reconciler will pick this up
-			continue
-		}
 
 		slog.Warn("rejected timed-out provision",
 			"lease_uuid", p.LeaseUUID,

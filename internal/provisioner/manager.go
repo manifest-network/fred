@@ -240,7 +240,8 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	// Note: ack batcher is started in NewManager() so handlers can use it immediately
 
-	// Start callback timeout checker in background
+	// Start callback timeout checker in background.
+	// This goroutine exits when ctx is canceled, which happens before Close() in production.
 	go m.timeoutChecker.Start(ctx)
 
 	// Run Watermill router (blocks until ctx canceled)
@@ -273,6 +274,11 @@ func (m *Manager) Close() error {
 	if err := m.wmRouter.Close(); err != nil {
 		return err
 	}
+
+	// Note: The timeout checker goroutine exits when its context is canceled.
+	// In production, the context is canceled before Close() is called,
+	// so the goroutine will have already exited or will exit promptly.
+	// We don't wait here because tests may call Close() without canceling the context.
 
 	// Close payload store if configured
 	if m.payloadStore != nil {

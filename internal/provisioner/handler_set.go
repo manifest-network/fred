@@ -209,38 +209,43 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		)
 
 	case backend.CallbackStatusFailed:
-		// Remove from in-flight - this is a terminal state, no retry needed
-		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
-		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
-
-		// Clean up payload - no point keeping it after terminal failure
-		if h.deps.PayloadStore != nil {
-			h.deps.PayloadStore.Delete(callback.LeaseUUID)
-		}
-
-		// Reject the lease on chain so tenant's credit is released immediately
+		// Reject the lease on chain FIRST, before untracking.
+		// This prevents a race where the reconciler sees a PENDING lease that's
+		// not in-flight and tries to provision it again.
 		reason := callback.Error
 		if reason == "" {
 			reason = "provisioning failed"
 		}
 		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, reason)
 		if err != nil {
-			// Log but don't retry - the lease will eventually expire if rejection fails
-			slog.Error("failed to reject lease after provisioning failure",
+			// Keep in-flight so reconciler doesn't try to re-provision.
+			// The timeout checker or next reconciliation will retry.
+			slog.Error("failed to reject lease after provisioning failure, keeping in-flight",
 				"lease_uuid", callback.LeaseUUID,
 				"tenant", provision.Tenant,
 				"error", err,
 			)
-		} else {
-			slog.Info("lease rejected after provisioning failure",
-				"lease_uuid", callback.LeaseUUID,
-				"tenant", provision.Tenant,
-				"rejected", rejected,
-				"tx_hashes", txHashes,
-				"reason", reason,
-			)
+			// Return error to trigger Watermill retry
+			return fmt.Errorf("failed to reject lease %s: %w", callback.LeaseUUID, err)
 		}
+
+		// Only untrack AFTER successful rejection
+		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+		recordDuration()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+
+		// Clean up payload after successful rejection
+		if h.deps.PayloadStore != nil {
+			h.deps.PayloadStore.Delete(callback.LeaseUUID)
+		}
+
+		slog.Info("lease rejected after provisioning failure",
+			"lease_uuid", callback.LeaseUUID,
+			"tenant", provision.Tenant,
+			"rejected", rejected,
+			"tx_hashes", txHashes,
+			"reason", reason,
+		)
 
 	default:
 		// Unknown status is treated as terminal to prevent leases from being stuck

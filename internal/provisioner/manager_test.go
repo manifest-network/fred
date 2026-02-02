@@ -2392,11 +2392,15 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		// Run timeout check - should not panic
 		failManager.checkCallbackTimeouts(context.Background())
 
-		// Lease should be removed from in-flight even on chain error
-		// (metrics recorded, reconciler will pick up later)
-		if failManager.IsInFlight("fail-lease") {
-			t.Error("lease should be removed from in-flight even on chain reject error")
+		// Lease should REMAIN in-flight when chain reject fails
+		// This prevents the reconciler from seeing a PENDING lease not in-flight
+		// and trying to re-provision it. The next timeout check will retry the rejection.
+		if !failManager.IsInFlight("fail-lease") {
+			t.Error("lease should remain in-flight when chain reject fails to prevent re-provisioning")
 		}
+
+		// Clean up
+		failManager.UntrackInFlight("fail-lease")
 	})
 }
 

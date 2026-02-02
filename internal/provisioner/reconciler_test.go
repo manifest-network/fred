@@ -1911,9 +1911,15 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 // TestReconciler_ConcurrentReconcileAll tests that concurrent ReconcileAll calls
 // are properly serialized by the atomic flag.
 func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
-	// Create mock chain client that returns one pending lease
+	// Create mock chain client that returns one pending lease.
+	// Add a delay to ensure reconciliation takes some time, which allows us to
+	// verify that concurrent calls are properly serialized by the atomic flag.
 	mockChain := &chain.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			// Small delay to ensure concurrent ReconcileAll calls overlap.
+			// Without this, the first call would complete before others even start,
+			// making them sequential rather than concurrent.
+			time.Sleep(10 * time.Millisecond)
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
 			}, nil

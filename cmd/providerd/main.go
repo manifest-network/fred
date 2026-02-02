@@ -51,15 +51,29 @@ var (
 	}
 )
 
+// sdkConfigOnce ensures SDK config is only set once, even if init() runs multiple times
+// (e.g., in tests) or if a dependency already configured it.
+var sdkConfigOnce sync.Once
+
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "path to config file")
 
-	// Configure SDK with manifest bech32 prefixes
-	config := sdk.GetConfig()
-	config.SetBech32PrefixForAccount("manifest", "manifestpub")
-	config.SetBech32PrefixForValidator("manifestvaloper", "manifestvaloperpub")
-	config.SetBech32PrefixForConsensusNode("manifestvalcons", "manifestvalconspub")
-	config.Seal()
+	// Configure SDK with manifest bech32 prefixes.
+	// Use sync.Once to prevent panic if config is already sealed by a dependency.
+	sdkConfigOnce.Do(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Config was already sealed by another package - this is fine,
+				// as long as it was configured with the same prefixes.
+				slog.Debug("SDK config already sealed", "recovered", r)
+			}
+		}()
+		config := sdk.GetConfig()
+		config.SetBech32PrefixForAccount("manifest", "manifestpub")
+		config.SetBech32PrefixForValidator("manifestvaloper", "manifestvaloperpub")
+		config.SetBech32PrefixForConsensusNode("manifestvalcons", "manifestvalconspub")
+		config.Seal()
+	})
 }
 
 func main() {

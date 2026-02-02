@@ -214,6 +214,11 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 
 		timer := time.NewTimer(waitDuration)
 
+		// Get internal context for select - this allows Stop() to wake us up
+		s.ctxMu.RLock()
+		internalCtx := s.ctx
+		s.ctxMu.RUnlock()
+
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -230,8 +235,26 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 			slog.Info("withdrawal scheduler stopped")
 			return ctx.Err()
 
+		case <-internalCtx.Done():
+			// Stop() was called - exit the loop
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			s.wg.Wait()
+			slog.Info("withdrawal scheduler stopped via Stop()")
+			return nil
+
 		case <-timer.C:
 			// Timer fired, no need to stop but good practice to ensure cleanup
+		}
+
+		// Check if we should stop before doing work
+		if internalCtx.Err() != nil {
+			s.wg.Wait()
+			return nil
 		}
 
 		s.withdrawAndCheckCredits(ctx)
