@@ -91,7 +91,10 @@ Start provisioning a resource asynchronously.
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
-  "sku": "docker-nginx",
+  "items": [
+    {"sku": "docker-nginx", "quantity": 1},
+    {"sku": "docker-redis", "quantity": 2}
+  ],
   "callback_url": "http://fred:8080/callbacks/provision",
   "payload": "base64-encoded-bytes",
   "payload_hash": "sha256-hex-string"
