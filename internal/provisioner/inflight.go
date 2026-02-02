@@ -2,255 +2,75 @@ package provisioner
 
 import (
 	"context"
-	"log/slog"
-	"maps"
-	"slices"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/metrics"
 )
 
-// inFlightProvision represents a lease that is currently being provisioned.
-type inFlightProvision struct {
-	LeaseUUID string
-	Tenant    string
-	Items     []backend.LeaseItem // All items being provisioned
-	Backend   string
-	StartTime time.Time // For duration metrics
-}
-
-// RoutingSKU returns the first SKU for backend routing decisions.
-//
-// Used during deprovision when we need to determine which backend handled
-// a lease but only have the in-flight tracking data. Since all items in a
-// lease belong to the same provider, any SKU works for routing.
-//
-// This should NOT be used for resource calculations - use Items directly.
-func (p inFlightProvision) RoutingSKU() string {
-	if len(p.Items) == 0 {
-		return ""
-	}
-	return p.Items[0].SKU
-}
-
-// TrackInFlight registers a lease as being provisioned.
-// This allows the manager to handle callbacks for this lease.
+// TrackInFlight delegates to the tracker.
 func (m *Manager) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
-	m.inFlightMu.Lock()
-	defer m.inFlightMu.Unlock()
-	m.inFlight[leaseUUID] = inFlightProvision{
-		LeaseUUID: leaseUUID,
-		Tenant:    tenant,
-		Items:     items,
-		Backend:   backendName,
-		StartTime: time.Now(),
-	}
-	metrics.InFlightProvisions.Inc()
+	m.tracker.TrackInFlight(leaseUUID, tenant, items, backendName)
 }
 
-// TryTrackInFlight atomically checks if a lease is already in-flight and tracks it if not.
-// Returns true if the lease was successfully tracked (was not already in-flight),
-// false if the lease was already being provisioned.
-// This prevents TOCTOU races between checking and tracking.
+// TryTrackInFlight delegates to the tracker.
 func (m *Manager) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	m.inFlightMu.Lock()
-	defer m.inFlightMu.Unlock()
-	if _, exists := m.inFlight[leaseUUID]; exists {
-		return false
-	}
-	m.inFlight[leaseUUID] = inFlightProvision{
-		LeaseUUID: leaseUUID,
-		Tenant:    tenant,
-		Items:     items,
-		Backend:   backendName,
-		StartTime: time.Now(),
-	}
-	metrics.InFlightProvisions.Inc()
-	return true
+	return m.tracker.TryTrackInFlight(leaseUUID, tenant, items, backendName)
 }
 
-// UntrackInFlight removes a lease from the in-flight tracking.
+// UntrackInFlight delegates to the tracker.
 func (m *Manager) UntrackInFlight(leaseUUID string) {
-	m.inFlightMu.Lock()
-	defer m.inFlightMu.Unlock()
-	if _, exists := m.inFlight[leaseUUID]; exists {
-		delete(m.inFlight, leaseUUID)
-		metrics.InFlightProvisions.Dec()
-	}
+	m.tracker.UntrackInFlight(leaseUUID)
 }
 
-// IsInFlight checks if a lease is currently being provisioned.
+// IsInFlight delegates to the tracker.
 func (m *Manager) IsInFlight(leaseUUID string) bool {
-	m.inFlightMu.RLock()
-	defer m.inFlightMu.RUnlock()
-	_, exists := m.inFlight[leaseUUID]
-	return exists
+	return m.tracker.IsInFlight(leaseUUID)
 }
 
-// PopInFlight atomically removes and returns an in-flight provision.
-// Returns the provision info and true if found, or zero value and false if not found.
-func (m *Manager) PopInFlight(leaseUUID string) (inFlightProvision, bool) {
-	m.inFlightMu.Lock()
-	defer m.inFlightMu.Unlock()
-	provision, exists := m.inFlight[leaseUUID]
-	if exists {
-		delete(m.inFlight, leaseUUID)
-		metrics.InFlightProvisions.Dec()
-	}
-	return provision, exists
+// PopInFlight delegates to the tracker.
+func (m *Manager) PopInFlight(leaseUUID string) (InFlightProvision, bool) {
+	return m.tracker.PopInFlight(leaseUUID)
 }
 
-// GetInFlight returns the in-flight provision info without removing it.
-// Returns the provision info and true if found, or zero value and false if not found.
-func (m *Manager) GetInFlight(leaseUUID string) (inFlightProvision, bool) {
-	m.inFlightMu.RLock()
-	defer m.inFlightMu.RUnlock()
-	provision, exists := m.inFlight[leaseUUID]
-	return provision, exists
+// GetInFlight delegates to the tracker.
+func (m *Manager) GetInFlight(leaseUUID string) (InFlightProvision, bool) {
+	return m.tracker.GetInFlight(leaseUUID)
 }
 
-// InFlightCount returns the number of provisions currently in flight.
+// InFlightCount delegates to the tracker.
 func (m *Manager) InFlightCount() int {
-	m.inFlightMu.RLock()
-	defer m.inFlightMu.RUnlock()
-	return len(m.inFlight)
+	return m.tracker.InFlightCount()
 }
 
-// GetInFlightLeases returns a snapshot of all in-flight lease UUIDs.
-// Used for logging during shutdown.
+// GetInFlightLeases delegates to the tracker.
 func (m *Manager) GetInFlightLeases() []string {
-	m.inFlightMu.RLock()
-	defer m.inFlightMu.RUnlock()
-
-	return slices.Collect(maps.Keys(m.inFlight))
+	return m.tracker.GetInFlightLeases()
 }
 
-// WaitForDrain waits for all in-flight provisions to complete, up to the given timeout.
-// Returns the number of provisions that were still in-flight when the timeout expired.
-// If all provisions complete before the timeout, returns 0.
+// WaitForDrain delegates to the tracker.
 func (m *Manager) WaitForDrain(ctx context.Context, timeout time.Duration) int {
-	if m.InFlightCount() == 0 {
-		return 0
-	}
-
-	slog.Info("waiting for in-flight provisions to drain",
-		"count", m.InFlightCount(),
-		"timeout", timeout,
-	)
-
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			remaining := m.InFlightCount()
-			if remaining > 0 {
-				slog.Warn("drain interrupted by context cancellation",
-					"remaining", remaining,
-					"leases", m.GetInFlightLeases(),
-				)
-			}
-			return remaining
-
-		case <-ticker.C:
-			count := m.InFlightCount()
-			if count == 0 {
-				slog.Info("all in-flight provisions drained successfully")
-				return 0
-			}
-
-			if time.Now().After(deadline) {
-				slog.Warn("drain timeout expired with provisions still in-flight",
-					"remaining", count,
-					"leases", m.GetInFlightLeases(),
-				)
-				return count
-			}
-
-			slog.Debug("waiting for provisions to drain",
-				"remaining", count,
-				"time_left", time.Until(deadline).Round(time.Second),
-			)
-		}
-	}
+	return m.tracker.WaitForDrain(ctx, timeout)
 }
 
-// runTimeoutChecker periodically checks for timed-out provisions and rejects them.
-func (m *Manager) runTimeoutChecker(ctx context.Context) {
-	ticker := time.NewTicker(m.timeoutCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			m.checkCallbackTimeouts(ctx)
-		}
-	}
+// GetTimedOutProvisions delegates to the tracker.
+func (m *Manager) GetTimedOutProvisions(timeout time.Duration) []InFlightProvision {
+	return m.tracker.GetTimedOutProvisions(timeout)
 }
 
-// checkCallbackTimeouts checks for provisions that have exceeded the callback timeout
-// and rejects them so the tenant's credit is released.
+// Tracker returns the internal tracker for testing purposes.
+// This should only be used in tests.
+func (m *Manager) Tracker() InFlightTracker {
+	return m.tracker
+}
+
+// TimeoutChecker returns the internal timeout checker for testing purposes.
+// This should only be used in tests.
+func (m *Manager) TimeoutChecker() *TimeoutChecker {
+	return m.timeoutChecker
+}
+
+// checkCallbackTimeouts delegates to the timeout checker for testing.
+// This is called by tests that directly invoke timeout checking.
 func (m *Manager) checkCallbackTimeouts(ctx context.Context) {
-	now := time.Now()
-	var timedOut []inFlightProvision
-
-	// Find timed-out provisions under read lock
-	m.inFlightMu.RLock()
-	for _, p := range m.inFlight {
-		if now.Sub(p.StartTime) > m.callbackTimeout {
-			timedOut = append(timedOut, p)
-		}
-	}
-	m.inFlightMu.RUnlock()
-
-	if len(timedOut) == 0 {
-		return
-	}
-
-	slog.Warn("found timed-out provisions",
-		"count", len(timedOut),
-		"timeout", m.callbackTimeout,
-	)
-
-	// Process each timed-out provision
-	for _, p := range timedOut {
-		// Check context before each operation
-		if ctx.Err() != nil {
-			return
-		}
-
-		// Remove from in-flight first
-		m.UntrackInFlight(p.LeaseUUID)
-		metrics.CallbackTimeoutsTotal.Inc()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend).Inc()
-
-		// Record duration (from start until timeout)
-		duration := now.Sub(p.StartTime).Seconds()
-		metrics.ProvisioningDuration.WithLabelValues(p.Backend).Observe(duration)
-
-		// Reject the lease on chain so tenant's credit is released
-		rejected, txHashes, err := m.chainClient.RejectLeases(ctx, []string{p.LeaseUUID}, "callback timeout")
-		if err != nil {
-			slog.Error("failed to reject timed-out lease",
-				"lease_uuid", p.LeaseUUID,
-				"error", err,
-			)
-			// Continue with next - reconciler will pick this up
-			continue
-		}
-
-		slog.Warn("rejected timed-out provision",
-			"lease_uuid", p.LeaseUUID,
-			"tenant", p.Tenant,
-			"backend", p.Backend,
-			"age", now.Sub(p.StartTime),
-			"rejected", rejected,
-			"tx_hashes", txHashes,
-		)
-	}
+	m.timeoutChecker.CheckOnce(ctx)
 }

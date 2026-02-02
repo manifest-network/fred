@@ -1,0 +1,347 @@
+package provisioner
+
+import (
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/ThreeDotsLabs/watermill/message"
+
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/metrics"
+)
+
+// HandlerDeps contains the dependencies needed by the handler set.
+type HandlerDeps struct {
+	ChainClient  ChainClient
+	Orchestrator *ProvisionOrchestrator
+	Tracker      InFlightTracker
+	Acknowledger Acknowledger
+	PayloadStore *PayloadStore
+}
+
+// HandlerSet contains the Watermill message handlers for the provisioner.
+// It encapsulates all handler methods and their dependencies.
+type HandlerSet struct {
+	deps HandlerDeps
+}
+
+// NewHandlerSet creates a new HandlerSet with the given dependencies.
+func NewHandlerSet(deps HandlerDeps) *HandlerSet {
+	return &HandlerSet{deps: deps}
+}
+
+// HandleLeaseCreated processes new lease events.
+func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
+	defer func() { recordWatermillMetrics(TopicLeaseCreated, err) }()
+
+	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseCreated)
+	if !ok {
+		return nil
+	}
+
+	// Fetch lease details from chain to get SKU for routing
+	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)
+	if err != nil {
+		slog.Error("failed to fetch lease details",
+			"lease_uuid", event.LeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("failed to fetch lease %s: %w", event.LeaseUUID, err)
+	}
+	if lease == nil {
+		slog.Warn("lease not found, skipping",
+			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
+		)
+		return nil
+	}
+
+	// Check if lease requires a payload (has MetaHash)
+	// If so, skip immediate provisioning - wait for payload upload
+	if len(lease.MetaHash) > 0 {
+		metrics.LeasesAwaitingPayloadTotal.Inc()
+		slog.Info("lease requires payload, awaiting upload",
+			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
+			"meta_hash_hex", fmt.Sprintf("%x", lease.MetaHash),
+		)
+		return nil // Don't provision yet - wait for payload
+	}
+
+	// Start provisioning without payload
+	return h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+}
+
+// HandleLeaseClosed processes lease closure events.
+func (h *HandlerSet) HandleLeaseClosed(msg *message.Message) (err error) {
+	defer func() { recordWatermillMetrics(TopicLeaseClosed, err) }()
+
+	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseClosed)
+	if !ok {
+		return nil
+	}
+
+	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant)
+
+	// Clean up any stored payload for this lease.
+	// This handles the case where a tenant uploaded a payload but canceled the lease
+	// before provisioning started, or any other scenario where payload exists but
+	// the lease is no longer valid.
+	if h.deps.PayloadStore != nil {
+		if h.deps.PayloadStore.Has(event.LeaseUUID) {
+			h.deps.PayloadStore.Delete(event.LeaseUUID)
+			slog.Info("cleaned up stored payload for closed lease",
+				"lease_uuid", event.LeaseUUID,
+				"tenant", event.Tenant,
+			)
+		}
+	}
+
+	// Get SKU hint from chain for routing if lease is not in-flight.
+	// The orchestrator will try in-flight tracking first, then fall back to SKU hint.
+	var skuHint string
+	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)
+	if err != nil {
+		slog.Warn("failed to fetch lease details for deprovision routing",
+			"lease_uuid", event.LeaseUUID,
+			"error", err,
+		)
+		// Continue without SKU hint - orchestrator will try all backends
+	} else if lease != nil {
+		skuHint = ExtractRoutingSKU(lease)
+	}
+
+	// Delegate to orchestrator for deprovisioning
+	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID, skuHint)
+}
+
+// HandleLeaseExpired processes lease expiration events.
+func (h *HandlerSet) HandleLeaseExpired(msg *message.Message) error {
+	// Same handling as closed - deprovision the resource
+	return h.HandleLeaseClosed(msg)
+}
+
+// HandleBackendCallback processes callbacks from backends.
+func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
+	defer func() { recordWatermillMetrics(TopicBackendCallback, err) }()
+
+	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, TopicBackendCallback)
+	if !ok {
+		return nil
+	}
+
+	// Check if this lease is in-flight (idempotency check)
+	// Ignore callbacks for unknown/already-processed leases to prevent:
+	// - Duplicate on-chain transactions from replay attacks
+	// - Processing misrouted callbacks from other providers
+	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
+	if !exists {
+		slog.Warn("ignoring callback for unknown or already-processed lease",
+			"lease_uuid", callback.LeaseUUID,
+			"status", callback.Status,
+		)
+		return nil // Don't retry - this is not an error
+	}
+
+	slog.Info("processing backend callback",
+		"lease_uuid", callback.LeaseUUID,
+		"tenant", provision.Tenant,
+		"status", callback.Status,
+		"backend", provision.Backend,
+	)
+
+	// Record provisioning duration if we have the start time
+	recordDuration := func() {
+		if !provision.StartTime.IsZero() {
+			duration := time.Since(provision.StartTime).Seconds()
+			metrics.ProvisioningDuration.WithLabelValues(provision.Backend).Observe(duration)
+		}
+	}
+
+	switch callback.Status {
+	case backend.CallbackStatusSuccess:
+		// Acknowledge the lease on chain via batcher to avoid sequence mismatch errors
+		acknowledged, txHash, err := h.deps.Acknowledger.Acknowledge(msg.Context(), callback.LeaseUUID)
+		if err != nil {
+			// Check if this is a terminal error (e.g., lease already acknowledged)
+			if isTerminalAcknowledgeError(err) {
+				// Lease is already in a non-PENDING state (likely already ACTIVE).
+				// This can happen if we received a duplicate callback or the reconciler
+				// already acknowledged it. Treat as success - the lease is active.
+				h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+				recordDuration()
+				metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
+				slog.Info("lease already acknowledged, skipping",
+					"lease_uuid", callback.LeaseUUID,
+					"tenant", provision.Tenant,
+				)
+				return nil
+			}
+
+			slog.Error("failed to acknowledge lease",
+				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
+				"error", err,
+			)
+			// Keep in-flight tracking for retry - Watermill will retry this message
+			return fmt.Errorf("%w: lease %s: %w", ErrAcknowledgeFailed, callback.LeaseUUID, err)
+		}
+
+		// Only remove from in-flight after successful acknowledgment
+		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+		recordDuration()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
+
+		// Clean up payload now that provisioning is confirmed successful
+		if h.deps.PayloadStore != nil {
+			h.deps.PayloadStore.Delete(callback.LeaseUUID)
+		}
+
+		slog.Info("lease acknowledged after provisioning",
+			"lease_uuid", callback.LeaseUUID,
+			"tenant", provision.Tenant,
+			"acknowledged", acknowledged,
+			"tx_hash", txHash,
+		)
+
+	case backend.CallbackStatusFailed:
+		// Remove from in-flight - this is a terminal state, no retry needed
+		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+		recordDuration()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+
+		// Clean up payload - no point keeping it after terminal failure
+		if h.deps.PayloadStore != nil {
+			h.deps.PayloadStore.Delete(callback.LeaseUUID)
+		}
+
+		// Reject the lease on chain so tenant's credit is released immediately
+		reason := callback.Error
+		if reason == "" {
+			reason = "provisioning failed"
+		}
+		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, reason)
+		if err != nil {
+			// Log but don't retry - the lease will eventually expire if rejection fails
+			slog.Error("failed to reject lease after provisioning failure",
+				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
+				"error", err,
+			)
+		} else {
+			slog.Info("lease rejected after provisioning failure",
+				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
+				"rejected", rejected,
+				"tx_hashes", txHashes,
+				"reason", reason,
+			)
+		}
+
+	default:
+		// Unknown status is treated as terminal to prevent leases from being stuck
+		// in the in-flight map indefinitely. The reconciler will pick up the lease
+		// and handle it based on its actual chain/backend state.
+		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+		recordDuration()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, provision.Backend).Inc()
+
+		slog.Warn("unknown callback status, treating as terminal",
+			"lease_uuid", callback.LeaseUUID,
+			"tenant", provision.Tenant,
+			"status", callback.Status,
+		)
+	}
+
+	return nil
+}
+
+// HandlePayloadReceived processes payload upload events.
+// This triggers provisioning for leases that were waiting for a payload.
+func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
+	defer func() { recordWatermillMetrics(TopicPayloadReceived, err) }()
+
+	// Guard against nil payloadStore - this shouldn't happen in normal operation
+	// since payload events are only published after successful storage, but
+	// handle it gracefully for robustness.
+	if h.deps.PayloadStore == nil {
+		slog.Error("payload store not configured, cannot process payload event")
+		return nil // Don't retry - configuration issue
+	}
+
+	event, ok := unmarshalMessagePayload[PayloadEvent](msg, TopicPayloadReceived)
+	if !ok {
+		return nil
+	}
+
+	slog.Info("processing payload received",
+		"lease_uuid", event.LeaseUUID,
+		"tenant", event.Tenant,
+	)
+
+	// Fetch lease details from chain to get SKU for routing
+	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)
+	if err != nil {
+		slog.Error("failed to fetch lease details",
+			"lease_uuid", event.LeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("failed to fetch lease %s: %w", event.LeaseUUID, err)
+	}
+	if lease == nil {
+		slog.Warn("lease not found, cleaning up payload",
+			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
+		)
+		h.deps.PayloadStore.Delete(event.LeaseUUID)
+		return nil
+	}
+
+	// Verify lease is still pending
+	if lease.State != billingtypes.LEASE_STATE_PENDING {
+		slog.Warn("lease is no longer pending, skipping provisioning",
+			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
+			"state", lease.State.String(),
+		)
+		// Clean up the stored payload
+		h.deps.PayloadStore.Delete(event.LeaseUUID)
+		return nil
+	}
+
+	// Get the payload from the store WITHOUT removing it yet.
+	// We only delete after Provision() succeeds to allow retries.
+	// Note: Payload is NOT deleted here. It will be deleted by HandleBackendCallback
+	// after the backend reports success or failure. This ensures the payload remains
+	// available for retry if the backend fails or crashes before sending a callback.
+	payload := h.deps.PayloadStore.Get(event.LeaseUUID)
+	if payload == nil {
+		// This shouldn't happen in normal operation since payload is stored
+		// before publishing the event, but handle it gracefully
+		slog.Warn("payload not found in store, proceeding without payload",
+			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
+		)
+	} else if event.MetaHashHex != "" {
+		// Re-verify payload hash before provisioning to catch any corruption.
+		// The payload was validated on upload, but disk corruption could occur.
+		if err := VerifyPayloadHashHex(payload, event.MetaHashHex); err != nil {
+			h.deps.PayloadStore.Delete(event.LeaseUUID)
+			slog.Error("payload hash mismatch - possible corruption",
+				"lease_uuid", event.LeaseUUID,
+				"error", err,
+			)
+			return err
+		}
+	}
+
+	// Start provisioning with payload
+	return h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
+		Payload:     payload,
+		PayloadHash: event.MetaHashHex,
+	})
+}

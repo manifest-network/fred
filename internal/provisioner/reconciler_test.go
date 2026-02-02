@@ -1723,34 +1723,98 @@ func (m *mockConcurrencyBackend) Health(ctx context.Context) error {
 	return nil
 }
 
-// mockInFlightTracker implements InFlightTracker for testing orphaned payload cleanup.
+// mockInFlightTracker implements ReconcilerTracker for testing orphaned payload cleanup.
 type mockInFlightTracker struct {
 	payloadStore *PayloadStore
-	inFlight     map[string]bool
+	inFlight     map[string]InFlightProvision
 	mu           sync.Mutex
 }
 
 func newMockInFlightTracker(payloadStore *PayloadStore) *mockInFlightTracker {
 	return &mockInFlightTracker{
 		payloadStore: payloadStore,
-		inFlight:     make(map[string]bool),
+		inFlight:     make(map[string]InFlightProvision),
 	}
 }
 
 func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.inFlight[leaseUUID] {
+	if _, exists := m.inFlight[leaseUUID]; exists {
 		return false
 	}
-	m.inFlight[leaseUUID] = true
+	m.inFlight[leaseUUID] = InFlightProvision{
+		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
+		Items:     items,
+		Backend:   backendName,
+	}
 	return true
+}
+
+func (m *mockInFlightTracker) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inFlight[leaseUUID] = InFlightProvision{
+		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
+		Items:     items,
+		Backend:   backendName,
+	}
 }
 
 func (m *mockInFlightTracker) UntrackInFlight(leaseUUID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.inFlight, leaseUUID)
+}
+
+func (m *mockInFlightTracker) PopInFlight(leaseUUID string) (InFlightProvision, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, exists := m.inFlight[leaseUUID]
+	if exists {
+		delete(m.inFlight, leaseUUID)
+	}
+	return p, exists
+}
+
+func (m *mockInFlightTracker) GetInFlight(leaseUUID string) (InFlightProvision, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, exists := m.inFlight[leaseUUID]
+	return p, exists
+}
+
+func (m *mockInFlightTracker) IsInFlight(leaseUUID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, exists := m.inFlight[leaseUUID]
+	return exists
+}
+
+func (m *mockInFlightTracker) InFlightCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.inFlight)
+}
+
+func (m *mockInFlightTracker) GetInFlightLeases() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	leases := make([]string, 0, len(m.inFlight))
+	for k := range m.inFlight {
+		leases = append(leases, k)
+	}
+	return leases
+}
+
+func (m *mockInFlightTracker) WaitForDrain(ctx context.Context, timeout time.Duration) int {
+	return m.InFlightCount()
+}
+
+func (m *mockInFlightTracker) GetTimedOutProvisions(timeout time.Duration) []InFlightProvision {
+	return nil
 }
 
 func (m *mockInFlightTracker) HasPayload(leaseUUID string) bool {

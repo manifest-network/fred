@@ -2278,15 +2278,8 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		mu.Unlock()
 
 		// Track a lease with an artificial old start time
-		manager.inFlightMu.Lock()
-		manager.inFlight["timeout-lease"] = inFlightProvision{
-			LeaseUUID: "timeout-lease",
-			Tenant:    "tenant-1",
-			Items:     testItems("test-sku"),
-			Backend:   "test",
-			StartTime: time.Now().Add(-1 * time.Hour), // Very old
-		}
-		manager.inFlightMu.Unlock()
+		tracker := manager.Tracker().(*DefaultInFlightTracker)
+		tracker.TrackInFlightWithStartTime("timeout-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
 
 		// Run timeout check
 		manager.checkCallbackTimeouts(context.Background())
@@ -2345,18 +2338,11 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		mu.Unlock()
 
 		// Track multiple old leases
-		manager.inFlightMu.Lock()
+		tracker := manager.Tracker().(*DefaultInFlightTracker)
 		for i := range 5 {
 			leaseID := "cancel-lease-" + string(rune('a'+i))
-			manager.inFlight[leaseID] = inFlightProvision{
-				LeaseUUID: leaseID,
-				Tenant:    "tenant-1",
-				Items:     testItems("test-sku"),
-				Backend:   "test",
-				StartTime: time.Now().Add(-1 * time.Hour),
-			}
+			tracker.TrackInFlightWithStartTime(leaseID, "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
 		}
-		manager.inFlightMu.Unlock()
 
 		// Cancel context immediately
 		ctx, cancel := context.WithCancel(context.Background())
@@ -2376,11 +2362,9 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		}
 
 		// Cleanup remaining
-		manager.inFlightMu.Lock()
-		for leaseID := range manager.inFlight {
-			delete(manager.inFlight, leaseID)
+		for _, leaseID := range manager.GetInFlightLeases() {
+			manager.UntrackInFlight(leaseID)
 		}
-		manager.inFlightMu.Unlock()
 	})
 
 	t.Run("handles_chain_reject_error", func(t *testing.T) {
@@ -2402,15 +2386,8 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		}
 
 		// Track an old lease
-		failManager.inFlightMu.Lock()
-		failManager.inFlight["fail-lease"] = inFlightProvision{
-			LeaseUUID: "fail-lease",
-			Tenant:    "tenant-1",
-			Items:     testItems("test-sku"),
-			Backend:   "test",
-			StartTime: time.Now().Add(-1 * time.Hour),
-		}
-		failManager.inFlightMu.Unlock()
+		tracker := failManager.Tracker().(*DefaultInFlightTracker)
+		tracker.TrackInFlightWithStartTime("fail-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
 
 		// Run timeout check - should not panic
 		failManager.checkCallbackTimeouts(context.Background())
@@ -2456,18 +2433,11 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go manager.runTimeoutChecker(ctx)
+	go manager.TimeoutChecker().Start(ctx)
 
 	// Track a lease that will timeout
-	manager.inFlightMu.Lock()
-	manager.inFlight["auto-timeout-lease"] = inFlightProvision{
-		LeaseUUID: "auto-timeout-lease",
-		Tenant:    "tenant-1",
-		Items:     testItems("test-sku"),
-		Backend:   "test",
-		StartTime: time.Now().Add(-1 * time.Second), // Already old
-	}
-	manager.inFlightMu.Unlock()
+	tracker := manager.Tracker().(*DefaultInFlightTracker)
+	tracker.TrackInFlightWithStartTime("auto-timeout-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Second))
 
 	// Wait for timeout checker to run
 	time.Sleep(100 * time.Millisecond)

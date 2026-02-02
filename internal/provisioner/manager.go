@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/ThreeDotsLabs/watermill"
@@ -65,8 +64,8 @@ type ChainClient interface {
 	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
 
-// Compile-time check that Manager implements InFlightTracker.
-var _ InFlightTracker = (*Manager)(nil)
+// Compile-time check that Manager implements ReconcilerTracker.
+var _ ReconcilerTracker = (*Manager)(nil)
 
 // Manager handles the provisioning lifecycle using Watermill for event routing.
 type Manager struct {
@@ -80,10 +79,18 @@ type Manager struct {
 	ackBatcher      *AckBatcher
 
 	// Track in-flight provisions (ephemeral - recovered via reconciliation)
-	inFlight   map[string]inFlightProvision
-	inFlightMu sync.RWMutex
+	tracker InFlightTracker
 
-	// Callback timeout handling
+	// Orchestrator for provisioning coordination
+	orchestrator *ProvisionOrchestrator
+
+	// Handler set for Watermill message handlers
+	handlers *HandlerSet
+
+	// Timeout checker for callback timeouts
+	timeoutChecker *TimeoutChecker
+
+	// Callback timeout handling (stored for external access if needed)
 	callbackTimeout      time.Duration
 	timeoutCheckInterval time.Duration
 }
@@ -152,6 +159,22 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	// This uses a background context; Stop() will still properly shut it down.
 	ackBatcher.Start(context.Background())
 
+	tracker := NewInFlightTracker()
+	orchestrator := NewProvisionOrchestrator(cfg.ProviderUUID, cfg.CallbackBaseURL, router, tracker)
+	handlers := NewHandlerSet(HandlerDeps{
+		ChainClient:  chainClient,
+		Orchestrator: orchestrator,
+		Tracker:      tracker,
+		Acknowledger: ackBatcher,
+		PayloadStore: cfg.PayloadStore,
+	})
+	timeoutChecker := NewTimeoutChecker(TimeoutCheckerConfig{
+		Tracker:       tracker,
+		Rejecter:      chainClient,
+		Timeout:       callbackTimeout,
+		CheckInterval: timeoutCheckInterval,
+	})
+
 	m := &Manager{
 		providerUUID:         cfg.ProviderUUID,
 		callbackBaseURL:      cfg.CallbackBaseURL,
@@ -161,7 +184,10 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		wmRouter:             wmRouter,
 		payloadStore:         cfg.PayloadStore,
 		ackBatcher:           ackBatcher,
-		inFlight:             make(map[string]inFlightProvision),
+		tracker:              tracker,
+		orchestrator:         orchestrator,
+		handlers:             handlers,
+		timeoutChecker:       timeoutChecker,
 		callbackTimeout:      callbackTimeout,
 		timeoutCheckInterval: timeoutCheckInterval,
 	}
@@ -171,35 +197,35 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		"handle_lease_created",
 		TopicLeaseCreated,
 		pubSub,
-		m.handleLeaseCreated,
+		handlers.HandleLeaseCreated,
 	)
 
 	wmRouter.AddNoPublisherHandler(
 		"handle_lease_closed",
 		TopicLeaseClosed,
 		pubSub,
-		m.handleLeaseClosed,
+		handlers.HandleLeaseClosed,
 	)
 
 	wmRouter.AddNoPublisherHandler(
 		"handle_lease_expired",
 		TopicLeaseExpired,
 		pubSub,
-		m.handleLeaseExpired,
+		handlers.HandleLeaseExpired,
 	)
 
 	wmRouter.AddNoPublisherHandler(
 		"handle_backend_callback",
 		TopicBackendCallback,
 		pubSub,
-		m.handleBackendCallback,
+		handlers.HandleBackendCallback,
 	)
 
 	wmRouter.AddNoPublisherHandler(
 		"handle_payload_received",
 		TopicPayloadReceived,
 		pubSub,
-		m.handlePayloadReceived,
+		handlers.HandlePayloadReceived,
 	)
 
 	return m, nil
@@ -215,7 +241,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Note: ack batcher is started in NewManager() so handlers can use it immediately
 
 	// Start callback timeout checker in background
-	go m.runTimeoutChecker(ctx)
+	go m.timeoutChecker.Start(ctx)
 
 	// Run Watermill router (blocks until ctx canceled)
 	return m.wmRouter.Run(ctx)

@@ -31,24 +31,7 @@ const (
 // This is not a real error - the caller should not treat it as a failure.
 var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
 
-// InFlightTracker provides methods for tracking in-flight provisions and payloads.
-// This interface decouples the Reconciler from the concrete Manager implementation,
-// enabling easier testing and reducing coupling between components.
-type InFlightTracker interface {
-	// TryTrackInFlight atomically checks if a lease is already in-flight and tracks it if not.
-	// Returns true if the lease was successfully tracked (was not already in-flight).
-	TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
-
-	// UntrackInFlight removes a lease from the in-flight tracking.
-	UntrackInFlight(leaseUUID string)
-
-	// HasPayload checks if a payload exists for a lease.
-	HasPayload(leaseUUID string) bool
-
-	// PayloadStore returns the payload store for direct access.
-	// May return nil if payload store is not configured.
-	PayloadStore() *PayloadStore
-}
+// Note: InFlightTracker and ReconcilerTracker interfaces are defined in tracker.go
 
 // ReconcilerChainClient defines the chain operations needed by the reconciler.
 type ReconcilerChainClient interface {
@@ -65,7 +48,7 @@ type Reconciler struct {
 	callbackBaseURL string
 	chainClient     ReconcilerChainClient
 	backendRouter   *backend.Router
-	tracker         InFlightTracker // For tracking in-flight provisions (shared state with event-driven path)
+	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
 
 	interval    time.Duration
 	maxWorkers  int         // Maximum concurrent workers for lease processing
@@ -82,7 +65,7 @@ type ReconcilerConfig struct {
 
 // NewReconciler creates a new reconciler.
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
-func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker InFlightTracker) (*Reconciler, error) {
+func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker ReconcilerTracker) (*Reconciler, error) {
 	if chainClient == nil {
 		return nil, fmt.Errorf("chain client is required")
 	}
@@ -334,7 +317,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		LeaseUUID:    lease.Uuid,
 		Tenant:       lease.Tenant,
 		ProviderUUID: r.providerUUID,
-		Items:        ExtractLeaseItems(&lease),
+		Items:        items,
 		CallbackURL:  BuildCallbackURL(r.callbackBaseURL),
 	}
 

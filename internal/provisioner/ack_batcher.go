@@ -8,6 +8,18 @@ import (
 	"time"
 )
 
+// Acknowledger defines the interface for acknowledging leases on chain.
+// This is used by handlers to acknowledge successful provisions.
+type Acknowledger interface {
+	// Acknowledge queues a lease for acknowledgment and waits for the result.
+	// Returns true if the lease was acknowledged, along with the transaction hash.
+	// This method blocks until the acknowledgment is processed.
+	Acknowledge(ctx context.Context, leaseUUID string) (acknowledged bool, txHash string, err error)
+}
+
+// Compile-time check that AckBatcher implements Acknowledger.
+var _ Acknowledger = (*AckBatcher)(nil)
+
 const (
 	// DefaultAckBatchInterval is the maximum time to wait before flushing a batch.
 	// Short interval to minimize latency while still allowing batching.
