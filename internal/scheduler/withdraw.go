@@ -248,7 +248,7 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 			return nil
 
 		case <-timer.C:
-			// Timer fired, no need to stop but good practice to ensure cleanup
+			// Timer consumed - proceed to work
 		}
 
 		// Check if we should stop before doing work

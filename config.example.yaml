@@ -394,3 +394,15 @@ credit_check_error_threshold: 3
 # How long to wait before retrying after a credit check error.
 # Applies when errors occur, not between normal checks.
 credit_check_retry_interval: "30s"
+
+# =============================================================================
+# ADVANCED: SHUTDOWN CONFIGURATION
+# =============================================================================
+# Settings for graceful shutdown behavior.
+
+# Maximum time to wait for graceful shutdown. This includes:
+# - Draining in-flight provisions (waiting for backend callbacks)
+# - Closing HTTP connections gracefully
+# - Flushing pending acknowledgment batches
+# If exceeded, shutdown proceeds with warnings about incomplete work.
+shutdown_timeout: "30s"

@@ -208,7 +208,7 @@ These options have sensible defaults but can be tuned for specific environments:
 | `tx_timeout` | Transaction confirmation timeout | `30s` |
 | `query_page_limit` | Page size for chain queries | `100` |
 | `max_withdraw_iterations` | Max iterations for withdrawal batching | `100` |
-| `gas_limit` | Gas limit for transactions | `500000` |
+| `gas_limit` | Gas limit for transactions | `1500000` |
 | `gas_price` | Gas price (in smallest denom) | `25` |
 | `fee_denom` | Fee denomination | `umfx` |
 | `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |

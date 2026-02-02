@@ -514,15 +514,15 @@ func (c *Client) doBroadcastTx(ctx context.Context, msg sdktypes.Msg) (string, e
 // waitForTx polls for a transaction until it's included in a block.
 // Uses exponential backoff to handle slow chain indexing.
 func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxResponse, error) {
+	// Apply transaction timeout to context (takes minimum of parent deadline and txTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.txTimeout)
+	defer cancel()
+
 	// Start with initial poll interval, then use exponential backoff
 	currentInterval := c.txPollInterval
 	if currentInterval == 0 {
 		currentInterval = txPollInitialInterval
 	}
-
-	// Use NewTimer instead of time.After to avoid timer leak on early return
-	timeoutTimer := time.NewTimer(c.txTimeout)
-	defer timeoutTimer.Stop()
 
 	var consecutiveErrors int
 	var lastErr error
@@ -535,13 +535,10 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 		select {
 		case <-ctx.Done():
 			pollTimer.Stop()
-			return nil, ctx.Err()
-		case <-timeoutTimer.C:
-			pollTimer.Stop()
 			if lastErr != nil {
-				return nil, fmt.Errorf("timeout waiting for tx %s after %d attempts: %w", txHash, pollAttempts, lastErr)
+				return nil, fmt.Errorf("waiting for tx %s after %d attempts: %w (last error: %v)", txHash, pollAttempts, ctx.Err(), lastErr)
 			}
-			return nil, fmt.Errorf("timeout waiting for tx %s after %d attempts", txHash, pollAttempts)
+			return nil, fmt.Errorf("waiting for tx %s after %d attempts: %w", txHash, pollAttempts, ctx.Err())
 		case <-pollTimer.C:
 			pollAttempts++
 			resp, err := c.txService.GetTx(ctx, &tx.GetTxRequest{Hash: txHash})

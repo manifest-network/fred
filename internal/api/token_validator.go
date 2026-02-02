@@ -50,8 +50,9 @@ func (v *tokenValidator) validateCommon(signData []byte, bech32Prefix string) er
 	if time.Since(tokenTime) > MaxTokenAge {
 		return fmt.Errorf("token expired: issued at %v", tokenTime)
 	}
-	if time.Until(tokenTime) > MaxTokenAge {
-		return fmt.Errorf("token timestamp is in the future: %v", tokenTime)
+	// Use tighter tolerance for future timestamps to limit pre-generated token attacks
+	if time.Until(tokenTime) > MaxFutureClockSkew {
+		return fmt.Errorf("token timestamp too far in future: %v (max skew: %v)", tokenTime, MaxFutureClockSkew)
 	}
 
 	// Decode public key
