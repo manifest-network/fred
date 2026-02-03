@@ -34,14 +34,6 @@ const (
 	writeChannelSize = 1000
 )
 
-const (
-	// DefaultPayloadTTL is the default time-to-live for stored payloads.
-	// Payloads older than this are considered stale and will be cleaned up.
-	DefaultPayloadTTL = 1 * time.Hour
-
-	// DefaultPayloadCleanupInterval is how often to clean up stale payloads.
-	DefaultPayloadCleanupInterval = 10 * time.Minute
-)
 
 var (
 	// payloadBucketName is the bbolt bucket for storing payloads.
@@ -58,7 +50,6 @@ const (
 	opStore writeOpType = iota
 	opDelete
 	opPop
-	opCleanup
 )
 
 // writeOp represents a write operation to be batched.
@@ -85,9 +76,7 @@ type writeResult struct {
 // Write operations are batched through a dedicated writer goroutine to reduce
 // bbolt lock contention under high concurrency.
 type PayloadStore struct {
-	db              *bolt.DB
-	ttl             time.Duration
-	cleanupInterval time.Duration
+	db *bolt.DB
 
 	// Write batching
 	writeCh       chan writeOp
@@ -101,11 +90,9 @@ type PayloadStore struct {
 
 // PayloadStoreConfig configures the payload store.
 type PayloadStoreConfig struct {
-	DBPath          string        // Path to bbolt database file
-	TTL             time.Duration // How long to keep payloads before cleanup (default: 1 hour)
-	CleanupInterval time.Duration // How often to clean up stale payloads (default: 10 minutes)
-	BatchSize       int           // Max operations per batch (default: 50)
-	FlushInterval   time.Duration // Max wait before flushing batch (default: 50ms)
+	DBPath        string        // Path to bbolt database file
+	BatchSize     int           // Max operations per batch (default: 50)
+	FlushInterval time.Duration // Max wait before flushing batch (default: 50ms)
 }
 
 // NewPayloadStore creates a new payload store with bbolt persistence.
@@ -116,8 +103,6 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 
 	// Apply defaults using cmp.Or (returns first non-zero value)
 	// For batchSize and flushInterval, use max() to convert negative values to 0
-	ttl := cmp.Or(cfg.TTL, DefaultPayloadTTL)
-	cleanupInterval := cmp.Or(cfg.CleanupInterval, DefaultPayloadCleanupInterval)
 	batchSize := cmp.Or(max(cfg.BatchSize, 0), DefaultBatchSize)
 	flushInterval := cmp.Or(max(cfg.FlushInterval, 0), DefaultFlushInterval)
 
@@ -145,34 +130,22 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &PayloadStore{
-		db:              db,
-		ttl:             ttl,
-		cleanupInterval: cleanupInterval,
-		writeCh:         make(chan writeOp, writeChannelSize),
-		batchSize:       batchSize,
-		flushInterval:   flushInterval,
-		cancel:          cancel,
-		wg:              &sync.WaitGroup{},
+		db:            db,
+		writeCh:       make(chan writeOp, writeChannelSize),
+		batchSize:     batchSize,
+		flushInterval: flushInterval,
+		cancel:        cancel,
+		wg:            &sync.WaitGroup{},
 	}
 
 	// Start the batching writer goroutine (using WaitGroup.Go for Go 1.25+)
 	s.wg.Go(func() { s.writerLoop(ctx) })
-
-	// Start background cleanup (using WaitGroup.Go for Go 1.25+)
-	s.wg.Go(func() { s.cleanupLoop(ctx) })
-
-	// Run initial cleanup to remove any stale entries from previous run
-	if err := s.cleanupDirect(); err != nil {
-		slog.Warn("initial payload cleanup failed", "error", err)
-	}
 
 	// Initialize the stored count metric based on current database state
 	metrics.PayloadStoredCount.Set(float64(s.Count()))
 
 	slog.Info("payload store initialized",
 		"db_path", cfg.DBPath,
-		"ttl", ttl,
-		"cleanup_interval", cleanupInterval,
 		"batch_size", batchSize,
 		"flush_interval", flushInterval,
 		"initial_count", s.Count(),
@@ -360,7 +333,7 @@ func (s *PayloadStore) List() []string {
 // Close shuts down the payload store gracefully.
 // It waits for all pending writes to complete before closing the database.
 func (s *PayloadStore) Close() error {
-	// Signal shutdown - this will cause writerLoop and cleanupLoop to exit
+	// Signal shutdown - this will cause writerLoop to exit
 	s.cancel()
 
 	// Wait for all goroutines to finish (writer will flush pending ops)
@@ -501,58 +474,6 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 	}
 }
 
-// cleanupLoop periodically removes stale payloads.
-// Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
-func (s *PayloadStore) cleanupLoop(ctx context.Context) {
-	util.StartCleanupLoop(ctx, s.cleanupInterval, s.cleanupDirect, "payload")
-}
-
-// cleanupDirect removes stale payloads from the database.
-// This is called directly (not through the batching writer) since cleanup
-// is already serialized through cleanupLoop and runs infrequently.
-func (s *PayloadStore) cleanupDirect() error {
-	now := time.Now()
-	cutoff := now.Add(-s.ttl)
-	var staleCount int
-
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		payloadBucket := tx.Bucket(payloadBucketName)
-		metaBucket := tx.Bucket(payloadMetaBucketName)
-		c := metaBucket.Cursor()
-
-		// Collect keys to delete
-		var toDelete [][]byte
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			storedAt := util.BytesToTime(v)
-			if storedAt.Before(cutoff) {
-				// Make a copy of the key since cursor reuses the slice
-				keyCopy := make([]byte, len(k))
-				copy(keyCopy, k)
-				toDelete = append(toDelete, keyCopy)
-			}
-		}
-
-		// Delete stale entries from both buckets
-		for _, k := range toDelete {
-			if err := payloadBucket.Delete(k); err != nil {
-				return err
-			}
-			if err := metaBucket.Delete(k); err != nil {
-				return err
-			}
-		}
-
-		staleCount = len(toDelete)
-		return nil
-	})
-
-	if err == nil && staleCount > 0 {
-		metrics.PayloadStoredCount.Sub(float64(staleCount))
-		slog.Info("cleaned up stale payloads", "count", staleCount)
-	}
-
-	return err
-}
 
 // PayloadEvent represents a payload upload event for Watermill.
 type PayloadEvent struct {

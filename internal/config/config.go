@@ -82,9 +82,7 @@ type Config struct {
 	TokenTrackerDBPath string `mapstructure:"token_tracker_db_path"`
 
 	// Payload store configuration
-	PayloadStoreDBPath      string        `mapstructure:"payload_store_db_path"`
-	PayloadStoreTTL         time.Duration `mapstructure:"payload_store_ttl"`
-	PayloadStoreCleanupFreq time.Duration `mapstructure:"payload_store_cleanup_freq"`
+	PayloadStoreDBPath string `mapstructure:"payload_store_db_path"`
 
 	// Shutdown configuration
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
@@ -154,10 +152,6 @@ func Load(configPath string) (*Config, error) {
 
 	// Reconciliation defaults
 	v.SetDefault("reconciliation_interval", "5m")
-
-	// Payload store defaults
-	v.SetDefault("payload_store_ttl", "1h")
-	v.SetDefault("payload_store_cleanup_freq", "10m")
 
 	// Shutdown defaults
 	v.SetDefault("shutdown_timeout", "30s")

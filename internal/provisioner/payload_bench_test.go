@@ -28,8 +28,7 @@ func BenchmarkPayloadStore_Write(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
+
 		FlushInterval:   time.Millisecond,
 	})
 	if err != nil {
@@ -56,8 +55,7 @@ func BenchmarkPayloadStore_Write_Parallel(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
+
 		BatchSize:       100,
 		FlushInterval:   time.Millisecond,
 	})
@@ -86,8 +84,7 @@ func BenchmarkPayloadStore_Read(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
+
 		FlushInterval:   time.Millisecond,
 	})
 	if err != nil {
@@ -122,8 +119,7 @@ func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
+
 		FlushInterval:   time.Millisecond,
 	})
 	if err != nil {
@@ -164,8 +160,7 @@ func BenchmarkPayloadStore_BatchEfficiency(b *testing.B) {
 			dir := b.TempDir()
 			store, err := NewPayloadStore(PayloadStoreConfig{
 				DBPath:          filepath.Join(dir, "payload.db"),
-				TTL:             time.Hour,
-				CleanupInterval: time.Hour,
+
 				BatchSize:       batchSize,
 				FlushInterval:   time.Millisecond,
 			})
@@ -207,8 +202,7 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 			dir := b.TempDir()
 			store, err := NewPayloadStore(PayloadStoreConfig{
 				DBPath:          filepath.Join(dir, "payload.db"),
-				TTL:             time.Hour,
-				CleanupInterval: time.Hour,
+
 				FlushInterval:   time.Millisecond,
 			})
 			if err != nil {
@@ -238,8 +232,7 @@ func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
+
 		BatchSize:       50,
 		FlushInterval:   time.Millisecond,
 	})
@@ -290,8 +283,7 @@ func TestPayloadStore_StressTest(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
+
 		BatchSize:       100,
 		FlushInterval:   time.Millisecond,
 	})
@@ -358,8 +350,7 @@ func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
+
 		BatchSize:       200,
 		FlushInterval:   time.Millisecond,
 	})

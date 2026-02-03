@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
@@ -341,7 +340,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
-		TTL:    time.Hour,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -397,7 +396,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
-		TTL:    time.Hour,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)

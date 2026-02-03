@@ -1842,9 +1842,9 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	// Store payloads for various leases
 	// pending-awaiting: pending lease with MetaHash but hasn't uploaded payload yet - simulates
 	// a lease that's still waiting for payload (payload won't be in store, so nothing to clean)
-	payloadStore.Store("closed-lease", []byte("closed payload"))      // Will be cleaned (lease is closed)
+	payloadStore.Store("closed-lease", []byte("closed payload"))      // Will be cleaned (lease is closed/not found)
 	payloadStore.Store("nonexistent-lease", []byte("orphan payload")) // Will be cleaned (lease doesn't exist)
-	payloadStore.Store("active-lease", []byte("active payload"))      // Will be cleaned (lease is active, not pending)
+	payloadStore.Store("active-lease", []byte("active payload"))      // Retained for re-provisioning
 
 	// Verify all payloads are stored
 	if count := payloadStore.Count(); count != 3 {
@@ -1887,9 +1887,9 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	}
 
 	// Verify orphaned payloads were cleaned up
-	// active-lease: payload should be cleaned (lease is active, not pending)
-	if payloadStore.Has("active-lease") {
-		t.Error("expected active-lease payload to be cleaned up (lease is no longer pending)")
+	// active-lease: payload should be RETAINED (active leases keep payload for re-provisioning)
+	if !payloadStore.Has("active-lease") {
+		t.Error("expected active-lease payload to be retained for re-provisioning")
 	}
 
 	// closed-lease: payload should be cleaned (lease doesn't exist in chain query results)
@@ -1902,9 +1902,9 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 		t.Error("expected nonexistent-lease payload to be cleaned up (lease not found)")
 	}
 
-	// Verify count - all orphaned payloads should be cleaned
-	if count := payloadStore.Count(); count != 0 {
-		t.Errorf("expected 0 payloads remaining (all orphans cleaned), got %d", count)
+	// Verify count - only active-lease payload should remain
+	if count := payloadStore.Count(); count != 1 {
+		t.Errorf("expected 1 payload remaining (active-lease retained), got %d", count)
 	}
 }
 

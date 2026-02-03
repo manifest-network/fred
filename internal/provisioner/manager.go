@@ -62,6 +62,7 @@ type ChainClient interface {
 	GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
 	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
+	CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
 
 // Compile-time check that Manager implements ReconcilerTracker.

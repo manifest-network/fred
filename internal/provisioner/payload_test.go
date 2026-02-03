@@ -20,7 +20,6 @@ func newTestPayloadStore(t *testing.T) *PayloadStore {
 	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-		TTL:    1 * time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -233,7 +232,7 @@ func TestPayloadStore_Persistence(t *testing.T) {
 	// Create store and add data
 	store1, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-		TTL:    1 * time.Hour,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -247,7 +246,7 @@ func TestPayloadStore_Persistence(t *testing.T) {
 	// Reopen store and verify data persisted
 	store2, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-		TTL:    1 * time.Hour,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() reopen error = %v", err)
@@ -267,50 +266,9 @@ func TestPayloadStore_RequiresDBPath(t *testing.T) {
 	}
 }
 
-func TestPayloadStore_CleanupExpiredPayloads(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          dbPath,
-		TTL:             50 * time.Millisecond, // Very short TTL for testing
-		CleanupInterval: 25 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
-	defer store.Close()
-
-	// Store some data
-	store.Store("lease-1", []byte("data1"))
-
-	if store.Count() != 1 {
-		t.Errorf("Count() = %d, want 1", store.Count())
-	}
-
-	// Poll until cleanup removes the data
-	deadline := time.After(5 * time.Second)
-	for store.Count() != 0 {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for cleanup")
-		default:
-			runtime.Gosched()
-		}
-	}
-
-	// Data should be cleaned up
-	if store.Count() != 0 {
-		t.Errorf("After TTL, Count() = %d, want 0", store.Count())
-	}
-
-	if store.Has("lease-1") {
-		t.Error("After TTL, Has() returned true, want false")
-	}
-}
-
 func TestNewPayloadStore_AppliesDefaults(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
 
-	// Create with zero values for TTL and CleanupInterval
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
 	})
@@ -319,12 +277,12 @@ func TestNewPayloadStore_AppliesDefaults(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Verify defaults were applied
-	if store.ttl != DefaultPayloadTTL {
-		t.Errorf("ttl = %v, want %v", store.ttl, DefaultPayloadTTL)
+	// Verify batch defaults were applied
+	if store.batchSize != DefaultBatchSize {
+		t.Errorf("batchSize = %v, want %v", store.batchSize, DefaultBatchSize)
 	}
-	if store.cleanupInterval != DefaultPayloadCleanupInterval {
-		t.Errorf("cleanupInterval = %v, want %v", store.cleanupInterval, DefaultPayloadCleanupInterval)
+	if store.flushInterval != DefaultFlushInterval {
+		t.Errorf("flushInterval = %v, want %v", store.flushInterval, DefaultFlushInterval)
 	}
 }
 
@@ -370,7 +328,7 @@ func TestPayloadStore_FilePermissions(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-		TTL:    1 * time.Hour,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -394,7 +352,7 @@ func TestPayloadStore_InvalidDBPath(t *testing.T) {
 	// Try to create store in a path that doesn't exist and can't be created
 	_, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: "/nonexistent/path/that/cannot/be/created/test.db",
-		TTL:    1 * time.Hour,
+
 	})
 	if err == nil {
 		t.Error("NewPayloadStore() with invalid path should return error")
@@ -451,7 +409,7 @@ func TestPayloadStore_FlushOnClose(t *testing.T) {
 	// Create store with short flush interval
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:        dbPath,
-		TTL:           1 * time.Hour,
+
 		FlushInterval: 10 * time.Millisecond,
 		BatchSize:     50,
 	})
@@ -471,7 +429,7 @@ func TestPayloadStore_FlushOnClose(t *testing.T) {
 	// Reopen and verify all data was persisted
 	store2, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-		TTL:    1 * time.Hour,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() reopen error = %v", err)
@@ -489,7 +447,7 @@ func TestPayloadStore_BatchingConcurrentWrites(t *testing.T) {
 
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:        dbPath,
-		TTL:           1 * time.Hour,
+
 		BatchSize:     10,
 		FlushInterval: 10 * time.Millisecond,
 	})
@@ -526,7 +484,7 @@ func TestPayloadStore_BatchingMixedOperations(t *testing.T) {
 
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:        dbPath,
-		TTL:           1 * time.Hour,
+
 		BatchSize:     5,
 		FlushInterval: 10 * time.Millisecond,
 	})
@@ -586,7 +544,7 @@ func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
 
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:        dbPath,
-		TTL:           1 * time.Hour,
+
 		BatchSize:     1000,                  // Large batch so it won't trigger by size
 		FlushInterval: 25 * time.Millisecond, // Short interval
 	})
@@ -871,7 +829,7 @@ func TestPayloadStore_CloseDrainsPendingWrites(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_drain.db")
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:        dbPath,
-		TTL:           1 * time.Hour,
+
 		FlushInterval: 1 * time.Second, // Slow flush to ensure operations queue up
 		BatchSize:     100,             // Large batch size
 	})

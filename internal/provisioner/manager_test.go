@@ -1662,7 +1662,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -1775,7 +1775,7 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -1819,7 +1819,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -1881,7 +1881,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -1939,7 +1939,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -1987,7 +1987,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -2052,7 +2052,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -2109,7 +2109,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -2179,7 +2179,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-		TTL:    time.Hour,
+
 	})
 	defer payloadStore.Close()
 
@@ -2500,8 +2500,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          t.TempDir() + "/payloads.db",
-		TTL:             time.Hour,
-		CleanupInterval: 10 * time.Minute,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -2567,9 +2566,11 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 		t.Fatalf("handleBackendCallback() error = %v", err)
 	}
 
-	// Payload should be deleted after successful callback
-	if payloadStore.Has("lease-1") {
-		t.Error("payload should be deleted after successful callback")
+	// Payload should persist after successful callback — it's retained for
+	// potential re-provisioning if the container crashes after acknowledgment.
+	// Cleanup happens when the lease is closed or rejected.
+	if !payloadStore.Has("lease-1") {
+		t.Error("payload should persist after successful callback for re-provisioning")
 	}
 
 	// Lease should no longer be in-flight
@@ -2605,8 +2606,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          t.TempDir() + "/payloads.db",
-		TTL:             time.Hour,
-		CleanupInterval: 10 * time.Minute,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -2694,8 +2694,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          dbPath,
-		TTL:             time.Hour,
-		CleanupInterval: 10 * time.Minute,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() error = %v", err)
@@ -2742,8 +2741,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	// "Restart" - create new payload store from same DB file
 	payloadStore2, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath:          dbPath,
-		TTL:             time.Hour,
-		CleanupInterval: 10 * time.Minute,
+
 	})
 	if err != nil {
 		t.Fatalf("NewPayloadStore() after restart error = %v", err)

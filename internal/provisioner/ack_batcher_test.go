@@ -57,6 +57,10 @@ func (m *mockAckChainClient) RejectLeases(ctx context.Context, leaseUUIDs []stri
 	return 0, nil, nil
 }
 
+func (m *mockAckChainClient) CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	return 0, nil, nil
+}
+
 const testProviderUUID = "01234567-89ab-cdef-0123-456789abcdef"
 
 func TestAckBatcher_BatchesMultipleRequests(t *testing.T) {

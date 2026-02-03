@@ -66,6 +66,7 @@ type provision struct {
 	Status       string
 	Quantity     int // Expected number of containers
 	CreatedAt    time.Time
+	FailCount    int // Number of times provisioning has failed for this lease
 }
 
 // shortID safely truncates an ID to 12 characters for logging.
@@ -187,10 +188,22 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	b.callbackURLsMu.Unlock()
 
 	// Atomically check-and-reserve the provision slot (fixes TOCTOU race).
+	// Allow re-provisioning if the existing provision has failed (e.g., container
+	// crashed and reconciler is retrying).
+	var prevFailCount int
+	var oldContainerIDs []string
+	var oldQuantity int
 	b.provisionsMu.Lock()
-	if _, exists := b.provisions[req.LeaseUUID]; exists {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID)
+	if existing, exists := b.provisions[req.LeaseUUID]; exists {
+		if existing.Status != backend.ProvisionStatusFailed {
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID)
+		}
+		// Capture data needed for cleanup, then release lock before Docker API calls.
+		prevFailCount = existing.FailCount
+		oldContainerIDs = existing.ContainerIDs
+		oldQuantity = existing.Quantity
+		delete(b.provisions, req.LeaseUUID)
 	}
 	b.provisions[req.LeaseUUID] = &provision{
 		LeaseUUID:    req.LeaseUUID,
@@ -200,8 +213,25 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		Quantity:     totalQuantity,
 		ContainerIDs: make([]string, 0, totalQuantity),
 		CreatedAt:    time.Now(),
+		FailCount:    prevFailCount,
 	}
 	b.provisionsMu.Unlock()
+
+	// Clean up old failed provision resources outside the lock.
+	if oldQuantity > 0 {
+		for i := 0; i < oldQuantity; i++ {
+			b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
+		}
+		for _, cid := range oldContainerIDs {
+			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
+				logger.Warn("failed to remove old container during re-provision",
+					"container_id", shortID(cid), "error", err)
+			}
+		}
+		logger.Info("replacing failed provision",
+			"fail_count", prevFailCount,
+		)
+	}
 
 	// Validate all SKUs upfront and build profile map.
 	// On failure, remove the reservation and return error synchronously.
@@ -303,6 +333,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[req.LeaseUUID]; ok {
 				prov.Status = backend.ProvisionStatusFailed
+				prov.FailCount++
 			}
 			b.provisionsMu.Unlock()
 
@@ -370,6 +401,14 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 			// Create container with instance index for unique naming
 			instanceLogger.Info("creating container")
+			// Read the current fail count so it's persisted in the container label.
+			b.provisionsMu.RLock()
+			failCount := 0
+			if prov, ok := b.provisions[req.LeaseUUID]; ok {
+				failCount = prov.FailCount
+			}
+			b.provisionsMu.RUnlock()
+
 			containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
 				LeaseUUID:      req.LeaseUUID,
 				Tenant:         req.Tenant,
@@ -378,6 +417,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				Manifest:       manifest,
 				Profile:        profile,
 				InstanceIndex:  instanceIndex,
+				FailCount:      failCount,
 				HostBindIP:     b.cfg.GetHostBindIP(),
 				ReadonlyRootfs: b.cfg.IsReadonlyRootfs(),
 				PidsLimit:      b.cfg.GetPidsLimit(),
@@ -556,6 +596,7 @@ func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, 
 			Status:       prov.Status,
 			CreatedAt:    prov.CreatedAt,
 			BackendName:  b.cfg.Name,
+			FailCount:    prov.FailCount,
 		})
 	}
 
@@ -617,6 +658,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				Image:        c.Image,
 				Status:       containerStatusToProvisionStatus(c.Status),
 				CreatedAt:    c.CreatedAt,
+				FailCount:    c.FailCount,
 				ContainerIDs: make([]string, 0),
 			}
 			recovered[c.LeaseUUID] = prov
@@ -625,6 +667,12 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// Add container ID to the provision
 		prov.ContainerIDs = append(prov.ContainerIDs, c.ContainerID)
 		prov.Quantity = len(prov.ContainerIDs)
+
+		// Use the highest FailCount across containers. Labels are normally
+		// identical, but can diverge after a partial re-provision.
+		if c.FailCount > prov.FailCount {
+			prov.FailCount = c.FailCount
+		}
 
 		// If any container is not ready, mark the whole provision as not ready
 		status := containerStatusToProvisionStatus(c.Status)
@@ -652,10 +700,29 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for uuid, existing := range b.provisions {
 		if existing.Status == backend.ProvisionStatusReady {
 			if rec, ok := recovered[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
+				// Carry over FailCount and increment for this failure.
+				rec.FailCount = existing.FailCount + 1
 				failedLeases = append(failedLeases, uuid)
 				b.logger.Warn("container crashed after provisioning",
 					"lease_uuid", uuid,
 					"tenant", existing.Tenant,
+					"fail_count", rec.FailCount,
+				)
+			}
+		}
+	}
+
+	// Cold-start correction: provisions recovered as failed with no prior
+	// in-memory state have a FailCount from the container label that was
+	// written at creation time (before this failure occurred). Increment
+	// it to account for the failure evidenced by the container being dead.
+	for uuid, rec := range recovered {
+		if rec.Status == backend.ProvisionStatusFailed {
+			if _, hasExisting := b.provisions[uuid]; !hasExisting {
+				rec.FailCount++
+				b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
+					"lease_uuid", uuid,
+					"fail_count", rec.FailCount,
 				)
 			}
 		}

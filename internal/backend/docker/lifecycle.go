@@ -27,6 +27,7 @@ const (
 	LabelSKU           = "fred.sku"
 	LabelCreatedAt     = "fred.created_at"
 	LabelInstanceIndex = "fred.instance_index"
+	LabelFailCount     = "fred.fail_count"
 )
 
 // ContainerInfo holds information about a managed container.
@@ -37,6 +38,7 @@ type ContainerInfo struct {
 	ProviderUUID  string
 	SKU           string
 	InstanceIndex int
+	FailCount     int
 	Image         string
 	Status        string
 	CreatedAt     time.Time
@@ -113,6 +115,9 @@ type CreateContainerParams struct {
 	Profile       SKUProfile
 	InstanceIndex int // For multi-unit leases (0-based index)
 
+	// Retry tracking
+	FailCount int
+
 	// Hardening parameters
 	HostBindIP     string
 	ReadonlyRootfs bool
@@ -134,6 +139,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		LabelSKU:           params.SKU,
 		LabelCreatedAt:     time.Now().Format(time.RFC3339),
 		LabelInstanceIndex: strconv.Itoa(params.InstanceIndex),
+		LabelFailCount:     strconv.Itoa(params.FailCount),
 	}
 
 	// Add user labels (already validated to not conflict with fred.*)
@@ -264,26 +270,40 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 	return nil
 }
 
-// parseLabelMeta extracts the instance index and created-at timestamp from
-// container labels. Returns an error if a label is present but malformed,
-// which prevents silent defaulting to zero values that could cause resource
-// allocation ID collisions.
-func parseLabelMeta(labels map[string]string) (instanceIndex int, createdAt time.Time, err error) {
+// labelMeta holds parsed metadata from container labels.
+type labelMeta struct {
+	InstanceIndex int
+	FailCount     int
+	CreatedAt     time.Time
+}
+
+// parseLabelMeta extracts metadata from container labels. Returns an error if
+// a label is present but malformed, which prevents silent defaulting to zero
+// values that could cause resource allocation ID collisions.
+func parseLabelMeta(labels map[string]string) (labelMeta, error) {
+	var m labelMeta
 	if idxStr, ok := labels[LabelInstanceIndex]; ok {
 		idx, parseErr := strconv.Atoi(idxStr)
 		if parseErr != nil {
-			return 0, time.Time{}, fmt.Errorf("invalid %s label %q: %w", LabelInstanceIndex, idxStr, parseErr)
+			return m, fmt.Errorf("invalid %s label %q: %w", LabelInstanceIndex, idxStr, parseErr)
 		}
-		instanceIndex = idx
+		m.InstanceIndex = idx
+	}
+	if fcStr, ok := labels[LabelFailCount]; ok {
+		fc, parseErr := strconv.Atoi(fcStr)
+		if parseErr != nil {
+			return m, fmt.Errorf("invalid %s label %q: %w", LabelFailCount, fcStr, parseErr)
+		}
+		m.FailCount = fc
 	}
 	if createdStr, ok := labels[LabelCreatedAt]; ok {
 		t, parseErr := time.Parse(time.RFC3339, createdStr)
 		if parseErr != nil {
-			return 0, time.Time{}, fmt.Errorf("invalid %s label %q: %w", LabelCreatedAt, createdStr, parseErr)
+			return m, fmt.Errorf("invalid %s label %q: %w", LabelCreatedAt, createdStr, parseErr)
 		}
-		createdAt = t
+		m.CreatedAt = t
 	}
-	return
+	return m, nil
 }
 
 // InspectContainer returns detailed information about a container.
@@ -293,7 +313,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		return nil, fmt.Errorf("failed to inspect container: %w", err)
 	}
 
-	instanceIndex, createdAt, err := parseLabelMeta(resp.Config.Labels)
+	meta, err := parseLabelMeta(resp.Config.Labels)
 	if err != nil {
 		return nil, fmt.Errorf("container %s: %w", resp.ID, err)
 	}
@@ -306,8 +326,9 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		SKU:           resp.Config.Labels[LabelSKU],
 		Image:         resp.Config.Image,
 		Status:        resp.State.Status,
-		InstanceIndex: instanceIndex,
-		CreatedAt:     createdAt,
+		InstanceIndex: meta.InstanceIndex,
+		FailCount:     meta.FailCount,
+		CreatedAt:     meta.CreatedAt,
 		Ports:         make(map[string]PortBinding),
 	}
 
@@ -338,7 +359,7 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 
 	var result []ContainerInfo
 	for _, c := range containers {
-		instanceIndex, createdAt, err := parseLabelMeta(c.Labels)
+		meta, err := parseLabelMeta(c.Labels)
 		if err != nil {
 			// Skip containers with malformed Fred labels — these can't be
 			// reliably tracked for resource accounting.
@@ -353,8 +374,9 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			SKU:           c.Labels[LabelSKU],
 			Image:         c.Image,
 			Status:        c.State,
-			InstanceIndex: instanceIndex,
-			CreatedAt:     createdAt,
+			InstanceIndex: meta.InstanceIndex,
+			FailCount:     meta.FailCount,
+			CreatedAt:     meta.CreatedAt,
 			Ports:         make(map[string]PortBinding),
 		}
 

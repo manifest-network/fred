@@ -115,6 +115,7 @@ type ProvisionInfo struct {
 	ProviderUUID string    `json:"provider_uuid"`
 	Status       string    `json:"status"` // "provisioning", "ready", "failed"
 	CreatedAt    time.Time `json:"created_at"`
+	FailCount    int       `json:"fail_count"`
 	BackendName  string    `json:"-"` // Set by reconciler, not from backend
 }
 

@@ -193,9 +193,7 @@ func run(cmd *cobra.Command, args []string) error {
 	var payloadStore *provisioner.PayloadStore
 	if cfg.PayloadStoreDBPath != "" {
 		payloadStore, err = provisioner.NewPayloadStore(provisioner.PayloadStoreConfig{
-			DBPath:          cfg.PayloadStoreDBPath,
-			TTL:             cfg.PayloadStoreTTL,
-			CleanupInterval: cfg.PayloadStoreCleanupFreq,
+			DBPath: cfg.PayloadStoreDBPath,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create payload store: %w", err)

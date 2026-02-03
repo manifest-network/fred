@@ -196,10 +196,10 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		recordDuration()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
 
-		// Clean up payload now that provisioning is confirmed successful
-		if h.deps.PayloadStore != nil {
-			h.deps.PayloadStore.Delete(callback.LeaseUUID)
-		}
+		// Payload is intentionally NOT deleted here. The lease is now ACTIVE
+		// but the container could crash later, requiring re-provisioning with
+		// the same manifest. Payload cleanup happens when the lease is closed
+		// (HandleLeaseClosed) or rejected (failure callback above).
 
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
@@ -209,13 +209,40 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		)
 
 	case backend.CallbackStatusFailed:
-		// Reject the lease on chain FIRST, before untracking.
-		// This prevents a race where the reconciler sees a PENDING lease that's
-		// not in-flight and tries to provision it again.
 		reason := callback.Error
 		if reason == "" {
 			reason = "provisioning failed"
 		}
+
+		// Check if this is a re-provision of an ACTIVE lease. Rejecting only
+		// applies to PENDING leases. For ACTIVE leases, just untrack and let
+		// the reconciler handle it (it will retry or reject based on FailCount).
+		lease, err := h.deps.ChainClient.GetLease(msg.Context(), callback.LeaseUUID)
+		if err != nil {
+			slog.Error("failed to fetch lease state for failure callback, keeping in-flight",
+				"lease_uuid", callback.LeaseUUID,
+				"error", err,
+			)
+			return fmt.Errorf("failed to fetch lease %s: %w", callback.LeaseUUID, err)
+		}
+		if lease != nil && lease.State == billingtypes.LEASE_STATE_ACTIVE {
+			// Lease is ACTIVE — this was a re-provision attempt. Untrack and
+			// let the reconciler detect the still-failed backend state.
+			h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+			recordDuration()
+			metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+
+			slog.Warn("re-provision failed for active lease, deferring to reconciler",
+				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
+				"reason", reason,
+			)
+			return nil
+		}
+
+		// PENDING lease — reject on chain FIRST, before untracking.
+		// This prevents a race where the reconciler sees a PENDING lease that's
+		// not in-flight and tries to provision it again.
 		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, reason)
 		if err != nil {
 			// Keep in-flight so reconciler doesn't try to re-provision.

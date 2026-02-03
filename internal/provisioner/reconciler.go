@@ -39,6 +39,7 @@ type ReconcilerChainClient interface {
 	GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
 	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
+	CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
 }
 
 // Reconciler performs level-triggered reconciliation between chain state and backend state.
@@ -50,17 +51,23 @@ type Reconciler struct {
 	backendRouter   *backend.Router
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
 
-	interval    time.Duration
-	maxWorkers  int         // Maximum concurrent workers for lease processing
-	reconciling atomic.Bool // Non-blocking flag to prevent concurrent reconciliation
+	interval               time.Duration
+	maxWorkers             int         // Maximum concurrent workers for lease processing
+	maxReprovisionAttempts int         // Max re-provision attempts before rejecting
+	reconciling            atomic.Bool // Non-blocking flag to prevent concurrent reconciliation
 }
+
+// DefaultMaxReprovisionAttempts is the default number of re-provision attempts
+// before rejecting a lease whose containers keep failing.
+const DefaultMaxReprovisionAttempts = 3
 
 // ReconcilerConfig configures the reconciler.
 type ReconcilerConfig struct {
-	ProviderUUID    string
-	CallbackBaseURL string
-	Interval        time.Duration // How often to run periodic reconciliation
-	MaxWorkers      int           // Maximum concurrent workers (default: 10)
+	ProviderUUID           string
+	CallbackBaseURL        string
+	Interval               time.Duration // How often to run periodic reconciliation
+	MaxWorkers             int           // Maximum concurrent workers (default: 10)
+	MaxReprovisionAttempts int           // Max re-provision attempts before rejecting (default: 3)
 }
 
 // NewReconciler creates a new reconciler.
@@ -82,15 +89,17 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 	// Apply defaults using cmp.Or (returns first non-zero value)
 	interval := cmp.Or(cfg.Interval, 5*time.Minute)
 	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
+	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
 
 	return &Reconciler{
-		providerUUID:    cfg.ProviderUUID,
-		callbackBaseURL: cfg.CallbackBaseURL,
-		chainClient:     chainClient,
-		backendRouter:   backendRouter,
-		tracker:         tracker,
-		interval:        interval,
-		maxWorkers:      maxWorkers,
+		providerUUID:           cfg.ProviderUUID,
+		callbackBaseURL:        cfg.CallbackBaseURL,
+		chainClient:            chainClient,
+		backendRouter:          backendRouter,
+		tracker:                tracker,
+		interval:               interval,
+		maxWorkers:             maxWorkers,
+		maxReprovisionAttempts: maxReprovision,
 	}, nil
 }
 
@@ -394,16 +403,47 @@ func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) err
 	return nil
 }
 
-// rejectLease rejects a lease on chain with a reason.
+// rejectLease rejects a PENDING lease on chain with a reason.
 func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) error {
 	rejected, txHashes, err := r.chainClient.RejectLeases(ctx, []string{leaseUUID}, reason)
 	if err != nil {
 		return err
 	}
 
+	// Clean up stored payload — the lease is terminal.
+	if r.tracker != nil {
+		if ps := r.tracker.PayloadStore(); ps != nil {
+			ps.Delete(leaseUUID)
+		}
+	}
+
 	slog.Info("reconcile: rejected lease",
 		"lease_uuid", leaseUUID,
 		"rejected", rejected,
+		"tx_hashes", txHashes,
+		"reason", reason,
+	)
+
+	return nil
+}
+
+// closeLease closes an ACTIVE lease on chain with a reason.
+func (r *Reconciler) closeLease(ctx context.Context, leaseUUID, reason string) error {
+	closed, txHashes, err := r.chainClient.CloseLeases(ctx, []string{leaseUUID}, reason)
+	if err != nil {
+		return err
+	}
+
+	// Clean up stored payload — the lease is terminal.
+	if r.tracker != nil {
+		if ps := r.tracker.PayloadStore(); ps != nil {
+			ps.Delete(leaseUUID)
+		}
+	}
+
+	slog.Info("reconcile: closed lease",
+		"lease_uuid", leaseUUID,
+		"closed", closed,
 		"tx_hashes", txHashes,
 		"reason", reason,
 	)
@@ -554,8 +594,8 @@ func (r *Reconciler) processLease(
 			"tenant", lease.Tenant,
 		)
 		anomalies.Add(1)
-		// Attempt to provision
-		if err := r.startProvisioning(ctx, lease); err != nil {
+		// Attempt to provision (with payload — Docker backend needs the manifest)
+		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
 			if !errors.Is(err, errLeaseAlreadyInFlight) {
 				slog.Error("reconcile: failed to provision anomalous lease",
 					"lease_uuid", leaseUUID,
@@ -568,14 +608,46 @@ func (r *Reconciler) processLease(
 		// Anomaly: Lease is active but the container has crashed/exited.
 		// This happens when a container dies after the success callback was sent
 		// and the lease was acknowledged (e.g., OOM kill, runtime crash).
-		// Attempt to re-provision so the tenant gets a working resource.
+		anomalies.Add(1)
+
+		if provision.FailCount >= r.maxReprovisionAttempts {
+			// Too many failures — close the lease instead of retrying forever.
+			// We use close (not reject) because the lease is ACTIVE.
+			slog.Error("reconcile: provision failed too many times, closing lease",
+				"lease_uuid", leaseUUID,
+				"tenant", lease.Tenant,
+				"backend", provision.BackendName,
+				"fail_count", provision.FailCount,
+				"max_attempts", r.maxReprovisionAttempts,
+			)
+			if err := r.closeLease(ctx, leaseUUID, fmt.Sprintf("provision failed %d times", provision.FailCount)); err != nil {
+				slog.Error("reconcile: failed to close exhausted lease",
+					"lease_uuid", leaseUUID,
+					"error", err,
+				)
+				return
+			}
+			// Immediately release backend resources instead of waiting for
+			// the next orphan-cleanup cycle.
+			if b := r.backendRouter.GetBackendByName(provision.BackendName); b != nil {
+				if err := b.Deprovision(ctx, leaseUUID); err != nil {
+					slog.Warn("reconcile: failed to deprovision after closing exhausted lease",
+						"lease_uuid", leaseUUID,
+						"error", err,
+					)
+				}
+			}
+			return
+		}
+
 		slog.Warn("reconcile: anomaly - active lease has failed provision, re-provisioning",
 			"lease_uuid", leaseUUID,
 			"tenant", lease.Tenant,
 			"backend", provision.BackendName,
+			"fail_count", provision.FailCount,
+			"max_attempts", r.maxReprovisionAttempts,
 		)
-		anomalies.Add(1)
-		if err := r.startProvisioning(ctx, lease); err != nil {
+		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
 			if !errors.Is(err, errLeaseAlreadyInFlight) {
 				slog.Error("reconcile: failed to re-provision failed active lease",
 					"lease_uuid", leaseUUID,
@@ -681,11 +753,13 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 			continue
 		}
 
-		if lease.State != billingtypes.LEASE_STATE_PENDING {
-			// Lease is no longer pending - orphaned payload
+		if lease.State != billingtypes.LEASE_STATE_PENDING && lease.State != billingtypes.LEASE_STATE_ACTIVE {
+			// Lease is closed/rejected — payload is no longer needed.
+			// ACTIVE leases retain their payload for re-provisioning if the
+			// container crashes after the success callback.
 			payloadStore.Delete(leaseUUID)
 			cleaned++
-			slog.Info("reconcile: cleaned up orphaned payload (lease no longer pending)",
+			slog.Info("reconcile: cleaned up orphaned payload (lease terminal)",
 				"lease_uuid", leaseUUID,
 				"lease_state", lease.State.String(),
 			)
