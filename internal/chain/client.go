@@ -77,7 +77,7 @@ type ClientConfig struct {
 	TLSCAFile      string        // Path to CA certificate file (optional, uses system CAs if empty)
 	TLSSkipVerify  bool          // Skip certificate verification (for testing only)
 	TxPollInterval time.Duration // Interval for polling tx status (default: 500ms)
-	TxTimeout      time.Duration // Timeout for waiting for tx inclusion (default: 30s)
+	TxTimeout      time.Duration // Timeout for waiting for tx inclusion (default: 60s)
 	QueryPageLimit int           // Page limit for paginated queries (default: 100)
 }
 

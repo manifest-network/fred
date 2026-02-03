@@ -123,7 +123,7 @@ func (a *CallbackAuthenticator) now() time.Time {
 
 // VerifySignature verifies that the provided signature matches the payload.
 // The signature should be in the format "t=<timestamp>,sha256=<hex>".
-// Returns false if the signature is invalid or the timestamp is too old.
+// Returns false if the signature is invalid, the timestamp is too old, or the timestamp is too far in the future.
 func (a *CallbackAuthenticator) VerifySignature(payload []byte, signature string) bool {
 	return a.VerifySignatureWithTime(payload, signature, a.now())
 }

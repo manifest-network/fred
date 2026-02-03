@@ -143,7 +143,7 @@ each component in isolation with mocks and allows swapping implementations.
 ```
 Manager (coordinator)
 ├── ChainClient          interface → chain.Client
-├── BackendRouter        interface → backend.Router
+├── BackendRouter        *backend.Router (passed to Orchestrator via interface)
 ├── InFlightTracker      interface → inFlightMap (sync.RWMutex-protected map)
 ├── Orchestrator         struct    → uses BackendRouter + InFlightTracker
 ├── HandlerSet           struct    → uses Orchestrator + Tracker + AckBatcher

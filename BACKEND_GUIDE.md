@@ -451,7 +451,7 @@ curl -X POST http://localhost:9001/provision \
     "lease_uuid": "test-lease-1",
     "tenant": "manifest1test",
     "provider_uuid": "test-provider",
-    "sku": "docker-nginx",
+    "items": [{"sku": "docker-nginx", "quantity": 1}],
     "callback_url": "http://localhost:8080/callbacks/provision"
   }'
 ```
