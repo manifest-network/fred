@@ -536,7 +536,7 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 		case <-ctx.Done():
 			pollTimer.Stop()
 			if lastErr != nil {
-				return nil, fmt.Errorf("waiting for tx %s after %d attempts: %w (last error: %v)", txHash, pollAttempts, ctx.Err(), lastErr)
+				return nil, fmt.Errorf("waiting for tx %s after %d attempts: %w (last error: %w)", txHash, pollAttempts, ctx.Err(), lastErr)
 			}
 			return nil, fmt.Errorf("waiting for tx %s after %d attempts: %w", txHash, pollAttempts, ctx.Err())
 		case <-pollTimer.C:

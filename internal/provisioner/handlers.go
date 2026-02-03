@@ -1,7 +1,6 @@
 package provisioner
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -123,20 +122,4 @@ func (m *Manager) handleBackendCallback(msg *message.Message) error {
 // handlePayloadReceived delegates to the handler set.
 func (m *Manager) handlePayloadReceived(msg *message.Message) error {
 	return m.handlers.HandlePayloadReceived(msg)
-}
-
-// startProvisioning is a convenience method for tests.
-// Deprecated: Use orchestrator.StartProvisioning directly.
-func (m *Manager) startProvisioning(ctx context.Context, lease *billingtypes.Lease, opts provisionOpts) error {
-	return m.orchestrator.StartProvisioning(ctx, lease, ProvisionOpts{
-		Payload:     opts.payload,
-		PayloadHash: opts.payloadHash,
-	})
-}
-
-// provisionOpts contains optional parameters for startProvisioning.
-// Deprecated: Use ProvisionOpts from orchestrator.go directly.
-type provisionOpts struct {
-	payload     []byte // Optional deployment payload
-	payloadHash string // Optional hex-encoded SHA-256 hash of payload
 }
