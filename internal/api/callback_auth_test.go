@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 // testCallbackSecret is a valid secret for testing (>= 32 bytes, ASCII).
@@ -779,7 +780,7 @@ func TestParseSignature(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			timestamp, sig, ok := parseSignature(tt.signature)
+			timestamp, sig, ok := hmacauth.ParseSignature(tt.signature)
 			if ok != tt.wantOK {
 				t.Errorf("parseSignature() ok = %v, want %v", ok, tt.wantOK)
 				return

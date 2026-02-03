@@ -162,6 +162,7 @@ func run(cmd *cobra.Command, args []string) error {
 			Name:    bcfg.Name,
 			BaseURL: bcfg.URL,
 			Timeout: bcfg.Timeout,
+			Secret:  cfg.CallbackSecret,
 		})
 
 		backendEntries = append(backendEntries, backend.BackendEntry{

@@ -14,6 +14,7 @@ import (
 
 	"github.com/sony/gobreaker"
 
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
@@ -148,6 +149,14 @@ const (
 	CallbackStatusFailed  = "failed"
 )
 
+// ErrValidation is returned when a provision request fails pre-flight validation
+// (e.g., unknown SKU, invalid manifest, disallowed image registry).
+var ErrValidation = errors.New("validation error")
+
+// ErrInsufficientResources is returned when there are not enough resources
+// to fulfill a provision request.
+var ErrInsufficientResources = errors.New("insufficient resources")
+
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
@@ -161,6 +170,7 @@ func isCircuitBreakerError(err error) bool {
 type HTTPClient struct {
 	name       string
 	baseURL    string
+	secret     string
 	httpClient *http.Client
 	cb         *gobreaker.CircuitBreaker
 }
@@ -172,6 +182,7 @@ type HTTPClientConfig struct {
 	Timeout             time.Duration
 	MaxIdleConns        int // Max idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost int // Max idle connections per host (default: 10)
+	Secret              string
 
 	// Circuit breaker settings
 	CBMaxRequests   uint32        // Max requests in half-open state (default: 1)
@@ -225,6 +236,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 	return &HTTPClient{
 		name:    cfg.Name,
 		baseURL: cfg.BaseURL,
+		secret:  cfg.Secret,
 		httpClient: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
@@ -249,6 +261,25 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	metrics.BackendRequestsTotal.WithLabelValues(c.name, operation, status).Inc()
 }
 
+// readErrorBody reads up to 4 KiB from an HTTP response body for inclusion
+// in error messages. If reading fails, the read error is reported instead.
+func readErrorBody(resp *http.Response) string {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return fmt.Sprintf("<body read error: %v>", err)
+	}
+	return string(body)
+}
+
+// signRequest adds an HMAC-SHA256 signature header to the request.
+// If no secret is configured, this is a no-op (backwards compatible).
+func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
+	if c.secret == "" {
+		return
+	}
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(c.secret, body))
+}
+
 // Provision sends a provision request to the backend.
 func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err error) {
 	start := time.Now()
@@ -265,6 +296,7 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -273,8 +305,7 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusAccepted {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		return nil, nil
@@ -310,8 +341,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("get info failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, fmt.Errorf("get info failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		var info LeaseInfo
@@ -347,6 +377,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -355,8 +386,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("deprovision failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, fmt.Errorf("deprovision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		return nil, nil
@@ -386,8 +416,7 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		var result struct {
