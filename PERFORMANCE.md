@@ -5,7 +5,7 @@ This document presents performance benchmarks and stress test results for Fred's
 ## Test Environment
 
 - **Platform**: Linux 6.18.4-1-MANJARO
-- **Go Version**: 1.24+
+- **Go Version**: 1.25+
 - **Event Library**: Watermill with GoChannel (in-memory pub/sub)
 - **Backend**: Mock backend (instant response, no I/O)
 

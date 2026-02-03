@@ -102,7 +102,7 @@ sequenceDiagram
 ## Building
 
 ```bash
-# Build all binaries (providerd and mock-backend)
+# Build all binaries (providerd, mock-backend, docker-backend)
 make build
 
 # Build only providerd
@@ -110,6 +110,9 @@ go build -o build/providerd ./cmd/providerd
 
 # Build only mock-backend
 go build -o build/mock-backend ./cmd/mock-backend
+
+# Build only docker-backend
+go build -o build/docker-backend ./cmd/docker-backend
 ```
 
 ## Configuration
@@ -213,6 +216,7 @@ These options have sensible defaults but can be tuned for specific environments:
 | `fee_denom` | Fee denomination | `umfx` |
 | `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |
 | `credit_check_retry_interval` | Retry interval after credit check errors | `30s` |
+| `shutdown_timeout` | Maximum time for graceful shutdown (drain + cleanup) | `30s` |
 
 ### TLS Configuration
 
@@ -636,6 +640,7 @@ curl -X POST http://localhost:9000/provision \
     "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
     "tenant": "manifest1abc",
     "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+    "items": [{"sku": "mock-resource", "quantity": 1}],
     "callback_url": "http://localhost:8080/callbacks/provision"
   }'
 ```
@@ -696,22 +701,35 @@ services:
 ```
 cmd/
 ├── providerd/          # Main daemon entry point
-└── mock-backend/       # Mock backend for testing
+├── mock-backend/       # Mock backend for testing
+├── docker-backend/     # Docker container backend
+└── loadtest/           # Load testing tool
 
 internal/
 ├── adr036/             # ADR-036 signature verification
 ├── api/                # HTTP server, handlers, rate limiting
 ├── auth/               # Shared authentication utilities
 ├── backend/            # Backend client and router
-│   ├── client.go       # HTTP client for backends
+│   ├── client.go       # HTTP client for backends (with circuit breaker)
 │   ├── router.go       # SKU-based routing
-│   └── mock.go         # In-memory mock for unit tests
+│   ├── mock.go         # In-memory mock for unit tests
+│   └── docker/         # Docker container backend implementation
 ├── chain/              # gRPC client, WebSocket subscriber, signer
 ├── config/             # Configuration loading and validation
 ├── metrics/            # Prometheus metrics definitions
 ├── provisioner/        # Provision lifecycle management
-│   ├── manager.go      # Watermill handlers
-│   └── bridge.go       # Chain events -> Watermill
+│   ├── manager.go      # Coordinator (wires components together)
+│   ├── orchestrator.go # Routes to backends, starts provisioning
+│   ├── handlers.go     # Shared handler logic and lease item extraction
+│   ├── handler_set.go  # Watermill message handlers
+│   ├── reconciler.go   # Level-triggered state reconciliation
+│   ├── tracker.go      # InFlightTracker interface definitions
+│   ├── inflight.go     # In-flight tracking implementation
+│   ├── ack_batcher.go  # Batches lease acknowledgments
+│   ├── timeout_checker.go # Detects callback timeouts
+│   ├── payload.go      # Temporary payload storage (bbolt)
+│   ├── bridge.go       # Chain events -> Watermill
+│   └── interfaces.go   # BackendRouter, LeaseRejecter interfaces
 ├── scheduler/          # Periodic withdrawal and credit monitoring
 ├── testutil/           # Test fixtures and helpers
 ├── util/               # Shared utility functions
@@ -776,7 +794,7 @@ Chain State (leases)     Backend State (provisions)
 - **Token Replay Protection**: Used tokens tracked in persistent database to prevent replay attacks. Uses fail-closed semantics: database errors result in 503 Service Unavailable rather than proceeding without protection
 - **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
 - **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
-- **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses
+- **Security Headers**: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Cache-Control headers on all responses
 - **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection, loopback/link-local/unspecified URLs). SSRF checks validate IP literals and the `localhost` hostname only — private IPs (RFC 1918) are allowed since backends commonly run on private networks. DNS resolution is not performed, so hostnames resolving to blocked addresses are not caught. Use network-level controls for defense in depth.
 
 ## Performance

@@ -95,7 +95,7 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  │                                                                     │   │
 │  │  Middleware: [Retry, Recoverer]                                      │   │
 │  │                                                                     │   │
-│  │  Topics → Handlers:                                                 │   │
+│  │  Topics → Handlers (HandlerSet):                                    │   │
 │  │  ─────────────────────────────────────────────────────────────      │   │
 │  │  events.lease.created       →  handleLeaseCreated                   │   │
 │  │  events.lease.closed        →  handleLeaseClosed                    │   │
@@ -108,14 +108,67 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                     Provision Manager                                │   │
 │  │                                                                     │   │
-│  │  • In-flight tracking (ephemeral map, recovered via reconciliation) │   │
-│  │  • Routes to appropriate backend by SKU                             │   │
-│  │  • Handles lifecycle: create → provision → ack/reject               │   │
-│  │  • Ack batching for efficiency                                      │   │
+│  │  Coordinator that wires together:                                   │   │
+│  │                                                                     │   │
+│  │  ┌──────────────────┐  ┌─────────────────┐  ┌──────────────────┐  │   │
+│  │  │   Orchestrator   │  │  InFlightTracker │  │   AckBatcher     │  │   │
+│  │  │  Routes to       │  │  (interface)     │  │  Batches chain   │  │   │
+│  │  │  backends,       │  │  Ephemeral map,  │  │  ack txns for    │  │   │
+│  │  │  starts          │  │  recovered via   │  │  efficiency      │  │   │
+│  │  │  provisioning    │  │  reconciliation  │  │                  │  │   │
+│  │  └──────────────────┘  └─────────────────┘  └──────────────────┘  │   │
+│  │                                                                     │   │
+│  │  ┌──────────────────┐  ┌─────────────────┐                        │   │
+│  │  │  TimeoutChecker  │  │   PayloadStore   │                        │   │
+│  │  │  Rejects leases  │  │  Temp storage    │                        │   │
+│  │  │  with expired    │  │  for tenant      │                        │   │
+│  │  │  callbacks       │  │  payloads (bbolt)│                        │   │
+│  │  └──────────────────┘  └─────────────────┘                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Reconciler (independent component)                                 │   │
+│  │  Level-triggered state comparison: chain vs backends                │   │
+│  │  Runs on startup + periodically, uses worker pool                   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Dependency Injection
+
+All components are wired via interfaces, not concrete types. This enables testing
+each component in isolation with mocks and allows swapping implementations.
+
+```
+Manager (coordinator)
+├── ChainClient          interface → chain.Client
+├── BackendRouter        interface → backend.Router
+├── InFlightTracker      interface → inFlightMap (sync.RWMutex-protected map)
+├── Orchestrator         struct    → uses BackendRouter + InFlightTracker
+├── HandlerSet           struct    → uses Orchestrator + Tracker + AckBatcher
+├── AckBatcher           struct    → uses ChainClient
+├── TimeoutChecker       struct    → uses InFlightTracker + LeaseRejecter
+└── PayloadStore         struct    → bbolt-backed (optional)
+
+Reconciler (independent)
+├── ReconcilerChainClient  interface → chain.Client
+├── BackendRouter          *backend.Router
+└── ReconcilerTracker      interface → Manager (extends InFlightTracker)
+```
+
+Key interfaces defined where they're consumed:
+
+| Interface | Defined in | Used by |
+|-----------|-----------|---------|
+| `ChainClient` | `provisioner/manager.go` | Manager, HandlerSet, AckBatcher |
+| `ReconcilerChainClient` | `provisioner/reconciler.go` | Reconciler |
+| `BackendRouter` | `provisioner/interfaces.go` | Orchestrator |
+| `InFlightTracker` | `provisioner/tracker.go` | Orchestrator, HandlerSet, TimeoutChecker |
+| `ReconcilerTracker` | `provisioner/tracker.go` | Reconciler |
+| `LeaseRejecter` | `provisioner/interfaces.go` | TimeoutChecker |
+| `CallbackPublisher` | `api/server.go` | API callback handler |
+| `StatusChecker` | `api/server.go` | API status handler |
 
 ## Event Flow
 
@@ -176,10 +229,9 @@ All long-running goroutines are:
 3. Cancellable via context
 
 ```go
+// Uses sync.WaitGroup.Go (Go 1.25+) for cleaner goroutine management.
 func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func() error) {
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
+    wg.Go(func() {
         defer func() {
             if r := recover(); r != nil {
                 errChan <- fmt.Errorf("%s panic: %v", component, r)
@@ -188,7 +240,7 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
         if err := fn(); err != nil && !errors.Is(err, context.Canceled) {
             errChan <- fmt.Errorf("%s error: %w", component, err)
         }
-    }()
+    })
 }
 ```
 
@@ -350,7 +402,8 @@ Common test data in `internal/testutil/fixtures.go`:
 2. Fred validates:
    - Signature matches message
    - Public key derives to tenant address
-   - Timestamp within 30 seconds
+   - Timestamp not expired (max 30 seconds old)
+   - Timestamp not too far in future (max 10 seconds clock skew)
    - Token not previously used (replay protection)
    - Lease belongs to tenant and this provider
 ```

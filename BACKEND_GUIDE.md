@@ -8,7 +8,7 @@ This guide explains how to implement a backend for Fred. A backend is an HTTP se
 ┌────────────────────────────────────────────────────────────────┐
 │                            FRED                                 │
 │                                                                │
-│  Lease: {sku: "docker-nginx", ...}                             │
+│  Lease: {items: [{sku: "docker-nginx", quantity: 1}], ...}     │
 │              │                                                 │
 │              ▼                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
@@ -27,7 +27,7 @@ This guide explains how to implement a backend for Fred. A backend is an HTTP se
 └─────────────────────────────│──────────────────────────────────┘
                               │
                               │ POST /provision
-                              │ {sku: "docker-nginx", ...}
+                              │ {items: [...], ...}
                               ▼
                 ┌───────────────────────────────┐
                 │       Your Backend            │
