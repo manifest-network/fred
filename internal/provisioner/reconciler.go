@@ -564,6 +564,26 @@ func (r *Reconciler) processLease(
 			}
 		}
 
+	case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned && provision.Status == backend.ProvisionStatusFailed:
+		// Anomaly: Lease is active but the container has crashed/exited.
+		// This happens when a container dies after the success callback was sent
+		// and the lease was acknowledged (e.g., OOM kill, runtime crash).
+		// Attempt to re-provision so the tenant gets a working resource.
+		slog.Warn("reconcile: anomaly - active lease has failed provision, re-provisioning",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+			"backend", provision.BackendName,
+		)
+		anomalies.Add(1)
+		if err := r.startProvisioning(ctx, lease); err != nil {
+			if !errors.Is(err, errLeaseAlreadyInFlight) {
+				slog.Error("reconcile: failed to re-provision failed active lease",
+					"lease_uuid", leaseUUID,
+					"error", err,
+				)
+			}
+		}
+
 	case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned:
 		// Healthy state - nothing to do
 	}

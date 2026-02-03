@@ -80,7 +80,7 @@ callback_insecure_skip_verify: true
 
 # External host address for port mappings
 # This is the address tenants will use to connect to containers
-host_address: "your-external-ip-or-hostname"
+host_address: "0.0.0.0"
 
 # Container Hardening
 #

@@ -88,6 +88,13 @@ type Config struct {
 	// ContainerTmpfsSizeMB sets the tmpfs size in MB for /tmp and /run when
 	// readonly rootfs is enabled. Defaults to 64.
 	ContainerTmpfsSizeMB int `yaml:"container_tmpfs_size_mb"`
+
+	// StartupVerifyDuration is how long to wait after starting containers before
+	// verifying they're still running. This catches containers that crash immediately
+	// on startup (e.g., bad config, read-only filesystem errors, missing dependencies).
+	// The success callback is only sent after verification passes.
+	// Defaults to 5 seconds. Set to 0 to disable.
+	StartupVerifyDuration time.Duration `yaml:"startup_verify_duration"`
 }
 
 func ptrBool(b bool) *bool    { return &b }

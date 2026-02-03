@@ -404,7 +404,34 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 	}
 
-	logger.Info("all containers provisioned successfully", "count", len(containerIDs))
+	// Verify containers are still running after a startup grace period.
+	// This catches containers that crash immediately on startup (e.g., bad config,
+	// read-only filesystem errors, missing dependencies) before we send a success
+	// callback and the lease is acknowledged as active on chain.
+	startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
+	logger.Info("waiting for startup verification", "duration", startupVerify)
+
+	select {
+	case <-ctx.Done():
+		err = fmt.Errorf("provisioning canceled during startup verification: %w", ctx.Err())
+		return
+	case <-time.After(startupVerify):
+	}
+
+	for i, containerID := range containerIDs {
+		info, inspectErr := b.docker.InspectContainer(ctx, containerID)
+		if inspectErr != nil {
+			err = fmt.Errorf("failed to verify container %d after startup: %w", i, inspectErr)
+			return
+		}
+		status := containerStatusToProvisionStatus(info.Status)
+		if status != backend.ProvisionStatusReady {
+			err = fmt.Errorf("container %d exited during startup (status: %s)", i, info.Status)
+			return
+		}
+	}
+
+	logger.Info("all containers provisioned and verified", "count", len(containerIDs))
 }
 
 // GetInfo returns lease information including connection details.
@@ -616,9 +643,25 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		})
 	}
 
-	// Merge with existing state: preserve in-flight provisions (status=provisioning)
-	// that haven't yet produced containers.
+	// Merge with existing state and detect status transitions.
 	b.provisionsMu.Lock()
+
+	// Detect ready→failed transitions: containers that were running but have since crashed.
+	// We must notify Fred so the lease doesn't remain active for a dead container.
+	var failedLeases []string
+	for uuid, existing := range b.provisions {
+		if existing.Status == backend.ProvisionStatusReady {
+			if rec, ok := recovered[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
+				failedLeases = append(failedLeases, uuid)
+				b.logger.Warn("container crashed after provisioning",
+					"lease_uuid", uuid,
+					"tenant", existing.Tenant,
+				)
+			}
+		}
+	}
+
+	// Preserve in-flight provisions (status=provisioning) that haven't yet produced containers.
 	for uuid, existing := range b.provisions {
 		if existing.Status == backend.ProvisionStatusProvisioning {
 			if _, hasContainers := recovered[uuid]; !hasContainers {
@@ -630,6 +673,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	b.provisions = recovered
 	b.pool.Reset(allocations)
 	b.provisionsMu.Unlock()
+
+	// Send failure callbacks outside the lock to avoid holding it during I/O.
+	for _, uuid := range failedLeases {
+		b.sendCallback(uuid, false, "container exited unexpectedly")
+	}
 
 	totalContainers := 0
 	for _, p := range recovered {
