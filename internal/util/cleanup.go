@@ -11,14 +11,14 @@ type CleanupFunc func() error
 
 // StartCleanupLoop runs a cleanup function periodically until the context is canceled.
 // It logs errors using slog with the provided component name.
-// The caller is responsible for calling wg.Done() if using a WaitGroup.
+// The caller is responsible for goroutine lifecycle management.
+// Typically used with wg.Go() (Go 1.25+) which handles Done() automatically.
 //
 // Example usage:
 //
-//	go func() {
-//	    defer wg.Done()
+//	wg.Go(func() {
 //	    util.StartCleanupLoop(ctx, interval, cleanupFunc, "token_tracker")
-//	}()
+//	})
 func StartCleanupLoop(ctx context.Context, interval time.Duration, cleanup CleanupFunc, component string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

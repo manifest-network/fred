@@ -1,11 +1,24 @@
 package provisioner
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
 	"sync"
 	"time"
 )
+
+// Acknowledger defines the interface for acknowledging leases on chain.
+// This is used by handlers to acknowledge successful provisions.
+type Acknowledger interface {
+	// Acknowledge queues a lease for acknowledgment and waits for the result.
+	// Returns true if the lease was acknowledged, along with the transaction hash.
+	// This method blocks until the acknowledgment is processed.
+	Acknowledge(ctx context.Context, leaseUUID string) (acknowledged bool, txHash string, err error)
+}
+
+// Compile-time check that AckBatcher implements Acknowledger.
+var _ Acknowledger = (*AckBatcher)(nil)
 
 const (
 	// DefaultAckBatchInterval is the maximum time to wait before flushing a batch.
@@ -28,7 +41,7 @@ type AckBatcherConfig struct {
 	BatchInterval time.Duration
 
 	// BatchSize is the maximum number of acks to collect before flushing.
-	// Default: 50
+	// Default: DefaultAckBatchSize (10)
 	BatchSize int
 }
 
@@ -65,15 +78,9 @@ type AckBatcher struct {
 
 // NewAckBatcher creates a new acknowledgment batcher.
 func NewAckBatcher(chainClient ChainClient, cfg AckBatcherConfig) *AckBatcher {
-	// Apply defaults
-	interval := cfg.BatchInterval
-	if interval == 0 {
-		interval = DefaultAckBatchInterval
-	}
-	size := cfg.BatchSize
-	if size == 0 {
-		size = DefaultAckBatchSize
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	interval := cmp.Or(cfg.BatchInterval, DefaultAckBatchInterval)
+	size := cmp.Or(cfg.BatchSize, DefaultAckBatchSize)
 
 	return &AckBatcher{
 		chainClient:   chainClient,
@@ -89,8 +96,8 @@ func NewAckBatcher(chainClient ChainClient, cfg AckBatcherConfig) *AckBatcher {
 func (b *AckBatcher) Start(ctx context.Context) {
 	ctx, b.cancel = context.WithCancel(ctx)
 
-	b.wg.Add(1)
-	go b.batchLoop(ctx)
+	// Use WaitGroup.Go for cleaner goroutine management (Go 1.25+)
+	b.wg.Go(func() { b.batchLoop(ctx) })
 
 	slog.Info("ack batcher started",
 		"batch_interval", b.batchInterval,
@@ -128,8 +135,8 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 }
 
 // batchLoop collects requests and flushes them periodically or when batch is full.
+// Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
 func (b *AckBatcher) batchLoop(ctx context.Context) {
-	defer b.wg.Done()
 
 	var pending []ackRequest
 	timer := time.NewTimer(b.batchInterval)

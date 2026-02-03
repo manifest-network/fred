@@ -467,38 +467,19 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 // requestTimeoutMiddleware applies a timeout to request processing.
 // This is separate from HTTP server timeouts (ReadTimeout/WriteTimeout) and applies
-// to the handler logic itself. If the handler takes longer than the timeout,
-// the request context is canceled and handlers should check ctx.Err() to detect
-// DeadlineExceeded and write an appropriate error response.
+// to the handler logic itself. Uses http.TimeoutHandler which properly buffers the
+// response and handles the timeout safely, avoiding race conditions with ResponseWriter.
+//
+// We pre-set Content-Type on the real ResponseWriter so that the timeout path
+// (which writes directly to it, bypassing the buffered timeoutWriter) produces
+// an application/json response matching the ErrorResponse envelope used by writeError.
+// On the success path, the handler's own Content-Type overwrites this pre-set value.
 func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
+		th := http.TimeoutHandler(next, timeout, `{"error":"request timeout","code":503}`)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx, cancel := context.WithTimeout(r.Context(), timeout)
-			defer cancel()
-
-			// Create a channel to signal completion
-			done := make(chan struct{})
-
-			// Run the handler in a goroutine so we can detect timeout
-			go func() {
-				next.ServeHTTP(w, r.WithContext(ctx))
-				close(done)
-			}()
-
-			select {
-			case <-done:
-				// Handler completed normally
-			case <-ctx.Done():
-				// Timeout occurred - log it and wait for handler to finish
-				// The handler should detect context.DeadlineExceeded and write an error response
-				slog.Warn("request timeout exceeded",
-					"method", r.Method,
-					"path", r.URL.Path,
-					"timeout", timeout,
-				)
-				// Wait for handler goroutine to finish to avoid races with ResponseWriter
-				<-done
-			}
+			w.Header().Set("Content-Type", "application/json")
+			th.ServeHTTP(w, r)
 		})
 	}
 }

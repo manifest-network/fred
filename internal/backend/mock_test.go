@@ -13,7 +13,7 @@ func TestMockBackend_Provision(t *testing.T) {
 	err := mock.Provision(context.Background(), ProvisionRequest{
 		LeaseUUID: "lease-1",
 		Tenant:    "tenant-1",
-		SKU:       "gpu-a100",
+		Items:     []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
 	})
 	if err != nil {
 		t.Fatalf("Provision() error = %v", err)

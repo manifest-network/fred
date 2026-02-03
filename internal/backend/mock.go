@@ -30,6 +30,7 @@ type mockProvision struct {
 	ProviderUUID string
 	Tenant       string
 	SKU          string
+	Quantity     int    // Number of units provisioned
 	Status       string // "provisioning", "ready", "failed"
 	CreatedAt    time.Time
 	Payload      []byte
@@ -76,7 +77,7 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 	// Check if already provisioned
 	if _, exists := m.provisions[req.LeaseUUID]; exists {
 		m.mu.Unlock()
-		return fmt.Errorf("lease %s already provisioned", req.LeaseUUID)
+		return fmt.Errorf("%w: %s", ErrAlreadyProvisioned, req.LeaseUUID)
 	}
 
 	// Create provision record
@@ -84,7 +85,8 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 		LeaseUUID:    req.LeaseUUID,
 		ProviderUUID: req.ProviderUUID,
 		Tenant:       req.Tenant,
-		SKU:          req.SKU,
+		SKU:          req.RoutingSKU(),
+		Quantity:     req.TotalQuantity(),
 		Status:       "provisioning",
 		CreatedAt:    time.Now(),
 		Payload:      req.Payload,

@@ -102,7 +102,7 @@ sequenceDiagram
 ## Building
 
 ```bash
-# Build all binaries (providerd and mock-backend)
+# Build all binaries (providerd, mock-backend, docker-backend)
 make build
 
 # Build only providerd
@@ -110,6 +110,9 @@ go build -o build/providerd ./cmd/providerd
 
 # Build only mock-backend
 go build -o build/mock-backend ./cmd/mock-backend
+
+# Build only docker-backend
+go build -o build/docker-backend ./cmd/docker-backend
 ```
 
 ## Configuration
@@ -208,11 +211,12 @@ These options have sensible defaults but can be tuned for specific environments:
 | `tx_timeout` | Transaction confirmation timeout | `30s` |
 | `query_page_limit` | Page size for chain queries | `100` |
 | `max_withdraw_iterations` | Max iterations for withdrawal batching | `100` |
-| `gas_limit` | Gas limit for transactions | `500000` |
+| `gas_limit` | Gas limit for transactions | `1500000` |
 | `gas_price` | Gas price (in smallest denom) | `25` |
 | `fee_denom` | Fee denomination | `umfx` |
 | `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |
 | `credit_check_retry_interval` | Retry interval after credit check errors | `30s` |
+| `shutdown_timeout` | Maximum time for graceful shutdown (drain + cleanup) | `30s` |
 
 ### TLS Configuration
 
@@ -290,7 +294,7 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 }
 ```
 
-**Response:**
+**Response (single instance):**
 ```json
 {
   "lease_uuid": "...",
@@ -298,7 +302,10 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   "provider_uuid": "...",
   "connection": {
     "host": "compute-alpha.example.com",
-    "port": 8443,
+    "ports": {
+      "8080/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"},
+      "443/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}
+    },
     "protocol": "https",
     "metadata": {
       "region": "us-east-1",
@@ -307,6 +314,40 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   }
 }
 ```
+
+**Response (multi-instance lease):**
+```json
+{
+  "lease_uuid": "...",
+  "tenant": "manifest1...",
+  "provider_uuid": "...",
+  "connection": {
+    "host": "compute-alpha.example.com",
+    "instances": [
+      {
+        "instance_index": 0,
+        "container_id": "abc123",
+        "image": "nginx:latest",
+        "status": "running",
+        "ports": {"80/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"}}
+      },
+      {
+        "instance_index": 1,
+        "container_id": "def456",
+        "image": "redis:alpine",
+        "status": "running",
+        "ports": {"6379/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}}
+      }
+    ],
+    "metadata": {"backend": "docker"}
+  }
+}
+```
+
+**Fields:**
+- `ports` - Map of container port to host binding (e.g., "8080/tcp" → host_port 32768)
+- `instances` - Array of per-instance details for multi-container leases (each with its own ports)
+- `metadata` - Additional backend-specific data
 
 ### Get Lease Status
 
@@ -433,12 +474,20 @@ Start provisioning a resource (async).
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
-  "sku": "k8s-small",
+  "items": [
+    {"sku": "k8s-small", "quantity": 2},
+    {"sku": "k8s-large", "quantity": 1}
+  ],
   "callback_url": "http://fred.example.com:8080/callbacks/provision",
   "payload": "<base64-encoded-bytes>",
   "payload_hash": "abc123..."
 }
 ```
+
+**Fields:**
+- `items` - Array of lease items with SKU and quantity. All items belong to the same provider.
+- `payload` - Optional base64-encoded deployment payload (only present if lease has meta_hash)
+- `payload_hash` - Optional hex-encoded SHA-256 hash of payload (only present with payload)
 
 **Response:** `202 Accepted`
 ```json
@@ -455,15 +504,23 @@ Get lease information for a provisioned resource.
 ```json
 {
   "host": "10.0.0.1",
-  "port": 8080,
+  "ports": {
+    "8080/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"},
+    "443/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}
+  },
   "protocol": "https",
-  "credentials": {"token": "..."},
   "metadata": {"region": "us-east-1"},
   "custom_field": "any additional backend-specific data"
 }
 ```
 
-The response can contain any JSON fields the backend wants to return.
+**Known Fields** (extracted by fred into structured response):
+- `host` - Hostname or IP for connecting to the resource
+- `ports` - Map of container ports to host bindings
+- `protocol` - Connection protocol (e.g., "https", "ssh")
+- `metadata` - Additional key-value metadata
+
+Any additional fields are passed through to the tenant in the `metadata` section.
 
 **Response:** `404 Not Found` if not provisioned.
 
@@ -583,6 +640,7 @@ curl -X POST http://localhost:9000/provision \
     "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
     "tenant": "manifest1abc",
     "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+    "items": [{"sku": "mock-resource", "quantity": 1}],
     "callback_url": "http://localhost:8080/callbacks/provision"
   }'
 ```
@@ -643,22 +701,35 @@ services:
 ```
 cmd/
 ├── providerd/          # Main daemon entry point
-└── mock-backend/       # Mock backend for testing
+├── mock-backend/       # Mock backend for testing
+├── docker-backend/     # Docker container backend
+└── loadtest/           # Load testing tool
 
 internal/
 ├── adr036/             # ADR-036 signature verification
 ├── api/                # HTTP server, handlers, rate limiting
 ├── auth/               # Shared authentication utilities
 ├── backend/            # Backend client and router
-│   ├── client.go       # HTTP client for backends
+│   ├── client.go       # HTTP client for backends (with circuit breaker)
 │   ├── router.go       # SKU-based routing
-│   └── mock.go         # In-memory mock for unit tests
+│   ├── mock.go         # In-memory mock for unit tests
+│   └── docker/         # Docker container backend implementation
 ├── chain/              # gRPC client, WebSocket subscriber, signer
 ├── config/             # Configuration loading and validation
 ├── metrics/            # Prometheus metrics definitions
 ├── provisioner/        # Provision lifecycle management
-│   ├── manager.go      # Watermill handlers
-│   └── bridge.go       # Chain events -> Watermill
+│   ├── manager.go      # Coordinator (wires components together)
+│   ├── orchestrator.go # Routes to backends, starts provisioning
+│   ├── handlers.go     # Shared handler logic and lease item extraction
+│   ├── handler_set.go  # Watermill message handlers
+│   ├── reconciler.go   # Level-triggered state reconciliation
+│   ├── tracker.go      # InFlightTracker interface definitions
+│   ├── inflight.go     # In-flight tracking implementation
+│   ├── ack_batcher.go  # Batches lease acknowledgments
+│   ├── timeout_checker.go # Detects callback timeouts
+│   ├── payload.go      # Temporary payload storage (bbolt)
+│   ├── bridge.go       # Chain events -> Watermill
+│   └── interfaces.go   # BackendRouter, LeaseRejecter interfaces
 ├── scheduler/          # Periodic withdrawal and credit monitoring
 ├── testutil/           # Test fixtures and helpers
 ├── util/               # Shared utility functions
@@ -723,7 +794,7 @@ Chain State (leases)     Backend State (provisions)
 - **Token Replay Protection**: Used tokens tracked in persistent database to prevent replay attacks. Uses fail-closed semantics: database errors result in 503 Service Unavailable rather than proceeding without protection
 - **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
 - **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
-- **Security Headers**: X-Content-Type-Options, X-Frame-Options, Cache-Control headers on all responses
+- **Security Headers**: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Cache-Control headers on all responses
 - **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection, loopback/link-local/unspecified URLs). SSRF checks validate IP literals and the `localhost` hostname only — private IPs (RFC 1918) are allowed since backends commonly run on private networks. DNS resolution is not performed, so hostnames resolving to blocked addresses are not caught. Use network-level controls for defense in depth.
 
 ## Performance
@@ -741,7 +812,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test result
 
 ## Dependencies
 
-- Go 1.24+ (uses `sync.WaitGroup.Go()`, `range` over integers)
+- Go 1.25+ (uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
 - Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -135,11 +136,28 @@ type ConnectionResponse struct {
 }
 
 // ConnectionDetails contains the connection information for a lease.
+// For multi-instance leases, the Instances array contains per-instance details.
 type ConnectionDetails struct {
-	Host     string            `json:"host"`
-	Port     int               `json:"port"`
-	Protocol string            `json:"protocol"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Host      string                 `json:"host"`
+	Ports     map[string]PortMapping `json:"ports,omitempty"`
+	Instances []InstanceInfo         `json:"instances,omitempty"`
+	Protocol  string                 `json:"protocol,omitempty"`
+	Metadata  map[string]string      `json:"metadata,omitempty"`
+}
+
+// InstanceInfo contains connection details for a single instance in a multi-instance lease.
+type InstanceInfo struct {
+	InstanceIndex int                    `json:"instance_index"`
+	ContainerID   string                 `json:"container_id,omitempty"`
+	Image         string                 `json:"image,omitempty"`
+	Status        string                 `json:"status,omitempty"`
+	Ports         map[string]PortMapping `json:"ports,omitempty"`
+}
+
+// PortMapping represents a port binding from container to host.
+type PortMapping struct {
+	HostIP   string `json:"host_ip"`
+	HostPort int    `json:"host_port"`
 }
 
 // ErrorResponse represents an error response.
@@ -187,7 +205,7 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract SKU for routing (use first item's SKU - all items share same provider)
-	sku := provisioner.ExtractPrimarySKU(auth.Lease)
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
 
 	// Route to appropriate backend based on SKU (Route already falls back to default)
 	backendClient := h.backendRouter.Route(sku)
@@ -226,8 +244,11 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 // LeaseStatusResponse represents the response for lease status.
+// Includes tenant and provider_uuid for consistency with ConnectionResponse.
 type LeaseStatusResponse struct {
 	LeaseUUID           string `json:"lease_uuid"`
+	Tenant              string `json:"tenant"`
+	ProviderUUID        string `json:"provider_uuid"`
 	State               string `json:"state"`
 	RequiresPayload     bool   `json:"requires_payload"`
 	MetaHashHex         string `json:"meta_hash_hex,omitempty"` // For debugging - shows the expected payload hash
@@ -251,6 +272,8 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	hasMetaHash := len(auth.Lease.MetaHash) > 0
 	response := LeaseStatusResponse{
 		LeaseUUID:       leaseUUID,
+		Tenant:          auth.Token.Tenant,
+		ProviderUUID:    h.providerUUID,
 		State:           auth.Lease.State.String(),
 		RequiresPayload: hasMetaHash,
 	}
@@ -383,12 +406,20 @@ func (h *Handlers) extractToken(r *http.Request) (*AuthToken, error) {
 }
 
 // writeJSON writes a JSON response.
+// Pre-encodes to buffer to catch encoding errors before writing headers.
 func writeJSON(w http.ResponseWriter, data any, status int) {
+	// Encode first to catch errors before writing headers
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		slog.Error("failed to encode response", "error", err)
+		http.Error(w, `{"error":"internal encoding error"}`, http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		slog.Error("failed to encode response", "error", err)
-	}
+	_, _ = w.Write(encoded)
+	_, _ = w.Write([]byte("\n")) // Match json.Encoder behavior (adds newline)
 }
 
 // writeError writes an error response.
@@ -400,8 +431,26 @@ func writeError(w http.ResponseWriter, message string, status int) {
 	writeJSON(w, response, status)
 }
 
+// extractPortMapping extracts a PortMapping from a binding map (JSON unmarshaled format).
+// Handles both string and float64 representations of host_port.
+func extractPortMapping(binding map[string]any) PortMapping {
+	var hostPort int
+	if hp, ok := binding["host_port"].(string); ok {
+		if parsed, err := strconv.Atoi(hp); err == nil {
+			hostPort = parsed
+		}
+	} else if hp, ok := binding["host_port"].(float64); ok {
+		hostPort = int(hp)
+	}
+	hostIP, _ := binding["host_ip"].(string)
+	return PortMapping{
+		HostIP:   hostIP,
+		HostPort: hostPort,
+	}
+}
+
 // extractConnectionDetails extracts ConnectionDetails from a backend LeaseInfo map.
-// Known fields (host, port, protocol, metadata) are mapped to struct fields.
+// Known fields (host, port, ports, protocol, metadata) are mapped to struct fields.
 // Unknown top-level string fields are placed in Metadata.
 func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 	details := ConnectionDetails{
@@ -410,23 +459,85 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 
 	// Known fields that map to struct fields
 	knownFields := map[string]bool{
-		"host":     true,
-		"port":     true,
-		"protocol": true,
-		"metadata": true,
+		"host":      true,
+		"ports":     true,
+		"instances": true,
+		"protocol":  true,
+		"metadata":  true,
 	}
 
 	// Extract known fields
 	if host, ok := info["host"].(string); ok {
 		details.Host = host
 	}
-	if port, ok := info["port"].(float64); ok {
-		details.Port = int(port)
-	} else if port, ok := info["port"].(int); ok {
-		details.Port = port
-	}
 	if protocol, ok := info["protocol"].(string); ok {
 		details.Protocol = protocol
+	}
+
+	// Extract ports map (from docker backend format)
+	if ports, ok := info["ports"].(map[string]map[string]string); ok {
+		details.Ports = make(map[string]PortMapping)
+		for containerPort, binding := range ports {
+			var hostPort int
+			if hp, ok := binding["host_port"]; ok {
+				if parsed, err := strconv.Atoi(hp); err == nil {
+					hostPort = parsed
+				}
+			}
+			details.Ports[containerPort] = PortMapping{
+				HostIP:   binding["host_ip"],
+				HostPort: hostPort,
+			}
+		}
+	} else if ports, ok := info["ports"].(map[string]any); ok {
+		// Handle JSON unmarshaled format (map[string]any)
+		details.Ports = make(map[string]PortMapping)
+		for containerPort, bindingAny := range ports {
+			if binding, ok := bindingAny.(map[string]any); ok {
+				details.Ports[containerPort] = extractPortMapping(binding)
+			}
+		}
+	}
+
+	// Extract instances array (for multi-container leases)
+	if instances, ok := info["instances"].([]any); ok {
+		for _, instAny := range instances {
+			if inst, ok := instAny.(map[string]any); ok {
+				instance := InstanceInfo{}
+
+				// Extract instance index
+				if idx, ok := inst["instance_index"].(float64); ok {
+					instance.InstanceIndex = int(idx)
+				}
+
+				// Extract container ID
+				if cid, ok := inst["container_id"].(string); ok {
+					instance.ContainerID = cid
+				}
+
+				// Extract image
+				if img, ok := inst["image"].(string); ok {
+					instance.Image = img
+				}
+
+				// Extract status
+				if status, ok := inst["status"].(string); ok {
+					instance.Status = status
+				}
+
+				// Extract per-instance ports
+				if ports, ok := inst["ports"].(map[string]any); ok {
+					instance.Ports = make(map[string]PortMapping)
+					for containerPort, bindingAny := range ports {
+						if binding, ok := bindingAny.(map[string]any); ok {
+							instance.Ports[containerPort] = extractPortMapping(binding)
+						}
+					}
+				}
+
+				details.Instances = append(details.Instances, instance)
+			}
+		}
 	}
 
 	// Extract explicit metadata field first

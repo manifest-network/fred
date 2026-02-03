@@ -26,10 +26,10 @@ import (
 // safeGo runs a function in a goroutine with panic recovery.
 // If the function panics, the panic is converted to an error and sent to errChan.
 // The component name is included in the error for debugging.
+//
+// Uses sync.WaitGroup.Go (Go 1.25+) for cleaner goroutine management.
 func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func() error) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("%s panic: %v", component, r)
@@ -38,7 +38,7 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 		if err := fn(); err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- fmt.Errorf("%s error: %w", component, err)
 		}
-	}()
+	})
 }
 
 var (
@@ -51,15 +51,29 @@ var (
 	}
 )
 
+// sdkConfigOnce ensures SDK config is only set once, even if init() runs multiple times
+// (e.g., in tests) or if a dependency already configured it.
+var sdkConfigOnce sync.Once
+
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "path to config file")
 
-	// Configure SDK with manifest bech32 prefixes
-	config := sdk.GetConfig()
-	config.SetBech32PrefixForAccount("manifest", "manifestpub")
-	config.SetBech32PrefixForValidator("manifestvaloper", "manifestvaloperpub")
-	config.SetBech32PrefixForConsensusNode("manifestvalcons", "manifestvalconspub")
-	config.Seal()
+	// Configure SDK with manifest bech32 prefixes.
+	// Use sync.Once to prevent panic if config is already sealed by a dependency.
+	sdkConfigOnce.Do(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Config was already sealed by another package - this is fine,
+				// as long as it was configured with the same prefixes.
+				slog.Debug("SDK config already sealed", "recovered", r)
+			}
+		}()
+		config := sdk.GetConfig()
+		config.SetBech32PrefixForAccount("manifest", "manifestpub")
+		config.SetBech32PrefixForValidator("manifestvaloper", "manifestvaloperpub")
+		config.SetBech32PrefixForConsensusNode("manifestvalcons", "manifestvalconspub")
+		config.Seal()
+	})
 }
 
 func main() {
@@ -278,6 +292,24 @@ func run(cmd *cobra.Command, args []string) error {
 		return <-apiErrChan
 	})
 
+	// Start provisioner BEFORE reconciliation so Watermill handlers are subscribed
+	// before any callbacks can arrive. Without this, callbacks from backends
+	// triggered by reconciliation would fail with "No subscribers to send message".
+	safeGo(&wg, errChan, "provision manager", func() error {
+		return provisionMgr.Start(ctx)
+	})
+
+	// Wait for Watermill router to be running before proceeding.
+	// This ensures handlers are subscribed and ready to receive callbacks.
+	select {
+	case <-provisionMgr.Running():
+		slog.Info("provision manager handlers ready")
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timeout waiting for provision manager to start")
+	}
+
 	// Perform startup operations sequentially to avoid same-block transaction conflicts
 	// WithdrawOnce waits for block inclusion before returning, ensuring the next tx is in a different block
 	slog.Info("performing initial withdrawal")
@@ -285,7 +317,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Run startup reconciliation to recover from any crash
 	// This compares chain state vs backend state and fixes inconsistencies
-	// Note: API server is already listening, so callbacks can be received
+	// Note: API server is already listening and handlers are subscribed, so callbacks can be received
 	slog.Info("performing startup reconciliation")
 	if err := reconciler.RunOnce(ctx); err != nil {
 		slog.Error("startup reconciliation failed", "error", err)
@@ -295,11 +327,6 @@ func run(cmd *cobra.Command, args []string) error {
 	// Start event subscriber (single reader, multiple consumers via Subscribe())
 	safeGo(&wg, errChan, "event subscriber", func() error {
 		return eventSub.Start(ctx)
-	})
-
-	// Start provisioner
-	safeGo(&wg, errChan, "provision manager", func() error {
-		return provisionMgr.Start(ctx)
 	})
 
 	// Start event bridge (subscribes to eventSub, forwards to Watermill)

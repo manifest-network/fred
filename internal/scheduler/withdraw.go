@@ -138,12 +138,8 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 		return
 	}
 
-	// Track the goroutine for graceful shutdown
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.withdrawAndCheckCredits(ctx)
-	}()
+	// Track the goroutine for graceful shutdown (using WaitGroup.Go for Go 1.25+)
+	s.wg.Go(func() { s.withdrawAndCheckCredits(ctx) })
 }
 
 // Stop cancels the scheduler's internal context, stopping all operations.
@@ -218,6 +214,11 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 
 		timer := time.NewTimer(waitDuration)
 
+		// Get internal context for select - this allows Stop() to wake us up
+		s.ctxMu.RLock()
+		internalCtx := s.ctx
+		s.ctxMu.RUnlock()
+
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -234,8 +235,26 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 			slog.Info("withdrawal scheduler stopped")
 			return ctx.Err()
 
+		case <-internalCtx.Done():
+			// Stop() was called - exit the loop
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			s.wg.Wait()
+			slog.Info("withdrawal scheduler stopped via Stop()")
+			return nil
+
 		case <-timer.C:
-			// Timer fired, no need to stop but good practice to ensure cleanup
+			// Timer consumed - proceed to work
+		}
+
+		// Check if we should stop before doing work
+		if internalCtx.Err() != nil {
+			s.wg.Wait()
+			return nil
 		}
 
 		s.withdrawAndCheckCredits(ctx)

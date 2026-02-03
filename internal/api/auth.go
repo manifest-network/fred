@@ -11,6 +11,11 @@ const (
 	// MaxTokenAge is the maximum age of a valid authentication token.
 	// Kept short (30 seconds) to limit replay attack window.
 	MaxTokenAge = 30 * time.Second
+
+	// MaxFutureClockSkew is the maximum allowed clock skew for tokens with future timestamps.
+	// This is intentionally smaller than MaxTokenAge to limit pre-generated token attacks.
+	// 10 seconds allows for reasonable clock drift without enabling abuse.
+	MaxFutureClockSkew = 10 * time.Second
 )
 
 // AuthToken represents the bearer token for tenant authentication.

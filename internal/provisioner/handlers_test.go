@@ -359,7 +359,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 
 	// Store a payload for a lease, then track it as in-flight
 	payloadStore.Store("lease-1", []byte("deployment data"))
-	manager.TrackInFlight("lease-1", "tenant-1", "", "test")
+	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,

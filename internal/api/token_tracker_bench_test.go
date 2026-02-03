@@ -1,8 +1,6 @@
 package api
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -24,19 +22,16 @@ func BenchmarkTokenTracker_TryUse(b *testing.B) {
 	}
 	defer tracker.Close()
 
-	// Pre-generate unique tokens
-	tokens := make([]string, b.N)
-	for i := 0; i < b.N; i++ {
-		tokenBytes := make([]byte, 32)
-		rand.Read(tokenBytes)
-		tokens[i] = hex.EncodeToString(tokenBytes)
-	}
-
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := tracker.TryUse(tokens[i]); err != nil {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	// Generate tokens on-the-fly since b.N is not reliable with b.Loop()
+	i := 0
+	for b.Loop() {
+		token := fmt.Sprintf("bench-token-%d", i)
+		if err := tracker.TryUse(token); err != nil {
 			b.Fatal(err)
 		}
+		i++
 	}
 }
 
@@ -91,12 +86,15 @@ func BenchmarkTokenTracker_ReplayDetection(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		// Try to reuse an existing token - should return ErrTokenAlreadyUsed
 		err := tracker.TryUse(tokens[i%numTokens])
 		if err != ErrTokenAlreadyUsed {
 			b.Fatalf("expected ErrTokenAlreadyUsed, got %v", err)
 		}
+		i++
 	}
 }
 

@@ -41,9 +41,12 @@ func BenchmarkPayloadStore_Write(b *testing.B) {
 	rand.Read(payload)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		leaseUUID := fmt.Sprintf("lease-%d", i)
 		store.Store(leaseUUID, payload)
+		i++
 	}
 	b.StopTimer()
 }
@@ -104,9 +107,12 @@ func BenchmarkPayloadStore_Read(b *testing.B) {
 	waitForFlush(b, store, lastKey, time.Second)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+	i := 0
+	for b.Loop() {
 		leaseUUID := fmt.Sprintf("lease-%d", i%numEntries)
 		store.Get(leaseUUID)
+		i++
 	}
 	b.StopTimer()
 }
@@ -215,9 +221,12 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 
 			b.ResetTimer()
 			b.SetBytes(int64(tc.size))
-			for i := 0; i < b.N; i++ {
+			// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
+			i := 0
+			for b.Loop() {
 				leaseUUID := fmt.Sprintf("lease-%d", i)
 				store.Store(leaseUUID, payload)
+				i++
 			}
 			b.StopTimer()
 		})

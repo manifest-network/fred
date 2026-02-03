@@ -5,7 +5,7 @@ This document presents performance benchmarks and stress test results for Fred's
 ## Test Environment
 
 - **Platform**: Linux 6.18.4-1-MANJARO
-- **Go Version**: 1.24+
+- **Go Version**: 1.25+
 - **Event Library**: Watermill with GoChannel (in-memory pub/sub)
 - **Backend**: Mock backend (instant response, no I/O)
 
@@ -174,7 +174,7 @@ Based on benchmark results:
 
 1. **Watermill GoChannel buffer**: Production uses unbuffered (default), benchmarks use 1000-10000
 2. **Handler concurrency**: Watermill handles this automatically with goroutines
-3. **Batch acknowledgments**: Ack batcher (50 items / 500ms) reduces chain transactions
+3. **Batch acknowledgments**: Ack batcher (10 items / 500ms) reduces chain transactions
 4. **PayloadStore batch size**: 100-200 provides good write throughput
 5. **Memory**: Allocate 2-4 GB for sustained high-throughput workloads
 

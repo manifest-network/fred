@@ -588,7 +588,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, &chain.MockClient{})
-	manager.TrackInFlight("lease-1", "tenant-1", "", "test")
+	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
@@ -999,7 +999,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 
 			// Simulate the atomic check-and-provision pattern used by both
 			// manager.handleLeaseCreated and reconciler.startProvisioning
-			if manager.TryTrackInFlight(leaseUUID, "tenant-1", "", "test") {
+			if manager.TryTrackInFlight(leaseUUID, "tenant-1", testItems(""), "test") {
 				// Only provision if we successfully tracked
 				_ = mockBackend.Provision(context.Background(), backend.ProvisionRequest{
 					LeaseUUID:    leaseUUID,
@@ -1342,8 +1342,8 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	if len(gpuCalls) > 0 && gpuCalls[0].LeaseUUID != "gpu-lease" {
 		t.Errorf("expected gpu-lease, got %s", gpuCalls[0].LeaseUUID)
 	}
-	if len(gpuCalls) > 0 && gpuCalls[0].SKU != "gpu-a100-4x" {
-		t.Errorf("expected SKU gpu-a100-4x, got %s", gpuCalls[0].SKU)
+	if len(gpuCalls) > 0 && gpuCalls[0].RoutingSKU() != "gpu-a100-4x" {
+		t.Errorf("expected SKU gpu-a100-4x, got %s", gpuCalls[0].RoutingSKU())
 	}
 
 	// Verify K8s and unknown leases went to K8s backend (default)
@@ -1358,7 +1358,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Verify the SKUs are passed correctly
 	skus := make(map[string]bool)
 	for _, call := range k8sCalls {
-		skus[call.SKU] = true
+		skus[call.RoutingSKU()] = true
 	}
 	if !skus["k8s-small"] {
 		t.Error("expected k8s-small SKU in K8s backend calls")
@@ -1723,34 +1723,98 @@ func (m *mockConcurrencyBackend) Health(ctx context.Context) error {
 	return nil
 }
 
-// mockInFlightTracker implements InFlightTracker for testing orphaned payload cleanup.
+// mockInFlightTracker implements ReconcilerTracker for testing orphaned payload cleanup.
 type mockInFlightTracker struct {
 	payloadStore *PayloadStore
-	inFlight     map[string]bool
+	inFlight     map[string]InFlightProvision
 	mu           sync.Mutex
 }
 
 func newMockInFlightTracker(payloadStore *PayloadStore) *mockInFlightTracker {
 	return &mockInFlightTracker{
 		payloadStore: payloadStore,
-		inFlight:     make(map[string]bool),
+		inFlight:     make(map[string]InFlightProvision),
 	}
 }
 
-func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant, sku, backendName string) bool {
+func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.inFlight[leaseUUID] {
+	if _, exists := m.inFlight[leaseUUID]; exists {
 		return false
 	}
-	m.inFlight[leaseUUID] = true
+	m.inFlight[leaseUUID] = InFlightProvision{
+		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
+		Items:     items,
+		Backend:   backendName,
+	}
 	return true
+}
+
+func (m *mockInFlightTracker) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inFlight[leaseUUID] = InFlightProvision{
+		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
+		Items:     items,
+		Backend:   backendName,
+	}
 }
 
 func (m *mockInFlightTracker) UntrackInFlight(leaseUUID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.inFlight, leaseUUID)
+}
+
+func (m *mockInFlightTracker) PopInFlight(leaseUUID string) (InFlightProvision, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, exists := m.inFlight[leaseUUID]
+	if exists {
+		delete(m.inFlight, leaseUUID)
+	}
+	return p, exists
+}
+
+func (m *mockInFlightTracker) GetInFlight(leaseUUID string) (InFlightProvision, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, exists := m.inFlight[leaseUUID]
+	return p, exists
+}
+
+func (m *mockInFlightTracker) IsInFlight(leaseUUID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, exists := m.inFlight[leaseUUID]
+	return exists
+}
+
+func (m *mockInFlightTracker) InFlightCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.inFlight)
+}
+
+func (m *mockInFlightTracker) GetInFlightLeases() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	leases := make([]string, 0, len(m.inFlight))
+	for k := range m.inFlight {
+		leases = append(leases, k)
+	}
+	return leases
+}
+
+func (m *mockInFlightTracker) WaitForDrain(ctx context.Context, timeout time.Duration) int {
+	return m.InFlightCount()
+}
+
+func (m *mockInFlightTracker) GetTimedOutProvisions(timeout time.Duration) []InFlightProvision {
+	return nil
 }
 
 func (m *mockInFlightTracker) HasPayload(leaseUUID string) bool {
@@ -1841,5 +1905,89 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	// Verify count - all orphaned payloads should be cleaned
 	if count := payloadStore.Count(); count != 0 {
 		t.Errorf("expected 0 payloads remaining (all orphans cleaned), got %d", count)
+	}
+}
+
+// TestReconciler_ConcurrentReconcileAll tests that concurrent ReconcileAll calls
+// are properly serialized by the atomic flag.
+func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
+	// Create mock chain client that returns one pending lease.
+	// Add a delay to ensure reconciliation takes some time, which allows us to
+	// verify that concurrent calls are properly serialized by the atomic flag.
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			// Small delay to ensure concurrent ReconcileAll calls overlap.
+			// Without this, the first call would complete before others even start,
+			// making them sequential rather than concurrent.
+			time.Sleep(10 * time.Millisecond)
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+	}
+
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080/callbacks",
+		MaxWorkers:      2,
+	}, mockChain, router, nil)
+	if err != nil {
+		t.Fatalf("NewReconciler() failed: %v", err)
+	}
+
+	// Start multiple concurrent ReconcileAll calls
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	start := make(chan struct{})
+	completed := make(chan struct{}, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+
+			_ = reconciler.ReconcileAll(context.Background())
+			completed <- struct{}{}
+		}()
+	}
+
+	// Start all goroutines simultaneously
+	close(start)
+	wg.Wait()
+	close(completed)
+
+	// Count how many completed
+	var completedCount int
+	for range completed {
+		completedCount++
+	}
+
+	// All should complete (either by running or skipping)
+	if completedCount != numGoroutines {
+		t.Errorf("expected %d goroutines to complete, got %d", numGoroutines, completedCount)
+	}
+
+	// At most ONE provision call should have been made
+	// (the atomic flag prevents concurrent reconciliation)
+	mockBackend.mu.Lock()
+	provisionCount := len(mockBackend.provisionCalls)
+	mockBackend.mu.Unlock()
+
+	if provisionCount > 1 {
+		t.Errorf("expected at most 1 provision call, got %d (concurrent reconciliation not prevented!)", provisionCount)
 	}
 }
