@@ -111,12 +111,12 @@ type InstanceInfo struct {
 
 // ProvisionInfo describes a single provisioned resource.
 type ProvisionInfo struct {
-	LeaseUUID    string    `json:"lease_uuid"`
-	ProviderUUID string    `json:"provider_uuid"`
-	Status       string    `json:"status"` // "provisioning", "ready", "failed"
-	CreatedAt    time.Time `json:"created_at"`
-	FailCount    int       `json:"fail_count"`
-	BackendName  string    `json:"-"` // Set by reconciler, not from backend
+	LeaseUUID    string          `json:"lease_uuid"`
+	ProviderUUID string          `json:"provider_uuid"`
+	Status       ProvisionStatus `json:"status"` // "provisioning", "ready", "failed"
+	CreatedAt    time.Time       `json:"created_at"`
+	FailCount    int             `json:"fail_count"`
+	BackendName  string          `json:"-"` // Set by reconciler, not from backend
 }
 
 // ListProvisionsResponse is the response from the /provisions endpoint.
@@ -126,9 +126,9 @@ type ListProvisionsResponse struct {
 
 // CallbackPayload is sent by backends to fred's callback endpoint.
 type CallbackPayload struct {
-	LeaseUUID string `json:"lease_uuid"`
-	Status    string `json:"status"` // "success" or "failed"
-	Error     string `json:"error,omitempty"`
+	LeaseUUID string         `json:"lease_uuid"`
+	Status    CallbackStatus `json:"status"` // "success" or "failed"
+	Error     string         `json:"error,omitempty"`
 }
 
 // ErrNotProvisioned is returned when a lease is not yet provisioned.
@@ -137,17 +137,24 @@ var ErrNotProvisioned = errors.New("lease not provisioned")
 // ErrAlreadyProvisioned is returned when attempting to provision an already provisioned lease.
 var ErrAlreadyProvisioned = errors.New("lease already provisioned")
 
+// ProvisionStatus represents the status of a provisioned resource.
+type ProvisionStatus string
+
 // Provision status constants.
 const (
-	ProvisionStatusProvisioning = "provisioning"
-	ProvisionStatusReady        = "ready"
-	ProvisionStatusFailed       = "failed"
+	ProvisionStatusProvisioning ProvisionStatus = "provisioning"
+	ProvisionStatusReady        ProvisionStatus = "ready"
+	ProvisionStatusFailed       ProvisionStatus = "failed"
+	ProvisionStatusUnknown      ProvisionStatus = "unknown"
 )
+
+// CallbackStatus represents the status sent in a callback payload.
+type CallbackStatus string
 
 // Callback status constants.
 const (
-	CallbackStatusSuccess = "success"
-	CallbackStatusFailed  = "failed"
+	CallbackStatusSuccess CallbackStatus = "success"
+	CallbackStatusFailed  CallbackStatus = "failed"
 )
 
 // ErrValidation is returned when a provision request fails pre-flight validation

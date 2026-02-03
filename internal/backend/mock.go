@@ -30,8 +30,8 @@ type mockProvision struct {
 	ProviderUUID string
 	Tenant       string
 	SKU          string
-	Quantity     int    // Number of units provisioned
-	Status       string // "provisioning", "ready", "failed"
+	Quantity     int             // Number of units provisioned
+	Status       ProvisionStatus // "provisioning", "ready", "failed"
 	CreatedAt    time.Time
 	Payload      []byte
 	PayloadHash  string
@@ -87,7 +87,7 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 		Tenant:       req.Tenant,
 		SKU:          req.RoutingSKU(),
 		Quantity:     req.TotalQuantity(),
-		Status:       "provisioning",
+		Status:       ProvisionStatusProvisioning,
 		CreatedAt:    time.Now(),
 		Payload:      req.Payload,
 		PayloadHash:  req.PayloadHash,
@@ -112,14 +112,14 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 				m.mu.Unlock()
 				return // Deprovisioned while provisioning
 			}
-			p.Status = "ready"
+			p.Status = ProvisionStatusReady
 			m.mu.Unlock()
 
 			// Send callback
 			if callbackFn != nil {
 				callbackFn(CallbackPayload{
 					LeaseUUID: req.LeaseUUID,
-					Status:    "success",
+					Status:    CallbackStatusSuccess,
 				})
 			}
 		}()
@@ -138,7 +138,7 @@ func (m *MockBackend) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo
 		return nil, ErrNotProvisioned
 	}
 
-	if provision.Status != "ready" {
+	if provision.Status != ProvisionStatusReady {
 		return nil, ErrNotProvisioned
 	}
 
@@ -211,7 +211,7 @@ func (m *MockBackend) GetProvision(leaseUUID string) (*mockProvision, bool) {
 }
 
 // SetProvisionStatus manually sets a provision's status (for testing).
-func (m *MockBackend) SetProvisionStatus(leaseUUID, status string) {
+func (m *MockBackend) SetProvisionStatus(leaseUUID string, status ProvisionStatus) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

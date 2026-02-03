@@ -16,6 +16,8 @@ import (
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // Labels used for tracking managed containers.
@@ -41,6 +43,7 @@ type ContainerInfo struct {
 	FailCount     int
 	Image         string
 	Status        string
+	Health        HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
 	CreatedAt     time.Time
 	Ports         map[string]PortBinding
 }
@@ -318,6 +321,11 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		return nil, fmt.Errorf("container %s: %w", resp.ID, err)
 	}
 
+	var health HealthStatus
+	if resp.State.Health != nil {
+		health = HealthStatus(resp.State.Health.Status)
+	}
+
 	info := &ContainerInfo{
 		ContainerID:   resp.ID,
 		LeaseUUID:     resp.Config.Labels[LabelLeaseUUID],
@@ -326,6 +334,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		SKU:           resp.Config.Labels[LabelSKU],
 		Image:         resp.Config.Image,
 		Status:        resp.State.Status,
+		Health:        health,
 		InstanceIndex: meta.InstanceIndex,
 		FailCount:     meta.FailCount,
 		CreatedAt:     meta.CreatedAt,
@@ -496,17 +505,27 @@ func buildNetworkConfig(networkID string) *networktypes.NetworkingConfig {
 	}
 }
 
+// HealthStatus represents the health check status of a Docker container.
+type HealthStatus string
+
+const (
+	HealthStatusHealthy   HealthStatus = "healthy"
+	HealthStatusUnhealthy HealthStatus = "unhealthy"
+	HealthStatusStarting  HealthStatus = "starting"
+	HealthStatusNone      HealthStatus = "" // No health check configured
+)
+
 // containerStatusToProvisionStatus converts Docker status to provision status.
-func containerStatusToProvisionStatus(status string) string {
+func containerStatusToProvisionStatus(status string) backend.ProvisionStatus {
 	status = strings.ToLower(status)
 	switch status {
 	case "created", "restarting":
-		return "provisioning"
+		return backend.ProvisionStatusProvisioning
 	case "running", "paused":
-		return "ready"
+		return backend.ProvisionStatusReady
 	case "removing", "exited", "dead":
-		return "failed"
+		return backend.ProvisionStatusFailed
 	default:
-		return "unknown"
+		return backend.ProvisionStatusUnknown
 	}
 }

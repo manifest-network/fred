@@ -63,7 +63,7 @@ type provision struct {
 	SKU          string
 	ContainerIDs []string // Multiple containers for multi-unit leases
 	Image        string
-	Status       string
+	Status       backend.ProvisionStatus
 	Quantity     int // Expected number of containers
 	CreatedAt    time.Time
 	FailCount    int // Number of times provisioning has failed for this lease
@@ -444,34 +444,95 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 	}
 
-	// Verify containers are still running after a startup grace period.
-	// This catches containers that crash immediately on startup (e.g., bad config,
-	// read-only filesystem errors, missing dependencies) before we send a success
-	// callback and the lease is acknowledged as active on chain.
-	startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
-	logger.Info("waiting for startup verification", "duration", startupVerify)
-
-	select {
-	case <-ctx.Done():
-		err = fmt.Errorf("provisioning canceled during startup verification: %w", ctx.Err())
-		return
-	case <-time.After(startupVerify):
-	}
-
-	for i, containerID := range containerIDs {
-		info, inspectErr := b.docker.InspectContainer(ctx, containerID)
-		if inspectErr != nil {
-			err = fmt.Errorf("failed to verify container %d after startup: %w", i, inspectErr)
+	// Startup verification: two paths based on whether the manifest declares
+	// an active health check.
+	if manifest.HasActiveHealthCheck() {
+		// Health-aware path: poll until all containers report "healthy".
+		// Bounded by the existing ProvisionTimeout context.
+		logger.Info("waiting for health checks to pass")
+		if err = b.waitForHealthy(ctx, containerIDs, logger); err != nil {
 			return
 		}
-		status := containerStatusToProvisionStatus(info.Status)
-		if status != backend.ProvisionStatusReady {
-			err = fmt.Errorf("container %d exited during startup (status: %s)", i, info.Status)
+	} else {
+		// Fixed-wait path: wait StartupVerifyDuration then check containers
+		// are still running. Catches immediate crashes before sending a
+		// success callback.
+		startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
+		logger.Info("waiting for startup verification", "duration", startupVerify)
+
+		select {
+		case <-ctx.Done():
+			err = fmt.Errorf("provisioning canceled during startup verification: %w", ctx.Err())
 			return
+		case <-time.After(startupVerify):
+		}
+
+		for i, containerID := range containerIDs {
+			info, inspectErr := b.docker.InspectContainer(ctx, containerID)
+			if inspectErr != nil {
+				err = fmt.Errorf("failed to verify container %d after startup: %w", i, inspectErr)
+				return
+			}
+			status := containerStatusToProvisionStatus(info.Status)
+			if status != backend.ProvisionStatusReady {
+				err = fmt.Errorf("container %d exited during startup (status: %s)", i, info.Status)
+				return
+			}
 		}
 	}
 
 	logger.Info("all containers provisioned and verified", "count", len(containerIDs))
+}
+
+// healthPollInterval is the interval between health check polls during startup verification.
+const healthPollInterval = 2 * time.Second
+
+// waitForHealthy polls container health status until all containers report
+// "healthy". It fails immediately if any container becomes "unhealthy" or
+// exits. The method is bounded by the caller's context (typically the
+// ProvisionTimeout).
+func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, logger *slog.Logger) error {
+	pending := make(map[int]struct{}, len(containerIDs))
+	for i := range containerIDs {
+		pending[i] = struct{}{}
+	}
+
+	ticker := time.NewTicker(healthPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for containers to become healthy: %w", ctx.Err())
+		case <-ticker.C:
+			for i := range pending {
+				info, err := b.docker.InspectContainer(ctx, containerIDs[i])
+				if err != nil {
+					return fmt.Errorf("failed to inspect container %d during health check: %w", i, err)
+				}
+
+				// Check if container has exited.
+				status := containerStatusToProvisionStatus(info.Status)
+				if status == backend.ProvisionStatusFailed {
+					return fmt.Errorf("container %d exited while waiting for healthy (status: %s)", i, info.Status)
+				}
+
+				switch info.Health {
+				case HealthStatusHealthy:
+					logger.Info("container healthy", "instance", i, "container_id", shortID(containerIDs[i]))
+					delete(pending, i)
+				case HealthStatusUnhealthy:
+					return fmt.Errorf("container %d reported unhealthy", i)
+				default:
+					// "starting" or other — keep polling
+				}
+			}
+
+			if len(pending) == 0 {
+				return nil
+			}
+		}
+	}
 }
 
 // GetInfo returns lease information including connection details.

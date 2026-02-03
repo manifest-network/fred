@@ -27,8 +27,8 @@ func TestMockBackend_Provision(t *testing.T) {
 	if p.LeaseUUID != "lease-1" {
 		t.Errorf("LeaseUUID = %q, want %q", p.LeaseUUID, "lease-1")
 	}
-	if p.Status != "provisioning" {
-		t.Errorf("Status = %q, want %q", p.Status, "provisioning")
+	if p.Status != ProvisionStatusProvisioning {
+		t.Errorf("Status = %q, want %q", p.Status, ProvisionStatusProvisioning)
 	}
 }
 
@@ -82,14 +82,14 @@ func TestMockBackend_ProvisionWithCallback(t *testing.T) {
 	if callbackReceived.LeaseUUID != "lease-1" {
 		t.Errorf("callback LeaseUUID = %q, want %q", callbackReceived.LeaseUUID, "lease-1")
 	}
-	if callbackReceived.Status != "success" {
-		t.Errorf("callback Status = %q, want %q", callbackReceived.Status, "success")
+	if callbackReceived.Status != CallbackStatusSuccess {
+		t.Errorf("callback Status = %q, want %q", callbackReceived.Status, CallbackStatusSuccess)
 	}
 
 	// Verify status changed to ready
 	p, _ := mock.GetProvision("lease-1")
-	if p.Status != "ready" {
-		t.Errorf("Status = %q, want %q", p.Status, "ready")
+	if p.Status != ProvisionStatusReady {
+		t.Errorf("Status = %q, want %q", p.Status, ProvisionStatusReady)
 	}
 }
 
@@ -114,7 +114,7 @@ func TestMockBackend_GetInfo(t *testing.T) {
 	}
 
 	// Mark as ready
-	mock.SetProvisionStatus("lease-1", "ready")
+	mock.SetProvisionStatus("lease-1", ProvisionStatusReady)
 
 	info, err := mock.GetInfo(context.Background(), "lease-1")
 	if err != nil {

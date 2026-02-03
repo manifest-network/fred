@@ -141,8 +141,8 @@ func TestHTTPClient_ListProvisions(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"provisions": []ProvisionInfo{
-				{LeaseUUID: "uuid-1", Status: "ready"},
-				{LeaseUUID: "uuid-2", Status: "provisioning"},
+				{LeaseUUID: "uuid-1", Status: ProvisionStatusReady},
+				{LeaseUUID: "uuid-2", Status: ProvisionStatusProvisioning},
 			},
 		})
 	}))

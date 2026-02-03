@@ -172,6 +172,21 @@ func validatePortSpec(spec string) error {
 	return nil
 }
 
+// HealthCheckTestType represents the type prefix of a Docker health check test command.
+type HealthCheckTestType string
+
+const (
+	HealthCheckTestCMD      HealthCheckTestType = "CMD"
+	HealthCheckTestCMDShell HealthCheckTestType = "CMD-SHELL"
+	HealthCheckTestNone     HealthCheckTestType = "NONE"
+)
+
+// HasActiveHealthCheck returns true when the manifest declares a health check
+// that is not disabled (i.e., Test[0] is not "NONE").
+func (m *DockerManifest) HasActiveHealthCheck() bool {
+	return m.HealthCheck != nil && len(m.HealthCheck.Test) > 0 && HealthCheckTestType(m.HealthCheck.Test[0]) != HealthCheckTestNone
+}
+
 // Validate checks that the health check configuration is valid.
 func (h *HealthCheckConfig) Validate() error {
 	if len(h.Test) == 0 {
@@ -179,12 +194,12 @@ func (h *HealthCheckConfig) Validate() error {
 	}
 
 	// First element must be CMD, CMD-SHELL, or NONE
-	switch h.Test[0] {
-	case "CMD", "CMD-SHELL":
+	switch HealthCheckTestType(h.Test[0]) {
+	case HealthCheckTestCMD, HealthCheckTestCMDShell:
 		if len(h.Test) < 2 {
 			return fmt.Errorf("test requires at least one command after %s", h.Test[0])
 		}
-	case "NONE":
+	case HealthCheckTestNone:
 		// Valid, disables health check
 	default:
 		return fmt.Errorf("test must start with CMD, CMD-SHELL, or NONE")
