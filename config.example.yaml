@@ -150,6 +150,12 @@ rate_limit_rps: 10
 # for strict limiting, or higher to allow bursts.
 rate_limit_burst: 20
 
+# Per-tenant rate limiting (in addition to global IP-based limits above).
+# These limits apply to authenticated requests on a per-tenant address basis,
+# preventing a single tenant from monopolizing API resources.
+tenant_rate_limit_rps: 5
+tenant_rate_limit_burst: 10
+
 # -----------------------------------------------------------------------------
 # Trusted Proxies (optional)
 # -----------------------------------------------------------------------------
