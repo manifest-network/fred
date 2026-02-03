@@ -469,9 +469,18 @@ func (rw *responseWriter) WriteHeader(code int) {
 // This is separate from HTTP server timeouts (ReadTimeout/WriteTimeout) and applies
 // to the handler logic itself. Uses http.TimeoutHandler which properly buffers the
 // response and handles the timeout safely, avoiding race conditions with ResponseWriter.
+//
+// We pre-set Content-Type on the real ResponseWriter so that the timeout path
+// (which writes directly to it, bypassing the buffered timeoutWriter) produces
+// an application/json response matching the ErrorResponse envelope used by writeError.
+// On the success path, the handler's own Content-Type overwrites this pre-set value.
 func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
-		return http.TimeoutHandler(next, timeout, `{"error":"request timeout"}`)
+		th := http.TimeoutHandler(next, timeout, `{"error":"request timeout","code":503}`)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			th.ServeHTTP(w, r)
+		})
 	}
 }
 
