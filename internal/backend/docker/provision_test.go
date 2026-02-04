@@ -1034,3 +1034,130 @@ func TestRemoveProvision(t *testing.T) {
 	// Removing nonexistent should not panic
 	b.removeProvision("nonexistent")
 }
+
+// --- waitForHealthy tests ---
+
+func TestWaitForHealthy_AllHealthy(t *testing.T) {
+	callCount := 0
+	mock := &mockDockerClient{
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			callCount++
+			return &ContainerInfo{
+				ContainerID: id,
+				Status:      "running",
+				Health:      HealthStatusHealthy,
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := b.waitForHealthy(ctx, []string{"c1", "c2"}, b.logger)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, callCount)
+}
+
+func TestWaitForHealthy_Unhealthy(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{
+				ContainerID: id,
+				Status:      "running",
+				Health:      HealthStatusUnhealthy,
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := b.waitForHealthy(ctx, []string{"c1"}, b.logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unhealthy")
+}
+
+func TestWaitForHealthy_ContainerExited(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{
+				ContainerID: id,
+				Status:      "exited",
+				Health:      HealthStatusNone,
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := b.waitForHealthy(ctx, []string{"c1"}, b.logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exited")
+}
+
+func TestWaitForHealthy_ContextTimeout(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{
+				ContainerID: id,
+				Status:      "running",
+				Health:      HealthStatusStarting,
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	// Use a very short timeout so the test doesn't wait long.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := b.waitForHealthy(ctx, []string{"c1"}, b.logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out")
+}
+
+func TestWaitForHealthy_InspectFailure(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return nil, fmt.Errorf("docker daemon error")
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := b.waitForHealthy(ctx, []string{"c1"}, b.logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to inspect")
+}
+
+func TestWaitForHealthy_BecomesHealthyAfterStarting(t *testing.T) {
+	inspectCount := 0
+	mock := &mockDockerClient{
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			inspectCount++
+			health := HealthStatusStarting
+			if inspectCount >= 2 {
+				health = HealthStatusHealthy
+			}
+			return &ContainerInfo{
+				ContainerID: id,
+				Status:      "running",
+				Health:      health,
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := b.waitForHealthy(ctx, []string{"c1"}, b.logger)
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, inspectCount, 2, "should have polled at least twice")
+}

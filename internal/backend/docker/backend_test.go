@@ -576,6 +576,46 @@ func TestConfigHardeningValidation(t *testing.T) {
 	})
 }
 
+func TestHasActiveHealthCheck(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest DockerManifest
+		expected bool
+	}{
+		{
+			name:     "nil health check",
+			manifest: DockerManifest{Image: "busybox:latest"},
+			expected: false,
+		},
+		{
+			name:     "empty test slice",
+			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{}}},
+			expected: false,
+		},
+		{
+			name:     "NONE disables health check",
+			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{"NONE"}}},
+			expected: false,
+		},
+		{
+			name:     "CMD is active",
+			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{"CMD", "true"}}},
+			expected: true,
+		},
+		{
+			name:     "CMD-SHELL is active",
+			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{"CMD-SHELL", "true"}}},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.manifest.HasActiveHealthCheck())
+		})
+	}
+}
+
 func TestTenantNetworkName(t *testing.T) {
 	t.Run("deterministic", func(t *testing.T) {
 		name1 := TenantNetworkName("manifest1abc")
