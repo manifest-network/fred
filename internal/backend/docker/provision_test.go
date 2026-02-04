@@ -876,7 +876,7 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 	b.httpClient = server.Client()
 	b.callbackURLs["lease-1"] = server.URL
 
-	// Close stopCh after first attempt
+	// Cancel stopCtx after first attempt
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		b.stopCancel()

@@ -1027,7 +1027,9 @@ func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = docker.RemoveTenantNetworkIfEmpty(cleanupCtx, tenant)
+		if err := docker.RemoveTenantNetworkIfEmpty(cleanupCtx, tenant); err != nil {
+			t.Logf("cleanup: failed to remove test network for tenant %s: %v", tenant, err)
+		}
 	})
 
 	const goroutines = 5
