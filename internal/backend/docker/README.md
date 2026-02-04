@@ -152,7 +152,7 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 
 ## State Recovery
 
-On startup and at each `ReconcileInterval`, `recoverState` rebuilds in-memory state from Docker:
+On startup, at each `ReconcileInterval`, and on every reconciler cycle (via `RefreshState`), `recoverState` rebuilds in-memory state from Docker:
 
 1. **List managed containers** -- filters by `fred.managed=true` label.
 2. **Group by lease UUID** -- containers are grouped into provision records. The highest `FailCount` across containers in a lease is used (handles partial re-provisions).

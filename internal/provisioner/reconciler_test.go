@@ -70,6 +70,10 @@ func (m *mockReconcilerBackend) Health(ctx context.Context) error {
 	return nil
 }
 
+func (m *mockReconcilerBackend) RefreshState(ctx context.Context) error {
+	return nil
+}
+
 func TestNewReconciler_Validation(t *testing.T) {
 	mockChain := &chain.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
@@ -1124,6 +1128,10 @@ func (m *mockCancellingBackend) Health(ctx context.Context) error {
 	return nil
 }
 
+func (m *mockCancellingBackend) RefreshState(ctx context.Context) error {
+	return nil
+}
+
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
 	mockChain := &chain.MockClient{
@@ -1516,6 +1524,10 @@ func (m *mockConcurrencyBackend) ListProvisions(ctx context.Context) ([]backend.
 }
 
 func (m *mockConcurrencyBackend) Health(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockConcurrencyBackend) RefreshState(ctx context.Context) error {
 	return nil
 }
 

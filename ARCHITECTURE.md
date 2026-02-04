@@ -129,6 +129,7 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │  Reconciler (independent component)                                 │   │
 │  │  Level-triggered state comparison: chain vs backends                │   │
+│  │  Calls RefreshState on each backend before reading provisions       │   │
 │  │  Runs on startup + periodically, uses worker pool                   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │

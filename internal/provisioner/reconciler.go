@@ -477,6 +477,14 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 
 	for _, b := range backends {
 		g.Go(func() error {
+			// Ensure backend state is fresh before reading provisions.
+			if err := b.RefreshState(gctx); err != nil {
+				slog.Warn("failed to refresh backend state",
+					"backend", b.Name(), "error", err,
+				)
+				// Continue — stale state is better than no state
+			}
+
 			provisions, err := b.ListProvisions(gctx)
 			if err != nil {
 				slog.Error("failed to list provisions from backend",

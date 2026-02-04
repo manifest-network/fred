@@ -76,6 +76,10 @@ func (m *mockManagerBackend) Health(ctx context.Context) error {
 	return nil
 }
 
+func (m *mockManagerBackend) RefreshState(ctx context.Context) error {
+	return nil
+}
+
 func TestNewManager_Validation(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{

@@ -19,7 +19,7 @@ import (
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
-// Any backend (Kubernetes, GPU, VM, etc.) must implement these 6 operations.
+// Any backend (Kubernetes, GPU, VM, etc.) must implement these operations.
 type Backend interface {
 	// Provision starts async provisioning of a resource.
 	// The backend will call the callback URL when provisioning completes.
@@ -39,6 +39,12 @@ type Backend interface {
 	// Health checks if the backend is reachable and healthy.
 	// Returns nil if healthy, error otherwise.
 	Health(ctx context.Context) error
+
+	// RefreshState synchronizes in-memory provision state with the
+	// underlying infrastructure. Backends should query the real
+	// container/VM state and update their internal tracking.
+	// Called by the reconciler before ListProvisions to avoid stale reads.
+	RefreshState(ctx context.Context) error
 
 	// Name returns the backend's configured name.
 	Name() string
@@ -444,6 +450,11 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		return nil, cbErr
 	}
 	return result.([]ProvisionInfo), nil
+}
+
+// RefreshState is a no-op for remote backends (they refresh server-side).
+func (c *HTTPClient) RefreshState(ctx context.Context) error {
+	return nil
 }
 
 // Health checks if the backend is reachable and healthy.

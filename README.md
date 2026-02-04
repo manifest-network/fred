@@ -707,6 +707,7 @@ internal/
 ├── adr036/             # ADR-036 signature verification
 ├── api/                # HTTP server, handlers, rate limiting
 ├── auth/               # Shared authentication utilities
+├── hmacauth/           # HMAC-SHA256 signing and verification
 ├── backend/            # Backend client and router
 │   ├── client.go       # HTTP client for backends (with circuit breaker)
 │   ├── router.go       # SKU-based routing
@@ -740,7 +741,7 @@ Fred uses **level-triggered reconciliation** to ensure consistency between chain
 
 ### How It Works
 
-Instead of replaying missed events (edge-triggered), reconciliation queries current state:
+Instead of replaying missed events (edge-triggered), reconciliation queries current state. Before reading provisions, the reconciler calls `RefreshState` on each backend to ensure in-memory state is synchronized with the actual infrastructure (e.g., Docker container status).
 
 ```
 Chain State (leases)     Backend State (provisions)
@@ -748,18 +749,21 @@ Chain State (leases)     Backend State (provisions)
         └──────────┬───────────────┘
                    │
                    ▼
+         RefreshState (each backend)
+                   │
+                   ▼
             Reconciler compares
                    │
-        ┌──────────┼──────────┐
-        ▼          ▼          ▼
-    PENDING     ACTIVE      CLOSED
-    + not      + not       + still
-    provisioned provisioned provisioned
-        │          │          │
-        ▼          ▼          ▼
-     Start      Anomaly:   Deprovision
-   provisioning  log &      (orphan
-                provision   cleanup)
+        ┌──────────┼──────────┬──────────┐
+        ▼          ▼          ▼          ▼
+    PENDING     ACTIVE      ACTIVE     CLOSED
+    + not      + not       + failed   + still
+    provisioned provisioned provision  provisioned
+        │          │          │          │
+        ▼          ▼          ▼          ▼
+     Start      Anomaly:  Re-provision Deprovision
+   provisioning  log &    (with limit)  (orphan
+                provision               cleanup)
 ```
 
 ### Reconciliation Triggers
@@ -775,7 +779,8 @@ Chain State (leases)     Backend State (provisions)
 | PENDING + meta_hash | Not provisioned | Await payload upload |
 | PENDING (no hash) | Not provisioned | Start provisioning |
 | PENDING | Provisioned + ready | Acknowledge lease |
-| ACTIVE | Provisioned | Healthy - no action |
+| ACTIVE | Provisioned + ready | Healthy - no action |
+| ACTIVE | Provisioned + failed | Anomaly: re-provision (with attempt limit) |
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |

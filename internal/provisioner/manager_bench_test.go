@@ -41,7 +41,8 @@ func (m *mockBenchBackend) Deprovision(ctx context.Context, leaseUUID string) er
 func (m *mockBenchBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	return nil, nil
 }
-func (m *mockBenchBackend) Health(ctx context.Context) error { return nil }
+func (m *mockBenchBackend) Health(ctx context.Context) error       { return nil }
+func (m *mockBenchBackend) RefreshState(ctx context.Context) error { return nil }
 
 // BenchmarkWatermill_Publish benchmarks Watermill message publishing.
 func BenchmarkWatermill_Publish(b *testing.B) {

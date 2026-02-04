@@ -660,6 +660,11 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	return nil
 }
 
+// RefreshState synchronizes in-memory provision state with Docker.
+func (b *Backend) RefreshState(ctx context.Context) error {
+	return b.recoverState(ctx)
+}
+
 // ListProvisions returns all currently provisioned resources.
 func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	b.provisionsMu.RLock()

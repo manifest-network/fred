@@ -471,7 +471,8 @@ func (m *mockLatencyBackend) Deprovision(ctx context.Context, leaseUUID string) 
 func (m *mockLatencyBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	return nil, nil
 }
-func (m *mockLatencyBackend) Health(ctx context.Context) error { return nil }
+func (m *mockLatencyBackend) Health(ctx context.Context) error       { return nil }
+func (m *mockLatencyBackend) RefreshState(ctx context.Context) error { return nil }
 
 // TestManager_HighConcurrencySustained tests sustained high concurrency.
 func TestManager_HighConcurrencySustained(t *testing.T) {
