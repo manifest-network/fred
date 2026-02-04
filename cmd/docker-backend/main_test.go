@@ -48,9 +48,16 @@ func TestVerifySignature(t *testing.T) {
 	})
 }
 
-// newTestHandler creates a Handler backed by a nil docker.Backend. Useful for
-// testing middleware and parameter validation paths that reject before the
-// handler calls backend methods.
+// newTestHandler creates a Handler backed by a nil docker.Backend.
+//
+// This is intentional: tests for middleware (HMAC auth) and parameter validation
+// (tail limits) exercise code paths that reject requests before calling backend
+// methods. For tests where validation passes, use assert.Panics to verify the
+// request reached the backend (which will panic on nil dereference).
+//
+// This pattern avoids the complexity of mocking a full docker.Backend for tests
+// that don't need it. If a handler change causes unexpected panics, it means
+// the change touched the backend in a path that previously didn't.
 func newTestHandler() http.Handler {
 	s := NewServer(nil, testSecret, slog.Default())
 	return s.Handler()

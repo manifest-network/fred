@@ -199,7 +199,9 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTenantRL(handlers.GetLeaseStatus))
 	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTenantRL(s.handlePayloadUpload))
 
-	// Apply global middleware (outermost runs first)
+	// Apply global middleware. Each wrapper becomes the new outermost layer,
+	// so the last-applied middleware runs first. Execution order:
+	// securityHeaders → rateLimiter → timeout → maxBody → logging → handler
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	handler = maxBodySizeMiddleware(maxBodySize)(handler)
