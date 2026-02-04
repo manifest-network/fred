@@ -58,6 +58,62 @@ func TestHTTPClient_Provision(t *testing.T) {
 	assert.Equal(t, "gpu-a100", receivedReq.RoutingSKU())
 }
 
+// TestHTTPClient_Provision_ValidationError verifies that 400 Bad Request responses
+// return ErrValidation to indicate a permanent error that shouldn't be retried.
+func TestHTTPClient_Provision_ValidationError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Return 400 with error details
+		http.Error(w, `{"error":"unknown SKU: invalid-sku"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-validation",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Provision(context.Background(), ProvisionRequest{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-1",
+		ProviderUUID: "provider-1",
+		Items:        []LeaseItem{{SKU: "invalid-sku", Quantity: 1}},
+		CallbackURL:  "http://fred/callback",
+	})
+
+	// Should return ErrValidation for 400 responses
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.Contains(t, err.Error(), "unknown SKU")
+}
+
+// TestHTTPClient_Provision_ValidationError_DoesNotTripCircuitBreaker verifies that
+// 400 errors don't trip the circuit breaker (they're permanent client errors, not transient backend failures).
+func TestHTTPClient_Provision_ValidationError_DoesNotTripCircuitBreaker(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		http.Error(w, `{"error":"validation error"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-validation-cb",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: 3,
+	})
+
+	// Make 10 requests that all return 400 (ErrValidation)
+	for i := range 10 {
+		err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+		assert.ErrorIs(t, err, ErrValidation, "Request %d should return ErrValidation", i+1)
+		assert.NotErrorIs(t, err, ErrCircuitOpen, "Circuit should not have opened at request %d", i+1)
+	}
+
+	// All 10 requests should have reached the server
+	assert.Equal(t, 10, requestCount)
+}
+
 func TestHTTPClient_GetInfo(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

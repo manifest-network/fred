@@ -199,23 +199,25 @@ func TestValidateCallbackURL(t *testing.T) {
 		{name: "valid with port", url: "https://example.com:8443/callback", wantErr: ""},
 		{name: "valid public IP", url: "https://203.0.113.50/callback", wantErr: ""},
 
+		// Localhost is allowed (common in development, and callback URL comes from trusted Fred)
+		{name: "localhost", url: "http://localhost/callback", wantErr: ""},
+		{name: "localhost https", url: "https://localhost:8080/callback", wantErr: ""},
+		{name: "127.0.0.1", url: "http://127.0.0.1/callback", wantErr: ""},
+		{name: "::1", url: "http://[::1]/callback", wantErr: ""},
+
+		// Private networks are allowed (backends often run on private networks)
+		{name: "private 10.x", url: "http://10.0.0.1/callback", wantErr: ""},
+		{name: "private 172.16.x", url: "http://172.16.0.1/callback", wantErr: ""},
+		{name: "private 192.168.x", url: "http://192.168.1.1/callback", wantErr: ""},
+
 		// Invalid schemes
 		{name: "file scheme", url: "file:///etc/passwd", wantErr: "scheme must be http or https"},
 		{name: "ftp scheme", url: "ftp://example.com/file", wantErr: "scheme must be http or https"},
 		{name: "no scheme", url: "example.com/callback", wantErr: "scheme must be http or https"},
 
-		// Localhost variants
-		{name: "localhost", url: "http://localhost/callback", wantErr: "localhost is not allowed"},
-		{name: "127.0.0.1", url: "http://127.0.0.1/callback", wantErr: "localhost is not allowed"},
-		{name: "::1", url: "http://[::1]/callback", wantErr: "localhost is not allowed"},
-
-		// Private networks (SSRF targets)
-		{name: "private 10.x", url: "http://10.0.0.1/callback", wantErr: "private network addresses are not allowed"},
-		{name: "private 172.16.x", url: "http://172.16.0.1/callback", wantErr: "private network addresses are not allowed"},
-		{name: "private 192.168.x", url: "http://192.168.1.1/callback", wantErr: "private network addresses are not allowed"},
-
-		// Cloud metadata endpoints
+		// Cloud metadata endpoints are blocked (SSRF risk)
 		{name: "AWS metadata", url: "http://169.254.169.254/latest/meta-data/", wantErr: "link-local addresses are not allowed"},
+		{name: "link-local", url: "http://169.254.1.1/callback", wantErr: "link-local addresses are not allowed"},
 
 		// Malformed
 		{name: "empty host", url: "http:///callback", wantErr: "host is required"},

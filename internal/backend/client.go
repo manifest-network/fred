@@ -235,8 +235,9 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		},
 		IsSuccessful: func(err error) bool {
 			// ErrNotProvisioned (404 from GetInfo) is a valid response, not a backend failure.
-			// It shouldn't count toward the circuit breaker failure threshold.
-			return err == nil || errors.Is(err, ErrNotProvisioned)
+			// ErrValidation (400 from Provision) is a permanent client error, not transient.
+			// Neither should count toward the circuit breaker failure threshold.
+			return err == nil || errors.Is(err, ErrNotProvisioned) || errors.Is(err, ErrValidation)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -320,7 +321,12 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusAccepted {
-			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+			errBody := readErrorBody(resp)
+			// 400 Bad Request indicates a validation error that won't succeed on retry
+			if resp.StatusCode == http.StatusBadRequest {
+				return nil, fmt.Errorf("%w: %s", ErrValidation, errBody)
+			}
+			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, errBody)
 		}
 
 		return nil, nil

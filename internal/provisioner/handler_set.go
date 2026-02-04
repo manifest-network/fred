@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -73,7 +74,31 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning without payload
-	return h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+	if err != nil {
+		// Check if this is a validation error (e.g., unknown SKU, invalid manifest)
+		// Validation errors are permanent - retrying won't help. Reject the lease
+		// and acknowledge the message to stop Watermill from retrying forever.
+		if errors.Is(err, backend.ErrValidation) {
+			slog.Warn("provisioning failed with validation error, rejecting lease",
+				"lease_uuid", lease.Uuid,
+				"tenant", lease.Tenant,
+				"error", err,
+			)
+			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, err.Error())
+			if rejectErr != nil {
+				slog.Error("failed to reject lease after validation error",
+					"lease_uuid", lease.Uuid,
+					"error", rejectErr,
+				)
+				// Return the reject error to retry the rejection
+				return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
+			}
+			return nil // Acknowledged - don't retry
+		}
+		return err
+	}
+	return nil
 }
 
 // HandleLeaseClosed processes lease closure events.
@@ -379,8 +404,35 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning with payload
-	return h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
 		Payload:     payload,
 		PayloadHash: event.MetaHashHex,
 	})
+	if err != nil {
+		// Check if this is a validation error (e.g., unknown SKU, invalid manifest)
+		// Validation errors are permanent - retrying won't help. Reject the lease
+		// and acknowledge the message to stop Watermill from retrying forever.
+		if errors.Is(err, backend.ErrValidation) {
+			slog.Warn("provisioning failed with validation error, rejecting lease",
+				"lease_uuid", lease.Uuid,
+				"tenant", lease.Tenant,
+				"error", err,
+			)
+			// Clean up the stored payload
+			h.deps.PayloadStore.Delete(event.LeaseUUID)
+
+			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, err.Error())
+			if rejectErr != nil {
+				slog.Error("failed to reject lease after validation error",
+					"lease_uuid", lease.Uuid,
+					"error", rejectErr,
+				)
+				// Return the reject error to retry the rejection
+				return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
+			}
+			return nil // Acknowledged - don't retry
+		}
+		return err
+	}
+	return nil
 }

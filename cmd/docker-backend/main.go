@@ -388,7 +388,12 @@ const maxRequestBodySize = 1 << 20 // 1 MiB
 const maxTailLines = 10000         // Upper bound for log tail requests
 
 // validateCallbackURL validates that a callback URL is safe to use.
-// It rejects non-HTTP(S) schemes and private/internal IP addresses to prevent SSRF.
+// It rejects non-HTTP(S) schemes and dangerous IP addresses to prevent SSRF.
+//
+// Note: This validation is defense-in-depth. The callback URL comes from Fred
+// (providerd), not from untrusted tenants. Fred should validate its own
+// callback_base_url configuration. We allow localhost and private IPs here
+// since backends commonly run on private networks alongside Fred.
 func validateCallbackURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -406,25 +411,15 @@ func validateCallbackURL(rawURL string) error {
 	// Extract hostname (without port)
 	hostname := parsed.Hostname()
 
-	// Reject localhost variants
-	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
-		return fmt.Errorf("localhost is not allowed")
-	}
-
 	// Check if hostname is an IP address
 	ip := net.ParseIP(hostname)
 	if ip != nil {
-		if ip.IsLoopback() {
-			return fmt.Errorf("loopback addresses are not allowed")
-		}
-		if ip.IsPrivate() {
-			return fmt.Errorf("private network addresses are not allowed")
-		}
+		// Block link-local addresses (including cloud metadata endpoints 169.254.x.x)
 		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return fmt.Errorf("link-local addresses are not allowed")
 		}
-		// Block cloud metadata endpoints (169.254.x.x range)
-		if ip.IsLinkLocalUnicast() || (ip.To4() != nil && ip.To4()[0] == 169 && ip.To4()[1] == 254) {
+		// Explicit check for AWS/cloud metadata endpoint
+		if ip.To4() != nil && ip.To4()[0] == 169 && ip.To4()[1] == 254 {
 			return fmt.Errorf("metadata service addresses are not allowed")
 		}
 	}
