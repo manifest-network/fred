@@ -346,18 +346,14 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 			// Database error — do NOT treat as "payload missing".
 			// Abort this provision attempt so a transient disk issue doesn't
 			// cause us to close an active lease.
-			if r.tracker != nil {
-				r.tracker.UntrackInFlight(lease.Uuid)
-			}
+			r.tracker.UntrackInFlight(lease.Uuid)
 			return fmt.Errorf("failed to read payload for lease %s: %w", lease.Uuid, getErr)
 		}
 		if req.Payload == nil && len(lease.MetaHash) > 0 {
 			// Payload is required (lease has MetaHash) but not in the store.
 			// This can happen if the payload DB was lost or fred restarted
 			// without its data. We cannot re-provision without the manifest.
-			if r.tracker != nil {
-				r.tracker.UntrackInFlight(lease.Uuid)
-			}
+			r.tracker.UntrackInFlight(lease.Uuid)
 			return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, lease.Uuid)
 		}
 		if req.Payload != nil && len(lease.MetaHash) > 0 {
