@@ -676,6 +676,25 @@ func TestVerifyPayloadHash_BinaryPayload(t *testing.T) {
 	assert.NoError(t, err, "VerifyPayloadHash() should succeed for binary payload")
 }
 
+func TestPayloadStore_Healthy(t *testing.T) {
+	store := newTestPayloadStore(t)
+
+	err := store.Healthy()
+	require.NoError(t, err)
+}
+
+func TestPayloadStore_CloseIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_idempotent.db")
+	store, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: dbPath,
+	})
+	require.NoError(t, err)
+
+	// Close twice — should not panic
+	require.NoError(t, store.Close())
+	require.NoError(t, store.Close())
+}
+
 // TestPayloadStore_CloseDrainsPendingWrites tests that Close() properly drains
 // pending write operations so callers don't block forever.
 func TestPayloadStore_CloseDrainsPendingWrites(t *testing.T) {

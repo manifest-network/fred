@@ -83,8 +83,9 @@ type PayloadStore struct {
 	flushInterval time.Duration
 
 	// For graceful shutdown
-	cancel context.CancelFunc
-	wg     *sync.WaitGroup // Pointer to avoid copy-by-value issues
+	cancel    context.CancelFunc
+	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
+	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
 }
 
 // PayloadStoreConfig configures the payload store.
@@ -135,6 +136,7 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 		flushInterval: flushInterval,
 		cancel:        cancel,
 		wg:            &sync.WaitGroup{},
+		closeOnce:     &sync.Once{},
 	}
 
 	// Start the batching writer goroutine (using WaitGroup.Go for Go 1.25+)
@@ -331,16 +333,34 @@ func (s *PayloadStore) List() []string {
 	return leaseUUIDs
 }
 
+// Healthy checks if the bbolt database is accessible and both buckets exist.
+func (s *PayloadStore) Healthy() error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(payloadBucketName) == nil {
+			return errors.New("payload bucket missing")
+		}
+		if tx.Bucket(payloadMetaBucketName) == nil {
+			return errors.New("payload metadata bucket missing")
+		}
+		return nil
+	})
+}
+
 // Close shuts down the payload store gracefully.
 // It waits for all pending writes to complete before closing the database.
+// Close is idempotent and safe to call multiple times.
 func (s *PayloadStore) Close() error {
-	// Signal shutdown - this will cause writerLoop to exit
-	s.cancel()
+	var closeErr error
+	s.closeOnce.Do(func() {
+		// Signal shutdown - this will cause writerLoop to exit
+		s.cancel()
 
-	// Wait for all goroutines to finish (writer will flush pending ops)
-	s.wg.Wait()
+		// Wait for all goroutines to finish (writer will flush pending ops)
+		s.wg.Wait()
 
-	return s.db.Close()
+		closeErr = s.db.Close()
+	})
+	return closeErr
 }
 
 // writerLoop is the dedicated writer goroutine that batches write operations.

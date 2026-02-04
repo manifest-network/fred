@@ -12,7 +12,7 @@ import (
 func TestCallbackStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_callbacks.db")
 
-	store, err := NewCallbackStore(dbPath)
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -88,7 +88,7 @@ func TestCallbackStore_Persistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "persist_callbacks.db")
 
 	// Write an entry
-	store1, err := NewCallbackStore(dbPath)
+	store1, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	err = store1.Store(CallbackEntry{
@@ -102,7 +102,7 @@ func TestCallbackStore_Persistence(t *testing.T) {
 	require.NoError(t, store1.Close())
 
 	// Reopen and verify entry survived
-	store2, err := NewCallbackStore(dbPath)
+	store2, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store2.Close()
 
@@ -115,6 +115,63 @@ func TestCallbackStore_Persistence(t *testing.T) {
 }
 
 func TestCallbackStore_EmptyPath(t *testing.T) {
-	_, err := NewCallbackStore("")
+	_, err := NewCallbackStore(CallbackStoreConfig{})
 	assert.Error(t, err)
+}
+
+func TestCallbackStore_Healthy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "healthy_callbacks.db")
+
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	err = store.Healthy()
+	require.NoError(t, err)
+}
+
+func TestCallbackStore_CloseIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "idempotent_callbacks.db")
+
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+
+	// Close twice — should not panic
+	require.NoError(t, store.Close())
+	require.NoError(t, store.Close())
+}
+
+func TestCallbackStore_InitialCleanup(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "initial_cleanup.db")
+
+	// Create store without expiry, insert old entries
+	store1, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+
+	require.NoError(t, store1.Store(CallbackEntry{
+		LeaseUUID:   "lease-old",
+		CallbackURL: "http://example.com",
+		Success:     true,
+		CreatedAt:   time.Now().Add(-48 * time.Hour),
+	}))
+	require.NoError(t, store1.Store(CallbackEntry{
+		LeaseUUID:   "lease-fresh",
+		CallbackURL: "http://example.com",
+		Success:     true,
+		CreatedAt:   time.Now(),
+	}))
+	require.NoError(t, store1.Close())
+
+	// Reopen WITH expiry — initial cleanup should remove the old entry
+	store2, err := NewCallbackStore(CallbackStoreConfig{
+		DBPath: dbPath,
+		MaxAge: 24 * time.Hour,
+	})
+	require.NoError(t, err)
+	defer store2.Close()
+
+	pending, err := store2.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "lease-fresh", pending[0].LeaseUUID)
 }

@@ -1594,7 +1594,7 @@ func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_persist.db")
-	cbStore, err := NewCallbackStore(dbPath)
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer cbStore.Close()
 
@@ -1625,7 +1625,7 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_fail.db")
-	cbStore, err := NewCallbackStore(dbPath)
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer cbStore.Close()
 
@@ -1664,7 +1664,7 @@ func TestReplayPendingCallbacks_Success(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_replay.db")
-	cbStore, err := NewCallbackStore(dbPath)
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	// Pre-populate with pending callbacks
@@ -1718,7 +1718,7 @@ func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_partial.db")
-	cbStore, err := NewCallbackStore(dbPath)
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	require.NoError(t, cbStore.Store(CallbackEntry{
@@ -1774,29 +1774,36 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// First, create a store without expiry and insert old + fresh entries
 	dbPath := filepath.Join(t.TempDir(), "cb_expire.db")
-	cbStore, err := NewCallbackStore(dbPath)
+	store1, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
-	// Store an old callback (2 hours ago) and a fresh one
-	require.NoError(t, cbStore.Store(CallbackEntry{
+	require.NoError(t, store1.Store(CallbackEntry{
 		LeaseUUID:   "lease-old",
 		CallbackURL: server.URL,
 		Success:     true,
 		CreatedAt:   time.Now().Add(-2 * time.Hour),
 	}))
-	require.NoError(t, cbStore.Store(CallbackEntry{
+	require.NoError(t, store1.Store(CallbackEntry{
 		LeaseUUID:   "lease-fresh",
 		CallbackURL: server.URL,
 		Success:     true,
 		CreatedAt:   time.Now(),
 	}))
+	require.NoError(t, store1.Close())
+
+	// Reopen with MaxAge — initial cleanup removes old entries
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{
+		DBPath: dbPath,
+		MaxAge: 1 * time.Hour,
+	})
+	require.NoError(t, err)
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
-	b.cfg.CallbackMaxAge = 1 * time.Hour // Expire anything older than 1 hour
 
 	b.replayPendingCallbacks()
 
@@ -1804,7 +1811,7 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 	require.Len(t, received, 1)
 	assert.Equal(t, "lease-fresh", received[0].LeaseUUID)
 
-	// Store should be empty after replay (old expired, fresh delivered)
+	// Store should be empty after replay (old expired at open, fresh delivered)
 	pending, err := cbStore.ListPending()
 	require.NoError(t, err)
 	assert.Empty(t, pending)
@@ -1814,7 +1821,7 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 
 func TestCallbackStore_RemoveOlderThan(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_ttl.db")
-	store, err := NewCallbackStore(dbPath)
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -1851,7 +1858,7 @@ func TestCallbackStore_RemoveOlderThan(t *testing.T) {
 
 func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_empty.db")
-	cbStore, err := NewCallbackStore(dbPath)
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer cbStore.Close()
 
@@ -1905,7 +1912,7 @@ func TestDeprovision_AllContainersFail(t *testing.T) {
 // Fix 2: RemoveOlderThan on an empty store returns zero.
 func TestCallbackStore_RemoveOlderThan_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_empty_ttl.db")
-	store, err := NewCallbackStore(dbPath)
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -1917,7 +1924,7 @@ func TestCallbackStore_RemoveOlderThan_EmptyStore(t *testing.T) {
 // Fix 2: RemoveOlderThan when all entries are fresh — none removed.
 func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_allfresh.db")
-	store, err := NewCallbackStore(dbPath)
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -1959,7 +1966,7 @@ func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_zeromax.db")
-	cbStore, err := NewCallbackStore(dbPath)
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	// Store an old callback (48 hours ago)
@@ -2133,7 +2140,7 @@ func TestGetLogs_FailedLease(t *testing.T) {
 // Fix 2: CallbackStore Store overwrites entry with same LeaseUUID.
 func TestCallbackStore_StoreOverwrites(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_overwrite.db")
-	store, err := NewCallbackStore(dbPath)
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 

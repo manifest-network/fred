@@ -130,7 +130,10 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		}
 	}
 
-	cbStore, err := NewCallbackStore(cfg.CallbackDBPath)
+	cbStore, err := NewCallbackStore(CallbackStoreConfig{
+		DBPath: cfg.CallbackDBPath,
+		MaxAge: cfg.CallbackMaxAge,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open callback store: %w", err)
 	}
@@ -194,21 +197,11 @@ func (b *Backend) Stop() error {
 
 // replayPendingCallbacks replays any callbacks that were persisted but not
 // successfully delivered before the previous shutdown.
-// Entries older than CallbackMaxAge are removed without delivery.
+// Expired entries are already removed by the CallbackStore's initial cleanup
+// (run during NewCallbackStore), so only deliverable entries remain.
 func (b *Backend) replayPendingCallbacks() {
 	if b.callbackStore == nil {
 		return
-	}
-
-	// Expire old callbacks before replaying
-	maxAge := b.cfg.CallbackMaxAge
-	if maxAge > 0 {
-		removed, err := b.callbackStore.RemoveOlderThan(maxAge)
-		if err != nil {
-			b.logger.Error("failed to remove expired callbacks", "error", err)
-		} else if removed > 0 {
-			b.logger.Warn("removed expired callbacks", "count", removed, "max_age", maxAge)
-		}
 	}
 
 	entries, err := b.callbackStore.ListPending()
