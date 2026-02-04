@@ -56,6 +56,19 @@ Images are validated before pull. The registry is extracted from the image refer
 |---|---|---|---|---|
 | CallbackSecret | `callback_secret` | string | *(required, min 32 chars)* | HMAC-SHA256 secret for signing callbacks |
 | CallbackInsecureSkipVerify | `callback_insecure_skip_verify` | bool | `false` | Skip TLS verification for callbacks (dev only) |
+| CallbackDBPath | `callback_db_path` | string | `"callbacks.db"` | Path to bbolt database for persisting pending callbacks |
+| CallbackMaxAge | `callback_max_age` | duration | `24h` | Maximum age of persisted callback entries before cleanup |
+
+### Tenant Quotas
+
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| TenantQuota | `tenant_quota` | object | *(none)* | Per-tenant resource limits (optional) |
+| TenantQuota.MaxCPUCores | `tenant_quota.max_cpu_cores` | float64 | - | Maximum CPU cores per tenant |
+| TenantQuota.MaxMemoryMB | `tenant_quota.max_memory_mb` | int64 | - | Maximum memory per tenant (MB) |
+| TenantQuota.MaxDiskMB | `tenant_quota.max_disk_mb` | int64 | - | Maximum disk per tenant (MB) |
+
+When `tenant_quota` is configured, no single tenant can consume more than the specified limits, even if the resource pool has capacity available. Quota values cannot exceed the total pool capacity.
 
 ### Timeouts
 
@@ -76,6 +89,34 @@ Images are validated before pull. The registry is extracted from the image refer
 | ContainerReadonlyRootfs | `container_readonly_rootfs` | *bool | `true` | Read-only root filesystem |
 | ContainerPidsLimit | `container_pids_limit` | *int64 | `256` | Maximum PIDs per container |
 | ContainerTmpfsSizeMB | `container_tmpfs_size_mb` | int | `64` | Tmpfs size (MB) for `/tmp` and `/run` when readonly rootfs is enabled |
+| ContainerDiskQuota | `container_disk_quota` | *bool | `true` | Enable Docker overlay2 storage driver disk quotas |
+
+#### Disk Quota Requirements
+
+The `container_disk_quota` option enables per-container disk quotas using Docker's `--storage-opt size=` feature. **This requires specific filesystem configuration:**
+
+- Docker must use the `overlay2` storage driver
+- The underlying filesystem must be **XFS**
+- XFS must be mounted with the `pquota` (project quota) option
+
+To check if your system supports disk quotas:
+
+```bash
+# Check storage driver (should show "overlay2")
+docker info | grep "Storage Driver"
+
+# Check if /var/lib/docker is on XFS with pquota
+mount | grep "$(df /var/lib/docker --output=source | tail -1)"
+# Should include "pquota" in mount options
+```
+
+If your system doesn't meet these requirements, you'll see errors like:
+
+```
+--storage-opt is supported only for overlay over xfs with 'pquota' mount option
+```
+
+**To disable disk quotas**, set `container_disk_quota: false` in your configuration. Containers will still have CPU and memory limits enforced via cgroups, but won't have storage limits at the Docker level.
 
 ## Provisioning Lifecycle
 

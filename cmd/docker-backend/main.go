@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -191,6 +193,10 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CallbackURL == "" {
 		s.errorResponse(w, http.StatusBadRequest, "callback_url is required")
+		return
+	}
+	if err := validateCallbackURL(req.CallbackURL); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
 		return
 	}
 	if len(req.Items) == 0 {
@@ -380,6 +386,51 @@ func (s *Server) errorResponse(w http.ResponseWriter, status int, message string
 
 const maxRequestBodySize = 1 << 20 // 1 MiB
 const maxTailLines = 10000         // Upper bound for log tail requests
+
+// validateCallbackURL validates that a callback URL is safe to use.
+// It rejects non-HTTP(S) schemes and private/internal IP addresses to prevent SSRF.
+func validateCallbackURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("malformed URL")
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("scheme must be http or https")
+	}
+
+	if parsed.Host == "" {
+		return fmt.Errorf("host is required")
+	}
+
+	// Extract hostname (without port)
+	hostname := parsed.Hostname()
+
+	// Reject localhost variants
+	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
+		return fmt.Errorf("localhost is not allowed")
+	}
+
+	// Check if hostname is an IP address
+	ip := net.ParseIP(hostname)
+	if ip != nil {
+		if ip.IsLoopback() {
+			return fmt.Errorf("loopback addresses are not allowed")
+		}
+		if ip.IsPrivate() {
+			return fmt.Errorf("private network addresses are not allowed")
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("link-local addresses are not allowed")
+		}
+		// Block cloud metadata endpoints (169.254.x.x range)
+		if ip.IsLinkLocalUnicast() || (ip.To4() != nil && ip.To4()[0] == 169 && ip.To4()[1] == 254) {
+			return fmt.Errorf("metadata service addresses are not allowed")
+		}
+	}
+
+	return nil
+}
 
 // hmacAuthMiddleware returns middleware that verifies HMAC-SHA256 signatures on requests.
 func hmacAuthMiddleware(secret string, logger *slog.Logger) func(http.Handler) http.Handler {

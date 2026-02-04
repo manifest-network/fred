@@ -232,7 +232,12 @@ func (b *Backend) replayPendingCallbacks() {
 		body, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
 			b.logger.Error("removing malformed callback entry", "error", marshalErr, "lease_uuid", entry.LeaseUUID)
-			_ = b.callbackStore.Remove(entry.LeaseUUID)
+			if rmErr := b.callbackStore.Remove(entry.LeaseUUID); rmErr != nil {
+				b.logger.Error("failed to remove malformed callback entry",
+					"error", rmErr,
+					"lease_uuid", entry.LeaseUUID,
+				)
+			}
 			continue
 		}
 
@@ -1152,6 +1157,8 @@ func (b *Backend) trySendCallback(leaseUUID, callbackURL string, body []byte) bo
 
 // GetLogs returns the last N lines of stdout/stderr for each container in
 // a lease, keyed by instance index (e.g., "0", "1").
+// On partial failure (some containers succeed, some fail), the successful logs
+// are returned along with error placeholders, and the errors are logged.
 func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
@@ -1165,6 +1172,12 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	for i, containerID := range prov.ContainerIDs {
 		logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
 		if err != nil {
+			b.logger.Warn("failed to retrieve container logs",
+				"lease_uuid", leaseUUID,
+				"instance", i,
+				"container_id", shortID(containerID),
+				"error", err,
+			)
 			result[fmt.Sprintf("%d", i)] = fmt.Sprintf("<error: %s>", err)
 			continue
 		}

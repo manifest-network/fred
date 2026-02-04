@@ -105,9 +105,11 @@ run-mock-delay: build-mock
 	@MOCK_BACKEND_DELAY=2s exec $(BUILD_DIR)/$(MOCK_BINARY_NAME)
 
 # Run the docker backend
+# Override config with: DOCKER_BACKEND_CONFIG=path/to/config.yaml make run-docker
+DOCKER_BACKEND_CONFIG ?= docker-backend.yaml
 run-docker: build-docker
-	@echo "Running $(DOCKER_BINARY_NAME)..."
-	@exec $(BUILD_DIR)/$(DOCKER_BINARY_NAME) --config docker-backend.example.yaml
+	@echo "Running $(DOCKER_BINARY_NAME) with config $(DOCKER_BACKEND_CONFIG)..."
+	@exec $(BUILD_DIR)/$(DOCKER_BINARY_NAME) --config $(DOCKER_BACKEND_CONFIG)
 
 # Format code
 fmt:
@@ -140,7 +142,7 @@ help:
 	@echo "  run              - Build and run providerd with example config"
 	@echo "  run-mock         - Build and run mock-backend"
 	@echo "  run-mock-delay   - Run mock-backend with 2s provisioning delay"
-	@echo "  run-docker       - Build and run docker-backend with example config"
+	@echo "  run-docker       - Build and run docker-backend (DOCKER_BACKEND_CONFIG=path to override)"
 	@echo "  fmt              - Format code"
 	@echo "  generate         - Generate mocks"
 	@echo "  verify           - Verify dependencies"
