@@ -3,10 +3,14 @@ package docker
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// maxTmpfsMounts is the maximum number of additional tmpfs mounts a tenant can request.
+const maxTmpfsMounts = 10
 
 // DockerManifest represents the tenant's container specification.
 // Resource limits are determined by the SKU, not the manifest.
@@ -32,6 +36,13 @@ type DockerManifest struct {
 
 	// HealthCheck configures container health checking.
 	HealthCheck *HealthCheckConfig `json:"health_check,omitempty"`
+
+	// Tmpfs specifies additional writable tmpfs mount paths for containers
+	// running with a read-only root filesystem. Paths like /tmp and /run are
+	// always mounted automatically. Use this for application-specific writable
+	// directories (e.g., "/var/cache/nginx", "/var/log/nginx").
+	// Each mount uses the operator-configured tmpfs size limit.
+	Tmpfs []string `json:"tmpfs,omitempty"`
 }
 
 // PortConfig specifies port mapping configuration.
@@ -141,6 +152,11 @@ func (m *DockerManifest) Validate() error {
 		}
 	}
 
+	// Validate tmpfs mounts
+	if err := validateTmpfsPaths(m.Tmpfs); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -185,6 +201,57 @@ const (
 // that is not disabled (i.e., Test[0] is not "NONE").
 func (m *DockerManifest) HasActiveHealthCheck() bool {
 	return m.HealthCheck != nil && len(m.HealthCheck.Test) > 0 && HealthCheckTestType(m.HealthCheck.Test[0]) != HealthCheckTestNone
+}
+
+// blockedTmpfsPaths are paths that cannot be used as tmpfs mounts because they
+// are managed by the backend (/tmp, /run) or are sensitive kernel filesystems.
+var blockedTmpfsPaths = map[string]bool{
+	"/tmp":  true,
+	"/run":  true,
+	"/proc": true,
+	"/sys":  true,
+	"/dev":  true,
+}
+
+// validateTmpfsPaths checks that tmpfs mount paths are safe and reasonable.
+func validateTmpfsPaths(paths []string) error {
+	if len(paths) > maxTmpfsMounts {
+		return fmt.Errorf("tmpfs: too many mounts (%d), maximum is %d", len(paths), maxTmpfsMounts)
+	}
+
+	seen := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		// Must be absolute
+		if !path.IsAbs(p) {
+			return fmt.Errorf("tmpfs: path must be absolute: %q", p)
+		}
+
+		// Clean the path to normalize (resolve .., trailing slashes, etc.)
+		cleaned := path.Clean(p)
+
+		// Must not be the root filesystem
+		if cleaned == "/" {
+			return fmt.Errorf("tmpfs: cannot mount root filesystem")
+		}
+
+		// Must not contain path traversal after cleaning
+		if strings.Contains(cleaned, "..") {
+			return fmt.Errorf("tmpfs: path traversal not allowed: %q", p)
+		}
+
+		// Must not overlap with blocked paths
+		if blockedTmpfsPaths[cleaned] {
+			return fmt.Errorf("tmpfs: path %q is managed by the backend or is a sensitive path", cleaned)
+		}
+
+		// Check for duplicates
+		if seen[cleaned] {
+			return fmt.Errorf("tmpfs: duplicate path: %q", cleaned)
+		}
+		seen[cleaned] = true
+	}
+
+	return nil
 }
 
 // Validate checks that the health check configuration is valid.

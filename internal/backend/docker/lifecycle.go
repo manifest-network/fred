@@ -269,6 +269,10 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 			"/tmp": tmpfsSize,
 			"/run": tmpfsSize,
 		}
+		// Add tenant-requested tmpfs mounts (validated in manifest.Validate)
+		for _, p := range params.Manifest.Tmpfs {
+			hostConfig.Tmpfs[p] = tmpfsSize
+		}
 	}
 
 	// Generate container name from lease UUID and instance index

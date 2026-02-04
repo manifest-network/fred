@@ -1581,6 +1581,69 @@ func TestDoProvision_DiskQuotaDisabled(t *testing.T) {
 	assert.False(t, capturedParams.DiskQuota, "DiskQuota should be false")
 }
 
+func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	var capturedParams CreateContainerParams
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	// Manifest with additional tmpfs mounts (like nginx would need)
+	manifestJSON := []byte(`{
+		"image": "nginx:latest",
+		"ports": {"80/tcp": {}},
+		"tmpfs": ["/var/cache/nginx", "/var/log/nginx"]
+	}`)
+	manifest, err := ParseManifest(manifestJSON)
+	require.NoError(t, err)
+
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, manifestJSON)
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	<-callbackReceived
+
+	// Verify the manifest tmpfs paths were passed through
+	assert.Equal(t, []string{"/var/cache/nginx", "/var/log/nginx"}, capturedParams.Manifest.Tmpfs)
+	assert.True(t, capturedParams.ReadonlyRootfs, "ReadonlyRootfs should be true")
+}
+
 // --- Callback persistence tests ---
 
 func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {

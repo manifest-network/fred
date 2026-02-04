@@ -845,6 +845,115 @@ func TestConfigHardeningValidation(t *testing.T) {
 	})
 }
 
+func TestParseManifest_Tmpfs(t *testing.T) {
+	t.Run("valid tmpfs paths", func(t *testing.T) {
+		data := `{
+			"image": "nginx:latest",
+			"ports": {"80/tcp": {}},
+			"tmpfs": ["/var/cache/nginx", "/var/log/nginx"]
+		}`
+		m, err := ParseManifest([]byte(data))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"/var/cache/nginx", "/var/log/nginx"}, m.Tmpfs)
+	})
+
+	t.Run("empty tmpfs is valid", func(t *testing.T) {
+		data := `{"image": "nginx:latest", "tmpfs": []}`
+		m, err := ParseManifest([]byte(data))
+		require.NoError(t, err)
+		assert.Empty(t, m.Tmpfs)
+	})
+
+	t.Run("no tmpfs field is valid", func(t *testing.T) {
+		data := `{"image": "nginx:latest"}`
+		m, err := ParseManifest([]byte(data))
+		require.NoError(t, err)
+		assert.Nil(t, m.Tmpfs)
+	})
+
+	t.Run("relative path rejected", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["var/cache"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be absolute")
+	})
+
+	t.Run("root path rejected", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "root filesystem")
+	})
+
+	t.Run("/tmp rejected (managed by backend)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/tmp"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "managed by the backend")
+	})
+
+	t.Run("/run rejected (managed by backend)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/run"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "managed by the backend")
+	})
+
+	t.Run("/proc rejected (sensitive)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/proc"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sensitive path")
+	})
+
+	t.Run("/sys rejected (sensitive)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/sys"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sensitive path")
+	})
+
+	t.Run("/dev rejected (sensitive)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/dev"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sensitive path")
+	})
+
+	t.Run("duplicate paths rejected", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/var/log", "/var/log"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate")
+	})
+
+	t.Run("paths are cleaned before duplicate check", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/var/log/", "/var/log"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate")
+	})
+
+	t.Run("too many mounts rejected", func(t *testing.T) {
+		paths := make([]string, maxTmpfsMounts+1)
+		for i := range paths {
+			paths[i] = fmt.Sprintf("/mnt/vol%d", i)
+		}
+		data, _ := json.Marshal(DockerManifest{Image: "nginx", Tmpfs: paths})
+		_, err := ParseManifest(data)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "too many mounts")
+	})
+
+	t.Run("path with .. rejected after cleaning to blocked path", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/tmp/../proc"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		// After path.Clean, "/tmp/../proc" becomes "/proc" which is blocked
+		assert.Contains(t, err.Error(), "sensitive path")
+	})
+}
+
 func TestHasActiveHealthCheck(t *testing.T) {
 	tests := []struct {
 		name     string
