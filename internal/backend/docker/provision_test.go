@@ -92,23 +92,18 @@ func TestProvision_Success(t *testing.T) {
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
-	// Verify provision slot was created
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	require.NotNil(t, prov)
-	assert.Equal(t, backend.ProvisionStatusProvisioning, prov.Status)
-
 	// Wait for async doProvision to complete (signaled by callback)
 	<-callbackReceived
 
-	// Verify final state
+	// Verify final state (must read status under lock to avoid race with goroutine)
 	b.provisionsMu.RLock()
-	prov = b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
+	prov := b.provisions["lease-1"]
 	require.NotNil(t, prov)
-	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
-	assert.Len(t, prov.ContainerIDs, 1)
+	status := prov.Status
+	containerIDs := prov.ContainerIDs
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, status)
+	assert.Len(t, containerIDs, 1)
 	assert.True(t, pullCalled)
 	assert.Equal(t, 1, createCalls)
 	assert.Equal(t, 1, startCalls)

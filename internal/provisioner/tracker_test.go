@@ -210,7 +210,9 @@ func TestTracker_WaitForDrain_Timeout(t *testing.T) {
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "t", nil, "")
 
-	remaining := tracker.WaitForDrain(context.Background(), 800*time.Millisecond)
+	// Use a timeout well above the internal 500ms poll interval to avoid
+	// coupling this test to the implementation's tick frequency.
+	remaining := tracker.WaitForDrain(context.Background(), 2*time.Second)
 	assert.Equal(t, 1, remaining)
 }
 
