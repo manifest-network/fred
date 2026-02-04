@@ -602,7 +602,10 @@ func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.
 	for _, s := range summaries {
 		inspected, err := d.client.NetworkInspect(ctx, s.ID, networktypes.InspectOptions{})
 		if err != nil {
-			continue // Network may have been removed between list and inspect
+			if !client.IsErrNotFound(err) {
+				slog.Warn("failed to inspect network during list", "network_id", s.ID, "error", err)
+			}
+			continue
 		}
 		result = append(result, inspected)
 	}

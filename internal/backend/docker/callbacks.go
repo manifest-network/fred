@@ -151,7 +151,8 @@ func (s *CallbackStore) ListPending() ([]CallbackEntry, error) {
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var entry CallbackEntry
 			if err := json.Unmarshal(v, &entry); err != nil {
-				continue // Skip malformed entries
+				slog.Warn("skipping malformed callback entry", "key", string(k), "error", err)
+				continue
 			}
 			entries = append(entries, entry)
 		}

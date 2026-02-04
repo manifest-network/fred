@@ -231,7 +231,8 @@ func (b *Backend) replayPendingCallbacks() {
 		}
 		body, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
-			b.logger.Error("failed to marshal replay callback", "error", marshalErr, "lease_uuid", entry.LeaseUUID)
+			b.logger.Error("removing malformed callback entry", "error", marshalErr, "lease_uuid", entry.LeaseUUID)
+			_ = b.callbackStore.Remove(entry.LeaseUUID)
 			continue
 		}
 
@@ -1110,7 +1111,7 @@ func (b *Backend) deliverCallback(leaseUUID, callbackURL string, body []byte) bo
 
 // trySendCallback makes a single callback attempt. Returns true on success.
 func (b *Backend) trySendCallback(leaseUUID, callbackURL string, body []byte) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), callbackTimeout)
+	ctx, cancel := context.WithTimeout(b.stopCtx, callbackTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))

@@ -97,7 +97,7 @@ type Config struct {
 	// verifying they're still running. This catches containers that crash immediately
 	// on startup (e.g., bad config, read-only filesystem errors, missing dependencies).
 	// The success callback is only sent after verification passes.
-	// Defaults to 5 seconds. Set to 0 to disable.
+	// Defaults to 5 seconds. Setting to 0 uses the default (verification cannot be disabled).
 	StartupVerifyDuration time.Duration `yaml:"startup_verify_duration"`
 
 	// TenantQuota configures per-tenant resource limits.
