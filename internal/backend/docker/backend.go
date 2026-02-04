@@ -15,6 +15,7 @@ import (
 	"time"
 
 	networktypes "github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/pkg/stringid"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/hmacauth"
@@ -94,12 +95,10 @@ type provision struct {
 	CallbackURL  string // URL to notify on provision completion
 }
 
-// shortID safely truncates an ID to 12 characters for logging.
+// shortID truncates a container/network ID to 12 characters for logging.
+// Uses Docker's stringid.TruncateID for consistency with Docker CLI output.
 func shortID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
+	return stringid.TruncateID(id)
 }
 
 // New creates a new Docker backend.

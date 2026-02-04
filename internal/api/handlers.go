@@ -315,9 +315,10 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	// Check chain connectivity
 	if h.client != nil {
 		if err := h.client.Ping(r.Context()); err != nil {
+			slog.Warn("health check: chain unhealthy", "error", err)
 			checks["chain"] = &CheckResult{
 				Status:  "unhealthy",
-				Message: err.Error(),
+				Message: "chain connectivity failed",
 			}
 			overallHealthy = false
 		} else {
@@ -337,9 +338,10 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 					Status: "healthy",
 				}
 			} else {
+				slog.Warn("health check: backend unhealthy", "backend", result.Name, "error", result.Error)
 				checks[checkKey] = &CheckResult{
 					Status:  "unhealthy",
-					Message: result.Error,
+					Message: "backend health check failed",
 				}
 			}
 		}
@@ -351,9 +353,10 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	// Check token tracker (bbolt database)
 	if h.tokenTracker != nil {
 		if err := h.tokenTracker.Healthy(); err != nil {
+			slog.Warn("health check: token tracker unhealthy", "error", err)
 			checks["token_tracker"] = &CheckResult{
 				Status:  "unhealthy",
-				Message: err.Error(),
+				Message: "token tracker unavailable",
 			}
 			overallHealthy = false
 		} else {

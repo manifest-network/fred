@@ -70,11 +70,12 @@ func TestHealthCheck_ChainUnavailable(t *testing.T) {
 
 	assert.Equal(t, "unhealthy", response.Status)
 
-	// Check that chain check shows unhealthy with error message
+	// Check that chain check shows unhealthy with sanitized message
+	// (raw error details are logged server-side, not exposed to clients)
 	chainCheck, ok := response.Checks["chain"]
 	require.True(t, ok, "missing chain check in response")
 	assert.Equal(t, "unhealthy", chainCheck.Status)
-	assert.Equal(t, "connection refused", chainCheck.Message)
+	assert.Equal(t, "chain connectivity failed", chainCheck.Message)
 }
 
 // TestHealthCheck_ChainHealthy tests health check when chain is available.

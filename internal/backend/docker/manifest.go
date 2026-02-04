@@ -10,7 +10,10 @@ import (
 )
 
 // maxTmpfsMounts is the maximum number of additional tmpfs mounts a tenant can request.
-const maxTmpfsMounts = 10
+// Combined with the automatic /tmp and /run mounts (2), and the default 64MB per mount,
+// this limits total tmpfs memory to 6 × 64MB = 384MB. This prevents tenants from using
+// excessive RAM via tmpfs mounts that bypass the container's cgroup memory limit.
+const maxTmpfsMounts = 4
 
 // DockerManifest represents the tenant's container specification.
 // Resource limits are determined by the SKU, not the manifest.
@@ -227,16 +230,13 @@ func validateTmpfsPaths(paths []string) error {
 		}
 
 		// Clean the path to normalize (resolve .., trailing slashes, etc.)
+		// Note: path.Clean resolves all ".." components, so paths like "/var/../etc"
+		// become "/etc". The blockedTmpfsPaths check below handles sensitive paths.
 		cleaned := path.Clean(p)
 
 		// Must not be the root filesystem
 		if cleaned == "/" {
 			return fmt.Errorf("tmpfs: cannot mount root filesystem")
-		}
-
-		// Must not contain path traversal after cleaning
-		if strings.Contains(cleaned, "..") {
-			return fmt.Errorf("tmpfs: path traversal not allowed: %q", p)
 		}
 
 		// Must not overlap with blocked paths

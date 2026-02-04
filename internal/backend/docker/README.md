@@ -109,7 +109,7 @@ Every container is created with the following security measures:
 | Drop all capabilities | `CapDrop: ["ALL"]` | No Linux capabilities granted |
 | No new privileges | `SecurityOpt: ["no-new-privileges:true"]` | Prevents privilege escalation via setuid/setgid |
 | Read-only root filesystem | `ReadonlyRootfs: true` | Configurable via `container_readonly_rootfs` |
-| Tmpfs for `/tmp` and `/run` | `Tmpfs: {"/tmp": "size=64M", "/run": "size=64M"}` | Only when readonly rootfs is enabled; size from `container_tmpfs_size_mb` |
+| Tmpfs for `/tmp` and `/run` | `Tmpfs: {"/tmp": "size=64M", "/run": "size=64M"}` | Only when readonly rootfs is enabled; size from `container_tmpfs_size_mb`. Tenants may request up to 4 additional tmpfs mounts via manifest, for a maximum of 6 total (384MB at default size). |
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | Memory (no swap) | `MemorySwap == Memory` | Prevents swap usage entirely |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
