@@ -187,8 +187,11 @@ func (s *PayloadStore) Store(leaseUUID string, payload []byte) bool {
 }
 
 // Get retrieves a payload for a lease without removing it.
-// Returns nil if no payload exists.
-func (s *PayloadStore) Get(leaseUUID string) []byte {
+// Returns (nil, nil) if no payload exists.
+// Returns a non-nil error if the database read fails — callers must not treat
+// errors the same as "not found" to avoid closing active leases on transient
+// disk failures.
+func (s *PayloadStore) Get(leaseUUID string) ([]byte, error) {
 	key := []byte(leaseUUID)
 	var payload []byte
 
@@ -204,11 +207,10 @@ func (s *PayloadStore) Get(leaseUUID string) []byte {
 	})
 
 	if err != nil {
-		slog.Error("failed to get payload", "lease_uuid", leaseUUID, "error", err)
-		return nil
+		return nil, fmt.Errorf("failed to get payload for %s: %w", leaseUUID, err)
 	}
 
-	return payload
+	return payload, nil
 }
 
 // Pop retrieves and removes a payload for a lease.

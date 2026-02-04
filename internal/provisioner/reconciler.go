@@ -340,7 +340,17 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// Only include PayloadHash when we have the actual payload - this ensures
 	// backends never receive a hash without the corresponding data.
 	if withPayload && r.tracker != nil {
-		req.Payload = r.tracker.PayloadStore().Get(lease.Uuid)
+		var getErr error
+		req.Payload, getErr = r.tracker.PayloadStore().Get(lease.Uuid)
+		if getErr != nil {
+			// Database error — do NOT treat as "payload missing".
+			// Abort this provision attempt so a transient disk issue doesn't
+			// cause us to close an active lease.
+			if r.tracker != nil {
+				r.tracker.UntrackInFlight(lease.Uuid)
+			}
+			return fmt.Errorf("failed to read payload for lease %s: %w", lease.Uuid, getErr)
+		}
 		if req.Payload == nil && len(lease.MetaHash) > 0 {
 			// Payload is required (lease has MetaHash) but not in the store.
 			// This can happen if the payload DB was lost or fred restarted
@@ -466,6 +476,9 @@ func (r *Reconciler) closeLease(ctx context.Context, leaseUUID, reason string) e
 }
 
 // fetchAllProvisions retrieves provisions from all backends in parallel.
+// Returns an error if any backend fails to list provisions, because partial
+// data would cause the reconciler to misidentify running containers as orphans
+// or active leases as unprovisioned anomalies.
 func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend.ProvisionInfo, error) {
 	backends := r.backendRouter.Backends()
 
@@ -474,6 +487,7 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 
 	var mu sync.Mutex
 	allProvisions := make(map[string]backend.ProvisionInfo)
+	var fetchErrors []error
 
 	for _, b := range backends {
 		g.Go(func() error {
@@ -491,8 +505,10 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 					"backend", b.Name(),
 					"error", err,
 				)
-				// Don't fail - partial reconciliation is better than none
-				return nil
+				mu.Lock()
+				fetchErrors = append(fetchErrors, fmt.Errorf("backend %s: %w", b.Name(), err))
+				mu.Unlock()
+				return nil // Don't cancel other backends — collect all errors
 			}
 
 			mu.Lock()
@@ -512,6 +528,10 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	if len(fetchErrors) > 0 {
+		return nil, fmt.Errorf("aborting reconciliation due to incomplete backend data: %w", errors.Join(fetchErrors...))
 	}
 
 	return allProvisions, nil

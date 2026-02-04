@@ -35,6 +35,13 @@
 production_mode: false
 
 # =============================================================================
+# LOGGING
+# =============================================================================
+# Log verbosity level. Valid values: debug, info, warn, error
+# Default: info
+log_level: "info"
+
+# =============================================================================
 # CHAIN CONNECTION
 # =============================================================================
 # Settings for connecting to the Manifest blockchain.

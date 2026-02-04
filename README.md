@@ -168,6 +168,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `log_level` | Log verbosity (debug, info, warn, error) | `info` |
 | `production_mode` | Enforce security requirements at startup (TLS, replay protection, SSRF) | `false` |
 | `chain_id` | Chain identifier | `manifest-1` |
 | `grpc_endpoint` | Chain gRPC endpoint | `localhost:9090` |
@@ -249,6 +250,9 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 
 # Or use environment variables
 ./build/providerd
+
+# Print version
+./build/providerd --version
 ```
 
 ## API Endpoints

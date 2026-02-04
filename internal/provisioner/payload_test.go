@@ -51,7 +51,8 @@ func TestPayloadStore_Store_Conflict(t *testing.T) {
 	assert.False(t, ok, "Store() = true, want false for duplicate")
 
 	// Original payload should be unchanged
-	got := store.Get(testutil.ValidUUID1)
+	got, err := store.Get(testutil.ValidUUID1)
+	require.NoError(t, err)
 	assert.Equal(t, string(payload1), string(got))
 }
 
@@ -61,7 +62,8 @@ func TestPayloadStore_Get(t *testing.T) {
 
 	store.Store(testutil.ValidUUID1, payload)
 
-	got := store.Get(testutil.ValidUUID1)
+	got, err := store.Get(testutil.ValidUUID1)
+	require.NoError(t, err)
 	assert.Equal(t, string(payload), string(got))
 
 	// Get should not remove the payload
@@ -71,7 +73,8 @@ func TestPayloadStore_Get(t *testing.T) {
 func TestPayloadStore_Get_NotFound(t *testing.T) {
 	store := newTestPayloadStore(t)
 
-	got := store.Get(testutil.ValidUUID1)
+	got, err := store.Get(testutil.ValidUUID1)
+	require.NoError(t, err)
 	assert.Nil(t, got, "Get() should return nil for non-existent")
 }
 
@@ -146,12 +149,14 @@ func TestPayloadStore_PayloadIsCopied(t *testing.T) {
 	// Modify original - should not affect stored value
 	original[0] = 'X'
 
-	got := store.Get(testutil.ValidUUID1)
+	got, err := store.Get(testutil.ValidUUID1)
+	require.NoError(t, err)
 	assert.NotEqual(t, byte('X'), got[0], "Store() did not copy payload, original mutation affected stored value")
 
 	// Modify returned value - should not affect stored value
 	got[0] = 'Y'
-	got2 := store.Get(testutil.ValidUUID1)
+	got2, err := store.Get(testutil.ValidUUID1)
+	require.NoError(t, err)
 	assert.NotEqual(t, byte('Y'), got2[0], "Get() did not copy payload, returned mutation affected stored value")
 }
 
@@ -174,7 +179,7 @@ func TestPayloadStore_ConcurrentAccess(t *testing.T) {
 				case 0:
 					store.Store(uuid, payload)
 				case 1:
-					store.Get(uuid)
+					_, _ = store.Get(uuid)
 				case 2:
 					store.Has(uuid)
 				case 3:
@@ -210,7 +215,8 @@ func TestPayloadStore_Persistence(t *testing.T) {
 	require.NoError(t, err, "NewPayloadStore() reopen error")
 	defer store2.Close()
 
-	got := store2.Get(leaseUUID)
+	got, err := store2.Get(leaseUUID)
+	require.NoError(t, err)
 	assert.Equal(t, string(payload), string(got), "After reopen, Get() returned wrong value")
 }
 
@@ -244,7 +250,8 @@ func TestPayloadStore_CanReuseAfterDelete(t *testing.T) {
 	// Should be able to store again
 	assert.True(t, store.Store(leaseUUID, []byte("second")), "Store() after Delete returned false, want true")
 
-	got := store.Get(leaseUUID)
+	got, err := store.Get(leaseUUID)
+	require.NoError(t, err)
 	assert.Equal(t, "second", string(got))
 }
 
@@ -259,7 +266,8 @@ func TestPayloadStore_CanReuseAfterPop(t *testing.T) {
 	// Should be able to store again
 	assert.True(t, store.Store(leaseUUID, []byte("second")), "Store() after Pop returned false, want true")
 
-	got := store.Get(leaseUUID)
+	got, err := store.Get(leaseUUID)
+	require.NoError(t, err)
 	assert.Equal(t, "second", string(got))
 }
 

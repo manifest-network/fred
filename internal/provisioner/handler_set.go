@@ -350,7 +350,14 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	// Note: Payload is NOT deleted here. It will be deleted by HandleBackendCallback
 	// after the backend reports success or failure. This ensures the payload remains
 	// available for retry if the backend fails or crashes before sending a callback.
-	payload := h.deps.PayloadStore.Get(event.LeaseUUID)
+	payload, err := h.deps.PayloadStore.Get(event.LeaseUUID)
+	if err != nil {
+		slog.Error("failed to read payload from store",
+			"lease_uuid", event.LeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("payload store read error: %w", err)
+	}
 	if payload == nil {
 		// This shouldn't happen in normal operation since payload is stored
 		// before publishing the event, but handle it gracefully

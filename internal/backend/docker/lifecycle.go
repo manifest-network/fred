@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -372,6 +373,11 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 		if err != nil {
 			// Skip containers with malformed Fred labels — these can't be
 			// reliably tracked for resource accounting.
+			slog.Warn("skipping managed container with malformed labels",
+				"container_id", c.ID[:12],
+				"lease_uuid", c.Labels[LabelLeaseUUID],
+				"error", err,
+			)
 			continue
 		}
 

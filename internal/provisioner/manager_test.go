@@ -2324,7 +2324,8 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	require.True(t, payloadStore2.Has("lease-1"), "REGRESSION: payload was lost after restart - reconciliation cannot retry")
 
 	// Verify we can retrieve the payload with correct content
-	retrievedPayload := payloadStore2.Get("lease-1")
+	retrievedPayload, err := payloadStore2.Get("lease-1")
+	require.NoError(t, err)
 	assert.Equal(t, string(testPayload), string(retrievedPayload))
 }
 

@@ -18,7 +18,8 @@ import (
 func waitForFlush(t testing.TB, store *PayloadStore, key string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if store.Get(key) != nil {
+		data, _ := store.Get(key)
+		if data != nil {
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -111,7 +112,7 @@ func BenchmarkPayloadStore_Read(b *testing.B) {
 	i := 0
 	for b.Loop() {
 		leaseUUID := fmt.Sprintf("lease-%d", i%numEntries)
-		store.Get(leaseUUID)
+		_, _ = store.Get(leaseUUID)
 		i++
 	}
 	b.StopTimer()
@@ -148,7 +149,7 @@ func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
 		for pb.Next() {
 			id := counter.Add(1)
 			leaseUUID := fmt.Sprintf("lease-%d", id%numEntries)
-			store.Get(leaseUUID)
+			_, _ = store.Get(leaseUUID)
 		}
 	})
 	b.StopTimer()
@@ -269,7 +270,7 @@ func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
 				id := writeCounter.Add(1) + numEntries
 				store.Store(fmt.Sprintf("lease-%d", id), localPayload)
 			} else {
-				store.Get(fmt.Sprintf("lease-%d", opCount%numEntries))
+				_, _ = store.Get(fmt.Sprintf("lease-%d", opCount%numEntries))
 			}
 		}
 	})
@@ -321,7 +322,7 @@ func TestPayloadStore_StressTest(t *testing.T) {
 					store.Delete(leaseUUID)
 					deleteOps.Add(1)
 				default: // 60% reads
-					store.Get(leaseUUID)
+					_, _ = store.Get(leaseUUID)
 					readOps.Add(1)
 				}
 			}
@@ -400,6 +401,8 @@ func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
 	// Verify data integrity - sample check
 	for g := 0; g < 10; g++ {
 		leaseUUID := fmt.Sprintf("lease-%d-0", g)
-		assert.NotNil(t, store.Get(leaseUUID), "failed to retrieve lease %s", leaseUUID)
+		got, err := store.Get(leaseUUID)
+		assert.NoError(t, err, "Get error for lease %s", leaseUUID)
+		assert.NotNil(t, got, "failed to retrieve lease %s", leaseUUID)
 	}
 }
