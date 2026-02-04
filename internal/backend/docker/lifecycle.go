@@ -17,6 +17,7 @@ import (
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -339,11 +340,11 @@ func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, ta
 	}
 	defer func() { _ = reader.Close() }()
 
-	// Docker multiplexes stdout/stderr with an 8-byte header per frame.
-	// Use stdcopy.StdCopy to demux, but for simplicity we combine both
-	// streams into one buffer.
+	// Docker multiplexes stdout/stderr with 8-byte headers per frame
+	// when the container is not using a TTY. Use stdcopy.StdCopy to
+	// demux, combining both streams into one buffer.
 	var buf strings.Builder
-	_, err = io.Copy(&buf, reader)
+	_, err = stdcopy.StdCopy(&buf, &buf, reader)
 	if err != nil {
 		return "", fmt.Errorf("failed to read container logs: %w", err)
 	}

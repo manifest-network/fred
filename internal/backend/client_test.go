@@ -511,3 +511,81 @@ func TestHTTPClient_Provision_NoHMAC_NoHeader(t *testing.T) {
 
 	assert.Empty(t, capturedSig, "X-Fred-Signature header should be absent when no secret configured")
 }
+
+func TestHTTPClient_GetInfo_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-signing-getinfo!"
+
+	var capturedSig string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(LeaseInfo{"host": "example.com"})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-getinfo",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	info, err := client.GetInfo(context.Background(), "lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, info)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present on GET /info")
+	// GET requests sign an empty body.
+	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
+}
+
+func TestHTTPClient_ListProvisions_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-signing-listprov"
+
+	var capturedSig string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"provisions": []ProvisionInfo{},
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-listprov",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	_, err := client.ListProvisions(context.Background())
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present on GET /provisions")
+	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
+}
+
+func TestHTTPClient_GetInfo_NoHMAC_NoHeader(t *testing.T) {
+	var capturedSig string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(LeaseInfo{"host": "example.com"})
+	}))
+	defer server.Close()
+
+	// No Secret configured
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-no-hmac-getinfo",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	_, err := client.GetInfo(context.Background(), "lease-1")
+	require.NoError(t, err)
+
+	assert.Empty(t, capturedSig, "X-Fred-Signature header should be absent when no secret configured")
+}

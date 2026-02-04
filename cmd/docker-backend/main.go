@@ -166,9 +166,11 @@ func (s *Server) Handler() http.Handler {
 	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger)
 	mux.Handle("POST /provision", authMw(http.HandlerFunc(s.handleProvision)))
 	mux.Handle("POST /deprovision", authMw(http.HandlerFunc(s.handleDeprovision)))
-	mux.HandleFunc("GET /info/{lease_uuid}", s.handleGetInfo)
-	mux.HandleFunc("GET /logs/{lease_uuid}", s.handleGetLogs)
-	mux.HandleFunc("GET /provisions", s.handleListProvisions)
+	mux.Handle("GET /info/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetInfo)))
+	mux.Handle("GET /logs/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetLogs)))
+	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
+
+	// Operational endpoints — no auth required (monitoring, health checks).
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /stats", s.handleStats)
 	mux.Handle("GET /metrics", promhttp.Handler())
@@ -255,6 +257,10 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
 			s.errorResponse(w, http.StatusBadRequest, "tail must be a positive integer")
+			return
+		}
+		if n > maxTailLines {
+			s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("tail must not exceed %d", maxTailLines))
 			return
 		}
 		tail = n
@@ -373,6 +379,7 @@ func (s *Server) errorResponse(w http.ResponseWriter, status int, message string
 }
 
 const maxRequestBodySize = 1 << 20 // 1 MiB
+const maxTailLines = 10000         // Upper bound for log tail requests
 
 // hmacAuthMiddleware returns middleware that verifies HMAC-SHA256 signatures on requests.
 func hmacAuthMiddleware(secret string, logger *slog.Logger) func(http.Handler) http.Handler {

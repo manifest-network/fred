@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	networktypes "github.com/docker/docker/api/types/network"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -574,4 +577,162 @@ func TestRecoverState(t *testing.T) {
 
 		assert.Len(t, b.provisions, 0)
 	})
+}
+
+func TestRecoverState_SetsActiveProvisionsGauge(t *testing.T) {
+	now := time.Now()
+
+	t.Run("cold start with running containers", func(t *testing.T) {
+		// Reset gauge to a known value to detect the change.
+		activeProvisions.Set(999)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:  "c1",
+						LeaseUUID:    "lease-1",
+						Tenant:       "tenant-a",
+						ProviderUUID: "prov-1",
+						SKU:          "docker-small",
+						Status:       "running",
+						CreatedAt:    now,
+					},
+					{
+						ContainerID:  "c2",
+						LeaseUUID:    "lease-2",
+						Tenant:       "tenant-b",
+						ProviderUUID: "prov-1",
+						SKU:          "docker-small",
+						Status:       "running",
+						CreatedAt:    now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, float64(2), testutil.ToFloat64(activeProvisions))
+	})
+
+	t.Run("mixed ready and failed provisions", func(t *testing.T) {
+		activeProvisions.Set(999)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:  "c1",
+						LeaseUUID:    "lease-1",
+						Tenant:       "tenant-a",
+						ProviderUUID: "prov-1",
+						SKU:          "docker-small",
+						Status:       "running",
+						CreatedAt:    now,
+					},
+					{
+						ContainerID:  "c2",
+						LeaseUUID:    "lease-2",
+						Tenant:       "tenant-b",
+						ProviderUUID: "prov-1",
+						SKU:          "docker-small",
+						Status:       "exited",
+						CreatedAt:    now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		// Only lease-1 is ready; lease-2 is failed.
+		assert.Equal(t, float64(1), testutil.ToFloat64(activeProvisions))
+	})
+
+	t.Run("no containers sets gauge to zero", func(t *testing.T) {
+		activeProvisions.Set(999)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return nil, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, float64(0), testutil.ToFloat64(activeProvisions))
+	})
+
+	t.Run("in-flight provisioning leases not counted", func(t *testing.T) {
+		activeProvisions.Set(999)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return nil, nil
+			},
+		}
+		existing := map[string]*provision{
+			"lease-1": {
+				LeaseUUID: "lease-1",
+				Status:    backend.ProvisionStatusProvisioning,
+				CreatedAt: now,
+			},
+		}
+		b := newBackendForTest(mock, existing)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		// Provisioning leases are preserved but not counted as active.
+		assert.Len(t, b.provisions, 1)
+		assert.Equal(t, float64(0), testutil.ToFloat64(activeProvisions))
+	})
+}
+
+func TestRecoverState_Serialized(t *testing.T) {
+	// Verify that concurrent recoverState calls are serialized by recoverMu.
+	// Use an atomic counter to track the maximum number of concurrent calls
+	// inside ListManagedContainers (called inside the critical section).
+	var concurrent atomic.Int32
+	var maxConcurrent atomic.Int32
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			n := concurrent.Add(1)
+			defer concurrent.Add(-1)
+
+			// Record the peak concurrency observed.
+			for {
+				cur := maxConcurrent.Load()
+				if n <= cur || maxConcurrent.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+
+			// Hold inside the lock long enough for the other goroutine to attempt entry.
+			time.Sleep(50 * time.Millisecond)
+			return nil, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			_ = b.recoverState(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(1), maxConcurrent.Load(),
+		"recoverState calls should be serialized (max concurrency must be 1)")
 }

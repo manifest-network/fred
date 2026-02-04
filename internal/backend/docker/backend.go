@@ -59,6 +59,12 @@ type Backend struct {
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
 
+	// recoverMu serializes recoverState calls. The reconcile loop and
+	// external RefreshState (called by Fred's reconciler) both invoke
+	// recoverState. Without serialization, concurrent calls can detect
+	// the same ready→failed transitions and send duplicate callbacks.
+	recoverMu sync.Mutex
+
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *CallbackStore
 
@@ -782,7 +788,14 @@ func (b *Backend) removeProvision(leaseUUID string) {
 // recoverState rebuilds in-memory state from Docker containers.
 // Handles multi-unit leases by grouping containers by lease UUID.
 // Merges with existing state to preserve in-flight provisions.
+//
+// Serialized by recoverMu to prevent concurrent calls (from the
+// reconcile loop and RefreshState) from duplicating transition
+// detection and failure callbacks.
 func (b *Backend) recoverState(ctx context.Context) error {
+	b.recoverMu.Lock()
+	defer b.recoverMu.Unlock()
+
 	containers, err := b.docker.ListManagedContainers(ctx)
 	if err != nil {
 		return err
@@ -915,6 +928,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	b.provisions = recovered
 	b.pool.Reset(allocations)
 	b.provisionsMu.Unlock()
+
+	// Reset the active provisions gauge from the recovered map. Without this,
+	// the gauge drifts (and can go negative) because Inc/Dec are only called
+	// during normal Provision/Deprovision, but recoverState replaces the map.
+	var readyCount float64
+	for _, p := range recovered {
+		if p.Status == backend.ProvisionStatusReady {
+			readyCount++
+		}
+	}
+	activeProvisions.Set(readyCount)
+	updateResourceMetrics(b.pool.Stats())
 
 	// Send failure callbacks outside the lock to avoid holding it during I/O.
 	for _, uuid := range failedLeases {

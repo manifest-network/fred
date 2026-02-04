@@ -344,6 +344,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
+		c.signRequest(httpReq, nil)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -427,6 +428,7 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
+		c.signRequest(httpReq, nil)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
