@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHTTPClient_Provision(t *testing.T) {
@@ -47,16 +49,10 @@ func TestHTTPClient_Provision(t *testing.T) {
 		CallbackURL:  "http://fred/callback",
 	})
 
-	if err != nil {
-		t.Fatalf("Provision() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if receivedReq.LeaseUUID != "lease-uuid-1" {
-		t.Errorf("LeaseUUID = %q, want %q", receivedReq.LeaseUUID, "lease-uuid-1")
-	}
-	if receivedReq.RoutingSKU() != "gpu-a100" {
-		t.Errorf("PrimarySKU() = %q, want %q", receivedReq.RoutingSKU(), "gpu-a100")
-	}
+	assert.Equal(t, "lease-uuid-1", receivedReq.LeaseUUID)
+	assert.Equal(t, "gpu-a100", receivedReq.RoutingSKU())
 }
 
 func TestHTTPClient_GetInfo(t *testing.T) {
@@ -87,18 +83,12 @@ func TestHTTPClient_GetInfo(t *testing.T) {
 
 	// Test found
 	info, err := client.GetInfo(context.Background(), "found-uuid")
-	if err != nil {
-		t.Fatalf("GetInfo() error = %v", err)
-	}
-	if (*info)["host"] != "test.example.com" {
-		t.Errorf("Host = %q, want %q", (*info)["host"], "test.example.com")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "test.example.com", (*info)["host"])
 
 	// Test not found
 	_, err = client.GetInfo(context.Background(), "not-found-uuid")
-	if err != ErrNotProvisioned {
-		t.Errorf("GetInfo() error = %v, want ErrNotProvisioned", err)
-	}
+	assert.ErrorIs(t, err, ErrNotProvisioned)
 }
 
 func TestHTTPClient_Deprovision(t *testing.T) {
@@ -123,12 +113,8 @@ func TestHTTPClient_Deprovision(t *testing.T) {
 	})
 
 	err := client.Deprovision(context.Background(), "lease-to-delete")
-	if err != nil {
-		t.Fatalf("Deprovision() error = %v", err)
-	}
-	if receivedUUID != "lease-to-delete" {
-		t.Errorf("received UUID = %q, want %q", receivedUUID, "lease-to-delete")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "lease-to-delete", receivedUUID)
 }
 
 func TestHTTPClient_ListProvisions(t *testing.T) {
@@ -154,12 +140,8 @@ func TestHTTPClient_ListProvisions(t *testing.T) {
 	})
 
 	provisions, err := client.ListProvisions(context.Background())
-	if err != nil {
-		t.Fatalf("ListProvisions() error = %v", err)
-	}
-	if len(provisions) != 2 {
-		t.Errorf("got %d provisions, want 2", len(provisions))
-	}
+	require.NoError(t, err)
+	assert.Len(t, provisions, 2)
 }
 
 func TestHTTPClient_Name(t *testing.T) {
@@ -168,9 +150,7 @@ func TestHTTPClient_Name(t *testing.T) {
 		BaseURL: "http://example.com",
 	})
 
-	if client.Name() != "my-backend" {
-		t.Errorf("Name() = %q, want %q", client.Name(), "my-backend")
-	}
+	assert.Equal(t, "my-backend", client.Name())
 }
 
 func TestHTTPClient_CircuitBreaker(t *testing.T) {
@@ -193,41 +173,27 @@ func TestHTTPClient_CircuitBreaker(t *testing.T) {
 	// First 3 calls should go through to server (and fail)
 	for i := 0; i < 3; i++ {
 		err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
-		if err == nil {
-			t.Fatalf("Provision() call %d should have failed", i+1)
-		}
-		if err == ErrCircuitOpen {
-			t.Fatalf("Circuit should not be open yet at call %d", i+1)
-		}
+		assert.Error(t, err)
+		assert.NotErrorIs(t, err, ErrCircuitOpen)
 	}
 
 	// Verify server received all 3 requests
-	if failCount != 3 {
-		t.Errorf("Server should have received 3 requests, got %d", failCount)
-	}
+	assert.Equal(t, 3, failCount)
 
 	// 4th call should fail immediately with circuit open error
 	err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
-	if err != ErrCircuitOpen {
-		t.Errorf("Provision() should return ErrCircuitOpen, got %v", err)
-	}
+	assert.ErrorIs(t, err, ErrCircuitOpen)
 
 	// Server should not receive the 4th request (circuit is open)
-	if failCount != 3 {
-		t.Errorf("Server should still have 3 requests after circuit open, got %d", failCount)
-	}
+	assert.Equal(t, 3, failCount)
 
 	// Wait for circuit breaker timeout to transition to half-open
 	time.Sleep(150 * time.Millisecond)
 
 	// Next call should go through (half-open state) but still fail
 	err = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
-	if err == ErrCircuitOpen {
-		t.Error("Circuit should be half-open, not open")
-	}
-	if failCount != 4 {
-		t.Errorf("Server should have received 4 requests after half-open, got %d", failCount)
-	}
+	assert.NotErrorIs(t, err, ErrCircuitOpen)
+	assert.Equal(t, 4, failCount)
 }
 
 func TestHTTPClient_CircuitBreaker_Recovery(t *testing.T) {
@@ -259,9 +225,7 @@ func TestHTTPClient_CircuitBreaker_Recovery(t *testing.T) {
 
 	// Verify circuit is open
 	err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
-	if err != ErrCircuitOpen {
-		t.Errorf("Circuit should be open, got %v", err)
-	}
+	assert.ErrorIs(t, err, ErrCircuitOpen)
 
 	// Wait for half-open
 	time.Sleep(150 * time.Millisecond)
@@ -271,16 +235,12 @@ func TestHTTPClient_CircuitBreaker_Recovery(t *testing.T) {
 
 	// This call should succeed and close the circuit
 	err = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
-	if err != nil {
-		t.Errorf("Provision() should succeed after recovery, got %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify circuit is closed by making more calls
 	for i := 0; i < 3; i++ {
 		err = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
-		if err != nil {
-			t.Errorf("Provision() call %d should succeed, got %v", i+1, err)
-		}
+		assert.NoError(t, err)
 	}
 }
 
@@ -303,9 +263,7 @@ func TestHTTPClient_Health_Success(t *testing.T) {
 	})
 
 	err := client.Health(context.Background())
-	if err != nil {
-		t.Errorf("Health() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestHTTPClient_Health_Unhealthy(t *testing.T) {
@@ -321,12 +279,8 @@ func TestHTTPClient_Health_Unhealthy(t *testing.T) {
 	})
 
 	err := client.Health(context.Background())
-	if err == nil {
-		t.Error("Health() should return error for unhealthy backend")
-	}
-	if !strings.Contains(err.Error(), "503") {
-		t.Errorf("Health() error should mention status code, got: %v", err)
-	}
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "503")
 }
 
 func TestHTTPClient_Health_ConnectionError(t *testing.T) {
@@ -337,9 +291,7 @@ func TestHTTPClient_Health_ConnectionError(t *testing.T) {
 	})
 
 	err := client.Health(context.Background())
-	if err == nil {
-		t.Error("Health() should return error when backend is unreachable")
-	}
+	assert.Error(t, err)
 }
 
 func TestHTTPClient_Health_ContextCancellation(t *testing.T) {
@@ -359,9 +311,7 @@ func TestHTTPClient_Health_ContextCancellation(t *testing.T) {
 	defer cancel()
 
 	err := client.Health(ctx)
-	if err == nil {
-		t.Error("Health() should return error when context is cancelled")
-	}
+	assert.Error(t, err)
 }
 
 // TestHTTPClient_CircuitBreaker_NotProvisioned_DoesNotTrip verifies that 404 responses
@@ -388,24 +338,16 @@ func TestHTTPClient_CircuitBreaker_NotProvisioned_DoesNotTrip(t *testing.T) {
 	// Make 10 requests that all return 404 (ErrNotProvisioned)
 	for i := range 10 {
 		_, err := client.GetInfo(context.Background(), "nonexistent-lease")
-		if err != ErrNotProvisioned {
-			t.Fatalf("GetInfo() call %d error = %v, want ErrNotProvisioned", i+1, err)
-		}
+		assert.ErrorIs(t, err, ErrNotProvisioned, "GetInfo() call %d", i+1)
 	}
 
 	// All 10 requests should have reached the server (circuit never opened)
-	if requestCount != 10 {
-		t.Errorf("Server received %d requests, want 10 (circuit should not have opened)", requestCount)
-	}
+	assert.Equal(t, 10, requestCount, "Server should have received 10 requests (circuit should not have opened)")
 
 	// Verify circuit is still closed by making another request
 	_, err := client.GetInfo(context.Background(), "another-lease")
-	if err == ErrCircuitOpen {
-		t.Error("Circuit breaker should not have opened from 404 responses")
-	}
-	if err != ErrNotProvisioned {
-		t.Errorf("GetInfo() error = %v, want ErrNotProvisioned", err)
-	}
+	assert.NotErrorIs(t, err, ErrCircuitOpen)
+	assert.ErrorIs(t, err, ErrNotProvisioned)
 }
 
 // TestHTTPClient_CircuitBreaker_404sResetFailureCount verifies that 404 responses
@@ -436,15 +378,11 @@ func TestHTTPClient_CircuitBreaker_404sResetFailureCount(t *testing.T) {
 	// Make 10 requests - circuit should NOT open because 404s reset consecutive failure count
 	for i := range 10 {
 		_, err := client.GetInfo(context.Background(), "test-lease")
-		if err == ErrCircuitOpen {
-			t.Fatalf("Circuit should not have opened at request %d - 404s should reset failure count", i+1)
-		}
+		assert.NotErrorIs(t, err, ErrCircuitOpen, "Circuit should not have opened at request %d - 404s should reset failure count", i+1)
 	}
 
 	// All 10 requests should have gone through
-	if requestCount != 10 {
-		t.Errorf("Server received %d requests, want 10", requestCount)
-	}
+	assert.Equal(t, 10, requestCount)
 }
 
 // TestHTTPClient_CircuitBreaker_ConsecutiveFailuresTrip verifies that consecutive
@@ -469,19 +407,13 @@ func TestHTTPClient_CircuitBreaker_ConsecutiveFailuresTrip(t *testing.T) {
 	// First 3 calls should go through and fail
 	for i := range 3 {
 		_, err := client.GetInfo(context.Background(), "test-lease")
-		if err == ErrCircuitOpen {
-			t.Fatalf("Circuit should not be open yet at call %d", i+1)
-		}
+		assert.NotErrorIs(t, err, ErrCircuitOpen, "Circuit should not be open yet at call %d", i+1)
 	}
 
 	// 4th call should fail with circuit open
 	_, err := client.GetInfo(context.Background(), "test-lease")
-	if err != ErrCircuitOpen {
-		t.Errorf("Circuit should be open after 3 consecutive failures, got %v", err)
-	}
+	assert.ErrorIs(t, err, ErrCircuitOpen)
 
 	// Server should have received exactly 3 requests
-	if requestCount != 3 {
-		t.Errorf("Server received %d requests, want 3", requestCount)
-	}
+	assert.Equal(t, 3, requestCount)
 }

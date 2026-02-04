@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
 
@@ -15,9 +16,7 @@ func TestChainTxError_Error(t *testing.T) {
 	}
 
 	msg := err.Error()
-	if msg != "transaction failed (code 22, codespace billing): lease not in pending state" {
-		t.Errorf("Error() = %q, want specific format", msg)
-	}
+	assert.Equal(t, "transaction failed (code 22, codespace billing): lease not in pending state", msg)
 }
 
 func TestChainTxError_Is(t *testing.T) {
@@ -83,9 +82,7 @@ func TestChainTxError_Is(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Use errors.Is to test the Is() method
 			got := errors.Is(tt.err, tt.target)
-			if got != tt.want {
-				t.Errorf("errors.Is() = %v, want %v", got, tt.want)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -99,11 +96,6 @@ func TestChainTxError_WorksWithErrorsIs(t *testing.T) {
 		RawLog:    "lease not in pending state",
 	}
 
-	if !errors.Is(chainErr, billingtypes.ErrLeaseNotPending) {
-		t.Error("ChainTxError should match ErrLeaseNotPending via errors.Is()")
-	}
-
-	if errors.Is(chainErr, billingtypes.ErrLeaseNotFound) {
-		t.Error("ChainTxError should NOT match ErrLeaseNotFound")
-	}
+	assert.True(t, errors.Is(chainErr, billingtypes.ErrLeaseNotPending))
+	assert.False(t, errors.Is(chainErr, billingtypes.ErrLeaseNotFound))
 }

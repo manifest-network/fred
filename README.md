@@ -191,8 +191,6 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
-| `payload_store_ttl` | TTL for stored payloads | `1h` |
-| `payload_store_cleanup_freq` | How often to clean up expired payloads | `10m` |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 ### Advanced Configuration

@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRouter_Route(t *testing.T) {
@@ -29,9 +32,7 @@ func TestRouter_Route(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	tests := []struct {
 		sku      string
@@ -50,9 +51,7 @@ func TestRouter_Route(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.sku, func(t *testing.T) {
 			backend := router.Route(tt.sku)
-			if backend.Name() != tt.wantName {
-				t.Errorf("Route(%q) = %q, want %q", tt.sku, backend.Name(), tt.wantName)
-			}
+			assert.Equal(t, tt.wantName, backend.Name())
 		})
 	}
 }
@@ -73,9 +72,7 @@ func TestRouter_ExactSKUMatch(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	tests := []struct {
 		sku      string
@@ -90,9 +87,7 @@ func TestRouter_ExactSKUMatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.sku, func(t *testing.T) {
 			backend := router.Route(tt.sku)
-			if backend.Name() != tt.wantName {
-				t.Errorf("Route(%q) = %q, want %q", tt.sku, backend.Name(), tt.wantName)
-			}
+			assert.Equal(t, tt.wantName, backend.Name())
 		})
 	}
 }
@@ -101,9 +96,7 @@ func TestRouter_NoBackends(t *testing.T) {
 	_, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{},
 	})
-	if err == nil {
-		t.Error("NewRouter() with no backends should return error")
-	}
+	assert.Error(t, err)
 }
 
 func TestRouter_MultipleDefaults(t *testing.T) {
@@ -116,9 +109,7 @@ func TestRouter_MultipleDefaults(t *testing.T) {
 			{Backend: backend2, IsDefault: true},
 		},
 	})
-	if err == nil {
-		t.Error("NewRouter() with multiple defaults should return error")
-	}
+	assert.Error(t, err)
 }
 
 func TestRouter_ImplicitDefault(t *testing.T) {
@@ -131,14 +122,10 @@ func TestRouter_ImplicitDefault(t *testing.T) {
 			{Backend: backend2, Match: MatchCriteria{SKUPrefix: "b-"}},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// First backend should be implicit default
-	if router.Default().Name() != "first" {
-		t.Errorf("Default() = %q, want %q", router.Default().Name(), "first")
-	}
+	assert.Equal(t, "first", router.Default().Name())
 }
 
 func TestRouter_Backends(t *testing.T) {
@@ -151,14 +138,10 @@ func TestRouter_Backends(t *testing.T) {
 			{Backend: backend2},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	backends := router.Backends()
-	if len(backends) != 2 {
-		t.Errorf("Backends() returned %d backends, want 2", len(backends))
-	}
+	assert.Len(t, backends, 2)
 }
 
 func TestRouter_GetBackendByName(t *testing.T) {
@@ -171,21 +154,16 @@ func TestRouter_GetBackendByName(t *testing.T) {
 			{Backend: backend2},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Found
 	b := router.GetBackendByName("backend-one")
-	if b == nil || b.Name() != "backend-one" {
-		t.Errorf("GetBackendByName(backend-one) failed")
-	}
+	require.NotNil(t, b)
+	assert.Equal(t, "backend-one", b.Name())
 
 	// Not found
 	b = router.GetBackendByName("nonexistent")
-	if b != nil {
-		t.Errorf("GetBackendByName(nonexistent) = %v, want nil", b)
-	}
+	assert.Nil(t, b)
 }
 
 func TestRouter_NilBackend(t *testing.T) {
@@ -223,12 +201,8 @@ func TestRouter_NilBackend(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := NewRouter(RouterConfig{Backends: tt.backends})
-			if err == nil {
-				t.Fatal("NewRouter() with nil backend should return error")
-			}
-			if err.Error() != tt.wantErr {
-				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err)
+			assert.Equal(t, tt.wantErr, err.Error())
 		})
 	}
 }
@@ -253,27 +227,17 @@ func TestRouter_HealthCheck_AllHealthy(t *testing.T) {
 			{Backend: backend2},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	results, allHealthy := router.HealthCheck(context.Background())
 
-	if !allHealthy {
-		t.Error("HealthCheck() allHealthy = false, want true")
-	}
+	assert.True(t, allHealthy)
 
-	if len(results) != 2 {
-		t.Fatalf("HealthCheck() returned %d results, want 2", len(results))
-	}
+	require.Len(t, results, 2)
 
 	for _, result := range results {
-		if !result.Healthy {
-			t.Errorf("Backend %q should be healthy", result.Name)
-		}
-		if result.Error != "" {
-			t.Errorf("Backend %q should have no error, got %q", result.Name, result.Error)
-		}
+		assert.True(t, result.Healthy, "Backend %q should be healthy", result.Name)
+		assert.Empty(t, result.Error, "Backend %q should have no error", result.Name)
 	}
 }
 
@@ -290,41 +254,27 @@ func TestRouter_HealthCheck_OneUnhealthy(t *testing.T) {
 			{Backend: unhealthyBackend},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	results, allHealthy := router.HealthCheck(context.Background())
 
-	if allHealthy {
-		t.Error("HealthCheck() allHealthy = true, want false (one backend unhealthy)")
-	}
+	assert.False(t, allHealthy)
 
-	if len(results) != 2 {
-		t.Fatalf("HealthCheck() returned %d results, want 2", len(results))
-	}
+	require.Len(t, results, 2)
 
 	// Find the unhealthy result
 	var foundUnhealthy bool
 	for _, result := range results {
 		if result.Name == "unhealthy" {
 			foundUnhealthy = true
-			if result.Healthy {
-				t.Error("Unhealthy backend should have Healthy = false")
-			}
-			if result.Error != "connection refused" {
-				t.Errorf("Unhealthy backend Error = %q, want %q", result.Error, "connection refused")
-			}
+			assert.False(t, result.Healthy)
+			assert.Equal(t, "connection refused", result.Error)
 		} else if result.Name == "healthy" {
-			if !result.Healthy {
-				t.Error("Healthy backend should have Healthy = true")
-			}
+			assert.True(t, result.Healthy)
 		}
 	}
 
-	if !foundUnhealthy {
-		t.Error("Did not find unhealthy backend in results")
-	}
+	assert.True(t, foundUnhealthy)
 }
 
 func TestRouter_HealthCheck_AllUnhealthy(t *testing.T) {
@@ -343,27 +293,17 @@ func TestRouter_HealthCheck_AllUnhealthy(t *testing.T) {
 			{Backend: backend2},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	results, allHealthy := router.HealthCheck(context.Background())
 
-	if allHealthy {
-		t.Error("HealthCheck() allHealthy = true, want false (all backends unhealthy)")
-	}
+	assert.False(t, allHealthy)
 
-	if len(results) != 2 {
-		t.Fatalf("HealthCheck() returned %d results, want 2", len(results))
-	}
+	require.Len(t, results, 2)
 
 	for _, result := range results {
-		if result.Healthy {
-			t.Errorf("Backend %q should be unhealthy", result.Name)
-		}
-		if result.Error == "" {
-			t.Errorf("Backend %q should have an error message", result.Name)
-		}
+		assert.False(t, result.Healthy, "Backend %q should be unhealthy", result.Name)
+		assert.NotEmpty(t, result.Error, "Backend %q should have an error message", result.Name)
 	}
 }
 
@@ -375,9 +315,7 @@ func TestRouter_HealthCheck_ContextCancellation(t *testing.T) {
 			{Backend: backend, IsDefault: true},
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewRouter() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Use already-cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -388,11 +326,7 @@ func TestRouter_HealthCheck_ContextCancellation(t *testing.T) {
 	results, allHealthy := router.HealthCheck(ctx)
 
 	// MockBackend always returns healthy since it doesn't check context
-	if !allHealthy {
-		t.Error("HealthCheck() allHealthy = false, want true (mock ignores context)")
-	}
+	assert.True(t, allHealthy)
 
-	if len(results) != 1 {
-		t.Fatalf("HealthCheck() returned %d results, want 1", len(results))
-	}
+	require.Len(t, results, 1)
 }

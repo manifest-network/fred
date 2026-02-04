@@ -8,6 +8,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // waitForFlush polls until the specified key is visible in the store.
@@ -287,9 +290,7 @@ func TestPayloadStore_StressTest(t *testing.T) {
 		BatchSize:       100,
 		FlushInterval:   time.Millisecond,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer store.Close()
 
 	// Reduced from 100 goroutines x 1000 ops to avoid long test times
@@ -354,9 +355,7 @@ func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
 		BatchSize:       200,
 		FlushInterval:   time.Millisecond,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer store.Close()
 
 	// Reduced from 200 goroutines x 500 writes
@@ -401,8 +400,6 @@ func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
 	// Verify data integrity - sample check
 	for g := 0; g < 10; g++ {
 		leaseUUID := fmt.Sprintf("lease-%d-0", g)
-		if data := store.Get(leaseUUID); data == nil {
-			t.Errorf("failed to retrieve lease %s", leaseUUID)
-		}
+		assert.NotNil(t, store.Get(leaseUUID), "failed to retrieve lease %s", leaseUUID)
 	}
 }

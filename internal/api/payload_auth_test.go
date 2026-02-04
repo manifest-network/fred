@@ -5,6 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -16,22 +19,12 @@ func TestParsePayloadAuthToken_Valid(t *testing.T) {
 	tokenStr := testutil.CreateTestPayloadToken(kp, leaseUUID, metaHash, time.Now())
 
 	token, err := ParsePayloadAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParsePayloadAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if token.Tenant != kp.Address {
-		t.Errorf("Tenant = %q, want %q", token.Tenant, kp.Address)
-	}
-	if token.LeaseUUID != leaseUUID {
-		t.Errorf("LeaseUUID = %q, want %q", token.LeaseUUID, leaseUUID)
-	}
-	if token.MetaHash != metaHash {
-		t.Errorf("MetaHash = %q, want %q", token.MetaHash, metaHash)
-	}
-	if token.PubKey != kp.PubKeyB64 {
-		t.Errorf("PubKey = %q, want %q", token.PubKey, kp.PubKeyB64)
-	}
+	assert.Equal(t, kp.Address, token.Tenant)
+	assert.Equal(t, leaseUUID, token.LeaseUUID)
+	assert.Equal(t, metaHash, token.MetaHash)
+	assert.Equal(t, kp.PubKeyB64, token.PubKey)
 }
 
 func TestParsePayloadAuthToken_InvalidBase64(t *testing.T) {
@@ -43,9 +36,7 @@ func TestParsePayloadAuthToken_InvalidBase64(t *testing.T) {
 
 	for _, tokenStr := range invalidTokens {
 		_, err := ParsePayloadAuthToken(tokenStr)
-		if err == nil {
-			t.Errorf("ParsePayloadAuthToken(%q) = nil error, want error", tokenStr)
-		}
+		assert.Error(t, err, "ParsePayloadAuthToken(%q) = nil error, want error", tokenStr)
 	}
 }
 
@@ -58,14 +49,10 @@ func TestPayloadAuthToken_Validate_ExpiredToken(t *testing.T) {
 	tokenStr := testutil.CreateExpiredPayloadToken(kp, leaseUUID, metaHash)
 
 	token, err := ParsePayloadAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParsePayloadAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = token.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for expired token")
-	}
+	assert.Error(t, err, "Validate() = nil, want error for expired token")
 }
 
 func TestPayloadAuthToken_Validate_FutureToken(t *testing.T) {
@@ -77,14 +64,10 @@ func TestPayloadAuthToken_Validate_FutureToken(t *testing.T) {
 	tokenStr := testutil.CreateFuturePayloadToken(kp, leaseUUID, metaHash)
 
 	token, err := ParsePayloadAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParsePayloadAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = token.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for future token")
-	}
+	assert.Error(t, err, "Validate() = nil, want error for future token")
 }
 
 func TestPayloadAuthToken_Validate_MissingMetaHash(t *testing.T) {
@@ -95,14 +78,10 @@ func TestPayloadAuthToken_Validate_MissingMetaHash(t *testing.T) {
 	tokenStr := testutil.CreateTestPayloadToken(kp, leaseUUID, "", time.Now())
 
 	token, err := ParsePayloadAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParsePayloadAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = token.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for missing meta_hash")
-	}
+	assert.Error(t, err, "Validate() = nil, want error for missing meta_hash")
 }
 
 func TestPayloadAuthToken_Validate_MissingLeaseUUID(t *testing.T) {
@@ -117,9 +96,7 @@ func TestPayloadAuthToken_Validate_MissingLeaseUUID(t *testing.T) {
 	}
 
 	err := tokenData.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for missing lease_uuid")
-	}
+	assert.Error(t, err, "Validate() = nil, want error for missing lease_uuid")
 }
 
 func TestPayloadAuthToken_Validate_MissingTenant(t *testing.T) {
@@ -134,9 +111,7 @@ func TestPayloadAuthToken_Validate_MissingTenant(t *testing.T) {
 	}
 
 	err := tokenData.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for missing tenant")
-	}
+	assert.Error(t, err, "Validate() = nil, want error for missing tenant")
 }
 
 func TestPayloadAuthToken_Validate_InvalidPubKeyLength(t *testing.T) {
@@ -151,9 +126,7 @@ func TestPayloadAuthToken_Validate_InvalidPubKeyLength(t *testing.T) {
 	}
 
 	err := tokenData.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for invalid pub key length")
-	}
+	assert.Error(t, err, "Validate() = nil, want error for invalid pub key length")
 }
 
 func TestPayloadAuthToken_Validate_ValidToken(t *testing.T) {
@@ -164,14 +137,10 @@ func TestPayloadAuthToken_Validate_ValidToken(t *testing.T) {
 	tokenStr := testutil.CreateTestPayloadToken(kp, leaseUUID, metaHash, time.Now())
 
 	token, err := ParsePayloadAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParsePayloadAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = token.Validate("manifest")
-	if err != nil {
-		t.Errorf("Validate() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestPayloadAuthToken_Validate_WrongBech32Prefix(t *testing.T) {
@@ -183,15 +152,11 @@ func TestPayloadAuthToken_Validate_WrongBech32Prefix(t *testing.T) {
 	tokenStr := testutil.CreateTestPayloadToken(kp, leaseUUID, metaHash, time.Now())
 
 	token, err := ParsePayloadAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParsePayloadAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Validate with different prefix - should fail address verification
 	err = token.Validate("cosmos")
-	if err == nil {
-		t.Error("Validate() = nil, want error for wrong bech32 prefix")
-	}
+	assert.Error(t, err, "Validate() = nil, want error for wrong bech32 prefix")
 }
 
 func TestPayloadAuthToken_CreateSignData(t *testing.T) {
@@ -205,7 +170,5 @@ func TestPayloadAuthToken_CreateSignData(t *testing.T) {
 	signData := token.createSignData()
 	expected := "manifest lease data 01234567-89ab-cdef-0123-456789abcdef abcdef0123456789 1234567890"
 
-	if string(signData) != expected {
-		t.Errorf("createSignData() = %q, want %q", string(signData), expected)
-	}
+	assert.Equal(t, expected, string(signData))
 }

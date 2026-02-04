@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -29,26 +31,16 @@ func TestHealthCheck(t *testing.T) {
 
 	h.HealthCheck(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusOK)
-	}
+	assert.Equal(t, http.StatusOK, rec.Code)
 
 	var response HealthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	if response.Status != "healthy" {
-		t.Errorf("status = %q, want %q", response.Status, "healthy")
-	}
-	if response.ProviderUUID != testutil.ValidUUID1 {
-		t.Errorf("provider_uuid = %q, want %q", response.ProviderUUID, testutil.ValidUUID1)
-	}
+	assert.Equal(t, "healthy", response.Status)
+	assert.Equal(t, testutil.ValidUUID1, response.ProviderUUID)
 
 	// Check Content-Type header
-	if rec.Header().Get("Content-Type") != "application/json" {
-		t.Errorf("Content-Type = %q, want %q", rec.Header().Get("Content-Type"), "application/json")
-	}
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 }
 
 // TestHealthCheck_ChainUnavailable tests health check when chain ping fails.
@@ -71,30 +63,18 @@ func TestHealthCheck_ChainUnavailable(t *testing.T) {
 	h.HealthCheck(rec, req)
 
 	// Should return 503 Service Unavailable
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-	}
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 
 	var response HealthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	if response.Status != "unhealthy" {
-		t.Errorf("status = %q, want %q", response.Status, "unhealthy")
-	}
+	assert.Equal(t, "unhealthy", response.Status)
 
 	// Check that chain check shows unhealthy with error message
 	chainCheck, ok := response.Checks["chain"]
-	if !ok {
-		t.Fatal("missing chain check in response")
-	}
-	if chainCheck.Status != "unhealthy" {
-		t.Errorf("chain check status = %q, want %q", chainCheck.Status, "unhealthy")
-	}
-	if chainCheck.Message != "connection refused" {
-		t.Errorf("chain check message = %q, want %q", chainCheck.Message, "connection refused")
-	}
+	require.True(t, ok, "missing chain check in response")
+	assert.Equal(t, "unhealthy", chainCheck.Status)
+	assert.Equal(t, "connection refused", chainCheck.Message)
 }
 
 // TestHealthCheck_ChainHealthy tests health check when chain is available.
@@ -116,26 +96,16 @@ func TestHealthCheck_ChainHealthy(t *testing.T) {
 
 	h.HealthCheck(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusOK)
-	}
+	assert.Equal(t, http.StatusOK, rec.Code)
 
 	var response HealthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	if response.Status != "healthy" {
-		t.Errorf("status = %q, want %q", response.Status, "healthy")
-	}
+	assert.Equal(t, "healthy", response.Status)
 
 	chainCheck, ok := response.Checks["chain"]
-	if !ok {
-		t.Fatal("missing chain check in response")
-	}
-	if chainCheck.Status != "healthy" {
-		t.Errorf("chain check status = %q, want %q", chainCheck.Status, "healthy")
-	}
+	require.True(t, ok, "missing chain check in response")
+	assert.Equal(t, "healthy", chainCheck.Status)
 }
 
 // TestHealthCheck_BackendUnhealthy tests health check when a backend is unavailable.
@@ -162,9 +132,7 @@ func TestHealthCheck_BackendUnhealthy(t *testing.T) {
 			{Backend: backendClient, IsDefault: true},
 		},
 	})
-	if err != nil {
-		t.Fatalf("failed to create router: %v", err)
-	}
+	require.NoError(t, err)
 
 	h := &Handlers{
 		client:        nil, // No chain client
@@ -179,27 +147,17 @@ func TestHealthCheck_BackendUnhealthy(t *testing.T) {
 	h.HealthCheck(rec, req)
 
 	// Should return 503 due to unhealthy backend
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-	}
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 
 	var response HealthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	if response.Status != "unhealthy" {
-		t.Errorf("status = %q, want %q", response.Status, "unhealthy")
-	}
+	assert.Equal(t, "unhealthy", response.Status)
 
 	// Check backend health status
 	backendCheck, ok := response.Checks["backend:test-backend"]
-	if !ok {
-		t.Fatalf("missing backend check in response, got: %v", response.Checks)
-	}
-	if backendCheck.Status != "unhealthy" {
-		t.Errorf("backend check status = %q, want %q", backendCheck.Status, "unhealthy")
-	}
+	require.True(t, ok, "missing backend check in response, got: %v", response.Checks)
+	assert.Equal(t, "unhealthy", backendCheck.Status)
 }
 
 // TestHealthCheck_AllHealthy tests health check when both chain and backend are healthy.
@@ -227,9 +185,7 @@ func TestHealthCheck_AllHealthy(t *testing.T) {
 			{Backend: backendClient, IsDefault: true},
 		},
 	})
-	if err != nil {
-		t.Fatalf("failed to create router: %v", err)
-	}
+	require.NoError(t, err)
 
 	h := &Handlers{
 		client:        chainClient,
@@ -243,47 +199,29 @@ func TestHealthCheck_AllHealthy(t *testing.T) {
 
 	h.HealthCheck(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("HealthCheck() status = %d, want %d", rec.Code, http.StatusOK)
-	}
+	assert.Equal(t, http.StatusOK, rec.Code)
 
 	var response HealthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	if response.Status != "healthy" {
-		t.Errorf("status = %q, want %q", response.Status, "healthy")
-	}
+	assert.Equal(t, "healthy", response.Status)
 
 	// Both checks should be healthy
-	if response.Checks["chain"].Status != "healthy" {
-		t.Errorf("chain status = %q, want %q", response.Checks["chain"].Status, "healthy")
-	}
-	if response.Checks["backend:healthy-backend"].Status != "healthy" {
-		t.Errorf("backend status = %q, want %q", response.Checks["backend:healthy-backend"].Status, "healthy")
-	}
+	assert.Equal(t, "healthy", response.Checks["chain"].Status)
+	assert.Equal(t, "healthy", response.Checks["backend:healthy-backend"].Status)
 }
 
 func TestWriteError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeError(rec, "test error", http.StatusBadRequest)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("writeError() status = %d, want %d", rec.Code, http.StatusBadRequest)
-	}
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 
 	var response ErrorResponse
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	if response.Error != "test error" {
-		t.Errorf("Error = %q, want %q", response.Error, "test error")
-	}
-	if response.Code != http.StatusBadRequest {
-		t.Errorf("Code = %d, want %d", response.Code, http.StatusBadRequest)
-	}
+	assert.Equal(t, "test error", response.Error)
+	assert.Equal(t, http.StatusBadRequest, response.Code)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -292,22 +230,13 @@ func TestWriteJSON(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeJSON(rec, data, http.StatusOK)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("writeJSON() status = %d, want %d", rec.Code, http.StatusOK)
-	}
-
-	if rec.Header().Get("Content-Type") != "application/json" {
-		t.Errorf("Content-Type = %q, want %q", rec.Header().Get("Content-Type"), "application/json")
-	}
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 
 	var response map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	if response["key"] != "value" {
-		t.Errorf("response[key] = %q, want %q", response["key"], "value")
-	}
+	assert.Equal(t, "value", response["key"])
 }
 
 func TestExtractToken_MissingAuth(t *testing.T) {
@@ -317,12 +246,8 @@ func TestExtractToken_MissingAuth(t *testing.T) {
 	// No Authorization header
 
 	_, err := h.extractToken(req)
-	if err == nil {
-		t.Error("extractToken() = nil error, want error for missing auth")
-	}
-	if err != errMissingAuth {
-		t.Errorf("extractToken() error = %v, want errMissingAuth", err)
-	}
+	assert.Error(t, err)
+	assert.Equal(t, errMissingAuth, err)
 }
 
 func TestExtractToken_InvalidFormat(t *testing.T) {
@@ -346,9 +271,7 @@ func TestExtractToken_InvalidFormat(t *testing.T) {
 			}
 
 			_, err := h.extractToken(req)
-			if err == nil {
-				t.Errorf("extractToken() = nil error for header %q", tt.header)
-			}
+			assert.Error(t, err, "extractToken() = nil error for header %q", tt.header)
 		})
 	}
 }
@@ -365,16 +288,10 @@ func TestExtractToken_ValidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+tokenB64)
 
 	token, err := h.extractToken(req)
-	if err != nil {
-		t.Fatalf("extractToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if token.Tenant != "manifest1abc" {
-		t.Errorf("token.Tenant = %q, want %q", token.Tenant, "manifest1abc")
-	}
-	if token.LeaseUUID != "01234567-89ab-cdef-0123-456789abcdef" {
-		t.Errorf("token.LeaseUUID = %q, want %q", token.LeaseUUID, "01234567-89ab-cdef-0123-456789abcdef")
-	}
+	assert.Equal(t, "manifest1abc", token.Tenant)
+	assert.Equal(t, "01234567-89ab-cdef-0123-456789abcdef", token.LeaseUUID)
 }
 
 func TestExtractToken_CaseInsensitiveBearer(t *testing.T) {
@@ -390,9 +307,7 @@ func TestExtractToken_CaseInsensitiveBearer(t *testing.T) {
 			req.Header.Set("Authorization", prefix+" "+tokenB64)
 
 			_, err := h.extractToken(req)
-			if err != nil {
-				t.Errorf("extractToken() with %q error = %v", prefix, err)
-			}
+			assert.NoError(t, err, "extractToken() with %q error = %v", prefix, err)
 		})
 	}
 }
@@ -415,21 +330,13 @@ func TestConnectionResponse_JSON(t *testing.T) {
 	}
 
 	jsonBytes, err := json.Marshal(response)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	var decoded ConnectionResponse
-	if err := json.Unmarshal(jsonBytes, &decoded); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
-	}
+	require.NoError(t, json.Unmarshal(jsonBytes, &decoded))
 
-	if decoded.LeaseUUID != response.LeaseUUID {
-		t.Errorf("LeaseUUID = %q, want %q", decoded.LeaseUUID, response.LeaseUUID)
-	}
-	if decoded.Connection.Host != response.Connection.Host {
-		t.Errorf("Connection.Host = %q, want %q", decoded.Connection.Host, response.Connection.Host)
-	}
+	assert.Equal(t, response.LeaseUUID, decoded.LeaseUUID)
+	assert.Equal(t, response.Connection.Host, decoded.Connection.Host)
 }
 
 // mockChainClient implements ChainClient for testing.
@@ -503,17 +410,11 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-		}
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 
 		var errResp ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if errResp.Error != "service not configured" {
-			t.Errorf("error = %q, want %q", errResp.Error, "service not configured")
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "service not configured", errResp.Error)
 	})
 
 	t.Run("not_provisioned_returns_404", func(t *testing.T) {
@@ -540,9 +441,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 				{Backend: backendClient, IsDefault: true},
 			},
 		})
-		if err != nil {
-			t.Fatalf("failed to create router: %v", err)
-		}
+		require.NoError(t, err)
 
 		h := &Handlers{
 			client:        chainClient,
@@ -558,17 +457,11 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
-		}
+		assert.Equal(t, http.StatusNotFound, rec.Code)
 
 		var errResp ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if errResp.Error != "lease not yet provisioned" {
-			t.Errorf("error = %q, want %q", errResp.Error, "lease not yet provisioned")
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "lease not yet provisioned", errResp.Error)
 	})
 
 	t.Run("backend_error_returns_500", func(t *testing.T) {
@@ -594,9 +487,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 				{Backend: backendClient, IsDefault: true},
 			},
 		})
-		if err != nil {
-			t.Fatalf("failed to create router: %v", err)
-		}
+		require.NoError(t, err)
 
 		h := &Handlers{
 			client:        chainClient,
@@ -612,17 +503,11 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusInternalServerError {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
-		}
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
 
 		var errResp ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if errResp.Error != "internal server error" {
-			t.Errorf("error = %q, want %q", errResp.Error, "internal server error")
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "internal server error", errResp.Error)
 	})
 
 	t.Run("happy_path_extracts_connection_details", func(t *testing.T) {
@@ -659,9 +544,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 				{Backend: backendClient, IsDefault: true},
 			},
 		})
-		if err != nil {
-			t.Fatalf("failed to create router: %v", err)
-		}
+		require.NoError(t, err)
 
 		h := &Handlers{
 			client:        chainClient,
@@ -677,42 +560,22 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec.Code, "status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 
 		var response ConnectionResponse
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
 		// Verify response fields
-		if response.LeaseUUID != leaseUUID {
-			t.Errorf("LeaseUUID = %q, want %q", response.LeaseUUID, leaseUUID)
-		}
-		if response.Tenant != kp.Address {
-			t.Errorf("Tenant = %q, want %q", response.Tenant, kp.Address)
-		}
-		if response.ProviderUUID != providerUUID {
-			t.Errorf("ProviderUUID = %q, want %q", response.ProviderUUID, providerUUID)
-		}
+		assert.Equal(t, leaseUUID, response.LeaseUUID)
+		assert.Equal(t, kp.Address, response.Tenant)
+		assert.Equal(t, providerUUID, response.ProviderUUID)
 
 		// Verify connection details extraction
-		if response.Connection.Host != "compute-alpha.example.com" {
-			t.Errorf("Connection.Host = %q, want %q", response.Connection.Host, "compute-alpha.example.com")
-		}
-		if response.Connection.Ports["443/tcp"].HostPort != 8443 {
-			t.Errorf("Connection.Ports[443/tcp].HostPort = %d, want %d", response.Connection.Ports["443/tcp"].HostPort, 8443)
-		}
-		if response.Connection.Protocol != "https" {
-			t.Errorf("Connection.Protocol = %q, want %q", response.Connection.Protocol, "https")
-		}
-		if response.Connection.Metadata["region"] != "us-east-1" {
-			t.Errorf("Connection.Metadata[region] = %q, want %q", response.Connection.Metadata["region"], "us-east-1")
-		}
-		if response.Connection.Metadata["backend"] != "test-backend" {
-			t.Errorf("Connection.Metadata[backend] = %q, want %q", response.Connection.Metadata["backend"], "test-backend")
-		}
+		assert.Equal(t, "compute-alpha.example.com", response.Connection.Host)
+		assert.Equal(t, 8443, response.Connection.Ports["443/tcp"].HostPort)
+		assert.Equal(t, "https", response.Connection.Protocol)
+		assert.Equal(t, "us-east-1", response.Connection.Metadata["region"])
+		assert.Equal(t, "test-backend", response.Connection.Metadata["backend"])
 	})
 
 	t.Run("happy_path_with_multiple_ports", func(t *testing.T) {
@@ -738,9 +601,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 				{Backend: backendClient, IsDefault: true},
 			},
 		})
-		if err != nil {
-			t.Fatalf("failed to create router: %v", err)
-		}
+		require.NoError(t, err)
 
 		h := &Handlers{
 			client:        chainClient,
@@ -756,24 +617,14 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec.Code, "status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 
 		var response ConnectionResponse
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-		if len(response.Connection.Ports) != 2 {
-			t.Errorf("len(Connection.Ports) = %d, want 2", len(response.Connection.Ports))
-		}
-		if response.Connection.Ports["80/tcp"].HostPort != 8080 {
-			t.Errorf("Connection.Ports[80/tcp].HostPort = %d, want 8080", response.Connection.Ports["80/tcp"].HostPort)
-		}
-		if response.Connection.Ports["443/tcp"].HostPort != 8443 {
-			t.Errorf("Connection.Ports[443/tcp].HostPort = %d, want 8443", response.Connection.Ports["443/tcp"].HostPort)
-		}
+		assert.Len(t, response.Connection.Ports, 2)
+		assert.Equal(t, 8080, response.Connection.Ports["80/tcp"].HostPort)
+		assert.Equal(t, 8443, response.Connection.Ports["443/tcp"].HostPort)
 	})
 }
 
@@ -997,55 +848,28 @@ func TestExtractConnectionDetails(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractConnectionDetails(tt.input)
 
-			if result.Host != tt.expectedHost {
-				t.Errorf("Host = %q, want %q", result.Host, tt.expectedHost)
-			}
-			if result.Protocol != tt.expectedProto {
-				t.Errorf("Protocol = %q, want %q", result.Protocol, tt.expectedProto)
-			}
-			if len(result.Metadata) != len(tt.expectedMeta) {
-				t.Errorf("Metadata length = %d, want %d", len(result.Metadata), len(tt.expectedMeta))
-			}
+			assert.Equal(t, tt.expectedHost, result.Host)
+			assert.Equal(t, tt.expectedProto, result.Protocol)
+			assert.Len(t, result.Metadata, len(tt.expectedMeta))
 			for k, v := range tt.expectedMeta {
-				if result.Metadata[k] != v {
-					t.Errorf("Metadata[%q] = %q, want %q", k, result.Metadata[k], v)
-				}
+				assert.Equal(t, v, result.Metadata[k])
 			}
-			if len(result.Ports) != len(tt.expectedPorts) {
-				t.Errorf("Ports length = %d, want %d", len(result.Ports), len(tt.expectedPorts))
-			}
+			assert.Len(t, result.Ports, len(tt.expectedPorts))
 			for k, v := range tt.expectedPorts {
-				if result.Ports[k] != v {
-					t.Errorf("Ports[%q] = %+v, want %+v", k, result.Ports[k], v)
-				}
+				assert.Equal(t, v, result.Ports[k])
 			}
 
 			// Verify instances
-			if len(result.Instances) != len(tt.expectedInstances) {
-				t.Errorf("Instances length = %d, want %d", len(result.Instances), len(tt.expectedInstances))
-			} else {
-				for i, expected := range tt.expectedInstances {
-					actual := result.Instances[i]
-					if actual.InstanceIndex != expected.InstanceIndex {
-						t.Errorf("Instances[%d].InstanceIndex = %d, want %d", i, actual.InstanceIndex, expected.InstanceIndex)
-					}
-					if actual.ContainerID != expected.ContainerID {
-						t.Errorf("Instances[%d].ContainerID = %q, want %q", i, actual.ContainerID, expected.ContainerID)
-					}
-					if actual.Image != expected.Image {
-						t.Errorf("Instances[%d].Image = %q, want %q", i, actual.Image, expected.Image)
-					}
-					if actual.Status != expected.Status {
-						t.Errorf("Instances[%d].Status = %q, want %q", i, actual.Status, expected.Status)
-					}
-					if len(actual.Ports) != len(expected.Ports) {
-						t.Errorf("Instances[%d].Ports length = %d, want %d", i, len(actual.Ports), len(expected.Ports))
-					}
-					for k, v := range expected.Ports {
-						if actual.Ports[k] != v {
-							t.Errorf("Instances[%d].Ports[%q] = %+v, want %+v", i, k, actual.Ports[k], v)
-						}
-					}
+			assert.Len(t, result.Instances, len(tt.expectedInstances))
+			for i, expected := range tt.expectedInstances {
+				actual := result.Instances[i]
+				assert.Equal(t, expected.InstanceIndex, actual.InstanceIndex)
+				assert.Equal(t, expected.ContainerID, actual.ContainerID)
+				assert.Equal(t, expected.Image, actual.Image)
+				assert.Equal(t, expected.Status, actual.Status)
+				assert.Len(t, actual.Ports, len(expected.Ports))
+				for k, v := range expected.Ports {
+					assert.Equal(t, v, actual.Ports[k])
 				}
 			}
 		})
@@ -1079,9 +903,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 			DBPath: dbPath,
 			MaxAge: 1 * time.Minute,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tokenTracker.Close()
 
 		// Create a backend server
@@ -1111,9 +933,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 				{Backend: backendClient, IsDefault: true},
 			},
 		})
-		if err != nil {
-			t.Fatalf("failed to create router: %v", err)
-		}
+		require.NoError(t, err)
 
 		h := &Handlers{
 			client:        chainClient,
@@ -1134,9 +954,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		rec1 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec1, req1)
 
-		if rec1.Code != http.StatusOK {
-			t.Errorf("first request status = %d, want %d; body: %s", rec1.Code, http.StatusOK, rec1.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec1.Code, "first request status = %d, want %d; body: %s", rec1.Code, http.StatusOK, rec1.Body.String())
 
 		// Second request with same token should be rejected
 		req2 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
@@ -1146,17 +964,11 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		rec2 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec2, req2)
 
-		if rec2.Code != http.StatusUnauthorized {
-			t.Errorf("second request (replay) status = %d, want %d", rec2.Code, http.StatusUnauthorized)
-		}
+		assert.Equal(t, http.StatusUnauthorized, rec2.Code)
 
 		var errResp ErrorResponse
-		if err := json.NewDecoder(rec2.Body).Decode(&errResp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if errResp.Error != "unauthorized" {
-			t.Errorf("error = %q, want %q", errResp.Error, "unauthorized")
-		}
+		require.NoError(t, json.NewDecoder(rec2.Body).Decode(&errResp))
+		assert.Equal(t, "unauthorized", errResp.Error)
 	})
 
 	t.Run("different_tokens_both_succeed", func(t *testing.T) {
@@ -1165,9 +977,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 			DBPath: dbPath,
 			MaxAge: 1 * time.Minute,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tokenTracker.Close()
 
 		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1196,9 +1006,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 				{Backend: backendClient, IsDefault: true},
 			},
 		})
-		if err != nil {
-			t.Fatalf("failed to create router: %v", err)
-		}
+		require.NoError(t, err)
 
 		h := &Handlers{
 			client:        chainClient,
@@ -1222,9 +1030,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		rec1 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec1, req1)
 
-		if rec1.Code != http.StatusOK {
-			t.Errorf("first token status = %d, want %d; body: %s", rec1.Code, http.StatusOK, rec1.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec1.Code, "first token status = %d, want %d; body: %s", rec1.Code, http.StatusOK, rec1.Body.String())
 
 		req2 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req2.Header.Set("Authorization", "Bearer "+token2)
@@ -1233,9 +1039,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		rec2 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec2, req2)
 
-		if rec2.Code != http.StatusOK {
-			t.Errorf("second token status = %d, want %d; body: %s", rec2.Code, http.StatusOK, rec2.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec2.Code, "second token status = %d, want %d; body: %s", rec2.Code, http.StatusOK, rec2.Body.String())
 	})
 
 	t.Run("no_tracker_allows_replay", func(t *testing.T) {
@@ -1267,9 +1071,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 				{Backend: backendClient, IsDefault: true},
 			},
 		})
-		if err != nil {
-			t.Fatalf("failed to create router: %v", err)
-		}
+		require.NoError(t, err)
 
 		h := &Handlers{
 			client:        chainClient,
@@ -1290,9 +1092,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.GetLeaseConnection(rec, req)
 
-			if rec.Code != http.StatusOK {
-				t.Errorf("request %d status = %d, want %d; body: %s", i+1, rec.Code, http.StatusOK, rec.Body.String())
-			}
+			assert.Equal(t, http.StatusOK, rec.Code, "request %d status = %d, want %d; body: %s", i+1, rec.Code, http.StatusOK, rec.Body.String())
 		}
 	})
 }
@@ -1325,9 +1125,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusInternalServerError {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
-		}
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	})
 
 	t.Run("lease_not_found_returns_404", func(t *testing.T) {
@@ -1351,9 +1149,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
-		}
+		assert.Equal(t, http.StatusNotFound, rec.Code)
 	})
 
 	t.Run("tenant_mismatch_returns_403", func(t *testing.T) {
@@ -1382,9 +1178,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
-		}
+		assert.Equal(t, http.StatusForbidden, rec.Code)
 	})
 
 	t.Run("provider_mismatch_returns_403", func(t *testing.T) {
@@ -1413,9 +1207,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
-		}
+		assert.Equal(t, http.StatusForbidden, rec.Code)
 	})
 }
 
@@ -1476,24 +1268,14 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec.Code, "status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 
 		var response LeaseStatusResponse
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-		if response.LeaseUUID != leaseUUID {
-			t.Errorf("LeaseUUID = %q, want %q", response.LeaseUUID, leaseUUID)
-		}
-		if response.State != "LEASE_STATE_PENDING" {
-			t.Errorf("State = %q, want %q", response.State, "LEASE_STATE_PENDING")
-		}
-		if response.RequiresPayload {
-			t.Errorf("RequiresPayload = %v, want false", response.RequiresPayload)
-		}
+		assert.Equal(t, leaseUUID, response.LeaseUUID)
+		assert.Equal(t, "LEASE_STATE_PENDING", response.State)
+		assert.False(t, response.RequiresPayload)
 	})
 
 	t.Run("pending_with_meta_hash_no_payload", func(t *testing.T) {
@@ -1531,24 +1313,14 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec.Code, "status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 
 		var response LeaseStatusResponse
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-		if !response.RequiresPayload {
-			t.Errorf("RequiresPayload = %v, want true", response.RequiresPayload)
-		}
-		if response.PayloadReceived {
-			t.Errorf("PayloadReceived = %v, want false", response.PayloadReceived)
-		}
-		if response.ProvisioningStarted {
-			t.Errorf("ProvisioningStarted = %v, want false", response.ProvisioningStarted)
-		}
+		assert.True(t, response.RequiresPayload)
+		assert.False(t, response.PayloadReceived)
+		assert.False(t, response.ProvisioningStarted)
 	})
 
 	t.Run("pending_with_payload_received", func(t *testing.T) {
@@ -1586,21 +1358,13 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec.Code, "status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 
 		var response LeaseStatusResponse
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-		if !response.PayloadReceived {
-			t.Errorf("PayloadReceived = %v, want true", response.PayloadReceived)
-		}
-		if !response.ProvisioningStarted {
-			t.Errorf("ProvisioningStarted = %v, want true", response.ProvisioningStarted)
-		}
+		assert.True(t, response.PayloadReceived)
+		assert.True(t, response.ProvisioningStarted)
 	})
 
 	t.Run("active_lease", func(t *testing.T) {
@@ -1632,18 +1396,12 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
-		}
+		assert.Equal(t, http.StatusOK, rec.Code)
 
 		var response LeaseStatusResponse
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-		if response.State != "LEASE_STATE_ACTIVE" {
-			t.Errorf("State = %q, want %q", response.State, "LEASE_STATE_ACTIVE")
-		}
+		assert.Equal(t, "LEASE_STATE_ACTIVE", response.State)
 	})
 
 	t.Run("invalid_uuid_returns_400", func(t *testing.T) {
@@ -1660,9 +1418,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
-		}
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 
 	t.Run("missing_auth_returns_401", func(t *testing.T) {
@@ -1679,9 +1435,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
-		}
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 
 	t.Run("lease_uuid_mismatch_returns_401", func(t *testing.T) {
@@ -1701,9 +1455,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
-		}
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 
 	t.Run("lease_not_found_returns_404", func(t *testing.T) {
@@ -1726,9 +1478,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
-		}
+		assert.Equal(t, http.StatusNotFound, rec.Code)
 	})
 
 	t.Run("tenant_mismatch_returns_403", func(t *testing.T) {
@@ -1756,9 +1506,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
-		}
+		assert.Equal(t, http.StatusForbidden, rec.Code)
 	})
 
 	t.Run("provider_mismatch_returns_403", func(t *testing.T) {
@@ -1786,9 +1534,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
-		}
+		assert.Equal(t, http.StatusForbidden, rec.Code)
 	})
 
 	t.Run("chain_error_returns_500", func(t *testing.T) {
@@ -1811,9 +1557,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
 
-		if rec.Code != http.StatusInternalServerError {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
-		}
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	})
 }
 
@@ -1879,9 +1623,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 			{Backend: backendClient, IsDefault: true},
 		},
 	})
-	if err != nil {
-		t.Fatalf("failed to create router: %v", err)
-	}
+	require.NoError(t, err)
 
 	t.Run("database_error_returns_503", func(t *testing.T) {
 		// Create a mock token tracker that returns a database error
@@ -1908,17 +1650,11 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-		}
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 
 		var errResp ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if errResp.Error != "service temporarily unavailable" {
-			t.Errorf("error = %q, want %q", errResp.Error, "service temporarily unavailable")
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "service temporarily unavailable", errResp.Error)
 	})
 
 	t.Run("replay_detected_returns_401", func(t *testing.T) {
@@ -1946,17 +1682,11 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
-		}
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 
 		var errResp ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-		if errResp.Error != "unauthorized" {
-			t.Errorf("error = %q, want %q", errResp.Error, "unauthorized")
-		}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "unauthorized", errResp.Error)
 	})
 
 	t.Run("success_returns_200", func(t *testing.T) {
@@ -1984,9 +1714,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
-		}
+		assert.Equal(t, http.StatusOK, rec.Code, "status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	})
 
 	t.Run("various_database_errors_return_503", func(t *testing.T) {
@@ -2022,9 +1750,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 				rec := httptest.NewRecorder()
 				h.GetLeaseConnection(rec, req)
 
-				if rec.Code != http.StatusServiceUnavailable {
-					t.Errorf("status = %d, want %d for error %q", rec.Code, http.StatusServiceUnavailable, dbErr)
-				}
+				assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "status = %d, want %d for error %q", rec.Code, http.StatusServiceUnavailable, dbErr)
 			})
 		}
 	})
@@ -2038,21 +1764,13 @@ func TestCallbackResponse_JSON(t *testing.T) {
 	}
 
 	jsonBytes, err := json.Marshal(response)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	var decoded CallbackResponse
-	if err := json.Unmarshal(jsonBytes, &decoded); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
-	}
+	require.NoError(t, json.Unmarshal(jsonBytes, &decoded))
 
-	if decoded.Status != response.Status {
-		t.Errorf("Status = %q, want %q", decoded.Status, response.Status)
-	}
-	if decoded.Message != response.Message {
-		t.Errorf("Message = %q, want %q", decoded.Message, response.Message)
-	}
+	assert.Equal(t, response.Status, decoded.Status)
+	assert.Equal(t, response.Message, decoded.Message)
 }
 
 // TestCallbackResponse_OmitEmptyMessage tests that empty message is omitted.
@@ -2063,14 +1781,10 @@ func TestCallbackResponse_OmitEmptyMessage(t *testing.T) {
 	}
 
 	jsonBytes, err := json.Marshal(response)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	jsonStr := string(jsonBytes)
-	if strings.Contains(jsonStr, "message") {
-		t.Errorf("JSON should not contain 'message' when empty, got %s", jsonStr)
-	}
+	assert.False(t, strings.Contains(jsonStr, "message"), "JSON should not contain 'message' when empty, got %s", jsonStr)
 }
 
 func TestNormalizePath(t *testing.T) {
@@ -2134,9 +1848,7 @@ func TestNormalizePath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := normalizePath(tt.path)
-			if got != tt.want {
-				t.Errorf("normalizePath(%q) = %q, want %q", tt.path, got, tt.want)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

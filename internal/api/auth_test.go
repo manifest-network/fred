@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseAuthToken_Valid(t *testing.T) {
@@ -16,19 +18,11 @@ func TestParseAuthToken_Valid(t *testing.T) {
 	tokenStr := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 
 	token, err := ParseAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParseAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if token.Tenant != kp.Address {
-		t.Errorf("Tenant = %q, want %q", token.Tenant, kp.Address)
-	}
-	if token.LeaseUUID != leaseUUID {
-		t.Errorf("LeaseUUID = %q, want %q", token.LeaseUUID, leaseUUID)
-	}
-	if token.PubKey != kp.PubKeyB64 {
-		t.Errorf("PubKey = %q, want %q", token.PubKey, kp.PubKeyB64)
-	}
+	assert.Equal(t, kp.Address, token.Tenant)
+	assert.Equal(t, leaseUUID, token.LeaseUUID)
+	assert.Equal(t, kp.PubKeyB64, token.PubKey)
 }
 
 func TestParseAuthToken_InvalidBase64(t *testing.T) {
@@ -40,9 +34,7 @@ func TestParseAuthToken_InvalidBase64(t *testing.T) {
 
 	for _, tokenStr := range invalidTokens {
 		_, err := ParseAuthToken(tokenStr)
-		if err == nil {
-			t.Errorf("ParseAuthToken(%q) = nil error, want error", tokenStr)
-		}
+		assert.Error(t, err)
 	}
 }
 
@@ -57,9 +49,7 @@ func TestParseAuthToken_InvalidJSON(t *testing.T) {
 	for _, jsonStr := range invalidJSONs {
 		tokenStr := base64.StdEncoding.EncodeToString([]byte(jsonStr))
 		_, err := ParseAuthToken(tokenStr)
-		if err == nil {
-			t.Errorf("ParseAuthToken(base64(%q)) = nil error, want error", jsonStr)
-		}
+		assert.Error(t, err)
 	}
 }
 
@@ -71,14 +61,10 @@ func TestValidate_ExpiredToken(t *testing.T) {
 	tokenStr := testutil.CreateExpiredToken(kp, leaseUUID)
 
 	token, err := ParseAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParseAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = token.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for expired token")
-	}
+	assert.Error(t, err)
 }
 
 func TestValidate_FutureToken(t *testing.T) {
@@ -89,14 +75,10 @@ func TestValidate_FutureToken(t *testing.T) {
 	tokenStr := testutil.CreateFutureToken(kp, leaseUUID)
 
 	token, err := ParseAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParseAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = token.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for future token")
-	}
+	assert.Error(t, err)
 }
 
 func TestValidate_InvalidPubKeyLength(t *testing.T) {
@@ -110,9 +92,7 @@ func TestValidate_InvalidPubKeyLength(t *testing.T) {
 	}
 
 	err := tokenData.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for invalid pub key length")
-	}
+	assert.Error(t, err)
 }
 
 func TestValidate_MissingLeaseUUID(t *testing.T) {
@@ -126,9 +106,7 @@ func TestValidate_MissingLeaseUUID(t *testing.T) {
 	}
 
 	err := tokenData.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for missing lease_uuid")
-	}
+	assert.Error(t, err)
 }
 
 func TestValidate_MissingTenant(t *testing.T) {
@@ -142,9 +120,7 @@ func TestValidate_MissingTenant(t *testing.T) {
 	}
 
 	err := tokenData.Validate("manifest")
-	if err == nil {
-		t.Error("Validate() = nil, want error for missing tenant")
-	}
+	assert.Error(t, err)
 }
 
 func TestValidate_ValidToken(t *testing.T) {
@@ -154,14 +130,10 @@ func TestValidate_ValidToken(t *testing.T) {
 	tokenStr := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 
 	token, err := ParseAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParseAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = token.Validate("manifest")
-	if err != nil {
-		t.Errorf("Validate() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestValidate_WrongBech32Prefix(t *testing.T) {
@@ -172,15 +144,11 @@ func TestValidate_WrongBech32Prefix(t *testing.T) {
 	tokenStr := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 
 	token, err := ParseAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParseAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Validate with different prefix - should fail address verification
 	err = token.Validate("cosmos")
-	if err == nil {
-		t.Error("Validate() = nil, want error for wrong bech32 prefix")
-	}
+	assert.Error(t, err)
 }
 
 func TestVerifyAddress_Valid(t *testing.T) {
@@ -191,9 +159,7 @@ func TestVerifyAddress_Valid(t *testing.T) {
 	}
 
 	err := v.verifyAddress(kp.PubKey.Bytes(), "manifest")
-	if err != nil {
-		t.Errorf("verifyAddress() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestVerifyAddress_Mismatch(t *testing.T) {
@@ -206,9 +172,7 @@ func TestVerifyAddress_Mismatch(t *testing.T) {
 	}
 
 	err := v.verifyAddress(kp2.PubKey.Bytes(), "manifest")
-	if err == nil {
-		t.Error("verifyAddress() = nil, want error for mismatched address")
-	}
+	assert.Error(t, err)
 }
 
 func TestVerifyAddress_InvalidPubKeyLength(t *testing.T) {
@@ -217,9 +181,7 @@ func TestVerifyAddress_InvalidPubKeyLength(t *testing.T) {
 	}
 
 	err := v.verifyAddress([]byte("short"), "manifest")
-	if err == nil {
-		t.Error("verifyAddress() = nil, want error for invalid pub key length")
-	}
+	assert.Error(t, err)
 }
 
 func TestCreateSignData(t *testing.T) {
@@ -232,9 +194,7 @@ func TestCreateSignData(t *testing.T) {
 	signData := token.createSignData()
 	expected := "manifest1abc:01234567-89ab-cdef-0123-456789abcdef:1234567890"
 
-	if string(signData) != expected {
-		t.Errorf("createSignData() = %q, want %q", string(signData), expected)
-	}
+	assert.Equal(t, expected, string(signData))
 }
 
 func TestAuthToken_RoundTrip(t *testing.T) {
@@ -247,23 +207,16 @@ func TestAuthToken_RoundTrip(t *testing.T) {
 
 	// Parse it back
 	token, err := ParseAuthToken(tokenStr)
-	if err != nil {
-		t.Fatalf("ParseAuthToken() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Validate
-	if err := token.Validate("manifest"); err != nil {
-		t.Errorf("Validate() error = %v", err)
-	}
+	err = token.Validate("manifest")
+	assert.NoError(t, err)
 
 	// Re-encode and compare
 	jsonBytes, err := json.Marshal(token)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
+	require.NoError(t, err)
 	reencoded := base64.StdEncoding.EncodeToString(jsonBytes)
 
-	if reencoded != tokenStr {
-		t.Errorf("Token re-encoding mismatch")
-	}
+	assert.Equal(t, tokenStr, reencoded)
 }

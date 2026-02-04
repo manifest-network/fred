@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/provisioner"
@@ -106,9 +108,7 @@ func TestPayloadHandler_InvalidUUID(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusBadRequest)
-	}
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
 func TestPayloadHandler_MissingAuth(t *testing.T) {
@@ -124,9 +124,7 @@ func TestPayloadHandler_MissingAuth(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
-	}
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
 }
 
 func TestPayloadHandler_InvalidAuthFormat(t *testing.T) {
@@ -142,9 +140,7 @@ func TestPayloadHandler_InvalidAuthFormat(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
-	}
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
 }
 
 func TestPayloadHandler_LeaseNotFound(t *testing.T) {
@@ -166,9 +162,7 @@ func TestPayloadHandler_LeaseNotFound(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusNotFound)
-	}
+	assert.Equal(t, http.StatusNotFound, rr.Code)
 }
 
 func TestPayloadHandler_LeaseNotPending(t *testing.T) {
@@ -197,9 +191,7 @@ func TestPayloadHandler_LeaseNotPending(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusNotFound)
-	}
+	assert.Equal(t, http.StatusNotFound, rr.Code)
 }
 
 func TestPayloadHandler_TenantMismatch(t *testing.T) {
@@ -229,9 +221,7 @@ func TestPayloadHandler_TenantMismatch(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusForbidden)
-	}
+	assert.Equal(t, http.StatusForbidden, rr.Code)
 }
 
 func TestPayloadHandler_ProviderMismatch(t *testing.T) {
@@ -260,9 +250,7 @@ func TestPayloadHandler_ProviderMismatch(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusForbidden)
-	}
+	assert.Equal(t, http.StatusForbidden, rr.Code)
 }
 
 func TestPayloadHandler_LeaseNoMetaHash(t *testing.T) {
@@ -290,9 +278,7 @@ func TestPayloadHandler_LeaseNoMetaHash(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusBadRequest)
-	}
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
 func TestPayloadHandler_MetaHashMismatch(t *testing.T) {
@@ -322,9 +308,7 @@ func TestPayloadHandler_MetaHashMismatch(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
-	}
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
 }
 
 func TestPayloadHandler_PayloadHashMismatch(t *testing.T) {
@@ -355,9 +339,7 @@ func TestPayloadHandler_PayloadHashMismatch(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusBadRequest)
-	}
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
 func TestPayloadHandler_EmptyPayload(t *testing.T) {
@@ -385,9 +367,7 @@ func TestPayloadHandler_EmptyPayload(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusBadRequest)
-	}
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
 func TestPayloadHandler_PayloadConflict(t *testing.T) {
@@ -420,9 +400,7 @@ func TestPayloadHandler_PayloadConflict(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusConflict {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusConflict)
-	}
+	assert.Equal(t, http.StatusConflict, rr.Code)
 }
 
 func TestPayloadHandler_Success(t *testing.T) {
@@ -452,30 +430,19 @@ func TestPayloadHandler_Success(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusAccepted {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusAccepted)
-	}
+	assert.Equal(t, http.StatusAccepted, rr.Code)
 
 	// Verify payload was stored
-	if _, exists := publisher.storedPayloads[testutil.ValidUUID1]; !exists {
-		t.Error("payload was not stored")
-	}
+	_, exists := publisher.storedPayloads[testutil.ValidUUID1]
+	assert.True(t, exists, "payload was not stored")
 
 	// Verify event was published
-	if len(publisher.publishedEvents) != 1 {
-		t.Errorf("publishedEvents = %d, want 1", len(publisher.publishedEvents))
-	}
+	require.Len(t, publisher.publishedEvents, 1)
 
 	event := publisher.publishedEvents[0]
-	if event.LeaseUUID != testutil.ValidUUID1 {
-		t.Errorf("event.LeaseUUID = %q, want %q", event.LeaseUUID, testutil.ValidUUID1)
-	}
-	if event.Tenant != kp.Address {
-		t.Errorf("event.Tenant = %q, want %q", event.Tenant, kp.Address)
-	}
-	if event.MetaHashHex != metaHash {
-		t.Errorf("event.MetaHashHex = %q, want %q", event.MetaHashHex, metaHash)
-	}
+	assert.Equal(t, testutil.ValidUUID1, event.LeaseUUID)
+	assert.Equal(t, kp.Address, event.Tenant)
+	assert.Equal(t, metaHash, event.MetaHashHex)
 }
 
 func TestPayloadHandler_PublishFailureRollback(t *testing.T) {
@@ -509,14 +476,11 @@ func TestPayloadHandler_PublishFailureRollback(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusInternalServerError)
-	}
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
 
 	// Verify payload was deleted (rollback)
-	if len(publisher.deletedUUIDs) != 1 || publisher.deletedUUIDs[0] != testutil.ValidUUID1 {
-		t.Error("payload was not rolled back after publish failure")
-	}
+	require.Len(t, publisher.deletedUUIDs, 1)
+	assert.Equal(t, testutil.ValidUUID1, publisher.deletedUUIDs[0], "payload was not rolled back after publish failure")
 }
 
 func TestPayloadHandler_LeaseUUIDMismatch(t *testing.T) {
@@ -546,9 +510,7 @@ func TestPayloadHandler_LeaseUUIDMismatch(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
-	}
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
 }
 
 func TestPayloadHandler_ExpiredToken(t *testing.T) {
@@ -578,7 +540,5 @@ func TestPayloadHandler_ExpiredToken(t *testing.T) {
 
 	handler.HandlePayloadUpload(rr, req)
 
-	if rr.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
-	}
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
 }

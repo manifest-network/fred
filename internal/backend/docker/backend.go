@@ -20,6 +20,22 @@ import (
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
+// dockerClient abstracts the Docker API surface used by Backend,
+// enabling unit tests to substitute a lightweight mock.
+type dockerClient interface {
+	Ping(ctx context.Context) error
+	Close() error
+	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
+	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
+	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
+	RemoveContainer(ctx context.Context, containerID string) error
+	InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error)
+	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
+	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
+	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
+	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
+}
+
 const (
 	// callbackMaxAttempts is the number of times to attempt callback delivery.
 	callbackMaxAttempts = 3
@@ -34,7 +50,7 @@ var callbackBackoff = [callbackMaxAttempts]time.Duration{0, 1 * time.Second, 5 *
 // Backend implements the backend.Backend interface for Docker containers.
 type Backend struct {
 	cfg    Config
-	docker *DockerClient
+	docker dockerClient
 	pool   *ResourcePool
 	logger *slog.Logger
 
@@ -789,13 +805,21 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 
-	// Preserve in-flight provisions (status=provisioning) that haven't yet produced containers.
+	// Preserve provisions without containers that need to remain visible
+	// to fred's reconciler.
 	for uuid, existing := range b.provisions {
-		if existing.Status == backend.ProvisionStatusProvisioning {
-			if _, hasContainers := recovered[uuid]; !hasContainers {
-				// In-flight provision with no containers yet — preserve it
-				recovered[uuid] = existing
-			}
+		if _, hasContainers := recovered[uuid]; hasContainers {
+			continue // Already recovered from containers
+		}
+		switch existing.Status {
+		case backend.ProvisionStatusProvisioning:
+			// In-flight provision that hasn't produced containers yet — preserve it.
+			recovered[uuid] = existing
+		case backend.ProvisionStatusFailed:
+			// Failed provision whose containers have been cleaned up (e.g., after
+			// a failed re-provision attempt). Preserve so fred's reconciler can
+			// see the failure and its FailCount for retry/close decisions.
+			recovered[uuid] = existing
 		}
 	}
 	b.provisions = recovered

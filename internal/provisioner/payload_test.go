@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -21,9 +24,7 @@ func newTestPayloadStore(t *testing.T) *PayloadStore {
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	t.Cleanup(func() { store.Close() })
 	return store
 }
@@ -33,13 +34,9 @@ func TestPayloadStore_Store_Success(t *testing.T) {
 	payload := []byte("test payload")
 
 	ok := store.Store(testutil.ValidUUID1, payload)
-	if !ok {
-		t.Error("Store() = false, want true for new payload")
-	}
+	assert.True(t, ok, "Store() = false, want true for new payload")
 
-	if !store.Has(testutil.ValidUUID1) {
-		t.Error("Has() = false after Store()")
-	}
+	assert.True(t, store.Has(testutil.ValidUUID1), "Has() = false after Store()")
 }
 
 func TestPayloadStore_Store_Conflict(t *testing.T) {
@@ -51,15 +48,11 @@ func TestPayloadStore_Store_Conflict(t *testing.T) {
 
 	// Second store should fail
 	ok := store.Store(testutil.ValidUUID1, payload2)
-	if ok {
-		t.Error("Store() = true, want false for duplicate")
-	}
+	assert.False(t, ok, "Store() = true, want false for duplicate")
 
 	// Original payload should be unchanged
 	got := store.Get(testutil.ValidUUID1)
-	if string(got) != string(payload1) {
-		t.Errorf("Get() = %q, want %q", got, payload1)
-	}
+	assert.Equal(t, string(payload1), string(got))
 }
 
 func TestPayloadStore_Get(t *testing.T) {
@@ -69,23 +62,17 @@ func TestPayloadStore_Get(t *testing.T) {
 	store.Store(testutil.ValidUUID1, payload)
 
 	got := store.Get(testutil.ValidUUID1)
-	if string(got) != string(payload) {
-		t.Errorf("Get() = %q, want %q", got, payload)
-	}
+	assert.Equal(t, string(payload), string(got))
 
 	// Get should not remove the payload
-	if !store.Has(testutil.ValidUUID1) {
-		t.Error("Has() = false after Get()")
-	}
+	assert.True(t, store.Has(testutil.ValidUUID1), "Has() = false after Get()")
 }
 
 func TestPayloadStore_Get_NotFound(t *testing.T) {
 	store := newTestPayloadStore(t)
 
 	got := store.Get(testutil.ValidUUID1)
-	if got != nil {
-		t.Errorf("Get() = %v, want nil for non-existent", got)
-	}
+	assert.Nil(t, got, "Get() should return nil for non-existent")
 }
 
 func TestPayloadStore_Pop(t *testing.T) {
@@ -95,37 +82,27 @@ func TestPayloadStore_Pop(t *testing.T) {
 	store.Store(testutil.ValidUUID1, payload)
 
 	got := store.Pop(testutil.ValidUUID1)
-	if string(got) != string(payload) {
-		t.Errorf("Pop() = %q, want %q", got, payload)
-	}
+	assert.Equal(t, string(payload), string(got))
 
 	// Pop should remove the payload
-	if store.Has(testutil.ValidUUID1) {
-		t.Error("Has() = true after Pop()")
-	}
+	assert.False(t, store.Has(testutil.ValidUUID1), "Has() = true after Pop()")
 }
 
 func TestPayloadStore_Pop_NotFound(t *testing.T) {
 	store := newTestPayloadStore(t)
 
 	got := store.Pop(testutil.ValidUUID1)
-	if got != nil {
-		t.Errorf("Pop() = %v, want nil for non-existent", got)
-	}
+	assert.Nil(t, got, "Pop() should return nil for non-existent")
 }
 
 func TestPayloadStore_Has(t *testing.T) {
 	store := newTestPayloadStore(t)
 
-	if store.Has(testutil.ValidUUID1) {
-		t.Error("Has() = true for empty store")
-	}
+	assert.False(t, store.Has(testutil.ValidUUID1), "Has() = true for empty store")
 
 	store.Store(testutil.ValidUUID1, []byte("test"))
 
-	if !store.Has(testutil.ValidUUID1) {
-		t.Error("Has() = false after Store()")
-	}
+	assert.True(t, store.Has(testutil.ValidUUID1), "Has() = false after Store()")
 }
 
 func TestPayloadStore_Delete(t *testing.T) {
@@ -135,9 +112,7 @@ func TestPayloadStore_Delete(t *testing.T) {
 	store.Store(testutil.ValidUUID1, payload)
 	store.Delete(testutil.ValidUUID1)
 
-	if store.Has(testutil.ValidUUID1) {
-		t.Error("Has() = true after Delete()")
-	}
+	assert.False(t, store.Has(testutil.ValidUUID1), "Has() = true after Delete()")
 }
 
 func TestPayloadStore_Delete_NotFound(t *testing.T) {
@@ -150,24 +125,16 @@ func TestPayloadStore_Delete_NotFound(t *testing.T) {
 func TestPayloadStore_Count(t *testing.T) {
 	store := newTestPayloadStore(t)
 
-	if count := store.Count(); count != 0 {
-		t.Errorf("Count() = %d, want 0 for empty store", count)
-	}
+	assert.Equal(t, 0, store.Count(), "Count() should be 0 for empty store")
 
 	store.Store(testutil.ValidUUID1, []byte("test1"))
-	if count := store.Count(); count != 1 {
-		t.Errorf("Count() = %d, want 1", count)
-	}
+	assert.Equal(t, 1, store.Count())
 
 	store.Store(testutil.ValidUUID2, []byte("test2"))
-	if count := store.Count(); count != 2 {
-		t.Errorf("Count() = %d, want 2", count)
-	}
+	assert.Equal(t, 2, store.Count())
 
 	store.Pop(testutil.ValidUUID1)
-	if count := store.Count(); count != 1 {
-		t.Errorf("Count() = %d, want 1 after Pop()", count)
-	}
+	assert.Equal(t, 1, store.Count(), "Count() should be 1 after Pop()")
 }
 
 func TestPayloadStore_PayloadIsCopied(t *testing.T) {
@@ -180,16 +147,12 @@ func TestPayloadStore_PayloadIsCopied(t *testing.T) {
 	original[0] = 'X'
 
 	got := store.Get(testutil.ValidUUID1)
-	if got[0] == 'X' {
-		t.Error("Store() did not copy payload, original mutation affected stored value")
-	}
+	assert.NotEqual(t, byte('X'), got[0], "Store() did not copy payload, original mutation affected stored value")
 
 	// Modify returned value - should not affect stored value
 	got[0] = 'Y'
 	got2 := store.Get(testutil.ValidUUID1)
-	if got2[0] == 'Y' {
-		t.Error("Get() did not copy payload, returned mutation affected stored value")
-	}
+	assert.NotEqual(t, byte('Y'), got2[0], "Get() did not copy payload, returned mutation affected stored value")
 }
 
 func TestPayloadStore_ConcurrentAccess(t *testing.T) {
@@ -234,9 +197,7 @@ func TestPayloadStore_Persistence(t *testing.T) {
 		DBPath: dbPath,
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 
 	leaseUUID := "persistent-lease"
 	payload := []byte("persistent payload data")
@@ -248,22 +209,16 @@ func TestPayloadStore_Persistence(t *testing.T) {
 		DBPath: dbPath,
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() reopen error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() reopen error")
 	defer store2.Close()
 
 	got := store2.Get(leaseUUID)
-	if string(got) != string(payload) {
-		t.Errorf("After reopen, Get() = %q, want %q", got, payload)
-	}
+	assert.Equal(t, string(payload), string(got), "After reopen, Get() returned wrong value")
 }
 
 func TestPayloadStore_RequiresDBPath(t *testing.T) {
 	_, err := NewPayloadStore(PayloadStoreConfig{})
-	if err == nil {
-		t.Error("NewPayloadStore() with empty DBPath should return error")
-	}
+	require.Error(t, err, "NewPayloadStore() with empty DBPath should return error")
 }
 
 func TestNewPayloadStore_AppliesDefaults(t *testing.T) {
@@ -272,18 +227,12 @@ func TestNewPayloadStore_AppliesDefaults(t *testing.T) {
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	defer store.Close()
 
 	// Verify batch defaults were applied
-	if store.batchSize != DefaultBatchSize {
-		t.Errorf("batchSize = %v, want %v", store.batchSize, DefaultBatchSize)
-	}
-	if store.flushInterval != DefaultFlushInterval {
-		t.Errorf("flushInterval = %v, want %v", store.flushInterval, DefaultFlushInterval)
-	}
+	assert.Equal(t, DefaultBatchSize, store.batchSize)
+	assert.Equal(t, DefaultFlushInterval, store.flushInterval)
 }
 
 func TestPayloadStore_CanReuseAfterDelete(t *testing.T) {
@@ -295,14 +244,10 @@ func TestPayloadStore_CanReuseAfterDelete(t *testing.T) {
 	store.Delete(leaseUUID)
 
 	// Should be able to store again
-	if !store.Store(leaseUUID, []byte("second")) {
-		t.Error("Store() after Delete returned false, want true")
-	}
+	assert.True(t, store.Store(leaseUUID, []byte("second")), "Store() after Delete returned false, want true")
 
 	got := store.Get(leaseUUID)
-	if string(got) != "second" {
-		t.Errorf("Get() = %q, want %q", got, "second")
-	}
+	assert.Equal(t, "second", string(got))
 }
 
 func TestPayloadStore_CanReuseAfterPop(t *testing.T) {
@@ -314,14 +259,10 @@ func TestPayloadStore_CanReuseAfterPop(t *testing.T) {
 	store.Pop(leaseUUID)
 
 	// Should be able to store again
-	if !store.Store(leaseUUID, []byte("second")) {
-		t.Error("Store() after Pop returned false, want true")
-	}
+	assert.True(t, store.Store(leaseUUID, []byte("second")), "Store() after Pop returned false, want true")
 
 	got := store.Get(leaseUUID)
-	if string(got) != "second" {
-		t.Errorf("Get() = %q, want %q", got, "second")
-	}
+	assert.Equal(t, "second", string(got))
 }
 
 func TestPayloadStore_FilePermissions(t *testing.T) {
@@ -330,22 +271,16 @@ func TestPayloadStore_FilePermissions(t *testing.T) {
 		DBPath: dbPath,
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	store.Close()
 
 	// Check file permissions (0600 = owner read/write only)
 	info, err := os.Stat(dbPath)
-	if err != nil {
-		t.Fatalf("os.Stat() error = %v", err)
-	}
+	require.NoError(t, err, "os.Stat() error")
 
 	// On Unix systems, check permissions
 	perm := info.Mode().Perm()
-	if perm&0077 != 0 {
-		t.Errorf("DB file has unexpected permissions: %o (should not be readable/writable by group/other)", perm)
-	}
+	assert.Equal(t, os.FileMode(0), perm&0077, "DB file has unexpected permissions: %o (should not be readable/writable by group/other)", perm)
 }
 
 func TestPayloadStore_InvalidDBPath(t *testing.T) {
@@ -354,9 +289,7 @@ func TestPayloadStore_InvalidDBPath(t *testing.T) {
 		DBPath: "/nonexistent/path/that/cannot/be/created/test.db",
 
 	})
-	if err == nil {
-		t.Error("NewPayloadStore() with invalid path should return error")
-	}
+	require.Error(t, err, "NewPayloadStore() with invalid path should return error")
 }
 
 func TestPayloadStore_BatchingDefaults(t *testing.T) {
@@ -365,18 +298,12 @@ func TestPayloadStore_BatchingDefaults(t *testing.T) {
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	defer store.Close()
 
 	// Verify batching defaults were applied
-	if store.batchSize != DefaultBatchSize {
-		t.Errorf("batchSize = %d, want %d", store.batchSize, DefaultBatchSize)
-	}
-	if store.flushInterval != DefaultFlushInterval {
-		t.Errorf("flushInterval = %v, want %v", store.flushInterval, DefaultFlushInterval)
-	}
+	assert.Equal(t, DefaultBatchSize, store.batchSize)
+	assert.Equal(t, DefaultFlushInterval, store.flushInterval)
 }
 
 func TestPayloadStore_BatchingCustomConfig(t *testing.T) {
@@ -390,17 +317,11 @@ func TestPayloadStore_BatchingCustomConfig(t *testing.T) {
 		BatchSize:     customBatchSize,
 		FlushInterval: customFlushInterval,
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	defer store.Close()
 
-	if store.batchSize != customBatchSize {
-		t.Errorf("batchSize = %d, want %d", store.batchSize, customBatchSize)
-	}
-	if store.flushInterval != customFlushInterval {
-		t.Errorf("flushInterval = %v, want %v", store.flushInterval, customFlushInterval)
-	}
+	assert.Equal(t, customBatchSize, store.batchSize)
+	assert.Equal(t, customFlushInterval, store.flushInterval)
 }
 
 func TestPayloadStore_FlushOnClose(t *testing.T) {
@@ -413,9 +334,7 @@ func TestPayloadStore_FlushOnClose(t *testing.T) {
 		FlushInterval: 10 * time.Millisecond,
 		BatchSize:     50,
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 
 	// Store multiple items
 	for i := 0; i < 20; i++ {
@@ -431,15 +350,10 @@ func TestPayloadStore_FlushOnClose(t *testing.T) {
 		DBPath: dbPath,
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() reopen error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() reopen error")
 	defer store2.Close()
 
-	count := store2.Count()
-	if count != 20 {
-		t.Errorf("After reopen, Count() = %d, want 20", count)
-	}
+	assert.Equal(t, 20, store2.Count(), "After reopen, Count() should be 20")
 }
 
 func TestPayloadStore_BatchingConcurrentWrites(t *testing.T) {
@@ -451,9 +365,7 @@ func TestPayloadStore_BatchingConcurrentWrites(t *testing.T) {
 		BatchSize:     10,
 		FlushInterval: 10 * time.Millisecond,
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	defer store.Close()
 
 	const numWrites = 100
@@ -473,10 +385,7 @@ func TestPayloadStore_BatchingConcurrentWrites(t *testing.T) {
 	wg.Wait()
 
 	// Verify all writes completed
-	count := store.Count()
-	if count != numWrites {
-		t.Errorf("Count() = %d, want %d", count, numWrites)
-	}
+	assert.Equal(t, numWrites, store.Count())
 }
 
 func TestPayloadStore_BatchingMixedOperations(t *testing.T) {
@@ -488,9 +397,7 @@ func TestPayloadStore_BatchingMixedOperations(t *testing.T) {
 		BatchSize:     5,
 		FlushInterval: 10 * time.Millisecond,
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	defer store.Close()
 
 	// Store multiple items
@@ -533,10 +440,7 @@ func TestPayloadStore_BatchingMixedOperations(t *testing.T) {
 	wg.Wait()
 
 	// Verify: 10 new stores - 10 pops = 10 remaining
-	count := store.Count()
-	if count != 10 {
-		t.Errorf("Count() = %d, want 10", count)
-	}
+	assert.Equal(t, 10, store.Count())
 }
 
 func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
@@ -548,9 +452,7 @@ func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
 		BatchSize:     1000,                  // Large batch so it won't trigger by size
 		FlushInterval: 25 * time.Millisecond, // Short interval
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 	defer store.Close()
 
 	// Store a single item (won't trigger batch size)
@@ -561,16 +463,14 @@ func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
 	for !store.Has("interval-test") {
 		select {
 		case <-deadline:
-			t.Fatal("timed out waiting for flush")
+			require.Fail(t, "timed out waiting for flush")
 		default:
 			runtime.Gosched()
 		}
 	}
 
 	// Data should be written
-	if !store.Has("interval-test") {
-		t.Error("Has() = false after flush interval")
-	}
+	assert.True(t, store.Has("interval-test"), "Has() = false after flush interval")
 }
 
 // Tests for VerifyPayloadHash and VerifyPayloadHashHex
@@ -581,9 +481,7 @@ func TestVerifyPayloadHash_ValidHash(t *testing.T) {
 	expectedHash := sha256.Sum256(payload)
 
 	err := VerifyPayloadHash(payload, expectedHash[:])
-	if err != nil {
-		t.Errorf("VerifyPayloadHash() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestVerifyPayloadHash_Mismatch(t *testing.T) {
@@ -592,38 +490,26 @@ func TestVerifyPayloadHash_Mismatch(t *testing.T) {
 	wrongHash := make([]byte, 32)
 
 	err := VerifyPayloadHash(payload, wrongHash)
-	if err == nil {
-		t.Fatal("VerifyPayloadHash() error = nil, want HashMismatchError")
-	}
+	require.Error(t, err, "VerifyPayloadHash() error = nil, want HashMismatchError")
 
 	var mismatchErr *HashMismatchError
-	if !errors.As(err, &mismatchErr) {
-		t.Errorf("VerifyPayloadHash() error type = %T, want *HashMismatchError", err)
-	}
+	assert.True(t, errors.As(err, &mismatchErr), "VerifyPayloadHash() error type = %T, want *HashMismatchError", err)
 }
 
 func TestVerifyPayloadHash_EmptyExpectedHash(t *testing.T) {
 	payload := []byte("test payload data")
 
 	err := VerifyPayloadHash(payload, []byte{})
-	if err == nil {
-		t.Fatal("VerifyPayloadHash() error = nil, want error for empty hash")
-	}
-	if err.Error() != "expected hash is empty" {
-		t.Errorf("VerifyPayloadHash() error = %q, want %q", err.Error(), "expected hash is empty")
-	}
+	require.Error(t, err, "VerifyPayloadHash() error = nil, want error for empty hash")
+	assert.Equal(t, "expected hash is empty", err.Error())
 }
 
 func TestVerifyPayloadHash_NilExpectedHash(t *testing.T) {
 	payload := []byte("test payload data")
 
 	err := VerifyPayloadHash(payload, nil)
-	if err == nil {
-		t.Fatal("VerifyPayloadHash() error = nil, want error for nil hash")
-	}
-	if err.Error() != "expected hash is empty" {
-		t.Errorf("VerifyPayloadHash() error = %q, want %q", err.Error(), "expected hash is empty")
-	}
+	require.Error(t, err, "VerifyPayloadHash() error = nil, want error for nil hash")
+	assert.Equal(t, "expected hash is empty", err.Error())
 }
 
 func TestVerifyPayloadHash_EmptyPayload(t *testing.T) {
@@ -637,9 +523,7 @@ func TestVerifyPayloadHash_EmptyPayload(t *testing.T) {
 	}
 
 	err := VerifyPayloadHash(payload, expectedHash)
-	if err != nil {
-		t.Errorf("VerifyPayloadHash() error = %v, want nil for empty payload", err)
-	}
+	assert.NoError(t, err, "VerifyPayloadHash() should succeed for empty payload")
 }
 
 func TestVerifyPayloadHash_NilPayload(t *testing.T) {
@@ -652,9 +536,7 @@ func TestVerifyPayloadHash_NilPayload(t *testing.T) {
 	}
 
 	err := VerifyPayloadHash(nil, expectedHash)
-	if err != nil {
-		t.Errorf("VerifyPayloadHash() error = %v, want nil for nil payload", err)
-	}
+	assert.NoError(t, err, "VerifyPayloadHash() should succeed for nil payload")
 }
 
 func TestVerifyPayloadHash_WrongLengthHash(t *testing.T) {
@@ -663,14 +545,10 @@ func TestVerifyPayloadHash_WrongLengthHash(t *testing.T) {
 	wrongLengthHash := []byte{0x01, 0x02, 0x03}
 
 	err := VerifyPayloadHash(payload, wrongLengthHash)
-	if err == nil {
-		t.Fatal("VerifyPayloadHash() error = nil, want HashMismatchError for wrong length hash")
-	}
+	require.Error(t, err, "VerifyPayloadHash() error = nil, want HashMismatchError for wrong length hash")
 
 	var mismatchErr *HashMismatchError
-	if !errors.As(err, &mismatchErr) {
-		t.Errorf("VerifyPayloadHash() error type = %T, want *HashMismatchError", err)
-	}
+	assert.True(t, errors.As(err, &mismatchErr), "VerifyPayloadHash() error type = %T, want *HashMismatchError", err)
 }
 
 func TestVerifyPayloadHashHex_ValidHash(t *testing.T) {
@@ -679,9 +557,7 @@ func TestVerifyPayloadHashHex_ValidHash(t *testing.T) {
 	expectedHashHex := "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
 
 	err := VerifyPayloadHashHex(payload, expectedHashHex)
-	if err != nil {
-		t.Errorf("VerifyPayloadHashHex() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestVerifyPayloadHashHex_Mismatch(t *testing.T) {
@@ -690,14 +566,10 @@ func TestVerifyPayloadHashHex_Mismatch(t *testing.T) {
 	wrongHashHex := "0000000000000000000000000000000000000000000000000000000000000000"
 
 	err := VerifyPayloadHashHex(payload, wrongHashHex)
-	if err == nil {
-		t.Fatal("VerifyPayloadHashHex() error = nil, want HashMismatchError")
-	}
+	require.Error(t, err, "VerifyPayloadHashHex() error = nil, want HashMismatchError")
 
 	var mismatchErr *HashMismatchError
-	if !errors.As(err, &mismatchErr) {
-		t.Errorf("VerifyPayloadHashHex() error type = %T, want *HashMismatchError", err)
-	}
+	assert.True(t, errors.As(err, &mismatchErr), "VerifyPayloadHashHex() error type = %T, want *HashMismatchError", err)
 }
 
 func TestVerifyPayloadHashHex_InvalidHex(t *testing.T) {
@@ -728,12 +600,8 @@ func TestVerifyPayloadHashHex_InvalidHex(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := VerifyPayloadHashHex(payload, tc.hexStr)
-			if err == nil {
-				t.Fatal("VerifyPayloadHashHex() error = nil, want error")
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("VerifyPayloadHashHex() error = %q, want to contain %q", err.Error(), tc.wantErr)
-			}
+			require.Error(t, err, "VerifyPayloadHashHex() error = nil, want error")
+			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
 }
@@ -742,13 +610,9 @@ func TestVerifyPayloadHashHex_EmptyHex(t *testing.T) {
 	payload := []byte("hello world")
 
 	err := VerifyPayloadHashHex(payload, "")
-	if err == nil {
-		t.Fatal("VerifyPayloadHashHex() error = nil, want error for empty hex")
-	}
+	require.Error(t, err, "VerifyPayloadHashHex() error = nil, want error for empty hex")
 	// Empty hex decodes to empty []byte, which triggers "expected hash is empty"
-	if err.Error() != "expected hash is empty" {
-		t.Errorf("VerifyPayloadHashHex() error = %q, want %q", err.Error(), "expected hash is empty")
-	}
+	assert.Equal(t, "expected hash is empty", err.Error())
 }
 
 func TestVerifyPayloadHashHex_EmptyPayload(t *testing.T) {
@@ -757,9 +621,7 @@ func TestVerifyPayloadHashHex_EmptyPayload(t *testing.T) {
 	expectedHashHex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 	err := VerifyPayloadHashHex(payload, expectedHashHex)
-	if err != nil {
-		t.Errorf("VerifyPayloadHashHex() error = %v, want nil for empty payload", err)
-	}
+	assert.NoError(t, err, "VerifyPayloadHashHex() should succeed for empty payload")
 }
 
 func TestVerifyPayloadHashHex_CaseInsensitive(t *testing.T) {
@@ -768,9 +630,7 @@ func TestVerifyPayloadHashHex_CaseInsensitive(t *testing.T) {
 	expectedHashHexUpper := "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9"
 
 	err := VerifyPayloadHashHex(payload, expectedHashHexUpper)
-	if err != nil {
-		t.Errorf("VerifyPayloadHashHex() error = %v, want nil (hex should be case-insensitive)", err)
-	}
+	assert.NoError(t, err, "hex should be case-insensitive")
 }
 
 func TestHashMismatchError_Error(t *testing.T) {
@@ -780,15 +640,9 @@ func TestHashMismatchError_Error(t *testing.T) {
 	}
 
 	msg := err.Error()
-	if !strings.Contains(msg, "010203") {
-		t.Errorf("HashMismatchError.Error() = %q, want to contain expected hash hex", msg)
-	}
-	if !strings.Contains(msg, "040506") {
-		t.Errorf("HashMismatchError.Error() = %q, want to contain actual hash hex", msg)
-	}
-	if !strings.Contains(msg, "payload hash mismatch") {
-		t.Errorf("HashMismatchError.Error() = %q, want to contain 'payload hash mismatch'", msg)
-	}
+	assert.Contains(t, msg, "010203", "HashMismatchError.Error() should contain expected hash hex")
+	assert.Contains(t, msg, "040506", "HashMismatchError.Error() should contain actual hash hex")
+	assert.Contains(t, msg, "payload hash mismatch", "HashMismatchError.Error() should contain 'payload hash mismatch'")
 }
 
 func TestVerifyPayloadHash_LargePayload(t *testing.T) {
@@ -802,9 +656,7 @@ func TestVerifyPayloadHash_LargePayload(t *testing.T) {
 	hash := sha256.Sum256(payload)
 
 	err := VerifyPayloadHash(payload, hash[:])
-	if err != nil {
-		t.Errorf("VerifyPayloadHash() error = %v, want nil for large payload", err)
-	}
+	assert.NoError(t, err, "VerifyPayloadHash() should succeed for large payload")
 }
 
 func TestVerifyPayloadHash_BinaryPayload(t *testing.T) {
@@ -818,9 +670,7 @@ func TestVerifyPayloadHash_BinaryPayload(t *testing.T) {
 	hash := sha256.Sum256(payload)
 
 	err := VerifyPayloadHash(payload, hash[:])
-	if err != nil {
-		t.Errorf("VerifyPayloadHash() error = %v, want nil for binary payload", err)
-	}
+	assert.NoError(t, err, "VerifyPayloadHash() should succeed for binary payload")
 }
 
 // TestPayloadStore_CloseDrainsPendingWrites tests that Close() properly drains
@@ -833,9 +683,7 @@ func TestPayloadStore_CloseDrainsPendingWrites(t *testing.T) {
 		FlushInterval: 1 * time.Second, // Slow flush to ensure operations queue up
 		BatchSize:     100,             // Large batch size
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore() error")
 
 	// Start many concurrent writers
 	const numWriters = 50
@@ -873,13 +721,13 @@ func TestPayloadStore_CloseDrainsPendingWrites(t *testing.T) {
 	case <-writersDone:
 		// Good - all writers completed
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for writers to complete - Close() did not drain pending operations")
+		require.Fail(t, "timeout waiting for writers to complete - Close() did not drain pending operations")
 	}
 
 	select {
 	case <-closeDone:
 		// Good - Close completed
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for Close() to complete")
+		require.Fail(t, "timeout waiting for Close() to complete")
 	}
 }

@@ -6,6 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStartCleanupLoop(t *testing.T) {
@@ -26,9 +29,7 @@ func TestStartCleanupLoop(t *testing.T) {
 		cancel()
 
 		count := callCount.Load()
-		if count < 2 {
-			t.Errorf("cleanup called %d times, want at least 2", count)
-		}
+		assert.GreaterOrEqual(t, count, int32(2))
 	})
 
 	t.Run("stops_on_context_cancellation", func(t *testing.T) {
@@ -57,7 +58,7 @@ func TestStartCleanupLoop(t *testing.T) {
 		case <-done:
 			// Good - loop exited
 		case <-time.After(100 * time.Millisecond):
-			t.Error("StartCleanupLoop did not exit after context cancellation")
+			require.Fail(t, "StartCleanupLoop did not exit after context cancellation")
 		}
 	})
 
@@ -78,9 +79,7 @@ func TestStartCleanupLoop(t *testing.T) {
 		time.Sleep(35 * time.Millisecond)
 
 		count := callCount.Load()
-		if count < 2 {
-			t.Errorf("cleanup should continue despite errors, called %d times", count)
-		}
+		assert.GreaterOrEqual(t, count, int32(2), "cleanup should continue despite errors")
 	})
 
 	t.Run("respects_interval", func(t *testing.T) {
@@ -100,8 +99,6 @@ func TestStartCleanupLoop(t *testing.T) {
 		cancel()
 
 		count := callCount.Load()
-		if count != 0 {
-			t.Errorf("cleanup called %d times before interval elapsed, want 0", count)
-		}
+		assert.Equal(t, int32(0), count, "cleanup called %d times before interval elapsed, want 0", count)
 	})
 }

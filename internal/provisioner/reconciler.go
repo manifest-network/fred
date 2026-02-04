@@ -31,6 +31,11 @@ const (
 // This is not a real error - the caller should not treat it as a failure.
 var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
 
+// errPayloadNotAvailable indicates the payload required for provisioning is
+// not in the store. This is a permanent failure — the lease cannot be
+// re-provisioned and should be closed.
+var errPayloadNotAvailable = errors.New("payload not available")
+
 // Note: InFlightTracker and ReconcilerTracker interfaces are defined in tracker.go
 
 // ReconcilerChainClient defines the chain operations needed by the reconciler.
@@ -336,6 +341,15 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// backends never receive a hash without the corresponding data.
 	if withPayload && r.tracker != nil {
 		req.Payload = r.tracker.PayloadStore().Get(lease.Uuid)
+		if req.Payload == nil && len(lease.MetaHash) > 0 {
+			// Payload is required (lease has MetaHash) but not in the store.
+			// This can happen if the payload DB was lost or fred restarted
+			// without its data. We cannot re-provision without the manifest.
+			if r.tracker != nil {
+				r.tracker.UntrackInFlight(lease.Uuid)
+			}
+			return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, lease.Uuid)
+		}
 		if req.Payload != nil && len(lease.MetaHash) > 0 {
 			// Re-verify payload hash before provisioning to catch any corruption.
 			// The payload was validated on upload, but disk corruption could occur.
@@ -596,7 +610,20 @@ func (r *Reconciler) processLease(
 		anomalies.Add(1)
 		// Attempt to provision (with payload — Docker backend needs the manifest)
 		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
-			if !errors.Is(err, errLeaseAlreadyInFlight) {
+			if errors.Is(err, errPayloadNotAvailable) {
+				// Payload is permanently missing — close the lease since
+				// we cannot re-provision without the manifest.
+				slog.Error("reconcile: closing anomalous lease - payload not available",
+					"lease_uuid", leaseUUID,
+					"tenant", lease.Tenant,
+				)
+				if closeErr := r.closeLease(ctx, leaseUUID, "payload not available for re-provisioning"); closeErr != nil {
+					slog.Error("reconcile: failed to close anomalous lease",
+						"lease_uuid", leaseUUID,
+						"error", closeErr,
+					)
+				}
+			} else if !errors.Is(err, errLeaseAlreadyInFlight) {
 				slog.Error("reconcile: failed to provision anomalous lease",
 					"lease_uuid", leaseUUID,
 					"error", err,
@@ -648,7 +675,19 @@ func (r *Reconciler) processLease(
 			"max_attempts", r.maxReprovisionAttempts,
 		)
 		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
-			if !errors.Is(err, errLeaseAlreadyInFlight) {
+			if errors.Is(err, errPayloadNotAvailable) {
+				slog.Error("reconcile: closing failed lease - payload not available",
+					"lease_uuid", leaseUUID,
+					"tenant", lease.Tenant,
+					"backend", provision.BackendName,
+				)
+				if closeErr := r.closeLease(ctx, leaseUUID, "payload not available for re-provisioning"); closeErr != nil {
+					slog.Error("reconcile: failed to close lease with missing payload",
+						"lease_uuid", leaseUUID,
+						"error", closeErr,
+					)
+				}
+			} else if !errors.Is(err, errLeaseAlreadyInFlight) {
 				slog.Error("reconcile: failed to re-provision failed active lease",
 					"lease_uuid", leaseUUID,
 					"error", err,

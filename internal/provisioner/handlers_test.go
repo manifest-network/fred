@@ -10,6 +10,8 @@ import (
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -21,9 +23,7 @@ import (
 func newLeaseEventMsg(t *testing.T, event chain.LeaseEvent) *message.Message {
 	t.Helper()
 	payload, err := json.Marshal(event)
-	if err != nil {
-		t.Fatalf("failed to marshal event: %v", err)
-	}
+	require.NoError(t, err, "failed to marshal event")
 	return message.NewMessage(watermill.NewUUID(), payload)
 }
 
@@ -31,9 +31,7 @@ func newLeaseEventMsg(t *testing.T, event chain.LeaseEvent) *message.Message {
 func newPayloadEventMsg(t *testing.T, event PayloadEvent) *message.Message {
 	t.Helper()
 	payload, err := json.Marshal(event)
-	if err != nil {
-		t.Fatalf("failed to marshal event: %v", err)
-	}
+	require.NoError(t, err, "failed to marshal event")
 	return message.NewMessage(watermill.NewUUID(), payload)
 }
 
@@ -47,24 +45,16 @@ func TestUnmarshalMessagePayload_Valid(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	result, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseCreated)
-	if !ok {
-		t.Fatal("unmarshalMessagePayload() ok = false, want true")
-	}
-	if result.LeaseUUID != "lease-1" {
-		t.Errorf("LeaseUUID = %q, want %q", result.LeaseUUID, "lease-1")
-	}
-	if result.Tenant != "tenant-1" {
-		t.Errorf("Tenant = %q, want %q", result.Tenant, "tenant-1")
-	}
+	require.True(t, ok, "unmarshalMessagePayload() ok = false, want true")
+	assert.Equal(t, "lease-1", result.LeaseUUID, "LeaseUUID")
+	assert.Equal(t, "tenant-1", result.Tenant, "Tenant")
 }
 
 func TestUnmarshalMessagePayload_Invalid(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), []byte("not json"))
 
 	_, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseCreated)
-	if ok {
-		t.Error("unmarshalMessagePayload() ok = true for invalid JSON, want false")
-	}
+	assert.False(t, ok, "unmarshalMessagePayload() ok = true for invalid JSON, want false")
 }
 
 func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
@@ -88,9 +78,7 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
@@ -99,16 +87,12 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 	})
 
 	err = manager.handleLeaseCreated(msg)
-	if err != nil {
-		t.Errorf("handleLeaseCreated() error = %v, want nil", err)
-	}
+	assert.NoError(t, err, "handleLeaseCreated()")
 
 	// Should NOT have called provision (awaiting payload)
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls for lease with MetaHash, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for lease with MetaHash")
 }
 
 func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
@@ -126,9 +110,7 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
@@ -138,9 +120,7 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 
 	// Should return nil (no retry)
 	err = manager.handleLeaseCreated(msg)
-	if err != nil {
-		t.Errorf("handleLeaseCreated() error = %v, want nil for lease not found", err)
-	}
+	assert.NoError(t, err, "handleLeaseCreated() for lease not found")
 }
 
 func TestHandleLeaseCreated_ChainError(t *testing.T) {
@@ -159,9 +139,7 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
@@ -171,9 +149,7 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 
 	// Should return error (retry)
 	err = manager.handleLeaseCreated(msg)
-	if err == nil {
-		t.Error("handleLeaseCreated() error = nil, want error for chain error")
-	}
+	assert.Error(t, err, "handleLeaseCreated() should return error for chain error")
 }
 
 func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
@@ -202,9 +178,7 @@ func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	// NOT in-flight, lease found on chain -> deprovision via SKU routing
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
@@ -213,27 +187,21 @@ func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
 	})
 
 	err = manager.handleLeaseClosed(msg)
-	if err != nil {
-		t.Errorf("handleLeaseClosed() error = %v", err)
-	}
+	assert.NoError(t, err, "handleLeaseClosed()")
 
 	// GPU backend should have received the deprovision call
 	gpuBackend.mu.Lock()
 	gpuCalls := len(gpuBackend.deprovisionCalls)
 	gpuBackend.mu.Unlock()
 
-	if gpuCalls != 1 {
-		t.Errorf("expected 1 deprovision call to GPU backend, got %d", gpuCalls)
-	}
+	assert.Equal(t, 1, gpuCalls, "deprovision calls to GPU backend")
 
 	// K8s backend should NOT have received any calls
 	k8sBackend.mu.Lock()
 	k8sCalls := len(k8sBackend.deprovisionCalls)
 	k8sBackend.mu.Unlock()
 
-	if k8sCalls != 0 {
-		t.Errorf("expected 0 deprovision calls to K8s backend, got %d", k8sCalls)
-	}
+	assert.Equal(t, 0, k8sCalls, "deprovision calls to K8s backend")
 }
 
 func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
@@ -258,9 +226,7 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
@@ -268,9 +234,7 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 	})
 
 	err = manager.handleLeaseClosed(msg)
-	if err != nil {
-		t.Errorf("handleLeaseClosed() error = %v", err)
-	}
+	assert.NoError(t, err, "handleLeaseClosed()")
 
 	// Both backends should have received deprovision calls
 	backend1.mu.Lock()
@@ -281,12 +245,8 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 	b2Calls := len(backend2.deprovisionCalls)
 	backend2.mu.Unlock()
 
-	if b1Calls != 1 {
-		t.Errorf("expected 1 deprovision call to backend-1, got %d", b1Calls)
-	}
-	if b2Calls != 1 {
-		t.Errorf("expected 1 deprovision call to backend-2, got %d", b2Calls)
-	}
+	assert.Equal(t, 1, b1Calls, "deprovision calls to backend-1")
+	assert.Equal(t, 1, b2Calls, "deprovision calls to backend-2")
 }
 
 func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
@@ -312,9 +272,7 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
@@ -322,12 +280,8 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 	})
 
 	err = manager.handleLeaseClosed(msg)
-	if err == nil {
-		t.Error("handleLeaseClosed() error = nil, want error when all backends fail")
-	}
-	if !errors.Is(err, ErrDeprovisionFailed) {
-		t.Errorf("handleLeaseClosed() error = %v, want ErrDeprovisionFailed", err)
-	}
+	require.Error(t, err, "handleLeaseClosed() should return error when all backends fail")
+	assert.ErrorIs(t, err, ErrDeprovisionFailed, "handleLeaseClosed() error")
 }
 
 func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
@@ -342,9 +296,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
@@ -352,9 +304,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	// Store a payload for a lease, then track it as in-flight
 	payloadStore.Store("lease-1", []byte("deployment data"))
@@ -366,14 +316,10 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	})
 
 	err = manager.handleLeaseClosed(msg)
-	if err != nil {
-		t.Errorf("handleLeaseClosed() error = %v", err)
-	}
+	assert.NoError(t, err, "handleLeaseClosed()")
 
 	// Payload should be cleaned up
-	if payloadStore.Has("lease-1") {
-		t.Error("payload should be deleted when lease closes")
-	}
+	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted when lease closes")
 }
 
 func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
@@ -398,9 +344,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
@@ -408,9 +352,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err, "NewManager()")
 
 	// Store a payload
 	testPayload := []byte("deployment manifest")
@@ -424,17 +366,11 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	})
 
 	err = manager.handlePayloadReceived(msg)
-	if err == nil {
-		t.Error("handlePayloadReceived() error = nil, want error for hash mismatch")
-	}
+	assert.Error(t, err, "handlePayloadReceived() should return error for hash mismatch")
 
 	// Payload should be deleted on hash mismatch
-	if payloadStore.Has("lease-1") {
-		t.Error("payload should be deleted on hash mismatch")
-	}
+	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted on hash mismatch")
 
 	// Lease should not be in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after hash mismatch")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after hash mismatch")
 }

@@ -3,8 +3,12 @@ package docker
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseRegistry(t *testing.T) {
@@ -45,9 +49,7 @@ func TestParseRegistry(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.image, func(t *testing.T) {
 			result := ParseRegistry(tt.image)
-			if result != tt.expected {
-				t.Errorf("ParseRegistry(%q) = %q, want %q", tt.image, result, tt.expected)
-			}
+			assert.Equal(t, tt.expected, result)
 		})
 	}
 }
@@ -69,9 +71,7 @@ func TestIsImageAllowed(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.image, func(t *testing.T) {
 			result := IsImageAllowed(tt.image, allowed)
-			if result != tt.expected {
-				t.Errorf("IsImageAllowed(%q, %v) = %v, want %v", tt.image, allowed, result, tt.expected)
-			}
+			assert.Equal(t, tt.expected, result)
 		})
 	}
 }
@@ -95,8 +95,10 @@ func TestValidateImage(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateImage(tt.image, allowed)
-			if (err != nil) != tt.expectErr {
-				t.Errorf("ValidateImage(%q) error = %v, expectErr %v", tt.image, err, tt.expectErr)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
@@ -123,25 +125,17 @@ func TestResourcePool(t *testing.T) {
 
 		// Allocate
 		err := pool.TryAllocate("lease-1", "small")
-		if err != nil {
-			t.Fatalf("TryAllocate failed: %v", err)
-		}
+		require.NoError(t, err)
 
 		stats := pool.Stats()
-		if stats.AllocatedCPU != 1.0 {
-			t.Errorf("AllocatedCPU = %v, want 1.0", stats.AllocatedCPU)
-		}
-		if stats.AllocatedMemory != 512 {
-			t.Errorf("AllocatedMemory = %v, want 512", stats.AllocatedMemory)
-		}
+		assert.Equal(t, 1.0, stats.AllocatedCPU)
+		assert.Equal(t, int64(512), stats.AllocatedMemory)
 
 		// Release
 		pool.Release("lease-1")
 
 		stats = pool.Stats()
-		if stats.AllocatedCPU != 0 {
-			t.Errorf("AllocatedCPU after release = %v, want 0", stats.AllocatedCPU)
-		}
+		assert.Equal(t, 0.0, stats.AllocatedCPU)
 	})
 
 	t.Run("insufficient resources", func(t *testing.T) {
@@ -150,38 +144,28 @@ func TestResourcePool(t *testing.T) {
 
 		// First allocation succeeds
 		err := pool.TryAllocate("lease-1", "small")
-		if err != nil {
-			t.Fatalf("first allocation failed: %v", err)
-		}
+		require.NoError(t, err)
 
 		// Second allocation should fail (not enough for large)
 		err = pool.TryAllocate("lease-2", "large")
-		if err == nil {
-			t.Error("expected error for insufficient resources")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("unknown SKU", func(t *testing.T) {
 		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles))
 
 		err := pool.TryAllocate("lease-1", "nonexistent")
-		if err == nil {
-			t.Error("expected error for unknown SKU")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("duplicate allocation", func(t *testing.T) {
 		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles))
 
 		err := pool.TryAllocate("lease-1", "small")
-		if err != nil {
-			t.Fatalf("first allocation failed: %v", err)
-		}
+		require.NoError(t, err)
 
 		err = pool.TryAllocate("lease-1", "small")
-		if err == nil {
-			t.Error("expected error for duplicate allocation")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("release nonexistent", func(t *testing.T) {
@@ -204,18 +188,12 @@ func TestResourcePool(t *testing.T) {
 		pool.Reset(allocations)
 
 		stats := pool.Stats()
-		if stats.AllocationCount != 1 {
-			t.Errorf("AllocationCount = %v, want 1", stats.AllocationCount)
-		}
-		if stats.AllocatedCPU != 4.0 {
-			t.Errorf("AllocatedCPU = %v, want 4.0", stats.AllocatedCPU)
-		}
+		assert.Equal(t, 1, stats.AllocationCount)
+		assert.Equal(t, 4.0, stats.AllocatedCPU)
 
 		// Original allocation should be gone
 		alloc := pool.GetAllocation("lease-1")
-		if alloc != nil {
-			t.Error("expected lease-1 to be gone after reset")
-		}
+		assert.Nil(t, alloc)
 	})
 }
 
@@ -242,81 +220,55 @@ func TestParseManifest(t *testing.T) {
 		}`
 
 		m, err := ParseManifest([]byte(data))
-		if err != nil {
-			t.Fatalf("ParseManifest failed: %v", err)
-		}
+		require.NoError(t, err)
 
-		if m.Image != "nginx:1.25-alpine" {
-			t.Errorf("Image = %q, want nginx:1.25-alpine", m.Image)
-		}
-		if len(m.Ports) != 2 {
-			t.Errorf("Ports count = %d, want 2", len(m.Ports))
-		}
-		if m.Ports["443/tcp"].HostPort != 8443 {
-			t.Errorf("HostPort = %d, want 8443", m.Ports["443/tcp"].HostPort)
-		}
-		if m.Env["NGINX_HOST"] != "example.com" {
-			t.Errorf("Env NGINX_HOST = %q, want example.com", m.Env["NGINX_HOST"])
-		}
-		if m.HealthCheck.Interval.Duration() != 30*time.Second {
-			t.Errorf("HealthCheck.Interval = %v, want 30s", m.HealthCheck.Interval.Duration())
-		}
+		assert.Equal(t, "nginx:1.25-alpine", m.Image)
+		assert.Len(t, m.Ports, 2)
+		assert.Equal(t, 8443, m.Ports["443/tcp"].HostPort)
+		assert.Equal(t, "example.com", m.Env["NGINX_HOST"])
+		assert.Equal(t, 30*time.Second, m.HealthCheck.Interval.Duration())
 	})
 
 	t.Run("minimal manifest", func(t *testing.T) {
 		data := `{"image": "nginx"}`
 
 		m, err := ParseManifest([]byte(data))
-		if err != nil {
-			t.Fatalf("ParseManifest failed: %v", err)
-		}
+		require.NoError(t, err)
 
-		if m.Image != "nginx" {
-			t.Errorf("Image = %q, want nginx", m.Image)
-		}
+		assert.Equal(t, "nginx", m.Image)
 	})
 
 	t.Run("empty manifest", func(t *testing.T) {
 		_, err := ParseManifest([]byte{})
-		if err == nil {
-			t.Error("expected error for empty manifest")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("missing image", func(t *testing.T) {
 		data := `{"ports": {"80/tcp": {}}}`
 
 		_, err := ParseManifest([]byte(data))
-		if err == nil {
-			t.Error("expected error for missing image")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("invalid port spec", func(t *testing.T) {
 		data := `{"image": "nginx", "ports": {"invalid": {}}}`
 
 		_, err := ParseManifest([]byte(data))
-		if err == nil {
-			t.Error("expected error for invalid port spec")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("reserved label prefix", func(t *testing.T) {
 		data := `{"image": "nginx", "labels": {"fred.custom": "value"}}`
 
 		_, err := ParseManifest([]byte(data))
-		if err == nil {
-			t.Error("expected error for reserved label prefix")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("invalid host_port", func(t *testing.T) {
 		data := `{"image": "nginx", "ports": {"80/tcp": {"host_port": 99999}}}`
 
 		_, err := ParseManifest([]byte(data))
-		if err == nil {
-			t.Error("expected error for host_port > 65535")
-		}
+		assert.Error(t, err)
 	})
 }
 
@@ -330,97 +282,73 @@ func TestConfigValidation(t *testing.T) {
 
 	t.Run("valid config", func(t *testing.T) {
 		cfg := validConfig()
-		if err := cfg.Validate(); err != nil {
-			t.Errorf("Validate failed: %v", err)
-		}
+		assert.NoError(t, cfg.Validate())
 	})
 
 	t.Run("missing name", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.Name = ""
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for missing name")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("missing listen addr", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.ListenAddr = ""
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for missing listen_addr")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("no SKU profiles", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.SKUProfiles = nil
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for no SKU profiles")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("invalid SKU profile", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.SKUProfiles["invalid"] = SKUProfile{CPUCores: 0} // Invalid: zero CPU
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for invalid SKU profile")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("no allowed registries", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.AllowedRegistries = nil
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for no allowed registries")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("short callback secret", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.CallbackSecret = "short"
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for short callback secret")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("missing host address", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostAddress = ""
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for missing host address")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("host address with URL rejected", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostAddress = "http://example.com"
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for URL in host address")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("bare hostname rejected", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostAddress = "myhostname"
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for bare hostname without dot")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("localhost accepted", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostAddress = "localhost"
-		if err := cfg.Validate(); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
+		assert.NoError(t, cfg.Validate())
 	})
 
 	t.Run("FQDN accepted", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostAddress = "backend.example.com"
-		if err := cfg.Validate(); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
+		assert.NoError(t, cfg.Validate())
 	})
 }
 
@@ -428,34 +356,22 @@ func TestDuration(t *testing.T) {
 	t.Run("unmarshal string", func(t *testing.T) {
 		var d Duration
 		err := json.Unmarshal([]byte(`"30s"`), &d)
-		if err != nil {
-			t.Fatalf("Unmarshal failed: %v", err)
-		}
-		if d.Duration() != 30*time.Second {
-			t.Errorf("Duration = %v, want 30s", d.Duration())
-		}
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Second, d.Duration())
 	})
 
 	t.Run("unmarshal number", func(t *testing.T) {
 		var d Duration
 		err := json.Unmarshal([]byte(`1000000000`), &d) // 1 second in nanoseconds
-		if err != nil {
-			t.Fatalf("Unmarshal failed: %v", err)
-		}
-		if d.Duration() != time.Second {
-			t.Errorf("Duration = %v, want 1s", d.Duration())
-		}
+		require.NoError(t, err)
+		assert.Equal(t, time.Second, d.Duration())
 	})
 
 	t.Run("marshal", func(t *testing.T) {
 		d := Duration(30 * time.Second)
 		data, err := json.Marshal(d)
-		if err != nil {
-			t.Fatalf("Marshal failed: %v", err)
-		}
-		if string(data) != `"30s"` {
-			t.Errorf("Marshal = %s, want \"30s\"", data)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, `"30s"`, string(data))
 	})
 }
 
@@ -464,54 +380,42 @@ func TestHealthCheckValidation(t *testing.T) {
 		hc := &HealthCheckConfig{
 			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
 		}
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate failed: %v", err)
-		}
+		assert.NoError(t, hc.Validate())
 	})
 
 	t.Run("valid CMD-SHELL", func(t *testing.T) {
 		hc := &HealthCheckConfig{
 			Test: []string{"CMD-SHELL", "curl -f http://localhost/health"},
 		}
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate failed: %v", err)
-		}
+		assert.NoError(t, hc.Validate())
 	})
 
 	t.Run("valid NONE", func(t *testing.T) {
 		hc := &HealthCheckConfig{
 			Test: []string{"NONE"},
 		}
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate failed: %v", err)
-		}
+		assert.NoError(t, hc.Validate())
 	})
 
 	t.Run("empty test", func(t *testing.T) {
 		hc := &HealthCheckConfig{
 			Test: []string{},
 		}
-		if err := hc.Validate(); err == nil {
-			t.Error("expected error for empty test")
-		}
+		assert.Error(t, hc.Validate())
 	})
 
 	t.Run("CMD without command", func(t *testing.T) {
 		hc := &HealthCheckConfig{
 			Test: []string{"CMD"},
 		}
-		if err := hc.Validate(); err == nil {
-			t.Error("expected error for CMD without command")
-		}
+		assert.Error(t, hc.Validate())
 	})
 
 	t.Run("invalid test type", func(t *testing.T) {
 		hc := &HealthCheckConfig{
 			Test: []string{"INVALID", "command"},
 		}
-		if err := hc.Validate(); err == nil {
-			t.Error("expected error for invalid test type")
-		}
+		assert.Error(t, hc.Validate())
 	})
 
 	t.Run("negative retries", func(t *testing.T) {
@@ -519,9 +423,7 @@ func TestHealthCheckValidation(t *testing.T) {
 			Test:    []string{"CMD", "curl", "-f", "http://localhost/health"},
 			Retries: -1,
 		}
-		if err := hc.Validate(); err == nil {
-			t.Error("expected error for negative retries")
-		}
+		assert.Error(t, hc.Validate())
 	})
 }
 
@@ -551,8 +453,10 @@ func TestPortSpecValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.spec, func(t *testing.T) {
 			err := validatePortSpec(tt.spec)
-			if (err != nil) != tt.expectErr {
-				t.Errorf("validatePortSpec(%q) error = %v, expectErr %v", tt.spec, err, tt.expectErr)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
@@ -572,32 +476,20 @@ func TestSKUMapping(t *testing.T) {
 
 	t.Run("UUID maps to profile", func(t *testing.T) {
 		profile, err := cfg.GetSKUProfile("019c1ee7-1aaf-7000-802c-ad775c72cc27")
-		if err != nil {
-			t.Fatalf("GetSKUProfile() error = %v", err)
-		}
-		if profile.CPUCores != 0.5 {
-			t.Errorf("expected CPUCores 0.5, got %v", profile.CPUCores)
-		}
-		if profile.MemoryMB != 512 {
-			t.Errorf("expected MemoryMB 512, got %v", profile.MemoryMB)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, 0.5, profile.CPUCores)
+		assert.Equal(t, int64(512), profile.MemoryMB)
 	})
 
 	t.Run("direct profile name still works", func(t *testing.T) {
 		profile, err := cfg.GetSKUProfile("docker-large")
-		if err != nil {
-			t.Fatalf("GetSKUProfile() error = %v", err)
-		}
-		if profile.CPUCores != 2.0 {
-			t.Errorf("expected CPUCores 2.0, got %v", profile.CPUCores)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, 2.0, profile.CPUCores)
 	})
 
 	t.Run("unknown UUID fails", func(t *testing.T) {
 		_, err := cfg.GetSKUProfile("unknown-uuid")
-		if err == nil {
-			t.Error("expected error for unknown SKU")
-		}
+		assert.Error(t, err)
 	})
 
 	t.Run("mapped to nonexistent profile fails validation", func(t *testing.T) {
@@ -622,30 +514,18 @@ func TestSKUMapping(t *testing.T) {
 			ReconcileInterval:     5 * time.Minute,
 		}
 		err := badCfg.Validate()
-		if err == nil {
-			t.Error("expected validation error for mapping to nonexistent profile")
-		}
+		assert.Error(t, err)
 	})
 }
 
 func TestConfigHardeningDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 
-	if !cfg.IsNetworkIsolation() {
-		t.Error("expected IsNetworkIsolation() = true by default")
-	}
-	if !cfg.IsReadonlyRootfs() {
-		t.Error("expected IsReadonlyRootfs() = true by default")
-	}
-	if *cfg.GetPidsLimit() != 256 {
-		t.Errorf("expected GetPidsLimit() = 256, got %d", *cfg.GetPidsLimit())
-	}
-	if cfg.GetTmpfsSizeMB() != 64 {
-		t.Errorf("expected GetTmpfsSizeMB() = 64, got %d", cfg.GetTmpfsSizeMB())
-	}
-	if cfg.GetHostBindIP() != "0.0.0.0" {
-		t.Errorf("expected GetHostBindIP() = 0.0.0.0, got %s", cfg.GetHostBindIP())
-	}
+	assert.True(t, cfg.IsNetworkIsolation())
+	assert.True(t, cfg.IsReadonlyRootfs())
+	assert.Equal(t, int64(256), *cfg.GetPidsLimit())
+	assert.Equal(t, 64, cfg.GetTmpfsSizeMB())
+	assert.Equal(t, "0.0.0.0", cfg.GetHostBindIP())
 }
 
 func TestConfigHardeningOverrides(t *testing.T) {
@@ -656,21 +536,11 @@ func TestConfigHardeningOverrides(t *testing.T) {
 	cfg.ContainerTmpfsSizeMB = 128
 	cfg.HostBindIP = "127.0.0.1"
 
-	if cfg.IsNetworkIsolation() {
-		t.Error("expected IsNetworkIsolation() = false after override")
-	}
-	if cfg.IsReadonlyRootfs() {
-		t.Error("expected IsReadonlyRootfs() = false after override")
-	}
-	if *cfg.GetPidsLimit() != 512 {
-		t.Errorf("expected GetPidsLimit() = 512, got %d", *cfg.GetPidsLimit())
-	}
-	if cfg.GetTmpfsSizeMB() != 128 {
-		t.Errorf("expected GetTmpfsSizeMB() = 128, got %d", cfg.GetTmpfsSizeMB())
-	}
-	if cfg.GetHostBindIP() != "127.0.0.1" {
-		t.Errorf("expected GetHostBindIP() = 127.0.0.1, got %s", cfg.GetHostBindIP())
-	}
+	assert.False(t, cfg.IsNetworkIsolation())
+	assert.False(t, cfg.IsReadonlyRootfs())
+	assert.Equal(t, int64(512), *cfg.GetPidsLimit())
+	assert.Equal(t, 128, cfg.GetTmpfsSizeMB())
+	assert.Equal(t, "127.0.0.1", cfg.GetHostBindIP())
 }
 
 func TestConfigHardeningValidation(t *testing.T) {
@@ -684,33 +554,25 @@ func TestConfigHardeningValidation(t *testing.T) {
 	t.Run("invalid host_bind_ip", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostBindIP = "not-an-ip"
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for invalid host_bind_ip")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 
 	t.Run("valid host_bind_ip", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostBindIP = "127.0.0.1"
-		if err := cfg.Validate(); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
+		assert.NoError(t, cfg.Validate())
 	})
 
 	t.Run("empty host_bind_ip is valid", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostBindIP = ""
-		if err := cfg.Validate(); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
+		assert.NoError(t, cfg.Validate())
 	})
 
 	t.Run("pids_limit too low", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.ContainerPidsLimit = ptrInt64(0)
-		if err := cfg.Validate(); err == nil {
-			t.Error("expected error for pids_limit = 0")
-		}
+		assert.Error(t, cfg.Validate())
 	})
 }
 
@@ -718,23 +580,17 @@ func TestTenantNetworkName(t *testing.T) {
 	t.Run("deterministic", func(t *testing.T) {
 		name1 := TenantNetworkName("manifest1abc")
 		name2 := TenantNetworkName("manifest1abc")
-		if name1 != name2 {
-			t.Errorf("expected deterministic names, got %s != %s", name1, name2)
-		}
+		assert.Equal(t, name1, name2)
 	})
 
 	t.Run("different tenants get different names", func(t *testing.T) {
 		name1 := TenantNetworkName("tenant-a")
 		name2 := TenantNetworkName("tenant-b")
-		if name1 == name2 {
-			t.Error("expected different names for different tenants")
-		}
+		assert.NotEqual(t, name1, name2)
 	})
 
 	t.Run("starts with prefix", func(t *testing.T) {
 		name := TenantNetworkName("any-tenant")
-		if name[:len("fred-tenant-")] != "fred-tenant-" {
-			t.Errorf("expected fred-tenant- prefix, got %s", name)
-		}
+		assert.True(t, strings.HasPrefix(name, "fred-tenant-"))
 	})
 }

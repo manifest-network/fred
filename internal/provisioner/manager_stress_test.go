@@ -13,6 +13,8 @@ import (
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
@@ -107,9 +109,7 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -122,7 +122,7 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 	select {
 	case <-mgr.Running():
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for manager to start")
+		require.Fail(t, "timeout waiting for manager to start")
 	}
 
 	// Collect memory stats before
@@ -210,9 +210,7 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 
 	// Verify we processed most events
 	successRate := float64(processed) / float64(numEvents) * 100
-	if successRate < 95 {
-		t.Errorf("Expected at least 95%% success rate, got %.1f%%", successRate)
-	}
+	assert.GreaterOrEqual(t, successRate, float64(95), "Expected at least 95%% success rate, got %.1f%%", successRate)
 }
 
 // TestManager_SustainedLoad tests sustained load over time.
@@ -244,9 +242,7 @@ func TestManager_SustainedLoad(t *testing.T) {
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -257,7 +253,7 @@ func TestManager_SustainedLoad(t *testing.T) {
 	select {
 	case <-mgr.Running():
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for manager to start")
+		require.Fail(t, "timeout waiting for manager to start")
 	}
 
 	// Sustained load: 1000 events/sec for 10 seconds
@@ -351,9 +347,7 @@ func TestManager_SustainedLoad(t *testing.T) {
 	t.Logf("Total processed: %d (%.1f%%)", processed, float64(processed)/float64(sent)*100)
 	t.Logf("Processing rate: %.0f events/sec", processedRPS)
 
-	if processed < int64(float64(sent)*0.95) {
-		t.Errorf("Expected at least 95%% processed, got %.1f%%", float64(processed)/float64(sent)*100)
-	}
+	assert.GreaterOrEqual(t, processed, int64(float64(sent)*0.95), "Expected at least 95%% processed, got %.1f%%", float64(processed)/float64(sent)*100)
 }
 
 // TestManager_WithBackendLatency tests event processing with realistic backend latency.
@@ -394,9 +388,7 @@ func TestManager_WithBackendLatency(t *testing.T) {
 				ProviderUUID:    "provider-uuid",
 				CallbackBaseURL: "http://localhost:8080",
 			}, router, mockChain)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 
 			ctx, cancel := context.WithCancel(context.Background())
 
@@ -407,7 +399,7 @@ func TestManager_WithBackendLatency(t *testing.T) {
 			select {
 			case <-mgr.Running():
 			case <-time.After(5 * time.Second):
-				t.Fatal("timeout waiting for manager to start")
+				require.Fail(t, "timeout waiting for manager to start")
 			}
 
 			const numEvents = 1000
@@ -447,9 +439,7 @@ func TestManager_WithBackendLatency(t *testing.T) {
 			t.Logf("  Processed: %d/%d in %v (%.0f events/sec)",
 				processed, numEvents, elapsed, float64(processed)/elapsed.Seconds())
 
-			if processed < int64(numEvents*90/100) {
-				t.Errorf("Expected at least 90%% processed, got %d/%d", processed, numEvents)
-			}
+			assert.GreaterOrEqual(t, processed, int64(numEvents*90/100), "Expected at least 90%% processed, got %d/%d", processed, numEvents)
 		})
 	}
 }
@@ -512,9 +502,7 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -525,7 +513,7 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 	select {
 	case <-mgr.Running():
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for manager to start")
+		require.Fail(t, "timeout waiting for manager to start")
 	}
 
 	// Sustained high concurrency: 5000 events/sec for 30 seconds
@@ -633,9 +621,7 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 	t.Logf("  Total alloc: %d MB", memAfter.TotalAlloc/1024/1024)
 	t.Logf("  Num GC: %d", memAfter.NumGC-memBefore.NumGC)
 
-	if processed < int64(float64(sent)*0.95) {
-		t.Errorf("Expected at least 95%% processed, got %.1f%%", float64(processed)/float64(sent)*100)
-	}
+	assert.GreaterOrEqual(t, processed, int64(float64(sent)*0.95), "Expected at least 95%% processed, got %.1f%%", float64(processed)/float64(sent)*100)
 }
 
 // BenchmarkManager_EndToEnd benchmarks the full event processing flow.

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestVerifySignature(t *testing.T) {
@@ -13,42 +14,30 @@ func TestVerifySignature(t *testing.T) {
 
 	t.Run("valid signature", func(t *testing.T) {
 		sig := hmacauth.Sign(secret, body)
-		if err := hmacauth.Verify(secret, body, sig, 5*time.Minute); err != nil {
-			t.Errorf("expected valid signature, got error: %v", err)
-		}
+		assert.NoError(t, hmacauth.Verify(secret, body, sig, 5*time.Minute))
 	})
 
 	t.Run("expired timestamp", func(t *testing.T) {
 		sig := hmacauth.SignWithTime(secret, body, time.Now().Add(-10*time.Minute))
-		if err := hmacauth.Verify(secret, body, sig, 5*time.Minute); err == nil {
-			t.Error("expected error for expired timestamp")
-		}
+		assert.Error(t, hmacauth.Verify(secret, body, sig, 5*time.Minute))
 	})
 
 	t.Run("wrong secret", func(t *testing.T) {
 		sig := hmacauth.Sign("wrong-secret-wrong-secret-wrong!", body)
-		if err := hmacauth.Verify(secret, body, sig, 5*time.Minute); err == nil {
-			t.Error("expected error for wrong secret")
-		}
+		assert.Error(t, hmacauth.Verify(secret, body, sig, 5*time.Minute))
 	})
 
 	t.Run("tampered body", func(t *testing.T) {
 		sig := hmacauth.Sign(secret, body)
-		if err := hmacauth.Verify(secret, []byte(`{"lease_uuid":"TAMPERED"}`), sig, 5*time.Minute); err == nil {
-			t.Error("expected error for tampered body")
-		}
+		assert.Error(t, hmacauth.Verify(secret, []byte(`{"lease_uuid":"TAMPERED"}`), sig, 5*time.Minute))
 	})
 
 	t.Run("malformed signature missing sha256", func(t *testing.T) {
 		sig := "t=1234567890"
-		if err := hmacauth.Verify(secret, body, sig, 5*time.Minute); err == nil {
-			t.Error("expected error for malformed signature")
-		}
+		assert.Error(t, hmacauth.Verify(secret, body, sig, 5*time.Minute))
 	})
 
 	t.Run("malformed signature missing timestamp", func(t *testing.T) {
-		if err := hmacauth.Verify(secret, body, "sha256=abc123", 5*time.Minute); err == nil {
-			t.Error("expected error for missing timestamp")
-		}
+		assert.Error(t, hmacauth.Verify(secret, body, "sha256=abc123", 5*time.Minute))
 	})
 }

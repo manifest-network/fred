@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
@@ -46,11 +49,9 @@ func TestWithdrawScheduler_StopStopsStart(t *testing.T) {
 	// Wait for Start() to return
 	select {
 	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Start() returned error: %v, want nil", err)
-		}
+		assert.NoError(t, err)
 	case <-time.After(2 * time.Second):
-		t.Fatal("Start() did not return after Stop() - timeout")
+		require.Fail(t, "Start() did not return after Stop() - timeout")
 	}
 
 	// Verify no more withdrawals happen after Stop()
@@ -58,7 +59,5 @@ func TestWithdrawScheduler_StopStopsStart(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	callsLater := atomic.LoadInt32(&withdrawCalled)
 
-	if callsLater != callsAfterStop {
-		t.Errorf("withdrawals continued after Stop(): before=%d, after=%d", callsAfterStop, callsLater)
-	}
+	assert.Equal(t, callsAfterStop, callsLater, "withdrawals continued after Stop()")
 }

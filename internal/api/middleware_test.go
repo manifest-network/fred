@@ -10,6 +10,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRequestTimeoutMiddleware_CompletesWithinTimeout(t *testing.T) {
@@ -32,17 +35,9 @@ func TestRequestTimeoutMiddleware_CompletesWithinTimeout(t *testing.T) {
 	wrapped.ServeHTTP(rec, req)
 	duration := time.Since(start)
 
-	if !handlerCalled {
-		t.Error("handler was not called")
-	}
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("status code = %d, want %d", rec.Code, http.StatusOK)
-	}
-
-	if rec.Body.String() != "success" {
-		t.Errorf("body = %q, want %q", rec.Body.String(), "success")
-	}
+	assert.True(t, handlerCalled, "handler was not called")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "success", rec.Body.String())
 
 	// Should complete quickly, well under the timeout
 	if duration > timeout {
@@ -123,9 +118,7 @@ func TestRequestTimeoutMiddleware_ContextCancellationPropagation(t *testing.T) {
 	}
 	err := contextErr.Load()
 
-	if err != context.DeadlineExceeded {
-		t.Errorf("context error = %v, want %v", err, context.DeadlineExceeded)
-	}
+	assert.Equal(t, context.DeadlineExceeded, err)
 }
 
 func TestRequestTimeoutMiddleware_ZeroTimeout(t *testing.T) {
@@ -232,13 +225,8 @@ func TestRequestTimeoutMiddleware_HandlerWritesBeforeTimeout(t *testing.T) {
 
 	wrapped.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusCreated {
-		t.Errorf("status code = %d, want %d", rec.Code, http.StatusCreated)
-	}
-
-	if rec.Body.String() != "created" {
-		t.Errorf("body = %q, want %q", rec.Body.String(), "created")
-	}
+	assert.Equal(t, http.StatusCreated, rec.Code)
+	assert.Equal(t, "created", rec.Body.String())
 }
 
 func TestRequestTimeoutMiddleware_PreservesRequestContext(t *testing.T) {
@@ -270,9 +258,7 @@ func TestRequestTimeoutMiddleware_PreservesRequestContext(t *testing.T) {
 	wrapped.ServeHTTP(rec, req)
 
 	captured := capturedValue.Load()
-	if captured != testValue {
-		t.Errorf("context value = %v, want %v", captured, testValue)
-	}
+	assert.Equal(t, testValue, captured)
 }
 
 func TestRequestTimeoutMiddleware_ConcurrentRequests(t *testing.T) {
@@ -311,9 +297,7 @@ func TestRequestTimeoutMiddleware_ConcurrentRequests(t *testing.T) {
 		}
 	}
 
-	if completedCount.Load() != numRequests {
-		t.Errorf("completed count = %d, want %d", completedCount.Load(), numRequests)
-	}
+	assert.Equal(t, int32(numRequests), completedCount.Load())
 }
 
 func TestRequestTimeoutMiddleware_SlowHandlerDoesNotBlockOthers(t *testing.T) {
@@ -360,9 +344,7 @@ func TestRequestTimeoutMiddleware_SlowHandlerDoesNotBlockOthers(t *testing.T) {
 		t.Errorf("fast request took %v, expected to complete quickly", duration)
 	}
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("fast request status = %d, want %d", rec.Code, http.StatusOK)
-	}
+	assert.Equal(t, http.StatusOK, rec.Code)
 
 	// Wait for slow handler to finish to avoid test pollution
 	<-slowHandlerDone
@@ -376,13 +358,8 @@ func TestReadBodyWithContext_Success(t *testing.T) {
 	body := bytes.NewReader(data)
 
 	result, err := readBodyWithContext(ctx, body)
-	if err != nil {
-		t.Fatalf("readBodyWithContext() error = %v", err)
-	}
-
-	if !bytes.Equal(result, data) {
-		t.Errorf("readBodyWithContext() = %q, want %q", result, data)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, data, result)
 }
 
 func TestReadBodyWithContext_EmptyBody(t *testing.T) {
@@ -390,13 +367,8 @@ func TestReadBodyWithContext_EmptyBody(t *testing.T) {
 	body := bytes.NewReader([]byte{})
 
 	result, err := readBodyWithContext(ctx, body)
-	if err != nil {
-		t.Fatalf("readBodyWithContext() error = %v", err)
-	}
-
-	if len(result) != 0 {
-		t.Errorf("readBodyWithContext() length = %d, want 0", len(result))
-	}
+	require.NoError(t, err)
+	assert.Empty(t, result)
 }
 
 func TestReadBodyWithContext_LargeBody(t *testing.T) {
@@ -409,13 +381,8 @@ func TestReadBodyWithContext_LargeBody(t *testing.T) {
 	body := bytes.NewReader(data)
 
 	result, err := readBodyWithContext(ctx, body)
-	if err != nil {
-		t.Fatalf("readBodyWithContext() error = %v", err)
-	}
-
-	if !bytes.Equal(result, data) {
-		t.Errorf("readBodyWithContext() data mismatch, got %d bytes, want %d bytes", len(result), len(data))
-	}
+	require.NoError(t, err)
+	assert.Equal(t, data, result)
 }
 
 func TestReadBodyWithContext_CancelledContext(t *testing.T) {
@@ -426,13 +393,8 @@ func TestReadBodyWithContext_CancelledContext(t *testing.T) {
 	body := bytes.NewReader(data)
 
 	_, err := readBodyWithContext(ctx, body)
-	if err == nil {
-		t.Fatal("readBodyWithContext() error = nil, want context.Canceled")
-	}
-
-	if err != context.Canceled {
-		t.Errorf("readBodyWithContext() error = %v, want %v", err, context.Canceled)
-	}
+	require.Error(t, err)
+	assert.Equal(t, context.Canceled, err)
 }
 
 func TestReadBodyWithContext_ContextCancelledDuringRead(t *testing.T) {
@@ -448,13 +410,8 @@ func TestReadBodyWithContext_ContextCancelledDuringRead(t *testing.T) {
 	}
 
 	_, err := readBodyWithContext(ctx, slowReader)
-	if err == nil {
-		t.Fatal("readBodyWithContext() error = nil, want context.Canceled")
-	}
-
-	if err != context.Canceled {
-		t.Errorf("readBodyWithContext() error = %v, want %v", err, context.Canceled)
-	}
+	require.Error(t, err)
+	assert.Equal(t, context.Canceled, err)
 }
 
 func TestReadBodyWithContext_ReadError(t *testing.T) {
@@ -463,13 +420,8 @@ func TestReadBodyWithContext_ReadError(t *testing.T) {
 	body := &errorReader{err: expectedErr}
 
 	_, err := readBodyWithContext(ctx, body)
-	if err == nil {
-		t.Fatal("readBodyWithContext() error = nil, want error")
-	}
-
-	if err != expectedErr {
-		t.Errorf("readBodyWithContext() error = %v, want %v", err, expectedErr)
-	}
+	require.Error(t, err)
+	assert.Equal(t, expectedErr, err)
 }
 
 // slowReader is a test helper that reads slowly and can cancel context mid-read

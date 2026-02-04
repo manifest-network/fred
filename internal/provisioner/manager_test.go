@@ -13,6 +13,8 @@ import (
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -129,15 +131,10 @@ func TestNewManager_Validation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := NewManager(tt.cfg, tt.router, tt.chainClient)
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("NewManager() error = %v, want nil", err)
-				}
+				assert.NoError(t, err)
 			} else {
-				if err == nil {
-					t.Errorf("NewManager() error = nil, want error containing %q", tt.wantErr)
-				} else if err.Error() != tt.wantErr {
-					t.Errorf("NewManager() error = %q, want %q", err.Error(), tt.wantErr)
-				}
+				require.Error(t, err)
+				assert.Equal(t, tt.wantErr, err.Error())
 			}
 		})
 	}
@@ -154,59 +151,37 @@ func TestManager_InFlightTracking(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Initially not in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("IsInFlight() = true before tracking, want false")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "IsInFlight() should be false before tracking")
 
 	// Track
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test-backend")
 
 	// Should be in-flight
-	if !manager.IsInFlight("lease-1") {
-		t.Error("IsInFlight() = false after tracking, want true")
-	}
+	assert.True(t, manager.IsInFlight("lease-1"), "IsInFlight() should be true after tracking")
 
 	// GetInFlight should return the data
 	provision, exists := manager.GetInFlight("lease-1")
-	if !exists {
-		t.Error("GetInFlight() exists = false, want true")
-	}
-	if provision.LeaseUUID != "lease-1" {
-		t.Errorf("GetInFlight() LeaseUUID = %q, want %q", provision.LeaseUUID, "lease-1")
-	}
-	if provision.Tenant != "tenant-1" {
-		t.Errorf("GetInFlight() Tenant = %q, want %q", provision.Tenant, "tenant-1")
-	}
-	if provision.RoutingSKU() != "sku-1" {
-		t.Errorf("GetInFlight() SKU = %q, want %q", provision.RoutingSKU(), "sku-1")
-	}
-	if provision.Backend != "test-backend" {
-		t.Errorf("GetInFlight() Backend = %q, want %q", provision.Backend, "test-backend")
-	}
+	assert.True(t, exists, "GetInFlight() exists should be true")
+	assert.Equal(t, "lease-1", provision.LeaseUUID)
+	assert.Equal(t, "tenant-1", provision.Tenant)
+	assert.Equal(t, "sku-1", provision.RoutingSKU())
+	assert.Equal(t, "test-backend", provision.Backend)
 
 	// Should still be in-flight (GetInFlight doesn't remove)
-	if !manager.IsInFlight("lease-1") {
-		t.Error("IsInFlight() = false after GetInFlight, want true")
-	}
+	assert.True(t, manager.IsInFlight("lease-1"), "IsInFlight() should be true after GetInFlight")
 
 	// Untrack
 	manager.UntrackInFlight("lease-1")
 
 	// Should no longer be in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("IsInFlight() = true after untracking, want false")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "IsInFlight() should be false after untracking")
 
 	// GetInFlight should return false
 	_, exists = manager.GetInFlight("lease-1")
-	if exists {
-		t.Error("GetInFlight() exists = true after untracking, want false")
-	}
+	assert.False(t, exists, "GetInFlight() exists should be false after untracking")
 }
 
 func TestManager_TryTrackInFlight(t *testing.T) {
@@ -220,38 +195,24 @@ func TestManager_TryTrackInFlight(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// First attempt should succeed
-	if !manager.TryTrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test-backend") {
-		t.Error("TryTrackInFlight() first call = false, want true")
-	}
+	assert.True(t, manager.TryTrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test-backend"), "TryTrackInFlight() first call should succeed")
 
 	// Verify it was tracked
-	if !manager.IsInFlight("lease-1") {
-		t.Error("IsInFlight() = false after TryTrackInFlight, want true")
-	}
+	assert.True(t, manager.IsInFlight("lease-1"), "IsInFlight() should be true after TryTrackInFlight")
 
 	// Second attempt for same lease should fail (already tracked)
-	if manager.TryTrackInFlight("lease-1", "tenant-2", testItems("sku-2"), "other-backend") {
-		t.Error("TryTrackInFlight() second call = true, want false")
-	}
+	assert.False(t, manager.TryTrackInFlight("lease-1", "tenant-2", testItems("sku-2"), "other-backend"), "TryTrackInFlight() second call should fail")
 
 	// Original tracking data should be preserved
 	provision, exists := manager.GetInFlight("lease-1")
-	if !exists {
-		t.Fatal("GetInFlight() exists = false, want true")
-	}
-	if provision.Tenant != "tenant-1" {
-		t.Errorf("GetInFlight() Tenant = %q, want %q (original data should be preserved)", provision.Tenant, "tenant-1")
-	}
+	require.True(t, exists, "GetInFlight() exists should be true")
+	assert.Equal(t, "tenant-1", provision.Tenant, "original data should be preserved")
 
 	// Different lease should succeed
-	if !manager.TryTrackInFlight("lease-2", "tenant-2", testItems("sku-2"), "test-backend") {
-		t.Error("TryTrackInFlight() for different lease = false, want true")
-	}
+	assert.True(t, manager.TryTrackInFlight("lease-2", "tenant-2", testItems("sku-2"), "test-backend"), "TryTrackInFlight() for different lease should succeed")
 }
 
 // TestManager_TryTrackInFlight_RaceCondition is a regression test for the TOCTOU
@@ -271,9 +232,7 @@ func TestManager_TryTrackInFlight_RaceCondition(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	const numGoroutines = 100
 	const leaseUUID = "race-test-lease"
@@ -312,14 +271,10 @@ func TestManager_TryTrackInFlight_RaceCondition(t *testing.T) {
 	wg.Wait()
 
 	// Exactly one goroutine should have succeeded
-	if successCount != 1 {
-		t.Errorf("TryTrackInFlight() success count = %d, want exactly 1", successCount)
-	}
+	assert.Equal(t, 1, successCount, "TryTrackInFlight() should succeed exactly once")
 
 	// The lease should be tracked
-	if !manager.IsInFlight(leaseUUID) {
-		t.Error("IsInFlight() = false after race test, want true")
-	}
+	assert.True(t, manager.IsInFlight(leaseUUID), "IsInFlight() should be true after race test")
 }
 
 func TestManager_PopInFlight(t *testing.T) {
@@ -333,39 +288,27 @@ func TestManager_PopInFlight(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track a lease
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test-backend")
 
 	// Pop should return the data and remove it
 	provision, exists := manager.PopInFlight("lease-1")
-	if !exists {
-		t.Error("PopInFlight() exists = false, want true")
-	}
-	if provision.LeaseUUID != "lease-1" {
-		t.Errorf("PopInFlight() LeaseUUID = %q, want %q", provision.LeaseUUID, "lease-1")
-	}
+	assert.True(t, exists, "PopInFlight() exists should be true")
+	assert.Equal(t, "lease-1", provision.LeaseUUID)
 
 	// Should no longer be in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("IsInFlight() = true after PopInFlight, want false")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "IsInFlight() should be false after PopInFlight")
 
 	// Pop again should return false
 	_, exists = manager.PopInFlight("lease-1")
-	if exists {
-		t.Error("PopInFlight() exists = true on second call, want false")
-	}
+	assert.False(t, exists, "PopInFlight() exists should be false on second call")
 }
 
 func TestBuildCallbackURL(t *testing.T) {
 	expected := "http://localhost:8080/callbacks/provision"
-	if got := BuildCallbackURL("http://localhost:8080"); got != expected {
-		t.Errorf("BuildCallbackURL() = %q, want %q", got, expected)
-	}
+	assert.Equal(t, expected, BuildCallbackURL("http://localhost:8080"))
 }
 
 func TestManager_HandleLeaseCreated(t *testing.T) {
@@ -391,9 +334,7 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Create a lease event message
 	event := chain.LeaseEvent{
@@ -406,33 +347,19 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 
 	// Handle the message
 	err = manager.handleLeaseCreated(msg)
-	if err != nil {
-		t.Errorf("handleLeaseCreated() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify provisioning was called
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 1 {
-		t.Fatalf("expected 1 provision call, got %d", len(mockBackend.provisionCalls))
-	}
-	if mockBackend.provisionCalls[0].LeaseUUID != "lease-1" {
-		t.Errorf("provision LeaseUUID = %q, want %q", mockBackend.provisionCalls[0].LeaseUUID, "lease-1")
-	}
-	if mockBackend.provisionCalls[0].Tenant != "tenant-1" {
-		t.Errorf("provision Tenant = %q, want %q", mockBackend.provisionCalls[0].Tenant, "tenant-1")
-	}
-	if mockBackend.provisionCalls[0].ProviderUUID != "provider-1" {
-		t.Errorf("provision ProviderUUID = %q, want %q", mockBackend.provisionCalls[0].ProviderUUID, "provider-1")
-	}
-	if mockBackend.provisionCalls[0].CallbackURL != "http://localhost:8080/callbacks/provision" {
-		t.Errorf("provision CallbackURL = %q, want %q", mockBackend.provisionCalls[0].CallbackURL, "http://localhost:8080/callbacks/provision")
-	}
+	require.Len(t, mockBackend.provisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.provisionCalls[0].LeaseUUID)
+	assert.Equal(t, "tenant-1", mockBackend.provisionCalls[0].Tenant)
+	assert.Equal(t, "provider-1", mockBackend.provisionCalls[0].ProviderUUID)
+	assert.Equal(t, "http://localhost:8080/callbacks/provision", mockBackend.provisionCalls[0].CallbackURL)
 
 	// Verify in-flight tracking
-	if !manager.IsInFlight("lease-1") {
-		t.Error("lease should be in-flight after handleLeaseCreated")
-	}
+	assert.True(t, manager.IsInFlight("lease-1"), "lease should be in-flight after handleLeaseCreated")
 }
 
 func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
@@ -457,9 +384,7 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	event := chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
@@ -471,17 +396,11 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 
 	// Handle should return error for retry
 	err = manager.handleLeaseCreated(msg)
-	if err == nil {
-		t.Error("handleLeaseCreated() error = nil, want error")
-	}
-	if !errors.Is(err, ErrProvisioningFailed) {
-		t.Errorf("handleLeaseCreated() error = %v, want ErrProvisioningFailed", err)
-	}
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrProvisioningFailed)
 
 	// Verify lease was untracked after error
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after provision error")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after provision error")
 }
 
 func TestManager_HandleLeaseCreated_MalformedMessage(t *testing.T) {
@@ -495,25 +414,19 @@ func TestManager_HandleLeaseCreated_MalformedMessage(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Send invalid JSON
 	msg := message.NewMessage(watermill.NewUUID(), []byte("invalid json"))
 
 	// Handle should return nil (don't retry malformed messages)
 	err = manager.handleLeaseCreated(msg)
-	if err != nil {
-		t.Errorf("handleLeaseCreated() error = %v, want nil for malformed message", err)
-	}
+	assert.NoError(t, err, "should return nil for malformed message")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls for malformed message, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for malformed message")
 }
 
 func TestManager_HandleLeaseClosed(t *testing.T) {
@@ -527,9 +440,7 @@ func TestManager_HandleLeaseClosed(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track lease first (simulating it was being provisioned)
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -542,24 +453,16 @@ func TestManager_HandleLeaseClosed(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleLeaseClosed(msg)
-	if err != nil {
-		t.Errorf("handleLeaseClosed() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify deprovision was called
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.deprovisionCalls) != 1 {
-		t.Fatalf("expected 1 deprovision call, got %d", len(mockBackend.deprovisionCalls))
-	}
-	if mockBackend.deprovisionCalls[0] != "lease-1" {
-		t.Errorf("deprovision leaseUUID = %q, want %q", mockBackend.deprovisionCalls[0], "lease-1")
-	}
+	require.Len(t, mockBackend.deprovisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.deprovisionCalls[0])
 
 	// Verify removed from in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after handleLeaseClosed")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after handleLeaseClosed")
 }
 
 func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
@@ -574,9 +477,7 @@ func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	event := chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
@@ -586,12 +487,8 @@ func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleLeaseClosed(msg)
-	if err == nil {
-		t.Error("handleLeaseClosed() error = nil, want error")
-	}
-	if !errors.Is(err, ErrDeprovisionFailed) {
-		t.Errorf("handleLeaseClosed() error = %v, want ErrDeprovisionFailed", err)
-	}
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrDeprovisionFailed)
 }
 
 func TestManager_HandleBackendCallback_Success(t *testing.T) {
@@ -621,9 +518,7 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track the lease first
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -636,24 +531,16 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleBackendCallback(msg)
-	if err != nil {
-		t.Errorf("handleBackendCallback() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify acknowledge was called
 	mu.Lock()
 	defer mu.Unlock()
-	if len(acknowledgedLeases) != 1 {
-		t.Fatalf("expected 1 acknowledged lease, got %d", len(acknowledgedLeases))
-	}
-	if acknowledgedLeases[0] != "lease-1" {
-		t.Errorf("acknowledged lease = %q, want %q", acknowledgedLeases[0], "lease-1")
-	}
+	require.Len(t, acknowledgedLeases, 1)
+	assert.Equal(t, "lease-1", acknowledgedLeases[0])
 
 	// Verify removed from in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after successful callback")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after successful callback")
 }
 
 func TestManager_HandleBackendCallback_Failed(t *testing.T) {
@@ -667,9 +554,7 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track the lease first
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -683,14 +568,10 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleBackendCallback(msg)
-	if err != nil {
-		t.Errorf("handleBackendCallback() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify removed from in-flight (failed is terminal)
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after failed callback")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after failed callback")
 }
 
 func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
@@ -704,9 +585,7 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Don't track the lease - simulating unknown callback
 	callback := backend.CallbackPayload{
@@ -718,9 +597,7 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 
 	// Should return nil (ignore unknown callbacks)
 	err = manager.handleBackendCallback(msg)
-	if err != nil {
-		t.Errorf("handleBackendCallback() error = %v, want nil for unknown lease", err)
-	}
+	assert.NoError(t, err, "should return nil for unknown lease")
 }
 
 func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
@@ -746,9 +623,7 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track the lease
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -761,17 +636,11 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleBackendCallback(msg)
-	if err == nil {
-		t.Error("handleBackendCallback() error = nil, want error")
-	}
-	if !errors.Is(err, ErrAcknowledgeFailed) {
-		t.Errorf("handleBackendCallback() error = %v, want ErrAcknowledgeFailed", err)
-	}
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrAcknowledgeFailed)
 
 	// Verify still in-flight (for retry)
-	if !manager.IsInFlight("lease-1") {
-		t.Error("lease should still be in-flight after acknowledge error (for retry)")
-	}
+	assert.True(t, manager.IsInFlight("lease-1"), "lease should still be in-flight after acknowledge error (for retry)")
 }
 
 func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
@@ -803,9 +672,7 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track the lease
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -819,14 +686,10 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 
 	// Should return nil (terminal error treated as success)
 	err = manager.handleBackendCallback(msg)
-	if err != nil {
-		t.Errorf("handleBackendCallback() error = %v, want nil for terminal acknowledge error", err)
-	}
+	assert.NoError(t, err, "should return nil for terminal acknowledge error")
 
 	// Verify removed from in-flight (not stuck for retry)
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should NOT be in-flight after terminal acknowledge error")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should NOT be in-flight after terminal acknowledge error")
 }
 
 func TestManager_IsTerminalAcknowledgeError(t *testing.T) {
@@ -870,9 +733,7 @@ func TestManager_IsTerminalAcknowledgeError(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := isTerminalAcknowledgeError(tt.err)
-			if got != tt.terminal {
-				t.Errorf("isTerminalAcknowledgeError() = %v, want %v", got, tt.terminal)
-			}
+			assert.Equal(t, tt.terminal, got)
 		})
 	}
 }
@@ -888,9 +749,7 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track the lease
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -904,15 +763,11 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 
 	// Should return nil (unknown status is logged, not retried)
 	err = manager.handleBackendCallback(msg)
-	if err != nil {
-		t.Errorf("handleBackendCallback() error = %v, want nil for unknown status", err)
-	}
+	assert.NoError(t, err, "should return nil for unknown status")
 
 	// Lease should be removed from in-flight (unknown status is treated as terminal
 	// to prevent leases from being stuck indefinitely)
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should NOT be in-flight after unknown status callback (treated as terminal)")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should NOT be in-flight after unknown status callback (treated as terminal)")
 }
 
 func TestManager_PublishLeaseEvent(t *testing.T) {
@@ -926,9 +781,7 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	tests := []struct {
 		name      string
@@ -950,11 +803,10 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 			}
 
 			err := manager.PublishLeaseEvent(event)
-			if tt.wantErr && err == nil {
-				t.Error("PublishLeaseEvent() error = nil, want error")
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("PublishLeaseEvent() error = %v, want nil", err)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
@@ -971,9 +823,7 @@ func TestManager_PublishCallback(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	callback := backend.CallbackPayload{
 		LeaseUUID: "lease-1",
@@ -981,9 +831,7 @@ func TestManager_PublishCallback(t *testing.T) {
 	}
 
 	err = manager.PublishCallback(callback)
-	if err != nil {
-		t.Errorf("PublishCallback() error = %v", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestManager_HandleLeaseExpired(t *testing.T) {
@@ -998,9 +846,7 @@ func TestManager_HandleLeaseExpired(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track lease first (simulating it was being provisioned)
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -1014,32 +860,21 @@ func TestManager_HandleLeaseExpired(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleLeaseExpired(msg)
-	if err != nil {
-		t.Errorf("handleLeaseExpired() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify deprovision was called (same behavior as handleLeaseClosed)
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.deprovisionCalls) != 1 {
-		t.Fatalf("expected 1 deprovision call, got %d", len(mockBackend.deprovisionCalls))
-	}
-	if mockBackend.deprovisionCalls[0] != "lease-1" {
-		t.Errorf("deprovision leaseUUID = %q, want %q", mockBackend.deprovisionCalls[0], "lease-1")
-	}
+	require.Len(t, mockBackend.deprovisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.deprovisionCalls[0])
 
 	// Verify removed from in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after handleLeaseExpired")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after handleLeaseExpired")
 }
 
 func TestManager_CallbackPath(t *testing.T) {
 	// Verify the CallbackPath constant is correct
-	expected := "/callbacks/provision"
-	if CallbackPath != expected {
-		t.Errorf("CallbackPath = %q, want %q", CallbackPath, expected)
-	}
+	assert.Equal(t, "/callbacks/provision", CallbackPath)
 }
 
 func TestManager_StartAndClose(t *testing.T) {
@@ -1053,9 +888,7 @@ func TestManager_StartAndClose(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Start in a goroutine
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1072,9 +905,7 @@ func TestManager_StartAndClose(t *testing.T) {
 	}
 
 	// Close should stop the router
-	if err := manager.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
+	assert.NoError(t, manager.Close())
 
 	// Cancel context to ensure clean shutdown
 	cancel()
@@ -1083,8 +914,8 @@ func TestManager_StartAndClose(t *testing.T) {
 	select {
 	case err := <-errCh:
 		// Start may return nil or context.Canceled depending on timing
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Start() returned unexpected error = %v", err)
+		if err != nil {
+			assert.ErrorIs(t, err, context.Canceled)
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("Start() did not return after Close()")
@@ -1103,9 +934,7 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track with a backend name that doesn't exist in the router
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "nonexistent-backend")
@@ -1119,19 +948,13 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 
 	// Should succeed by falling back to default backend
 	err = manager.handleLeaseClosed(msg)
-	if err != nil {
-		t.Errorf("handleLeaseClosed() error = %v, want nil (should fallback to default)", err)
-	}
+	assert.NoError(t, err, "should fallback to default backend")
 
 	// Verify deprovision was called on the default backend
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.deprovisionCalls) != 1 {
-		t.Fatalf("expected 1 deprovision call, got %d", len(mockBackend.deprovisionCalls))
-	}
-	if mockBackend.deprovisionCalls[0] != "lease-1" {
-		t.Errorf("deprovision leaseUUID = %q, want %q", mockBackend.deprovisionCalls[0], "lease-1")
-	}
+	require.Len(t, mockBackend.deprovisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.deprovisionCalls[0])
 }
 
 func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
@@ -1162,9 +985,7 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Create a lease event message
 	event := chain.LeaseEvent{
@@ -1177,45 +998,29 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 
 	// Handle the message
 	err = manager.handleLeaseCreated(msg)
-	if err != nil {
-		t.Errorf("handleLeaseCreated() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify GPU backend received the provision call
 	gpuBackend.mu.Lock()
 	gpuCalls := gpuBackend.provisionCalls
 	gpuBackend.mu.Unlock()
 
-	if len(gpuCalls) != 1 {
-		t.Fatalf("expected 1 provision call to GPU backend, got %d", len(gpuCalls))
-	}
-	if gpuCalls[0].LeaseUUID != "gpu-lease-1" {
-		t.Errorf("provision LeaseUUID = %q, want %q", gpuCalls[0].LeaseUUID, "gpu-lease-1")
-	}
-	if gpuCalls[0].RoutingSKU() != "gpu-a100-4x" {
-		t.Errorf("provision SKU = %q, want %q", gpuCalls[0].RoutingSKU(), "gpu-a100-4x")
-	}
+	require.Len(t, gpuCalls, 1)
+	assert.Equal(t, "gpu-lease-1", gpuCalls[0].LeaseUUID)
+	assert.Equal(t, "gpu-a100-4x", gpuCalls[0].RoutingSKU())
 
 	// Verify K8s backend did NOT receive any calls
 	k8sBackend.mu.Lock()
 	k8sCalls := k8sBackend.provisionCalls
 	k8sBackend.mu.Unlock()
 
-	if len(k8sCalls) != 0 {
-		t.Errorf("expected 0 provision calls to K8s backend, got %d", len(k8sCalls))
-	}
+	assert.Empty(t, k8sCalls, "K8s backend should not have received any provision calls")
 
 	// Verify in-flight tracking includes the correct backend
 	provision, exists := manager.GetInFlight("gpu-lease-1")
-	if !exists {
-		t.Fatal("lease should be in-flight")
-	}
-	if provision.Backend != "gpu-backend" {
-		t.Errorf("in-flight Backend = %q, want %q", provision.Backend, "gpu-backend")
-	}
-	if provision.RoutingSKU() != "gpu-a100-4x" {
-		t.Errorf("in-flight SKU = %q, want %q", provision.RoutingSKU(), "gpu-a100-4x")
-	}
+	require.True(t, exists, "lease should be in-flight")
+	assert.Equal(t, "gpu-backend", provision.Backend)
+	assert.Equal(t, "gpu-a100-4x", provision.RoutingSKU())
 }
 
 func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
@@ -1242,9 +1047,7 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track the lease first
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
@@ -1259,27 +1062,17 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleBackendCallback(msg)
-	if err != nil {
-		t.Errorf("handleBackendCallback() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify lease was rejected
 	mu.Lock()
 	defer mu.Unlock()
-	if len(rejectedLeases) != 1 {
-		t.Fatalf("expected 1 rejected lease, got %d", len(rejectedLeases))
-	}
-	if rejectedLeases[0] != "lease-1" {
-		t.Errorf("rejected lease = %q, want %q", rejectedLeases[0], "lease-1")
-	}
-	if rejectedReason != "out of GPU resources" {
-		t.Errorf("rejection reason = %q, want %q", rejectedReason, "out of GPU resources")
-	}
+	require.Len(t, rejectedLeases, 1)
+	assert.Equal(t, "lease-1", rejectedLeases[0])
+	assert.Equal(t, "out of GPU resources", rejectedReason)
 
 	// Verify removed from in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after failed callback")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after failed callback")
 }
 
 func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
@@ -1304,9 +1097,7 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track the lease first
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
@@ -1321,16 +1112,12 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handleBackendCallback(msg)
-	if err != nil {
-		t.Errorf("handleBackendCallback() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify default reason was used
 	mu.Lock()
 	defer mu.Unlock()
-	if rejectedReason != "provisioning failed" {
-		t.Errorf("rejection reason = %q, want %q", rejectedReason, "provisioning failed")
-	}
+	assert.Equal(t, "provisioning failed", rejectedReason)
 }
 
 func TestExtractRoutingSKU(t *testing.T) {
@@ -1371,9 +1158,7 @@ func TestExtractRoutingSKU(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := ExtractRoutingSKU(tt.lease)
-			if got != tt.want {
-				t.Errorf("ExtractRoutingSKU() = %q, want %q", got, tt.want)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -1389,15 +1174,11 @@ func TestManager_GetInFlightLeases(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Initially empty
 	leases := manager.GetInFlightLeases()
-	if len(leases) != 0 {
-		t.Errorf("GetInFlightLeases() returned %d leases, want 0", len(leases))
-	}
+	assert.Empty(t, leases)
 
 	// Track some leases
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "backend-1")
@@ -1406,29 +1187,18 @@ func TestManager_GetInFlightLeases(t *testing.T) {
 
 	// Should return all 3
 	leases = manager.GetInFlightLeases()
-	if len(leases) != 3 {
-		t.Errorf("GetInFlightLeases() returned %d leases, want 3", len(leases))
-	}
+	assert.Len(t, leases, 3)
 
 	// Verify all expected leases are present
-	leaseMap := make(map[string]bool)
-	for _, uuid := range leases {
-		leaseMap[uuid] = true
-	}
-
-	for _, expected := range []string{"lease-1", "lease-2", "lease-3"} {
-		if !leaseMap[expected] {
-			t.Errorf("GetInFlightLeases() missing %q", expected)
-		}
-	}
+	assert.Contains(t, leases, "lease-1")
+	assert.Contains(t, leases, "lease-2")
+	assert.Contains(t, leases, "lease-3")
 
 	// Untrack one
 	manager.UntrackInFlight("lease-2")
 
 	leases = manager.GetInFlightLeases()
-	if len(leases) != 2 {
-		t.Errorf("GetInFlightLeases() after untrack returned %d leases, want 2", len(leases))
-	}
+	assert.Len(t, leases, 2)
 }
 
 func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
@@ -1442,15 +1212,11 @@ func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// No in-flight leases, should return immediately with 0
 	remaining := manager.WaitForDrain(context.Background(), 100*time.Millisecond)
-	if remaining != 0 {
-		t.Errorf("WaitForDrain() remaining = %d, want 0", remaining)
-	}
+	assert.Equal(t, 0, remaining)
 }
 
 func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
@@ -1464,9 +1230,7 @@ func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track some leases
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "backend-1")
@@ -1481,9 +1245,7 @@ func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
 
 	// Wait for drain with sufficient timeout
 	remaining := manager.WaitForDrain(context.Background(), 1*time.Second)
-	if remaining != 0 {
-		t.Errorf("WaitForDrain() remaining = %d, want 0", remaining)
-	}
+	assert.Equal(t, 0, remaining)
 }
 
 func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
@@ -1497,9 +1259,7 @@ func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track leases that won't be drained
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "backend-1")
@@ -1507,9 +1267,7 @@ func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
 
 	// Wait with short timeout - should return remaining count
 	remaining := manager.WaitForDrain(context.Background(), 100*time.Millisecond)
-	if remaining != 2 {
-		t.Errorf("WaitForDrain() remaining = %d, want 2", remaining)
-	}
+	assert.Equal(t, 2, remaining)
 
 	// Clean up
 	manager.UntrackInFlight("lease-1")
@@ -1527,9 +1285,7 @@ func TestManager_WaitForDrain_ContextCancelled(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track leases that won't be drained
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "backend-1")
@@ -1545,9 +1301,7 @@ func TestManager_WaitForDrain_ContextCancelled(t *testing.T) {
 
 	// Wait with long timeout but context will be cancelled first
 	remaining := manager.WaitForDrain(ctx, 5*time.Second)
-	if remaining != 1 {
-		t.Errorf("WaitForDrain() remaining = %d, want 1", remaining)
-	}
+	assert.Equal(t, 1, remaining)
 
 	// Clean up
 	manager.UntrackInFlight("lease-1")
@@ -1564,37 +1318,25 @@ func TestManager_InFlightCount(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Initially 0
-	if manager.InFlightCount() != 0 {
-		t.Errorf("InFlightCount() = %d, want 0", manager.InFlightCount())
-	}
+	assert.Equal(t, 0, manager.InFlightCount())
 
 	// Track some
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "backend-1")
-	if manager.InFlightCount() != 1 {
-		t.Errorf("InFlightCount() = %d, want 1", manager.InFlightCount())
-	}
+	assert.Equal(t, 1, manager.InFlightCount())
 
 	manager.TrackInFlight("lease-2", "tenant-2", testItems("sku-2"), "backend-2")
-	if manager.InFlightCount() != 2 {
-		t.Errorf("InFlightCount() = %d, want 2", manager.InFlightCount())
-	}
+	assert.Equal(t, 2, manager.InFlightCount())
 
 	// Untrack one
 	manager.UntrackInFlight("lease-1")
-	if manager.InFlightCount() != 1 {
-		t.Errorf("InFlightCount() after untrack = %d, want 1", manager.InFlightCount())
-	}
+	assert.Equal(t, 1, manager.InFlightCount())
 
 	// Untrack the other
 	manager.UntrackInFlight("lease-2")
-	if manager.InFlightCount() != 0 {
-		t.Errorf("InFlightCount() after all untracked = %d, want 0", manager.InFlightCount())
-	}
+	assert.Equal(t, 0, manager.InFlightCount())
 }
 
 // mockPayloadStore implements a simple in-memory payload store for testing.
@@ -1664,9 +1406,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 		DBPath: tempDir + "/payloads.db",
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err)
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
@@ -1674,9 +1414,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store a payload first
 	testPayload := []byte("deployment manifest data")
@@ -1694,36 +1432,22 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 
 	// Handle the message
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify provisioning was called with payload
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 1 {
-		t.Fatalf("expected 1 provision call, got %d", len(mockBackend.provisionCalls))
-	}
-	if mockBackend.provisionCalls[0].LeaseUUID != "lease-1" {
-		t.Errorf("provision LeaseUUID = %q, want %q", mockBackend.provisionCalls[0].LeaseUUID, "lease-1")
-	}
-	if string(mockBackend.provisionCalls[0].Payload) != string(testPayload) {
-		t.Errorf("provision Payload = %q, want %q", mockBackend.provisionCalls[0].Payload, testPayload)
-	}
-	if mockBackend.provisionCalls[0].PayloadHash != testPayloadHash {
-		t.Errorf("provision PayloadHash = %q, want %q", mockBackend.provisionCalls[0].PayloadHash, testPayloadHash)
-	}
+	require.Len(t, mockBackend.provisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.provisionCalls[0].LeaseUUID)
+	assert.Equal(t, string(testPayload), string(mockBackend.provisionCalls[0].Payload))
+	assert.Equal(t, testPayloadHash, mockBackend.provisionCalls[0].PayloadHash)
 
 	// Verify in-flight tracking
-	if !manager.IsInFlight("lease-1") {
-		t.Error("lease should be in-flight after handlePayloadReceived")
-	}
+	assert.True(t, manager.IsInFlight("lease-1"), "lease should be in-flight after handlePayloadReceived")
 
 	// Verify payload is still in store - it should only be deleted after callback
 	// This ensures the payload is available for retry if provisioning fails
-	if !payloadStore.Has("lease-1") {
-		t.Error("payload should remain in store until callback is received")
-	}
+	assert.True(t, payloadStore.Has("lease-1"), "payload should remain in store until callback is received")
 }
 
 func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
@@ -1739,9 +1463,7 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    nil, // No payload store
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	event := PayloadEvent{
 		LeaseUUID:   "lease-1",
@@ -1753,16 +1475,12 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 
 	// Should return nil (no retry) when payload store is not configured
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v, want nil for missing payload store", err)
-	}
+	assert.NoError(t, err, "should return nil for missing payload store")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls when payload store is nil, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls when payload store is nil")
 }
 
 func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
@@ -1784,25 +1502,19 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Send invalid JSON
 	msg := message.NewMessage(watermill.NewUUID(), []byte("invalid json"))
 
 	// Handle should return nil (don't retry malformed messages)
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v, want nil for malformed message", err)
-	}
+	assert.NoError(t, err, "should return nil for malformed message")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls for malformed message, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for malformed message")
 }
 
 func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
@@ -1828,9 +1540,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store a payload
 	payloadStore.Store("lease-1", []byte("payload data"))
@@ -1845,21 +1555,15 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 
 	// Should return nil (lease not found, clean up payload)
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v, want nil for lease not found", err)
-	}
+	assert.NoError(t, err, "should return nil for lease not found")
 
 	// Verify payload was cleaned up
-	if payloadStore.Has("lease-1") {
-		t.Error("payload should be deleted when lease not found")
-	}
+	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted when lease not found")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls for lease not found, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for lease not found")
 }
 
 func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
@@ -1890,9 +1594,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store a payload
 	payloadStore.Store("lease-1", []byte("payload data"))
@@ -1907,21 +1609,15 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 
 	// Should return nil (lease not pending, skip provisioning)
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v, want nil for non-pending lease", err)
-	}
+	assert.NoError(t, err, "should return nil for non-pending lease")
 
 	// Verify payload was cleaned up
-	if payloadStore.Has("lease-1") {
-		t.Error("payload should be deleted when lease is not pending")
-	}
+	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted when lease is not pending")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls for non-pending lease, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for non-pending lease")
 }
 
 func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
@@ -1948,9 +1644,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	event := PayloadEvent{
 		LeaseUUID:   "lease-1",
@@ -1962,9 +1656,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 
 	// Should return error for retry
 	err = manager.handlePayloadReceived(msg)
-	if err == nil {
-		t.Error("handlePayloadReceived() error = nil, want error for chain error")
-	}
+	require.Error(t, err, "should return error for chain error")
 }
 
 func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
@@ -1996,9 +1688,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store payload
 	testPayload := []byte("payload data")
@@ -2015,22 +1705,14 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 
 	// Should return error for retry
 	err = manager.handlePayloadReceived(msg)
-	if err == nil {
-		t.Error("handlePayloadReceived() error = nil, want error")
-	}
-	if !errors.Is(err, ErrProvisioningFailed) {
-		t.Errorf("handlePayloadReceived() error = %v, want ErrProvisioningFailed", err)
-	}
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrProvisioningFailed)
 
 	// Verify lease was untracked after error
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after provision error")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after provision error")
 
 	// Verify payload was NOT deleted (kept for retry)
-	if !payloadStore.Has("lease-1") {
-		t.Error("payload should be kept for retry after provision error")
-	}
+	assert.True(t, payloadStore.Has("lease-1"), "payload should be kept for retry after provision error")
 }
 
 func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
@@ -2061,9 +1743,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Pre-track the lease (simulating concurrent processing)
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
@@ -2078,16 +1758,12 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 
 	// Should return nil (skip already in-flight lease)
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v, want nil for already in-flight", err)
-	}
+	assert.NoError(t, err, "should return nil for already in-flight lease")
 
 	// Verify no provisioning was attempted (already being processed)
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls for already in-flight lease, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for already in-flight lease")
 }
 
 func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
@@ -2118,9 +1794,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// DON'T store a payload - simulate race where payload was cleaned up
 
@@ -2134,24 +1808,16 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 
 	// Should succeed (proceeds without payload with warning)
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v, want nil when payload missing from store", err)
-	}
+	assert.NoError(t, err, "should return nil when payload missing from store")
 
 	// Verify provisioning was called (with nil payload and no hash)
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 1 {
-		t.Fatalf("expected 1 provision call, got %d", len(mockBackend.provisionCalls))
-	}
-	if mockBackend.provisionCalls[0].Payload != nil {
-		t.Errorf("provision Payload = %v, want nil", mockBackend.provisionCalls[0].Payload)
-	}
+	require.Len(t, mockBackend.provisionCalls, 1)
+	assert.Nil(t, mockBackend.provisionCalls[0].Payload)
 	// PayloadHash should be empty when payload is missing - backends should never
 	// receive a hash without the corresponding payload data
-	if mockBackend.provisionCalls[0].PayloadHash != "" {
-		t.Errorf("provision PayloadHash = %q, want empty when payload is missing", mockBackend.provisionCalls[0].PayloadHash)
-	}
+	assert.Empty(t, mockBackend.provisionCalls[0].PayloadHash, "PayloadHash should be empty when payload is missing")
 }
 
 func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
@@ -2188,9 +1854,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store payload
 	testPayload := []byte("gpu deployment")
@@ -2206,39 +1870,27 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Errorf("handlePayloadReceived() error = %v", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify GPU backend received the call
 	gpuBackend.mu.Lock()
 	gpuCalls := gpuBackend.provisionCalls
 	gpuBackend.mu.Unlock()
 
-	if len(gpuCalls) != 1 {
-		t.Fatalf("expected 1 provision call to GPU backend, got %d", len(gpuCalls))
-	}
-	if gpuCalls[0].RoutingSKU() != "gpu-a100" {
-		t.Errorf("provision SKU = %q, want %q", gpuCalls[0].RoutingSKU(), "gpu-a100")
-	}
+	require.Len(t, gpuCalls, 1)
+	assert.Equal(t, "gpu-a100", gpuCalls[0].RoutingSKU())
 
 	// Verify K8s backend did NOT receive any calls
 	k8sBackend.mu.Lock()
 	k8sCalls := k8sBackend.provisionCalls
 	k8sBackend.mu.Unlock()
 
-	if len(k8sCalls) != 0 {
-		t.Errorf("expected 0 provision calls to K8s backend, got %d", len(k8sCalls))
-	}
+	assert.Empty(t, k8sCalls, "K8s backend should not have received any provision calls")
 
 	// Verify in-flight tracking has correct backend
 	provision, exists := manager.GetInFlight("gpu-lease-1")
-	if !exists {
-		t.Fatal("lease should be in-flight")
-	}
-	if provision.Backend != "gpu-backend" {
-		t.Errorf("in-flight Backend = %q, want %q", provision.Backend, "gpu-backend")
-	}
+	require.True(t, exists, "lease should be in-flight")
+	assert.Equal(t, "gpu-backend", provision.Backend)
 }
 
 // TestManager_CheckCallbackTimeouts tests the timeout detection and rejection logic.
@@ -2268,9 +1920,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		CallbackTimeout:      100 * time.Millisecond, // Short timeout for testing
 		TimeoutCheckInterval: 50 * time.Millisecond,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	t.Run("detects_timed_out_provisions", func(t *testing.T) {
 		mu.Lock()
@@ -2287,20 +1937,12 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		// Verify lease was rejected
 		mu.Lock()
 		defer mu.Unlock()
-		if len(rejectedLeases) != 1 {
-			t.Fatalf("expected 1 rejected lease, got %d", len(rejectedLeases))
-		}
-		if rejectedLeases[0] != "timeout-lease" {
-			t.Errorf("rejected lease = %q, want %q", rejectedLeases[0], "timeout-lease")
-		}
-		if rejectReason != "callback timeout" {
-			t.Errorf("reject reason = %q, want %q", rejectReason, "callback timeout")
-		}
+		require.Len(t, rejectedLeases, 1)
+		assert.Equal(t, "timeout-lease", rejectedLeases[0])
+		assert.Equal(t, "callback timeout", rejectReason)
 
 		// Verify removed from in-flight
-		if manager.IsInFlight("timeout-lease") {
-			t.Error("timed-out lease should be removed from in-flight")
-		}
+		assert.False(t, manager.IsInFlight("timeout-lease"), "timed-out lease should be removed from in-flight")
 	})
 
 	t.Run("ignores_recent_provisions", func(t *testing.T) {
@@ -2319,14 +1961,10 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		rejected := len(rejectedLeases)
 		mu.Unlock()
 
-		if rejected != 0 {
-			t.Errorf("expected 0 rejected leases, got %d", rejected)
-		}
+		assert.Equal(t, 0, rejected, "fresh lease should not be rejected")
 
 		// Verify still in-flight
-		if !manager.IsInFlight("fresh-lease") {
-			t.Error("fresh lease should still be in-flight")
-		}
+		assert.True(t, manager.IsInFlight("fresh-lease"), "fresh lease should still be in-flight")
 
 		// Cleanup
 		manager.UntrackInFlight("fresh-lease")
@@ -2357,9 +1995,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		mu.Unlock()
 
 		// Should have stopped early due to cancellation
-		if rejected >= 5 {
-			t.Errorf("expected less than 5 rejected leases with cancelled context, got %d", rejected)
-		}
+		assert.Less(t, rejected, 5, "should have stopped early due to cancellation")
 
 		// Cleanup remaining
 		for _, leaseID := range manager.GetInFlightLeases() {
@@ -2381,9 +2017,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 			CallbackTimeout:      100 * time.Millisecond,
 			TimeoutCheckInterval: 50 * time.Millisecond,
 		}, router, failingChain)
-		if err != nil {
-			t.Fatalf("NewManager() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Track an old lease
 		tracker := failManager.Tracker().(*DefaultInFlightTracker)
@@ -2395,9 +2029,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		// Lease should REMAIN in-flight when chain reject fails
 		// This prevents the reconciler from seeing a PENDING lease not in-flight
 		// and trying to re-provision it. The next timeout check will retry the rejection.
-		if !failManager.IsInFlight("fail-lease") {
-			t.Error("lease should remain in-flight when chain reject fails to prevent re-provisioning")
-		}
+		assert.True(t, failManager.IsInFlight("fail-lease"), "lease should remain in-flight when chain reject fails to prevent re-provisioning")
 
 		// Clean up
 		failManager.UntrackInFlight("fail-lease")
@@ -2429,9 +2061,7 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 		CallbackTimeout:      50 * time.Millisecond, // Short for testing
 		TimeoutCheckInterval: 25 * time.Millisecond, // Check frequently
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Start the timeout checker
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2457,14 +2087,10 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	}
 	mu.Unlock()
 
-	if !found {
-		t.Error("timeout checker should have rejected the timed-out lease")
-	}
+	assert.True(t, found, "timeout checker should have rejected the timed-out lease")
 
 	// Verify removed from in-flight
-	if manager.IsInFlight("auto-timeout-lease") {
-		t.Error("lease should be removed from in-flight after timeout")
-	}
+	assert.False(t, manager.IsInFlight("auto-timeout-lease"), "lease should be removed from in-flight after timeout")
 }
 
 // TestPayloadPersistsUntilCallback is a regression test for the bug where payload
@@ -2502,9 +2128,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 		DBPath:          t.TempDir() + "/payloads.db",
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err)
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
@@ -2512,14 +2136,10 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store payload (simulating upload)
-	if !payloadStore.Store("lease-1", testPayload) {
-		t.Fatal("failed to store payload")
-	}
+	require.True(t, payloadStore.Store("lease-1", testPayload), "failed to store payload")
 
 	// Step 1: Send payload received event to trigger provisioning
 	event := PayloadEvent{
@@ -2531,27 +2151,19 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), eventPayload)
 
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Fatalf("handlePayloadReceived() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Step 2: REGRESSION CHECK - Payload must still exist after Provision() returns
 	// Previously, the payload was deleted here, causing data loss if callback failed
-	if !payloadStore.Has("lease-1") {
-		t.Fatal("REGRESSION: payload was deleted after Provision() - should persist until callback")
-	}
+	require.True(t, payloadStore.Has("lease-1"), "REGRESSION: payload was deleted after Provision() - should persist until callback")
 
 	// Verify provisioning was called
 	mockBackend.mu.Lock()
-	if len(mockBackend.provisionCalls) != 1 {
-		t.Fatalf("expected 1 provision call, got %d", len(mockBackend.provisionCalls))
-	}
+	require.Len(t, mockBackend.provisionCalls, 1)
 	mockBackend.mu.Unlock()
 
 	// Verify lease is in-flight
-	if !manager.IsInFlight("lease-1") {
-		t.Fatal("lease should be in-flight after provisioning started")
-	}
+	require.True(t, manager.IsInFlight("lease-1"), "lease should be in-flight after provisioning started")
 
 	// Step 3: Simulate successful callback - payload should be deleted now
 	callback := backend.CallbackPayload{
@@ -2562,21 +2174,15 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)
 
 	err = manager.handleBackendCallback(callbackMsg)
-	if err != nil {
-		t.Fatalf("handleBackendCallback() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Payload should persist after successful callback — it's retained for
 	// potential re-provisioning if the container crashes after acknowledgment.
 	// Cleanup happens when the lease is closed or rejected.
-	if !payloadStore.Has("lease-1") {
-		t.Error("payload should persist after successful callback for re-provisioning")
-	}
+	assert.True(t, payloadStore.Has("lease-1"), "payload should persist after successful callback for re-provisioning")
 
 	// Lease should no longer be in-flight
-	if manager.IsInFlight("lease-1") {
-		t.Error("lease should not be in-flight after successful callback")
-	}
+	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after successful callback")
 }
 
 // TestPayloadDeletedAfterFailedCallback verifies that payloads are cleaned up
@@ -2608,9 +2214,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 		DBPath:          t.TempDir() + "/payloads.db",
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err)
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
@@ -2618,14 +2222,10 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store payload
-	if !payloadStore.Store("lease-1", testPayload) {
-		t.Fatal("failed to store payload")
-	}
+	require.True(t, payloadStore.Store("lease-1", testPayload), "failed to store payload")
 
 	// Trigger provisioning
 	event := PayloadEvent{
@@ -2637,14 +2237,10 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), eventPayload)
 
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Fatalf("handlePayloadReceived() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Payload should still exist
-	if !payloadStore.Has("lease-1") {
-		t.Fatal("payload should exist after provisioning started")
-	}
+	require.True(t, payloadStore.Has("lease-1"), "payload should exist after provisioning started")
 
 	// Simulate failed callback
 	callback := backend.CallbackPayload{
@@ -2656,14 +2252,10 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)
 
 	err = manager.handleBackendCallback(callbackMsg)
-	if err != nil {
-		t.Fatalf("handleBackendCallback() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Payload should be deleted after failed callback (no point keeping it)
-	if payloadStore.Has("lease-1") {
-		t.Error("payload should be deleted after failed callback")
-	}
+	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted after failed callback")
 }
 
 // TestPayloadSurvivesRestartForReconciliation verifies that if a provider restarts
@@ -2696,23 +2288,17 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 		DBPath:          dbPath,
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Store payload and trigger provisioning
-	if !payloadStore.Store("lease-1", testPayload) {
-		t.Fatal("failed to store payload")
-	}
+	require.True(t, payloadStore.Store("lease-1", testPayload), "failed to store payload")
 
 	event := PayloadEvent{
 		LeaseUUID:   "lease-1",
@@ -2723,17 +2309,13 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), eventPayload)
 
 	err = manager.handlePayloadReceived(msg)
-	if err != nil {
-		t.Fatalf("handlePayloadReceived() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Verify provisioning was called
 	mockBackend.mu.Lock()
 	provisionCount := len(mockBackend.provisionCalls)
 	mockBackend.mu.Unlock()
-	if provisionCount != 1 {
-		t.Fatalf("expected 1 provision call, got %d", provisionCount)
-	}
+	require.Equal(t, 1, provisionCount)
 
 	// Simulate restart: close payload store (manager doesn't need to be started for this test)
 	payloadStore.Close()
@@ -2743,22 +2325,16 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 		DBPath:          dbPath,
 
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() after restart error = %v", err)
-	}
+	require.NoError(t, err)
 	defer payloadStore2.Close()
 
 	// KEY ASSERTION: Payload should still exist after "restart"
 	// This is what allows reconciliation to retry provisioning
-	if !payloadStore2.Has("lease-1") {
-		t.Fatal("REGRESSION: payload was lost after restart - reconciliation cannot retry")
-	}
+	require.True(t, payloadStore2.Has("lease-1"), "REGRESSION: payload was lost after restart - reconciliation cannot retry")
 
 	// Verify we can retrieve the payload with correct content
 	retrievedPayload := payloadStore2.Get("lease-1")
-	if string(retrievedPayload) != string(testPayload) {
-		t.Errorf("retrieved payload = %q, want %q", retrievedPayload, testPayload)
-	}
+	assert.Equal(t, string(testPayload), string(retrievedPayload))
 }
 
 // TestCallbacksRequireRunningRouter is a regression test for the startup race condition
@@ -2792,9 +2368,7 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2834,9 +2408,7 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	}
 
 	// Use the manager's PublishCallback method which publishes to the internal topic
-	if err := manager.PublishCallback(callback); err != nil {
-		t.Fatalf("failed to publish callback: %v", err)
-	}
+	require.NoError(t, manager.PublishCallback(callback), "failed to publish callback")
 
 	// Wait for callback to be processed
 	deadline := time.Now().Add(2 * time.Second)
@@ -2847,14 +2419,10 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if !ackCalled.Load() {
-		t.Error("REGRESSION: callback was not processed after Running() - handlers may not be subscribed")
-	}
+	assert.True(t, ackCalled.Load(), "REGRESSION: callback was not processed after Running() - handlers may not be subscribed")
 
 	// Verify lease was removed from in-flight (callback was processed)
-	if manager.IsInFlight("lease-after") {
-		t.Error("lease should not be in-flight after successful callback")
-	}
+	assert.False(t, manager.IsInFlight("lease-after"), "lease should not be in-flight after successful callback")
 
 	// Clean up
 	cancel()
