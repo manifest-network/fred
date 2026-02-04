@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 func TestHTTPClient_Provision(t *testing.T) {
@@ -416,4 +419,95 @@ func TestHTTPClient_CircuitBreaker_ConsecutiveFailuresTrip(t *testing.T) {
 
 	// Server should have received exactly 3 requests
 	assert.Equal(t, 3, requestCount)
+}
+
+func TestHTTPClient_Provision_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-signing-provision"
+
+	var capturedSig string
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	err := client.Provision(context.Background(), ProvisionRequest{
+		LeaseUUID:    "lease-hmac-1",
+		Tenant:       "tenant-1",
+		ProviderUUID: "provider-1",
+		Items:        []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
+		CallbackURL:  "http://fred/callback",
+	})
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
+	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature should verify successfully")
+}
+
+func TestHTTPClient_Deprovision_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-signing-deprovision"
+
+	var capturedSig string
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-deprov",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	err := client.Deprovision(context.Background(), "lease-to-delete")
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
+	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature should verify successfully")
+}
+
+func TestHTTPClient_Provision_NoHMAC_NoHeader(t *testing.T) {
+	var capturedSig string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	// No Secret configured
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-no-hmac",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Provision(context.Background(), ProvisionRequest{
+		LeaseUUID:    "lease-no-hmac",
+		Tenant:       "tenant-1",
+		ProviderUUID: "provider-1",
+		Items:        []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
+		CallbackURL:  "http://fred/callback",
+	})
+	require.NoError(t, err)
+
+	assert.Empty(t, capturedSig, "X-Fred-Signature header should be absent when no secret configured")
 }

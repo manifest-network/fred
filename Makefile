@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker install clean deps test test-coverage lint run run-mock run-mock-delay run-docker fmt generate verify help
+.PHONY: all build build-mock build-docker install clean deps test test-integration test-coverage lint run run-mock run-mock-delay run-docker fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -65,6 +65,11 @@ test:
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
 
+# Run Docker integration tests (requires Docker daemon)
+test-integration:
+	@echo "Running Docker integration tests..."
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration
+
 # Run tests with coverage
 test-coverage:
 	@echo "Running tests with coverage..."
@@ -126,6 +131,7 @@ help:
 	@echo "  clean            - Clean build artifacts"
 	@echo "  deps             - Download and tidy dependencies"
 	@echo "  test             - Run tests"
+	@echo "  test-integration - Run Docker integration tests (requires Docker)"
 	@echo "  test-coverage    - Run tests with coverage report"
 	@echo "  lint             - Run linter"
 	@echo "  run              - Build and run providerd with example config"
