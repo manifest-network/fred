@@ -30,6 +30,7 @@ type dockerClient interface {
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainer(ctx context.Context, containerID string) error
 	InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error)
+	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
 	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
@@ -193,9 +194,21 @@ func (b *Backend) Stop() error {
 
 // replayPendingCallbacks replays any callbacks that were persisted but not
 // successfully delivered before the previous shutdown.
+// Entries older than CallbackMaxAge are removed without delivery.
 func (b *Backend) replayPendingCallbacks() {
 	if b.callbackStore == nil {
 		return
+	}
+
+	// Expire old callbacks before replaying
+	maxAge := b.cfg.CallbackMaxAge
+	if maxAge > 0 {
+		removed, err := b.callbackStore.RemoveOlderThan(maxAge)
+		if err != nil {
+			b.logger.Error("failed to remove expired callbacks", "error", err)
+		} else if removed > 0 {
+			b.logger.Warn("removed expired callbacks", "count", removed, "max_age", maxAge)
+		}
 	}
 
 	entries, err := b.callbackStore.ListPending()
@@ -668,50 +681,68 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 // Returns an error if any container removal fails for a reason other than
 // the container already being gone (which is handled idempotently by
 // RemoveContainer).
+//
+// On partial failure (some containers removed, some stuck), the provision
+// is kept in the map with Status=Failed and ContainerIDs narrowed to only
+// the failed removals. Resource pool allocations are still released (the
+// lease is being abandoned). On retry, only the stuck containers are
+// attempted.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
 
-	b.provisionsMu.Lock()
+	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
-	if exists {
-		delete(b.provisions, leaseUUID)
-	}
-	b.provisionsMu.Unlock()
-
-	// Release resources for all instances
-	if exists {
-		for i := 0; i < prov.Quantity; i++ {
-			b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
-		}
-	}
+	b.provisionsMu.RUnlock()
 
 	if !exists {
 		// Already deprovisioned - idempotent success
 		return nil
 	}
 
-	// Remove all containers, collecting any real errors.
+	// Remove all containers, collecting successes and failures.
 	// RemoveContainer is idempotent (already-removed containers return nil),
 	// so non-nil errors indicate actual failures (I/O, permissions, etc.).
 	var errs []error
+	var failedIDs []string
 	for _, containerID := range prov.ContainerIDs {
 		if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
 			logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
 			errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+			failedIDs = append(failedIDs, containerID)
 		} else {
 			logger.Info("container removed", "container_id", shortID(containerID))
 		}
 	}
+
+	// Release resource pool allocations regardless of outcome — the lease
+	// is being abandoned and these resources should be freed.
+	for i := 0; i < prov.Quantity; i++ {
+		b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
+	}
+
+	if len(errs) > 0 {
+		// Partial failure: keep provision visible with only the stuck containers
+		// so the reconciler (or a retry) can see and re-attempt them.
+		b.provisionsMu.Lock()
+		if p, ok := b.provisions[leaseUUID]; ok {
+			p.Status = backend.ProvisionStatusFailed
+			p.ContainerIDs = failedIDs
+			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
+		}
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
+	}
+
+	// All containers removed successfully — delete provision from map.
+	b.provisionsMu.Lock()
+	delete(b.provisions, leaseUUID)
+	b.provisionsMu.Unlock()
 
 	// Clean up tenant network if isolation is enabled
 	if b.cfg.IsNetworkIsolation() {
 		if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, prov.Tenant); err != nil {
 			logger.Warn("failed to remove tenant network", "tenant", prov.Tenant, "error", err)
 		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
 	}
 
 	deprovisionsTotal.Inc()
@@ -1099,6 +1130,29 @@ func (b *Backend) trySendCallback(leaseUUID, callbackURL string, body []byte) bo
 		"body", string(respBody),
 	)
 	return false
+}
+
+// GetLogs returns the last N lines of stdout/stderr for each container in
+// a lease, keyed by instance index (e.g., "0", "1").
+func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	b.provisionsMu.RLock()
+	prov, exists := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+
+	if !exists {
+		return nil, backend.ErrNotProvisioned
+	}
+
+	result := make(map[string]string, len(prov.ContainerIDs))
+	for i, containerID := range prov.ContainerIDs {
+		logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
+		if err != nil {
+			result[fmt.Sprintf("%d", i)] = fmt.Sprintf("<error: %s>", err)
+			continue
+		}
+		result[fmt.Sprintf("%d", i)] = logs
+	}
+	return result, nil
 }
 
 // Stats returns current resource usage statistics.

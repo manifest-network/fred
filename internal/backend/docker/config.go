@@ -109,6 +109,11 @@ type Config struct {
 	// When enabled, StorageOpt is set on the container's HostConfig.
 	// Defaults to true. Set to false on unsupported filesystems.
 	ContainerDiskQuota *bool `yaml:"container_disk_quota"`
+
+	// CallbackMaxAge is the maximum age of a persisted callback entry.
+	// Entries older than this are removed during startup replay.
+	// Defaults to 24h.
+	CallbackMaxAge time.Duration `yaml:"callback_max_age"`
 }
 
 func ptrBool(b bool) *bool    { return &b }
@@ -201,6 +206,7 @@ func DefaultConfig() Config {
 		ContainerPidsLimit:      ptrInt64(256),
 		ContainerTmpfsSizeMB:    64,
 		ContainerDiskQuota:      ptrBool(true),
+		CallbackMaxAge:          24 * time.Hour,
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
 				CPUCores: 0.25,
@@ -336,6 +342,10 @@ func (c *Config) Validate() error {
 
 	if c.ContainerTmpfsSizeMB < 0 {
 		return fmt.Errorf("container_tmpfs_size_mb must be >= 0")
+	}
+
+	if c.CallbackMaxAge < 0 {
+		return fmt.Errorf("callback_max_age must be non-negative")
 	}
 
 	if c.TenantQuota != nil {

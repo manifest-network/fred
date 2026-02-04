@@ -25,6 +25,7 @@ type mockDockerClient struct {
 	StartContainerFn             func(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainerFn            func(ctx context.Context, containerID string) error
 	InspectContainerFn           func(ctx context.Context, containerID string) (*ContainerInfo, error)
+	ContainerLogsFn              func(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainersFn      func(ctx context.Context) ([]ContainerInfo, error)
 	EnsureTenantNetworkFn        func(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
@@ -78,6 +79,13 @@ func (m *mockDockerClient) InspectContainer(ctx context.Context, containerID str
 		return m.InspectContainerFn(ctx, containerID)
 	}
 	panic("unexpected call to InspectContainer")
+}
+
+func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string, tail int) (string, error) {
+	if m.ContainerLogsFn != nil {
+		return m.ContainerLogsFn(ctx, containerID, tail)
+	}
+	panic("unexpected call to ContainerLogs")
 }
 
 func (m *mockDockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {

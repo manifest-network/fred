@@ -132,7 +132,42 @@ type CreateContainerParams struct {
 	NetworkConfig  *networktypes.NetworkingConfig
 }
 
+// portBindRetries is the number of times to retry container creation when
+// an ephemeral port conflict occurs.
+const portBindRetries = 3
+
+// portBindRetryDelay is the delay between retries for ephemeral port conflicts.
+const portBindRetryDelay = 500 * time.Millisecond
+
+// isPortBindingError checks if an error is a port binding conflict.
+func isPortBindingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "port is already allocated") ||
+		strings.Contains(msg, "address already in use")
+}
+
+// hasEphemeralPorts returns true if any port binding uses an ephemeral host
+// port (HostPort == 0 or empty, meaning Docker assigns a random port).
+// Returns false only when all ports have an explicit HostPort, in which
+// case retrying a port conflict won't help.
+func hasEphemeralPorts(ports map[string]PortConfig) bool {
+	if len(ports) == 0 {
+		return false // No ports, no conflicts to retry
+	}
+	for _, cfg := range ports {
+		if cfg.HostPort == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // CreateContainer creates a new container with the specified configuration.
+// For ephemeral port bindings, it retries up to portBindRetries times on
+// port conflict errors since these can be transient.
 func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -244,12 +279,30 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		networkConfig = &networktypes.NetworkingConfig{}
 	}
 
-	resp, err := d.client.ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
-	if err != nil {
-		return "", fmt.Errorf("failed to create container: %w", err)
+	// Attempt creation with retry for ephemeral port conflicts.
+	ephemeral := hasEphemeralPorts(params.Manifest.Ports)
+	var lastErr error
+	for attempt := range portBindRetries {
+		resp, err := d.client.ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
+		if err == nil {
+			return resp.ID, nil
+		}
+
+		if !ephemeral || !isPortBindingError(err) {
+			return "", fmt.Errorf("failed to create container: %w", err)
+		}
+
+		lastErr = err
+		if attempt < portBindRetries-1 {
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("failed to create container: %w (port conflict retries exhausted by context: %w)", lastErr, ctx.Err())
+			case <-time.After(portBindRetryDelay):
+			}
+		}
 	}
 
-	return resp.ID, nil
+	return "", fmt.Errorf("failed to create container after %d retries: %w", portBindRetries, lastErr)
 }
 
 // StartContainer starts a container.
@@ -263,6 +316,35 @@ func (d *DockerClient) StartContainer(ctx context.Context, containerID string, t
 	}
 
 	return nil
+}
+
+// ContainerLogs returns the last `tail` lines of combined stdout/stderr for
+// a container. If tail is <= 0 it defaults to 100.
+func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, tail int) (string, error) {
+	if tail <= 0 {
+		tail = 100
+	}
+
+	reader, err := d.client.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       strconv.Itoa(tail),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get container logs: %w", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	// Docker multiplexes stdout/stderr with an 8-byte header per frame.
+	// Use stdcopy.StdCopy to demux, but for simplicity we combine both
+	// streams into one buffer.
+	var buf strings.Builder
+	_, err = io.Copy(&buf, reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read container logs: %w", err)
+	}
+
+	return buf.String(), nil
 }
 
 // RemoveContainer removes a container. It is idempotent — removing an

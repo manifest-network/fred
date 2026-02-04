@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -166,6 +167,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /provision", authMw(http.HandlerFunc(s.handleProvision)))
 	mux.Handle("POST /deprovision", authMw(http.HandlerFunc(s.handleDeprovision)))
 	mux.HandleFunc("GET /info/{lease_uuid}", s.handleGetInfo)
+	mux.HandleFunc("GET /logs/{lease_uuid}", s.handleGetLogs)
 	mux.HandleFunc("GET /provisions", s.handleListProvisions)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /stats", s.handleStats)
@@ -239,6 +241,37 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
+}
+
+func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+	if leaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+
+	tail := 100 // default
+	if v := r.URL.Query().Get("tail"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			s.errorResponse(w, http.StatusBadRequest, "tail must be a positive integer")
+			return
+		}
+		tail = n
+	}
+
+	logs, err := s.backend.GetLogs(r.Context(), leaseUUID, tail)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
 }
 
 // DeprovisionRequest is the request body for /deprovision.

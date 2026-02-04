@@ -885,6 +885,45 @@ func TestHasActiveHealthCheck(t *testing.T) {
 	}
 }
 
+func TestIsPortBindingError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"nil error", nil, false},
+		{"port already allocated", fmt.Errorf("failed to create container: port is already allocated"), true},
+		{"address already in use", fmt.Errorf("Bind for 0.0.0.0:8080: address already in use"), true},
+		{"unrelated error", fmt.Errorf("disk full"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isPortBindingError(tt.err))
+		})
+	}
+}
+
+func TestHasEphemeralPorts(t *testing.T) {
+	tests := []struct {
+		name     string
+		ports    map[string]PortConfig
+		expected bool
+	}{
+		{"nil ports", nil, false},
+		{"empty ports", map[string]PortConfig{}, false},
+		{"ephemeral port", map[string]PortConfig{"80/tcp": {HostPort: 0}}, true},
+		{"explicit port only", map[string]PortConfig{"80/tcp": {HostPort: 8080}}, false},
+		{"mixed ports", map[string]PortConfig{"80/tcp": {HostPort: 0}, "443/tcp": {HostPort: 8443}}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, hasEphemeralPorts(tt.ports))
+		})
+	}
+}
+
 func TestTenantNetworkName(t *testing.T) {
 	t.Run("deterministic", func(t *testing.T) {
 		name1 := TenantNetworkName("manifest1abc")

@@ -91,6 +91,38 @@ func (s *CallbackStore) ListPending() ([]CallbackEntry, error) {
 	return entries, err
 }
 
+// RemoveOlderThan deletes callback entries older than maxAge and returns
+// the number of entries removed.
+func (s *CallbackStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(callbackBucketName)
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var entry CallbackEntry
+			if err := json.Unmarshal(v, &entry); err != nil {
+				// Remove malformed entries
+				if delErr := c.Delete(); delErr != nil {
+					return delErr
+				}
+				removed++
+				continue
+			}
+			if entry.CreatedAt.Before(cutoff) {
+				if delErr := c.Delete(); delErr != nil {
+					return delErr
+				}
+				removed++
+			}
+		}
+		return nil
+	})
+
+	return removed, err
+}
+
 // Close closes the underlying bbolt database.
 func (s *CallbackStore) Close() error {
 	return s.db.Close()

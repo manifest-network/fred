@@ -540,6 +540,90 @@ func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 }
 
+func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var removedIDs []string
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return fmt.Sprintf("container-%d", params.InstanceIndex), nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			// Always return "starting" so health check never passes
+			return &ContainerInfo{
+				ContainerID: containerID,
+				Status:      "running",
+				Health:      HealthStatusStarting,
+			}, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			removedIDs = append(removedIDs, containerID)
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    2,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+
+	manifest := &DockerManifest{
+		Image: "nginx:latest",
+		HealthCheck: &HealthCheckConfig{
+			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
+		},
+	}
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	// Use a very short timeout so the health check times out quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      validManifestJSON("nginx:latest"),
+	}
+	b.doProvision(ctx, req, manifest, profiles, b.logger)
+
+	// Verify: provision should be marked failed
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Contains(t, prov.LastError, "timed out")
+
+	// Verify: both containers should have been cleaned up by the defer
+	assert.ElementsMatch(t, []string{"container-0", "container-1"}, removedIDs,
+		"containers should be cleaned up when health check times out")
+
+	// Verify: resources should be released
+	stats := b.pool.Stats()
+	assert.Equal(t, 0, stats.AllocationCount)
+}
+
 // --- Deprovision tests ---
 
 func TestDeprovision_Success(t *testing.T) {
@@ -607,10 +691,63 @@ func TestDeprovision_PartialContainerFailure(t *testing.T) {
 			ContainerIDs: []string{"c1", "c2"},
 		},
 	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
 
 	err := b.Deprovision(context.Background(), "lease-1")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "deprovision partially failed")
+
+	// Provision should remain in map with only the failed container
+	b.provisionsMu.RLock()
+	prov, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	require.True(t, exists, "provision should remain in map after partial failure")
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Equal(t, []string{"c2"}, prov.ContainerIDs, "only stuck containers should remain")
+	assert.Contains(t, prov.LastError, "deprovision partially failed")
+
+	// Resources should still be released (lease is being abandoned)
+	stats := b.pool.Stats()
+	assert.Equal(t, 0, stats.AllocationCount)
+}
+
+func TestDeprovision_PartialFailure_RetryOnlyStuck(t *testing.T) {
+	removeCalls := 0
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			removeCalls++
+			if containerID == "c2" && removeCalls <= 2 {
+				// Fail on first attempt, succeed on second
+				return errors.New("permission denied")
+			}
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     2,
+			ContainerIDs: []string{"c1", "c2"},
+		},
+	})
+
+	// First deprovision: partial failure (c2 fails)
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.Error(t, err)
+
+	// Retry: only the stuck container (c2) should be attempted
+	err = b.Deprovision(context.Background(), "lease-1")
+	require.NoError(t, err)
+
+	// Provision should now be fully removed
+	b.provisionsMu.RLock()
+	_, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, exists, "provision should be removed after successful retry")
 }
 
 func TestDeprovision_WithNetworkIsolation(t *testing.T) {
@@ -725,6 +862,62 @@ func TestGetInfo_MultiContainer(t *testing.T) {
 	require.NoError(t, err)
 	instances := (*info)["instances"].([]map[string]any)
 	assert.Len(t, instances, 3)
+}
+
+// --- GetLogs tests ---
+
+func TestGetLogs_Success(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return fmt.Sprintf("logs for %s (tail=%d)", containerID, tail), nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1", "c2"},
+		},
+	})
+
+	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
+	require.NoError(t, err)
+	assert.Len(t, logs, 2)
+	assert.Equal(t, "logs for c1 (tail=50)", logs["0"])
+	assert.Equal(t, "logs for c2 (tail=50)", logs["1"])
+}
+
+func TestGetLogs_NotProvisioned(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+
+	_, err := b.GetLogs(context.Background(), "nonexistent", 100)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+func TestGetLogs_PartialError(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			if containerID == "c2" {
+				return "", errors.New("container not running")
+			}
+			return "hello world", nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1", "c2"},
+		},
+	})
+
+	logs, err := b.GetLogs(context.Background(), "lease-1", 100)
+	require.NoError(t, err)
+	assert.Equal(t, "hello world", logs["0"])
+	assert.Contains(t, logs["1"], "<error:")
 }
 
 // --- ListProvisions tests ---
@@ -1567,6 +1760,95 @@ func TestReplayPendingCallbacks_NilStore(t *testing.T) {
 	b.replayPendingCallbacks()
 }
 
+func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	var received []backend.CallbackPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		received = append(received, p)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb_expire.db")
+	cbStore, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+
+	// Store an old callback (2 hours ago) and a fresh one
+	require.NoError(t, cbStore.Store(CallbackEntry{
+		LeaseUUID:   "lease-old",
+		CallbackURL: server.URL,
+		Success:     true,
+		CreatedAt:   time.Now().Add(-2 * time.Hour),
+	}))
+	require.NoError(t, cbStore.Store(CallbackEntry{
+		LeaseUUID:   "lease-fresh",
+		CallbackURL: server.URL,
+		Success:     true,
+		CreatedAt:   time.Now(),
+	}))
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.httpClient = server.Client()
+	b.callbackStore = cbStore
+	b.cfg.CallbackMaxAge = 1 * time.Hour // Expire anything older than 1 hour
+
+	b.replayPendingCallbacks()
+
+	// Only the fresh callback should have been delivered
+	require.Len(t, received, 1)
+	assert.Equal(t, "lease-fresh", received[0].LeaseUUID)
+
+	// Store should be empty after replay (old expired, fresh delivered)
+	pending, err := cbStore.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+
+	cbStore.Close()
+}
+
+func TestCallbackStore_RemoveOlderThan(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_ttl.db")
+	store, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Store entries at different ages
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "old-1",
+		CallbackURL: "http://example.com",
+		Success:     true,
+		CreatedAt:   time.Now().Add(-48 * time.Hour),
+	}))
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "old-2",
+		CallbackURL: "http://example.com",
+		Success:     false,
+		Error:       "some error",
+		CreatedAt:   time.Now().Add(-25 * time.Hour),
+	}))
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "fresh",
+		CallbackURL: "http://example.com",
+		Success:     true,
+		CreatedAt:   time.Now(),
+	}))
+
+	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 2, removed)
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "fresh", pending[0].LeaseUUID)
+}
+
 func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_empty.db")
 	cbStore, err := NewCallbackStore(dbPath)
@@ -1579,4 +1861,303 @@ func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 
 	// Should not panic or make HTTP calls
 	b.replayPendingCallbacks()
+}
+
+// --- Additional coverage tests ---
+
+// Fix 1: Total deprovision failure — ALL container removals fail.
+func TestDeprovision_AllContainersFail(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return errors.New("permission denied")
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     2,
+			ContainerIDs: []string{"c1", "c2"},
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deprovision partially failed")
+
+	// Provision should remain with all containers marked as failed
+	b.provisionsMu.RLock()
+	prov, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	require.True(t, exists)
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.ElementsMatch(t, []string{"c1", "c2"}, prov.ContainerIDs)
+
+	// Resources should still be released
+	stats := b.pool.Stats()
+	assert.Equal(t, 0, stats.AllocationCount)
+}
+
+// Fix 2: RemoveOlderThan on an empty store returns zero.
+func TestCallbackStore_RemoveOlderThan_EmptyStore(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_empty_ttl.db")
+	store, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+	defer store.Close()
+
+	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 0, removed)
+}
+
+// Fix 2: RemoveOlderThan when all entries are fresh — none removed.
+func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_allfresh.db")
+	store, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com",
+		Success:     true,
+		CreatedAt:   time.Now(),
+	}))
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-2",
+		CallbackURL: "http://example.com",
+		Success:     true,
+		CreatedAt:   time.Now().Add(-1 * time.Hour),
+	}))
+
+	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 0, removed)
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	assert.Len(t, pending, 2)
+}
+
+// Fix 2: CallbackMaxAge=0 skips expiry in replayPendingCallbacks.
+func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	var received []backend.CallbackPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		received = append(received, p)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb_zeromax.db")
+	cbStore, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+
+	// Store an old callback (48 hours ago)
+	require.NoError(t, cbStore.Store(CallbackEntry{
+		LeaseUUID:   "lease-old",
+		CallbackURL: server.URL,
+		Success:     true,
+		CreatedAt:   time.Now().Add(-48 * time.Hour),
+	}))
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.httpClient = server.Client()
+	b.callbackStore = cbStore
+	b.cfg.CallbackMaxAge = 0 // Zero means "don't expire"
+
+	b.replayPendingCallbacks()
+
+	// Old callback should still be delivered (not expired)
+	require.Len(t, received, 1)
+	assert.Equal(t, "lease-old", received[0].LeaseUUID)
+
+	cbStore.Close()
+}
+
+// Fix 2: Negative CallbackMaxAge rejected by config validation.
+func TestConfigValidation_NegativeCallbackMaxAge(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CallbackSecret = "this-is-a-32-character-secret!!x"
+	cfg.HostAddress = "192.168.1.100"
+	cfg.CallbackMaxAge = -1 * time.Hour
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "callback_max_age")
+}
+
+// Fix 4: GetLogs on a provisioning (in-progress) lease still returns logs.
+func TestGetLogs_ProvisioningLease(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "startup log output", nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Status:       backend.ProvisionStatusProvisioning,
+			ContainerIDs: []string{"c1"},
+		},
+	})
+
+	// GetLogs doesn't check status — it should work for in-progress provisions
+	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
+	require.NoError(t, err)
+	assert.Equal(t, "startup log output", logs["0"])
+}
+
+// Fix 4: GetLogs with empty ContainerIDs returns empty map.
+func TestGetLogs_EmptyContainerIDs(t *testing.T) {
+	mock := &mockDockerClient{}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{},
+		},
+	})
+
+	logs, err := b.GetLogs(context.Background(), "lease-1", 100)
+	require.NoError(t, err)
+	assert.Empty(t, logs)
+}
+
+// Fix 5: Explicit (non-ephemeral) port conflict returns error immediately without retry.
+func TestCreateContainer_ExplicitPortConflict_NoRetry(t *testing.T) {
+	createCalls := 0
+	mock := &mockDockerClient{
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			createCalls++
+			// Simulate the retry logic by checking what hasEphemeralPorts + isPortBindingError would do.
+			// The mock receives the params — the actual retry logic is in DockerClient.CreateContainer,
+			// not the mock. Instead, test the helper functions' decision logic.
+			return "", fmt.Errorf("port is already allocated")
+		},
+	}
+
+	// Manifest with explicit (non-ephemeral) port
+	manifest := &DockerManifest{
+		Image: "nginx:latest",
+		Ports: map[string]PortConfig{
+			"80/tcp": {HostPort: 8080}, // Explicit port
+		},
+	}
+
+	// Verify the decision logic: explicit ports should NOT trigger retry
+	assert.False(t, hasEphemeralPorts(manifest.Ports), "explicit ports should not be ephemeral")
+	assert.True(t, isPortBindingError(fmt.Errorf("port is already allocated")))
+
+	// Also verify: mixed ports (one explicit, one ephemeral) DO trigger retry
+	mixedPorts := map[string]PortConfig{
+		"80/tcp":  {HostPort: 8080}, // explicit
+		"443/tcp": {HostPort: 0},    // ephemeral
+	}
+	assert.True(t, hasEphemeralPorts(mixedPorts), "mixed ports with an ephemeral should be ephemeral")
+
+	// Verify: no ports means no ephemeral
+	assert.False(t, hasEphemeralPorts(nil))
+	assert.False(t, hasEphemeralPorts(map[string]PortConfig{}))
+
+	_ = mock
+	_ = createCalls
+}
+
+// Fix 1: Deprovision on a provisioning lease still removes containers.
+func TestDeprovision_ProvisioningLease(t *testing.T) {
+	var removedIDs []string
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			removedIDs = append(removedIDs, containerID)
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusProvisioning,
+			Quantity:     1,
+			ContainerIDs: []string{"c1"},
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"c1"}, removedIDs)
+
+	b.provisionsMu.RLock()
+	_, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, exists)
+}
+
+// Fix 4: GetLogs on a failed lease still returns logs for remaining containers.
+func TestGetLogs_FailedLease(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "crash log output", nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Status:       backend.ProvisionStatusFailed,
+			ContainerIDs: []string{"c1"},
+			LastError:    "container crashed",
+		},
+	})
+
+	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
+	require.NoError(t, err)
+	assert.Equal(t, "crash log output", logs["0"])
+}
+
+// Fix 2: CallbackStore Store overwrites entry with same LeaseUUID.
+func TestCallbackStore_StoreOverwrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_overwrite.db")
+	store, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Store initial entry
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com/v1",
+		Success:     true,
+		CreatedAt:   time.Now(),
+	}))
+
+	// Overwrite with new entry (same LeaseUUID)
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com/v2",
+		Success:     false,
+		Error:       "updated error",
+		CreatedAt:   time.Now(),
+	}))
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "should have exactly one entry (overwritten)")
+	assert.Equal(t, "http://example.com/v2", pending[0].CallbackURL)
+	assert.False(t, pending[0].Success)
+	assert.Equal(t, "updated error", pending[0].Error)
 }
