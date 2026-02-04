@@ -128,6 +128,8 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		provs[k] = v
 	}
 
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+
 	return &Backend{
 		cfg:          cfg,
 		docker:       mock,
@@ -135,7 +137,8 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		logger:       slog.Default(),
 		provisions:   provs,
 		callbackURLs: make(map[string]string),
-		stopCh:       make(chan struct{}),
+		stopCtx:      stopCtx,
+		stopCancel:   stopCancel,
 	}
 }
 

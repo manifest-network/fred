@@ -35,21 +35,38 @@ func TestParseRegistry(t *testing.T) {
 		{"gcr.io/project/image:tag", "gcr.io"},
 		{"registry.example.com/image", "registry.example.com"},
 		{"registry.example.com/org/image:tag", "registry.example.com"},
-		{"registry.example.com:5000/image", "registry.example.com"},
+		{"registry.example.com:5000/image", "registry.example.com:5000"},
 
 		// Localhost
 		{"localhost/image", "localhost"},
-		{"localhost:5000/image", "localhost"},
+		{"localhost:5000/image", "localhost:5000"},
 
-		// With digests
-		{"nginx@sha256:abc123", "docker.io"},
-		{"ghcr.io/org/app@sha256:abc123", "ghcr.io"},
+		// With digests (valid sha256 hex)
+		{"nginx@sha256:e4c58958181a5925816faa528ce959e487632f4cfd42f9bc0fb0d8d696503c46", "docker.io"},
+		{"ghcr.io/org/app@sha256:e4c58958181a5925816faa528ce959e487632f4cfd42f9bc0fb0d8d696503c46", "ghcr.io"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.image, func(t *testing.T) {
-			result := ParseRegistry(tt.image)
+			result, err := ParseRegistry(tt.image)
+			require.NoError(t, err)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestParseRegistry_Invalid(t *testing.T) {
+	tests := []string{
+		"",
+		":latest",
+		"/image",
+		"nginx@sha256:tooshort",
+	}
+
+	for _, image := range tests {
+		t.Run(image, func(t *testing.T) {
+			_, err := ParseRegistry(image)
+			assert.Error(t, err)
 		})
 	}
 }

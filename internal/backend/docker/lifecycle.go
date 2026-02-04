@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/go-connections/nat"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -435,7 +436,8 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 		return networks[0].ID, nil
 	}
 
-	// Create the network
+	// Create the network. If a concurrent caller already created it, the
+	// Docker API returns a conflict error. Handle this by re-listing.
 	resp, err := d.client.NetworkCreate(ctx, name, networktypes.CreateOptions{
 		Driver:   "bridge",
 		Internal: true,
@@ -445,6 +447,22 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 		},
 	})
 	if err != nil {
+		if errdefs.IsConflict(err) {
+			// Another goroutine created the network between our list and create.
+			networks, listErr := d.client.NetworkList(ctx, networktypes.ListOptions{
+				Filters: filters.NewArgs(
+					filters.Arg("name", name),
+					filters.Arg("label", LabelManaged+"=true"),
+				),
+			})
+			if listErr != nil {
+				return "", fmt.Errorf("failed to list networks after conflict: %w", listErr)
+			}
+			if len(networks) > 0 {
+				return networks[0].ID, nil
+			}
+			return "", fmt.Errorf("network conflict but not found on retry: %w", err)
+		}
 		return "", fmt.Errorf("failed to create tenant network: %w", err)
 	}
 	return resp.ID, nil

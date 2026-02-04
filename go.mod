@@ -8,6 +8,7 @@ require (
 	github.com/ThreeDotsLabs/watermill v1.5.1
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/cosmos/cosmos-sdk v0.50.14
+	github.com/distribution/reference v0.5.0
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/docker/go-connections v0.6.0
 	github.com/google/uuid v1.6.0
@@ -73,7 +74,6 @@ require (
 	github.com/desertbit/timer v0.0.0-20180107155436-c41aec40b27f // indirect
 	github.com/dgraph-io/badger/v4 v4.2.0 // indirect
 	github.com/dgraph-io/ristretto v0.1.1 // indirect
-	github.com/distribution/reference v0.5.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/dvsekhvalnov/jose2go v1.7.0 // indirect

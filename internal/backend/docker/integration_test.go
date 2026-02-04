@@ -1009,3 +1009,57 @@ func TestIntegration_Docker_PortConflict(t *testing.T) {
 		t.Fatal("timeout waiting for failure callback")
 	}
 }
+
+// TestIntegration_EnsureTenantNetwork_ConcurrentRace verifies that two
+// concurrent calls to EnsureTenantNetwork for the same tenant both succeed,
+// even when the second call races with the first's NetworkCreate.
+func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
+	docker, err := NewDockerClient("")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	if err := docker.Ping(ctx); err != nil {
+		t.Skip("Docker not available:", err)
+	}
+
+	tenant := fmt.Sprintf("race-test-%d", time.Now().UnixNano())
+
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = docker.RemoveTenantNetworkIfEmpty(cleanupCtx, tenant)
+	})
+
+	const goroutines = 5
+	results := make(chan string, goroutines)
+	errs := make(chan error, goroutines)
+
+	for range goroutines {
+		go func() {
+			id, err := docker.EnsureTenantNetwork(ctx, tenant)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- id
+		}()
+	}
+
+	var networkIDs []string
+	for range goroutines {
+		select {
+		case id := <-results:
+			networkIDs = append(networkIDs, id)
+		case err := <-errs:
+			t.Fatalf("EnsureTenantNetwork failed: %v", err)
+		case <-time.After(30 * time.Second):
+			t.Fatal("timeout waiting for goroutines")
+		}
+	}
+
+	// All goroutines must return the same network ID.
+	require.Len(t, networkIDs, goroutines)
+	for _, id := range networkIDs[1:] {
+		assert.Equal(t, networkIDs[0], id, "all goroutines should return the same network ID")
+	}
+}

@@ -190,7 +190,7 @@ The HMAC-SHA256 is computed over `<timestamp>.<body>` using the configured `Call
 
 - **3 attempts** with backoff delays of 0s, 1s, 5s.
 - Each attempt has a 10s HTTP timeout.
-- Retries abort immediately if the backend is shutting down (`stopCh` is closed).
+- Retries abort immediately if the backend is shutting down (`stopCtx` is canceled).
 - A 2xx response is considered success; any other status triggers a retry.
 
 ## Resource Pool

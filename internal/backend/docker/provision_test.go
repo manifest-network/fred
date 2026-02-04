@@ -108,7 +108,7 @@ func TestProvision_Success(t *testing.T) {
 	assert.Equal(t, 1, createCalls)
 	assert.Equal(t, 1, startCalls)
 
-	close(b.stopCh)
+	b.stopCancel()
 	b.wg.Wait()
 }
 
@@ -192,7 +192,7 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 	assert.Equal(t, 2, prov.FailCount, "FailCount should be preserved from previous provision")
 
 	<-callbackReceived
-	close(b.stopCh)
+	b.stopCancel()
 	b.wg.Wait()
 }
 
@@ -879,7 +879,7 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 	// Close stopCh after first attempt
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		close(b.stopCh)
+		b.stopCancel()
 	}()
 
 	b.sendCallback("lease-1", true, "")

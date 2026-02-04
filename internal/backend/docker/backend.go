@@ -65,9 +65,10 @@ type Backend struct {
 	// httpClient for sending callbacks
 	httpClient *http.Client
 
-	// stopCh signals shutdown
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	// stopCtx is canceled on shutdown; stopCancel triggers it.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // provision tracks provisioned containers for a lease.
@@ -133,9 +134,10 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		logger:       logger.With("backend", cfg.Name),
 		provisions:   make(map[string]*provision),
 		callbackURLs: make(map[string]string),
-		httpClient:   httpClient,
-		stopCh:       make(chan struct{}),
+		httpClient: httpClient,
 	}
+
+	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
 
 	return b, nil
 }
@@ -165,7 +167,7 @@ func (b *Backend) Start(ctx context.Context) error {
 
 // Stop shuts down the backend gracefully.
 func (b *Backend) Stop() error {
-	close(b.stopCh)
+	b.stopCancel()
 	b.wg.Wait()
 	return b.docker.Close()
 }
@@ -308,21 +310,14 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// Start async provisioning with shutdown-aware context.
 	// The context cancels on either:
 	// 1. Provision timeout exceeded
-	// 2. Backend shutdown (stopCh closed)
+	// 2. Backend shutdown (stopCtx canceled)
 	b.wg.Go(func() {
-		// Create context with provision timeout (use cmp.Or for consistency with codebase)
 		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
 		ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
 		defer cancel()
 
-		// Cancel on shutdown — tracked by WaitGroup for clean shutdown.
-		b.wg.Go(func() {
-			select {
-			case <-b.stopCh:
-				cancel()
-			case <-ctx.Done():
-			}
-		})
+		stop := context.AfterFunc(b.stopCtx, cancel)
+		defer stop()
 
 		b.doProvision(ctx, req, manifest, profiles, logger)
 	})
@@ -895,7 +890,7 @@ func (b *Backend) reconcileLoop() {
 
 	for {
 		select {
-		case <-b.stopCh:
+		case <-b.stopCtx.Done():
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -941,7 +936,7 @@ func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
 		if attempt > 0 {
 			// Wait with backoff, but abort if shutting down
 			select {
-			case <-b.stopCh:
+			case <-b.stopCtx.Done():
 				b.logger.Warn("callback retry aborted by shutdown",
 					"lease_uuid", leaseUUID,
 					"attempt", attempt+1,
