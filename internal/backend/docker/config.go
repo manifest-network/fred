@@ -63,6 +63,10 @@ type Config struct {
 	// WARNING: Only use for development with self-signed certificates.
 	CallbackInsecureSkipVerify bool `yaml:"callback_insecure_skip_verify"`
 
+	// CallbackDBPath is the path to the bbolt database for persisting pending callbacks.
+	// Defaults to "callbacks.db".
+	CallbackDBPath string `yaml:"callback_db_path"`
+
 	// ProvisionTimeout is the maximum time allowed for the entire provisioning
 	// operation (image pull + container creation + start). If exceeded, the
 	// provisioning is canceled and a failure callback is sent.
@@ -95,6 +99,16 @@ type Config struct {
 	// The success callback is only sent after verification passes.
 	// Defaults to 5 seconds. Set to 0 to disable.
 	StartupVerifyDuration time.Duration `yaml:"startup_verify_duration"`
+
+	// TenantQuota configures per-tenant resource limits.
+	// When set, prevents any single tenant from consuming the entire pool.
+	TenantQuota *TenantQuotaConfig `yaml:"tenant_quota"`
+
+	// ContainerDiskQuota enables Docker overlay2 storage driver disk quotas
+	// on containers. Requires overlay2 with xfs + pquota mount option.
+	// When enabled, StorageOpt is set on the container's HostConfig.
+	// Defaults to true. Set to false on unsupported filesystems.
+	ContainerDiskQuota *bool `yaml:"container_disk_quota"`
 }
 
 func ptrBool(b bool) *bool    { return &b }
@@ -143,6 +157,23 @@ func (c *Config) GetTmpfsSizeMB() int {
 	return 64
 }
 
+// TenantQuotaConfig configures per-tenant resource limits.
+// When set, each tenant's aggregate resource usage is capped.
+type TenantQuotaConfig struct {
+	MaxCPUCores float64 `yaml:"max_cpu_cores"`
+	MaxMemoryMB int64   `yaml:"max_memory_mb"`
+	MaxDiskMB   int64   `yaml:"max_disk_mb"`
+}
+
+// IsDiskQuota returns whether container disk quotas are enabled.
+// Defaults to true. Requires overlay2 with xfs + pquota.
+func (c *Config) IsDiskQuota() bool {
+	if c.ContainerDiskQuota != nil {
+		return *c.ContainerDiskQuota
+	}
+	return true
+}
+
 // SKUProfile defines resource limits for a SKU.
 type SKUProfile struct {
 	CPUCores float64 `yaml:"cpu_cores"`
@@ -164,10 +195,12 @@ func DefaultConfig() Config {
 		ContainerStartTimeout:   30 * time.Second,
 		ReconcileInterval:       5 * time.Minute,
 		ProvisionTimeout:        10 * time.Minute,
+		CallbackDBPath:          "callbacks.db",
 		NetworkIsolation:        ptrBool(true),
 		ContainerReadonlyRootfs: ptrBool(true),
 		ContainerPidsLimit:      ptrInt64(256),
 		ContainerTmpfsSizeMB:    64,
+		ContainerDiskQuota:      ptrBool(true),
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
 				CPUCores: 0.25,
@@ -303,6 +336,28 @@ func (c *Config) Validate() error {
 
 	if c.ContainerTmpfsSizeMB < 0 {
 		return fmt.Errorf("container_tmpfs_size_mb must be >= 0")
+	}
+
+	if c.TenantQuota != nil {
+		tq := c.TenantQuota
+		if tq.MaxCPUCores <= 0 {
+			return fmt.Errorf("tenant_quota.max_cpu_cores must be positive")
+		}
+		if tq.MaxMemoryMB <= 0 {
+			return fmt.Errorf("tenant_quota.max_memory_mb must be positive")
+		}
+		if tq.MaxDiskMB <= 0 {
+			return fmt.Errorf("tenant_quota.max_disk_mb must be positive")
+		}
+		if tq.MaxCPUCores > c.TotalCPUCores {
+			return fmt.Errorf("tenant_quota.max_cpu_cores (%.2f) exceeds total_cpu_cores (%.2f)", tq.MaxCPUCores, c.TotalCPUCores)
+		}
+		if tq.MaxMemoryMB > c.TotalMemoryMB {
+			return fmt.Errorf("tenant_quota.max_memory_mb (%d) exceeds total_memory_mb (%d)", tq.MaxMemoryMB, c.TotalMemoryMB)
+		}
+		if tq.MaxDiskMB > c.TotalDiskMB {
+			return fmt.Errorf("tenant_quota.max_disk_mb (%d) exceeds total_disk_mb (%d)", tq.MaxDiskMB, c.TotalDiskMB)
+		}
 	}
 
 	return nil

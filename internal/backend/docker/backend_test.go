@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -138,10 +139,10 @@ func TestResourcePool(t *testing.T) {
 	}
 
 	t.Run("allocate and release", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles))
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
 
 		// Allocate
-		err := pool.TryAllocate("lease-1", "small")
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
 		require.NoError(t, err)
 
 		stats := pool.Stats()
@@ -157,50 +158,50 @@ func TestResourcePool(t *testing.T) {
 
 	t.Run("insufficient resources", func(t *testing.T) {
 		// Small pool
-		pool := NewResourcePool(2.0, 1024, 2048, makeResolver(profiles))
+		pool := NewResourcePool(2.0, 1024, 2048, makeResolver(profiles), nil)
 
 		// First allocation succeeds
-		err := pool.TryAllocate("lease-1", "small")
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
 		require.NoError(t, err)
 
 		// Second allocation should fail (not enough for large)
-		err = pool.TryAllocate("lease-2", "large")
+		err = pool.TryAllocate("lease-2", "large", "tenant-a")
 		assert.Error(t, err)
 	})
 
 	t.Run("unknown SKU", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles))
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
 
-		err := pool.TryAllocate("lease-1", "nonexistent")
+		err := pool.TryAllocate("lease-1", "nonexistent", "tenant-a")
 		assert.Error(t, err)
 	})
 
 	t.Run("duplicate allocation", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles))
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
 
-		err := pool.TryAllocate("lease-1", "small")
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
 		require.NoError(t, err)
 
-		err = pool.TryAllocate("lease-1", "small")
+		err = pool.TryAllocate("lease-1", "small", "tenant-a")
 		assert.Error(t, err)
 	})
 
 	t.Run("release nonexistent", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles))
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
 
 		// Should not panic
 		pool.Release("nonexistent")
 	})
 
 	t.Run("reset", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles))
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
 
 		// Allocate something
-		pool.TryAllocate("lease-1", "small")
+		pool.TryAllocate("lease-1", "small", "tenant-a")
 
 		// Reset with different allocations
 		allocations := []ResourceAllocation{
-			{LeaseUUID: "lease-2", SKU: "large", CPUCores: 4.0, MemoryMB: 4096, DiskMB: 8192},
+			{LeaseUUID: "lease-2", Tenant: "tenant-b", SKU: "large", CPUCores: 4.0, MemoryMB: 4096, DiskMB: 8192},
 		}
 		pool.Reset(allocations)
 
@@ -211,6 +212,159 @@ func TestResourcePool(t *testing.T) {
 		// Original allocation should be gone
 		alloc := pool.GetAllocation("lease-1")
 		assert.Nil(t, alloc)
+	})
+
+	t.Run("tenant quota enforcement", func(t *testing.T) {
+		quota := &TenantQuotaConfig{
+			MaxCPUCores: 2.0,
+			MaxMemoryMB: 1024,
+			MaxDiskMB:   2048,
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+
+		// First allocation within quota succeeds
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
+		require.NoError(t, err)
+
+		// Second allocation within quota succeeds
+		err = pool.TryAllocate("lease-2", "small", "tenant-a")
+		require.NoError(t, err)
+
+		// Third allocation exceeds tenant CPU quota (3 * 1.0 > 2.0)
+		err = pool.TryAllocate("lease-3", "small", "tenant-a")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "tenant tenant-a")
+
+		// Different tenant can still allocate
+		err = pool.TryAllocate("lease-4", "small", "tenant-b")
+		require.NoError(t, err)
+
+		// Release from tenant-a frees quota
+		pool.Release("lease-1")
+		err = pool.TryAllocate("lease-5", "small", "tenant-a")
+		require.NoError(t, err)
+	})
+
+	t.Run("tenant stats", func(t *testing.T) {
+		quota := &TenantQuotaConfig{
+			MaxCPUCores: 4.0,
+			MaxMemoryMB: 4096,
+			MaxDiskMB:   8192,
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+
+		pool.TryAllocate("lease-1", "small", "tenant-a")
+
+		stats := pool.TenantStats("tenant-a")
+		assert.Equal(t, 1.0, stats.AllocatedCPU)
+		assert.Equal(t, int64(512), stats.AllocatedMemory)
+		assert.Equal(t, 4.0, stats.TotalCPU)
+
+		// Empty tenant returns zeroes
+		stats = pool.TenantStats("tenant-b")
+		assert.Equal(t, 0.0, stats.AllocatedCPU)
+	})
+
+	t.Run("tenant memory quota exceeded", func(t *testing.T) {
+		quota := &TenantQuotaConfig{
+			MaxCPUCores: 8.0,
+			MaxMemoryMB: 600,
+			MaxDiskMB:   102400,
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
+		require.NoError(t, err)
+
+		// small = 512MB, second would be 1024MB > quota of 600MB
+		err = pool.TryAllocate("lease-2", "small", "tenant-a")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "memory quota exceeded")
+	})
+
+	t.Run("tenant disk quota exceeded", func(t *testing.T) {
+		quota := &TenantQuotaConfig{
+			MaxCPUCores: 8.0,
+			MaxMemoryMB: 16384,
+			MaxDiskMB:   1500,
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
+		require.NoError(t, err)
+
+		// small = 1024MB disk, second would be 2048MB > quota of 1500MB
+		err = pool.TryAllocate("lease-2", "small", "tenant-a")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "disk quota exceeded")
+	})
+
+	t.Run("no quota allows full pool usage by one tenant", func(t *testing.T) {
+		pool := NewResourcePool(2.0, 1024, 2048, makeResolver(profiles), nil)
+
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
+		require.NoError(t, err)
+		err = pool.TryAllocate("lease-2", "small", "tenant-a")
+		require.NoError(t, err)
+	})
+
+	t.Run("empty tenant bypasses quota check", func(t *testing.T) {
+		quota := &TenantQuotaConfig{
+			MaxCPUCores: 0.1,
+			MaxMemoryMB: 1,
+			MaxDiskMB:   1,
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+
+		// Empty tenant string should bypass tenant quota
+		err := pool.TryAllocate("lease-1", "small", "")
+		require.NoError(t, err)
+	})
+
+	t.Run("reset rebuilds tenant aggregates", func(t *testing.T) {
+		quota := &TenantQuotaConfig{
+			MaxCPUCores: 2.0,
+			MaxMemoryMB: 1024,
+			MaxDiskMB:   2048,
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+
+		pool.TryAllocate("lease-1", "small", "tenant-a")
+
+		// Reset with allocation for different tenant
+		pool.Reset([]ResourceAllocation{
+			{LeaseUUID: "lease-2", Tenant: "tenant-b", SKU: "small", CPUCores: 1.0, MemoryMB: 512, DiskMB: 1024},
+		})
+
+		// tenant-a should have no usage after reset
+		stats := pool.TenantStats("tenant-a")
+		assert.Equal(t, 0.0, stats.AllocatedCPU)
+
+		// tenant-b should have usage
+		stats = pool.TenantStats("tenant-b")
+		assert.Equal(t, 1.0, stats.AllocatedCPU)
+	})
+
+	t.Run("release cleans up tenant entry at zero", func(t *testing.T) {
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+
+		pool.TryAllocate("lease-1", "small", "tenant-a")
+		pool.Release("lease-1")
+
+		stats := pool.TenantStats("tenant-a")
+		assert.Equal(t, 0.0, stats.AllocatedCPU)
+		assert.Equal(t, int64(0), stats.AllocatedMemory)
+		assert.Equal(t, int64(0), stats.AllocatedDisk)
+	})
+
+	t.Run("allocation stores tenant in record", func(t *testing.T) {
+		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+
+		pool.TryAllocate("lease-1", "small", "tenant-a")
+
+		alloc := pool.GetAllocation("lease-1")
+		require.NotNil(t, alloc)
+		assert.Equal(t, "tenant-a", alloc.Tenant)
 	})
 }
 
@@ -543,6 +697,8 @@ func TestConfigHardeningDefaults(t *testing.T) {
 	assert.Equal(t, int64(256), *cfg.GetPidsLimit())
 	assert.Equal(t, 64, cfg.GetTmpfsSizeMB())
 	assert.Equal(t, "0.0.0.0", cfg.GetHostBindIP())
+	assert.True(t, cfg.IsDiskQuota())
+	assert.Equal(t, "callbacks.db", cfg.CallbackDBPath)
 }
 
 func TestConfigHardeningOverrides(t *testing.T) {
@@ -558,6 +714,14 @@ func TestConfigHardeningOverrides(t *testing.T) {
 	assert.Equal(t, int64(512), *cfg.GetPidsLimit())
 	assert.Equal(t, 128, cfg.GetTmpfsSizeMB())
 	assert.Equal(t, "127.0.0.1", cfg.GetHostBindIP())
+
+	cfg.ContainerDiskQuota = ptrBool(false)
+	assert.False(t, cfg.IsDiskQuota())
+}
+
+func TestIsDiskQuota_NilDefaultsTrue(t *testing.T) {
+	cfg := Config{}
+	assert.True(t, cfg.IsDiskQuota())
 }
 
 func TestConfigHardeningValidation(t *testing.T) {
@@ -590,6 +754,94 @@ func TestConfigHardeningValidation(t *testing.T) {
 		cfg := validConfig()
 		cfg.ContainerPidsLimit = ptrInt64(0)
 		assert.Error(t, cfg.Validate())
+	})
+
+	t.Run("valid tenant quota", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &TenantQuotaConfig{
+			MaxCPUCores: 2.0,
+			MaxMemoryMB: 4096,
+			MaxDiskMB:   50000,
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("tenant quota zero cpu", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &TenantQuotaConfig{
+			MaxCPUCores: 0,
+			MaxMemoryMB: 4096,
+			MaxDiskMB:   50000,
+		}
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "max_cpu_cores")
+	})
+
+	t.Run("tenant quota zero memory", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &TenantQuotaConfig{
+			MaxCPUCores: 2.0,
+			MaxMemoryMB: 0,
+			MaxDiskMB:   50000,
+		}
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "max_memory_mb")
+	})
+
+	t.Run("tenant quota zero disk", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &TenantQuotaConfig{
+			MaxCPUCores: 2.0,
+			MaxMemoryMB: 4096,
+			MaxDiskMB:   0,
+		}
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "max_disk_mb")
+	})
+
+	t.Run("tenant quota exceeds total cpu", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &TenantQuotaConfig{
+			MaxCPUCores: cfg.TotalCPUCores + 1,
+			MaxMemoryMB: 4096,
+			MaxDiskMB:   50000,
+		}
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "exceeds total_cpu_cores")
+	})
+
+	t.Run("tenant quota exceeds total memory", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &TenantQuotaConfig{
+			MaxCPUCores: 2.0,
+			MaxMemoryMB: cfg.TotalMemoryMB + 1,
+			MaxDiskMB:   50000,
+		}
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "exceeds total_memory_mb")
+	})
+
+	t.Run("tenant quota exceeds total disk", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &TenantQuotaConfig{
+			MaxCPUCores: 2.0,
+			MaxMemoryMB: 4096,
+			MaxDiskMB:   cfg.TotalDiskMB + 1,
+		}
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "exceeds total_disk_mb")
+	})
+
+	t.Run("nil tenant quota is valid", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = nil
+		assert.NoError(t, cfg.Validate())
 	})
 }
 
@@ -649,5 +901,40 @@ func TestTenantNetworkName(t *testing.T) {
 	t.Run("starts with prefix", func(t *testing.T) {
 		name := TenantNetworkName("any-tenant")
 		assert.True(t, strings.HasPrefix(name, "fred-tenant-"))
+	})
+}
+
+func TestUpdateResourceMetrics(t *testing.T) {
+	t.Run("sets ratios correctly", func(t *testing.T) {
+		updateResourceMetrics(ResourceStats{
+			TotalCPU:        8.0,
+			AllocatedCPU:    2.0,
+			TotalMemoryMB:   16384,
+			AllocatedMemory: 4096,
+			TotalDiskMB:     102400,
+			AllocatedDisk:   51200,
+		})
+
+		assert.InDelta(t, 0.25, testutil.ToFloat64(resourceCPUAllocatedRatio), 0.001)
+		assert.InDelta(t, 0.25, testutil.ToFloat64(resourceMemoryAllocatedRatio), 0.001)
+		assert.InDelta(t, 0.5, testutil.ToFloat64(resourceDiskAllocatedRatio), 0.001)
+	})
+
+	t.Run("zero totals skips update", func(t *testing.T) {
+		// Reset to known values first
+		resourceCPUAllocatedRatio.Set(0.99)
+		resourceMemoryAllocatedRatio.Set(0.99)
+		resourceDiskAllocatedRatio.Set(0.99)
+
+		updateResourceMetrics(ResourceStats{
+			TotalCPU:      0,
+			TotalMemoryMB: 0,
+			TotalDiskMB:   0,
+		})
+
+		// Values should remain at 0.99 since zero totals are skipped
+		assert.InDelta(t, 0.99, testutil.ToFloat64(resourceCPUAllocatedRatio), 0.001)
+		assert.InDelta(t, 0.99, testutil.ToFloat64(resourceMemoryAllocatedRatio), 0.001)
+		assert.InDelta(t, 0.99, testutil.ToFloat64(resourceDiskAllocatedRatio), 0.001)
 	})
 }

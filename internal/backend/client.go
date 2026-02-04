@@ -122,6 +122,7 @@ type ProvisionInfo struct {
 	Status       ProvisionStatus `json:"status"` // "provisioning", "ready", "failed"
 	CreatedAt    time.Time       `json:"created_at"`
 	FailCount    int             `json:"fail_count"`
+	LastError    string          `json:"last_error,omitempty"`
 	BackendName  string          `json:"-"` // Set by reconciler, not from backend
 }
 

@@ -58,9 +58,8 @@ type Backend struct {
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
 
-	// callbackURLs stores per-lease callback URLs
-	callbackURLs   map[string]string
-	callbackURLsMu sync.Mutex
+	// callbackStore persists pending callbacks in bbolt
+	callbackStore *CallbackStore
 
 	// httpClient for sending callbacks
 	httpClient *http.Client
@@ -83,7 +82,9 @@ type provision struct {
 	Status       backend.ProvisionStatus
 	Quantity     int // Expected number of containers
 	CreatedAt    time.Time
-	FailCount    int // Number of times provisioning has failed for this lease
+	FailCount    int    // Number of times provisioning has failed for this lease
+	LastError    string // Last error message, queryable after failure
+	CallbackURL  string // URL to notify on provision completion
 }
 
 // shortID safely truncates an ID to 12 characters for logging.
@@ -110,6 +111,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		cfg.TotalMemoryMB,
 		cfg.TotalDiskMB,
 		cfg.GetSKUProfile, // Use Config's resolver to avoid duplicating SKU mapping logic
+		cfg.TenantQuota,
 	)
 
 	// Create HTTP client for callbacks
@@ -127,14 +129,19 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		}
 	}
 
+	cbStore, err := NewCallbackStore(cfg.CallbackDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open callback store: %w", err)
+	}
+
 	b := &Backend{
-		cfg:          cfg,
-		docker:       docker,
-		pool:         pool,
-		logger:       logger.With("backend", cfg.Name),
-		provisions:   make(map[string]*provision),
-		callbackURLs: make(map[string]string),
-		httpClient: httpClient,
+		cfg:           cfg,
+		docker:        docker,
+		pool:          pool,
+		logger:        logger.With("backend", cfg.Name),
+		provisions:    make(map[string]*provision),
+		callbackStore: cbStore,
+		httpClient:    httpClient,
 	}
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
@@ -154,6 +161,9 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
 
+	// Replay any pending callbacks from a previous run
+	b.replayPendingCallbacks()
+
 	// Start periodic reconciliation (using WaitGroup.Go for Go 1.25+)
 	b.wg.Go(b.reconcileLoop)
 
@@ -169,7 +179,57 @@ func (b *Backend) Start(ctx context.Context) error {
 func (b *Backend) Stop() error {
 	b.stopCancel()
 	b.wg.Wait()
-	return b.docker.Close()
+	var errs []error
+	if b.callbackStore != nil {
+		if err := b.callbackStore.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing callback store: %w", err))
+		}
+	}
+	if err := b.docker.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("closing docker client: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+// replayPendingCallbacks replays any callbacks that were persisted but not
+// successfully delivered before the previous shutdown.
+func (b *Backend) replayPendingCallbacks() {
+	if b.callbackStore == nil {
+		return
+	}
+
+	entries, err := b.callbackStore.ListPending()
+	if err != nil {
+		b.logger.Error("failed to list pending callbacks", "error", err)
+		return
+	}
+	if len(entries) == 0 {
+		return
+	}
+
+	b.logger.Info("replaying pending callbacks", "count", len(entries))
+	for _, entry := range entries {
+		status := backend.CallbackStatusSuccess
+		if !entry.Success {
+			status = backend.CallbackStatusFailed
+		}
+		payload := backend.CallbackPayload{
+			LeaseUUID: entry.LeaseUUID,
+			Status:    status,
+			Error:     entry.Error,
+		}
+		body, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			b.logger.Error("failed to marshal replay callback", "error", marshalErr, "lease_uuid", entry.LeaseUUID)
+			continue
+		}
+
+		if b.deliverCallback(entry.LeaseUUID, entry.CallbackURL, body) {
+			if rmErr := b.callbackStore.Remove(entry.LeaseUUID); rmErr != nil {
+				b.logger.Error("failed to remove replayed callback", "error", rmErr, "lease_uuid", entry.LeaseUUID)
+			}
+		}
+	}
 }
 
 // Name returns the backend name.
@@ -200,11 +260,6 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		"total_quantity", totalQuantity,
 	)
 
-	// Store callback URL
-	b.callbackURLsMu.Lock()
-	b.callbackURLs[req.LeaseUUID] = req.CallbackURL
-	b.callbackURLsMu.Unlock()
-
 	// Atomically check-and-reserve the provision slot (fixes TOCTOU race).
 	// Allow re-provisioning if the existing provision has failed (e.g., container
 	// crashed and reconciler is retrying).
@@ -232,6 +287,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		ContainerIDs: make([]string, 0, totalQuantity),
 		CreatedAt:    time.Now(),
 		FailCount:    prevFailCount,
+		CallbackURL:  req.CallbackURL,
 	}
 	b.provisionsMu.Unlock()
 
@@ -286,7 +342,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	for _, item := range req.Items {
 		for i := 0; i < item.Quantity; i++ {
 			instanceID := fmt.Sprintf("%s-%d", req.LeaseUUID, instanceIdx)
-			if err := b.pool.TryAllocate(instanceID, item.SKU); err != nil {
+			if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
 				// Release any previously allocated resources
 				for _, id := range allocatedIDs {
 					b.pool.Release(id)
@@ -332,10 +388,13 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var err error
+	provisionStart := time.Now()
 
 	// Single cleanup path via defer - handles both early cancellation and runtime errors
 	defer func() {
+		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
 		if err != nil {
+			provisionsTotal.WithLabelValues("failure").Inc()
 			// Clean up on failure - release all allocated resources
 			for i := 0; i < totalQuantity; i++ {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
@@ -345,6 +404,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			if prov, ok := b.provisions[req.LeaseUUID]; ok {
 				prov.Status = backend.ProvisionStatusFailed
 				prov.FailCount++
+				prov.LastError = err.Error()
 			}
 			b.provisionsMu.Unlock()
 
@@ -363,6 +423,8 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 
 		// Update provision record on success
+		provisionsTotal.WithLabelValues("success").Inc()
+		activeProvisions.Inc()
 		b.provisionsMu.Lock()
 		if prov, ok := b.provisions[req.LeaseUUID]; ok {
 			prov.ContainerIDs = containerIDs
@@ -370,6 +432,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 		b.provisionsMu.Unlock()
 
+		updateResourceMetrics(b.pool.Stats())
 		b.sendCallback(req.LeaseUUID, true, "")
 	}()
 
@@ -382,11 +445,13 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 	// Pull image (only once, shared by all containers)
 	logger.Info("pulling image", "image", manifest.Image)
+	pullStart := time.Now()
 	if err = b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); err != nil {
 		logger.Error("failed to pull image", "error", err)
 		err = fmt.Errorf("image pull failed: %w", err)
 		return
 	}
+	imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())
 
 	// Set up per-tenant network isolation if enabled
 	var networkConfig *networktypes.NetworkingConfig
@@ -420,6 +485,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			}
 			b.provisionsMu.RUnlock()
 
+			createStart := time.Now()
 			containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
 				LeaseUUID:      req.LeaseUUID,
 				Tenant:         req.Tenant,
@@ -433,8 +499,10 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				ReadonlyRootfs: b.cfg.IsReadonlyRootfs(),
 				PidsLimit:      b.cfg.GetPidsLimit(),
 				TmpfsSizeMB:    b.cfg.GetTmpfsSizeMB(),
+				DiskQuota:      b.cfg.IsDiskQuota(),
 				NetworkConfig:  networkConfig,
 			}, b.cfg.ContainerCreateTimeout)
+			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
 			if createErr != nil {
 				instanceLogger.Error("failed to create container", "error", createErr)
 				err = fmt.Errorf("container creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, createErr)
@@ -610,11 +678,6 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	}
 	b.provisionsMu.Unlock()
 
-	// Clean up callback URL
-	b.callbackURLsMu.Lock()
-	delete(b.callbackURLs, leaseUUID)
-	b.callbackURLsMu.Unlock()
-
 	// Release resources for all instances
 	if exists {
 		for i := 0; i < prov.Quantity; i++ {
@@ -651,6 +714,9 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
 	}
 
+	deprovisionsTotal.Inc()
+	activeProvisions.Dec()
+	updateResourceMetrics(b.pool.Stats())
 	logger.Info("deprovisioned", "containers_removed", len(prov.ContainerIDs))
 	return nil
 }
@@ -674,6 +740,7 @@ func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, 
 			CreatedAt:    prov.CreatedAt,
 			BackendName:  b.cfg.Name,
 			FailCount:    prov.FailCount,
+			LastError:    prov.LastError,
 		})
 	}
 
@@ -686,10 +753,6 @@ func (b *Backend) removeProvision(leaseUUID string) {
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
 	b.provisionsMu.Unlock()
-
-	b.callbackURLsMu.Lock()
-	delete(b.callbackURLs, leaseUUID)
-	b.callbackURLsMu.Unlock()
 }
 
 // recoverState rebuilds in-memory state from Docker containers.
@@ -761,6 +824,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		instanceID := fmt.Sprintf("%s-%d", c.LeaseUUID, c.InstanceIndex)
 		allocations = append(allocations, ResourceAllocation{
 			LeaseUUID: instanceID,
+			Tenant:    c.Tenant,
 			SKU:       c.SKU,
 			CPUCores:  profile.CPUCores,
 			MemoryMB:  profile.MemoryMB,
@@ -779,6 +843,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if rec, ok := recovered[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
 				// Carry over FailCount and increment for this failure.
 				rec.FailCount = existing.FailCount + 1
+				rec.LastError = "container exited unexpectedly"
 				failedLeases = append(failedLeases, uuid)
 				b.logger.Warn("container crashed after provisioning",
 					"lease_uuid", uuid,
@@ -797,6 +862,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if rec.Status == backend.ProvisionStatusFailed {
 			if _, hasExisting := b.provisions[uuid]; !hasExisting {
 				rec.FailCount++
+				rec.LastError = "container exited unexpectedly"
 				b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
 					"lease_uuid", uuid,
 					"fail_count", rec.FailCount,
@@ -896,6 +962,9 @@ func (b *Backend) reconcileLoop() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := b.recoverState(ctx); err != nil {
 				b.logger.Error("reconciliation failed", "error", err)
+				reconciliationTotal.WithLabelValues("error").Inc()
+			} else {
+				reconciliationTotal.WithLabelValues("success").Inc()
 			}
 			cancel()
 		}
@@ -906,11 +975,15 @@ func (b *Backend) reconcileLoop() {
 // It retries up to callbackMaxAttempts times with exponential backoff.
 // Retries are aborted if the backend is shutting down.
 func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
-	b.callbackURLsMu.Lock()
-	callbackURL, ok := b.callbackURLs[leaseUUID]
-	b.callbackURLsMu.Unlock()
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions[leaseUUID]
+	var callbackURL string
+	if ok {
+		callbackURL = prov.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
 
-	if !ok {
+	if callbackURL == "" {
 		b.logger.Warn("no callback URL for lease", "lease_uuid", leaseUUID)
 		return
 	}
@@ -932,6 +1005,32 @@ func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
 		return
 	}
 
+	// Persist callback before attempting delivery so it survives restarts
+	if b.callbackStore != nil {
+		if storeErr := b.callbackStore.Store(CallbackEntry{
+			LeaseUUID:   leaseUUID,
+			CallbackURL: callbackURL,
+			Success:     success,
+			Error:       errMsg,
+			CreatedAt:   time.Now(),
+		}); storeErr != nil {
+			b.logger.Error("failed to persist callback", "error", storeErr, "lease_uuid", leaseUUID)
+		}
+	}
+
+	delivered := b.deliverCallback(leaseUUID, callbackURL, body)
+
+	// Remove from persistent store on successful delivery
+	if delivered && b.callbackStore != nil {
+		if rmErr := b.callbackStore.Remove(leaseUUID); rmErr != nil {
+			b.logger.Error("failed to remove delivered callback from store", "error", rmErr, "lease_uuid", leaseUUID)
+		}
+	}
+}
+
+// deliverCallback attempts to deliver a callback with retries.
+// Returns true if delivery succeeded.
+func (b *Backend) deliverCallback(leaseUUID, callbackURL string, body []byte) bool {
 	for attempt := range callbackMaxAttempts {
 		if attempt > 0 {
 			// Wait with backoff, but abort if shutting down
@@ -941,21 +1040,24 @@ func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
 					"lease_uuid", leaseUUID,
 					"attempt", attempt+1,
 				)
-				return
+				callbackDeliveryTotal.WithLabelValues("failure").Inc()
+				return false
 			case <-time.After(callbackBackoff[attempt]):
 			}
 		}
 
 		if b.trySendCallback(leaseUUID, callbackURL, body) {
-			return
+			callbackDeliveryTotal.WithLabelValues("success").Inc()
+			return true
 		}
 	}
 
+	callbackDeliveryTotal.WithLabelValues("failure").Inc()
 	b.logger.Error("callback delivery failed after retries",
 		"lease_uuid", leaseUUID,
 		"attempts", callbackMaxAttempts,
-		"success", success,
 	)
+	return false
 }
 
 // trySendCallback makes a single callback attempt. Returns true on success.

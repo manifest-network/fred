@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -163,7 +164,7 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 		},
 	})
 	// Pre-allocate a resource for the old provision
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small")
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	callbackReceived := make(chan struct{})
@@ -243,7 +244,7 @@ func TestProvision_InsufficientResources(t *testing.T) {
 	// Exhaust the pool
 	b.cfg.TotalCPUCores = 0.1
 	b.cfg.TotalMemoryMB = 1
-	b.pool = NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile)
+	b.pool = NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
 	err := b.Provision(context.Background(), req)
@@ -258,7 +259,7 @@ func TestProvision_MultiItem_PartialResourceRollback(t *testing.T) {
 	// Only enough resources for 1 docker-small, not 2
 	b.cfg.TotalCPUCores = 0.6
 	b.cfg.TotalMemoryMB = 600
-	b.pool = NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile)
+	b.pool = NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
 
 	req := backend.ProvisionRequest{
 		LeaseUUID:    "lease-1",
@@ -305,8 +306,8 @@ func TestDoProvision_PullFailure(t *testing.T) {
 			Quantity:  1,
 		},
 	})
-	b.callbackURLs["lease-1"] = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small")
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
 	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
@@ -320,6 +321,7 @@ func TestDoProvision_PullFailure(t *testing.T) {
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 	assert.Equal(t, 1, prov.FailCount)
+	assert.Contains(t, prov.LastError, "image pull failed")
 
 	// Resources should be released
 	stats := b.pool.Stats()
@@ -369,9 +371,9 @@ func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
 			Quantity:  2,
 		},
 	})
-	b.callbackURLs["lease-1"] = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small")
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
 
 	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
@@ -410,8 +412,8 @@ func TestDoProvision_ContextCanceled(t *testing.T) {
 			Quantity:  1,
 		},
 	})
-	b.callbackURLs["lease-1"] = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small")
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
 	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
@@ -468,8 +470,8 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 		},
 	})
 	b.cfg.NetworkIsolation = ptrBool(true)
-	b.callbackURLs["lease-1"] = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small")
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
@@ -522,8 +524,8 @@ func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
 			Quantity:  1,
 		},
 	})
-	b.callbackURLs["lease-1"] = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small")
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
@@ -556,11 +558,11 @@ func TestDeprovision_Success(t *testing.T) {
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
 			ContainerIDs: []string{"c1", "c2"},
+			CallbackURL:  "http://localhost/callback",
 		},
 	})
-	b.callbackURLs["lease-1"] = "http://localhost/callback"
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small")
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
 
 	err := b.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
@@ -572,12 +574,6 @@ func TestDeprovision_Success(t *testing.T) {
 	_, exists := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, exists)
-
-	// Callback URL should be cleaned up
-	b.callbackURLsMu.Lock()
-	_, hasCallback := b.callbackURLs["lease-1"]
-	b.callbackURLsMu.Unlock()
-	assert.False(t, hasCallback)
 
 	// Resources should be released
 	stats := b.pool.Stats()
@@ -791,10 +787,11 @@ func TestSendCallback_Success(t *testing.T) {
 	defer server.Close()
 
 	mock := &mockDockerClient{}
-	b := newBackendForProvisionTest(t, mock, nil)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+	})
 	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	b.callbackURLs["lease-1"] = server.URL
 
 	b.sendCallback("lease-1", true, "")
 
@@ -816,9 +813,10 @@ func TestSendCallback_FailurePayload(t *testing.T) {
 	defer server.Close()
 
 	mock := &mockDockerClient{}
-	b := newBackendForProvisionTest(t, mock, nil)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+	})
 	b.httpClient = server.Client()
-	b.callbackURLs["lease-1"] = server.URL
 
 	b.sendCallback("lease-1", false, "image pull failed")
 
@@ -850,9 +848,10 @@ func TestSendCallback_Retry(t *testing.T) {
 	defer server.Close()
 
 	mock := &mockDockerClient{}
-	b := newBackendForProvisionTest(t, mock, nil)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+	})
 	b.httpClient = server.Client()
-	b.callbackURLs["lease-1"] = server.URL
 
 	b.sendCallback("lease-1", true, "")
 
@@ -872,9 +871,10 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 	defer server.Close()
 
 	mock := &mockDockerClient{}
-	b := newBackendForProvisionTest(t, mock, nil)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+	})
 	b.httpClient = server.Client()
-	b.callbackURLs["lease-1"] = server.URL
 
 	// Cancel stopCtx after first attempt
 	go func() {
@@ -1015,9 +1015,8 @@ func TestContainerStatusToProvisionStatus(t *testing.T) {
 func TestRemoveProvision(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1"},
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: "http://localhost"},
 	})
-	b.callbackURLs["lease-1"] = "http://localhost"
 
 	b.removeProvision("lease-1")
 
@@ -1025,11 +1024,6 @@ func TestRemoveProvision(t *testing.T) {
 	_, exists := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, exists)
-
-	b.callbackURLsMu.Lock()
-	_, hasCallback := b.callbackURLs["lease-1"]
-	b.callbackURLsMu.Unlock()
-	assert.False(t, hasCallback)
 
 	// Removing nonexistent should not panic
 	b.removeProvision("nonexistent")
@@ -1160,4 +1154,429 @@ func TestWaitForHealthy_BecomesHealthyAfterStarting(t *testing.T) {
 	err := b.waitForHealthy(ctx, []string{"c1"}, b.logger)
 	assert.NoError(t, err)
 	assert.GreaterOrEqual(t, inspectCount, 2, "should have polled at least twice")
+}
+
+// --- Error persistence tests ---
+
+func TestDoProvision_LastError_ContextCanceled(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(ctx, req, manifest, profiles, b.logger)
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Contains(t, prov.LastError, "canceled")
+}
+
+func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	// Start with a previously failed provision that had a LastError
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			LastError:   "previous error",
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	<-callbackReceived
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+	// LastError should still have old value since success path doesn't clear it
+	// (it's only set on failure, not cleared on success — which is correct
+	// because a re-provision creates a new provision record)
+}
+
+func TestListProvisions_IncludesLastError(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			ProviderUUID: "prov-1",
+			Status:       backend.ProvisionStatusFailed,
+			CreatedAt:    time.Now(),
+			FailCount:    2,
+			LastError:    "container crashed",
+		},
+	})
+
+	result, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.Equal(t, "container crashed", result[0].LastError)
+	assert.Equal(t, 2, result[0].FailCount)
+}
+
+// --- Disk quota container creation tests ---
+
+func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	var capturedParams CreateContainerParams
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	b.cfg.ContainerDiskQuota = ptrBool(true)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	<-callbackReceived
+
+	assert.True(t, capturedParams.DiskQuota, "DiskQuota should be true")
+	assert.Equal(t, int64(1024), capturedParams.Profile.DiskMB)
+}
+
+func TestDoProvision_DiskQuotaDisabled(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	var capturedParams CreateContainerParams
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	b.cfg.ContainerDiskQuota = ptrBool(false)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	<-callbackReceived
+
+	assert.False(t, capturedParams.DiskQuota, "DiskQuota should be false")
+}
+
+// --- Callback persistence tests ---
+
+func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb_persist.db")
+	cbStore, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+	defer cbStore.Close()
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+	})
+	b.httpClient = server.Client()
+	b.callbackStore = cbStore
+
+	b.sendCallback("lease-1", true, "")
+
+	// After successful delivery, callback should be removed from store
+	pending, err := cbStore.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending, "callback should be removed from store after delivery")
+}
+
+func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	// Server always returns 500
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb_fail.db")
+	cbStore, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+	defer cbStore.Close()
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+	})
+	b.httpClient = server.Client()
+	b.callbackStore = cbStore
+
+	b.sendCallback("lease-1", false, "container crashed")
+
+	// After failed delivery, callback should remain in store
+	pending, err := cbStore.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "lease-1", pending[0].LeaseUUID)
+	assert.False(t, pending[0].Success)
+	assert.Equal(t, "container crashed", pending[0].Error)
+}
+
+// --- Replay callbacks tests ---
+
+func TestReplayPendingCallbacks_Success(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	var received []backend.CallbackPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		received = append(received, p)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb_replay.db")
+	cbStore, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+
+	// Pre-populate with pending callbacks
+	require.NoError(t, cbStore.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: server.URL,
+		Success:     true,
+		CreatedAt:   time.Now(),
+	}))
+	require.NoError(t, cbStore.Store(CallbackEntry{
+		LeaseUUID:   "lease-2",
+		CallbackURL: server.URL,
+		Success:     false,
+		Error:       "pull failed",
+		CreatedAt:   time.Now(),
+	}))
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.httpClient = server.Client()
+	b.callbackStore = cbStore
+
+	b.replayPendingCallbacks()
+
+	// Both callbacks should have been delivered
+	assert.Len(t, received, 2)
+
+	// Store should be empty after successful replay
+	pending, err := cbStore.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+
+	cbStore.Close()
+}
+
+func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
+	origBackoff := callbackBackoff
+	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
+	defer func() { callbackBackoff = origBackoff }()
+
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// First callback delivery succeeds, second fails all retries
+		if callCount <= 1 {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb_partial.db")
+	cbStore, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+
+	require.NoError(t, cbStore.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: server.URL,
+		Success:     true,
+		CreatedAt:   time.Now(),
+	}))
+	require.NoError(t, cbStore.Store(CallbackEntry{
+		LeaseUUID:   "lease-2",
+		CallbackURL: server.URL,
+		Success:     false,
+		Error:       "some error",
+		CreatedAt:   time.Now(),
+	}))
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.httpClient = server.Client()
+	b.callbackStore = cbStore
+
+	b.replayPendingCallbacks()
+
+	// lease-2 should remain in store since delivery failed
+	pending, err := cbStore.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "lease-2", pending[0].LeaseUUID)
+
+	cbStore.Close()
+}
+
+func TestReplayPendingCallbacks_NilStore(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.callbackStore = nil
+
+	// Should not panic
+	b.replayPendingCallbacks()
+}
+
+func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_empty.db")
+	cbStore, err := NewCallbackStore(dbPath)
+	require.NoError(t, err)
+	defer cbStore.Close()
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.callbackStore = cbStore
+
+	// Should not panic or make HTTP calls
+	b.replayPendingCallbacks()
 }

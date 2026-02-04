@@ -12,6 +12,7 @@ type SKUResolver func(sku string) (SKUProfile, error)
 // ResourceAllocation tracks resources allocated to a single lease.
 type ResourceAllocation struct {
 	LeaseUUID string
+	Tenant    string
 	SKU       string
 	CPUCores  float64
 	MemoryMB  int64
@@ -36,24 +37,31 @@ type ResourcePool struct {
 	// Per-lease tracking
 	allocations map[string]ResourceAllocation
 
+	// Per-tenant aggregate tracking
+	tenantUsage map[string]ResourceAllocation
+	tenantQuota *TenantQuotaConfig
+
 	// skuResolver resolves SKU identifiers to profiles
 	skuResolver SKUResolver
 }
 
 // NewResourcePool creates a new resource pool with the given capacity.
-func NewResourcePool(totalCPU float64, totalMemoryMB, totalDiskMB int64, resolver SKUResolver) *ResourcePool {
+func NewResourcePool(totalCPU float64, totalMemoryMB, totalDiskMB int64, resolver SKUResolver, tenantQuota *TenantQuotaConfig) *ResourcePool {
 	return &ResourcePool{
 		totalCPU:    totalCPU,
 		totalMemory: totalMemoryMB,
 		totalDisk:   totalDiskMB,
 		allocations: make(map[string]ResourceAllocation),
+		tenantUsage: make(map[string]ResourceAllocation),
+		tenantQuota: tenantQuota,
 		skuResolver: resolver,
 	}
 }
 
 // TryAllocate attempts to reserve resources for a lease based on SKU profile.
+// The tenant parameter is used for per-tenant quota enforcement.
 // Returns nil if allocation succeeds, error if SKU is unknown or insufficient resources.
-func (p *ResourcePool) TryAllocate(leaseUUID, sku string) error {
+func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -68,7 +76,7 @@ func (p *ResourcePool) TryAllocate(leaseUUID, sku string) error {
 		return err
 	}
 
-	// Check capacity
+	// Check global capacity
 	if p.allocatedCPU+profile.CPUCores > p.totalCPU {
 		return fmt.Errorf("insufficient CPU: need %.2f cores, have %.2f available",
 			profile.CPUCores, p.totalCPU-p.allocatedCPU)
@@ -82,6 +90,23 @@ func (p *ResourcePool) TryAllocate(leaseUUID, sku string) error {
 			profile.DiskMB, p.totalDisk-p.allocatedDisk)
 	}
 
+	// Check per-tenant quota if configured
+	if p.tenantQuota != nil && tenant != "" {
+		usage := p.tenantUsage[tenant]
+		if usage.CPUCores+profile.CPUCores > p.tenantQuota.MaxCPUCores {
+			return fmt.Errorf("tenant %s CPU quota exceeded: need %.2f cores, have %.2f available (quota: %.2f)",
+				tenant, profile.CPUCores, p.tenantQuota.MaxCPUCores-usage.CPUCores, p.tenantQuota.MaxCPUCores)
+		}
+		if usage.MemoryMB+profile.MemoryMB > p.tenantQuota.MaxMemoryMB {
+			return fmt.Errorf("tenant %s memory quota exceeded: need %d MB, have %d MB available (quota: %d)",
+				tenant, profile.MemoryMB, p.tenantQuota.MaxMemoryMB-usage.MemoryMB, p.tenantQuota.MaxMemoryMB)
+		}
+		if usage.DiskMB+profile.DiskMB > p.tenantQuota.MaxDiskMB {
+			return fmt.Errorf("tenant %s disk quota exceeded: need %d MB, have %d MB available (quota: %d)",
+				tenant, profile.DiskMB, p.tenantQuota.MaxDiskMB-usage.DiskMB, p.tenantQuota.MaxDiskMB)
+		}
+	}
+
 	// Reserve resources
 	p.allocatedCPU += profile.CPUCores
 	p.allocatedMemory += profile.MemoryMB
@@ -89,10 +114,20 @@ func (p *ResourcePool) TryAllocate(leaseUUID, sku string) error {
 
 	p.allocations[leaseUUID] = ResourceAllocation{
 		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
 		SKU:       sku,
 		CPUCores:  profile.CPUCores,
 		MemoryMB:  profile.MemoryMB,
 		DiskMB:    profile.DiskMB,
+	}
+
+	// Update tenant aggregate
+	if tenant != "" {
+		usage := p.tenantUsage[tenant]
+		usage.CPUCores += profile.CPUCores
+		usage.MemoryMB += profile.MemoryMB
+		usage.DiskMB += profile.DiskMB
+		p.tenantUsage[tenant] = usage
 	}
 
 	return nil
@@ -112,6 +147,19 @@ func (p *ResourcePool) Release(leaseUUID string) {
 	p.allocatedCPU -= alloc.CPUCores
 	p.allocatedMemory -= alloc.MemoryMB
 	p.allocatedDisk -= alloc.DiskMB
+
+	// Update tenant aggregate
+	if alloc.Tenant != "" {
+		usage := p.tenantUsage[alloc.Tenant]
+		usage.CPUCores -= alloc.CPUCores
+		usage.MemoryMB -= alloc.MemoryMB
+		usage.DiskMB -= alloc.DiskMB
+		if usage.CPUCores <= 0 && usage.MemoryMB <= 0 && usage.DiskMB <= 0 {
+			delete(p.tenantUsage, alloc.Tenant)
+		} else {
+			p.tenantUsage[alloc.Tenant] = usage
+		}
+	}
 
 	delete(p.allocations, leaseUUID)
 }
@@ -142,6 +190,25 @@ func (p *ResourcePool) Stats() ResourceStats {
 		AllocatedDisk:   p.allocatedDisk,
 		AllocationCount: len(p.allocations),
 	}
+}
+
+// TenantStats returns resource usage statistics for a specific tenant.
+func (p *ResourcePool) TenantStats(tenant string) ResourceStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	usage := p.tenantUsage[tenant]
+	stats := ResourceStats{
+		AllocatedCPU:    usage.CPUCores,
+		AllocatedMemory: usage.MemoryMB,
+		AllocatedDisk:   usage.DiskMB,
+	}
+	if p.tenantQuota != nil {
+		stats.TotalCPU = p.tenantQuota.MaxCPUCores
+		stats.TotalMemoryMB = p.tenantQuota.MaxMemoryMB
+		stats.TotalDiskMB = p.tenantQuota.MaxDiskMB
+	}
+	return stats
 }
 
 // ResourceStats contains resource usage statistics.
@@ -178,6 +245,7 @@ func (p *ResourcePool) Reset(allocations []ResourceAllocation) {
 
 	// Clear existing
 	p.allocations = make(map[string]ResourceAllocation)
+	p.tenantUsage = make(map[string]ResourceAllocation)
 	p.allocatedCPU = 0
 	p.allocatedMemory = 0
 	p.allocatedDisk = 0
@@ -188,6 +256,15 @@ func (p *ResourcePool) Reset(allocations []ResourceAllocation) {
 		p.allocatedCPU += alloc.CPUCores
 		p.allocatedMemory += alloc.MemoryMB
 		p.allocatedDisk += alloc.DiskMB
+
+		// Rebuild tenant aggregates
+		if alloc.Tenant != "" {
+			usage := p.tenantUsage[alloc.Tenant]
+			usage.CPUCores += alloc.CPUCores
+			usage.MemoryMB += alloc.MemoryMB
+			usage.DiskMB += alloc.DiskMB
+			p.tenantUsage[alloc.Tenant] = usage
+		}
 	}
 }
 

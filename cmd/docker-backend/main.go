@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -168,6 +169,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /provisions", s.handleListProvisions)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /stats", s.handleStats)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return mux
 }

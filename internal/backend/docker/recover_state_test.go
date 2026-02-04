@@ -121,6 +121,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		cfg.TotalMemoryMB,
 		cfg.TotalDiskMB,
 		cfg.GetSKUProfile,
+		nil,
 	)
 
 	provs := make(map[string]*provision)
@@ -131,14 +132,13 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 
 	return &Backend{
-		cfg:          cfg,
-		docker:       mock,
-		pool:         pool,
-		logger:       slog.Default(),
-		provisions:   provs,
-		callbackURLs: make(map[string]string),
-		stopCtx:      stopCtx,
-		stopCancel:   stopCancel,
+		cfg:        cfg,
+		docker:     mock,
+		pool:       pool,
+		logger:     slog.Default(),
+		provisions: provs,
+		stopCtx:    stopCtx,
+		stopCancel: stopCancel,
 	}
 }
 
@@ -299,6 +299,7 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 		// Cold-start: FailCount should be incremented from the label value (0 → 1).
 		assert.Equal(t, 1, prov.FailCount)
+		assert.Equal(t, "container exited unexpectedly", prov.LastError)
 	})
 
 	t.Run("in-flight provision preserved without containers", func(t *testing.T) {
@@ -496,6 +497,47 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, int64(512), stats.AllocatedMemory)
 		assert.Equal(t, int64(1024), stats.AllocatedDisk)
 		assert.Equal(t, 1, stats.AllocationCount)
+	})
+
+	t.Run("ready to failed transition sets LastError", func(t *testing.T) {
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "exited",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		// Pre-populate with a "ready" provision so recoverState detects a ready→failed transition.
+		existing := map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusReady,
+				ContainerIDs: []string{"c1"},
+				FailCount:    0,
+				CreatedAt:    now,
+			},
+		}
+		b := newBackendForTest(mock, existing)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+		assert.Equal(t, 1, prov.FailCount)
+		assert.Equal(t, "container exited unexpectedly", prov.LastError)
 	})
 
 	t.Run("container missing labels skipped", func(t *testing.T) {

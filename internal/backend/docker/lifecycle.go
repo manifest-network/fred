@@ -128,6 +128,7 @@ type CreateContainerParams struct {
 	ReadonlyRootfs bool
 	PidsLimit      *int64
 	TmpfsSizeMB    int
+	DiskQuota      bool // Enable overlay2 storage driver disk quota
 	NetworkConfig  *networktypes.NetworkingConfig
 }
 
@@ -221,6 +222,11 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		CapDrop:        []string{"ALL"},
 		SecurityOpt:    []string{"no-new-privileges:true"},
 		ReadonlyRootfs: params.ReadonlyRootfs,
+	}
+	if params.DiskQuota {
+		hostConfig.StorageOpt = map[string]string{
+			"size": fmt.Sprintf("%dM", params.Profile.DiskMB),
+		}
 	}
 	if params.ReadonlyRootfs {
 		tmpfsSize := fmt.Sprintf("size=%dM", params.TmpfsSizeMB)

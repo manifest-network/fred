@@ -230,3 +230,43 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.fail_count` | integer string | Number of provision failures for this lease at creation time |
 
 User-provided labels in the manifest are also applied, but may not use the `fred.*` prefix.
+
+## Bandwidth Limiting
+
+Network bandwidth limiting is an operational concern handled outside of the docker-backend process. Operators can use Linux `tc` (traffic control) to rate-limit container network traffic on the host.
+
+### Identifying container interfaces
+
+Each Docker container gets a veth pair. The host-side interface can be found by inspecting the container's network namespace:
+
+```bash
+# Get the container's PID
+PID=$(docker inspect --format '{{.State.Pid}}' <container_id>)
+
+# Get the veth peer index from inside the container's namespace
+PEER_IDX=$(nsenter -t $PID -n ip link show eth0 | grep -oP '(?<=@if)\d+')
+
+# Find the host-side veth interface by index
+HOST_VETH=$(ip link | grep "^${PEER_IDX}:" | awk '{print $2}' | tr -d ':@')
+```
+
+### Applying rate limits with tc
+
+Use `tc` to set ingress and egress limits on the host-side veth interface:
+
+```bash
+# Egress (container → network): limit to 10 Mbit/s with 32KB burst
+tc qdisc add dev $HOST_VETH root tbf rate 10mbit burst 32kbit latency 50ms
+
+# Ingress (network → container): use an IFB (intermediate functional block) device
+modprobe ifb
+ip link set dev ifb0 up
+tc qdisc add dev $HOST_VETH ingress
+tc filter add dev $HOST_VETH parent ffff: protocol ip u32 match u32 0 0 \
+    action mirred egress redirect dev ifb0
+tc qdisc add dev ifb0 root tbf rate 10mbit burst 32kbit latency 50ms
+```
+
+### Automation
+
+For production use, integrate `tc` rules into a container lifecycle hook or a script triggered by Docker events (`docker events --filter event=start`). The docker-backend does not manage bandwidth limits directly to keep the provisioning path simple and avoid requiring `CAP_NET_ADMIN`.
