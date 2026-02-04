@@ -195,7 +195,6 @@ func TestPayloadStore_Persistence(t *testing.T) {
 	// Create store and add data
 	store1, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-
 	})
 	require.NoError(t, err, "NewPayloadStore() error")
 
@@ -207,7 +206,6 @@ func TestPayloadStore_Persistence(t *testing.T) {
 	// Reopen store and verify data persisted
 	store2, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-
 	})
 	require.NoError(t, err, "NewPayloadStore() reopen error")
 	defer store2.Close()
@@ -269,7 +267,6 @@ func TestPayloadStore_FilePermissions(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
 	store, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-
 	})
 	require.NoError(t, err, "NewPayloadStore() error")
 	store.Close()
@@ -287,7 +284,6 @@ func TestPayloadStore_InvalidDBPath(t *testing.T) {
 	// Try to create store in a path that doesn't exist and can't be created
 	_, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: "/nonexistent/path/that/cannot/be/created/test.db",
-
 	})
 	require.Error(t, err, "NewPayloadStore() with invalid path should return error")
 }
@@ -329,7 +325,7 @@ func TestPayloadStore_FlushOnClose(t *testing.T) {
 
 	// Create store with short flush interval
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:        dbPath,
+		DBPath: dbPath,
 
 		FlushInterval: 10 * time.Millisecond,
 		BatchSize:     50,
@@ -348,7 +344,6 @@ func TestPayloadStore_FlushOnClose(t *testing.T) {
 	// Reopen and verify all data was persisted
 	store2, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: dbPath,
-
 	})
 	require.NoError(t, err, "NewPayloadStore() reopen error")
 	defer store2.Close()
@@ -360,7 +355,7 @@ func TestPayloadStore_BatchingConcurrentWrites(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
 
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:        dbPath,
+		DBPath: dbPath,
 
 		BatchSize:     10,
 		FlushInterval: 10 * time.Millisecond,
@@ -392,7 +387,7 @@ func TestPayloadStore_BatchingMixedOperations(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
 
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:        dbPath,
+		DBPath: dbPath,
 
 		BatchSize:     5,
 		FlushInterval: 10 * time.Millisecond,
@@ -447,7 +442,7 @@ func TestPayloadStore_FlushIntervalTriggersWrite(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
 
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:        dbPath,
+		DBPath: dbPath,
 
 		BatchSize:     1000,                  // Large batch so it won't trigger by size
 		FlushInterval: 25 * time.Millisecond, // Short interval
@@ -678,7 +673,7 @@ func TestVerifyPayloadHash_BinaryPayload(t *testing.T) {
 func TestPayloadStore_CloseDrainsPendingWrites(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_drain.db")
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:        dbPath,
+		DBPath: dbPath,
 
 		FlushInterval: 1 * time.Second, // Slow flush to ensure operations queue up
 		BatchSize:     100,             // Large batch size

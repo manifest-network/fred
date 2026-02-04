@@ -30,9 +30,9 @@ func waitForFlush(t testing.TB, store *PayloadStore, key string, timeout time.Du
 func BenchmarkPayloadStore_Write(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
+		DBPath: filepath.Join(dir, "payload.db"),
 
-		FlushInterval:   time.Millisecond,
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -57,10 +57,10 @@ func BenchmarkPayloadStore_Write(b *testing.B) {
 func BenchmarkPayloadStore_Write_Parallel(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
+		DBPath: filepath.Join(dir, "payload.db"),
 
-		BatchSize:       100,
-		FlushInterval:   time.Millisecond,
+		BatchSize:     100,
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -86,9 +86,9 @@ func BenchmarkPayloadStore_Write_Parallel(b *testing.B) {
 func BenchmarkPayloadStore_Read(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
+		DBPath: filepath.Join(dir, "payload.db"),
 
-		FlushInterval:   time.Millisecond,
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -121,9 +121,9 @@ func BenchmarkPayloadStore_Read(b *testing.B) {
 func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
+		DBPath: filepath.Join(dir, "payload.db"),
 
-		FlushInterval:   time.Millisecond,
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -162,10 +162,10 @@ func BenchmarkPayloadStore_BatchEfficiency(b *testing.B) {
 		b.Run(fmt.Sprintf("batch=%d", batchSize), func(b *testing.B) {
 			dir := b.TempDir()
 			store, err := NewPayloadStore(PayloadStoreConfig{
-				DBPath:          filepath.Join(dir, "payload.db"),
+				DBPath: filepath.Join(dir, "payload.db"),
 
-				BatchSize:       batchSize,
-				FlushInterval:   time.Millisecond,
+				BatchSize:     batchSize,
+				FlushInterval: time.Millisecond,
 			})
 			if err != nil {
 				b.Fatal(err)
@@ -204,9 +204,9 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 		b.Run(tc.name, func(b *testing.B) {
 			dir := b.TempDir()
 			store, err := NewPayloadStore(PayloadStoreConfig{
-				DBPath:          filepath.Join(dir, "payload.db"),
+				DBPath: filepath.Join(dir, "payload.db"),
 
-				FlushInterval:   time.Millisecond,
+				FlushInterval: time.Millisecond,
 			})
 			if err != nil {
 				b.Fatal(err)
@@ -234,10 +234,10 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
 	dir := b.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
+		DBPath: filepath.Join(dir, "payload.db"),
 
-		BatchSize:       50,
-		FlushInterval:   time.Millisecond,
+		BatchSize:     50,
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -285,10 +285,10 @@ func TestPayloadStore_StressTest(t *testing.T) {
 
 	dir := t.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
+		DBPath: filepath.Join(dir, "payload.db"),
 
-		BatchSize:       100,
-		FlushInterval:   time.Millisecond,
+		BatchSize:     100,
+		FlushInterval: time.Millisecond,
 	})
 	require.NoError(t, err)
 	defer store.Close()
@@ -350,10 +350,10 @@ func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
 
 	dir := t.TempDir()
 	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
+		DBPath: filepath.Join(dir, "payload.db"),
 
-		BatchSize:       200,
-		FlushInterval:   time.Millisecond,
+		BatchSize:     200,
+		FlushInterval: time.Millisecond,
 	})
 	require.NoError(t, err)
 	defer store.Close()

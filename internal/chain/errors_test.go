@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestChainTxError_Error(t *testing.T) {

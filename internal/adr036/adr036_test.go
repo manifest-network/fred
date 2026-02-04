@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/manifest-network/fred/internal/adr036"
-	"github.com/manifest-network/fred/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/adr036"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 func TestVerifySignature_Valid(t *testing.T) {

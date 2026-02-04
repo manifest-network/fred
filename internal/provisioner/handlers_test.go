@@ -294,7 +294,6 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
-
 	})
 	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()
@@ -342,7 +341,6 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
-
 	})
 	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()

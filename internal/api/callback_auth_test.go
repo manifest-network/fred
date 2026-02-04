@@ -11,10 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 // testCallbackSecret is a valid secret for testing (>= 32 bytes, ASCII).

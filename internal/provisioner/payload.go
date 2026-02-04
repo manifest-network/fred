@@ -34,7 +34,6 @@ const (
 	writeChannelSize = 1000
 )
 
-
 var (
 	// payloadBucketName is the bbolt bucket for storing payloads.
 	payloadBucketName = []byte("payloads")
@@ -473,7 +472,6 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 		}
 	}
 }
-
 
 // PayloadEvent represents a payload upload event for Watermill.
 type PayloadEvent struct {

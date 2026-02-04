@@ -4,8 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 func TestVerifySignature(t *testing.T) {

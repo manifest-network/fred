@@ -6,9 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manifest-network/fred/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 func TestParseAuthToken_Valid(t *testing.T) {

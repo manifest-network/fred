@@ -1404,7 +1404,6 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	require.NoError(t, err)
 	defer payloadStore.Close()
@@ -1493,7 +1492,6 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -1531,7 +1529,6 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -1585,7 +1582,6 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -1635,7 +1631,6 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -1679,7 +1674,6 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -1734,7 +1728,6 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -1785,7 +1778,6 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -1845,7 +1837,6 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	tempDir := t.TempDir()
 	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
 		DBPath: tempDir + "/payloads.db",
-
 	})
 	defer payloadStore.Close()
 
@@ -2125,8 +2116,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	}
 
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          t.TempDir() + "/payloads.db",
-
+		DBPath: t.TempDir() + "/payloads.db",
 	})
 	require.NoError(t, err)
 	defer payloadStore.Close()
@@ -2211,8 +2201,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	}
 
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          t.TempDir() + "/payloads.db",
-
+		DBPath: t.TempDir() + "/payloads.db",
 	})
 	require.NoError(t, err)
 	defer payloadStore.Close()
@@ -2285,8 +2274,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	dbPath := t.TempDir() + "/payloads.db"
 
 	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          dbPath,
-
+		DBPath: dbPath,
 	})
 	require.NoError(t, err)
 
@@ -2322,8 +2310,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 
 	// "Restart" - create new payload store from same DB file
 	payloadStore2, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          dbPath,
-
+		DBPath: dbPath,
 	})
 	require.NoError(t, err)
 	defer payloadStore2.Close()
