@@ -12,6 +12,22 @@ import (
 	"github.com/spf13/viper"
 )
 
+// ParseLogLevel converts a string log level to slog.Level.
+func ParseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("unknown log level: %q (valid: debug, info, warn, error)", s)
+	}
+}
+
 // Default values for configuration.
 const (
 	DefaultMaxRequestBodySize int64 = 1 << 20 // 1MB
@@ -86,6 +102,9 @@ type Config struct {
 
 	// Shutdown configuration
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+
+	// Logging
+	LogLevel string `mapstructure:"log_level"`
 }
 
 // BackendConfig configures a single provisioning backend.
@@ -155,6 +174,9 @@ func Load(configPath string) (*Config, error) {
 
 	// Shutdown defaults
 	v.SetDefault("shutdown_timeout", "30s")
+
+	// Logging defaults
+	v.SetDefault("log_level", "info")
 
 	// Environment variable support
 	v.SetEnvPrefix("PROVIDER")

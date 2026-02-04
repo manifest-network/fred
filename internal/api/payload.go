@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/gorilla/mux"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/config"
@@ -46,8 +45,7 @@ func NewPayloadHandler(client ChainClient, publisher PayloadPublisher, providerU
 
 // HandlePayloadUpload handles POST /v1/leases/{lease_uuid}/data
 func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	leaseUUID := vars["lease_uuid"]
+	leaseUUID := r.PathValue("lease_uuid")
 
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {

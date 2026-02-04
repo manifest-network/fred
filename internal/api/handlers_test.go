@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -406,7 +405,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -453,7 +452,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -499,7 +498,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -556,7 +555,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -613,7 +612,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -950,7 +949,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		// First request should succeed
 		req1 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req1.Header.Set("Authorization", "Bearer "+validToken)
-		req1 = mux.SetURLVars(req1, map[string]string{"lease_uuid": leaseUUID})
+		req1.SetPathValue("lease_uuid", leaseUUID)
 
 		rec1 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec1, req1)
@@ -960,7 +959,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		// Second request with same token should be rejected
 		req2 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req2.Header.Set("Authorization", "Bearer "+validToken)
-		req2 = mux.SetURLVars(req2, map[string]string{"lease_uuid": leaseUUID})
+		req2.SetPathValue("lease_uuid", leaseUUID)
 
 		rec2 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec2, req2)
@@ -1026,7 +1025,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		// Both requests should succeed since they're different tokens
 		req1 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req1.Header.Set("Authorization", "Bearer "+token1)
-		req1 = mux.SetURLVars(req1, map[string]string{"lease_uuid": leaseUUID})
+		req1.SetPathValue("lease_uuid", leaseUUID)
 
 		rec1 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec1, req1)
@@ -1035,7 +1034,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 
 		req2 := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req2.Header.Set("Authorization", "Bearer "+token2)
-		req2 = mux.SetURLVars(req2, map[string]string{"lease_uuid": leaseUUID})
+		req2.SetPathValue("lease_uuid", leaseUUID)
 
 		rec2 := httptest.NewRecorder()
 		h.GetLeaseConnection(rec2, req2)
@@ -1088,7 +1087,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		for i := 0; i < 2; i++ {
 			req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 			req.Header.Set("Authorization", "Bearer "+validToken)
-			req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+			req.SetPathValue("lease_uuid", leaseUUID)
 
 			rec := httptest.NewRecorder()
 			h.GetLeaseConnection(rec, req)
@@ -1121,7 +1120,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -1145,7 +1144,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -1174,7 +1173,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -1203,7 +1202,7 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -1264,7 +1263,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1309,7 +1308,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1354,7 +1353,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1392,7 +1391,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1414,7 +1413,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/not-a-uuid/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": "not-a-uuid"})
+		req.SetPathValue("lease_uuid", "not-a-uuid")
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1431,7 +1430,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		// No Authorization header
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1451,7 +1450,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+differentLeaseToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1474,7 +1473,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1502,7 +1501,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1530,7 +1529,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1553,7 +1552,7 @@ func TestGetLeaseStatus(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseStatus(rec, req)
@@ -1571,6 +1570,10 @@ func (m *mockTokenTracker) TryUse(signature string) error {
 	if m.tryUseFunc != nil {
 		return m.tryUseFunc(signature)
 	}
+	return nil
+}
+
+func (m *mockTokenTracker) Healthy() error {
 	return nil
 }
 
@@ -1646,7 +1649,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -1678,7 +1681,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -1710,7 +1713,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
-		req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+		req.SetPathValue("lease_uuid", leaseUUID)
 
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
@@ -1746,7 +1749,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 
 				req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 				req.Header.Set("Authorization", "Bearer "+validToken)
-				req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+				req.SetPathValue("lease_uuid", leaseUUID)
 
 				rec := httptest.NewRecorder()
 				h.GetLeaseConnection(rec, req)

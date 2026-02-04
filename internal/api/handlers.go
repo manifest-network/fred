@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gorilla/mux"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -29,6 +28,7 @@ type ChainClient interface {
 // This interface allows for testing with mock implementations.
 type TokenTrackerInterface interface {
 	TryUse(signature string) error
+	Healthy() error
 	Close() error
 }
 
@@ -187,8 +187,7 @@ const (
 
 // GetLeaseConnection handles GET /v1/leases/{lease_uuid}/connection
 func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	leaseUUID := vars["lease_uuid"]
+	leaseUUID := r.PathValue("lease_uuid")
 
 	// Authenticate and authorize the request (requires active lease, checks replay)
 	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
@@ -258,8 +257,7 @@ type LeaseStatusResponse struct {
 
 // GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
 func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	leaseUUID := vars["lease_uuid"]
+	leaseUUID := r.PathValue("lease_uuid")
 
 	// Authenticate and authorize the request (any lease state, no replay check for read-heavy endpoint)
 	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
@@ -347,6 +345,21 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		}
 		if !backendsHealthy {
 			overallHealthy = false
+		}
+	}
+
+	// Check token tracker (bbolt database)
+	if h.tokenTracker != nil {
+		if err := h.tokenTracker.Healthy(); err != nil {
+			checks["token_tracker"] = &CheckResult{
+				Status:  "unhealthy",
+				Message: err.Error(),
+			}
+			overallHealthy = false
+		} else {
+			checks["token_tracker"] = &CheckResult{
+				Status: "healthy",
+			}
 		}
 	}
 

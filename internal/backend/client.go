@@ -372,7 +372,11 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 	if cbErr != nil {
 		return nil, cbErr
 	}
-	return result.(*LeaseInfo), nil
+	info, ok := result.(*LeaseInfo)
+	if !ok {
+		return nil, fmt.Errorf("get info: unexpected result type %T", result)
+	}
+	return info, nil
 }
 
 // Deprovision releases resources for a lease.
@@ -449,7 +453,11 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 	if cbErr != nil {
 		return nil, cbErr
 	}
-	return result.([]ProvisionInfo), nil
+	provisions, ok := result.([]ProvisionInfo)
+	if !ok {
+		return nil, fmt.Errorf("list provisions: unexpected result type %T", result)
+	}
+	return provisions, nil
 }
 
 // RefreshState is a no-op for remote backends (they refresh server-side).

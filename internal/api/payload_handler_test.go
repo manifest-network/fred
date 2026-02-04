@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -85,11 +84,11 @@ func (m *mockPayloadChainClient) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Helper to create a request with mux vars set
+// Helper to create a request with path values set
 func createPayloadRequest(t *testing.T, method, path, leaseUUID string, body []byte, authHeader string) *http.Request {
 	t.Helper()
 	req := httptest.NewRequest(method, path, bytes.NewReader(body))
-	req = mux.SetURLVars(req, map[string]string{"lease_uuid": leaseUUID})
+	req.SetPathValue("lease_uuid", leaseUUID)
 	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
