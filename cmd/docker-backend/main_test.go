@@ -158,6 +158,28 @@ func TestGetLogs_RequiresAuth(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "missing signature")
 }
 
+func TestGetProvision_RequiresAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("GET", "/provisions/lease-1", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "missing signature")
+}
+
+func TestGetProvision_PassesAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("GET", "/provisions/lease-1", nil)
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+
+	w := httptest.NewRecorder()
+	// Passes auth, panics on nil backend — expected.
+	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
+}
+
 func TestListProvisions_RequiresAuth(t *testing.T) {
 	handler := newTestHandler()
 

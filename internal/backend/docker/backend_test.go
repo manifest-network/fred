@@ -598,6 +598,34 @@ func TestParseManifest_Tmpfs(t *testing.T) {
 		// After path.Clean, "/tmp/../proc" becomes "/proc" which is blocked
 		assert.Contains(t, err.Error(), "sensitive path")
 	})
+
+	t.Run("/proc/self rejected (subdirectory of sensitive path)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/proc/self"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "under sensitive path")
+	})
+
+	t.Run("/sys/fs/cgroup rejected (subdirectory of sensitive path)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/sys/fs/cgroup"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "under sensitive path")
+	})
+
+	t.Run("/dev/shm rejected (subdirectory of sensitive path)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/dev/shm"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "under sensitive path")
+	})
+
+	t.Run("/run/secrets rejected (subdirectory of managed path)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/run/secrets"]}`
+		_, err := ParseManifest([]byte(data))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "under sensitive path")
+	})
 }
 
 func TestHasActiveHealthCheck(t *testing.T) {

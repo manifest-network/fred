@@ -217,6 +217,12 @@ t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 
 The HMAC-SHA256 is computed over `<timestamp>.<body>` using the configured `CallbackSecret`.
 
+### Error Message Sanitization
+
+Callback error messages use hardcoded, deterministic strings and never include container logs or runtime-specific data. This prevents secrets, API keys, or other sensitive data from being permanently recorded on-chain as rejection reasons.
+
+Full diagnostics (exit codes, OOM status, container logs) are available via the HMAC-authenticated `GET /provisions/{lease_uuid}` and `GET /logs/{lease_uuid}` endpoints.
+
 ### Payload
 
 ```json
@@ -233,6 +239,185 @@ The HMAC-SHA256 is computed over `<timestamp>.<body>` using the configured `Call
 - Each attempt has a 10s HTTP timeout.
 - Retries abort immediately if the backend is shutting down (`stopCtx` is canceled).
 - A 2xx response is considered success; any other status triggers a retry.
+
+## HTTP API
+
+All authenticated endpoints require an `X-Fred-Signature` HMAC-SHA256 header (see [Signing](#signing)). Request bodies are limited to 1 MiB. All JSON responses use `Content-Type: application/json`. Errors return `{"error": "message"}`.
+
+### `POST /provision` (authenticated)
+
+Starts async container provisioning. Pre-flight validation (SKU, manifest, image allowlist, resources) is synchronous; the actual container lifecycle runs in a background goroutine with results delivered via callback.
+
+**Request:**
+
+```json
+{
+  "lease_uuid": "abc-123",
+  "tenant": "manifest1...",
+  "provider_uuid": "prov-1",
+  "items": [
+    { "sku": "docker-small", "quantity": 2 }
+  ],
+  "callback_url": "https://fred-host/api/v1/backend/callback",
+  "payload": "<base64-encoded manifest JSON>"
+}
+```
+
+**Response (`202 Accepted`):**
+
+```json
+{
+  "provision_id": "abc-123"
+}
+```
+
+**Errors:** `400` (validation), `409` (already provisioned), `503` (insufficient resources).
+
+### `POST /deprovision` (authenticated)
+
+Removes all containers for a lease and releases resources. Idempotent — deprovisioning a nonexistent lease returns success.
+
+**Request:**
+
+```json
+{
+  "lease_uuid": "abc-123"
+}
+```
+
+**Response (`200`):**
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### `GET /info/{lease_uuid}` (authenticated)
+
+Returns connection details for a running lease. Only available when the provision status is `ready` — returns `404` otherwise.
+
+**Response (`200`):**
+
+```json
+{
+  "host": "192.168.1.100",
+  "instances": [
+    {
+      "instance_index": 0,
+      "container_id": "abcdefghijkl",
+      "image": "nginx:latest",
+      "status": "running",
+      "ports": {
+        "80/tcp": { "host_ip": "0.0.0.0", "host_port": "32768" }
+      }
+    }
+  ]
+}
+```
+
+### `GET /logs/{lease_uuid}` (authenticated)
+
+Returns container stdout/stderr keyed by instance index. Works for any provision status (provisioning, ready, or failed).
+
+**Query parameters:** `tail` — number of lines (default 100, max 10000).
+
+**Response (`200`):**
+
+```json
+{
+  "0": "2025-01-15T10:00:00Z Starting server...\n...",
+  "1": "2025-01-15T10:00:00Z Worker ready\n..."
+}
+```
+
+If log retrieval fails for a specific instance, its value contains `<error: ...>` instead.
+
+### `GET /provisions/{lease_uuid}` (authenticated)
+
+Returns a single provision record. This is the primary endpoint for retrieving full failure diagnostics after a sanitized callback.
+
+**Response (`200`):**
+
+```json
+{
+  "lease_uuid": "abc-123",
+  "provider_uuid": "prov-1",
+  "status": "failed",
+  "created_at": "2025-01-15T10:00:00Z",
+  "fail_count": 2,
+  "last_error": "container 0 exited during startup (status: exited): exit_code=1; logs:\nError: config file not found"
+}
+```
+
+`status` is one of: `provisioning`, `ready`, `failed`, `unknown`. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
+
+### `GET /provisions` (authenticated)
+
+Returns all provision records.
+
+**Response (`200`):**
+
+```json
+{
+  "provisions": [
+    {
+      "lease_uuid": "abc-123",
+      "provider_uuid": "prov-1",
+      "status": "ready",
+      "created_at": "2025-01-15T10:00:00Z",
+      "fail_count": 0
+    },
+    {
+      "lease_uuid": "def-456",
+      "provider_uuid": "prov-1",
+      "status": "failed",
+      "created_at": "2025-01-15T10:05:00Z",
+      "fail_count": 3,
+      "last_error": "container exited unexpectedly: exit_code=137, oom_killed=true; logs:\nKilled"
+    }
+  ]
+}
+```
+
+### `GET /health` (unauthenticated)
+
+Docker daemon reachability check.
+
+**Response (`200`):**
+
+```json
+{
+  "status": "healthy"
+}
+```
+
+Returns `503` if the Docker daemon is unreachable.
+
+### `GET /stats` (unauthenticated)
+
+Resource pool usage.
+
+**Response (`200`):**
+
+```json
+{
+  "total_cpu_cores": 8.0,
+  "total_memory_mb": 16384,
+  "total_disk_mb": 102400,
+  "allocated_cpu_cores": 2.5,
+  "allocated_memory_mb": 4096,
+  "allocated_disk_mb": 10240,
+  "available_cpu_cores": 5.5,
+  "available_memory_mb": 12288,
+  "available_disk_mb": 92160,
+  "active_containers": 5
+}
+```
+
+### `GET /metrics` (unauthenticated)
+
+Prometheus metrics in exposition format. Served by `promhttp.Handler()`.
 
 ## Resource Pool
 
@@ -269,6 +454,7 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.created_at` | RFC 3339 timestamp | When the container was created |
 | `fred.instance_index` | integer string | 0-based index within a multi-unit lease |
 | `fred.fail_count` | integer string | Number of provision failures for this lease at creation time |
+| `fred.callback_url` | URL string | Callback URL for provision results; persisted so failure callbacks survive backend restarts |
 
 User-provided labels in the manifest are also applied, but may not use the `fred.*` prefix.
 

@@ -929,6 +929,36 @@ func TestGetLogs_PartialError(t *testing.T) {
 	assert.Contains(t, logs["1"], "<error:")
 }
 
+// --- GetProvision tests ---
+
+func TestGetProvision_Found(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			ProviderUUID: "prov-1",
+			Status:       backend.ProvisionStatusFailed,
+			FailCount:    2,
+			LastError:    "exit_code=1; logs:\nSECRET=abc",
+		},
+	})
+
+	info, err := b.GetProvision(context.Background(), "lease-1")
+	require.NoError(t, err)
+	assert.Equal(t, "lease-1", info.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	assert.Equal(t, 2, info.FailCount)
+	assert.Contains(t, info.LastError, "exit_code=1")
+}
+
+func TestGetProvision_NotFound(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+
+	_, err := b.GetProvision(context.Background(), "nonexistent")
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
 // --- ListProvisions tests ---
 
 func TestListProvisions_Empty(t *testing.T) {
@@ -2200,5 +2230,197 @@ func TestContainerFailureDiagnostics_Truncation(t *testing.T) {
 
 	assert.LessOrEqual(t, len(diag), diagnosticMaxBytes)
 	assert.True(t, strings.HasSuffix(diag, "..."))
+}
+
+// --- Callback sanitization tests ---
+// These tests verify that callback error messages (which flow on-chain) never
+// contain container logs or dynamic data, while prov.LastError retains full
+// diagnostics for authenticated API access.
+
+func TestDoProvision_CallbackSanitized_ContainerExitedDuringStartup(t *testing.T) {
+	secret := "SECRET_API_KEY=abc123"
+
+	var callbackPayload backend.CallbackPayload
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return secret, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Callback should have a hardcoded message — no secrets.
+	assert.Equal(t, "container exited during startup", callbackPayload.Error)
+	assert.NotContains(t, callbackPayload.Error, secret)
+
+	// LastError should contain full diagnostics including logs.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Contains(t, prov.LastError, "exit_code=1")
+	assert.Contains(t, prov.LastError, secret)
+}
+
+func TestDoProvision_CallbackSanitized_Unhealthy(t *testing.T) {
+	secret := "DB_PASSWORD=hunter2"
+
+	var callbackPayload backend.CallbackPayload
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{
+				ContainerID: containerID,
+				Status:      "running",
+				Health:      HealthStatusUnhealthy,
+			}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return secret, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest := &DockerManifest{
+		Image: "nginx:latest",
+		HealthCheck: &HealthCheckConfig{
+			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
+		},
+	}
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Callback should have a hardcoded message — no secrets.
+	assert.Equal(t, "container reported unhealthy", callbackPayload.Error)
+	assert.NotContains(t, callbackPayload.Error, secret)
+
+	// LastError should contain full diagnostics including logs.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Contains(t, prov.LastError, "unhealthy")
+	assert.Contains(t, prov.LastError, secret)
+}
+
+func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
+	var callbackPayload backend.CallbackPayload
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return errors.New("unauthorized: authentication required for registry.example.com")
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusProvisioning,
+			Quantity:    1,
+			CallbackURL: callbackServer.URL,
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Callback should have hardcoded message — no registry auth details.
+	assert.Equal(t, "image pull failed", callbackPayload.Error)
+	assert.NotContains(t, callbackPayload.Error, "registry.example.com")
+
+	// LastError should contain the full error.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Contains(t, prov.LastError, "registry.example.com")
+}
+
+func TestHealthErrorToCallbackMsg(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"unhealthy", fmt.Errorf("container 0 reported unhealthy: exit_code=1; logs: oops"), "container reported unhealthy"},
+		{"exited during health", fmt.Errorf("container 0 exited while waiting for healthy"), "container exited during health check"},
+		{"timeout", fmt.Errorf("timed out waiting for containers to become healthy"), "container exited during health check"},
+		{"inspect failure", fmt.Errorf("failed to inspect container 0 during health check"), "container exited during health check"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, healthErrorToCallbackMsg(tt.err))
+		})
+	}
 }
 

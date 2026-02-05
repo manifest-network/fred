@@ -239,9 +239,15 @@ func validateTmpfsPaths(paths []string) error {
 			return fmt.Errorf("tmpfs: cannot mount root filesystem")
 		}
 
-		// Must not overlap with blocked paths
+		// Must not overlap with blocked paths or their subdirectories.
+		// For example, /proc/self and /sys/fs/cgroup must be rejected.
 		if blockedTmpfsPaths[cleaned] {
 			return fmt.Errorf("tmpfs: path %q is managed by the backend or is a sensitive path", cleaned)
+		}
+		for blocked := range blockedTmpfsPaths {
+			if strings.HasPrefix(cleaned, blocked+"/") {
+				return fmt.Errorf("tmpfs: path %q is under sensitive path %q", cleaned, blocked)
+			}
 		}
 
 		// Check for duplicates

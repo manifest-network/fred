@@ -1702,6 +1702,112 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 
 // TestReconciler_ConcurrentReconcileAll tests that concurrent ReconcileAll calls
 // are properly serialized by the atomic flag.
+func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
+	// Setup: Active lease on chain, failed provision with FailCount >= maxReprovisionAttempts
+	// Expected: Close the lease and deprovision the backend resources
+	var closedLeases []string
+	var closedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			closedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   3, // >= DefaultMaxReprovisionAttempts (3)
+				BackendName: "test",
+			},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was closed (not rejected — it's ACTIVE, not PENDING)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, closedLeases, 1)
+	assert.Equal(t, "lease-1", closedLeases[0])
+	assert.Contains(t, closedReason, "failed 3 times")
+
+	// Verify backend resources were released immediately
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	require.Len(t, mockBackend.deprovisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.deprovisionCalls[0])
+
+	// Verify NO re-provisioning was attempted
+	assert.Empty(t, mockBackend.provisionCalls)
+}
+
+func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
+	// Setup: Active lease on chain, failed provision with FailCount < maxReprovisionAttempts
+	// Expected: Attempt re-provisioning (not close)
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   1, // < DefaultMaxReprovisionAttempts (3)
+				BackendName: "test",
+			},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify re-provisioning was attempted (not closed)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Len(t, mockBackend.provisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.provisionCalls[0].LeaseUUID)
+
+	// No deprovisions (that happens after close, not re-provision)
+	assert.Empty(t, mockBackend.deprovisionCalls)
+}
+
 func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	// Create mock chain client that returns one pending lease.
 	// Add a delay to ensure reconciliation takes some time, which allows us to

@@ -170,6 +170,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /deprovision", authMw(http.HandlerFunc(s.handleDeprovision)))
 	mux.Handle("GET /info/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetInfo)))
 	mux.Handle("GET /logs/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetLogs)))
+	mux.Handle("GET /provisions/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetProvision)))
 	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
 
 	// Operational endpoints — no auth required (monitoring, health checks).
@@ -330,6 +331,27 @@ type StatsResponse struct {
 // StatusResponse is a simple status response.
 type StatusResponse struct {
 	Status string `json:"status"`
+}
+
+func (s *Server) handleGetProvision(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+	if leaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+
+	info, err := s.backend.GetProvision(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {

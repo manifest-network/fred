@@ -251,5 +251,4 @@ const (
 	ActionAcknowledged  = "acknowledged"
 	ActionDeprovisioned = "deprovisioned"
 	ActionAnomaly       = "anomaly"
-	ActionRejected      = "rejected"
 )

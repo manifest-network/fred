@@ -33,6 +33,7 @@ const (
 	LabelCreatedAt     = "fred.created_at"
 	LabelInstanceIndex = "fred.instance_index"
 	LabelFailCount     = "fred.fail_count"
+	LabelCallbackURL   = "fred.callback_url"
 )
 
 // ContainerInfo holds information about a managed container.
@@ -44,6 +45,7 @@ type ContainerInfo struct {
 	SKU           string
 	InstanceIndex int
 	FailCount     int
+	CallbackURL   string
 	Image         string
 	Status        string
 	Health        HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
@@ -126,6 +128,10 @@ type CreateContainerParams struct {
 	// Retry tracking
 	FailCount int
 
+	// CallbackURL is persisted as a label so failure callbacks can be
+	// sent after a docker-backend restart (when in-memory state is lost).
+	CallbackURL string
+
 	// Hardening parameters
 	HostBindIP     string
 	ReadonlyRootfs bool
@@ -184,6 +190,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		LabelCreatedAt:     time.Now().Format(time.RFC3339),
 		LabelInstanceIndex: strconv.Itoa(params.InstanceIndex),
 		LabelFailCount:     strconv.Itoa(params.FailCount),
+		LabelCallbackURL:   params.CallbackURL,
 	}
 
 	// Add user labels (already validated to not conflict with fred.*)
@@ -429,6 +436,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		Tenant:        resp.Config.Labels[LabelTenant],
 		ProviderUUID:  resp.Config.Labels[LabelProviderUUID],
 		SKU:           resp.Config.Labels[LabelSKU],
+		CallbackURL:   resp.Config.Labels[LabelCallbackURL],
 		Image:         resp.Config.Image,
 		Status:        resp.State.Status,
 		Health:        health,
@@ -485,6 +493,7 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			Tenant:        c.Labels[LabelTenant],
 			ProviderUUID:  c.Labels[LabelProviderUUID],
 			SKU:           c.Labels[LabelSKU],
+			CallbackURL:   c.Labels[LabelCallbackURL],
 			Image:         c.Image,
 			Status:        c.State,
 			InstanceIndex: meta.InstanceIndex,

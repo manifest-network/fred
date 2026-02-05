@@ -419,6 +419,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var err error
+	var callbackErr string // hardcoded message for callbacks (safe for on-chain)
 	provisionStart := time.Now()
 
 	// Single cleanup path via defer - handles both early cancellation and runtime errors
@@ -449,7 +450,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				}
 			}
 
-			b.sendCallback(req.LeaseUUID, false, err.Error())
+			// Send hardcoded callback message — never includes logs or dynamic data.
+			// Full diagnostics remain in prov.LastError for authenticated API access.
+			b.sendCallback(req.LeaseUUID, false, callbackErr)
 			return
 		}
 
@@ -471,6 +474,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	if ctx.Err() != nil {
 		logger.Warn("provisioning canceled before start", "error", ctx.Err())
 		err = fmt.Errorf("provisioning canceled: %w", ctx.Err())
+		callbackErr = "provisioning canceled"
 		return
 	}
 
@@ -480,6 +484,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	if err = b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); err != nil {
 		logger.Error("failed to pull image", "error", err)
 		err = fmt.Errorf("image pull failed: %w", err)
+		callbackErr = "image pull failed"
 		return
 	}
 	imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())
@@ -491,6 +496,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		if netErr != nil {
 			logger.Error("failed to create tenant network", "error", netErr)
 			err = fmt.Errorf("tenant network setup failed: %w", netErr)
+			callbackErr = "tenant network setup failed"
 			return
 		}
 		networkConfig = buildNetworkConfig(networkID)
@@ -526,6 +532,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				Profile:        profile,
 				InstanceIndex:  instanceIndex,
 				FailCount:      failCount,
+				CallbackURL:    req.CallbackURL,
 				HostBindIP:     b.cfg.GetHostBindIP(),
 				ReadonlyRootfs: b.cfg.IsReadonlyRootfs(),
 				PidsLimit:      b.cfg.GetPidsLimit(),
@@ -537,6 +544,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			if createErr != nil {
 				instanceLogger.Error("failed to create container", "error", createErr)
 				err = fmt.Errorf("container creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, createErr)
+				callbackErr = "container creation failed"
 				return
 			}
 			containerIDs = append(containerIDs, containerID)
@@ -546,6 +554,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
 				instanceLogger.Error("failed to start container", "error", startErr)
 				err = fmt.Errorf("container start failed (instance %d, sku %s): %w", instanceIndex, item.SKU, startErr)
+				callbackErr = "container start failed"
 				return
 			}
 
@@ -561,6 +570,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		// Bounded by the existing ProvisionTimeout context.
 		logger.Info("waiting for health checks to pass")
 		if err = b.waitForHealthy(ctx, containerIDs, logger); err != nil {
+			callbackErr = healthErrorToCallbackMsg(err)
 			return
 		}
 	} else {
@@ -573,6 +583,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		select {
 		case <-ctx.Done():
 			err = fmt.Errorf("provisioning canceled during startup verification: %w", ctx.Err())
+			callbackErr = "provisioning canceled"
 			return
 		case <-time.After(startupVerify):
 		}
@@ -581,12 +592,14 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			info, inspectErr := b.docker.InspectContainer(ctx, containerID)
 			if inspectErr != nil {
 				err = fmt.Errorf("failed to verify container %d after startup: %w", i, inspectErr)
+				callbackErr = "container exited during startup"
 				return
 			}
 			status := containerStatusToProvisionStatus(info.Status)
 			if status != backend.ProvisionStatusReady {
 				diag := b.containerFailureDiagnostics(ctx, containerID, info)
 				err = fmt.Errorf("container %d exited during startup (status: %s): %s", i, info.Status, diag)
+				callbackErr = "container exited during startup"
 				return
 			}
 		}
@@ -597,6 +610,20 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 // healthPollInterval is the interval between health check polls during startup verification.
 const healthPollInterval = 2 * time.Second
+
+// healthErrorToCallbackMsg maps a waitForHealthy error to a hardcoded callback
+// message safe for on-chain surfacing.
+func healthErrorToCallbackMsg(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "unhealthy"):
+		return "container reported unhealthy"
+	case strings.Contains(msg, "exited"):
+		return "container exited during health check"
+	default:
+		return "container exited during health check"
+	}
+}
 
 // waitForHealthy polls container health status until all containers report
 // "healthy". It fails immediately if any container becomes "unhealthy" or
@@ -778,6 +805,28 @@ func (b *Backend) RefreshState(ctx context.Context) error {
 	return b.recoverState(ctx)
 }
 
+// GetProvision returns a single provision by lease UUID.
+// Returns ErrNotProvisioned if the lease is not found.
+func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+
+	if !ok {
+		return nil, backend.ErrNotProvisioned
+	}
+
+	return &backend.ProvisionInfo{
+		LeaseUUID:    prov.LeaseUUID,
+		ProviderUUID: prov.ProviderUUID,
+		Status:       prov.Status,
+		CreatedAt:    prov.CreatedAt,
+		BackendName:  b.cfg.Name,
+		FailCount:    prov.FailCount,
+		LastError:    prov.LastError,
+	}, nil
+}
+
 // ListProvisions returns all currently provisioned resources.
 func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	b.provisionsMu.RLock()
@@ -858,6 +907,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				Status:       containerStatusToProvisionStatus(c.Status),
 				CreatedAt:    c.CreatedAt,
 				FailCount:    c.FailCount,
+				CallbackURL:  c.CallbackURL,
 				ContainerIDs: make([]string, 0),
 			}
 			recovered[c.LeaseUUID] = prov
@@ -1001,13 +1051,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.provisionsMu.Unlock()
 	}
 
-	// Send failure callbacks with diagnostics outside the lock.
+	// Send failure callbacks with hardcoded message — never includes logs
+	// or dynamic data. Full diagnostics are in prov.LastError for
+	// authenticated API access.
 	for _, uuid := range failedLeases {
-		msg := errMsgContainerExited
-		if diag, ok := failedDiagnostics[uuid]; ok {
-			msg = msg + ": " + diag
-		}
-		b.sendCallback(uuid, false, msg)
+		b.sendCallback(uuid, false, errMsgContainerExited)
 	}
 
 	totalContainers := 0

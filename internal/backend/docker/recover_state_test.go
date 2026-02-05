@@ -2,9 +2,11 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -759,6 +761,160 @@ func TestRecoverState_SetsActiveProvisionsGauge(t *testing.T) {
 	})
 }
 
+func TestCleanupOrphanedNetworks(t *testing.T) {
+	now := time.Now()
+
+	t.Run("removes networks for tenants without active provisions", func(t *testing.T) {
+		var removedTenants []string
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:  "c1",
+						LeaseUUID:    "lease-1",
+						Tenant:       "tenant-a",
+						ProviderUUID: "prov-1",
+						SKU:          "docker-small",
+						Status:       "running",
+						CreatedAt:    now,
+					},
+				}, nil
+			},
+			ListManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
+				return []networktypes.Inspect{
+					{
+						Name:       "fred-tenant-aaaa",
+						Labels:     map[string]string{LabelTenant: "tenant-a"},
+						Containers: map[string]networktypes.EndpointResource{"c1": {}},
+					},
+					{
+						Name:       "fred-tenant-bbbb",
+						Labels:     map[string]string{LabelTenant: "tenant-b"},
+						Containers: map[string]networktypes.EndpointResource{}, // No containers
+					},
+				}, nil
+			},
+			RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) error {
+				removedTenants = append(removedTenants, tenant)
+				return nil
+			},
+		}
+
+		cfg := DefaultConfig()
+		cfg.NetworkIsolation = ptrBool(true)
+		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+		stopCtx, stopCancel := context.WithCancel(context.Background())
+		defer stopCancel()
+
+		b := &Backend{
+			cfg:        cfg,
+			docker:     mock,
+			pool:       pool,
+			logger:     slog.Default(),
+			provisions: make(map[string]*provision),
+			stopCtx:    stopCtx,
+			stopCancel: stopCancel,
+		}
+		b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+			HTTPClient: http.DefaultClient,
+			Logger:     b.logger,
+			StopCtx:    b.stopCtx,
+		})
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		// tenant-b should be removed (no active provisions, no containers)
+		assert.Equal(t, []string{"tenant-b"}, removedTenants)
+	})
+
+	t.Run("keeps networks with connected containers", func(t *testing.T) {
+		var removedTenants []string
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return nil, nil // No managed containers
+			},
+			ListManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
+				return []networktypes.Inspect{
+					{
+						Name:   "fred-tenant-cccc",
+						Labels: map[string]string{LabelTenant: "tenant-c"},
+						// Has containers still connected even though no provisions
+						Containers: map[string]networktypes.EndpointResource{"some-container": {}},
+					},
+				}, nil
+			},
+			RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) error {
+				removedTenants = append(removedTenants, tenant)
+				return nil
+			},
+		}
+
+		cfg := DefaultConfig()
+		cfg.NetworkIsolation = ptrBool(true)
+		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+		stopCtx, stopCancel := context.WithCancel(context.Background())
+		defer stopCancel()
+
+		b := &Backend{
+			cfg:        cfg,
+			docker:     mock,
+			pool:       pool,
+			logger:     slog.Default(),
+			provisions: make(map[string]*provision),
+			stopCtx:    stopCtx,
+			stopCancel: stopCancel,
+		}
+		b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+			HTTPClient: http.DefaultClient,
+			Logger:     b.logger,
+			StopCtx:    b.stopCtx,
+		})
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		// Network with containers should NOT be removed
+		assert.Empty(t, removedTenants)
+	})
+
+	t.Run("ListManagedNetworks error is non-fatal", func(t *testing.T) {
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return nil, nil
+			},
+			ListManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
+				return nil, fmt.Errorf("docker network list failed")
+			},
+		}
+
+		cfg := DefaultConfig()
+		cfg.NetworkIsolation = ptrBool(true)
+		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+		stopCtx, stopCancel := context.WithCancel(context.Background())
+		defer stopCancel()
+
+		b := &Backend{
+			cfg:        cfg,
+			docker:     mock,
+			pool:       pool,
+			logger:     slog.Default(),
+			provisions: make(map[string]*provision),
+			stopCtx:    stopCtx,
+			stopCancel: stopCancel,
+		}
+		b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+			HTTPClient: http.DefaultClient,
+			Logger:     b.logger,
+			StopCtx:    b.stopCtx,
+		})
+
+		// Should not return error - network cleanup failure is logged, not propagated
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+	})
+}
+
 func TestRecoverState_Serialized(t *testing.T) {
 	// Verify that concurrent recoverState calls are serialized by recoverMu.
 	// Use an atomic counter to track the maximum number of concurrent calls
@@ -798,4 +954,72 @@ func TestRecoverState_Serialized(t *testing.T) {
 
 	assert.Equal(t, int32(1), maxConcurrent.Load(),
 		"recoverState calls should be serialized (max concurrency must be 1)")
+}
+
+func TestRecoverState_CallbackSanitized(t *testing.T) {
+	// Verify that recoverState failure callbacks never include container logs
+	// or dynamic data — only the hardcoded errMsgContainerExited.
+	secret := "AWS_SECRET_KEY=wJalrXUtnFEMI"
+	now := time.Now()
+
+	var callbackPayload backend.CallbackPayload
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{
+					ContainerID:   "c1",
+					LeaseUUID:     "lease-1",
+					Tenant:        "tenant-a",
+					ProviderUUID:  "prov-1",
+					SKU:           "docker-small",
+					InstanceIndex: 0,
+					Image:         "nginx:latest",
+					Status:        "exited",
+					CreatedAt:     now,
+					CallbackURL:   callbackServer.URL,
+				},
+			}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return secret, nil
+		},
+	}
+
+	existing := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1"},
+			FailCount:    0,
+			CreatedAt:    now,
+			CallbackURL:  callbackServer.URL,
+		},
+	}
+	b := newBackendForTest(mock, existing)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	err := b.recoverState(context.Background())
+	require.NoError(t, err)
+
+	// Callback should have hardcoded message only — no secrets.
+	assert.Equal(t, errMsgContainerExited, callbackPayload.Error)
+	assert.NotContains(t, callbackPayload.Error, secret)
+	assert.NotContains(t, callbackPayload.Error, "exit_code")
+
+	// LastError should contain full diagnostics.
+	prov := b.provisions["lease-1"]
+	require.NotNil(t, prov)
+	assert.Contains(t, prov.LastError, "exit_code=1")
+	assert.Contains(t, prov.LastError, secret)
 }
