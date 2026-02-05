@@ -24,6 +24,7 @@ import (
 // enabling unit tests to substitute a lightweight mock.
 type dockerClient interface {
 	Ping(ctx context.Context) error
+	DaemonInfo(ctx context.Context) (DaemonSecurityInfo, error)
 	Close() error
 	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
 	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
@@ -56,6 +57,9 @@ type Backend struct {
 
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore
+
+	// diagnosticsStore persists failure diagnostics in bbolt
+	diagnosticsStore *shared.DiagnosticsStore
 
 	// callbackSender handles callback delivery with retry and HMAC
 	callbackSender *shared.CallbackSender
@@ -95,6 +99,7 @@ func shortID(id string) string {
 const (
 	diagnosticLogTail  = 20
 	diagnosticMaxBytes = 4096
+	persistedLogTail   = 100 // lines per container stored in diagnostics
 
 	// callbackMaxErrorLen is the maximum length of an error message sent in
 	// a callback payload. The on-chain rejection reason has a 256-character
@@ -133,6 +138,49 @@ func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID s
 		s = s[:diagnosticMaxBytes-3] + "..."
 	}
 	return s
+}
+
+// persistDiagnostics saves failure diagnostics and container logs to the
+// diagnostics store. It is a best-effort operation: errors are logged but
+// not propagated. Skipped if diagnosticsStore is nil (e.g., in tests).
+func (b *Backend) persistDiagnostics(leaseUUID string, prov *provision, containerIDs []string) {
+	if b.diagnosticsStore == nil {
+		return
+	}
+
+	entry := shared.DiagnosticEntry{
+		LeaseUUID:    prov.LeaseUUID,
+		ProviderUUID: prov.ProviderUUID,
+		Tenant:       prov.Tenant,
+		Error:        prov.LastError,
+		FailCount:    prov.FailCount,
+		CreatedAt:    time.Now(),
+	}
+
+	// Fetch logs from containers that still exist.
+	if len(containerIDs) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		logs := make(map[string]string, len(containerIDs))
+		for i, cid := range containerIDs {
+			logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
+			if err != nil {
+				b.logger.Debug("failed to fetch container logs for diagnostics persistence",
+					"container_id", shortID(cid), "error", err)
+				continue
+			}
+			logs[fmt.Sprintf("%d", i)] = logOutput
+		}
+		if len(logs) > 0 {
+			entry.Logs = logs
+		}
+	}
+
+	if err := b.diagnosticsStore.Store(entry); err != nil {
+		b.logger.Warn("failed to persist failure diagnostics",
+			"lease_uuid", leaseUUID, "error", err)
+	}
 }
 
 // New creates a new Docker backend.
@@ -177,14 +225,24 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to open callback store: %w", err)
 	}
 
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
+		DBPath: cfg.DiagnosticsDBPath,
+		MaxAge: cfg.DiagnosticsMaxAge,
+	})
+	if err != nil {
+		_ = cbStore.Close()
+		return nil, fmt.Errorf("failed to open diagnostics store: %w", err)
+	}
+
 	b := &Backend{
-		cfg:           cfg,
-		docker:        docker,
-		pool:          pool,
-		logger:        logger.With("backend", cfg.Name),
-		provisions:    make(map[string]*provision),
-		callbackStore: cbStore,
-		httpClient:    httpClient,
+		cfg:              cfg,
+		docker:           docker,
+		pool:             pool,
+		logger:           logger.With("backend", cfg.Name),
+		provisions:       make(map[string]*provision),
+		callbackStore:    cbStore,
+		diagnosticsStore: diagStore,
+		httpClient:       httpClient,
 	}
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
@@ -210,6 +268,9 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
+	// Check daemon capabilities for hardening configuration
+	b.checkDaemonCapabilities(ctx)
+
 	// Recover state from existing containers
 	if err := b.recoverState(ctx); err != nil {
 		return fmt.Errorf("failed to recover state: %w", err)
@@ -229,6 +290,39 @@ func (b *Backend) Start(ctx context.Context) error {
 	return nil
 }
 
+// checkDaemonCapabilities inspects the Docker daemon and logs warnings for
+// misconfigured hardening features. Non-fatal: failures are logged and startup
+// continues.
+func (b *Backend) checkDaemonCapabilities(ctx context.Context) {
+	info, err := b.docker.DaemonInfo(ctx)
+	if err != nil {
+		b.logger.Warn("failed to query daemon info for capability checks", "error", err)
+		return
+	}
+
+	// Check disk quota prerequisites
+	if b.cfg.IsDiskQuota() {
+		if info.StorageDriver != "overlay2" || info.BackingFilesystem != "xfs" {
+			b.logger.Warn("disk quotas enabled but storage configuration incompatible; quotas require overlay2 on xfs with pquota mount option",
+				"storage_driver", info.StorageDriver,
+				"backing_filesystem", info.BackingFilesystem,
+			)
+		}
+	}
+
+	// Check seccomp availability
+	hasSeccomp := false
+	for _, opt := range info.SecurityOptions {
+		if strings.HasPrefix(opt, "name=seccomp") {
+			hasSeccomp = true
+			break
+		}
+	}
+	if !hasSeccomp {
+		b.logger.Warn("Docker daemon has seccomp disabled; containers will not have syscall filtering")
+	}
+}
+
 // Stop shuts down the backend gracefully.
 func (b *Backend) Stop() error {
 	b.stopCancel()
@@ -237,6 +331,11 @@ func (b *Backend) Stop() error {
 	if b.callbackStore != nil {
 		if err := b.callbackStore.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing callback store: %w", err))
+		}
+	}
+	if b.diagnosticsStore != nil {
+		if err := b.diagnosticsStore.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing diagnostics store: %w", err))
 		}
 	}
 	if err := b.docker.Close(); err != nil {
@@ -437,6 +536,8 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				prov.Status = backend.ProvisionStatusFailed
 				prov.FailCount++
 				prov.LastError = err.Error()
+				// Persist diagnostics while containers still exist for log access.
+				b.persistDiagnostics(req.LeaseUUID, prov, containerIDs)
 			}
 			b.provisionsMu.Unlock()
 
@@ -465,6 +566,12 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			prov.Status = backend.ProvisionStatusReady
 		}
 		b.provisionsMu.Unlock()
+
+		// Remove any stale diagnostic entry from a previous failure
+		// (e.g., re-provision after a crash).
+		if b.diagnosticsStore != nil {
+			_ = b.diagnosticsStore.Delete(req.LeaseUUID)
+		}
 
 		updateResourceMetrics(b.pool.Stats())
 		b.sendCallback(req.LeaseUUID, true, "")
@@ -776,6 +883,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			p.Status = backend.ProvisionStatusFailed
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
+			b.persistDiagnostics(leaseUUID, p, failedIDs)
 		}
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
@@ -806,25 +914,45 @@ func (b *Backend) RefreshState(ctx context.Context) error {
 }
 
 // GetProvision returns a single provision by lease UUID.
-// Returns ErrNotProvisioned if the lease is not found.
+// Falls back to the diagnostics store when the provision is not in memory
+// (e.g., after deprovision). Returns ErrNotProvisioned only if both miss.
 func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
 	b.provisionsMu.RLock()
 	prov, ok := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()
 
-	if !ok {
-		return nil, backend.ErrNotProvisioned
+	if ok {
+		return &backend.ProvisionInfo{
+			LeaseUUID:    prov.LeaseUUID,
+			ProviderUUID: prov.ProviderUUID,
+			Status:       prov.Status,
+			CreatedAt:    prov.CreatedAt,
+			BackendName:  b.cfg.Name,
+			FailCount:    prov.FailCount,
+			LastError:    prov.LastError,
+		}, nil
 	}
 
-	return &backend.ProvisionInfo{
-		LeaseUUID:    prov.LeaseUUID,
-		ProviderUUID: prov.ProviderUUID,
-		Status:       prov.Status,
-		CreatedAt:    prov.CreatedAt,
-		BackendName:  b.cfg.Name,
-		FailCount:    prov.FailCount,
-		LastError:    prov.LastError,
-	}, nil
+	// Fall back to persisted diagnostics.
+	if b.diagnosticsStore != nil {
+		entry, err := b.diagnosticsStore.Get(leaseUUID)
+		if err != nil {
+			b.logger.Warn("diagnostics store lookup failed", "lease_uuid", leaseUUID, "error", err)
+		}
+		if entry != nil {
+			return &backend.ProvisionInfo{
+				LeaseUUID:    entry.LeaseUUID,
+				ProviderUUID: entry.ProviderUUID,
+				Status:       backend.ProvisionStatusFailed,
+				CreatedAt:    entry.CreatedAt,
+				BackendName:  b.cfg.Name,
+				FailCount:    entry.FailCount,
+				LastError:    entry.Error,
+			}, nil
+		}
+	}
+
+	return nil, backend.ErrNotProvisioned
 }
 
 // ListProvisions returns all currently provisioned resources.
@@ -1051,6 +1179,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.provisionsMu.Unlock()
 	}
 
+	// Persist diagnostics for all failed leases (containers are dead but not removed).
+	b.provisionsMu.RLock()
+	for _, uuid := range allFailed {
+		if prov, ok := b.provisions[uuid]; ok {
+			b.persistDiagnostics(uuid, prov, prov.ContainerIDs)
+		}
+	}
+	b.provisionsMu.RUnlock()
+
 	// Send failure callbacks with hardcoded message — never includes logs
 	// or dynamic data. Full diagnostics are in prov.LastError for
 	// authenticated API access.
@@ -1134,6 +1271,8 @@ func (b *Backend) reconcileLoop() {
 
 // GetLogs returns the last N lines of stdout/stderr for each container in
 // a lease, keyed by instance index (e.g., "0", "1").
+// Falls back to the diagnostics store when the provision is not in memory
+// (e.g., after deprovision). Returns ErrNotProvisioned only if both miss.
 // On partial failure (some containers succeed, some fail), the successful logs
 // are returned along with error placeholders, and the errors are logged.
 func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
@@ -1141,26 +1280,37 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	prov, exists := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()
 
-	if !exists {
-		return nil, backend.ErrNotProvisioned
+	if exists {
+		result := make(map[string]string, len(prov.ContainerIDs))
+		for i, containerID := range prov.ContainerIDs {
+			logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
+			if err != nil {
+				b.logger.Warn("failed to retrieve container logs",
+					"lease_uuid", leaseUUID,
+					"instance", i,
+					"container_id", shortID(containerID),
+					"error", err,
+				)
+				result[fmt.Sprintf("%d", i)] = fmt.Sprintf("<error: %s>", err)
+				continue
+			}
+			result[fmt.Sprintf("%d", i)] = logs
+		}
+		return result, nil
 	}
 
-	result := make(map[string]string, len(prov.ContainerIDs))
-	for i, containerID := range prov.ContainerIDs {
-		logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
+	// Fall back to persisted diagnostics.
+	if b.diagnosticsStore != nil {
+		entry, err := b.diagnosticsStore.Get(leaseUUID)
 		if err != nil {
-			b.logger.Warn("failed to retrieve container logs",
-				"lease_uuid", leaseUUID,
-				"instance", i,
-				"container_id", shortID(containerID),
-				"error", err,
-			)
-			result[fmt.Sprintf("%d", i)] = fmt.Sprintf("<error: %s>", err)
-			continue
+			b.logger.Warn("diagnostics store lookup failed", "lease_uuid", leaseUUID, "error", err)
 		}
-		result[fmt.Sprintf("%d", i)] = logs
+		if entry != nil && len(entry.Logs) > 0 {
+			return entry.Logs, nil
+		}
 	}
-	return result, nil
+
+	return nil, backend.ErrNotProvisioned
 }
 
 // Stats returns current resource usage statistics.

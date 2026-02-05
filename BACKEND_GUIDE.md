@@ -118,6 +118,7 @@ Start provisioning a resource asynchronously.
 **Error Responses:**
 - `400 Bad Request` - Invalid request body
 - `409 Conflict` - Lease already provisioned
+- `503 Service Unavailable` - Insufficient resources
 
 ### GET /info/{lease_uuid}
 

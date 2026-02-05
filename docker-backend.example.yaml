@@ -113,6 +113,22 @@ callback_db_path: "callbacks.db"
 callback_max_age: 24h
 
 # =============================================================================
+# DIAGNOSTICS
+# =============================================================================
+# Failure diagnostics (error messages and container logs) are persisted to a
+# bbolt database so they survive deprovision and backend restarts. The
+# GET /provisions/{lease_uuid} and GET /logs/{lease_uuid} endpoints fall back
+# to this store when the provision is no longer in memory.
+
+# Path to bbolt database for persisting failure diagnostics.
+# Default: "diagnostics.db"
+diagnostics_db_path: "diagnostics.db"
+
+# Maximum age of persisted diagnostic entries. Entries older than this are
+# removed by background cleanup. Default: 7 days (168h).
+diagnostics_max_age: 168h
+
+# =============================================================================
 # HOST CONFIGURATION
 # =============================================================================
 

@@ -36,6 +36,14 @@ const (
 	LabelCallbackURL   = "fred.callback_url"
 )
 
+// DaemonSecurityInfo contains Docker daemon capabilities relevant to
+// container hardening validation.
+type DaemonSecurityInfo struct {
+	StorageDriver     string
+	BackingFilesystem string
+	SecurityOptions   []string
+}
+
 // ContainerInfo holds information about a managed container.
 type ContainerInfo struct {
 	ContainerID   string
@@ -93,6 +101,28 @@ func (d *DockerClient) Close() error {
 func (d *DockerClient) Ping(ctx context.Context) error {
 	_, err := d.client.Ping(ctx)
 	return err
+}
+
+// DaemonInfo returns Docker daemon capabilities for hardening validation.
+func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, error) {
+	info, err := d.client.Info(ctx)
+	if err != nil {
+		return DaemonSecurityInfo{}, fmt.Errorf("failed to get daemon info: %w", err)
+	}
+
+	var backingFS string
+	for _, pair := range info.DriverStatus {
+		if len(pair) == 2 && pair[0] == "Backing Filesystem" {
+			backingFS = pair[1]
+			break
+		}
+	}
+
+	return DaemonSecurityInfo{
+		StorageDriver:     info.Driver,
+		BackingFilesystem: backingFS,
+		SecurityOptions:   info.SecurityOptions,
+	}, nil
 }
 
 // PullImage pulls a container image with timeout.

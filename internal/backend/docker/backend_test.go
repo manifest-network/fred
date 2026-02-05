@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -345,6 +346,8 @@ func TestConfigHardeningDefaults(t *testing.T) {
 	assert.Equal(t, "0.0.0.0", cfg.GetHostBindIP())
 	assert.True(t, cfg.IsDiskQuota())
 	assert.Equal(t, "callbacks.db", cfg.CallbackDBPath)
+	assert.Equal(t, "diagnostics.db", cfg.DiagnosticsDBPath)
+	assert.Equal(t, 7*24*time.Hour, cfg.DiagnosticsMaxAge)
 }
 
 func TestConfigHardeningOverrides(t *testing.T) {
@@ -487,6 +490,20 @@ func TestConfigHardeningValidation(t *testing.T) {
 	t.Run("nil tenant quota is valid", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.TenantQuota = nil
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("negative diagnostics_max_age rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.DiagnosticsMaxAge = -1
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "diagnostics_max_age")
+	})
+
+	t.Run("zero diagnostics_max_age is valid", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.DiagnosticsMaxAge = 0
 		assert.NoError(t, cfg.Validate())
 	})
 }
@@ -723,6 +740,92 @@ func TestTenantNetworkName(t *testing.T) {
 	t.Run("starts with prefix", func(t *testing.T) {
 		name := TenantNetworkName("any-tenant")
 		assert.True(t, strings.HasPrefix(name, "fred-tenant-"))
+	})
+}
+
+func TestCheckDaemonCapabilities(t *testing.T) {
+	t.Run("disk quota warning on non-xfs", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{
+					StorageDriver:     "overlay2",
+					BackingFilesystem: "ext4",
+					SecurityOptions:   []string{"name=seccomp,profile=default"},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		// disk quota is true by default — should warn about ext4
+		b.checkDaemonCapabilities(context.Background())
+		// Verify no panic; warning is logged (not assertable without a test logger).
+	})
+
+	t.Run("disk quota warning on non-overlay2", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{
+					StorageDriver:     "devicemapper",
+					BackingFilesystem: "xfs",
+					SecurityOptions:   []string{"name=seccomp,profile=default"},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.checkDaemonCapabilities(context.Background())
+	})
+
+	t.Run("no disk quota warning when disabled", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{
+					StorageDriver:     "devicemapper",
+					BackingFilesystem: "ext4",
+					SecurityOptions:   []string{"name=seccomp,profile=default"},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.cfg.ContainerDiskQuota = ptrBool(false)
+		b.checkDaemonCapabilities(context.Background())
+	})
+
+	t.Run("seccomp warning when missing", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{
+					StorageDriver:     "overlay2",
+					BackingFilesystem: "xfs",
+					SecurityOptions:   []string{"name=apparmor"},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.checkDaemonCapabilities(context.Background())
+	})
+
+	t.Run("no warnings when everything is correct", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{
+					StorageDriver:     "overlay2",
+					BackingFilesystem: "xfs",
+					SecurityOptions:   []string{"name=seccomp,profile=default"},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.checkDaemonCapabilities(context.Background())
+	})
+
+	t.Run("daemon info error is non-fatal", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{}, fmt.Errorf("connection refused")
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.checkDaemonCapabilities(context.Background())
+		// Should not panic; warning is logged and startup continues.
 	})
 }
 

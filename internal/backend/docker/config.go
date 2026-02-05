@@ -120,6 +120,15 @@ type Config struct {
 	// Entries older than this are removed by the callback store's background cleanup.
 	// Defaults to 24h.
 	CallbackMaxAge time.Duration `yaml:"callback_max_age"`
+
+	// DiagnosticsDBPath is the path to the bbolt database for persisting failure diagnostics.
+	// Defaults to "diagnostics.db".
+	DiagnosticsDBPath string `yaml:"diagnostics_db_path"`
+
+	// DiagnosticsMaxAge is the maximum age of a persisted diagnostic entry.
+	// Entries older than this are removed by the diagnostics store's background cleanup.
+	// Defaults to 7 days.
+	DiagnosticsMaxAge time.Duration `yaml:"diagnostics_max_age"`
 }
 
 func ptrBool(b bool) *bool    { return &b }
@@ -198,6 +207,8 @@ func DefaultConfig() Config {
 		ContainerTmpfsSizeMB:    64,
 		ContainerDiskQuota:      ptrBool(true),
 		CallbackMaxAge:          24 * time.Hour,
+		DiagnosticsDBPath:       "diagnostics.db",
+		DiagnosticsMaxAge:       7 * 24 * time.Hour,
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
 				CPUCores: 0.25,
@@ -337,6 +348,10 @@ func (c *Config) Validate() error {
 
 	if c.CallbackMaxAge < 0 {
 		return fmt.Errorf("callback_max_age must be non-negative")
+	}
+
+	if c.DiagnosticsMaxAge < 0 {
+		return fmt.Errorf("diagnostics_max_age must be non-negative")
 	}
 
 	if c.TenantQuota != nil {

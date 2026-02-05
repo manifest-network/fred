@@ -59,6 +59,15 @@ Images are validated before pull. The registry is extracted from the image refer
 | CallbackDBPath | `callback_db_path` | string | `"callbacks.db"` | Path to bbolt database for persisting pending callbacks |
 | CallbackMaxAge | `callback_max_age` | duration | `24h` | Maximum age of persisted callback entries before cleanup |
 
+### Diagnostics
+
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| DiagnosticsDBPath | `diagnostics_db_path` | string | `"diagnostics.db"` | Path to bbolt database for persisting failure diagnostics |
+| DiagnosticsMaxAge | `diagnostics_max_age` | duration | `7d` | Maximum age of persisted diagnostic entries before cleanup |
+
+When a provision fails (during provisioning, state recovery, or partial deprovision), the backend persists full failure diagnostics and container logs to a bbolt database. `GET /provisions/{lease_uuid}` and `GET /logs/{lease_uuid}` fall back to this store when the provision is no longer in memory (e.g., after deprovision or restart), returning the persisted error and logs with a 7-day default retention.
+
 ### Tenant Quotas
 
 | Field | YAML Key | Type | Default | Description |
@@ -77,7 +86,7 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | ImagePullTimeout | `image_pull_timeout` | duration | `5m` | Timeout for pulling images |
 | ContainerCreateTimeout | `container_create_timeout` | duration | `30s` | Timeout for creating containers |
 | ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers |
-| ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation |
+| ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation. Setting to `0` uses the default (10m) via `cmp.Or` |
 | ReconcileInterval | `reconcile_interval` | duration | `5m` | How often to reconcile state with Docker |
 | StartupVerifyDuration | `startup_verify_duration` | duration | `5s` | Grace period after start before verifying containers are still running |
 
@@ -150,7 +159,7 @@ Every container is created with the following security measures:
 | Drop all capabilities | `CapDrop: ["ALL"]` | No Linux capabilities granted |
 | No new privileges | `SecurityOpt: ["no-new-privileges:true"]` | Prevents privilege escalation via setuid/setgid |
 | Read-only root filesystem | `ReadonlyRootfs: true` | Configurable via `container_readonly_rootfs` |
-| Tmpfs for `/tmp` and `/run` | `Tmpfs: {"/tmp": "size=64M", "/run": "size=64M"}` | Only when readonly rootfs is enabled; size from `container_tmpfs_size_mb`. Tenants may request up to 4 additional tmpfs mounts via manifest, for a maximum of 6 total (384MB at default size). |
+| Tmpfs for `/tmp` and `/run` | `Tmpfs: {"/tmp": "size=64M", "/run": "size=64M"}` | Only when readonly rootfs is enabled; size from `container_tmpfs_size_mb`. Tenants may request up to 4 additional tmpfs mounts via manifest, for a maximum of 6 total (384MB at default size). **Note:** On cgroup v1, tmpfs memory is not counted against the container's cgroup memory limit. On cgroup v2 (default on modern systems), it is. |
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | Memory (no swap) | `MemorySwap == Memory` | Prevents swap usage entirely |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,7 @@ import (
 // loudly rather than silently returning zero values.
 type mockDockerClient struct {
 	PingFn                       func(ctx context.Context) error
+	DaemonInfoFn                 func(ctx context.Context) (DaemonSecurityInfo, error)
 	CloseFn                      func() error
 	PullImageFn                  func(ctx context.Context, imageName string, timeout time.Duration) error
 	CreateContainerFn            func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
@@ -44,6 +46,18 @@ func (m *mockDockerClient) Ping(ctx context.Context) error {
 		return m.PingFn(ctx)
 	}
 	panic("unexpected call to Ping")
+}
+
+func (m *mockDockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, error) {
+	if m.DaemonInfoFn != nil {
+		return m.DaemonInfoFn(ctx)
+	}
+	// Default: return sensible values so existing tests don't break.
+	return DaemonSecurityInfo{
+		StorageDriver:     "overlay2",
+		BackingFilesystem: "xfs",
+		SecurityOptions:   []string{"name=seccomp,profile=default"},
+	}, nil
 }
 
 func (m *mockDockerClient) Close() error {
@@ -954,6 +968,70 @@ func TestRecoverState_Serialized(t *testing.T) {
 
 	assert.Equal(t, int32(1), maxConcurrent.Load(),
 		"recoverState calls should be serialized (max concurrency must be 1)")
+}
+
+func TestRecoverState_PersistsDiagnostics(t *testing.T) {
+	// Verify that a ready→failed transition detected by recoverState persists
+	// diagnostics including container logs.
+	dbPath := filepath.Join(t.TempDir(), "recover_diag.db")
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer diagStore.Close()
+
+	now := time.Now()
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{
+					ContainerID:   "c1",
+					LeaseUUID:     "lease-1",
+					Tenant:        "tenant-a",
+					ProviderUUID:  "prov-1",
+					SKU:           "docker-small",
+					InstanceIndex: 0,
+					Image:         "nginx:latest",
+					Status:        "exited",
+					CreatedAt:     now,
+				},
+			}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 137, OOMKilled: true}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "Killed by OOM\n", nil
+		},
+	}
+
+	existing := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1"},
+			FailCount:    0,
+			CreatedAt:    now,
+		},
+	}
+	b := newBackendForTest(mock, existing)
+	b.diagnosticsStore = diagStore
+
+	err = b.recoverState(context.Background())
+	require.NoError(t, err)
+
+	// Verify diagnostics were persisted.
+	entry, err := diagStore.Get("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "diagnostics should be persisted for failed transition")
+	assert.Contains(t, entry.Error, "container exited unexpectedly")
+	assert.Contains(t, entry.Error, "exit_code=137")
+	assert.Equal(t, 1, entry.FailCount)
+	assert.Equal(t, "tenant-a", entry.Tenant)
+	assert.Equal(t, "prov-1", entry.ProviderUUID)
+	// Logs should be persisted
+	require.NotNil(t, entry.Logs)
+	assert.Contains(t, entry.Logs["0"], "Killed by OOM")
 }
 
 func TestRecoverState_CallbackSanitized(t *testing.T) {

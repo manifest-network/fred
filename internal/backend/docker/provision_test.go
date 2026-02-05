@@ -2424,3 +2424,198 @@ func TestHealthErrorToCallbackMsg(t *testing.T) {
 	}
 }
 
+func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
+	// Verify that a provisioning failure (image pull) persists diagnostics
+	// and that GetProvision/GetLogs fall back to the diagnostics store
+	// after deprovision removes the in-memory provision.
+	dbPath := filepath.Join(t.TempDir(), "diag.db")
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer diagStore.Close()
+
+	var callbackReceived atomic.Bool
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackReceived.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return fmt.Errorf("registry unreachable")
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.diagnosticsStore = diagStore
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-diag",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      validManifestJSON("docker.io/nginx:latest"),
+	}
+
+	err = b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	// Wait for async provision to complete.
+	require.Eventually(t, func() bool { return callbackReceived.Load() }, 5*time.Second, 50*time.Millisecond)
+
+	// Verify diagnostics were persisted.
+	entry, err := diagStore.Get("lease-diag")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Contains(t, entry.Error, "image pull failed")
+	assert.Equal(t, 1, entry.FailCount)
+	assert.Equal(t, "tenant-a", entry.Tenant)
+	assert.Equal(t, "prov-1", entry.ProviderUUID)
+
+	// In-memory GetProvision should still work.
+	info, err := b.GetProvision(context.Background(), "lease-diag")
+	require.NoError(t, err)
+	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
+
+	// Now simulate deprovision (remove from in-memory map).
+	b.provisionsMu.Lock()
+	delete(b.provisions, "lease-diag")
+	b.provisionsMu.Unlock()
+
+	// GetProvision should fall back to diagnostics store.
+	info, err = b.GetProvision(context.Background(), "lease-diag")
+	require.NoError(t, err)
+	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	assert.Contains(t, info.LastError, "image pull failed")
+	assert.Equal(t, 1, info.FailCount)
+	assert.Equal(t, "prov-1", info.ProviderUUID)
+
+	// GetProvision for unknown lease still returns ErrNotProvisioned.
+	_, err = b.GetProvision(context.Background(), "nonexistent")
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+func TestGetLogs_FallsBackToDiagnosticsStore(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "diag_logs.db")
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer diagStore.Close()
+
+	// Persist a diagnostic entry with logs.
+	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
+		LeaseUUID:    "lease-logs",
+		ProviderUUID: "prov-1",
+		Tenant:       "tenant-a",
+		Error:        "container exited",
+		Logs: map[string]string{
+			"0": "line 1\nline 2\n",
+			"1": "worker output\n",
+		},
+		FailCount: 1,
+	}))
+
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	b.diagnosticsStore = diagStore
+
+	// No in-memory provision — should fall back to diagnostics store.
+	logs, err := b.GetLogs(context.Background(), "lease-logs", 100)
+	require.NoError(t, err)
+	require.Len(t, logs, 2)
+	assert.Equal(t, "line 1\nline 2\n", logs["0"])
+	assert.Equal(t, "worker output\n", logs["1"])
+
+	// Unknown lease still returns ErrNotProvisioned.
+	_, err = b.GetLogs(context.Background(), "nonexistent", 100)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+func TestGetLogs_FallbackNoLogs(t *testing.T) {
+	// When diagnostics entry exists but has no logs (e.g., image pull failure),
+	// GetLogs should return ErrNotProvisioned.
+	dbPath := filepath.Join(t.TempDir(), "diag_nologs.db")
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer diagStore.Close()
+
+	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
+		LeaseUUID: "lease-nologs",
+		Error:     "image pull failed",
+		FailCount: 1,
+	}))
+
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	b.diagnosticsStore = diagStore
+
+	_, err = b.GetLogs(context.Background(), "lease-nologs", 100)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
+	// When a re-provision succeeds, the stale diagnostic entry from the
+	// previous failure should be removed from the diagnostics store.
+	dbPath := filepath.Join(t.TempDir(), "diag_clear.db")
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer diagStore.Close()
+
+	// Pre-populate a stale diagnostic entry.
+	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
+		LeaseUUID: "lease-reprov",
+		Error:     "old failure",
+		FailCount: 1,
+	}))
+
+	var callbackReceived atomic.Bool
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackReceived.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+		PullImageFn:       func(ctx context.Context, imageName string, timeout time.Duration) error { return nil },
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "new-ctr", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-reprov": {
+			LeaseUUID:    "lease-reprov",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			Status:       backend.ProvisionStatusFailed,
+			FailCount:    1,
+			Quantity:     1,
+			ContainerIDs: []string{"old-ctr"},
+		},
+	})
+	b.diagnosticsStore = diagStore
+	_ = b.pool.TryAllocate("lease-reprov-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	req := newProvisionRequest("lease-reprov", "tenant-a", "docker-small", 1, validManifestJSON("docker.io/nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+	err = b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool { return callbackReceived.Load() }, 5*time.Second, 50*time.Millisecond)
+
+	// Stale diagnostic entry should be removed.
+	entry, err := diagStore.Get("lease-reprov")
+	require.NoError(t, err)
+	assert.Nil(t, entry, "stale diagnostic entry should be removed on successful re-provision")
+}
+
