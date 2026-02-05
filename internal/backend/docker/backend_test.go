@@ -90,6 +90,93 @@ func TestParseManifest(t *testing.T) {
 	})
 }
 
+func TestParseManifest_Env(t *testing.T) {
+	t.Run("safe env allowed", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"APP_PORT": "8080", "DATABASE_URL": "postgres://localhost/db"}}`
+
+		m, err := ParseManifest([]byte(data))
+		require.NoError(t, err)
+		assert.Equal(t, "8080", m.Env["APP_PORT"])
+	})
+
+	t.Run("PATH blocked", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"PATH": "/usr/local/bin:/usr/bin"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "not allowed")
+	})
+
+	t.Run("PATH case insensitive", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"Path": "/usr/local/bin"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "not allowed")
+	})
+
+	t.Run("LD_PRELOAD blocked", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"LD_PRELOAD": "/tmp/malicious.so"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "not allowed")
+	})
+
+	t.Run("LD_LIBRARY_PATH blocked", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"LD_LIBRARY_PATH": "/tmp"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "prefix")
+	})
+
+	t.Run("LD_AUDIT blocked", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"LD_AUDIT": "/tmp/audit.so"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "prefix")
+	})
+
+	t.Run("ld_preload case insensitive", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"ld_preload": "/tmp/lib.so"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "not allowed")
+	})
+
+	t.Run("DOCKER_ prefix blocked", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"DOCKER_HOST": "tcp://attacker:2375"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "prefix")
+	})
+
+	t.Run("FRED_ prefix blocked", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"FRED_INTERNAL": "value"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "prefix")
+	})
+
+	t.Run("empty name rejected", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"": "value"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "empty")
+	})
+
+	t.Run("name with equals rejected", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"FOO=BAR": "value"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.ErrorContains(t, err, "invalid character")
+	})
+
+	t.Run("mixed safe and blocked rejects all", func(t *testing.T) {
+		data := `{"image": "nginx", "env": {"APP_PORT": "8080", "LD_PRELOAD": "/tmp/lib.so"}}`
+
+		_, err := ParseManifest([]byte(data))
+		assert.Error(t, err)
+	})
+}
+
 func TestConfigValidation(t *testing.T) {
 	validConfig := func() Config {
 		cfg := DefaultConfig()

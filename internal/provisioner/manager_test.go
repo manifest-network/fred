@@ -80,6 +80,14 @@ func (m *mockManagerBackend) RefreshState(ctx context.Context) error {
 	return nil
 }
 
+func (m *mockManagerBackend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
+func (m *mockManagerBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
 func TestNewManager_Validation(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{

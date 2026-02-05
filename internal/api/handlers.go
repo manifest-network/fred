@@ -294,6 +294,146 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, http.StatusOK)
 }
 
+// LeaseProvisionResponse represents the response for provision diagnostics.
+type LeaseProvisionResponse struct {
+	LeaseUUID    string `json:"lease_uuid"`
+	Tenant       string `json:"tenant"`
+	ProviderUUID string `json:"provider_uuid"`
+	Status       string `json:"status"`
+	FailCount    int    `json:"fail_count"`
+	LastError    string `json:"last_error,omitempty"`
+}
+
+// LeaseLogsResponse represents the response for container logs.
+type LeaseLogsResponse struct {
+	LeaseUUID    string            `json:"lease_uuid"`
+	Tenant       string            `json:"tenant"`
+	ProviderUUID string            `json:"provider_uuid"`
+	Logs         map[string]string `json:"logs"`
+}
+
+// GetLeaseProvision handles GET /v1/leases/{lease_uuid}/provision
+func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (any lease state, no replay check for read endpoint)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.backendRouter.Route(sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	info, err := backendClient.GetProvision(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "provision not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to get provision from backend", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	response := LeaseProvisionResponse{
+		LeaseUUID:    leaseUUID,
+		Tenant:       auth.Token.Tenant,
+		ProviderUUID: h.providerUUID,
+		Status:       string(info.Status),
+		FailCount:    info.FailCount,
+		LastError:    info.LastError,
+	}
+
+	slog.Info("lease provision info served",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"status", info.Status,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
+// GetLeaseLogs handles GET /v1/leases/{lease_uuid}/logs
+func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (any lease state, no replay check for read endpoint)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Parse tail parameter
+	tail := 100 // default
+	if v := r.URL.Query().Get("tail"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n < 1 {
+			writeError(w, "tail must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		if n > 10000 {
+			writeError(w, "tail must not exceed 10000", http.StatusBadRequest)
+			return
+		}
+		tail = n
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.backendRouter.Route(sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	logs, err := backendClient.GetLogs(r.Context(), leaseUUID, tail)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "logs not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to get logs from backend", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	response := LeaseLogsResponse{
+		LeaseUUID:    leaseUUID,
+		Tenant:       auth.Token.Tenant,
+		ProviderUUID: h.providerUUID,
+		Logs:         logs,
+	}
+
+	slog.Info("lease logs served",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
 // HealthResponse represents the health check response.
 type HealthResponse struct {
 	Status       string                  `json:"status"`

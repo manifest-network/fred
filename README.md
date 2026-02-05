@@ -377,6 +377,73 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `payload_received` - True if payload has been uploaded
 - `provisioning_started` - True if provisioning is in progress
 
+### Get Provision Diagnostics
+
+```
+GET /v1/leases/{lease_uuid}/provision
+Authorization: Bearer <token>
+```
+
+Returns provision diagnostics for a lease, including status, error details, and failure count. Works for both active and non-active leases (e.g., after rejection or closure), falling back to persisted diagnostics when the provision is no longer in memory.
+
+**Response:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "status": "failed",
+  "fail_count": 3,
+  "last_error": "container exited with code 1 (OOM killed)"
+}
+```
+
+**Fields:**
+- `status` - Provision status: `provisioning`, `ready`, or `failed`
+- `fail_count` - Number of provision attempts that failed
+- `last_error` - Detailed error message (only present on failure)
+
+**Response Codes:**
+- `200 OK` - Provision found
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Provision not found (never provisioned or diagnostics expired)
+
+### Get Container Logs
+
+```
+GET /v1/leases/{lease_uuid}/logs?tail=100
+Authorization: Bearer <token>
+```
+
+Returns container logs for a lease. Works for both active and non-active leases, falling back to persisted logs when the provision is no longer in memory.
+
+**Query Parameters:**
+- `tail` - Number of log lines to return per container (default: 100, max: 10000)
+
+**Response:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "logs": {
+    "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
+    "1": "2024-01-15 Redis ready\n"
+  }
+}
+```
+
+**Fields:**
+- `logs` - Map of container instance index to log output
+
+**Response Codes:**
+- `200 OK` - Logs found
+- `400 Bad Request` - Invalid tail parameter (negative, zero, or exceeds max)
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Provision not found (never provisioned or logs expired)
+
 ### Upload Payload
 
 ```
@@ -538,6 +605,43 @@ Deprovision a resource (idempotent).
 ```
 
 **Response:** `200 OK`
+
+### GET /provisions/{lease_uuid}
+
+Get provision diagnostics for a specific lease.
+
+**Response:** `200 OK`
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "status": "failed",
+  "fail_count": 3,
+  "last_error": "container exited with code 1 (OOM killed)",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Response:** `404 Not Found` if not provisioned.
+
+### GET /logs/{lease_uuid}
+
+Get container logs for a specific lease.
+
+**Query Parameters:**
+- `tail` - Number of log lines per container (default: 100)
+
+**Response:** `200 OK`
+```json
+{
+  "logs": {
+    "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
+    "1": "2024-01-15 Redis ready\n"
+  }
+}
+```
+
+**Response:** `404 Not Found` if not provisioned.
 
 ### GET /provisions
 

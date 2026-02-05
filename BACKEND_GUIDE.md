@@ -191,6 +191,53 @@ List all currently provisioned resources. Used by Fred for reconciliation.
 - `ready` - Resource is available
 - `failed` - Provisioning failed
 
+### GET /provisions/{lease_uuid}
+
+Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/leases/{uuid}/provision` to tenants. Falls back to persisted diagnostics (bbolt) when the provision is no longer in memory.
+
+**Response:** `200 OK`
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "status": "failed",
+  "fail_count": 3,
+  "last_error": "container exited with code 1 (OOM killed)",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Fields:**
+- `status` - Provision status: `provisioning`, `ready`, or `failed`
+- `fail_count` - Number of provision failures
+- `last_error` - Full diagnostic error message (exit codes, OOM, truncated logs)
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned (or diagnostics expired)
+
+### GET /logs/{lease_uuid}
+
+Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{uuid}/logs` to tenants. Falls back to persisted logs when containers no longer exist.
+
+**Query Parameters:**
+- `tail` - Number of log lines per container (default: 100)
+
+**Response:** `200 OK`
+```json
+{
+  "logs": {
+    "0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
+    "1": "2024-01-15 10:30:00 Redis ready\n"
+  }
+}
+```
+
+**Fields:**
+- `logs` - Map of container instance index (`"0"`, `"1"`, ...) to log output string
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned (or logs expired)
+
 ### GET /health
 
 Simple health check endpoint.
@@ -383,6 +430,8 @@ func main() {
     mux := http.NewServeMux()
     mux.HandleFunc("POST /provision", b.handleProvision)
     mux.HandleFunc("GET /info/{lease_uuid}", b.handleGetInfo)
+    mux.HandleFunc("GET /provisions/{lease_uuid}", b.handleGetProvision)
+    mux.HandleFunc("GET /logs/{lease_uuid}", b.handleGetLogs)
     mux.HandleFunc("POST /deprovision", b.handleDeprovision)
     mux.HandleFunc("GET /provisions", b.handleListProvisions)
     mux.HandleFunc("GET /health", b.handleHealth)
@@ -484,7 +533,7 @@ curl -X POST http://localhost:9001/deprovision \
 
 Before deploying your backend:
 
-- [ ] All 5 required HTTP endpoints implemented (`/provision`, `/info/{uuid}`, `/deprovision`, `/provisions`, `/health`)
+- [ ] All 7 required HTTP endpoints implemented (`/provision`, `/info/{uuid}`, `/provisions/{uuid}`, `/logs/{uuid}`, `/deprovision`, `/provisions`, `/health`)
 - [ ] Provision returns 202 and works asynchronously
 - [ ] Callbacks signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent

@@ -148,6 +148,11 @@ func (m *DockerManifest) Validate() error {
 		}
 	}
 
+	// Validate environment variables
+	if err := validateEnvVars(m.Env); err != nil {
+		return err
+	}
+
 	// Validate labels don't conflict with fred.* namespace
 	for key := range m.Labels {
 		if strings.HasPrefix(key, "fred.") {
@@ -204,6 +209,45 @@ const (
 // that is not disabled (i.e., Test[0] is not "NONE").
 func (m *DockerManifest) HasActiveHealthCheck() bool {
 	return m.HealthCheck != nil && len(m.HealthCheck.Test) > 0 && HealthCheckTestType(m.HealthCheck.Test[0]) != HealthCheckTestNone
+}
+
+// blockedEnvNames are environment variable names that tenants cannot set.
+// These variables control process execution in ways that could compromise
+// container security or interfere with the runtime.
+var blockedEnvNames = map[string]bool{
+	"PATH": true, // prevents command hijacking
+}
+
+// blockedEnvPrefixes are prefixes for environment variable names that tenants
+// cannot set. Any variable whose uppercase name starts with one of these
+// prefixes is rejected.
+var blockedEnvPrefixes = []string{
+	"LD_",    // dynamic linker (LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, etc.)
+	"FRED_",  // reserved for backend-internal use
+	"DOCKER_", // Docker runtime variables
+}
+
+// validateEnvVars checks that environment variable names are safe.
+func validateEnvVars(env map[string]string) error {
+	for k := range env {
+		if k == "" {
+			return fmt.Errorf("env: variable name cannot be empty")
+		}
+		if strings.ContainsAny(k, "=\x00") {
+			return fmt.Errorf("env: variable name contains invalid character: %q", k)
+		}
+
+		upper := strings.ToUpper(k)
+		if blockedEnvNames[upper] {
+			return fmt.Errorf("env: variable %q is not allowed", k)
+		}
+		for _, prefix := range blockedEnvPrefixes {
+			if strings.HasPrefix(upper, prefix) {
+				return fmt.Errorf("env: variable %q is not allowed (prefix %q is reserved)", k, prefix)
+			}
+		}
+	}
+	return nil
 }
 
 // blockedTmpfsPaths are paths that cannot be used as tmpfs mounts because they

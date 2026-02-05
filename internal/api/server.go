@@ -197,6 +197,8 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	}
 	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTenantRL(handlers.GetLeaseConnection))
 	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTenantRL(handlers.GetLeaseStatus))
+	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTenantRL(handlers.GetLeaseProvision))
+	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTenantRL(handlers.GetLeaseLogs))
 	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTenantRL(s.handlePayloadUpload))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,

@@ -21,7 +21,7 @@ func TestMockBackend_Provision(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify provision exists
-	p, exists := mock.GetProvision("lease-1")
+	p, exists := mock.GetMockProvision("lease-1")
 	require.True(t, exists)
 	assert.Equal(t, "lease-1", p.LeaseUUID)
 	assert.Equal(t, ProvisionStatusProvisioning, p.Status)
@@ -72,7 +72,7 @@ func TestMockBackend_ProvisionWithCallback(t *testing.T) {
 	assert.Equal(t, CallbackStatusSuccess, callbackReceived.Status)
 
 	// Verify status changed to ready
-	p, _ := mock.GetProvision("lease-1")
+	p, _ := mock.GetMockProvision("lease-1")
 	assert.Equal(t, ProvisionStatusReady, p.Status)
 }
 
@@ -116,7 +116,7 @@ func TestMockBackend_Deprovision(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify gone
-	_, exists := mock.GetProvision("lease-1")
+	_, exists := mock.GetMockProvision("lease-1")
 	assert.False(t, exists)
 
 	// Deprovision nonexistent (should be idempotent)

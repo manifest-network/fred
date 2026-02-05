@@ -46,6 +46,15 @@ type Backend interface {
 	// Called by the reconciler before ListProvisions to avoid stale reads.
 	RefreshState(ctx context.Context) error
 
+	// GetProvision returns status information for a single provision.
+	// Returns ErrNotProvisioned if the lease is not found.
+	GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error)
+
+	// GetLogs returns container logs for a provisioned lease.
+	// The tail parameter limits the number of log lines per container.
+	// Returns ErrNotProvisioned if the lease is not found.
+	GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
+
 	// Name returns the backend's configured name.
 	Name() string
 }
@@ -467,6 +476,104 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		return nil, fmt.Errorf("list provisions: unexpected result type %T", result)
 	}
 	return provisions, nil
+}
+
+// GetProvision retrieves status information for a single provision.
+func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (_ *ProvisionInfo, err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("get_provision", start, err) }()
+
+	url := fmt.Sprintf("%s/provisions/%s", c.baseURL, leaseUUID)
+
+	result, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		c.signRequest(httpReq, nil)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("get provision request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotProvisioned
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("get provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+
+		var info ProvisionInfo
+		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+			return nil, fmt.Errorf("decode provision response: %w", err)
+		}
+
+		return &info, nil
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return nil, ErrCircuitOpen
+	}
+	if cbErr != nil {
+		return nil, cbErr
+	}
+	info, ok := result.(*ProvisionInfo)
+	if !ok {
+		return nil, fmt.Errorf("get provision: unexpected result type %T", result)
+	}
+	return info, nil
+}
+
+// GetLogs retrieves container logs for a provisioned lease.
+func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (_ map[string]string, err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("get_logs", start, err) }()
+
+	url := fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail)
+
+	result, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		c.signRequest(httpReq, nil)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("get logs request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotProvisioned
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("get logs failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+
+		var logs map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&logs); err != nil {
+			return nil, fmt.Errorf("decode logs response: %w", err)
+		}
+
+		return logs, nil
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return nil, ErrCircuitOpen
+	}
+	if cbErr != nil {
+		return nil, cbErr
+	}
+	logs, ok := result.(map[string]string)
+	if !ok {
+		return nil, fmt.Errorf("get logs: unexpected result type %T", result)
+	}
+	return logs, nil
 }
 
 // RefreshState is a no-op for remote backends (they refresh server-side).

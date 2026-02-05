@@ -326,7 +326,7 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
 - HTTP 5xx errors (server errors)
 
 **What does NOT count as a failure:**
-- HTTP 404 from `GetInfo` (`ErrNotProvisioned`) - this is a valid "lease not found" response
+- HTTP 404 from `GetInfo`, `GetProvision`, or `GetLogs` (`ErrNotProvisioned`) - this is a valid "lease not found" response
 
 This ensures that tenant requests for unprovisioned leases don't accidentally trip the circuit breaker and block backend operations.
 
