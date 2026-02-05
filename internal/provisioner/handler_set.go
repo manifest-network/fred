@@ -85,7 +85,7 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 				"tenant", lease.Tenant,
 				"error", err,
 			)
-			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, err.Error())
+			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, truncateRejectReason(err.Error()))
 			if rejectErr != nil {
 				slog.Error("failed to reject lease after validation error",
 					"lease_uuid", lease.Uuid,
@@ -268,7 +268,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		// PENDING lease — reject on chain FIRST, before untracking.
 		// This prevents a race where the reconciler sees a PENDING lease that's
 		// not in-flight and tries to provision it again.
-		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, reason)
+		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, truncateRejectReason(reason))
 		if err != nil {
 			// Keep in-flight so reconciler doesn't try to re-provision.
 			// The timeout checker or next reconciliation will retry.
@@ -421,7 +421,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 			// Clean up the stored payload
 			h.deps.PayloadStore.Delete(event.LeaseUUID)
 
-			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, err.Error())
+			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, truncateRejectReason(err.Error()))
 			if rejectErr != nil {
 				slog.Error("failed to reject lease after validation error",
 					"lease_uuid", lease.Uuid,

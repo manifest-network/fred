@@ -425,7 +425,7 @@ func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) err
 
 // rejectLease rejects a PENDING lease on chain with a reason.
 func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) error {
-	rejected, txHashes, err := r.chainClient.RejectLeases(ctx, []string{leaseUUID}, reason)
+	rejected, txHashes, err := r.chainClient.RejectLeases(ctx, []string{leaseUUID}, truncateRejectReason(reason))
 	if err != nil {
 		return err
 	}

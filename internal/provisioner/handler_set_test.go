@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ThreeDotsLabs/watermill"
@@ -645,6 +646,65 @@ func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 	err = hs.HandlePayloadReceived(msg)
 	assert.Error(t, err, "should return error for hash mismatch")
 	assert.False(t, ps.Has("lease-1"), "payload should be deleted on hash mismatch")
+}
+
+// --- truncateRejectReason tests ---
+
+func TestTruncateRejectReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{"short string unchanged", "short error", "short error"},
+		{"empty string unchanged", "", ""},
+		{"exactly 256 chars unchanged", strings.Repeat("a", 256), strings.Repeat("a", 256)},
+		{"257 chars truncated", strings.Repeat("a", 257), strings.Repeat("a", 253) + "..."},
+		{"500 chars truncated", strings.Repeat("b", 500), strings.Repeat("b", 253) + "..."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := truncateRejectReason(tt.input)
+			assert.Equal(t, tt.expect, result)
+			assert.LessOrEqual(t, len(result), maxRejectReasonLen)
+		})
+	}
+}
+
+func TestHandlerSet_HandleBackendCallback_LongReasonTruncated(t *testing.T) {
+	ack := &mockAcknowledger{}
+	mb := &mockManagerBackend{name: "test-backend"}
+	var receivedReason string
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:  leaseUUID,
+				State: billingtypes.LEASE_STATE_PENDING,
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			receivedReason = reason
+			return 1, nil, nil
+		},
+	}
+
+	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+
+	longReason := strings.Repeat("x", 500)
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusFailed,
+		Error:     longReason,
+	})
+
+	err := hs.HandleBackendCallback(msg)
+	assert.NoError(t, err)
+	assert.LessOrEqual(t, len(receivedReason), maxRejectReasonLen,
+		"rejection reason should be truncated to fit on-chain limit")
+	assert.True(t, strings.HasSuffix(receivedReason, "..."),
+		"truncated reason should end with ellipsis")
 }
 
 // --- isTerminalAcknowledgeError tests ---

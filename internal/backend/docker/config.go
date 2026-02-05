@@ -8,7 +8,13 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
+
+// Type aliases for readability within the docker package.
+type SKUProfile = shared.SKUProfile
+type TenantQuotaConfig = shared.TenantQuotaConfig
 
 // Config holds the configuration for the Docker backend.
 type Config struct {
@@ -111,7 +117,7 @@ type Config struct {
 	ContainerDiskQuota *bool `yaml:"container_disk_quota"`
 
 	// CallbackMaxAge is the maximum age of a persisted callback entry.
-	// Entries older than this are removed during startup replay.
+	// Entries older than this are removed by the callback store's background cleanup.
 	// Defaults to 24h.
 	CallbackMaxAge time.Duration `yaml:"callback_max_age"`
 }
@@ -162,14 +168,6 @@ func (c *Config) GetTmpfsSizeMB() int {
 	return 64
 }
 
-// TenantQuotaConfig configures per-tenant resource limits.
-// When set, each tenant's aggregate resource usage is capped.
-type TenantQuotaConfig struct {
-	MaxCPUCores float64 `yaml:"max_cpu_cores"`
-	MaxMemoryMB int64   `yaml:"max_memory_mb"`
-	MaxDiskMB   int64   `yaml:"max_disk_mb"`
-}
-
 // IsDiskQuota returns whether container disk quotas are enabled.
 // Defaults to true. Requires overlay2 with xfs + pquota.
 func (c *Config) IsDiskQuota() bool {
@@ -177,13 +175,6 @@ func (c *Config) IsDiskQuota() bool {
 		return *c.ContainerDiskQuota
 	}
 	return true
-}
-
-// SKUProfile defines resource limits for a SKU.
-type SKUProfile struct {
-	CPUCores float64 `yaml:"cpu_cores"`
-	MemoryMB int64   `yaml:"memory_mb"`
-	DiskMB   int64   `yaml:"disk_mb"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -350,14 +341,8 @@ func (c *Config) Validate() error {
 
 	if c.TenantQuota != nil {
 		tq := c.TenantQuota
-		if tq.MaxCPUCores <= 0 {
-			return fmt.Errorf("tenant_quota.max_cpu_cores must be positive")
-		}
-		if tq.MaxMemoryMB <= 0 {
-			return fmt.Errorf("tenant_quota.max_memory_mb must be positive")
-		}
-		if tq.MaxDiskMB <= 0 {
-			return fmt.Errorf("tenant_quota.max_disk_mb must be positive")
+		if err := tq.Validate(); err != nil {
+			return fmt.Errorf("tenant_quota.%w", err)
 		}
 		if tq.MaxCPUCores > c.TotalCPUCores {
 			return fmt.Errorf("tenant_quota.max_cpu_cores (%.2f) exceeds total_cpu_cores (%.2f)", tq.MaxCPUCores, c.TotalCPUCores)
@@ -374,14 +359,8 @@ func (c *Config) Validate() error {
 }
 
 func validateSKUProfile(name string, profile SKUProfile) error {
-	if profile.CPUCores <= 0 {
-		return fmt.Errorf("SKU %q: cpu_cores must be positive", name)
-	}
-	if profile.MemoryMB <= 0 {
-		return fmt.Errorf("SKU %q: memory_mb must be positive", name)
-	}
-	if profile.DiskMB <= 0 {
-		return fmt.Errorf("SKU %q: disk_mb must be positive", name)
+	if err := profile.Validate(); err != nil {
+		return fmt.Errorf("SKU %q: %w", name, err)
 	}
 	return nil
 }

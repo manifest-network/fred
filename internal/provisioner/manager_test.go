@@ -2425,3 +2425,67 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 		t.Error("manager.Start() did not return after cancel")
 	}
 }
+
+func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
+	// This test verifies that when a handler permanently fails (exhausting
+	// all retries), the message is sent to the poison queue instead of being
+	// re-delivered in an infinite loop.
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	var callCount atomic.Int32
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			callCount.Add(1)
+			// Always fail to trigger retries
+			return nil, errors.New("permanent chain failure")
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, router, mockChain)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- manager.Start(ctx) }()
+
+	// Wait for router to be running
+	select {
+	case <-manager.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager did not start in time")
+	}
+
+	// Publish a lease event that will permanently fail
+	err = manager.PublishLeaseEvent(chain.LeaseEvent{
+		Type:      chain.LeaseCreated,
+		LeaseUUID: "poison-lease",
+		Tenant:    "tenant-1",
+	})
+	require.NoError(t, err)
+
+	// Wait for the message to be processed (retries + poison queue)
+	time.Sleep(3 * time.Second)
+
+	// The handler should have been called (initial + 3 retries = 4 times),
+	// NOT infinitely. With poison queue, the message is acknowledged after
+	// retries are exhausted, breaking the loop.
+	count := callCount.Load()
+	assert.GreaterOrEqual(t, count, int32(4), "handler should be called at least 4 times (1 + 3 retries)")
+	assert.LessOrEqual(t, count, int32(8), "handler should NOT be called many more times (poison queue should stop the loop)")
+
+	cancel()
+	manager.Close()
+	select {
+	case <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Error("manager.Start() did not return after cancel")
+	}
+}

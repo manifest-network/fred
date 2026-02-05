@@ -47,6 +47,8 @@ type ContainerInfo struct {
 	Image         string
 	Status        string
 	Health        HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
+	ExitCode      int          // Process exit code (meaningful when Status is "exited"/"dead")
+	OOMKilled     bool         // True if container was killed by the OOM killer
 	CreatedAt     time.Time
 	Ports         map[string]PortBinding
 }
@@ -430,6 +432,8 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		Image:         resp.Config.Image,
 		Status:        resp.State.Status,
 		Health:        health,
+		ExitCode:      resp.State.ExitCode,
+		OOMKilled:     resp.State.OOMKilled,
 		InstanceIndex: meta.InstanceIndex,
 		FailCount:     meta.FailCount,
 		CreatedAt:     meta.CreatedAt,

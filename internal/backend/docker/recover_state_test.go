@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // mockDockerClient implements dockerClient for testing. Each method delegates to
@@ -127,7 +129,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	cfg := DefaultConfig()
 	cfg.NetworkIsolation = ptrBool(false)
 
-	pool := NewResourcePool(
+	pool := shared.NewResourcePool(
 		cfg.TotalCPUCores,
 		cfg.TotalMemoryMB,
 		cfg.TotalDiskMB,
@@ -142,7 +144,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 
-	return &Backend{
+	b := &Backend{
 		cfg:        cfg,
 		docker:     mock,
 		pool:       pool,
@@ -151,6 +153,12 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		stopCtx:    stopCtx,
 		stopCancel: stopCancel,
 	}
+	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+		HTTPClient: http.DefaultClient,
+		Logger:     b.logger,
+		StopCtx:    b.stopCtx,
+	})
+	return b
 }
 
 func TestRecoverState(t *testing.T) {
@@ -299,6 +307,12 @@ func TestRecoverState(t *testing.T) {
 					},
 				}, nil
 			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+			},
+			ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+				return "segfault", nil
+			},
 		}
 		b := newBackendForTest(mock, nil)
 
@@ -310,7 +324,8 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 		// Cold-start: FailCount should be incremented from the label value (0 → 1).
 		assert.Equal(t, 1, prov.FailCount)
-		assert.Equal(t, "container exited unexpectedly", prov.LastError)
+		assert.Contains(t, prov.LastError, "container exited unexpectedly")
+		assert.Contains(t, prov.LastError, "exit_code=1")
 	})
 
 	t.Run("in-flight provision preserved without containers", func(t *testing.T) {
@@ -505,8 +520,8 @@ func TestRecoverState(t *testing.T) {
 		// docker-small profile: CPU=0.5, Memory=512, Disk=1024
 		stats := b.pool.Stats()
 		assert.Equal(t, 0.5, stats.AllocatedCPU)
-		assert.Equal(t, int64(512), stats.AllocatedMemory)
-		assert.Equal(t, int64(1024), stats.AllocatedDisk)
+		assert.Equal(t, int64(512), stats.AllocatedMemoryMB)
+		assert.Equal(t, int64(1024), stats.AllocatedDiskMB)
 		assert.Equal(t, 1, stats.AllocationCount)
 	})
 
@@ -526,6 +541,12 @@ func TestRecoverState(t *testing.T) {
 						CreatedAt:     now,
 					},
 				}, nil
+			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 137, OOMKilled: true}, nil
+			},
+			ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+				return "Killed", nil
 			},
 		}
 		// Pre-populate with a "ready" provision so recoverState detects a ready→failed transition.
@@ -548,6 +569,42 @@ func TestRecoverState(t *testing.T) {
 		require.NotNil(t, prov)
 		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 		assert.Equal(t, 1, prov.FailCount)
+		assert.Contains(t, prov.LastError, "container exited unexpectedly")
+		assert.Contains(t, prov.LastError, "exit_code=137")
+		assert.Contains(t, prov.LastError, "oom_killed=true")
+	})
+
+	t.Run("diagnostics fallback when inspect fails in recovery", func(t *testing.T) {
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "exited",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return nil, fmt.Errorf("docker daemon unreachable")
+			},
+		}
+		b := newBackendForTest(mock, nil)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+		// When InspectContainer fails, LastError should remain the bare message
+		// set inside the lock (no diagnostic enrichment).
 		assert.Equal(t, "container exited unexpectedly", prov.LastError)
 	})
 
@@ -643,6 +700,12 @@ func TestRecoverState_SetsActiveProvisionsGauge(t *testing.T) {
 						CreatedAt:    now,
 					},
 				}, nil
+			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+			},
+			ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+				return "", nil
 			},
 		}
 		b := newBackendForTest(mock, nil)

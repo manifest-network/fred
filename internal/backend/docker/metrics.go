@@ -3,6 +3,8 @@ package docker
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 const (
@@ -91,7 +93,7 @@ var (
 		Subsystem: metricsSubsystem,
 		Name:      "container_create_duration_seconds",
 		Help:      "Duration of container creation operations in seconds",
-		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 10), // 0.1s to ~1.7min
+		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 10), // 0.1s to ~51s
 	})
 
 	// reconciliationTotal tracks reconciliation runs by outcome.
@@ -104,14 +106,14 @@ var (
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
-func updateResourceMetrics(stats ResourceStats) {
+func updateResourceMetrics(stats shared.ResourceStats) {
 	if stats.TotalCPU > 0 {
 		resourceCPUAllocatedRatio.Set(stats.AllocatedCPU / stats.TotalCPU)
 	}
 	if stats.TotalMemoryMB > 0 {
-		resourceMemoryAllocatedRatio.Set(float64(stats.AllocatedMemory) / float64(stats.TotalMemoryMB))
+		resourceMemoryAllocatedRatio.Set(float64(stats.AllocatedMemoryMB) / float64(stats.TotalMemoryMB))
 	}
 	if stats.TotalDiskMB > 0 {
-		resourceDiskAllocatedRatio.Set(float64(stats.AllocatedDisk) / float64(stats.TotalDiskMB))
+		resourceDiskAllocatedRatio.Set(float64(stats.AllocatedDiskMB) / float64(stats.TotalDiskMB))
 	}
 }

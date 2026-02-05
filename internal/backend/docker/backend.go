@@ -1,16 +1,15 @@
 package docker
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +17,7 @@ import (
 	"github.com/docker/docker/pkg/stringid"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // dockerClient abstracts the Docker API surface used by Backend,
@@ -38,22 +37,11 @@ type dockerClient interface {
 	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 }
 
-const (
-	// callbackMaxAttempts is the number of times to attempt callback delivery.
-	callbackMaxAttempts = 3
-
-	// callbackTimeout is the per-attempt timeout for callback HTTP requests.
-	callbackTimeout = 10 * time.Second
-)
-
-// callbackBackoff defines the delay before each retry attempt (index 0 = first attempt, no delay).
-var callbackBackoff = [callbackMaxAttempts]time.Duration{0, 1 * time.Second, 5 * time.Second}
-
 // Backend implements the backend.Backend interface for Docker containers.
 type Backend struct {
 	cfg    Config
 	docker dockerClient
-	pool   *ResourcePool
+	pool   *shared.ResourcePool
 	logger *slog.Logger
 
 	// provisions tracks active provisions by lease UUID
@@ -67,9 +55,12 @@ type Backend struct {
 	recoverMu sync.Mutex
 
 	// callbackStore persists pending callbacks in bbolt
-	callbackStore *CallbackStore
+	callbackStore *shared.CallbackStore
 
-	// httpClient for sending callbacks
+	// callbackSender handles callback delivery with retry and HMAC
+	callbackSender *shared.CallbackSender
+
+	// httpClient for sending callbacks (kept for test injection)
 	httpClient *http.Client
 
 	// stopCtx is canceled on shutdown; stopCancel triggers it.
@@ -101,6 +92,49 @@ func shortID(id string) string {
 	return stringid.TruncateID(id)
 }
 
+const (
+	diagnosticLogTail  = 20
+	diagnosticMaxBytes = 4096
+
+	// callbackMaxErrorLen is the maximum length of an error message sent in
+	// a callback payload. The on-chain rejection reason has a 256-character
+	// hard limit; exceeding it causes the transaction to fail and triggers
+	// an infinite retry loop. Truncating here keeps full diagnostics in
+	// LastError (for ListProvisions) while ensuring callbacks succeed.
+	callbackMaxErrorLen = 256
+
+	// errMsgContainerExited is the base error message for containers that
+	// exit unexpectedly, used by recoverState and failure callbacks.
+	errMsgContainerExited = "container exited unexpectedly"
+)
+
+// containerFailureDiagnostics builds a diagnostic string from a failed
+// container's exit state and recent logs.
+func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID string, info *ContainerInfo) string {
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "exit_code=%d", info.ExitCode)
+	if info.OOMKilled {
+		buf.WriteString(", oom_killed=true")
+	}
+
+	logs, err := b.docker.ContainerLogs(ctx, containerID, diagnosticLogTail)
+	if err != nil {
+		b.logger.Warn("failed to fetch container logs for diagnostics",
+			"container_id", shortID(containerID), "error", err)
+		return buf.String()
+	}
+	if logs != "" {
+		buf.WriteString("; logs:\n")
+		buf.WriteString(logs)
+	}
+
+	s := buf.String()
+	if len(s) > diagnosticMaxBytes {
+		s = s[:diagnosticMaxBytes-3] + "..."
+	}
+	return s
+}
+
 // New creates a new Docker backend.
 func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	if err := cfg.Validate(); err != nil {
@@ -112,7 +146,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
-	pool := NewResourcePool(
+	pool := shared.NewResourcePool(
 		cfg.TotalCPUCores,
 		cfg.TotalMemoryMB,
 		cfg.TotalDiskMB,
@@ -135,7 +169,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		}
 	}
 
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
 		DBPath: cfg.CallbackDBPath,
 		MaxAge: cfg.CallbackMaxAge,
 	})
@@ -155,6 +189,17 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
 
+	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+		Store:      cbStore,
+		HTTPClient: httpClient,
+		Secret:     cfg.CallbackSecret,
+		Logger:     b.logger,
+		StopCtx:    b.stopCtx,
+		OnDelivery: func(outcome string) {
+			callbackDeliveryTotal.WithLabelValues(outcome).Inc()
+		},
+	})
+
 	return b, nil
 }
 
@@ -171,7 +216,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	}
 
 	// Replay any pending callbacks from a previous run
-	b.replayPendingCallbacks()
+	b.callbackSender.ReplayPendingCallbacks()
 
 	// Start periodic reconciliation (using WaitGroup.Go for Go 1.25+)
 	b.wg.Go(b.reconcileLoop)
@@ -198,55 +243,6 @@ func (b *Backend) Stop() error {
 		errs = append(errs, fmt.Errorf("closing docker client: %w", err))
 	}
 	return errors.Join(errs...)
-}
-
-// replayPendingCallbacks replays any callbacks that were persisted but not
-// successfully delivered before the previous shutdown.
-// Expired entries are already removed by the CallbackStore's initial cleanup
-// (run during NewCallbackStore), so only deliverable entries remain.
-func (b *Backend) replayPendingCallbacks() {
-	if b.callbackStore == nil {
-		return
-	}
-
-	entries, err := b.callbackStore.ListPending()
-	if err != nil {
-		b.logger.Error("failed to list pending callbacks", "error", err)
-		return
-	}
-	if len(entries) == 0 {
-		return
-	}
-
-	b.logger.Info("replaying pending callbacks", "count", len(entries))
-	for _, entry := range entries {
-		status := backend.CallbackStatusSuccess
-		if !entry.Success {
-			status = backend.CallbackStatusFailed
-		}
-		payload := backend.CallbackPayload{
-			LeaseUUID: entry.LeaseUUID,
-			Status:    status,
-			Error:     entry.Error,
-		}
-		body, marshalErr := json.Marshal(payload)
-		if marshalErr != nil {
-			b.logger.Error("removing malformed callback entry", "error", marshalErr, "lease_uuid", entry.LeaseUUID)
-			if rmErr := b.callbackStore.Remove(entry.LeaseUUID); rmErr != nil {
-				b.logger.Error("failed to remove malformed callback entry",
-					"error", rmErr,
-					"lease_uuid", entry.LeaseUUID,
-				)
-			}
-			continue
-		}
-
-		if b.deliverCallback(entry.LeaseUUID, entry.CallbackURL, body) {
-			if rmErr := b.callbackStore.Remove(entry.LeaseUUID); rmErr != nil {
-				b.logger.Error("failed to remove replayed callback", "error", rmErr, "lease_uuid", entry.LeaseUUID)
-			}
-		}
-	}
 }
 
 // Name returns the backend name.
@@ -347,7 +343,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	}
 
 	// Validate image against registry allowlist
-	if err := ValidateImage(manifest.Image, b.cfg.AllowedRegistries); err != nil {
+	if err := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); err != nil {
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
@@ -396,6 +392,24 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	})
 
 	return nil
+}
+
+// sendCallback resolves the callback URL from the provisions map and delegates to callbackSender.
+func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions[leaseUUID]
+	var callbackURL string
+	if ok {
+		callbackURL = prov.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
+
+	// Truncate error to fit the on-chain rejection reason limit.
+	if len(errMsg) > callbackMaxErrorLen {
+		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
+	}
+
+	b.callbackSender.SendCallback(leaseUUID, callbackURL, success, errMsg)
 }
 
 // doProvision performs the actual container creation asynchronously.
@@ -571,7 +585,8 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			}
 			status := containerStatusToProvisionStatus(info.Status)
 			if status != backend.ProvisionStatusReady {
-				err = fmt.Errorf("container %d exited during startup (status: %s)", i, info.Status)
+				diag := b.containerFailureDiagnostics(ctx, containerID, info)
+				err = fmt.Errorf("container %d exited during startup (status: %s): %s", i, info.Status, diag)
 				return
 			}
 		}
@@ -610,7 +625,8 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 				// Check if container has exited.
 				status := containerStatusToProvisionStatus(info.Status)
 				if status == backend.ProvisionStatusFailed {
-					return fmt.Errorf("container %d exited while waiting for healthy (status: %s)", i, info.Status)
+					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], info)
+					return fmt.Errorf("container %d exited while waiting for healthy (status: %s): %s", i, info.Status, diag)
 				}
 
 				switch info.Health {
@@ -618,7 +634,8 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 					logger.Info("container healthy", "instance", i, "container_id", shortID(containerIDs[i]))
 					delete(pending, i)
 				case HealthStatusUnhealthy:
-					return fmt.Errorf("container %d reported unhealthy", i)
+					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], info)
+					return fmt.Errorf("container %d reported unhealthy: %s", i, diag)
 				default:
 					// "starting" or other — keep polling
 				}
@@ -806,7 +823,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		return err
 	}
 
-	var allocations []ResourceAllocation
+	var allocations []shared.ResourceAllocation
 	recovered := make(map[string]*provision)
 	skippedUnknownSKU := 0
 
@@ -864,7 +881,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 		// Use instance-specific allocation ID
 		instanceID := fmt.Sprintf("%s-%d", c.LeaseUUID, c.InstanceIndex)
-		allocations = append(allocations, ResourceAllocation{
+		allocations = append(allocations, shared.ResourceAllocation{
 			LeaseUUID: instanceID,
 			Tenant:    c.Tenant,
 			SKU:       c.SKU,
@@ -885,7 +902,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if rec, ok := recovered[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
 				// Carry over FailCount and increment for this failure.
 				rec.FailCount = existing.FailCount + 1
-				rec.LastError = "container exited unexpectedly"
+				rec.LastError = errMsgContainerExited
 				failedLeases = append(failedLeases, uuid)
 				b.logger.Warn("container crashed after provisioning",
 					"lease_uuid", uuid,
@@ -900,11 +917,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// in-memory state have a FailCount from the container label that was
 	// written at creation time (before this failure occurred). Increment
 	// it to account for the failure evidenced by the container being dead.
+	var coldStartFailed []string
 	for uuid, rec := range recovered {
 		if rec.Status == backend.ProvisionStatusFailed {
 			if _, hasExisting := b.provisions[uuid]; !hasExisting {
 				rec.FailCount++
-				rec.LastError = "container exited unexpectedly"
+				rec.LastError = errMsgContainerExited
+				coldStartFailed = append(coldStartFailed, uuid)
 				b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
 					"lease_uuid", uuid,
 					"fail_count", rec.FailCount,
@@ -946,9 +965,49 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	activeProvisions.Set(readyCount)
 	updateResourceMetrics(b.pool.Stats())
 
-	// Send failure callbacks outside the lock to avoid holding it during I/O.
+	// Gather diagnostics for failed leases (I/O outside the lock).
+	allFailed := slices.Concat(failedLeases, coldStartFailed)
+	failedDiagnostics := make(map[string]string, len(allFailed))
+	for _, uuid := range allFailed {
+		b.provisionsMu.RLock()
+		prov, ok := b.provisions[uuid]
+		if !ok {
+			b.provisionsMu.RUnlock()
+			continue
+		}
+		containerIDs := prov.ContainerIDs
+		b.provisionsMu.RUnlock()
+
+		for _, cid := range containerIDs {
+			info, inspErr := b.docker.InspectContainer(ctx, cid)
+			if inspErr != nil {
+				continue
+			}
+			if containerStatusToProvisionStatus(info.Status) == backend.ProvisionStatusFailed {
+				failedDiagnostics[uuid] = b.containerFailureDiagnostics(ctx, cid, info)
+				break
+			}
+		}
+	}
+
+	// Update LastError with enriched diagnostics.
+	if len(failedDiagnostics) > 0 {
+		b.provisionsMu.Lock()
+		for uuid, diag := range failedDiagnostics {
+			if prov, ok := b.provisions[uuid]; ok {
+				prov.LastError = errMsgContainerExited + ": " + diag
+			}
+		}
+		b.provisionsMu.Unlock()
+	}
+
+	// Send failure callbacks with diagnostics outside the lock.
 	for _, uuid := range failedLeases {
-		b.sendCallback(uuid, false, "container exited unexpectedly")
+		msg := errMsgContainerExited
+		if diag, ok := failedDiagnostics[uuid]; ok {
+			msg = msg + ": " + diag
+		}
+		b.sendCallback(uuid, false, msg)
 	}
 
 	totalContainers := 0
@@ -961,7 +1020,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		"leases", len(recovered),
 		"containers", totalContainers,
 		"cpu_allocated", stats.AllocatedCPU,
-		"memory_allocated_mb", stats.AllocatedMemory,
+		"memory_allocated_mb", stats.AllocatedMemoryMB,
 	}
 	if skippedUnknownSKU > 0 {
 		logAttrs = append(logAttrs, "untracked_unknown_sku", skippedUnknownSKU)
@@ -1025,136 +1084,6 @@ func (b *Backend) reconcileLoop() {
 	}
 }
 
-// sendCallback sends a provision result callback to Fred with HMAC signature.
-// It retries up to callbackMaxAttempts times with exponential backoff.
-// Retries are aborted if the backend is shutting down.
-func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
-	b.provisionsMu.RLock()
-	prov, ok := b.provisions[leaseUUID]
-	var callbackURL string
-	if ok {
-		callbackURL = prov.CallbackURL
-	}
-	b.provisionsMu.RUnlock()
-
-	if callbackURL == "" {
-		b.logger.Warn("no callback URL for lease", "lease_uuid", leaseUUID)
-		return
-	}
-
-	status := backend.CallbackStatusSuccess
-	if !success {
-		status = backend.CallbackStatusFailed
-	}
-
-	payload := backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    status,
-		Error:     errMsg,
-	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		b.logger.Error("failed to marshal callback payload", "error", err)
-		return
-	}
-
-	// Persist callback before attempting delivery so it survives restarts
-	if b.callbackStore != nil {
-		if storeErr := b.callbackStore.Store(CallbackEntry{
-			LeaseUUID:   leaseUUID,
-			CallbackURL: callbackURL,
-			Success:     success,
-			Error:       errMsg,
-			CreatedAt:   time.Now(),
-		}); storeErr != nil {
-			b.logger.Error("failed to persist callback", "error", storeErr, "lease_uuid", leaseUUID)
-		}
-	}
-
-	delivered := b.deliverCallback(leaseUUID, callbackURL, body)
-
-	// Remove from persistent store on successful delivery
-	if delivered && b.callbackStore != nil {
-		if rmErr := b.callbackStore.Remove(leaseUUID); rmErr != nil {
-			b.logger.Error("failed to remove delivered callback from store", "error", rmErr, "lease_uuid", leaseUUID)
-		}
-	}
-}
-
-// deliverCallback attempts to deliver a callback with retries.
-// Returns true if delivery succeeded.
-func (b *Backend) deliverCallback(leaseUUID, callbackURL string, body []byte) bool {
-	for attempt := range callbackMaxAttempts {
-		if attempt > 0 {
-			// Wait with backoff, but abort if shutting down
-			select {
-			case <-b.stopCtx.Done():
-				b.logger.Warn("callback retry aborted by shutdown",
-					"lease_uuid", leaseUUID,
-					"attempt", attempt+1,
-				)
-				callbackDeliveryTotal.WithLabelValues("failure").Inc()
-				return false
-			case <-time.After(callbackBackoff[attempt]):
-			}
-		}
-
-		if b.trySendCallback(leaseUUID, callbackURL, body) {
-			callbackDeliveryTotal.WithLabelValues("success").Inc()
-			return true
-		}
-	}
-
-	callbackDeliveryTotal.WithLabelValues("failure").Inc()
-	b.logger.Error("callback delivery failed after retries",
-		"lease_uuid", leaseUUID,
-		"attempts", callbackMaxAttempts,
-	)
-	return false
-}
-
-// trySendCallback makes a single callback attempt. Returns true on success.
-func (b *Backend) trySendCallback(leaseUUID, callbackURL string, body []byte) bool {
-	ctx, cancel := context.WithTimeout(b.stopCtx, callbackTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
-	if err != nil {
-		b.logger.Error("failed to create callback request", "error", err, "lease_uuid", leaseUUID)
-		return false
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(b.cfg.CallbackSecret, body))
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		b.logger.Warn("callback attempt failed",
-			"error", err,
-			"lease_uuid", leaseUUID,
-		)
-		return false
-	}
-
-	// Always read and close the response body to allow connection reuse.
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		b.logger.Debug("callback sent", "lease_uuid", leaseUUID)
-		return true
-	}
-
-	b.logger.Warn("callback returned error status",
-		"status", resp.StatusCode,
-		"lease_uuid", leaseUUID,
-		"body", string(respBody),
-	)
-	return false
-}
-
 // GetLogs returns the last N lines of stdout/stderr for each container in
 // a lease, keyed by instance index (e.g., "0", "1").
 // On partial failure (some containers succeed, some fail), the successful logs
@@ -1187,6 +1116,6 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 }
 
 // Stats returns current resource usage statistics.
-func (b *Backend) Stats() ResourceStats {
+func (b *Backend) Stats() shared.ResourceStats {
 	return b.pool.Stats()
 }

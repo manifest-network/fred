@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // Sentinel errors for provisioner operations.
@@ -138,8 +139,18 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		return nil, fmt.Errorf("create router: %w", err)
 	}
 
-	// Add middleware for retries and panic recovery
+	// Add poison queue middleware to catch messages that exhaust all retries.
+	// This prevents infinite retry loops: after Retry exhausts its attempts,
+	// PoisonQueue intercepts the error, publishes the message to a dead-letter
+	// topic, and returns nil — acknowledging the message and breaking the loop.
+	poisonQueue, err := middleware.PoisonQueue(pubSub, "events.poison")
+	if err != nil {
+		return nil, fmt.Errorf("create poison queue middleware: %w", err)
+	}
+
+	// Add middleware: poison queue (outermost) → retry → recoverer (innermost)
 	wmRouter.AddMiddleware(
+		poisonQueue,
 		middleware.Retry{
 			MaxRetries:      3,
 			InitialInterval: 100 * time.Millisecond,
@@ -227,6 +238,23 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		TopicPayloadReceived,
 		pubSub,
 		handlers.HandlePayloadReceived,
+	)
+
+	// Handle poisoned messages: log and drop them to prevent infinite loops
+	wmRouter.AddNoPublisherHandler(
+		"handle_poison_queue",
+		"events.poison",
+		pubSub,
+		func(msg *message.Message) error {
+			slog.Error("message moved to poison queue after all retries exhausted",
+				"message_uuid", msg.UUID,
+				"poisoned_topic", msg.Metadata.Get(middleware.PoisonedTopicKey),
+				"poisoned_handler", msg.Metadata.Get(middleware.PoisonedHandlerKey),
+				"reason", msg.Metadata.Get(middleware.ReasonForPoisonedKey),
+			)
+			metrics.PoisonedMessagesTotal.Inc()
+			return nil
+		},
 	)
 
 	return m, nil

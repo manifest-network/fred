@@ -13,6 +13,18 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
+// maxRejectReasonLen is the maximum length for on-chain lease rejection reasons.
+// The billing module enforces a 256-character limit.
+const maxRejectReasonLen = 256
+
+// truncateRejectReason truncates a rejection reason to fit the on-chain limit.
+func truncateRejectReason(reason string) string {
+	if len(reason) > maxRejectReasonLen {
+		return reason[:maxRejectReasonLen-3] + "..."
+	}
+	return reason
+}
+
 // isTerminalAcknowledgeError returns true if the error indicates the lease
 // cannot be acknowledged and retrying won't help. This includes cases where
 // the lease is already acknowledged (not in PENDING state).

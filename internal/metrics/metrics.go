@@ -179,6 +179,14 @@ var (
 		Name:      "messages_total",
 		Help:      "Total number of Watermill messages processed",
 	}, []string{"topic", "outcome"}) // outcome: success, error, dropped
+
+	// PoisonedMessagesTotal tracks messages sent to the poison queue after all retries exhausted.
+	PoisonedMessagesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "watermill",
+		Name:      "poisoned_messages_total",
+		Help:      "Total messages sent to poison queue after all retries exhausted.",
+	})
 )
 
 // Event subscriber metrics

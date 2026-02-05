@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -45,7 +47,34 @@ func newBackendForProvisionTest(t *testing.T, mock *mockDockerClient, provisions
 	t.Helper()
 	b := newBackendForTest(mock, provisions)
 	b.httpClient = &http.Client{Timeout: 5 * time.Second}
+	rebuildCallbackSender(b)
 	return b
+}
+
+// zeroBackoff eliminates retry delays in tests.
+var zeroBackoff = [shared.CallbackMaxAttempts]time.Duration{}
+
+// rebuildCallbackSender is a test-only workaround that re-creates the
+// callbackSender from the Backend's current httpClient, callbackStore, and cfg
+// fields with zero backoff for fast tests.
+//
+// Why this exists: CallbackSender captures its dependencies (HTTP client,
+// secret, store, etc.) at construction time. Many tests swap these fields on
+// the Backend after newBackendForProvisionTest returns (e.g. b.httpClient =
+// server.Client()), but those mutations have no effect on the already-built
+// sender. This helper rebuilds the sender so it picks up the new values.
+//
+// The alternative would be a more complex test builder that accepts every
+// possible override before constructing the Backend.
+func rebuildCallbackSender(b *Backend) {
+	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+		Store:      b.callbackStore,
+		HTTPClient: b.httpClient,
+		Secret:     b.cfg.CallbackSecret,
+		Logger:     b.logger,
+		StopCtx:    b.stopCtx,
+		Backoff:    &zeroBackoff,
+	})
 }
 
 // --- Provision (synchronous validation) tests ---
@@ -72,10 +101,6 @@ func TestProvision_Success(t *testing.T) {
 		},
 	}
 
-	// Override callback backoff so tests run instantly
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -150,9 +175,6 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 		},
 	}
 
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {
@@ -244,7 +266,7 @@ func TestProvision_InsufficientResources(t *testing.T) {
 	// Exhaust the pool
 	b.cfg.TotalCPUCores = 0.1
 	b.cfg.TotalMemoryMB = 1
-	b.pool = NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
+	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
 	err := b.Provision(context.Background(), req)
@@ -259,7 +281,7 @@ func TestProvision_MultiItem_PartialResourceRollback(t *testing.T) {
 	// Only enough resources for 1 docker-small, not 2
 	b.cfg.TotalCPUCores = 0.6
 	b.cfg.TotalMemoryMB = 600
-	b.pool = NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
+	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
 
 	req := backend.ProvisionRequest{
 		LeaseUUID:    "lease-1",
@@ -282,9 +304,6 @@ func TestProvision_MultiItem_PartialResourceRollback(t *testing.T) {
 // --- doProvision (async) tests ---
 
 func TestDoProvision_PullFailure(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	var callbackPayload backend.CallbackPayload
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -333,9 +352,6 @@ func TestDoProvision_PullFailure(t *testing.T) {
 }
 
 func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -394,9 +410,6 @@ func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
 }
 
 func TestDoProvision_ContextCanceled(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -431,9 +444,6 @@ func TestDoProvision_ContextCanceled(t *testing.T) {
 }
 
 func TestDoProvision_NetworkIsolation(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -489,9 +499,6 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 }
 
 func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -510,7 +517,10 @@ func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
 		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			// Container exited during startup verify
-			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "Error: config not found", nil
 		},
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
@@ -538,12 +548,11 @@ func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Contains(t, prov.LastError, "exit_code=1")
+	assert.Contains(t, prov.LastError, "config not found")
 }
 
 func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -966,9 +975,6 @@ func TestListProvisions_Multiple(t *testing.T) {
 // --- sendCallback / trySendCallback tests ---
 
 func TestSendCallback_Success(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	var received backend.CallbackPayload
 	var receivedSig string
@@ -985,6 +991,7 @@ func TestSendCallback_Success(t *testing.T) {
 	})
 	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
 
 	b.sendCallback("lease-1", true, "")
 
@@ -994,9 +1001,6 @@ func TestSendCallback_Success(t *testing.T) {
 }
 
 func TestSendCallback_FailurePayload(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	var received backend.CallbackPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1010,6 +1014,7 @@ func TestSendCallback_FailurePayload(t *testing.T) {
 		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
 	})
 	b.httpClient = server.Client()
+	rebuildCallbackSender(b)
 
 	b.sendCallback("lease-1", false, "image pull failed")
 
@@ -1024,10 +1029,31 @@ func TestSendCallback_NoCallbackURL(t *testing.T) {
 	b.sendCallback("unknown-lease", true, "")
 }
 
+func TestSendCallback_TruncatesLongError(t *testing.T) {
+	var received backend.CallbackPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+	})
+	b.httpClient = server.Client()
+	rebuildCallbackSender(b)
+
+	// Send an error message that exceeds the on-chain rejection reason limit.
+	longError := strings.Repeat("x", callbackMaxErrorLen+100)
+	b.sendCallback("lease-1", false, longError)
+
+	assert.LessOrEqual(t, len(received.Error), callbackMaxErrorLen,
+		"callback error should be truncated to fit on-chain limit")
+	assert.True(t, strings.HasSuffix(received.Error, "..."))
+}
+
 func TestSendCallback_Retry(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1045,6 +1071,7 @@ func TestSendCallback_Retry(t *testing.T) {
 		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
 	})
 	b.httpClient = server.Client()
+	rebuildCallbackSender(b)
 
 	b.sendCallback("lease-1", true, "")
 
@@ -1052,10 +1079,6 @@ func TestSendCallback_Retry(t *testing.T) {
 }
 
 func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 5 * time.Second, 5 * time.Second}
-	defer func() { callbackBackoff = origBackoff }()
-
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts.Add(1)
@@ -1068,6 +1091,16 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
 	})
 	b.httpClient = server.Client()
+	// Use long backoff so shutdown cancellation is observable.
+	longBackoff := [shared.CallbackMaxAttempts]time.Duration{0, 5 * time.Second, 5 * time.Second}
+	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+		Store:      b.callbackStore,
+		HTTPClient: b.httpClient,
+		Secret:     b.cfg.CallbackSecret,
+		Logger:     b.logger,
+		StopCtx:    b.stopCtx,
+		Backoff:    &longBackoff,
+	})
 
 	// Cancel stopCtx after first attempt
 	go func() {
@@ -1081,7 +1114,8 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 	assert.LessOrEqual(t, attempts.Load(), int32(2))
 }
 
-func TestTrySendCallback_Success(t *testing.T) {
+func TestDeliverCallback_Success(t *testing.T) {
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 		w.WriteHeader(http.StatusOK)
@@ -1091,12 +1125,14 @@ func TestTrySendCallback_Success(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.httpClient = server.Client()
+	rebuildCallbackSender(b)
 
-	ok := b.trySendCallback("lease-1", server.URL, []byte(`{"test":true}`))
+	ok := b.callbackSender.DeliverCallback("lease-1", server.URL, []byte(`{"test":true}`))
 	assert.True(t, ok)
 }
 
-func TestTrySendCallback_ServerError(t *testing.T) {
+func TestDeliverCallback_ServerError(t *testing.T) {
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -1105,8 +1141,9 @@ func TestTrySendCallback_ServerError(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.httpClient = server.Client()
+	rebuildCallbackSender(b)
 
-	ok := b.trySendCallback("lease-1", server.URL, []byte(`{}`))
+	ok := b.callbackSender.DeliverCallback("lease-1", server.URL, []byte(`{}`))
 	assert.False(t, ok)
 }
 
@@ -1255,6 +1292,9 @@ func TestWaitForHealthy_Unhealthy(t *testing.T) {
 				Health:      HealthStatusUnhealthy,
 			}, nil
 		},
+		ContainerLogsFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
 	}
 	b := newBackendForTest(mock, nil)
 
@@ -1273,7 +1313,12 @@ func TestWaitForHealthy_ContainerExited(t *testing.T) {
 				ContainerID: id,
 				Status:      "exited",
 				Health:      HealthStatusNone,
+				ExitCode:    137,
+				OOMKilled:   true,
 			}, nil
+		},
+		ContainerLogsFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "Killed", nil
 		},
 	}
 	b := newBackendForTest(mock, nil)
@@ -1284,6 +1329,8 @@ func TestWaitForHealthy_ContainerExited(t *testing.T) {
 	err := b.waitForHealthy(ctx, []string{"c1"}, b.logger)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exited")
+	assert.Contains(t, err.Error(), "exit_code=137")
+	assert.Contains(t, err.Error(), "oom_killed=true")
 }
 
 func TestWaitForHealthy_ContextTimeout(t *testing.T) {
@@ -1352,9 +1399,6 @@ func TestWaitForHealthy_BecomesHealthyAfterStarting(t *testing.T) {
 // --- Error persistence tests ---
 
 func TestDoProvision_LastError_ContextCanceled(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1389,9 +1433,6 @@ func TestDoProvision_LastError_ContextCanceled(t *testing.T) {
 }
 
 func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1471,9 +1512,6 @@ func TestListProvisions_IncludesLastError(t *testing.T) {
 // --- Disk quota container creation tests ---
 
 func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1527,9 +1565,6 @@ func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
 }
 
 func TestDoProvision_DiskQuotaDisabled(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1582,9 +1617,6 @@ func TestDoProvision_DiskQuotaDisabled(t *testing.T) {
 }
 
 func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1647,9 +1679,6 @@ func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
 // --- Callback persistence tests ---
 
 func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1657,7 +1686,7 @@ func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_persist.db")
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer cbStore.Close()
 
@@ -1667,6 +1696,7 @@ func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
 	})
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
+	rebuildCallbackSender(b)
 
 	b.sendCallback("lease-1", true, "")
 
@@ -1677,9 +1707,6 @@ func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
 }
 
 func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	// Server always returns 500
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1688,7 +1715,7 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_fail.db")
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer cbStore.Close()
 
@@ -1698,6 +1725,7 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 	})
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
+	rebuildCallbackSender(b)
 
 	b.sendCallback("lease-1", false, "container crashed")
 
@@ -1713,9 +1741,6 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 // --- Replay callbacks tests ---
 
 func TestReplayPendingCallbacks_Success(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	var received []backend.CallbackPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1727,17 +1752,17 @@ func TestReplayPendingCallbacks_Success(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_replay.db")
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	// Pre-populate with pending callbacks
-	require.NoError(t, cbStore.Store(CallbackEntry{
+	require.NoError(t, cbStore.Store(shared.CallbackEntry{
 		LeaseUUID:   "lease-1",
 		CallbackURL: server.URL,
 		Success:     true,
 		CreatedAt:   time.Now(),
 	}))
-	require.NoError(t, cbStore.Store(CallbackEntry{
+	require.NoError(t, cbStore.Store(shared.CallbackEntry{
 		LeaseUUID:   "lease-2",
 		CallbackURL: server.URL,
 		Success:     false,
@@ -1749,8 +1774,9 @@ func TestReplayPendingCallbacks_Success(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
+	rebuildCallbackSender(b)
 
-	b.replayPendingCallbacks()
+	b.callbackSender.ReplayPendingCallbacks()
 
 	// Both callbacks should have been delivered
 	assert.Len(t, received, 2)
@@ -1764,15 +1790,12 @@ func TestReplayPendingCallbacks_Success(t *testing.T) {
 }
 
 func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
-	callCount := 0
+	var callCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
+		n := callCount.Add(1)
 		// First callback delivery succeeds, second fails all retries
-		if callCount <= 1 {
+		if n <= 1 {
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1781,16 +1804,16 @@ func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_partial.db")
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
-	require.NoError(t, cbStore.Store(CallbackEntry{
+	require.NoError(t, cbStore.Store(shared.CallbackEntry{
 		LeaseUUID:   "lease-1",
 		CallbackURL: server.URL,
 		Success:     true,
 		CreatedAt:   time.Now(),
 	}))
-	require.NoError(t, cbStore.Store(CallbackEntry{
+	require.NoError(t, cbStore.Store(shared.CallbackEntry{
 		LeaseUUID:   "lease-2",
 		CallbackURL: server.URL,
 		Success:     false,
@@ -1802,8 +1825,9 @@ func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
+	rebuildCallbackSender(b)
 
-	b.replayPendingCallbacks()
+	b.callbackSender.ReplayPendingCallbacks()
 
 	// lease-2 should remain in store since delivery failed
 	pending, err := cbStore.ListPending()
@@ -1818,15 +1842,13 @@ func TestReplayPendingCallbacks_NilStore(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.callbackStore = nil
+	rebuildCallbackSender(b)
 
 	// Should not panic
-	b.replayPendingCallbacks()
+	b.callbackSender.ReplayPendingCallbacks()
 }
 
 func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	var received []backend.CallbackPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1839,16 +1861,16 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 
 	// First, create a store without expiry and insert old + fresh entries
 	dbPath := filepath.Join(t.TempDir(), "cb_expire.db")
-	store1, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store1, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
-	require.NoError(t, store1.Store(CallbackEntry{
+	require.NoError(t, store1.Store(shared.CallbackEntry{
 		LeaseUUID:   "lease-old",
 		CallbackURL: server.URL,
 		Success:     true,
 		CreatedAt:   time.Now().Add(-2 * time.Hour),
 	}))
-	require.NoError(t, store1.Store(CallbackEntry{
+	require.NoError(t, store1.Store(shared.CallbackEntry{
 		LeaseUUID:   "lease-fresh",
 		CallbackURL: server.URL,
 		Success:     true,
@@ -1857,7 +1879,7 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 	require.NoError(t, store1.Close())
 
 	// Reopen with MaxAge — initial cleanup removes old entries
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
 		DBPath: dbPath,
 		MaxAge: 1 * time.Hour,
 	})
@@ -1867,8 +1889,9 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
+	rebuildCallbackSender(b)
 
-	b.replayPendingCallbacks()
+	b.callbackSender.ReplayPendingCallbacks()
 
 	// Only the fresh callback should have been delivered
 	require.Len(t, received, 1)
@@ -1882,55 +1905,20 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 	cbStore.Close()
 }
 
-func TestCallbackStore_RemoveOlderThan(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "cb_ttl.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer store.Close()
-
-	// Store entries at different ages
-	require.NoError(t, store.Store(CallbackEntry{
-		LeaseUUID:   "old-1",
-		CallbackURL: "http://example.com",
-		Success:     true,
-		CreatedAt:   time.Now().Add(-48 * time.Hour),
-	}))
-	require.NoError(t, store.Store(CallbackEntry{
-		LeaseUUID:   "old-2",
-		CallbackURL: "http://example.com",
-		Success:     false,
-		Error:       "some error",
-		CreatedAt:   time.Now().Add(-25 * time.Hour),
-	}))
-	require.NoError(t, store.Store(CallbackEntry{
-		LeaseUUID:   "fresh",
-		CallbackURL: "http://example.com",
-		Success:     true,
-		CreatedAt:   time.Now(),
-	}))
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 2, removed)
-
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, "fresh", pending[0].LeaseUUID)
-}
 
 func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_empty.db")
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer cbStore.Close()
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.callbackStore = cbStore
+	rebuildCallbackSender(b)
 
 	// Should not panic or make HTTP calls
-	b.replayPendingCallbacks()
+	b.callbackSender.ReplayPendingCallbacks()
 }
 
 // --- Additional coverage tests ---
@@ -1972,52 +1960,8 @@ func TestDeprovision_AllContainersFail(t *testing.T) {
 	assert.Equal(t, 0, stats.AllocationCount)
 }
 
-// Fix 2: RemoveOlderThan on an empty store returns zero.
-func TestCallbackStore_RemoveOlderThan_EmptyStore(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "cb_empty_ttl.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer store.Close()
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 0, removed)
-}
-
-// Fix 2: RemoveOlderThan when all entries are fresh — none removed.
-func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "cb_allfresh.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer store.Close()
-
-	require.NoError(t, store.Store(CallbackEntry{
-		LeaseUUID:   "lease-1",
-		CallbackURL: "http://example.com",
-		Success:     true,
-		CreatedAt:   time.Now(),
-	}))
-	require.NoError(t, store.Store(CallbackEntry{
-		LeaseUUID:   "lease-2",
-		CallbackURL: "http://example.com",
-		Success:     true,
-		CreatedAt:   time.Now().Add(-1 * time.Hour),
-	}))
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 0, removed)
-
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	assert.Len(t, pending, 2)
-}
-
-// Fix 2: CallbackMaxAge=0 skips expiry in replayPendingCallbacks.
+// Fix 2: CallbackMaxAge=0 skips expiry in ReplayPendingCallbacks.
 func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
-	origBackoff := callbackBackoff
-	callbackBackoff = [callbackMaxAttempts]time.Duration{0, 0, 0}
-	defer func() { callbackBackoff = origBackoff }()
 
 	var received []backend.CallbackPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2029,11 +1973,11 @@ func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb_zeromax.db")
-	cbStore, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	// Store an old callback (48 hours ago)
-	require.NoError(t, cbStore.Store(CallbackEntry{
+	require.NoError(t, cbStore.Store(shared.CallbackEntry{
 		LeaseUUID:   "lease-old",
 		CallbackURL: server.URL,
 		Success:     true,
@@ -2044,9 +1988,10 @@ func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
+	rebuildCallbackSender(b)
 	b.cfg.CallbackMaxAge = 0 // Zero means "don't expire"
 
-	b.replayPendingCallbacks()
+	b.callbackSender.ReplayPendingCallbacks()
 
 	// Old callback should still be delivered (not expired)
 	require.Len(t, received, 1)
@@ -2108,42 +2053,21 @@ func TestGetLogs_EmptyContainerIDs(t *testing.T) {
 
 // Fix 5: Explicit (non-ephemeral) port conflict returns error immediately without retry.
 func TestCreateContainer_ExplicitPortConflict_NoRetry(t *testing.T) {
-	createCalls := 0
-	mock := &mockDockerClient{
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			createCalls++
-			// Simulate the retry logic by checking what hasEphemeralPorts + isPortBindingError would do.
-			// The mock receives the params — the actual retry logic is in DockerClient.CreateContainer,
-			// not the mock. Instead, test the helper functions' decision logic.
-			return "", fmt.Errorf("port is already allocated")
-		},
-	}
-
-	// Manifest with explicit (non-ephemeral) port
-	manifest := &DockerManifest{
-		Image: "nginx:latest",
-		Ports: map[string]PortConfig{
-			"80/tcp": {HostPort: 8080}, // Explicit port
-		},
-	}
-
 	// Verify the decision logic: explicit ports should NOT trigger retry
-	assert.False(t, hasEphemeralPorts(manifest.Ports), "explicit ports should not be ephemeral")
+	assert.False(t, hasEphemeralPorts(map[string]PortConfig{
+		"80/tcp": {HostPort: 8080},
+	}), "explicit ports should not be ephemeral")
 	assert.True(t, isPortBindingError(fmt.Errorf("port is already allocated")))
 
-	// Also verify: mixed ports (one explicit, one ephemeral) DO trigger retry
-	mixedPorts := map[string]PortConfig{
+	// Mixed ports (one explicit, one ephemeral) DO trigger retry
+	assert.True(t, hasEphemeralPorts(map[string]PortConfig{
 		"80/tcp":  {HostPort: 8080}, // explicit
 		"443/tcp": {HostPort: 0},    // ephemeral
-	}
-	assert.True(t, hasEphemeralPorts(mixedPorts), "mixed ports with an ephemeral should be ephemeral")
+	}), "mixed ports with an ephemeral should be ephemeral")
 
-	// Verify: no ports means no ephemeral
+	// No ports means no ephemeral
 	assert.False(t, hasEphemeralPorts(nil))
 	assert.False(t, hasEphemeralPorts(map[string]PortConfig{}))
-
-	_ = mock
-	_ = createCalls
 }
 
 // Fix 1: Deprovision on a provisioning lease still removes containers.
@@ -2200,34 +2124,81 @@ func TestGetLogs_FailedLease(t *testing.T) {
 	assert.Equal(t, "crash log output", logs["0"])
 }
 
-// Fix 2: CallbackStore Store overwrites entry with same LeaseUUID.
-func TestCallbackStore_StoreOverwrites(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "cb_overwrite.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer store.Close()
+// --- containerFailureDiagnostics tests ---
 
-	// Store initial entry
-	require.NoError(t, store.Store(CallbackEntry{
-		LeaseUUID:   "lease-1",
-		CallbackURL: "http://example.com/v1",
-		Success:     true,
-		CreatedAt:   time.Now(),
-	}))
+func TestContainerFailureDiagnostics_ExitCodeAndLogs(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			assert.Equal(t, diagnosticLogTail, tail)
+			return "Error: EACCES: permission denied", nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
 
-	// Overwrite with new entry (same LeaseUUID)
-	require.NoError(t, store.Store(CallbackEntry{
-		LeaseUUID:   "lease-1",
-		CallbackURL: "http://example.com/v2",
-		Success:     false,
-		Error:       "updated error",
-		CreatedAt:   time.Now(),
-	}))
+	info := &ContainerInfo{ExitCode: 1}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
 
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1, "should have exactly one entry (overwritten)")
-	assert.Equal(t, "http://example.com/v2", pending[0].CallbackURL)
-	assert.False(t, pending[0].Success)
-	assert.Equal(t, "updated error", pending[0].Error)
+	assert.Equal(t, "exit_code=1; logs:\nError: EACCES: permission denied", diag)
 }
+
+func TestContainerFailureDiagnostics_OOMKilled(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "Killed", nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	info := &ContainerInfo{ExitCode: 137, OOMKilled: true}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+
+	assert.Contains(t, diag, "exit_code=137")
+	assert.Contains(t, diag, "oom_killed=true")
+	assert.Contains(t, diag, "Killed")
+}
+
+func TestContainerFailureDiagnostics_LogsFetchFails(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", errors.New("container not found")
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	info := &ContainerInfo{ExitCode: 1}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+
+	assert.Equal(t, "exit_code=1", diag)
+}
+
+func TestContainerFailureDiagnostics_ZeroExitCode(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	info := &ContainerInfo{ExitCode: 0}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+
+	assert.Equal(t, "exit_code=0", diag)
+}
+
+func TestContainerFailureDiagnostics_Truncation(t *testing.T) {
+	// Generate logs larger than diagnosticMaxBytes
+	largeLogs := strings.Repeat("x", diagnosticMaxBytes)
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return largeLogs, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	info := &ContainerInfo{ExitCode: 1}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+
+	assert.LessOrEqual(t, len(diag), diagnosticMaxBytes)
+	assert.True(t, strings.HasSuffix(diag, "..."))
+}
+
