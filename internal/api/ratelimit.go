@@ -286,20 +286,23 @@ func (tl *TenantRateLimiter) Middleware(bech32Prefix string) func(http.Handler) 
 }
 
 // extractTenantFromAuth attempts to extract the tenant address from the Authorization header.
-// Returns empty string if extraction fails.
+// Returns empty string if extraction fails (request proceeds without tenant rate limiting).
 func extractTenantFromAuth(r *http.Request, bech32Prefix string) string {
 	tokenStr, err := extractBearerToken(r)
 	if err != nil {
+		slog.Debug("tenant extraction: no bearer token", "error", err)
 		return ""
 	}
 
 	token, err := ParseAuthToken(tokenStr)
 	if err != nil {
+		slog.Debug("tenant extraction: token parse failed", "error", err)
 		return ""
 	}
 
 	// Validate the token to ensure it's properly signed
 	if err := token.Validate(bech32Prefix); err != nil {
+		slog.Debug("tenant extraction: token validation failed", "error", err)
 		return ""
 	}
 

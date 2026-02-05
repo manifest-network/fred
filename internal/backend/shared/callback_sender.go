@@ -32,7 +32,8 @@ type CallbackSender struct {
 	logger     *slog.Logger
 	stopCtx    context.Context
 	backoff    [CallbackMaxAttempts]time.Duration
-	onDelivery func(outcome string) // nil-safe; injected by the caller for metrics
+	onDelivery    func(outcome string) // nil-safe; injected by the caller for metrics
+	onStoreError  func()              // nil-safe; called when bbolt persistence fails
 }
 
 // CallbackSenderConfig configures a CallbackSender.
@@ -42,8 +43,9 @@ type CallbackSenderConfig struct {
 	Secret     string
 	Logger     *slog.Logger
 	StopCtx    context.Context
-	OnDelivery func(outcome string)                   // optional metrics callback
-	Backoff    *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
+	OnDelivery   func(outcome string)                   // optional metrics callback
+	OnStoreError func()                                 // optional; called when bbolt persistence fails
+	Backoff      *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
 }
 
 // NewCallbackSender creates a new CallbackSender.
@@ -66,13 +68,14 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 	}
 
 	return &CallbackSender{
-		store:      cfg.Store,
-		httpClient: cfg.HTTPClient,
-		secret:     cfg.Secret,
-		logger:     cfg.Logger,
-		stopCtx:    cfg.StopCtx,
-		backoff:    backoff,
-		onDelivery: cfg.OnDelivery,
+		store:        cfg.Store,
+		httpClient:   cfg.HTTPClient,
+		secret:       cfg.Secret,
+		logger:       cfg.Logger,
+		stopCtx:      cfg.StopCtx,
+		backoff:      backoff,
+		onDelivery:   cfg.OnDelivery,
+		onStoreError: cfg.OnStoreError,
 	}
 }
 
@@ -112,6 +115,9 @@ func (s *CallbackSender) SendCallback(leaseUUID, callbackURL string, success boo
 			CreatedAt:   time.Now(),
 		}); storeErr != nil {
 			s.logger.Error("failed to persist callback", "error", storeErr, "lease_uuid", leaseUUID)
+			if s.onStoreError != nil {
+				s.onStoreError()
+			}
 		}
 	}
 

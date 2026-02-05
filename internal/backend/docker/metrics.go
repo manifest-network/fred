@@ -78,6 +78,14 @@ var (
 		Help:      "Total number of callback delivery attempts by outcome",
 	}, []string{"outcome"})
 
+	// callbackStoreErrorsTotal tracks bbolt persistence failures for callbacks.
+	callbackStoreErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "callback_store_errors_total",
+		Help:      "Total number of callback persistence failures (bbolt store errors)",
+	})
+
 	// imagePullDurationSeconds tracks image pull duration.
 	imagePullDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,

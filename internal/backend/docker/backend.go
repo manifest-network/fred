@@ -256,6 +256,9 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		OnDelivery: func(outcome string) {
 			callbackDeliveryTotal.WithLabelValues(outcome).Inc()
 		},
+		OnStoreError: func() {
+			callbackStoreErrorsTotal.Inc()
+		},
 	})
 
 	return b, nil

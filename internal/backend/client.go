@@ -287,9 +287,12 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 }
 
 // readErrorBody reads up to 4 KiB from an HTTP response body for inclusion
-// in error messages. If reading fails, the read error is reported instead.
+// in error messages. Remaining bytes are drained to allow connection reuse.
+// If reading fails, the read error is reported instead.
 func readErrorBody(resp *http.Response) string {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// Drain any remaining bytes so the underlying connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if err != nil {
 		return fmt.Sprintf("<body read error: %v>", err)
 	}

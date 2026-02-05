@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"fmt"
+	stdmath "math"
 
 	"cosmossdk.io/math"
 	"github.com/cosmos/cosmos-sdk/client"
@@ -114,6 +115,9 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 	}
 
 	// Set gas and fees from configuration
+	if s.gasLimit > uint64(stdmath.MaxInt64) {
+		return nil, fmt.Errorf("gas limit %d overflows int64", s.gasLimit)
+	}
 	txBuilder.SetGasLimit(s.gasLimit)
 	feeAmount := int64(s.gasLimit) * s.gasPrice / gasPriceDivisor
 	if feeAmount < minFeeAmount {

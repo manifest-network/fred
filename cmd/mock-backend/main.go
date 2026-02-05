@@ -43,6 +43,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -141,6 +142,8 @@ func main() {
 	mux.HandleFunc("GET /info/{lease_uuid}", server.handleGetInfo)
 	mux.HandleFunc("POST /deprovision", server.handleDeprovision)
 	mux.HandleFunc("GET /provisions", server.handleListProvisions)
+	mux.HandleFunc("GET /provisions/{lease_uuid}", server.handleGetProvision)
+	mux.HandleFunc("GET /logs/{lease_uuid}", server.handleGetLogs)
 	mux.HandleFunc("GET /health", server.handleHealth)
 
 	httpServer := &http.Server{
@@ -326,6 +329,59 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 		Provisions: provisions,
 	}); err != nil {
 		slog.Error("failed to encode provisions response", "error", err)
+	}
+}
+
+func (s *MockBackendServer) handleGetProvision(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+	if leaseUUID == "" {
+		http.Error(w, "lease_uuid is required", http.StatusBadRequest)
+		return
+	}
+
+	info, err := s.backend.GetProvision(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			http.Error(w, "not provisioned", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(info); err != nil {
+		slog.Error("failed to encode provision response", "error", err)
+	}
+}
+
+func (s *MockBackendServer) handleGetLogs(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+	if leaseUUID == "" {
+		http.Error(w, "lease_uuid is required", http.StatusBadRequest)
+		return
+	}
+
+	tail := 100
+	if tailStr := r.URL.Query().Get("tail"); tailStr != "" {
+		if n, err := strconv.Atoi(tailStr); err == nil && n > 0 {
+			tail = n
+		}
+	}
+
+	logs, err := s.backend.GetLogs(r.Context(), leaseUUID, tail)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			http.Error(w, "not provisioned", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(logs); err != nil {
+		slog.Error("failed to encode logs response", "error", err)
 	}
 }
 

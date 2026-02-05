@@ -201,8 +201,9 @@ func (s *EventSubscriber) broadcast(event LeaseEvent) {
 	s.subscribersMu.RUnlock()
 
 	// Send to all channels without holding the lock.
-	// Since we're tracked by broadcastWg, Close() will wait for us to finish
-	// before closing channels, so trySend() won't panic.
+	// Close() waits on broadcastWg before closing channels, so that path is safe.
+	// Unsubscribe() may close a channel concurrently; trySend() recovers from
+	// the resulting panic (the event is for a departing subscriber anyway).
 	for _, ch := range channels {
 		s.trySend(ch, event)
 	}
