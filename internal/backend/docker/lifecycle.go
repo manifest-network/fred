@@ -576,7 +576,7 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 	// Docker API returns a conflict error. Handle this by re-listing.
 	resp, err := d.client.NetworkCreate(ctx, name, networktypes.CreateOptions{
 		Driver:   "bridge",
-		Internal: true,
+		Internal: false,
 		Labels: map[string]string{
 			LabelManaged: "true",
 			LabelTenant:  tenant,

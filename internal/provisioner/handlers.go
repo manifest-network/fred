@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 
 	"github.com/ThreeDotsLabs/watermill/message"
 
@@ -23,6 +24,32 @@ func truncateRejectReason(reason string) string {
 		return reason[:maxRejectReasonLen-3] + "..."
 	}
 	return reason
+}
+
+// Deterministic rejection reasons for on-chain lease rejection.
+// These hardcoded strings prevent dynamic data (SKU names, image registries,
+// file paths, JSON bodies) from leaking on-chain.
+const (
+	rejectReasonInvalidSKU      = "invalid SKU"
+	rejectReasonInvalidManifest = "invalid manifest"
+	rejectReasonImageNotAllowed = "image not allowed"
+	rejectReasonValidationError = "validation error"
+)
+
+// validationErrorToRejectReason maps a validation error to a hardcoded
+// rejection reason safe for on-chain surfacing.
+func validationErrorToRejectReason(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "unknown SKU"):
+		return rejectReasonInvalidSKU
+	case strings.Contains(msg, "invalid manifest"):
+		return rejectReasonInvalidManifest
+	case strings.Contains(msg, "not allowed"):
+		return rejectReasonImageNotAllowed
+	default:
+		return rejectReasonValidationError
+	}
 }
 
 // isTerminalAcknowledgeError returns true if the error indicates the lease

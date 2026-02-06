@@ -672,6 +672,31 @@ func TestTruncateRejectReason(t *testing.T) {
 	}
 }
 
+func TestValidationErrorToRejectReason(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		// Direct backend errors (docker backend path)
+		{"unknown SKU direct", fmt.Errorf("%w: unknown SKU: gpu-xl (profile: gpu-xl)", backend.ErrValidation), rejectReasonInvalidSKU},
+		{"invalid manifest direct", fmt.Errorf("%w: invalid manifest: %w", backend.ErrValidation, errors.New("invalid manifest JSON: unexpected end of JSON input")), rejectReasonInvalidManifest},
+		{"image not allowed direct", fmt.Errorf("%w: image from registry %q is not allowed; allowed registries: %v", backend.ErrValidation, "evil.io", []string{"docker.io"}), rejectReasonImageNotAllowed},
+		// HTTP client errors (wraps JSON body from remote backend)
+		{"unknown SKU HTTP", fmt.Errorf("%w: {\"error\":\"unknown SKU: invalid-sku\"}", backend.ErrValidation), rejectReasonInvalidSKU},
+		{"invalid manifest HTTP", fmt.Errorf("%w: {\"error\":\"invalid manifest: bad yaml\"}", backend.ErrValidation), rejectReasonInvalidManifest},
+		{"image not allowed HTTP", fmt.Errorf("%w: {\"error\":\"image not allowed: evil.io/malware\"}", backend.ErrValidation), rejectReasonImageNotAllowed},
+		// Catch-all
+		{"unknown error", fmt.Errorf("%w: something unexpected", backend.ErrValidation), rejectReasonValidationError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, validationErrorToRejectReason(tt.err))
+		})
+	}
+}
+
 func TestHandlerSet_HandleBackendCallback_LongReasonTruncated(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}

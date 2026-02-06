@@ -85,7 +85,7 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 				"tenant", lease.Tenant,
 				"error", err,
 			)
-			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, truncateRejectReason(err.Error()))
+			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, validationErrorToRejectReason(err))
 			if rejectErr != nil {
 				slog.Error("failed to reject lease after validation error",
 					"lease_uuid", lease.Uuid,
@@ -421,7 +421,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 			// Clean up the stored payload
 			h.deps.PayloadStore.Delete(event.LeaseUUID)
 
-			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, truncateRejectReason(err.Error()))
+			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, validationErrorToRejectReason(err))
 			if rejectErr != nil {
 				slog.Error("failed to reject lease after validation error",
 					"lease_uuid", lease.Uuid,
