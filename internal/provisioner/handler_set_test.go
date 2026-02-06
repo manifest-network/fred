@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ThreeDotsLabs/watermill"
@@ -32,6 +33,68 @@ func (m *mockAcknowledger) Acknowledge(ctx context.Context, leaseUUID string) (b
 	}
 	return true, "tx-hash", nil
 }
+
+// mockPlacementStore implements PlacementStore for testing.
+type mockPlacementStore struct {
+	mu         sync.Mutex
+	placements map[string]string
+}
+
+func (m *mockPlacementStore) Get(leaseUUID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.placements == nil {
+		return ""
+	}
+	return m.placements[leaseUUID]
+}
+
+func (m *mockPlacementStore) Set(leaseUUID, backendName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.placements == nil {
+		m.placements = make(map[string]string)
+	}
+	m.placements[leaseUUID] = backendName
+	return nil
+}
+
+func (m *mockPlacementStore) Delete(leaseUUID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.placements, leaseUUID)
+}
+
+func (m *mockPlacementStore) SetBatch(placements map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.placements == nil {
+		m.placements = make(map[string]string)
+	}
+	for k, v := range placements {
+		m.placements[k] = v
+	}
+	return nil
+}
+
+func (m *mockPlacementStore) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.placements)
+}
+
+func (m *mockPlacementStore) List() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	uuids := make([]string, 0, len(m.placements))
+	for k := range m.placements {
+		uuids = append(uuids, k)
+	}
+	return uuids
+}
+
+func (m *mockPlacementStore) Healthy() error { return nil }
+func (m *mockPlacementStore) Close() error   { return nil }
 
 // newTestHandlerSet creates a HandlerSet with mocked dependencies for testing.
 func newTestHandlerSet(
@@ -764,6 +827,144 @@ func TestIsTerminalAcknowledgeError(t *testing.T) {
 			assert.Equal(t, tt.terminal, isTerminalAcknowledgeError(tt.err))
 		})
 	}
+}
+
+// placementTestFixture holds the shared setup for placement-related callback tests.
+type placementTestFixture struct {
+	hs      *HandlerSet
+	tracker *DefaultInFlightTracker
+	ps      *mockPlacementStore
+	mb      *mockManagerBackend
+}
+
+// newPlacementTestFixture creates a HandlerSet wired with a mockPlacementStore.
+func newPlacementTestFixture(chainClient *chain.MockClient, ack *mockAcknowledger) placementTestFixture {
+	mb := &mockManagerBackend{name: "test-backend"}
+	ps := &mockPlacementStore{}
+	tracker := NewInFlightTracker()
+	router := &mockBackendRouter{
+		routeFn: func(sku string) backend.Backend { return mb },
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == mb.name {
+				return mb
+			}
+			return nil
+		},
+		backendsFn: func() []backend.Backend { return []backend.Backend{mb} },
+	}
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
+	hs := NewHandlerSet(HandlerDeps{
+		ChainClient:  chainClient,
+		Orchestrator: orch,
+		Tracker:      tracker,
+		Acknowledger: ack,
+	})
+	return placementTestFixture{hs: hs, tracker: tracker, ps: ps, mb: mb}
+}
+
+func TestHandlerSet_HandleBackendCallback_Failed_PendingLease_CleansUpPlacement(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: leaseUUID, State: billingtypes.LEASE_STATE_PENDING}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			return 1, []string{"tx-rej"}, nil
+		},
+	}
+
+	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
+	f.ps.Set("lease-1", "test-backend")
+	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusFailed,
+		Error:     "container crash",
+	})
+
+	err := f.hs.HandleBackendCallback(msg)
+	assert.NoError(t, err)
+	assert.False(t, f.tracker.IsInFlight("lease-1"))
+	assert.Empty(t, f.ps.Get("lease-1"), "placement should be deleted after rejection")
+}
+
+func TestHandlerSet_HandleBackendCallback_Failed_RejectFails_PreservesPlacement(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: leaseUUID, State: billingtypes.LEASE_STATE_PENDING}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			return 0, nil, errors.New("chain error")
+		},
+	}
+
+	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
+	f.ps.Set("lease-1", "test-backend")
+	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusFailed,
+		Error:     "failed",
+	})
+
+	err := f.hs.HandleBackendCallback(msg)
+	require.Error(t, err, "should return error for retry")
+
+	// Placement must be preserved so the retry can still find the backend
+	assert.True(t, f.tracker.IsInFlight("lease-1"), "should stay in-flight for retry")
+	assert.Equal(t, "test-backend", f.ps.Get("lease-1"), "placement should be preserved when reject fails")
+}
+
+func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease_PreservesPlacement(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: leaseUUID, State: billingtypes.LEASE_STATE_ACTIVE}, nil
+		},
+	}
+
+	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
+	f.ps.Set("lease-1", "test-backend")
+	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusFailed,
+		Error:     "re-provision failed",
+	})
+
+	err := f.hs.HandleBackendCallback(msg)
+	assert.NoError(t, err)
+
+	// Placement must be preserved — reconciler needs it to find the backend
+	assert.False(t, f.tracker.IsInFlight("lease-1"), "should be untracked for reconciler")
+	assert.Equal(t, "test-backend", f.ps.Get("lease-1"), "placement should be preserved for active lease")
+}
+
+func TestHandlerSet_HandleBackendCallback_Success_PreservesPlacement(t *testing.T) {
+	mockChain := &chain.MockClient{}
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			return true, "tx-abc", nil
+		},
+	}
+
+	f := newPlacementTestFixture(mockChain, ack)
+	f.ps.Set("lease-1", "test-backend")
+	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusSuccess,
+	})
+
+	err := f.hs.HandleBackendCallback(msg)
+	assert.NoError(t, err)
+
+	// Placement must be preserved — the lease is now ACTIVE and the container
+	// could crash later, requiring reads/re-provision from the same backend.
+	assert.False(t, f.tracker.IsInFlight("lease-1"))
+	assert.Equal(t, "test-backend", f.ps.Get("lease-1"), "placement should be preserved after success")
 }
 
 // --- Helper ---

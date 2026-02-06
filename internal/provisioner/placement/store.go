@@ -138,6 +138,24 @@ func (s *Store) SetBatch(placements map[string]string) error {
 	return nil
 }
 
+// Count returns the number of placements in the cache.
+func (s *Store) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.cache)
+}
+
+// List returns all lease UUIDs that have placements.
+func (s *Store) List() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	uuids := make([]string, 0, len(s.cache))
+	for k := range s.cache {
+		uuids = append(uuids, k)
+	}
+	return uuids
+}
+
 // Healthy checks that the bbolt database and bucket are accessible.
 func (s *Store) Healthy() error {
 	return s.db.View(func(tx *bolt.Tx) error {

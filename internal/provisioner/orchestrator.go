@@ -133,6 +133,15 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	return nil
 }
 
+// DeletePlacement removes the placement record for a lease. Called when a
+// lease reaches a terminal state (e.g., rejected after a failure callback)
+// without going through the full Deprovision flow.
+func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
+	if o.placementStore != nil {
+		o.placementStore.Delete(leaseUUID)
+	}
+}
+
 // Deprovision handles deprovisioning a lease from the appropriate backend.
 // It tries to determine the backend in this order:
 //  0. From the placement store (most reliable for completed provisions)

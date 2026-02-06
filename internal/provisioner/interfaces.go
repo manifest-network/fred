@@ -34,6 +34,8 @@ type PlacementStore interface {
 	Set(leaseUUID, backendName string) error
 	Delete(leaseUUID string)
 	SetBatch(placements map[string]string) error
+	Count() int
+	List() []string
 	Healthy() error
 	Close() error
 }

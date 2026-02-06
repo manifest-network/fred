@@ -300,10 +300,14 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		recordDuration()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
 
-		// Clean up payload after successful rejection
+		// Clean up payload and placement after successful rejection.
+		// Placement was recorded when the backend accepted the provision
+		// request, but rejected leases don't emit a close event, so
+		// Deprovision (which normally cleans up placement) is never called.
 		if h.deps.PayloadStore != nil {
 			h.deps.PayloadStore.Delete(callback.LeaseUUID)
 		}
+		h.deps.Orchestrator.DeletePlacement(callback.LeaseUUID)
 
 		slog.Info("lease rejected after provisioning failure",
 			"lease_uuid", callback.LeaseUUID,
