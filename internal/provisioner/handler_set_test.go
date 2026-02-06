@@ -690,13 +690,13 @@ func TestValidationErrorToRejectReason(t *testing.T) {
 		want string
 	}{
 		// Direct backend errors (docker backend path)
-		{"unknown SKU direct", fmt.Errorf("%w: unknown SKU: gpu-xl (profile: gpu-xl)", backend.ErrValidation), rejectReasonInvalidSKU},
-		{"invalid manifest direct", fmt.Errorf("%w: invalid manifest: %w", backend.ErrValidation, errors.New("invalid manifest JSON: unexpected end of JSON input")), rejectReasonInvalidManifest},
-		{"image not allowed direct", fmt.Errorf("%w: image from registry %q is not allowed; allowed registries: %v", backend.ErrValidation, "evil.io", []string{"docker.io"}), rejectReasonImageNotAllowed},
-		// HTTP client errors (wraps JSON body from remote backend)
-		{"unknown SKU HTTP", fmt.Errorf("%w: {\"error\":\"unknown SKU: invalid-sku\"}", backend.ErrValidation), rejectReasonInvalidSKU},
-		{"invalid manifest HTTP", fmt.Errorf("%w: {\"error\":\"invalid manifest: bad yaml\"}", backend.ErrValidation), rejectReasonInvalidManifest},
-		{"image not allowed HTTP", fmt.Errorf("%w: {\"error\":\"image not allowed: evil.io/malware\"}", backend.ErrValidation), rejectReasonImageNotAllowed},
+		{"unknown SKU direct", fmt.Errorf("%w: gpu-xl (profile: gpu-xl)", backend.ErrUnknownSKU), rejectReasonInvalidSKU},
+		{"invalid manifest direct", fmt.Errorf("%w: %w", backend.ErrInvalidManifest, errors.New("unexpected end of JSON input")), rejectReasonInvalidManifest},
+		{"image not allowed direct", fmt.Errorf("%w: registry %q; allowed registries: %v", backend.ErrImageNotAllowed, "evil.io", []string{"docker.io"}), rejectReasonImageNotAllowed},
+		// Nested wrapping (e.g., docker backend wraps config error which wraps sentinel)
+		{"unknown SKU nested", fmt.Errorf("%w: %w", backend.ErrValidation, fmt.Errorf("%w: bad-sku", backend.ErrUnknownSKU)), rejectReasonInvalidSKU},
+		{"invalid manifest nested", fmt.Errorf("%w: %w", backend.ErrValidation, fmt.Errorf("%w: bad yaml", backend.ErrInvalidManifest)), rejectReasonInvalidManifest},
+		{"image not allowed nested", fmt.Errorf("%w: %w", backend.ErrValidation, fmt.Errorf("%w: evil.io/malware", backend.ErrImageNotAllowed)), rejectReasonImageNotAllowed},
 		// Catch-all
 		{"unknown error", fmt.Errorf("%w: something unexpected", backend.ErrValidation), rejectReasonValidationError},
 	}

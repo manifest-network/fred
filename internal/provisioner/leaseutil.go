@@ -2,7 +2,6 @@ package provisioner
 
 import (
 	"errors"
-	"strings"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -34,13 +33,12 @@ const (
 // validationErrorToRejectReason maps a validation error to a hardcoded
 // rejection reason safe for on-chain surfacing.
 func validationErrorToRejectReason(err error) string {
-	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "unknown SKU"):
+	case errors.Is(err, backend.ErrUnknownSKU):
 		return rejectReasonInvalidSKU
-	case strings.Contains(msg, "invalid manifest"):
+	case errors.Is(err, backend.ErrInvalidManifest):
 		return rejectReasonInvalidManifest
-	case strings.Contains(msg, "not allowed"):
+	case errors.Is(err, backend.ErrImageNotAllowed):
 		return rejectReasonImageNotAllowed
 	default:
 		return rejectReasonValidationError

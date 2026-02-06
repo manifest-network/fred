@@ -228,6 +228,7 @@ func TestProvision_UnknownSKU(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrValidation)
+	assert.ErrorIs(t, err, backend.ErrUnknownSKU)
 
 	// Provision slot should be cleaned up
 	b.provisionsMu.RLock()
@@ -245,6 +246,7 @@ func TestProvision_InvalidManifest(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrValidation)
+	assert.ErrorIs(t, err, backend.ErrInvalidManifest)
 }
 
 func TestProvision_DisallowedImage(t *testing.T) {
@@ -258,6 +260,7 @@ func TestProvision_DisallowedImage(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrValidation)
+	assert.ErrorIs(t, err, backend.ErrImageNotAllowed)
 }
 
 func TestProvision_InsufficientResources(t *testing.T) {

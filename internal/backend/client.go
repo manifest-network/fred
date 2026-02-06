@@ -177,6 +177,14 @@ const (
 // (e.g., unknown SKU, invalid manifest, disallowed image registry).
 var ErrValidation = errors.New("validation error")
 
+// Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
+// still works, while allowing callers to classify the failure without string matching.
+var (
+	ErrUnknownSKU      = fmt.Errorf("%w: unknown SKU", ErrValidation)
+	ErrInvalidManifest = fmt.Errorf("%w: invalid manifest", ErrValidation)
+	ErrImageNotAllowed = fmt.Errorf("%w: image not allowed", ErrValidation)
+)
+
 // ErrInsufficientResources is returned when there are not enough resources
 // to fulfill a provision request.
 var ErrInsufficientResources = errors.New("insufficient resources")
