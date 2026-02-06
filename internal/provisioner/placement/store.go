@@ -45,7 +45,7 @@ func NewStore(dbPath string) (*Store, error) {
 		_, err := tx.CreateBucketIfNotExists(bucketName)
 		return err
 	}); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to create placement bucket: %w", err)
 	}
 
@@ -58,7 +58,7 @@ func NewStore(dbPath string) (*Store, error) {
 			return nil
 		})
 	}); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to load placements into cache: %w", err)
 	}
 

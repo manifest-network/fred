@@ -2129,3 +2129,193 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 	assert.Equal(t, "lease-1", closedLeases[0])
 	assert.Equal(t, rejectReasonInvalidSKU, closedReason)
 }
+
+// --- Placement store integration tests ---
+
+func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
+	// Setup: Two backends each with provisions. Placement store should be
+	// synced with SetBatch from actual backend state.
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+				{Uuid: "lease-2", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+
+	b1 := &mockReconcilerBackend{
+		name: "backend-1",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		},
+	}
+	b2 := &mockReconcilerBackend{
+		name: "backend-2",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-2", Status: backend.ProvisionStatusReady},
+		},
+	}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: b1, IsDefault: true},
+			{Backend: b2, Match: backend.MatchCriteria{SKUPrefix: "b2-"}},
+		},
+	})
+
+	ps := &mockPlacementStore{}
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, ps)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify placements were synced from backend state
+	assert.Equal(t, "backend-1", ps.Get("lease-1"))
+	assert.Equal(t, "backend-2", ps.Get("lease-2"))
+	assert.Equal(t, 2, ps.Count())
+}
+
+func TestReconciler_ReconcileAll_StartProvisioning_RecordsPlacement(t *testing.T) {
+	// Setup: Pending lease, not provisioned. After provisioning, placement should be recorded.
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+	mb := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+
+	ps := &mockPlacementStore{}
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, ps)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify placement was recorded after provisioning
+	assert.Equal(t, "test", ps.Get("lease-1"))
+}
+
+func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
+	// Setup: Pending lease with failed provision. After rejection, placement should be deleted.
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mb := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailed},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "test")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, ps)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after rejection")
+}
+
+func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.T) {
+	// Setup: No lease on chain, provisioned on backend (orphan). Placement should be cleaned up.
+	mockChain := &chain.MockClient{}
+	mb := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "orphan-1", Status: backend.ProvisionStatusReady, BackendName: "test"},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+
+	ps := &mockPlacementStore{}
+	ps.Set("orphan-1", "test")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, ps)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	assert.Empty(t, ps.Get("orphan-1"), "placement should be cleaned up after orphan deprovision")
+}
+
+func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
+	// Setup: Active lease, failed provision exhausted retries. After close, placement cleaned up.
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mb := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   3,
+				BackendName: "test",
+			},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "test")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, ps)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after lease close")
+}
