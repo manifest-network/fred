@@ -441,7 +441,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	manifest, err := ParseManifest(req.Payload)
 	if err != nil {
 		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: invalid manifest: %w", backend.ErrValidation, err)
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 	}
 
 	// Validate image against registry allowlist

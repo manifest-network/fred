@@ -289,10 +289,10 @@ func (tl *TenantRateLimiter) Middleware() func(http.Handler) http.Handler {
 // Returns empty string if extraction fails (request proceeds without tenant rate limiting).
 //
 // This intentionally skips full signature verification (secp256k1 + ADR-036) because:
-// 1. The downstream handler performs full authentication — this is only for rate-limit bucketing
-// 2. Avoiding redundant crypto verification saves significant CPU per request
-// 3. A spoofed tenant in an unsigned token only affects rate-limit bucketing;
-//    the request will still be rejected by the handler's real authentication
+//  1. The downstream handler performs full authentication — this is only for rate-limit bucketing
+//  2. Avoiding redundant crypto verification saves significant CPU per request
+//  3. A spoofed tenant in an unsigned token only affects rate-limit bucketing;
+//     the request will still be rejected by the handler's real authentication
 //
 // Security note: without signature verification, an attacker can forge tokens with
 // arbitrary tenant addresses to distribute requests across rate-limit buckets. This

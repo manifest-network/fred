@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
@@ -395,7 +396,7 @@ func (c *Config) GetSKUProfile(sku string) (SKUProfile, error) {
 	// Look up the profile by name
 	profile, ok := c.SKUProfiles[profileName]
 	if !ok {
-		return SKUProfile{}, fmt.Errorf("unknown SKU: %s (profile: %s)", sku, profileName)
+		return SKUProfile{}, fmt.Errorf("%w: %s (profile: %s)", backend.ErrUnknownSKU, sku, profileName)
 	}
 	return profile, nil
 }

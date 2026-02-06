@@ -7,6 +7,8 @@ import (
 	"slices"
 
 	"github.com/distribution/reference"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // ParseRegistry extracts the registry domain from a container image reference.
@@ -41,8 +43,8 @@ func ValidateImage(image string, allowedRegistries []string) error {
 	}
 
 	if !slices.Contains(allowedRegistries, registry) {
-		return fmt.Errorf("image from registry %q is not allowed; allowed registries: %v",
-			registry, allowedRegistries)
+		return fmt.Errorf("%w: registry %q; allowed registries: %v",
+			backend.ErrImageNotAllowed, registry, allowedRegistries)
 	}
 
 	return nil

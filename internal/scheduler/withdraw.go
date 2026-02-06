@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
 	"sync"
@@ -80,19 +81,11 @@ type WithdrawSchedulerConfig struct {
 
 // NewWithdrawScheduler creates a new withdrawal scheduler.
 func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *WithdrawScheduler {
-	// Apply defaults
-	maxIterations := cfg.MaxWithdrawIterations
-	if maxIterations <= 0 {
-		maxIterations = 100
-	}
-	errorThreshold := cfg.CreditCheckErrorThreshold
-	if errorThreshold <= 0 {
-		errorThreshold = 3
-	}
-	retryInterval := cfg.CreditCheckRetryInterval
-	if retryInterval <= 0 {
-		retryInterval = 30 * time.Second
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	// For int/duration fields, use max() to convert negative values to 0
+	maxIterations := cmp.Or(max(cfg.MaxWithdrawIterations, 0), 100)
+	errorThreshold := cmp.Or(max(cfg.CreditCheckErrorThreshold, 0), 3)
+	retryInterval := cmp.Or(max(cfg.CreditCheckRetryInterval, 0), 30*time.Second)
 
 	// Create initial context that can be canceled on shutdown.
 	// This ensures TriggerWithdraw works correctly even before Start() is called.

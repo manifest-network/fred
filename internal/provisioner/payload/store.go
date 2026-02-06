@@ -80,7 +80,7 @@ type Store struct {
 	flushInterval time.Duration
 
 	// For graceful shutdown
-	ctx       context.Context    // store-level context; Done channel used by write methods to avoid blocking after Close
+	ctx       context.Context // store-level context; Done channel used by write methods to avoid blocking after Close
 	cancel    context.CancelFunc
 	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
 	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues

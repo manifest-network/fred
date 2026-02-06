@@ -177,6 +177,46 @@ const (
 // (e.g., unknown SKU, invalid manifest, disallowed image registry).
 var ErrValidation = errors.New("validation error")
 
+// Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
+// still works, while allowing callers to classify the failure without string matching.
+var (
+	ErrUnknownSKU      = fmt.Errorf("%w: unknown SKU", ErrValidation)
+	ErrInvalidManifest = fmt.Errorf("%w: invalid manifest", ErrValidation)
+	ErrImageNotAllowed = fmt.Errorf("%w: image not allowed", ErrValidation)
+)
+
+// ValidationCode identifies the sub-category of a validation error in HTTP
+// responses. Backends include this in 400 JSON bodies so the client can
+// reconstruct the correct sentinel error across the HTTP boundary.
+type ValidationCode string
+
+// Validation code constants used in HTTP error responses.
+const (
+	ValidationCodeUnknownSKU      ValidationCode = "unknown_sku"
+	ValidationCodeInvalidManifest ValidationCode = "invalid_manifest"
+	ValidationCodeImageNotAllowed ValidationCode = "image_not_allowed"
+)
+
+// validationCodeErrors is the single source of truth mapping validation codes
+// to their sentinel errors. Used by both ClassifyValidationError (server-side,
+// error → code) and parseValidationError (client-side, code → error).
+var validationCodeErrors = map[ValidationCode]error{
+	ValidationCodeUnknownSKU:      ErrUnknownSKU,
+	ValidationCodeInvalidManifest: ErrInvalidManifest,
+	ValidationCodeImageNotAllowed: ErrImageNotAllowed,
+}
+
+// ClassifyValidationError returns the ValidationCode for a validation error.
+// Returns "" if the error does not match any known sub-category.
+func ClassifyValidationError(err error) ValidationCode {
+	for code, sentinel := range validationCodeErrors {
+		if errors.Is(err, sentinel) {
+			return code
+		}
+	}
+	return ""
+}
+
 // ErrInsufficientResources is returned when there are not enough resources
 // to fulfill a provision request.
 var ErrInsufficientResources = errors.New("insufficient resources")
@@ -286,17 +326,47 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	metrics.BackendRequestsTotal.WithLabelValues(c.name, operation, status).Inc()
 }
 
-// readErrorBody reads up to 4 KiB from an HTTP response body for inclusion
-// in error messages. Remaining bytes are drained to allow connection reuse.
-// If reading fails, the read error is reported instead.
-func readErrorBody(resp *http.Response) string {
+// readErrorBodyBytes reads up to 4 KiB from an HTTP response body for
+// inclusion in error messages. Remaining bytes are drained to allow
+// connection reuse. If reading fails, a placeholder message is returned.
+func readErrorBodyBytes(resp *http.Response) []byte {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	// Drain any remaining bytes so the underlying connection can be reused.
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if err != nil {
-		return fmt.Sprintf("<body read error: %v>", err)
+		return []byte(fmt.Sprintf("<body read error: %v>", err))
 	}
-	return string(body)
+	return body
+}
+
+// readErrorBody reads the response body as a string (convenience wrapper).
+func readErrorBody(resp *http.Response) string {
+	return string(readErrorBodyBytes(resp))
+}
+
+// parseValidationError parses a 400 response body and returns an error
+// wrapping the appropriate validation sentinel. If the body contains a
+// validation_code field, the corresponding sub-category sentinel is used
+// (ErrUnknownSKU, ErrInvalidManifest, ErrImageNotAllowed). Otherwise
+// falls back to the generic ErrValidation.
+func parseValidationError(body []byte) error {
+	var resp struct {
+		Error          string         `json:"error"`
+		ValidationCode ValidationCode `json:"validation_code"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("%w: %s", ErrValidation, string(body))
+	}
+
+	msg := resp.Error
+	if msg == "" {
+		msg = string(body)
+	}
+
+	if sentinel, ok := validationCodeErrors[resp.ValidationCode]; ok {
+		return fmt.Errorf("%w: %s", sentinel, msg)
+	}
+	return fmt.Errorf("%w: %s", ErrValidation, msg)
 }
 
 // signRequest adds an HMAC-SHA256 signature header to the request.
@@ -333,12 +403,12 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusAccepted {
-			errBody := readErrorBody(resp)
-			// 400 Bad Request indicates a validation error that won't succeed on retry
+			// 400 Bad Request indicates a validation error that won't succeed on retry.
+			// Parse the structured response to recover sub-category sentinels.
 			if resp.StatusCode == http.StatusBadRequest {
-				return nil, fmt.Errorf("%w: %s", ErrValidation, errBody)
+				return nil, parseValidationError(readErrorBodyBytes(resp))
 			}
-			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, errBody)
+			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		return nil, nil

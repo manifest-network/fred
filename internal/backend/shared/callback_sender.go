@@ -26,25 +26,25 @@ var defaultCallbackBackoff = [CallbackMaxAttempts]time.Duration{0, 1 * time.Seco
 
 // CallbackSender handles HMAC-signed callback delivery with retry and persistence.
 type CallbackSender struct {
-	store      *CallbackStore
-	httpClient *http.Client
-	secret     string
-	logger     *slog.Logger
-	stopCtx    context.Context
-	backoff    [CallbackMaxAttempts]time.Duration
-	onDelivery    func(outcome string) // nil-safe; injected by the caller for metrics
-	onStoreError  func()              // nil-safe; called when bbolt persistence fails
+	store        *CallbackStore
+	httpClient   *http.Client
+	secret       string
+	logger       *slog.Logger
+	stopCtx      context.Context
+	backoff      [CallbackMaxAttempts]time.Duration
+	onDelivery   func(outcome string) // nil-safe; injected by the caller for metrics
+	onStoreError func()               // nil-safe; called when bbolt persistence fails
 }
 
 // CallbackSenderConfig configures a CallbackSender.
 type CallbackSenderConfig struct {
-	Store      *CallbackStore
-	HTTPClient *http.Client
-	Secret     string
-	Logger     *slog.Logger
-	StopCtx    context.Context
-	OnDelivery   func(outcome string)                   // optional metrics callback
-	OnStoreError func()                                 // optional; called when bbolt persistence fails
+	Store        *CallbackStore
+	HTTPClient   *http.Client
+	Secret       string
+	Logger       *slog.Logger
+	StopCtx      context.Context
+	OnDelivery   func(outcome string)                // optional metrics callback
+	OnStoreError func()                              // optional; called when bbolt persistence fails
 	Backoff      *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
 }
 

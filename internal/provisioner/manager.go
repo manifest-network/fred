@@ -54,12 +54,12 @@ type Manager struct {
 // ManagerConfig configures the provision manager.
 type ManagerConfig struct {
 	ProviderUUID         string
-	CallbackBaseURL      string        // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
+	CallbackBaseURL      string         // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
 	PayloadStore         *payload.Store // Optional external payload store (if nil, manager won't handle payloads)
-	CallbackTimeout      time.Duration // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
-	TimeoutCheckInterval time.Duration // How often to check for timeouts (default: 1 minute)
-	AckBatchInterval     time.Duration // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
-	AckBatchSize         int           // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
+	CallbackTimeout      time.Duration  // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
+	TimeoutCheckInterval time.Duration  // How often to check for timeouts (default: 1 minute)
+	AckBatchInterval     time.Duration  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
+	AckBatchSize         int            // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
 }
 
 // NewManager creates a new provision manager with Watermill routing.

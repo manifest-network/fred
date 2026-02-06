@@ -127,6 +127,10 @@ If your system doesn't meet these requirements, you'll see errors like:
 
 **To disable disk quotas**, set `container_disk_quota: false` in your configuration. Containers will still have CPU and memory limits enforced via cgroups, but won't have storage limits at the Docker level.
 
+## Tenant Manifest Reference
+
+See [TENANT_MANIFEST.md](TENANT_MANIFEST.md) for the full tenant-facing manifest specification (image, ports, env, health check, tmpfs).
+
 ## Provisioning Lifecycle
 
 1. **Synchronous validation** -- the `Provision` method validates the request before returning:

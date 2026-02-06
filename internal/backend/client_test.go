@@ -59,11 +59,15 @@ func TestHTTPClient_Provision(t *testing.T) {
 }
 
 // TestHTTPClient_Provision_ValidationError verifies that 400 Bad Request responses
-// return ErrValidation to indicate a permanent error that shouldn't be retried.
+// with a validation_code return the correct sub-category sentinel.
 func TestHTTPClient_Provision_ValidationError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Return 400 with error details
-		http.Error(w, `{"error":"unknown SKU: invalid-sku"}`, http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":           "validation error: unknown SKU: invalid-sku",
+			"validation_code": "unknown_sku",
+		})
 	}))
 	defer server.Close()
 
@@ -81,9 +85,80 @@ func TestHTTPClient_Provision_ValidationError(t *testing.T) {
 		CallbackURL:  "http://fred/callback",
 	})
 
-	// Should return ErrValidation for 400 responses
 	assert.ErrorIs(t, err, ErrValidation)
+	assert.ErrorIs(t, err, ErrUnknownSKU)
 	assert.Contains(t, err.Error(), "unknown SKU")
+}
+
+// TestHTTPClient_Provision_ValidationErrorCodes verifies that validation_code
+// in 400 responses maps to the correct sentinel error, with backwards-compatible
+// fallback for missing or unknown codes.
+func TestHTTPClient_Provision_ValidationErrorCodes(t *testing.T) {
+	tests := []struct {
+		name         string
+		responseBody string
+		wantSentinel error
+		wantMessage  string
+	}{
+		{
+			"unknown SKU code",
+			`{"error":"validation error: unknown SKU: bad-sku","validation_code":"unknown_sku"}`,
+			ErrUnknownSKU,
+			"unknown SKU: bad-sku",
+		},
+		{
+			"invalid manifest code",
+			`{"error":"validation error: invalid manifest: bad json","validation_code":"invalid_manifest"}`,
+			ErrInvalidManifest,
+			"invalid manifest: bad json",
+		},
+		{
+			"image not allowed code",
+			`{"error":"validation error: image not allowed: evil.io","validation_code":"image_not_allowed"}`,
+			ErrImageNotAllowed,
+			"image not allowed: evil.io",
+		},
+		{
+			"missing code (backwards compat)",
+			`{"error":"some validation error"}`,
+			ErrValidation,
+			"some validation error",
+		},
+		{
+			"unknown code",
+			`{"error":"something new","validation_code":"future_code"}`,
+			ErrValidation,
+			"something new",
+		},
+		{
+			"non-JSON body (backwards compat)",
+			`plain text error`,
+			ErrValidation,
+			"plain text error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(tt.responseBody))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name:    "test-codes",
+				BaseURL: server.URL,
+				Timeout: 5 * time.Second,
+			})
+
+			err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+			assert.ErrorIs(t, err, tt.wantSentinel)
+			assert.ErrorIs(t, err, ErrValidation, "all validation errors should match ErrValidation")
+			assert.Contains(t, err.Error(), tt.wantMessage)
+		})
+	}
 }
 
 // TestHTTPClient_Provision_ValidationError_DoesNotTripCircuitBreaker verifies that

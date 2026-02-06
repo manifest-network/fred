@@ -1941,7 +1941,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	mockBackend := &mockReconcilerBackend{
 		name:         "test",
 		provisions:   []backend.ProvisionInfo{},
-		provisionErr: fmt.Errorf("%w: unknown SKU: bad-sku", backend.ErrValidation),
+		provisionErr: fmt.Errorf("%w: bad-sku", backend.ErrUnknownSKU),
 	}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -2004,7 +2004,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	mockBackend := &mockReconcilerBackend{
 		name:         "test",
 		provisions:   []backend.ProvisionInfo{},
-		provisionErr: fmt.Errorf("%w: invalid manifest: bad yaml", backend.ErrValidation),
+		provisionErr: fmt.Errorf("%w: bad yaml", backend.ErrInvalidManifest),
 	}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -2053,7 +2053,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 	mockBackend := &mockReconcilerBackend{
 		name:         "test",
 		provisions:   []backend.ProvisionInfo{},
-		provisionErr: fmt.Errorf("%w: image from registry %q is not allowed", backend.ErrValidation, "evil.io"),
+		provisionErr: fmt.Errorf("%w: registry %q", backend.ErrImageNotAllowed, "evil.io"),
 	}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -2107,7 +2107,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 				BackendName: "test",
 			},
 		},
-		provisionErr: fmt.Errorf("%w: unknown SKU: removed-sku", backend.ErrValidation),
+		provisionErr: fmt.Errorf("%w: removed-sku", backend.ErrUnknownSKU),
 	}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},

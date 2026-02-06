@@ -19,8 +19,8 @@ import (
 // secp256k1 curve order N and half-order N/2 for low-S normalization.
 // These are the standard values for the secp256k1 curve used by Bitcoin and Cosmos.
 var (
-	secp256k1N, _        = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
-	secp256k1HalfN       = new(big.Int).Rsh(secp256k1N, 1)
+	secp256k1N, _  = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+	secp256k1HalfN = new(big.Int).Rsh(secp256k1N, 1)
 )
 
 // SignDoc represents the ADR-036 sign document structure.

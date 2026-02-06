@@ -222,8 +222,8 @@ var blockedEnvNames = map[string]bool{
 // cannot set. Any variable whose uppercase name starts with one of these
 // prefixes is rejected.
 var blockedEnvPrefixes = []string{
-	"LD_",    // dynamic linker (LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, etc.)
-	"FRED_",  // reserved for backend-internal use
+	"LD_",     // dynamic linker (LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, etc.)
+	"FRED_",   // reserved for backend-internal use
 	"DOCKER_", // Docker runtime variables
 }
 

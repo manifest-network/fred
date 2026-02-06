@@ -101,7 +101,6 @@ func TestProvision_Success(t *testing.T) {
 		},
 	}
 
-
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -175,7 +174,6 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 		},
 	}
 
-
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -228,6 +226,7 @@ func TestProvision_UnknownSKU(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrValidation)
+	assert.ErrorIs(t, err, backend.ErrUnknownSKU)
 
 	// Provision slot should be cleaned up
 	b.provisionsMu.RLock()
@@ -245,6 +244,7 @@ func TestProvision_InvalidManifest(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrValidation)
+	assert.ErrorIs(t, err, backend.ErrInvalidManifest)
 }
 
 func TestProvision_DisallowedImage(t *testing.T) {
@@ -258,6 +258,7 @@ func TestProvision_DisallowedImage(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrValidation)
+	assert.ErrorIs(t, err, backend.ErrImageNotAllowed)
 }
 
 func TestProvision_InsufficientResources(t *testing.T) {
@@ -1935,7 +1936,6 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 	cbStore.Close()
 }
 
-
 func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_empty.db")
 	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
@@ -2618,4 +2618,3 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, entry, "stale diagnostic entry should be removed on successful re-provision")
 }
-

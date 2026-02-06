@@ -212,7 +212,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrValidation) {
-			s.errorResponse(w, http.StatusBadRequest, err.Error())
+			s.validationErrorResponse(w, err)
 			return
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
@@ -397,13 +397,25 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // ErrorResponse is the response body for errors.
 type ErrorResponse struct {
-	Error string `json:"error"`
+	Error          string                 `json:"error"`
+	ValidationCode backend.ValidationCode `json:"validation_code,omitempty"`
 }
 
 func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+// validationErrorResponse writes a 400 response with a validation_code field
+// so the HTTPClient can reconstruct the correct sentinel error.
+func (s *Server) validationErrorResponse(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(ErrorResponse{
+		Error:          err.Error(),
+		ValidationCode: backend.ClassifyValidationError(err),
+	})
 }
 
 const maxRequestBodySize = 1 << 20 // 1 MiB
