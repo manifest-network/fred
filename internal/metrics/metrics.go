@@ -241,6 +241,7 @@ var (
 // Outcome constants for consistent labeling
 const (
 	OutcomeSuccess = "success"
+	OutcomePartial = "partial"
 	OutcomeError   = "error"
 	OutcomeFailed  = "failed"
 )
@@ -251,4 +252,5 @@ const (
 	ActionAcknowledged  = "acknowledged"
 	ActionDeprovisioned = "deprovisioned"
 	ActionAnomaly       = "anomaly"
+	ActionLeaseError    = "lease_error"
 )

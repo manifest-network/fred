@@ -2,7 +2,9 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -1906,4 +1908,217 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	mockBackend.mu.Unlock()
 
 	assert.LessOrEqual(t, provisionCount, 1, "concurrent reconciliation not prevented!")
+}
+
+func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
+	// Setup: Pending lease on chain, not provisioned, backend returns ErrValidation
+	// Expected: Reject the lease immediately (not retry forever)
+	var rejectedLeases []string
+	var rejectedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: fmt.Errorf("%w: unknown SKU: bad-sku", backend.ErrValidation),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was rejected (not left to retry forever)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, rejectedLeases, 1)
+	assert.Equal(t, "lease-1", rejectedLeases[0])
+	assert.Equal(t, rejectReasonInvalidSKU, rejectedReason)
+}
+
+func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *testing.T) {
+	// Setup: Pending lease with MetaHash, payload available, backend returns ErrValidation
+	// Expected: Reject the lease immediately
+	var rejectedLeases []string
+	var rejectedReason string
+	var mu sync.Mutex
+
+	tmpDir := t.TempDir()
+	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+		DBPath: tmpDir + "/payloads.db",
+	})
+	require.NoError(t, err)
+	defer payloadStore.Close()
+
+	payloadData := []byte("test payload")
+	payloadHash := sha256.Sum256(payloadData)
+	payloadStore.Store("lease-1", payloadData)
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_PENDING,
+					MetaHash: payloadHash[:], // SHA-256 of payloadData
+				},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: fmt.Errorf("%w: invalid manifest: bad yaml", backend.ErrValidation),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	mockTracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, mockTracker)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was rejected
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, rejectedLeases, 1)
+	assert.Equal(t, "lease-1", rejectedLeases[0])
+	assert.Equal(t, rejectReasonInvalidManifest, rejectedReason)
+}
+
+func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *testing.T) {
+	// Setup: Active lease on chain, not provisioned (anomaly), backend returns ErrValidation
+	// Expected: Close the lease (not reject — it's ACTIVE)
+	var closedLeases []string
+	var closedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			closedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: fmt.Errorf("%w: image from registry %q is not allowed", backend.ErrValidation, "evil.io"),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was closed (not rejected — it's ACTIVE)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, closedLeases, 1)
+	assert.Equal(t, "lease-1", closedLeases[0])
+	assert.Equal(t, rejectReasonImageNotAllowed, closedReason)
+}
+
+func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T) {
+	// Setup: Active lease, failed provision with FailCount < max, re-provision returns ErrValidation
+	// Expected: Close the lease immediately (not keep retrying)
+	var closedLeases []string
+	var closedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			closedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   1, // Below max — would normally re-provision
+				BackendName: "test",
+			},
+		},
+		provisionErr: fmt.Errorf("%w: unknown SKU: removed-sku", backend.ErrValidation),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was closed (validation error is permanent)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, closedLeases, 1)
+	assert.Equal(t, "lease-1", closedLeases[0])
+	assert.Equal(t, rejectReasonInvalidSKU, closedReason)
 }

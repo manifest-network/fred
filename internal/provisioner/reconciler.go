@@ -200,6 +200,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		provisioned  atomic.Int32
 		acknowledged atomic.Int32
 		anomalies    atomic.Int32
+		leaseErrors  atomic.Int32
 	)
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -210,7 +211,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 		g.Go(func() error {
 			r.processLease(gctx, leaseUUID, lease, provision, isProvisioned,
-				&provisioned, &acknowledged, &anomalies)
+				&provisioned, &acknowledged, &anomalies, &leaseErrors)
 			return nil // Don't fail fast - continue processing other leases
 		})
 	}
@@ -240,7 +241,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 	for leaseUUID, provision := range allProvisions {
 		og.Go(func() error {
-			r.processOrphan(ogctx, leaseUUID, provision, &orphans)
+			r.processOrphan(ogctx, leaseUUID, provision, &orphans, &leaseErrors)
 			return nil // Don't fail fast - continue processing other orphans
 		})
 	}
@@ -260,6 +261,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	acknowledgedCount := acknowledged.Load()
 	anomaliesCount := anomalies.Load()
 	orphansCount := orphans.Load()
+	leaseErrorCount := leaseErrors.Load()
 
 	if provisionedCount > 0 {
 		metrics.ReconciliationActions.WithLabelValues(metrics.ActionProvisioned).Add(float64(provisionedCount))
@@ -273,18 +275,30 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	if orphansCount > 0 {
 		metrics.ReconciliationActions.WithLabelValues(metrics.ActionDeprovisioned).Add(float64(orphansCount))
 	}
+	if leaseErrorCount > 0 {
+		metrics.ReconciliationActions.WithLabelValues(metrics.ActionLeaseError).Add(float64(leaseErrorCount))
+	}
 
-	// Record outcome
-	metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
+	// Record outcome: partial if per-lease errors occurred, success otherwise
+	if leaseErrorCount > 0 {
+		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomePartial).Inc()
+	} else {
+		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
+	}
 
 	// 5. Clean up orphaned payloads (payloads for leases that are no longer pending)
 	orphanedPayloads := r.cleanupOrphanedPayloads(ctx, chainLeases)
 
-	slog.Info("reconciliation complete",
+	logFunc := slog.Info
+	if leaseErrorCount > 0 {
+		logFunc = slog.Warn
+	}
+	logFunc("reconciliation complete",
 		"provisioned", provisionedCount,
 		"acknowledged", acknowledgedCount,
 		"anomalies", anomaliesCount,
 		"orphans", orphansCount,
+		"errors", leaseErrorCount,
 		"orphaned_payloads_cleaned", orphanedPayloads,
 	)
 
@@ -540,12 +554,21 @@ func (r *Reconciler) processLease(
 	lease billingtypes.Lease,
 	provision backend.ProvisionInfo,
 	isProvisioned bool,
-	provisioned, acknowledged, anomalies *atomic.Int32,
+	provisioned, acknowledged, anomalies, leaseErrors *atomic.Int32,
 ) {
 	// Check context before doing any work to respect cancellation
 	if ctx.Err() != nil {
 		return
 	}
+
+	// Track whether this lease hit an unresolved error. Counted once per
+	// lease so the aggregate tells operators "how many leases had problems".
+	hadError := false
+	defer func() {
+		if hadError {
+			leaseErrors.Add(1)
+		}
+	}()
 
 	switch {
 	case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:
@@ -559,11 +582,27 @@ func (r *Reconciler) processLease(
 						slog.Debug("reconcile: lease already in-flight, skipping",
 							"lease_uuid", leaseUUID,
 						)
+					} else if errors.Is(err, backend.ErrValidation) {
+						// Validation errors are permanent — reject immediately to stop
+						// retrying every reconciliation cycle.
+						slog.Warn("reconcile: validation error, rejecting pending lease",
+							"lease_uuid", leaseUUID,
+							"tenant", lease.Tenant,
+							"error", err,
+						)
+						if rejectErr := r.rejectLease(ctx, leaseUUID, validationErrorToRejectReason(err)); rejectErr != nil {
+							slog.Error("reconcile: failed to reject lease after validation error",
+								"lease_uuid", leaseUUID,
+								"error", rejectErr,
+							)
+							hadError = true
+						}
 					} else {
 						slog.Error("reconcile: failed to start provisioning with payload",
 							"lease_uuid", leaseUUID,
 							"error", err,
 						)
+						hadError = true
 					}
 				} else {
 					provisioned.Add(1)
@@ -583,11 +622,27 @@ func (r *Reconciler) processLease(
 					slog.Debug("reconcile: lease already in-flight, skipping",
 						"lease_uuid", leaseUUID,
 					)
+				} else if errors.Is(err, backend.ErrValidation) {
+					// Validation errors are permanent — reject immediately to stop
+					// retrying every reconciliation cycle.
+					slog.Warn("reconcile: validation error, rejecting pending lease",
+						"lease_uuid", leaseUUID,
+						"tenant", lease.Tenant,
+						"error", err,
+					)
+					if rejectErr := r.rejectLease(ctx, leaseUUID, validationErrorToRejectReason(err)); rejectErr != nil {
+						slog.Error("reconcile: failed to reject lease after validation error",
+							"lease_uuid", leaseUUID,
+							"error", rejectErr,
+						)
+						hadError = true
+					}
 				} else {
 					slog.Error("reconcile: failed to start provisioning",
 						"lease_uuid", leaseUUID,
 						"error", err,
 					)
+					hadError = true
 				}
 			} else {
 				provisioned.Add(1)
@@ -601,6 +656,7 @@ func (r *Reconciler) processLease(
 				"lease_uuid", leaseUUID,
 				"error", err,
 			)
+			hadError = true
 		} else {
 			acknowledged.Add(1)
 		}
@@ -622,6 +678,7 @@ func (r *Reconciler) processLease(
 				"lease_uuid", leaseUUID,
 				"error", err,
 			)
+			hadError = true
 		}
 
 	case lease.State == billingtypes.LEASE_STATE_ACTIVE && !isProvisioned:
@@ -646,12 +703,28 @@ func (r *Reconciler) processLease(
 						"lease_uuid", leaseUUID,
 						"error", closeErr,
 					)
+					hadError = true
+				}
+			} else if errors.Is(err, backend.ErrValidation) {
+				// Validation errors are permanent — close the active lease.
+				slog.Error("reconcile: closing anomalous lease - validation error",
+					"lease_uuid", leaseUUID,
+					"tenant", lease.Tenant,
+					"error", err,
+				)
+				if closeErr := r.closeLease(ctx, leaseUUID, validationErrorToRejectReason(err)); closeErr != nil {
+					slog.Error("reconcile: failed to close anomalous lease after validation error",
+						"lease_uuid", leaseUUID,
+						"error", closeErr,
+					)
+					hadError = true
 				}
 			} else if !errors.Is(err, errLeaseAlreadyInFlight) {
 				slog.Error("reconcile: failed to provision anomalous lease",
 					"lease_uuid", leaseUUID,
 					"error", err,
 				)
+				hadError = true
 			}
 		}
 
@@ -676,6 +749,7 @@ func (r *Reconciler) processLease(
 					"lease_uuid", leaseUUID,
 					"error", err,
 				)
+				hadError = true
 				return
 			}
 			// Immediately release backend resources instead of waiting for
@@ -710,12 +784,29 @@ func (r *Reconciler) processLease(
 						"lease_uuid", leaseUUID,
 						"error", closeErr,
 					)
+					hadError = true
+				}
+			} else if errors.Is(err, backend.ErrValidation) {
+				// Validation errors are permanent — close the active lease.
+				slog.Error("reconcile: closing failed lease - validation error",
+					"lease_uuid", leaseUUID,
+					"tenant", lease.Tenant,
+					"backend", provision.BackendName,
+					"error", err,
+				)
+				if closeErr := r.closeLease(ctx, leaseUUID, validationErrorToRejectReason(err)); closeErr != nil {
+					slog.Error("reconcile: failed to close lease after validation error",
+						"lease_uuid", leaseUUID,
+						"error", closeErr,
+					)
+					hadError = true
 				}
 			} else if !errors.Is(err, errLeaseAlreadyInFlight) {
 				slog.Error("reconcile: failed to re-provision failed active lease",
 					"lease_uuid", leaseUUID,
 					"error", err,
 				)
+				hadError = true
 			}
 		}
 
@@ -729,7 +820,7 @@ func (r *Reconciler) processOrphan(
 	ctx context.Context,
 	leaseUUID string,
 	provision backend.ProvisionInfo,
-	orphans *atomic.Int32,
+	orphans, leaseErrors *atomic.Int32,
 ) {
 	// Check context before doing any work to respect cancellation
 	if ctx.Err() != nil {
@@ -758,6 +849,7 @@ func (r *Reconciler) processOrphan(
 			"lease_uuid", leaseUUID,
 			"backend", provision.BackendName,
 		)
+		leaseErrors.Add(1)
 		return
 	}
 
@@ -773,6 +865,7 @@ func (r *Reconciler) processOrphan(
 			"backend", b.Name(),
 			"error", err,
 		)
+		leaseErrors.Add(1)
 	}
 }
 
