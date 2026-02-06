@@ -2434,6 +2434,97 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	}
 }
 
+// TestManager_Close_NoPanicWithActiveHandler is a regression test for the
+// shutdown ordering bug where Manager.Close() stopped the ack batcher before
+// closing the Watermill router. If a handler was actively calling Acknowledge()
+// during shutdown, the batcher's batchLoop would close b.requests, and the
+// handler (or a Watermill retry of it) would panic with send-on-closed-channel.
+//
+// The fix ensures the Watermill router is closed first (draining all in-progress
+// handlers) before stopping the ack batcher.
+func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
+	ackReached := make(chan struct{}, 1) // signals AcknowledgeLeases is executing
+
+	mockBackend := &mockManagerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			// Signal that the handler has reached the chain acknowledge call
+			select {
+			case ackReached <- struct{}{}:
+			default:
+			}
+			// Simulate a slow chain response. Use a select so the call
+			// respects context cancellation (as real chain calls do).
+			select {
+			case <-time.After(200 * time.Millisecond):
+				return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			}
+		},
+	}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:     "provider-1",
+		CallbackBaseURL:  "http://localhost:8080",
+		AckBatchInterval: 50 * time.Millisecond, // Flush quickly
+	}, router, mockChain)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- manager.Start(ctx) }()
+
+	select {
+	case <-manager.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager did not start")
+	}
+
+	// Track lease and publish a success callback. The handler will call
+	// Acknowledge(), which sends to the batcher's request channel.
+	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
+	require.NoError(t, manager.PublishCallback(backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusSuccess,
+	}))
+
+	// Wait for the handler to reach AcknowledgeLeases inside the batcher.
+	select {
+	case <-ackReached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not reach AcknowledgeLeases")
+	}
+
+	// Call Close() while the handler is actively using the ack batcher.
+	// Do NOT cancel the context first — this exercises the path where
+	// Close() alone must safely drain handlers before stopping the batcher.
+	//
+	// With the old ordering (batcher stopped before router), the batcher's
+	// context cancellation causes AcknowledgeLeases to return an error,
+	// Watermill retries the handler, and the retried Acknowledge() call
+	// sends to the now-closed b.requests channel, panicking.
+	assert.NotPanics(t, func() {
+		assert.NoError(t, manager.Close())
+	})
+
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(2 * time.Second):
+	}
+}
+
 func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 	// This test verifies that when a handler permanently fails (exhausting
 	// all retries), the message is sent to the poison queue instead of being

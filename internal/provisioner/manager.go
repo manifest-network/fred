@@ -294,14 +294,18 @@ func (m *Manager) Close() error {
 		)
 	}
 
-	// Stop ack batcher first to flush pending acks
-	if m.ackBatcher != nil {
-		m.ackBatcher.Stop()
-	}
-
-	// Close Watermill router
+	// Close Watermill router FIRST to drain in-progress handlers.
+	// Handlers may call AckBatcher.Acknowledge() which sends to b.requests.
+	// If we stopped the batcher first, its batchLoop would close b.requests,
+	// and any handler still running would panic on send-to-closed-channel.
 	if err := m.wmRouter.Close(); err != nil {
 		return err
+	}
+
+	// Stop ack batcher AFTER all handlers have finished.
+	// This flushes any pending ack requests that were queued by handlers.
+	if m.ackBatcher != nil {
+		m.ackBatcher.Stop()
 	}
 
 	// Note: The timeout checker goroutine exits when its context is canceled.
