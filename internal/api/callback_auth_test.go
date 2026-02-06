@@ -11,7 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 // testCallbackSecret is a valid secret for testing (>= 32 bytes, ASCII).
@@ -22,9 +26,7 @@ const testCallbackSecret = "test-secret-that-is-at-least-32-bytes"
 func newTestCallbackAuthenticator(t *testing.T, secret string) *CallbackAuthenticator {
 	t.Helper()
 	auth, err := NewCallbackAuthenticator(secret)
-	if err != nil {
-		t.Fatalf("NewCallbackAuthenticator() error = %v", err)
-	}
+	require.NoError(t, err)
 	return auth
 }
 
@@ -65,19 +67,11 @@ func TestNewCallbackAuthenticator_SecretValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			auth, err := NewCallbackAuthenticator(tt.secret)
 			if tt.wantError {
-				if err == nil {
-					t.Error("NewCallbackAuthenticator() error = nil, want error")
-				}
-				if auth != nil {
-					t.Error("NewCallbackAuthenticator() returned non-nil auth with error")
-				}
+				assert.Error(t, err)
+				assert.Nil(t, auth)
 			} else {
-				if err != nil {
-					t.Errorf("NewCallbackAuthenticator() error = %v, want nil", err)
-				}
-				if auth == nil {
-					t.Error("NewCallbackAuthenticator() returned nil auth without error")
-				}
+				assert.NoError(t, err)
+				assert.NotNil(t, auth)
 			}
 		})
 	}
@@ -90,19 +84,13 @@ func TestCallbackAuthenticator_ComputeSignature(t *testing.T) {
 	signature := auth.ComputeSignature(payload)
 
 	// Should have format "t=<timestamp>,sha256=<hex>"
-	if !strings.HasPrefix(signature, "t=") {
-		t.Errorf("signature should start with 't=', got %q", signature)
-	}
-	if !strings.Contains(signature, ",sha256=") {
-		t.Errorf("signature should contain ',sha256=', got %q", signature)
-	}
+	assert.True(t, strings.HasPrefix(signature, "t="), "signature should start with 't=', got %q", signature)
+	assert.Contains(t, signature, ",sha256=")
 
 	// Different payload should produce different signature
 	differentPayload := []byte(`{"lease_uuid":"xyz-789","status":"failed"}`)
 	differentSig := auth.ComputeSignature(differentPayload)
-	if signature == differentSig {
-		t.Error("different payloads should produce different signatures")
-	}
+	assert.NotEqual(t, signature, differentSig)
 }
 
 func TestCallbackAuthenticator_ComputeSignatureWithTime(t *testing.T) {
@@ -114,15 +102,11 @@ func TestCallbackAuthenticator_ComputeSignatureWithTime(t *testing.T) {
 	signature := auth.ComputeSignatureWithTime(payload, fixedTime)
 
 	// Should have the fixed timestamp
-	if !strings.HasPrefix(signature, "t=1700000000,") {
-		t.Errorf("signature should have fixed timestamp, got %q", signature)
-	}
+	assert.True(t, strings.HasPrefix(signature, "t=1700000000,"), "signature should have fixed timestamp, got %q", signature)
 
 	// Signature should be deterministic with same time
 	signature2 := auth.ComputeSignatureWithTime(payload, fixedTime)
-	if signature != signature2 {
-		t.Errorf("signature should be deterministic: %q != %q", signature, signature2)
-	}
+	assert.Equal(t, signature, signature2)
 }
 
 func TestCallbackAuthenticator_VerifySignature(t *testing.T) {
@@ -249,9 +233,7 @@ func TestCallbackAuthenticator_VerifySignature(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			valid := auth.VerifySignatureWithTime(tt.payload, tt.signature, tt.refTime)
-			if valid != tt.wantValid {
-				t.Errorf("VerifySignature() = %v, want %v", valid, tt.wantValid)
-			}
+			assert.Equal(t, tt.wantValid, valid)
 		})
 	}
 }
@@ -301,22 +283,15 @@ func TestCallbackAuthenticator_VerifyRequest(t *testing.T) {
 			body, err := auth.VerifyRequest(req)
 
 			if tt.wantErr {
-				if err == nil {
-					t.Error("VerifyRequest() expected error, got nil")
-				} else if tt.wantErrMsg != "" && !strings.Contains(err.Error(), tt.wantErrMsg) {
-					t.Errorf("VerifyRequest() error = %q, want error containing %q", err.Error(), tt.wantErrMsg)
+				assert.Error(t, err)
+				if tt.wantErrMsg != "" {
+					assert.Contains(t, err.Error(), tt.wantErrMsg)
 				}
 				return
 			}
 
-			if err != nil {
-				t.Errorf("VerifyRequest() unexpected error: %v", err)
-				return
-			}
-
-			if !bytes.Equal(body, tt.body) {
-				t.Errorf("VerifyRequest() body = %q, want %q", body, tt.body)
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.body, body)
 		})
 	}
 }
@@ -332,17 +307,11 @@ func TestCallbackAuthenticator_DifferentSecrets(t *testing.T) {
 	sig2 := auth2.ComputeSignatureWithTime(payload, now)
 
 	// Different secrets should produce different signatures
-	if sig1 == sig2 {
-		t.Error("different secrets should produce different signatures")
-	}
+	assert.NotEqual(t, sig1, sig2)
 
 	// Each authenticator should only verify its own signatures
-	if auth1.VerifySignatureWithTime(payload, sig2, now) {
-		t.Error("auth1 should not verify sig2")
-	}
-	if auth2.VerifySignatureWithTime(payload, sig1, now) {
-		t.Error("auth2 should not verify sig1")
-	}
+	assert.False(t, auth1.VerifySignatureWithTime(payload, sig2, now))
+	assert.False(t, auth2.VerifySignatureWithTime(payload, sig1, now))
 }
 
 func TestCallbackAuthenticator_ReplayProtection(t *testing.T) {
@@ -355,24 +324,16 @@ func TestCallbackAuthenticator_ReplayProtection(t *testing.T) {
 	signature := auth.ComputeSignatureWithTime(payload, signedAt)
 
 	// Should be valid immediately
-	if !auth.VerifySignatureWithTime(payload, signature, signedAt) {
-		t.Error("signature should be valid immediately")
-	}
+	assert.True(t, auth.VerifySignatureWithTime(payload, signature, signedAt))
 
 	// Should still be valid at T+4 minutes
-	if !auth.VerifySignatureWithTime(payload, signature, signedAt.Add(4*time.Minute)) {
-		t.Error("signature should be valid at T+4 minutes")
-	}
+	assert.True(t, auth.VerifySignatureWithTime(payload, signature, signedAt.Add(4*time.Minute)))
 
 	// Should be invalid at T+6 minutes (replay attack)
-	if auth.VerifySignatureWithTime(payload, signature, signedAt.Add(6*time.Minute)) {
-		t.Error("signature should be invalid at T+6 minutes (replay protection)")
-	}
+	assert.False(t, auth.VerifySignatureWithTime(payload, signature, signedAt.Add(6*time.Minute)))
 
 	// Should be invalid at T+1 hour (definitely expired)
-	if auth.VerifySignatureWithTime(payload, signature, signedAt.Add(time.Hour)) {
-		t.Error("signature should be invalid at T+1 hour")
-	}
+	assert.False(t, auth.VerifySignatureWithTime(payload, signature, signedAt.Add(time.Hour)))
 }
 
 func TestNewCallbackAuthenticatorWithMaxAge_Validation(t *testing.T) {
@@ -398,19 +359,11 @@ func TestNewCallbackAuthenticatorWithMaxAge_Validation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			auth, err := NewCallbackAuthenticatorWithMaxAge(tt.secret, tt.maxAge)
 			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error, got nil")
-				}
-				if auth != nil {
-					t.Error("expected nil authenticator on error")
-				}
+				assert.Error(t, err)
+				assert.Nil(t, auth)
 			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				if auth == nil {
-					t.Error("expected authenticator, got nil")
-				}
+				assert.NoError(t, err)
+				assert.NotNil(t, auth)
 			}
 		})
 	}
@@ -419,23 +372,17 @@ func TestNewCallbackAuthenticatorWithMaxAge_Validation(t *testing.T) {
 func TestCallbackAuthenticator_CustomMaxAge(t *testing.T) {
 	// Create authenticator with 1 minute max age
 	auth, err := NewCallbackAuthenticatorWithMaxAge("test-secret-that-is-at-least-32-chars", time.Minute)
-	if err != nil {
-		t.Fatalf("NewCallbackAuthenticatorWithMaxAge() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	payload := []byte(`{"test":"data"}`)
 	signedAt := time.Now()
 	signature := auth.ComputeSignatureWithTime(payload, signedAt)
 
 	// Should be valid within 1 minute
-	if !auth.VerifySignatureWithTime(payload, signature, signedAt.Add(30*time.Second)) {
-		t.Error("signature should be valid within custom max age")
-	}
+	assert.True(t, auth.VerifySignatureWithTime(payload, signature, signedAt.Add(30*time.Second)))
 
 	// Should be invalid after 1 minute
-	if auth.VerifySignatureWithTime(payload, signature, signedAt.Add(2*time.Minute)) {
-		t.Error("signature should be invalid after custom max age")
-	}
+	assert.False(t, auth.VerifySignatureWithTime(payload, signature, signedAt.Add(2*time.Minute)))
 }
 
 func TestHandleProvisionCallback_Authentication(t *testing.T) {
@@ -487,16 +434,13 @@ func TestHandleProvisionCallback_Authentication(t *testing.T) {
 			rr := httptest.NewRecorder()
 			server.handleProvisionCallback(rr, req)
 
-			if rr.Code != tt.wantStatusCode {
-				t.Errorf("status code = %d, want %d, body: %s", rr.Code, tt.wantStatusCode, rr.Body.String())
-			}
+			assert.Equal(t, tt.wantStatusCode, rr.Code, "body: %s", rr.Body.String())
 
 			// Verify callback was only published for successful auth
-			if tt.wantStatusCode == http.StatusOK && !publishedCallback.called {
-				t.Error("callback should have been published")
-			}
-			if tt.wantStatusCode != http.StatusOK && publishedCallback.called {
-				t.Error("callback should not have been published for failed auth")
+			if tt.wantStatusCode == http.StatusOK {
+				assert.True(t, publishedCallback.called)
+			} else {
+				assert.False(t, publishedCallback.called)
 			}
 		})
 	}
@@ -508,9 +452,7 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	// Use injectable time for deterministic testing (no time.Sleep needed)
 	currentTime := time.Now()
 	auth, err := NewCallbackAuthenticatorWithMaxAge(secret, time.Minute)
-	if err != nil {
-		t.Fatalf("NewCallbackAuthenticatorWithMaxAge() error = %v", err)
-	}
+	require.NoError(t, err)
 	auth.nowFunc = func() time.Time { return currentTime }
 
 	publishedCallback := &mockCallbackPublisher{}
@@ -531,9 +473,7 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	rr1 := httptest.NewRecorder()
 	server.handleProvisionCallback(rr1, req1)
 
-	if rr1.Code != http.StatusOK {
-		t.Errorf("first request should succeed, got status %d: %s", rr1.Code, rr1.Body.String())
-	}
+	assert.Equal(t, http.StatusOK, rr1.Code, "first request should succeed: %s", rr1.Body.String())
 
 	// Advance time past the max age (deterministic, no sleep)
 	currentTime = currentTime.Add(2 * time.Minute)
@@ -546,9 +486,7 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	rr2 := httptest.NewRecorder()
 	server.handleProvisionCallback(rr2, req2)
 
-	if rr2.Code != http.StatusUnauthorized {
-		t.Errorf("replay attack should be rejected, got status %d: %s", rr2.Code, rr2.Body.String())
-	}
+	assert.Equal(t, http.StatusUnauthorized, rr2.Code, "replay attack should be rejected: %s", rr2.Body.String())
 }
 
 // TestHandleProvisionCallback_IdempotencyResponse tests that duplicate callbacks
@@ -586,27 +524,18 @@ func TestHandleProvisionCallback_IdempotencyResponse(t *testing.T) {
 		server.handleProvisionCallback(rr, req)
 
 		// Should still return 200 OK for idempotency
-		if rr.Code != http.StatusOK {
-			t.Errorf("status code = %d, want %d", rr.Code, http.StatusOK)
-		}
+		assert.Equal(t, http.StatusOK, rr.Code)
 
 		// But now with a helpful body
 		var response CallbackResponse
-		if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
-			t.Fatalf("failed to decode response: %v, body: %s", err, rr.Body.String())
-		}
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err, "body: %s", rr.Body.String())
 
-		if response.Status != "already_processed" {
-			t.Errorf("Status = %q, want %q", response.Status, "already_processed")
-		}
-		if response.Message != "callback for this lease was already handled" {
-			t.Errorf("Message = %q, want %q", response.Message, "callback for this lease was already handled")
-		}
+		assert.Equal(t, "already_processed", response.Status)
+		assert.Equal(t, "callback for this lease was already handled", response.Message)
 
 		// Callback should NOT be published for already-processed leases
-		if publishedCallback.called {
-			t.Error("callback should not be published for already-processed lease")
-		}
+		assert.False(t, publishedCallback.called)
 	})
 
 	t.Run("in_flight_lease_is_published", func(t *testing.T) {
@@ -622,14 +551,10 @@ func TestHandleProvisionCallback_IdempotencyResponse(t *testing.T) {
 		rr := httptest.NewRecorder()
 		server.handleProvisionCallback(rr, req)
 
-		if rr.Code != http.StatusOK {
-			t.Errorf("status code = %d, want %d", rr.Code, http.StatusOK)
-		}
+		assert.Equal(t, http.StatusOK, rr.Code)
 
 		// Callback should be published for in-flight leases
-		if !publishedCallback.called {
-			t.Error("callback should be published for in-flight lease")
-		}
+		assert.True(t, publishedCallback.called)
 	})
 
 	t.Run("no_status_checker_publishes_all", func(t *testing.T) {
@@ -652,14 +577,10 @@ func TestHandleProvisionCallback_IdempotencyResponse(t *testing.T) {
 		rr := httptest.NewRecorder()
 		serverNoChecker.handleProvisionCallback(rr, req)
 
-		if rr.Code != http.StatusOK {
-			t.Errorf("status code = %d, want %d", rr.Code, http.StatusOK)
-		}
+		assert.Equal(t, http.StatusOK, rr.Code)
 
 		// Without status checker, callback should be published
-		if !publishedCallback.called {
-			t.Error("callback should be published when no status checker")
-		}
+		assert.True(t, publishedCallback.called)
 	})
 }
 
@@ -668,8 +589,8 @@ type mockIdempotencyStatusChecker struct {
 	isInFlight map[string]bool
 }
 
-func (m *mockIdempotencyStatusChecker) HasPayload(leaseUUID string) bool {
-	return false
+func (m *mockIdempotencyStatusChecker) HasPayload(leaseUUID string) (bool, error) {
+	return false, nil
 }
 
 func (m *mockIdempotencyStatusChecker) IsInFlight(leaseUUID string) bool {
@@ -695,9 +616,7 @@ func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
 		signature := auth.ComputeSignatureWithTime(payload, fixedTime)
 
 		// VerifySignature should use the injected time and succeed
-		if !auth.VerifySignature(payload, signature) {
-			t.Error("VerifySignature() should return true for valid signature with injected time")
-		}
+		assert.True(t, auth.VerifySignature(payload, signature))
 	})
 
 	t.Run("rejects_expired_signature", func(t *testing.T) {
@@ -709,9 +628,7 @@ func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
 		auth.nowFunc = func() time.Time { return time.Unix(1700000000, 0) }
 
 		// Should reject - signature is too old
-		if auth.VerifySignature(payload, signature) {
-			t.Error("VerifySignature() should return false for expired signature")
-		}
+		assert.False(t, auth.VerifySignature(payload, signature))
 	})
 
 	t.Run("accepts_valid_current_signature", func(t *testing.T) {
@@ -722,9 +639,7 @@ func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
 		signature := auth.ComputeSignature(payload)
 
 		// Should accept
-		if !auth.VerifySignature(payload, signature) {
-			t.Error("VerifySignature() should return true for valid current signature")
-		}
+		assert.True(t, auth.VerifySignature(payload, signature))
 	})
 }
 
@@ -779,20 +694,13 @@ func TestParseSignature(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			timestamp, sig, ok := parseSignature(tt.signature)
-			if ok != tt.wantOK {
-				t.Errorf("parseSignature() ok = %v, want %v", ok, tt.wantOK)
-				return
-			}
+			timestamp, sig, ok := hmacauth.ParseSignature(tt.signature)
+			assert.Equal(t, tt.wantOK, ok)
 			if !tt.wantOK {
 				return
 			}
-			if timestamp != tt.wantTimestamp {
-				t.Errorf("parseSignature() timestamp = %d, want %d", timestamp, tt.wantTimestamp)
-			}
-			if sig != tt.wantSig {
-				t.Errorf("parseSignature() sig = %q, want %q", sig, tt.wantSig)
-			}
+			assert.Equal(t, tt.wantTimestamp, timestamp)
+			assert.Equal(t, tt.wantSig, sig)
 		})
 	}
 }

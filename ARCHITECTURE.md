@@ -129,6 +129,7 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │  Reconciler (independent component)                                 │   │
 │  │  Level-triggered state comparison: chain vs backends                │   │
+│  │  Calls RefreshState on each backend before reading provisions       │   │
 │  │  Runs on startup + periodically, uses worker pool                   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -251,19 +252,20 @@ The startup order is critical to avoid race conditions:
 ```
 1. Start API server (wait for it to be listening)
    └─ Must be ready before reconciliation triggers callbacks
-2. Perform initial withdrawal
-3. Perform startup reconciliation
+2. Start provision manager (wait for Watermill handlers to be subscribed)
+   └─ Must be ready before callbacks arrive from backends
+3. Perform initial withdrawal
+4. Perform startup reconciliation
    └─ May provision leases, triggering backend callbacks
-4. Start remaining components in parallel:
+5. Start remaining components in parallel:
    - Event subscriber
-   - Provision manager
    - Event bridge
    - Lease watcher
    - Withdrawal scheduler
    - Periodic reconciler
 ```
 
-**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to Fred's API. If the API server isn't listening yet, callbacks fail with "connection refused".
+**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to Fred's API. If the API server isn't listening yet, callbacks fail with "connection refused". If the provision manager's Watermill handlers aren't subscribed yet, callbacks fail with "No subscribers to send message".
 
 ### State Protection
 
@@ -324,7 +326,7 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
 - HTTP 5xx errors (server errors)
 
 **What does NOT count as a failure:**
-- HTTP 404 from `GetInfo` (`ErrNotProvisioned`) - this is a valid "lease not found" response
+- HTTP 404 from `GetInfo`, `GetProvision`, or `GetLogs` (`ErrNotProvisioned`) - this is a valid "lease not found" response
 
 This ensures that tenant requests for unprovisioned leases don't accidentally trip the circuit breaker and block backend operations.
 

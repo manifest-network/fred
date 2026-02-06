@@ -149,7 +149,7 @@ func (c *Client) Close() error {
 }
 
 // recordQueryMetrics records duration for a chain query.
-func recordQueryMetrics(queryName string, start time.Time, _ error) {
+func recordQueryMetrics(queryName string, start time.Time) {
 	duration := time.Since(start).Seconds()
 	metrics.ChainQueryDuration.WithLabelValues(queryName).Observe(duration)
 }
@@ -209,7 +209,7 @@ func (c *Client) getLeasesByProviderWithState(ctx context.Context, providerUUID 
 func (c *Client) GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 	start := time.Now()
 	leases, err := c.getLeasesByProviderWithState(ctx, providerUUID, billingtypes.LEASE_STATE_PENDING)
-	recordQueryMetrics("get_pending_leases", start, err)
+	recordQueryMetrics("get_pending_leases", start)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending leases: %w", err)
 	}
@@ -223,7 +223,7 @@ func (c *Client) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.
 	resp, err := c.billingQuery.Lease(ctx, &billingtypes.QueryLeaseRequest{
 		LeaseUuid: leaseUUID,
 	})
-	recordQueryMetrics("get_lease", start, err)
+	recordQueryMetrics("get_lease", start)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query lease: %w", err)
 	}
@@ -580,7 +580,7 @@ func (c *Client) waitForTx(ctx context.Context, txHash string) (*tx.GetTxRespons
 func (c *Client) GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 	start := time.Now()
 	leases, err := c.getLeasesByProviderWithState(ctx, providerUUID, billingtypes.LEASE_STATE_ACTIVE)
-	recordQueryMetrics("get_active_leases", start, err)
+	recordQueryMetrics("get_active_leases", start)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active leases: %w", err)
 	}

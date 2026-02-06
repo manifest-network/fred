@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker install clean deps test test-coverage lint run run-mock run-mock-delay run-docker fmt generate verify help
+.PHONY: all build build-mock build-docker install clean deps test test-integration test-coverage lint run run-mock run-mock-delay run-docker fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -15,8 +15,11 @@ GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOVET=$(GOCMD) vet
 
+# Version
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+
 # Build flags
-LDFLAGS=-ldflags "-s -w"
+LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
 # Default target
 all: build build-mock build-docker
@@ -65,10 +68,15 @@ test:
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
 
+# Run Docker integration tests (requires Docker daemon)
+test-integration:
+	@echo "Running Docker integration tests..."
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration
+
 # Run tests with coverage
 test-coverage:
 	@echo "Running tests with coverage..."
-	$(GOTEST) -v -coverprofile=coverage.out ./...
+	$(GOTEST) -tags integration -v -coverprofile=coverage.out ./...
 	$(GOCMD) tool cover -html=coverage.out -o coverage.html
 
 # Run linter
@@ -97,9 +105,11 @@ run-mock-delay: build-mock
 	@MOCK_BACKEND_DELAY=2s exec $(BUILD_DIR)/$(MOCK_BINARY_NAME)
 
 # Run the docker backend
+# Override config with: DOCKER_BACKEND_CONFIG=path/to/config.yaml make run-docker
+DOCKER_BACKEND_CONFIG ?= docker-backend.yaml
 run-docker: build-docker
-	@echo "Running $(DOCKER_BINARY_NAME)..."
-	@exec $(BUILD_DIR)/$(DOCKER_BINARY_NAME) --config docker-backend.example.yaml
+	@echo "Running $(DOCKER_BINARY_NAME) with config $(DOCKER_BACKEND_CONFIG)..."
+	@exec $(BUILD_DIR)/$(DOCKER_BINARY_NAME) --config $(DOCKER_BACKEND_CONFIG)
 
 # Format code
 fmt:
@@ -126,12 +136,13 @@ help:
 	@echo "  clean            - Clean build artifacts"
 	@echo "  deps             - Download and tidy dependencies"
 	@echo "  test             - Run tests"
+	@echo "  test-integration - Run Docker integration tests (requires Docker)"
 	@echo "  test-coverage    - Run tests with coverage report"
 	@echo "  lint             - Run linter"
 	@echo "  run              - Build and run providerd with example config"
 	@echo "  run-mock         - Build and run mock-backend"
 	@echo "  run-mock-delay   - Run mock-backend with 2s provisioning delay"
-	@echo "  run-docker       - Build and run docker-backend with example config"
+	@echo "  run-docker       - Build and run docker-backend (DOCKER_BACKEND_CONFIG=path to override)"
 	@echo "  fmt              - Format code"
 	@echo "  generate         - Generate mocks"
 	@echo "  verify           - Verify dependencies"

@@ -5,6 +5,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMockBackend_Provision(t *testing.T) {
@@ -15,21 +18,13 @@ func TestMockBackend_Provision(t *testing.T) {
 		Tenant:    "tenant-1",
 		Items:     []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
 	})
-	if err != nil {
-		t.Fatalf("Provision() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Verify provision exists
-	p, exists := mock.GetProvision("lease-1")
-	if !exists {
-		t.Fatal("provision not found")
-	}
-	if p.LeaseUUID != "lease-1" {
-		t.Errorf("LeaseUUID = %q, want %q", p.LeaseUUID, "lease-1")
-	}
-	if p.Status != "provisioning" {
-		t.Errorf("Status = %q, want %q", p.Status, "provisioning")
-	}
+	p, exists := mock.GetMockProvision("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, "lease-1", p.LeaseUUID)
+	assert.Equal(t, ProvisionStatusProvisioning, p.Status)
 }
 
 func TestMockBackend_ProvisionDuplicate(t *testing.T) {
@@ -39,17 +34,13 @@ func TestMockBackend_ProvisionDuplicate(t *testing.T) {
 	err := mock.Provision(context.Background(), ProvisionRequest{
 		LeaseUUID: "lease-1",
 	})
-	if err != nil {
-		t.Fatalf("first Provision() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Duplicate should fail
 	err = mock.Provision(context.Background(), ProvisionRequest{
 		LeaseUUID: "lease-1",
 	})
-	if err == nil {
-		t.Error("duplicate Provision() should return error")
-	}
+	assert.Error(t, err)
 }
 
 func TestMockBackend_ProvisionWithCallback(t *testing.T) {
@@ -72,25 +63,17 @@ func TestMockBackend_ProvisionWithCallback(t *testing.T) {
 	err := mock.Provision(context.Background(), ProvisionRequest{
 		LeaseUUID: "lease-1",
 	})
-	if err != nil {
-		t.Fatalf("Provision() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Wait for callback
 	wg.Wait()
 
-	if callbackReceived.LeaseUUID != "lease-1" {
-		t.Errorf("callback LeaseUUID = %q, want %q", callbackReceived.LeaseUUID, "lease-1")
-	}
-	if callbackReceived.Status != "success" {
-		t.Errorf("callback Status = %q, want %q", callbackReceived.Status, "success")
-	}
+	assert.Equal(t, "lease-1", callbackReceived.LeaseUUID)
+	assert.Equal(t, CallbackStatusSuccess, callbackReceived.Status)
 
 	// Verify status changed to ready
-	p, _ := mock.GetProvision("lease-1")
-	if p.Status != "ready" {
-		t.Errorf("Status = %q, want %q", p.Status, "ready")
-	}
+	p, _ := mock.GetMockProvision("lease-1")
+	assert.Equal(t, ProvisionStatusReady, p.Status)
 }
 
 func TestMockBackend_GetInfo(t *testing.T) {
@@ -98,9 +81,7 @@ func TestMockBackend_GetInfo(t *testing.T) {
 
 	// Not provisioned
 	_, err := mock.GetInfo(context.Background(), "nonexistent")
-	if err != ErrNotProvisioned {
-		t.Errorf("GetInfo() error = %v, want ErrNotProvisioned", err)
-	}
+	assert.ErrorIs(t, err, ErrNotProvisioned)
 
 	// Provision but still provisioning
 	mock.Provision(context.Background(), ProvisionRequest{
@@ -109,27 +90,17 @@ func TestMockBackend_GetInfo(t *testing.T) {
 	})
 
 	_, err = mock.GetInfo(context.Background(), "lease-1")
-	if err != ErrNotProvisioned {
-		t.Errorf("GetInfo() while provisioning error = %v, want ErrNotProvisioned", err)
-	}
+	assert.ErrorIs(t, err, ErrNotProvisioned)
 
 	// Mark as ready
-	mock.SetProvisionStatus("lease-1", "ready")
+	mock.SetProvisionStatus("lease-1", ProvisionStatusReady)
 
 	info, err := mock.GetInfo(context.Background(), "lease-1")
-	if err != nil {
-		t.Fatalf("GetInfo() error = %v", err)
-	}
-	if (*info)["host"] == "" {
-		t.Error("info host is empty")
-	}
+	require.NoError(t, err)
+	assert.NotEmpty(t, (*info)["host"])
 	metadata, ok := (*info)["metadata"].(map[string]string)
-	if !ok {
-		t.Fatal("metadata is not map[string]string")
-	}
-	if metadata["lease_uuid"] != "lease-1" {
-		t.Errorf("info metadata lease_uuid = %q, want %q", metadata["lease_uuid"], "lease-1")
-	}
+	require.True(t, ok)
+	assert.Equal(t, "lease-1", metadata["lease_uuid"])
 }
 
 func TestMockBackend_Deprovision(t *testing.T) {
@@ -142,21 +113,15 @@ func TestMockBackend_Deprovision(t *testing.T) {
 
 	// Deprovision
 	err := mock.Deprovision(context.Background(), "lease-1")
-	if err != nil {
-		t.Fatalf("Deprovision() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Verify gone
-	_, exists := mock.GetProvision("lease-1")
-	if exists {
-		t.Error("provision should not exist after deprovision")
-	}
+	_, exists := mock.GetMockProvision("lease-1")
+	assert.False(t, exists)
 
 	// Deprovision nonexistent (should be idempotent)
 	err = mock.Deprovision(context.Background(), "nonexistent")
-	if err != nil {
-		t.Errorf("Deprovision(nonexistent) error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestMockBackend_ListProvisions(t *testing.T) {
@@ -164,24 +129,16 @@ func TestMockBackend_ListProvisions(t *testing.T) {
 
 	// Empty list
 	provisions, err := mock.ListProvisions(context.Background())
-	if err != nil {
-		t.Fatalf("ListProvisions() error = %v", err)
-	}
-	if len(provisions) != 0 {
-		t.Errorf("ListProvisions() returned %d, want 0", len(provisions))
-	}
+	require.NoError(t, err)
+	assert.Len(t, provisions, 0)
 
 	// Add some provisions
 	mock.Provision(context.Background(), ProvisionRequest{LeaseUUID: "lease-1"})
 	mock.Provision(context.Background(), ProvisionRequest{LeaseUUID: "lease-2"})
 
 	provisions, err = mock.ListProvisions(context.Background())
-	if err != nil {
-		t.Fatalf("ListProvisions() error = %v", err)
-	}
-	if len(provisions) != 2 {
-		t.Errorf("ListProvisions() returned %d, want 2", len(provisions))
-	}
+	require.NoError(t, err)
+	assert.Len(t, provisions, 2)
 }
 
 func TestMockBackend_Clear(t *testing.T) {
@@ -196,20 +153,14 @@ func TestMockBackend_Clear(t *testing.T) {
 
 	// Verify empty
 	provisions, _ := mock.ListProvisions(context.Background())
-	if len(provisions) != 0 {
-		t.Errorf("ListProvisions() after Clear() returned %d, want 0", len(provisions))
-	}
+	assert.Len(t, provisions, 0)
 }
 
 func TestMockBackend_Name(t *testing.T) {
 	mock := NewMockBackend(MockBackendConfig{Name: "my-mock"})
-	if mock.Name() != "my-mock" {
-		t.Errorf("Name() = %q, want %q", mock.Name(), "my-mock")
-	}
+	assert.Equal(t, "my-mock", mock.Name())
 
 	// Default name
 	mock2 := NewMockBackend(MockBackendConfig{})
-	if mock2.Name() != "mock" {
-		t.Errorf("Name() = %q, want %q", mock2.Name(), "mock")
-	}
+	assert.Equal(t, "mock", mock2.Name())
 }

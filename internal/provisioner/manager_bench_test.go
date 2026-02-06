@@ -13,6 +13,8 @@ import (
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
@@ -39,7 +41,14 @@ func (m *mockBenchBackend) Deprovision(ctx context.Context, leaseUUID string) er
 func (m *mockBenchBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	return nil, nil
 }
-func (m *mockBenchBackend) Health(ctx context.Context) error { return nil }
+func (m *mockBenchBackend) Health(ctx context.Context) error       { return nil }
+func (m *mockBenchBackend) RefreshState(ctx context.Context) error { return nil }
+func (m *mockBenchBackend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+func (m *mockBenchBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	return nil, backend.ErrNotProvisioned
+}
 
 // BenchmarkWatermill_Publish benchmarks Watermill message publishing.
 func BenchmarkWatermill_Publish(b *testing.B) {
@@ -185,9 +194,7 @@ func TestManager_HighThroughput(t *testing.T) {
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -200,7 +207,7 @@ func TestManager_HighThroughput(t *testing.T) {
 	select {
 	case <-mgr.Running():
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for manager to start")
+		require.Fail(t, "timeout waiting for manager to start")
 	}
 
 	const (
@@ -249,9 +256,7 @@ func TestManager_HighThroughput(t *testing.T) {
 	t.Logf("  Events published: %d in %v (%.0f/sec)", numEvents, publishDone, float64(numEvents)/publishDone.Seconds())
 	t.Logf("  Events processed: %d in %v (%.0f/sec)", processed, elapsed, float64(processed)/elapsed.Seconds())
 
-	if processed < int64(numEvents*90/100) {
-		t.Errorf("expected at least 90%% events processed, got %d/%d", processed, numEvents)
-	}
+	assert.GreaterOrEqual(t, processed, int64(numEvents*90/100), "expected at least 90%% events processed, got %d/%d", processed, numEvents)
 }
 
 // TestManager_BurstTraffic tests manager's ability to handle traffic bursts.
@@ -283,9 +288,7 @@ func TestManager_BurstTraffic(t *testing.T) {
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -298,7 +301,7 @@ func TestManager_BurstTraffic(t *testing.T) {
 	select {
 	case <-mgr.Running():
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for manager to start")
+		require.Fail(t, "timeout waiting for manager to start")
 	}
 
 	const (
@@ -345,7 +348,5 @@ func TestManager_BurstTraffic(t *testing.T) {
 	t.Logf("  Total events: %d sent in %v", totalEvents, burstsDone)
 	t.Logf("  Events processed: %d in %v (%.0f/sec)", processed, elapsed, float64(processed)/elapsed.Seconds())
 
-	if processed < int64(totalEvents*90/100) {
-		t.Errorf("expected at least 90%% events processed, got %d/%d", processed, totalEvents)
-	}
+	assert.GreaterOrEqual(t, processed, int64(totalEvents*90/100), "expected at least 90%% events processed, got %d/%d", processed, totalEvents)
 }

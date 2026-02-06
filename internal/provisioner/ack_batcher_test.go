@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
 
@@ -57,6 +59,10 @@ func (m *mockAckChainClient) RejectLeases(ctx context.Context, leaseUUIDs []stri
 	return 0, nil, nil
 }
 
+func (m *mockAckChainClient) CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	return 0, nil, nil
+}
+
 const testProviderUUID = "01234567-89ab-cdef-0123-456789abcdef"
 
 func TestAckBatcher_BatchesMultipleRequests(t *testing.T) {
@@ -94,12 +100,8 @@ func TestAckBatcher_BatchesMultipleRequests(t *testing.T) {
 			defer wg.Done()
 			leaseUUID := "lease-" + string(rune('a'+i))
 			acked, _, err := batcher.Acknowledge(ctx, leaseUUID)
-			if err != nil {
-				t.Errorf("Acknowledge(%s) error = %v", leaseUUID, err)
-			}
-			if !acked {
-				t.Errorf("Acknowledge(%s) acked = false, want true", leaseUUID)
-			}
+			assert.NoError(t, err, "Acknowledge(%s)", leaseUUID)
+			assert.True(t, acked, "Acknowledge(%s) acked should be true", leaseUUID)
 		}(i)
 	}
 
@@ -114,14 +116,10 @@ func TestAckBatcher_BatchesMultipleRequests(t *testing.T) {
 		totalAcked += len(batch)
 	}
 
-	if totalAcked != 5 {
-		t.Errorf("total acknowledged = %d, want 5", totalAcked)
-	}
+	assert.Equal(t, 5, totalAcked, "total acknowledged")
 
 	// Should have been batched into 1-2 batches, not 5 individual calls
-	if len(batches) > 2 {
-		t.Errorf("batches = %d, want <= 2 (requests should be batched)", len(batches))
-	}
+	assert.LessOrEqual(t, len(batches), 2, "requests should be batched")
 }
 
 func TestAckBatcher_FallsBackToIndividualOnBatchFailure(t *testing.T) {
@@ -177,21 +175,15 @@ func TestAckBatcher_FallsBackToIndividualOnBatchFailure(t *testing.T) {
 
 	// All should succeed (via individual fallback)
 	for i, err := range errs {
-		if err != nil {
-			t.Errorf("Acknowledge[%d] error = %v, want nil", i, err)
-		}
-		if !results[i] {
-			t.Errorf("Acknowledge[%d] acked = false, want true", i)
-		}
+		assert.NoError(t, err, "Acknowledge[%d]", i)
+		assert.True(t, results[i], "Acknowledge[%d] acked should be true", i)
 	}
 
 	// Should have individual calls after batch failure
 	mu.Lock()
 	defer mu.Unlock()
 
-	if len(individualCalls) != 3 {
-		t.Errorf("individual calls = %d, want 3", len(individualCalls))
-	}
+	assert.Len(t, individualCalls, 3, "individual calls")
 }
 
 func TestAckBatcher_FlushesOnBatchSizeReached(t *testing.T) {
@@ -237,11 +229,9 @@ func TestAckBatcher_FlushesOnBatchSizeReached(t *testing.T) {
 	defer mu.Unlock()
 
 	// Should have flushed when batch size was reached
-	if len(batches) != 1 {
-		t.Errorf("batches = %d, want 1", len(batches))
-	}
-	if len(batches) > 0 && len(batches[0]) != 3 {
-		t.Errorf("batch size = %d, want 3", len(batches[0]))
+	assert.Len(t, batches, 1, "batches")
+	if len(batches) > 0 {
+		assert.Len(t, batches[0], 3, "batch size")
 	}
 }
 
@@ -286,9 +276,7 @@ func TestAckBatcher_ContextCancellation(t *testing.T) {
 	// Request should complete with error
 	select {
 	case <-done:
-		if err == nil {
-			t.Error("expected error after context cancellation")
-		}
+		assert.Error(t, err, "expected error after context cancellation")
 	case <-time.After(2 * time.Second):
 		t.Error("Acknowledge did not return after context cancellation")
 	}
@@ -343,12 +331,8 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 
 	// All should report success (including already-acknowledged ones)
 	for i, err := range errs {
-		if err != nil {
-			t.Errorf("Acknowledge[%d] error = %v, want nil", i, err)
-		}
-		if !results[i] {
-			t.Errorf("Acknowledge[%d] acked = false, want true", i)
-		}
+		assert.NoError(t, err, "Acknowledge[%d]", i)
+		assert.True(t, results[i], "Acknowledge[%d] acked should be true", i)
 	}
 
 	// Only lease-b should have been sent to AcknowledgeLeases
@@ -360,9 +344,7 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 		totalAcked += len(batch)
 	}
 
-	if totalAcked != 1 {
-		t.Errorf("total acknowledged = %d, want 1 (only lease-b should need ack)", totalAcked)
-	}
+	assert.Equal(t, 1, totalAcked, "only lease-b should need ack")
 
 	// Verify lease-b was in the ack call
 	found := false
@@ -371,13 +353,12 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 			if uuid == "lease-b" {
 				found = true
 			}
-			if uuid == "lease-a" || uuid == "lease-c" {
-				t.Errorf("already-acknowledged lease %s was sent to AcknowledgeLeases", uuid)
-			}
+			assert.NotEqual(t, "lease-a", uuid, "already-acknowledged lease lease-a was sent to AcknowledgeLeases")
+			assert.NotEqual(t, "lease-c", uuid, "already-acknowledged lease lease-c was sent to AcknowledgeLeases")
 		}
 	}
-	if !found && totalAcked > 0 {
-		t.Error("lease-b was not in any ack batch")
+	if totalAcked > 0 {
+		assert.True(t, found, "lease-b was not in any ack batch")
 	}
 }
 
@@ -411,15 +392,9 @@ func TestAckBatcher_SkipsNotFoundLeases(t *testing.T) {
 	acked, _, err := batcher.Acknowledge(ctx, "non-existent-lease")
 
 	// Should report success (lease doesn't exist, nothing to do)
-	if err != nil {
-		t.Errorf("Acknowledge() error = %v, want nil", err)
-	}
-	if !acked {
-		t.Error("Acknowledge() acked = false, want true")
-	}
+	assert.NoError(t, err, "Acknowledge()")
+	assert.True(t, acked, "Acknowledge() acked should be true")
 
 	// AcknowledgeLeases should NOT have been called
-	if ackCalled.Load() {
-		t.Error("AcknowledgeLeases was called for non-existent lease")
-	}
+	assert.False(t, ackCalled.Load(), "AcknowledgeLeases was called for non-existent lease")
 }

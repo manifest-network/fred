@@ -14,11 +14,12 @@ import (
 
 	"github.com/sony/gobreaker"
 
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
-// Any backend (Kubernetes, GPU, VM, etc.) must implement these 6 operations.
+// Any backend (Kubernetes, GPU, VM, etc.) must implement these operations.
 type Backend interface {
 	// Provision starts async provisioning of a resource.
 	// The backend will call the callback URL when provisioning completes.
@@ -38,6 +39,21 @@ type Backend interface {
 	// Health checks if the backend is reachable and healthy.
 	// Returns nil if healthy, error otherwise.
 	Health(ctx context.Context) error
+
+	// RefreshState synchronizes in-memory provision state with the
+	// underlying infrastructure. Backends should query the real
+	// container/VM state and update their internal tracking.
+	// Called by the reconciler before ListProvisions to avoid stale reads.
+	RefreshState(ctx context.Context) error
+
+	// GetProvision returns status information for a single provision.
+	// Returns ErrNotProvisioned if the lease is not found.
+	GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error)
+
+	// GetLogs returns container logs for a provisioned lease.
+	// The tail parameter limits the number of log lines per container.
+	// Returns ErrNotProvisioned if the lease is not found.
+	GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
 
 	// Name returns the backend's configured name.
 	Name() string
@@ -110,11 +126,13 @@ type InstanceInfo struct {
 
 // ProvisionInfo describes a single provisioned resource.
 type ProvisionInfo struct {
-	LeaseUUID    string    `json:"lease_uuid"`
-	ProviderUUID string    `json:"provider_uuid"`
-	Status       string    `json:"status"` // "provisioning", "ready", "failed"
-	CreatedAt    time.Time `json:"created_at"`
-	BackendName  string    `json:"-"` // Set by reconciler, not from backend
+	LeaseUUID    string          `json:"lease_uuid"`
+	ProviderUUID string          `json:"provider_uuid"`
+	Status       ProvisionStatus `json:"status"` // "provisioning", "ready", "failed"
+	CreatedAt    time.Time       `json:"created_at"`
+	FailCount    int             `json:"fail_count"`
+	LastError    string          `json:"last_error,omitempty"`
+	BackendName  string          `json:"-"` // Set by reconciler, not from backend
 }
 
 // ListProvisionsResponse is the response from the /provisions endpoint.
@@ -124,9 +142,9 @@ type ListProvisionsResponse struct {
 
 // CallbackPayload is sent by backends to fred's callback endpoint.
 type CallbackPayload struct {
-	LeaseUUID string `json:"lease_uuid"`
-	Status    string `json:"status"` // "success" or "failed"
-	Error     string `json:"error,omitempty"`
+	LeaseUUID string         `json:"lease_uuid"`
+	Status    CallbackStatus `json:"status"` // "success" or "failed"
+	Error     string         `json:"error,omitempty"`
 }
 
 // ErrNotProvisioned is returned when a lease is not yet provisioned.
@@ -135,18 +153,33 @@ var ErrNotProvisioned = errors.New("lease not provisioned")
 // ErrAlreadyProvisioned is returned when attempting to provision an already provisioned lease.
 var ErrAlreadyProvisioned = errors.New("lease already provisioned")
 
+// ProvisionStatus represents the status of a provisioned resource.
+type ProvisionStatus string
+
 // Provision status constants.
 const (
-	ProvisionStatusProvisioning = "provisioning"
-	ProvisionStatusReady        = "ready"
-	ProvisionStatusFailed       = "failed"
+	ProvisionStatusProvisioning ProvisionStatus = "provisioning"
+	ProvisionStatusReady        ProvisionStatus = "ready"
+	ProvisionStatusFailed       ProvisionStatus = "failed"
+	ProvisionStatusUnknown      ProvisionStatus = "unknown"
 )
+
+// CallbackStatus represents the status sent in a callback payload.
+type CallbackStatus string
 
 // Callback status constants.
 const (
-	CallbackStatusSuccess = "success"
-	CallbackStatusFailed  = "failed"
+	CallbackStatusSuccess CallbackStatus = "success"
+	CallbackStatusFailed  CallbackStatus = "failed"
 )
+
+// ErrValidation is returned when a provision request fails pre-flight validation
+// (e.g., unknown SKU, invalid manifest, disallowed image registry).
+var ErrValidation = errors.New("validation error")
+
+// ErrInsufficientResources is returned when there are not enough resources
+// to fulfill a provision request.
+var ErrInsufficientResources = errors.New("insufficient resources")
 
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
@@ -161,6 +194,7 @@ func isCircuitBreakerError(err error) bool {
 type HTTPClient struct {
 	name       string
 	baseURL    string
+	secret     string
 	httpClient *http.Client
 	cb         *gobreaker.CircuitBreaker
 }
@@ -172,6 +206,7 @@ type HTTPClientConfig struct {
 	Timeout             time.Duration
 	MaxIdleConns        int // Max idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost int // Max idle connections per host (default: 10)
+	Secret              string
 
 	// Circuit breaker settings
 	CBMaxRequests   uint32        // Max requests in half-open state (default: 1)
@@ -209,8 +244,9 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		},
 		IsSuccessful: func(err error) bool {
 			// ErrNotProvisioned (404 from GetInfo) is a valid response, not a backend failure.
-			// It shouldn't count toward the circuit breaker failure threshold.
-			return err == nil || errors.Is(err, ErrNotProvisioned)
+			// ErrValidation (400 from Provision) is a permanent client error, not transient.
+			// Neither should count toward the circuit breaker failure threshold.
+			return err == nil || errors.Is(err, ErrNotProvisioned) || errors.Is(err, ErrValidation)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -225,6 +261,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 	return &HTTPClient{
 		name:    cfg.Name,
 		baseURL: cfg.BaseURL,
+		secret:  cfg.Secret,
 		httpClient: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
@@ -249,6 +286,28 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	metrics.BackendRequestsTotal.WithLabelValues(c.name, operation, status).Inc()
 }
 
+// readErrorBody reads up to 4 KiB from an HTTP response body for inclusion
+// in error messages. Remaining bytes are drained to allow connection reuse.
+// If reading fails, the read error is reported instead.
+func readErrorBody(resp *http.Response) string {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// Drain any remaining bytes so the underlying connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if err != nil {
+		return fmt.Sprintf("<body read error: %v>", err)
+	}
+	return string(body)
+}
+
+// signRequest adds an HMAC-SHA256 signature header to the request.
+// If no secret is configured, this is a no-op (backwards compatible).
+func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
+	if c.secret == "" {
+		return
+	}
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(c.secret, body))
+}
+
 // Provision sends a provision request to the backend.
 func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err error) {
 	start := time.Now()
@@ -265,6 +324,7 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -273,8 +333,12 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusAccepted {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			errBody := readErrorBody(resp)
+			// 400 Bad Request indicates a validation error that won't succeed on retry
+			if resp.StatusCode == http.StatusBadRequest {
+				return nil, fmt.Errorf("%w: %s", ErrValidation, errBody)
+			}
+			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, errBody)
 		}
 
 		return nil, nil
@@ -298,6 +362,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
+		c.signRequest(httpReq, nil)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -310,8 +375,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("get info failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, fmt.Errorf("get info failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		var info LeaseInfo
@@ -328,7 +392,11 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 	if cbErr != nil {
 		return nil, cbErr
 	}
-	return result.(*LeaseInfo), nil
+	info, ok := result.(*LeaseInfo)
+	if !ok {
+		return nil, fmt.Errorf("get info: unexpected result type %T", result)
+	}
+	return info, nil
 }
 
 // Deprovision releases resources for a lease.
@@ -347,6 +415,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -355,8 +424,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("deprovision failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, fmt.Errorf("deprovision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		return nil, nil
@@ -378,6 +446,7 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
+		c.signRequest(httpReq, nil)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -386,8 +455,7 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		var result struct {
@@ -406,7 +474,114 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 	if cbErr != nil {
 		return nil, cbErr
 	}
-	return result.([]ProvisionInfo), nil
+	provisions, ok := result.([]ProvisionInfo)
+	if !ok {
+		return nil, fmt.Errorf("list provisions: unexpected result type %T", result)
+	}
+	return provisions, nil
+}
+
+// GetProvision retrieves status information for a single provision.
+func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (_ *ProvisionInfo, err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("get_provision", start, err) }()
+
+	url := fmt.Sprintf("%s/provisions/%s", c.baseURL, leaseUUID)
+
+	result, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		c.signRequest(httpReq, nil)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("get provision request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotProvisioned
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("get provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+
+		var info ProvisionInfo
+		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+			return nil, fmt.Errorf("decode provision response: %w", err)
+		}
+
+		return &info, nil
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return nil, ErrCircuitOpen
+	}
+	if cbErr != nil {
+		return nil, cbErr
+	}
+	info, ok := result.(*ProvisionInfo)
+	if !ok {
+		return nil, fmt.Errorf("get provision: unexpected result type %T", result)
+	}
+	return info, nil
+}
+
+// GetLogs retrieves container logs for a provisioned lease.
+func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (_ map[string]string, err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("get_logs", start, err) }()
+
+	url := fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail)
+
+	result, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		c.signRequest(httpReq, nil)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("get logs request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotProvisioned
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("get logs failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+
+		var logs map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&logs); err != nil {
+			return nil, fmt.Errorf("decode logs response: %w", err)
+		}
+
+		return logs, nil
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return nil, ErrCircuitOpen
+	}
+	if cbErr != nil {
+		return nil, cbErr
+	}
+	logs, ok := result.(map[string]string)
+	if !ok {
+		return nil, fmt.Errorf("get logs: unexpected result type %T", result)
+	}
+	return logs, nil
+}
+
+// RefreshState is a no-op for remote backends (they refresh server-side).
+func (c *HTTPClient) RefreshState(ctx context.Context) error {
+	return nil
 }
 
 // Health checks if the backend is reachable and healthy.

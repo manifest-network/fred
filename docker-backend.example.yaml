@@ -1,0 +1,205 @@
+# Docker Backend Configuration Example
+#
+# Copy this file to docker-backend.yaml and customize for your environment.
+#
+# IMPORTANT: You must configure sku_mapping to link on-chain SKU UUIDs to
+# local resource profiles. Without this mapping, provisioning will fail with
+# "unknown SKU" errors.
+
+# Backend name (used in Fred configuration)
+name: docker
+
+# HTTP server listen address
+listen_addr: ":9001"
+
+# Docker daemon socket or URL
+docker_host: "unix:///var/run/docker.sock"
+
+# =============================================================================
+# RESOURCE POOL
+# =============================================================================
+# Total resources available for provisioning containers.
+
+total_cpu_cores: 8.0
+total_memory_mb: 16384
+total_disk_mb: 102400
+
+# =============================================================================
+# SKU MAPPING (REQUIRED)
+# =============================================================================
+# Maps on-chain SKU UUIDs to local profile names. When a tenant creates a lease,
+# the chain assigns a SKU UUID. This mapping tells the backend which resource
+# profile to provision.
+#
+# To get your SKU UUIDs:
+#   manifestd query sku skus-by-provider <your-provider-uuid>
+#
+# Example output:
+#   - uuid: "019c1ee7-1aaf-7000-802c-ad775c72cc27"
+#     name: "compute-small"
+#     ...
+#
+# Then map each UUID to a profile below:
+sku_mapping:
+  "019c1ee7-1aaf-7000-802c-ad775c72cc27": "docker-micro"
+  "019c1ee7-816c-7001-8c26-a61d57e7403e": "docker-small"
+  "019c1ee8-3ef5-7002-beb3-07a3d4b8ce95": "docker-medium"
+  "019c1ee8-9d9c-7003-8d01-4188dfe9e204": "docker-large"
+  # Add your SKU UUIDs here...
+
+# SKU profiles define resource limits for each tier
+# Profile names are referenced by sku_mapping above
+sku_profiles:
+  docker-micro:
+    cpu_cores: 0.25
+    memory_mb: 256
+    disk_mb: 512
+  docker-small:
+    cpu_cores: 0.5
+    memory_mb: 512
+    disk_mb: 1024
+  docker-medium:
+    cpu_cores: 1.0
+    memory_mb: 1024
+    disk_mb: 2048
+  docker-large:
+    cpu_cores: 2.0
+    memory_mb: 2048
+    disk_mb: 4096
+
+# =============================================================================
+# TENANT QUOTAS (optional)
+# =============================================================================
+# Per-tenant resource limits. Prevents any single tenant from consuming the
+# entire resource pool. Leave commented out to allow full pool usage.
+#
+# tenant_quota:
+#   max_cpu_cores: 4.0      # Max CPU cores per tenant
+#   max_memory_mb: 8192     # Max memory per tenant (MB)
+#   max_disk_mb: 51200      # Max disk per tenant (MB)
+
+# =============================================================================
+# ALLOWED REGISTRIES
+# =============================================================================
+# Security: Only images from these registries can be pulled.
+
+allowed_registries:
+  - "docker.io"
+  - "ghcr.io"
+  # Add more registries as needed:
+  # - "gcr.io"
+  # - "registry.example.com"
+
+# =============================================================================
+# CALLBACK CONFIGURATION
+# =============================================================================
+# Settings for callbacks to Fred reporting provisioning results.
+
+# HMAC secret for signing callbacks to Fred (minimum 32 characters)
+# Generate with: openssl rand -hex 32
+callback_secret: "change-me-to-a-secure-32-char-secret!"
+
+# Skip TLS certificate verification for callbacks (development only!)
+# WARNING: Never enable in production - vulnerable to MITM attacks
+callback_insecure_skip_verify: true
+
+# Path to bbolt database for persisting pending callbacks.
+# Callbacks are stored before delivery to survive restarts.
+# Default: "callbacks.db"
+callback_db_path: "callbacks.db"
+
+# Maximum age of persisted callback entries. Entries older than this are
+# removed during startup replay. Default: 24h.
+callback_max_age: 24h
+
+# =============================================================================
+# DIAGNOSTICS
+# =============================================================================
+# Failure diagnostics (error messages and container logs) are persisted to a
+# bbolt database so they survive deprovision and backend restarts. The
+# GET /provisions/{lease_uuid} and GET /logs/{lease_uuid} endpoints fall back
+# to this store when the provision is no longer in memory.
+
+# Path to bbolt database for persisting failure diagnostics.
+# Default: "diagnostics.db"
+diagnostics_db_path: "diagnostics.db"
+
+# Maximum age of persisted diagnostic entries. Entries older than this are
+# removed by background cleanup. Default: 7 days (168h).
+diagnostics_max_age: 168h
+
+# =============================================================================
+# HOST CONFIGURATION
+# =============================================================================
+
+# External host address for port mappings.
+# This is the address tenants will use to connect to containers.
+# Must be a valid hostname or IP address (not a URL).
+host_address: "0.0.0.0"
+
+# IP address to bind container ports to. Use "127.0.0.1" to restrict
+# to localhost only. Default: "0.0.0.0" (all interfaces).
+# host_bind_ip: "0.0.0.0"
+
+# =============================================================================
+# CONTAINER HARDENING
+# =============================================================================
+# These settings control multi-tenant security hardening for containers.
+# All defaults are secure-by-default.
+
+# Enable per-tenant Docker network isolation. Each tenant's containers
+# are placed in a separate internal bridge network with no external
+# connectivity between tenants. Default: true.
+# network_isolation: true
+
+# Set the container's root filesystem to read-only. When enabled,
+# /tmp and /run are mounted as tmpfs. Default: true.
+# container_readonly_rootfs: true
+
+# Maximum number of PIDs allowed in each container. Prevents fork bombs.
+# Default: 256.
+# container_pids_limit: 256
+
+# Size in MB for tmpfs mounts (/tmp, /run) when readonly rootfs is
+# enabled. Default: 64.
+# container_tmpfs_size_mb: 64
+
+# Enable Docker overlay2 storage driver disk quotas on containers.
+# REQUIRES: overlay2 storage driver with XFS filesystem mounted with 'pquota' option.
+# If your Docker host doesn't meet these requirements, set to false.
+# Default: true.
+#
+# To check if your system supports disk quotas:
+#   docker info | grep "Storage Driver"  # Should show "overlay2"
+#   mount | grep /var/lib/docker         # Should show "pquota" in mount options
+#
+# If unsupported, you'll see errors like:
+#   "--storage-opt is supported only for overlay over xfs with 'pquota' mount option"
+container_disk_quota: true
+
+# =============================================================================
+# TIMEOUTS
+# =============================================================================
+
+# Maximum time for the entire provisioning operation (image pull + container
+# creation + start + startup verification). Default: 10m.
+provision_timeout: 10m
+
+# Timeout for pulling container images. Default: 5m.
+image_pull_timeout: 5m
+
+# Timeout for creating containers. Default: 30s.
+container_create_timeout: 30s
+
+# Timeout for starting containers. Default: 30s.
+container_start_timeout: 30s
+
+# How long to wait after starting containers before verifying they're still
+# running. Catches containers that crash immediately on startup. The success
+# callback is only sent after verification passes. Default: 5s.
+# Note: Setting to 0 uses the default (5s), verification cannot be disabled.
+startup_verify_duration: 5s
+
+# How often to reconcile in-memory state with Docker. Detects crashed
+# containers and sends failure callbacks. Default: 5m.
+reconcile_interval: 5m

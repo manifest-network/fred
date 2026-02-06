@@ -10,16 +10,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // freePort binds :0, extracts the port, and returns "127.0.0.1:<port>".
 func freePort(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to find free port: %v", err)
-	}
+	require.NoError(t, err, "failed to find free port")
 	addr := ln.Addr().String()
 	ln.Close()
 	return addr
@@ -47,9 +48,7 @@ func newTestServer(t *testing.T, addr string) *Server {
 		nil, // no payload publisher
 		&mockStatusChecker{},
 	)
-	if err != nil {
-		t.Fatalf("NewServer() error = %v", err)
-	}
+	require.NoError(t, err)
 	return s
 }
 
@@ -95,18 +94,12 @@ func TestServer_StartAndHealth(t *testing.T) {
 	client := startAndWaitForServer(t, s, addr)
 
 	resp, err := client.Get(fmt.Sprintf("http://%s/health", addr))
-	if err != nil {
-		t.Fatalf("health check request failed: %v", err)
-	}
+	require.NoError(t, err, "health check request failed")
 	resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("health check status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-	if err := s.Shutdown(context.Background()); err != nil {
-		t.Errorf("Shutdown() error = %v", err)
-	}
+	assert.NoError(t, s.Shutdown(context.Background()))
 }
 
 func TestServer_GracefulShutdown(t *testing.T) {
@@ -115,15 +108,11 @@ func TestServer_GracefulShutdown(t *testing.T) {
 
 	client := startAndWaitForServer(t, s, addr)
 
-	if err := s.Shutdown(context.Background()); err != nil {
-		t.Fatalf("Shutdown() error = %v", err)
-	}
+	require.NoError(t, s.Shutdown(context.Background()))
 
 	// Subsequent requests should fail
 	_, err := client.Get(fmt.Sprintf("http://%s/health", addr))
-	if err == nil {
-		t.Error("request after shutdown should fail")
-	}
+	assert.Error(t, err, "request after shutdown should fail")
 }
 
 func TestServer_RoutesRegistered(t *testing.T) {
@@ -148,14 +137,10 @@ func TestServer_RoutesRegistered(t *testing.T) {
 			url := fmt.Sprintf("http://%s%s", addr, route.path)
 			req, _ := http.NewRequest(route.method, url, nil)
 			resp, err := client.Do(req)
-			if err != nil {
-				t.Fatalf("request failed: %v", err)
-			}
+			require.NoError(t, err, "request failed")
 			resp.Body.Close()
 
-			if resp.StatusCode == http.StatusNotFound {
-				t.Errorf("route %s %s returned 404, expected route to be registered", route.method, route.path)
-			}
+			assert.NotEqual(t, http.StatusNotFound, resp.StatusCode, "route %s %s returned 404, expected route to be registered", route.method, route.path)
 		})
 	}
 }
@@ -183,25 +168,19 @@ func TestServer_ShutdownClosesTokenTracker(t *testing.T) {
 		nil,
 		&mockStatusChecker{},
 	)
-	if err != nil {
-		t.Fatalf("NewServer() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if s.tokenTracker == nil {
-		t.Fatal("expected token tracker to be configured")
-	}
+	require.NotNil(t, s.tokenTracker, "expected token tracker to be configured")
 
 	startAndWaitForServer(t, s, addr)
 
-	if err := s.Shutdown(context.Background()); err != nil {
-		t.Errorf("Shutdown() error = %v", err)
-	}
+	assert.NoError(t, s.Shutdown(context.Background()))
 }
 
 // testPayloadPublisher implements PayloadPublisher for server lifecycle tests.
 type testPayloadPublisher struct{}
 
-func (m *testPayloadPublisher) PublishPayload(event provisioner.PayloadEvent) error {
+func (m *testPayloadPublisher) PublishPayload(event payload.Event) error {
 	return nil
 }
 
@@ -232,9 +211,7 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 			nil, // No payload publisher - handler won't be set
 			&mockStatusChecker{},
 		)
-		if err != nil {
-			t.Fatalf("NewServer() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Directly test the handler
 		req := httptest.NewRequest(http.MethodPost, "/v1/leases/test-uuid/data", nil)
@@ -242,15 +219,11 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 
 		s.handlePayloadUpload(rec, req)
 
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-		}
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 
 		// Verify error message
 		body := rec.Body.String()
-		if body == "" {
-			t.Error("expected error response body")
-		}
+		assert.NotEmpty(t, body, "expected error response body")
 	})
 
 	t.Run("delegates_to_configured_handler", func(t *testing.T) {
@@ -275,14 +248,10 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 			payloadPub, // Provide publisher so handler is configured
 			&mockStatusChecker{},
 		)
-		if err != nil {
-			t.Fatalf("NewServer() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Verify handler was configured
-		if s.payloadHandler == nil {
-			t.Fatal("expected payload handler to be configured")
-		}
+		require.NotNil(t, s.payloadHandler, "expected payload handler to be configured")
 
 		// The handler is configured - actual payload upload testing
 		// is done in payload_test.go. Here we just verify the delegation path.
@@ -293,9 +262,7 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 		s.handlePayloadUpload(rec, req)
 
 		// Should get auth error (401), not service unavailable (503)
-		if rec.Code == http.StatusServiceUnavailable {
-			t.Error("handler should be configured and called, not return 503")
-		}
+		assert.NotEqual(t, http.StatusServiceUnavailable, rec.Code, "handler should be configured and called, not return 503")
 	})
 }
 
@@ -336,9 +303,7 @@ func TestServer_Start_ContextCancellation(t *testing.T) {
 	// Start should return with context.Canceled
 	select {
 	case err := <-errCh:
-		if err != context.Canceled {
-			t.Errorf("Start() error = %v, want context.Canceled", err)
-		}
+		assert.Equal(t, context.Canceled, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for Start to return after context cancellation")
 	}
@@ -346,9 +311,7 @@ func TestServer_Start_ContextCancellation(t *testing.T) {
 	// Server should be shut down - port should be free
 	// Verify by successfully binding to the same port
 	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Errorf("port should be free after context cancellation, but got: %v", err)
-	} else {
+	if assert.NoError(t, err, "port should be free after context cancellation") {
 		ln.Close()
 	}
 }
@@ -359,29 +322,21 @@ func TestServer_StartBackground(t *testing.T) {
 		s := newTestServer(t, addr)
 
 		errChan, err := s.StartBackground()
-		if err != nil {
-			t.Fatalf("StartBackground() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer s.Shutdown(context.Background())
 
 		// Server should be immediately ready to accept connections
 		client := &http.Client{Timeout: 2 * time.Second}
 		resp, err := client.Get(fmt.Sprintf("http://%s/health", addr))
-		if err != nil {
-			t.Fatalf("health check failed immediately after StartBackground: %v", err)
-		}
+		require.NoError(t, err, "health check failed immediately after StartBackground")
 		resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("health check status = %d, want %d", resp.StatusCode, http.StatusOK)
-		}
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
 
 		// Error channel should not have any errors yet
 		select {
 		case err := <-errChan:
-			if err != nil {
-				t.Errorf("unexpected error from errChan: %v", err)
-			}
+			assert.NoError(t, err, "unexpected error from errChan")
 		default:
 			// Expected - no error yet
 		}
@@ -392,20 +347,16 @@ func TestServer_StartBackground(t *testing.T) {
 		s := newTestServer(t, addr)
 
 		errChan, err := s.StartBackground()
-		if err != nil {
-			t.Fatalf("StartBackground() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Shutdown the server
-		if err := s.Shutdown(context.Background()); err != nil {
-			t.Fatalf("Shutdown() error = %v", err)
-		}
+		require.NoError(t, s.Shutdown(context.Background()))
 
 		// Error channel should close without error (graceful shutdown)
 		select {
 		case err, ok := <-errChan:
-			if ok && err != nil {
-				t.Errorf("expected channel to close cleanly, got error: %v", err)
+			if ok {
+				assert.NoError(t, err, "expected channel to close cleanly")
 			}
 		case <-time.After(2 * time.Second):
 			t.Error("timed out waiting for error channel to close")
@@ -416,9 +367,7 @@ func TestServer_StartBackground(t *testing.T) {
 		s := newTestServer(t, "invalid:address:format")
 
 		_, err := s.StartBackground()
-		if err == nil {
-			t.Error("expected error for invalid address")
-		}
+		assert.Error(t, err, "expected error for invalid address")
 	})
 
 	t.Run("returns_error_for_port_in_use", func(t *testing.T) {
@@ -427,17 +376,13 @@ func TestServer_StartBackground(t *testing.T) {
 		// Start first server
 		s1 := newTestServer(t, addr)
 		_, err := s1.StartBackground()
-		if err != nil {
-			t.Fatalf("first StartBackground() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer s1.Shutdown(context.Background())
 
 		// Try to start second server on same port
 		s2 := newTestServer(t, addr)
 		_, err = s2.StartBackground()
-		if err == nil {
-			t.Error("expected error when port is already in use")
-		}
+		assert.Error(t, err, "expected error when port is already in use")
 	})
 
 	t.Run("returns_error_for_invalid_tls_certs", func(t *testing.T) {
@@ -463,20 +408,14 @@ func TestServer_StartBackground(t *testing.T) {
 			nil,
 			&mockStatusChecker{},
 		)
-		if err != nil {
-			t.Fatalf("NewServer() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		_, err = s.StartBackground()
-		if err == nil {
-			t.Error("expected error for invalid TLS certificates")
-		}
+		assert.Error(t, err, "expected error for invalid TLS certificates")
 
 		// Verify the port is free (listener was properly closed on error)
 		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			t.Errorf("port should be free after TLS cert error, but got: %v", err)
-		} else {
+		if assert.NoError(t, err, "port should be free after TLS cert error") {
 			ln.Close()
 		}
 	})

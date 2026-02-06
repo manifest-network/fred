@@ -13,6 +13,8 @@ import (
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/bech32"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockChainClient implements ChainClient interface for testing.
@@ -110,27 +112,13 @@ func TestNewWithdrawScheduler(t *testing.T) {
 			client := &mockChainClient{}
 			s := NewWithdrawScheduler(client, tt.cfg)
 
-			if s == nil {
-				t.Fatal("NewWithdrawScheduler() returned nil")
-			}
-			if s.providerUUID != tt.cfg.ProviderUUID {
-				t.Errorf("providerUUID = %q, want %q", s.providerUUID, tt.cfg.ProviderUUID)
-			}
-			if s.interval != tt.cfg.Interval {
-				t.Errorf("interval = %v, want %v", s.interval, tt.cfg.Interval)
-			}
-			if s.maxWithdrawIterations != tt.wantMaxIterations {
-				t.Errorf("maxWithdrawIterations = %d, want %d", s.maxWithdrawIterations, tt.wantMaxIterations)
-			}
-			if s.creditCheckErrorThreshold != tt.wantErrorThreshold {
-				t.Errorf("creditCheckErrorThreshold = %d, want %d", s.creditCheckErrorThreshold, tt.wantErrorThreshold)
-			}
-			if s.creditCheckRetryInterval != tt.wantRetryInterval {
-				t.Errorf("creditCheckRetryInterval = %v, want %v", s.creditCheckRetryInterval, tt.wantRetryInterval)
-			}
-			if s.tenants == nil {
-				t.Error("tenants map is nil")
-			}
+			require.NotNil(t, s, "NewWithdrawScheduler() returned nil")
+			assert.Equal(t, tt.cfg.ProviderUUID, s.providerUUID)
+			assert.Equal(t, tt.cfg.Interval, s.interval)
+			assert.Equal(t, tt.wantMaxIterations, s.maxWithdrawIterations)
+			assert.Equal(t, tt.wantErrorThreshold, s.creditCheckErrorThreshold)
+			assert.Equal(t, tt.wantRetryInterval, s.creditCheckRetryInterval)
+			assert.NotNil(t, s.tenants, "tenants map is nil")
 		})
 	}
 }
@@ -155,9 +143,7 @@ func TestWithdrawScheduler_Withdraw_NothingToWithdraw(t *testing.T) {
 
 	s.withdraw(context.Background())
 
-	if withdrawCalled {
-		t.Error("WithdrawByProvider should not be called when nothing to withdraw")
-	}
+	assert.False(t, withdrawCalled, "WithdrawByProvider should not be called when nothing to withdraw")
 }
 
 func TestWithdrawScheduler_Withdraw_Success(t *testing.T) {
@@ -180,9 +166,7 @@ func TestWithdrawScheduler_Withdraw_Success(t *testing.T) {
 
 	s.withdraw(context.Background())
 
-	if withdrawCalls != 1 {
-		t.Errorf("WithdrawByProvider called %d times, want 1", withdrawCalls)
-	}
+	assert.Equal(t, 1, withdrawCalls, "WithdrawByProvider called unexpected number of times")
 }
 
 func TestWithdrawScheduler_Withdraw_Error(t *testing.T) {
@@ -206,9 +190,7 @@ func TestWithdrawScheduler_Withdraw_Error(t *testing.T) {
 	// Should not panic on error
 	s.withdraw(context.Background())
 
-	if withdrawCalls != 1 {
-		t.Errorf("WithdrawByProvider called %d times, want 1", withdrawCalls)
-	}
+	assert.Equal(t, 1, withdrawCalls, "WithdrawByProvider called unexpected number of times")
 }
 
 func TestWithdrawScheduler_Withdraw_RetryOnError(t *testing.T) {
@@ -237,9 +219,7 @@ func TestWithdrawScheduler_Withdraw_RetryOnError(t *testing.T) {
 
 	s.withdraw(ctx)
 
-	if atomic.LoadInt32(&getCalls) != 3 {
-		t.Errorf("GetProviderWithdrawable called %d times, want 3 (2 retries + 1 success)", getCalls)
-	}
+	assert.Equal(t, int32(3), atomic.LoadInt32(&getCalls), "GetProviderWithdrawable called unexpected number of times (want 2 retries + 1 success)")
 }
 
 func TestWithdrawScheduler_CheckCreditsAndClose_NoLeases(t *testing.T) {
@@ -259,9 +239,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_NoLeases(t *testing.T) {
 	// Should return default interval
 	expectedMin := time.Now().Add(time.Minute - time.Second)
 	expectedMax := time.Now().Add(time.Minute + time.Second)
-	if nextCheck.Before(expectedMin) || nextCheck.After(expectedMax) {
-		t.Errorf("nextCheck = %v, want approximately now + 1 minute", nextCheck)
-	}
+	assert.True(t, !nextCheck.Before(expectedMin) && !nextCheck.After(expectedMax),
+		"nextCheck = %v, want approximately now + 1 minute", nextCheck)
 }
 
 func TestWithdrawScheduler_CheckCreditsAndClose_DepletedCredit(t *testing.T) {
@@ -285,9 +264,7 @@ func TestWithdrawScheduler_CheckCreditsAndClose_DepletedCredit(t *testing.T) {
 		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			closeCalled = true
 			closedLeases = leaseUUIDs
-			if reason != "credit exhausted" {
-				t.Errorf("close reason = %q, want %q", reason, "credit exhausted")
-			}
+			assert.Equal(t, "credit exhausted", reason)
 			return uint64(len(leaseUUIDs)), []string{"txhash"}, nil
 		},
 	}
@@ -299,12 +276,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_DepletedCredit(t *testing.T) {
 
 	s.checkCreditsAndClose(context.Background())
 
-	if !closeCalled {
-		t.Error("CloseLeases was not called for depleted credit")
-	}
-	if len(closedLeases) != 2 {
-		t.Errorf("closedLeases = %d, want 2", len(closedLeases))
-	}
+	assert.True(t, closeCalled, "CloseLeases was not called for depleted credit")
+	assert.Len(t, closedLeases, 2)
 }
 
 func TestWithdrawScheduler_CheckCreditsAndClose_HealthyCredit(t *testing.T) {
@@ -335,9 +308,7 @@ func TestWithdrawScheduler_CheckCreditsAndClose_HealthyCredit(t *testing.T) {
 
 	s.checkCreditsAndClose(context.Background())
 
-	if closeCalled {
-		t.Error("CloseLeases should not be called for healthy credit")
-	}
+	assert.False(t, closeCalled, "CloseLeases should not be called for healthy credit")
 }
 
 func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
@@ -468,20 +439,15 @@ func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 			depletion := s.estimateDepletionTime(tt.prevBalance, tt.currBalance, tt.elapsed, now)
 
 			if tt.wantZero {
-				if !depletion.IsZero() {
-					t.Errorf("estimateDepletionTime() = %v, want zero time", depletion)
-				}
+				assert.True(t, depletion.IsZero(), "estimateDepletionTime() = %v, want zero time", depletion)
 				return
 			}
 
-			if depletion.IsZero() {
-				t.Fatal("estimateDepletionTime() returned zero time, want non-zero")
-			}
+			require.False(t, depletion.IsZero(), "estimateDepletionTime() returned zero time, want non-zero")
 
 			remaining := depletion.Sub(now)
-			if remaining < tt.minRemaining || remaining > tt.maxRemaining {
-				t.Errorf("estimated remaining = %v, want between %v and %v", remaining, tt.minRemaining, tt.maxRemaining)
-			}
+			assert.True(t, remaining >= tt.minRemaining && remaining <= tt.maxRemaining,
+				"estimated remaining = %v, want between %v and %v", remaining, tt.minRemaining, tt.maxRemaining)
 		})
 	}
 }
@@ -521,9 +487,7 @@ func TestWithdrawScheduler_TriggerWithdraw(t *testing.T) {
 	// Wait for the goroutine to complete
 	wg.Wait()
 
-	if atomic.LoadInt32(&withdrawCalled) != 1 {
-		t.Errorf("WithdrawByProvider called %d times, want 1", withdrawCalled)
-	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&withdrawCalled))
 }
 
 func TestWithdrawScheduler_WithdrawOnce(t *testing.T) {
@@ -558,12 +522,8 @@ func TestWithdrawScheduler_WithdrawOnce(t *testing.T) {
 
 	s.WithdrawOnce(context.Background())
 
-	if !withdrawCalled {
-		t.Error("WithdrawByProvider was not called")
-	}
-	if !creditCheckCalled {
-		t.Error("GetActiveLeasesByProvider was not called (credit check)")
-	}
+	assert.True(t, withdrawCalled, "WithdrawByProvider was not called")
+	assert.True(t, creditCheckCalled, "GetActiveLeasesByProvider was not called (credit check)")
 }
 
 func TestWithdrawScheduler_Start_ContextCancellation(t *testing.T) {
@@ -599,9 +559,7 @@ func TestWithdrawScheduler_Start_ContextCancellation(t *testing.T) {
 		// Should return context.Canceled
 		select {
 		case err := <-errCh:
-			if err != context.Canceled {
-				t.Errorf("Start() returned %v, want context.Canceled", err)
-			}
+			assert.ErrorIs(t, err, context.Canceled)
 		default:
 			t.Error("Start() did not return after context cancellation")
 		}
@@ -638,12 +596,8 @@ func TestWithdrawScheduler_ConsecutiveErrors(t *testing.T) {
 	state := s.tenants[tenant]
 	s.mu.Unlock()
 
-	if state == nil {
-		t.Fatal("tenant state not created")
-	}
-	if state.consecutiveErrs != 1 {
-		t.Errorf("consecutiveErrs = %d, want 1", state.consecutiveErrs)
-	}
+	require.NotNil(t, state, "tenant state not created")
+	assert.Equal(t, 1, state.consecutiveErrs)
 
 	// Second check - 2 errors, exceeds threshold
 	nextCheck := s.checkCreditsAndClose(context.Background())
@@ -652,15 +606,12 @@ func TestWithdrawScheduler_ConsecutiveErrors(t *testing.T) {
 	state = s.tenants[tenant]
 	s.mu.Unlock()
 
-	if state.consecutiveErrs != 2 {
-		t.Errorf("consecutiveErrs = %d, want 2", state.consecutiveErrs)
-	}
+	assert.Equal(t, 2, state.consecutiveErrs)
 
 	// Next check should be scheduled earlier due to errors
 	expectedEarliest := time.Now().Add(10 * time.Second)
-	if nextCheck.After(expectedEarliest.Add(time.Second)) {
-		t.Errorf("nextCheck = %v, should be before %v due to error threshold", nextCheck, expectedEarliest)
-	}
+	assert.False(t, nextCheck.After(expectedEarliest.Add(time.Second)),
+		"nextCheck = %v, should be before %v due to error threshold", nextCheck, expectedEarliest)
 }
 
 // generateTestAddress creates a valid bech32 address for testing.
@@ -669,9 +620,7 @@ func generateTestAddress(t *testing.T, prefix string) string {
 	// Use a fixed 20-byte value for deterministic tests
 	addrBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 	addr, err := bech32.ConvertAndEncode(prefix, addrBytes)
-	if err != nil {
-		t.Fatalf("failed to generate test address: %v", err)
-	}
+	require.NoError(t, err, "failed to generate test address")
 	return addr
 }
 
@@ -680,9 +629,7 @@ func generateTestAddressN(t *testing.T, prefix string, n int) string {
 	t.Helper()
 	addrBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, byte(n)}
 	addr, err := bech32.ConvertAndEncode(prefix, addrBytes)
-	if err != nil {
-		t.Fatalf("failed to generate test address: %v", err)
-	}
+	require.NoError(t, err, "failed to generate test address")
 	return addr
 }
 
@@ -729,9 +676,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_ContextCancellation(t *testing.T
 	// Verify we stopped iterating when context was cancelled
 	// Due to map iteration order being non-deterministic, we may get 1-2 calls
 	finalCount := atomic.LoadInt32(&getCreditCallCount)
-	if finalCount > 2 {
-		t.Errorf("expected at most 2 GetCreditAccount calls before cancellation, got %d", finalCount)
-	}
+	assert.LessOrEqual(t, finalCount, int32(2),
+		"expected at most 2 GetCreditAccount calls before cancellation, got %d", finalCount)
 }
 
 func TestWithdrawScheduler_CheckCreditsAndClose_CloseLeasesContextCheck(t *testing.T) {
@@ -767,9 +713,7 @@ func TestWithdrawScheduler_CheckCreditsAndClose_CloseLeasesContextCheck(t *testi
 	s.checkCreditsAndClose(ctx)
 
 	// CloseLeases should NOT be called because context was cancelled
-	if closeCalled {
-		t.Error("CloseLeases should not be called when context is cancelled")
-	}
+	assert.False(t, closeCalled, "CloseLeases should not be called when context is cancelled")
 }
 
 func TestWithdrawScheduler_EstimateDepletionTime_HighPrecision(t *testing.T) {
@@ -826,20 +770,15 @@ func TestWithdrawScheduler_EstimateDepletionTime_HighPrecision(t *testing.T) {
 			depletion := s.estimateDepletionTime(tt.prevBalance, tt.currBalance, tt.elapsed, now)
 
 			if tt.wantZero {
-				if !depletion.IsZero() {
-					t.Errorf("estimateDepletionTime() = %v, want zero time", depletion)
-				}
+				assert.True(t, depletion.IsZero(), "estimateDepletionTime() = %v, want zero time", depletion)
 				return
 			}
 
-			if depletion.IsZero() {
-				t.Fatal("estimateDepletionTime() returned zero time, want non-zero")
-			}
+			require.False(t, depletion.IsZero(), "estimateDepletionTime() returned zero time, want non-zero")
 
 			remaining := depletion.Sub(now)
-			if remaining < tt.minRemaining || remaining > tt.maxRemaining {
-				t.Errorf("estimated remaining = %v, want between %v and %v", remaining, tt.minRemaining, tt.maxRemaining)
-			}
+			assert.True(t, remaining >= tt.minRemaining && remaining <= tt.maxRemaining,
+				"estimated remaining = %v, want between %v and %v", remaining, tt.minRemaining, tt.maxRemaining)
 		})
 	}
 }

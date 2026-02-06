@@ -19,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/scheduler"
 	"github.com/manifest-network/fred/internal/watcher"
 )
@@ -41,6 +42,8 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 	})
 }
 
+var version = "dev"
+
 var (
 	configFile string
 	rootCmd    = &cobra.Command{
@@ -56,6 +59,7 @@ var (
 var sdkConfigOnce sync.Once
 
 func init() {
+	rootCmd.Version = version
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "path to config file")
 
 	// Configure SDK with manifest bech32 prefixes.
@@ -84,21 +88,27 @@ func main() {
 }
 
 func run(cmd *cobra.Command, args []string) error {
-	// Set up structured logging
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
-
-	// Load configuration
+	// Load configuration (uses default logger during loading)
 	cfg, err := config.Load(configFile)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
+	// Set up structured logging with configured level
+	logLevel, err := config.ParseLogLevel(cfg.LogLevel)
+	if err != nil {
+		return fmt.Errorf("invalid log_level: %w", err)
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
+	slog.SetDefault(logger)
+
 	slog.Info("starting providerd",
+		"version", version,
 		"provider_uuid", cfg.ProviderUUID,
 		"chain_id", cfg.ChainID,
+		"log_level", cfg.LogLevel,
 	)
 
 	// Create context with cancellation
@@ -162,6 +172,7 @@ func run(cmd *cobra.Command, args []string) error {
 			Name:    bcfg.Name,
 			BaseURL: bcfg.URL,
 			Timeout: bcfg.Timeout,
+			Secret:  cfg.CallbackSecret,
 		})
 
 		backendEntries = append(backendEntries, backend.BackendEntry{
@@ -189,12 +200,10 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create payload store if database path is configured
-	var payloadStore *provisioner.PayloadStore
+	var payloadStore *payload.Store
 	if cfg.PayloadStoreDBPath != "" {
-		payloadStore, err = provisioner.NewPayloadStore(provisioner.PayloadStoreConfig{
-			DBPath:          cfg.PayloadStoreDBPath,
-			TTL:             cfg.PayloadStoreTTL,
-			CleanupInterval: cfg.PayloadStoreCleanupFreq,
+		payloadStore, err = payload.NewStore(payload.StoreConfig{
+			DBPath: cfg.PayloadStoreDBPath,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create payload store: %w", err)

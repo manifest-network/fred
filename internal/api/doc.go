@@ -42,6 +42,8 @@
 //	GET  /metrics                         - Prometheus metrics
 //	GET  /v1/leases/{uuid}/connection     - Get connection details (authenticated)
 //	GET  /v1/leases/{uuid}/status         - Get provisioning status (authenticated)
+//	GET  /v1/leases/{uuid}/provision      - Get provision diagnostics (authenticated)
+//	GET  /v1/leases/{uuid}/logs           - Get container logs (authenticated)
 //	POST /v1/leases/{uuid}/data           - Upload deployment payload (authenticated)
 //	POST /callbacks/provision             - Backend provisioning callback (HMAC auth)
 package api

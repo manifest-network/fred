@@ -30,8 +30,8 @@ type mockProvision struct {
 	ProviderUUID string
 	Tenant       string
 	SKU          string
-	Quantity     int    // Number of units provisioned
-	Status       string // "provisioning", "ready", "failed"
+	Quantity     int             // Number of units provisioned
+	Status       ProvisionStatus // "provisioning", "ready", "failed"
 	CreatedAt    time.Time
 	Payload      []byte
 	PayloadHash  string
@@ -87,7 +87,7 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 		Tenant:       req.Tenant,
 		SKU:          req.RoutingSKU(),
 		Quantity:     req.TotalQuantity(),
-		Status:       "provisioning",
+		Status:       ProvisionStatusProvisioning,
 		CreatedAt:    time.Now(),
 		Payload:      req.Payload,
 		PayloadHash:  req.PayloadHash,
@@ -112,14 +112,14 @@ func (m *MockBackend) Provision(ctx context.Context, req ProvisionRequest) error
 				m.mu.Unlock()
 				return // Deprovisioned while provisioning
 			}
-			p.Status = "ready"
+			p.Status = ProvisionStatusReady
 			m.mu.Unlock()
 
 			// Send callback
 			if callbackFn != nil {
 				callbackFn(CallbackPayload{
 					LeaseUUID: req.LeaseUUID,
-					Status:    "success",
+					Status:    CallbackStatusSuccess,
 				})
 			}
 		}()
@@ -138,7 +138,7 @@ func (m *MockBackend) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo
 		return nil, ErrNotProvisioned
 	}
 
-	if provision.Status != "ready" {
+	if provision.Status != ProvisionStatusReady {
 		return nil, ErrNotProvisioned
 	}
 
@@ -195,8 +195,43 @@ func (m *MockBackend) Health(ctx context.Context) error {
 	return nil
 }
 
-// GetProvision returns a specific provision (for testing).
-func (m *MockBackend) GetProvision(leaseUUID string) (*mockProvision, bool) {
+// RefreshState is a no-op for mock backend.
+func (m *MockBackend) RefreshState(ctx context.Context) error {
+	return nil
+}
+
+// GetProvision returns status information for a single provision (Backend interface).
+func (m *MockBackend) GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	p, exists := m.provisions[leaseUUID]
+	if !exists {
+		return nil, ErrNotProvisioned
+	}
+
+	return &ProvisionInfo{
+		LeaseUUID:    p.LeaseUUID,
+		ProviderUUID: p.ProviderUUID,
+		Status:       p.Status,
+		CreatedAt:    p.CreatedAt,
+	}, nil
+}
+
+// GetLogs returns empty logs for mock backend (Backend interface).
+func (m *MockBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.provisions[leaseUUID]; !exists {
+		return nil, ErrNotProvisioned
+	}
+
+	return map[string]string{"0": "mock log output\n"}, nil
+}
+
+// GetMockProvision returns the internal mock provision (for testing).
+func (m *MockBackend) GetMockProvision(leaseUUID string) (*mockProvision, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -211,7 +246,7 @@ func (m *MockBackend) GetProvision(leaseUUID string) (*mockProvision, bool) {
 }
 
 // SetProvisionStatus manually sets a provision's status (for testing).
-func (m *MockBackend) SetProvisionStatus(leaseUUID, status string) {
+func (m *MockBackend) SetProvisionStatus(leaseUUID string, status ProvisionStatus) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

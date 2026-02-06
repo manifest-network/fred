@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Test UUIDs - valid RFC 4122 format
@@ -57,33 +60,15 @@ func TestNewEventSubscriber(t *testing.T) {
 				ReconnectInitial: tt.reconnectInitial,
 				ReconnectMax:     tt.reconnectMax,
 			})
-			if err != nil {
-				t.Fatalf("NewEventSubscriber() error = %v", err)
-			}
-			if sub == nil {
-				t.Fatal("NewEventSubscriber() returned nil")
-			}
-			if sub.url != tt.url {
-				t.Errorf("url = %q, want %q", sub.url, tt.url)
-			}
-			if sub.providerUUID != tt.providerUUID {
-				t.Errorf("providerUUID = %q, want %q", sub.providerUUID, tt.providerUUID)
-			}
-			if sub.pingInterval != tt.wantPing {
-				t.Errorf("pingInterval = %v, want %v", sub.pingInterval, tt.wantPing)
-			}
-			if sub.reconnectInitial != tt.wantInitial {
-				t.Errorf("reconnectInitial = %v, want %v", sub.reconnectInitial, tt.wantInitial)
-			}
-			if sub.reconnectMax != tt.wantMax {
-				t.Errorf("reconnectMax = %v, want %v", sub.reconnectMax, tt.wantMax)
-			}
-			if sub.subscribers == nil {
-				t.Error("subscribers map is nil")
-			}
-			if sub.done == nil {
-				t.Error("done channel is nil")
-			}
+			require.NoError(t, err)
+			require.NotNil(t, sub)
+			assert.Equal(t, tt.url, sub.url)
+			assert.Equal(t, tt.providerUUID, sub.providerUUID)
+			assert.Equal(t, tt.wantPing, sub.pingInterval)
+			assert.Equal(t, tt.wantInitial, sub.reconnectInitial)
+			assert.Equal(t, tt.wantMax, sub.reconnectMax)
+			assert.NotNil(t, sub.subscribers)
+			assert.NotNil(t, sub.done)
 		})
 	}
 }
@@ -106,9 +91,7 @@ func TestNewEventSubscriber_InvalidUUID(t *testing.T) {
 				URL:          "ws://localhost:26657/websocket",
 				ProviderUUID: tt.providerUUID,
 			})
-			if err == nil {
-				t.Errorf("NewEventSubscriber() should reject invalid UUID %q", tt.providerUUID)
-			}
+			assert.Error(t, err)
 		})
 	}
 }
@@ -118,14 +101,10 @@ func TestEventSubscriber_Subscribe(t *testing.T) {
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: testProviderUUID,
 	})
-	if err != nil {
-		t.Fatalf("NewEventSubscriber() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ch := sub.Subscribe()
-	if ch == nil {
-		t.Error("Subscribe() returned nil channel")
-	}
+	assert.NotNil(t, ch)
 
 	// Should be able to unsubscribe
 	sub.Unsubscribe(ch)
@@ -133,12 +112,9 @@ func TestEventSubscriber_Subscribe(t *testing.T) {
 	// Multiple subscriptions should work
 	ch1 := sub.Subscribe()
 	ch2 := sub.Subscribe()
-	if ch1 == nil || ch2 == nil {
-		t.Error("Subscribe() returned nil channel")
-	}
-	if ch1 == ch2 {
-		t.Error("Subscribe() should return different channels")
-	}
+	assert.NotNil(t, ch1)
+	assert.NotNil(t, ch2)
+	assert.False(t, ch1 == ch2)
 
 	sub.Unsubscribe(ch1)
 	sub.Unsubscribe(ch2)
@@ -194,9 +170,7 @@ func TestGetEventAttribute(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := getEventAttribute(tt.events, tt.key)
-			if got != tt.want {
-				t.Errorf("getEventAttribute() = %q, want %q", got, tt.want)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -206,9 +180,7 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: testProviderUUID,
 	})
-	if err != nil {
-		t.Fatalf("NewEventSubscriber() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	tests := []struct {
 		name   string
@@ -278,26 +250,14 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := sub.parseLeaseEvent(tt.events)
 			if tt.want == nil {
-				if got != nil {
-					t.Errorf("parseLeaseEvent() = %v, want nil", got)
-				}
+				assert.Nil(t, got)
 				return
 			}
-			if got == nil {
-				t.Fatal("parseLeaseEvent() = nil, want non-nil")
-			}
-			if got.Type != tt.want.Type {
-				t.Errorf("Type = %v, want %v", got.Type, tt.want.Type)
-			}
-			if got.LeaseUUID != tt.want.LeaseUUID {
-				t.Errorf("LeaseUUID = %q, want %q", got.LeaseUUID, tt.want.LeaseUUID)
-			}
-			if got.ProviderUUID != tt.want.ProviderUUID {
-				t.Errorf("ProviderUUID = %q, want %q", got.ProviderUUID, tt.want.ProviderUUID)
-			}
-			if got.Tenant != tt.want.Tenant {
-				t.Errorf("Tenant = %q, want %q", got.Tenant, tt.want.Tenant)
-			}
+			require.NotNil(t, got)
+			assert.Equal(t, tt.want.Type, got.Type)
+			assert.Equal(t, tt.want.LeaseUUID, got.LeaseUUID)
+			assert.Equal(t, tt.want.ProviderUUID, got.ProviderUUID)
+			assert.Equal(t, tt.want.Tenant, got.Tenant)
 		})
 	}
 }
@@ -307,9 +267,7 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: testProviderUUID,
 	})
-	if err != nil {
-		t.Fatalf("NewEventSubscriber() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Helper to create result JSON with events
 	makeResultJSON := func(events map[string][]string) json.RawMessage {
@@ -393,13 +351,9 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 			// Check if event was emitted
 			select {
 			case <-events:
-				if !tt.expectEvent {
-					t.Error("handleMessage() emitted event when none expected")
-				}
+				assert.True(t, tt.expectEvent)
 			default:
-				if tt.expectEvent {
-					t.Error("handleMessage() did not emit expected event")
-				}
+				assert.False(t, tt.expectEvent)
 			}
 		})
 	}
@@ -410,9 +364,7 @@ func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: testProviderUUID,
 	})
-	if err != nil {
-		t.Fatalf("NewEventSubscriber() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Track multiple invalid messages
 	for range 15 {
@@ -423,9 +375,7 @@ func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
 	count := sub.invalidMsgCount
 	sub.mu.Unlock()
 
-	if count != 15 {
-		t.Errorf("invalidMsgCount = %d, want 15", count)
-	}
+	assert.Equal(t, 15, count)
 }
 
 func TestEventSubscriber_Close(t *testing.T) {
@@ -433,9 +383,7 @@ func TestEventSubscriber_Close(t *testing.T) {
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: testProviderUUID,
 	})
-	if err != nil {
-		t.Fatalf("NewEventSubscriber() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Close should not panic
 	sub.Close()
@@ -464,9 +412,7 @@ func TestLeaseEventType_String(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(string(tt.eventType), func(t *testing.T) {
-			if string(tt.eventType) != tt.want {
-				t.Errorf("LeaseEventType = %q, want %q", tt.eventType, tt.want)
-			}
+			assert.Equal(t, tt.want, string(tt.eventType))
 		})
 	}
 }

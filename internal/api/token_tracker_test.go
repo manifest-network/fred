@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -14,9 +17,7 @@ func TestNewTokenTracker(t *testing.T) {
 		_, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: "",
 		})
-		if err == nil {
-			t.Error("NewTokenTracker() should fail with empty DBPath")
-		}
+		assert.Error(t, err, "NewTokenTracker() should fail with empty DBPath")
 	})
 
 	t.Run("creates_db_file", func(t *testing.T) {
@@ -25,15 +26,12 @@ func TestNewTokenTracker(t *testing.T) {
 		tracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tracker.Close()
 
 		// Check file exists
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			t.Error("database file was not created")
-		}
+		_, err = os.Stat(dbPath)
+		assert.False(t, os.IsNotExist(err), "database file was not created")
 	})
 
 	t.Run("uses_default_max_age", func(t *testing.T) {
@@ -43,14 +41,10 @@ func TestNewTokenTracker(t *testing.T) {
 			DBPath: dbPath,
 			// MaxAge not set - should default to MaxTokenAge
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tracker.Close()
 
-		if tracker.maxAge != MaxTokenAge {
-			t.Errorf("maxAge = %v, want %v", tracker.maxAge, MaxTokenAge)
-		}
+		assert.Equal(t, MaxTokenAge, tracker.maxAge)
 	})
 }
 
@@ -61,15 +55,11 @@ func TestTokenTracker_TryUse(t *testing.T) {
 			DBPath: dbPath,
 			MaxAge: 1 * time.Minute,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tracker.Close()
 
 		err = tracker.TryUse("test-token-123")
-		if err != nil {
-			t.Errorf("TryUse() first use error = %v", err)
-		}
+		assert.NoError(t, err)
 	})
 
 	t.Run("second_use_fails", func(t *testing.T) {
@@ -78,22 +68,16 @@ func TestTokenTracker_TryUse(t *testing.T) {
 			DBPath: dbPath,
 			MaxAge: 1 * time.Minute,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tracker.Close()
 
 		// First use
 		err = tracker.TryUse("test-token-456")
-		if err != nil {
-			t.Fatalf("TryUse() first use error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Second use should fail
 		err = tracker.TryUse("test-token-456")
-		if err != ErrTokenAlreadyUsed {
-			t.Errorf("TryUse() second use error = %v, want ErrTokenAlreadyUsed", err)
-		}
+		assert.Equal(t, ErrTokenAlreadyUsed, err)
 	})
 
 	t.Run("different_tokens_independent", func(t *testing.T) {
@@ -102,28 +86,20 @@ func TestTokenTracker_TryUse(t *testing.T) {
 			DBPath: dbPath,
 			MaxAge: 1 * time.Minute,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tracker.Close()
 
 		// Use token A
 		err = tracker.TryUse("token-A")
-		if err != nil {
-			t.Fatalf("TryUse(A) first error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Use token B should succeed
 		err = tracker.TryUse("token-B")
-		if err != nil {
-			t.Errorf("TryUse(B) error = %v, want nil", err)
-		}
+		assert.NoError(t, err)
 
 		// Use token A again should fail
 		err = tracker.TryUse("token-A")
-		if err != ErrTokenAlreadyUsed {
-			t.Errorf("TryUse(A) second error = %v, want ErrTokenAlreadyUsed", err)
-		}
+		assert.Equal(t, ErrTokenAlreadyUsed, err)
 	})
 
 	t.Run("expired_token_can_be_reused", func(t *testing.T) {
@@ -133,25 +109,19 @@ func TestTokenTracker_TryUse(t *testing.T) {
 			MaxAge:          50 * time.Millisecond, // Very short for testing
 			CleanupInterval: 1 * time.Hour,         // Don't auto-cleanup during test
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 		defer tracker.Close()
 
 		// First use
 		err = tracker.TryUse("expiring-token")
-		if err != nil {
-			t.Fatalf("TryUse() first use error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Wait for expiry
 		time.Sleep(60 * time.Millisecond)
 
 		// Should be able to reuse after expiry
 		err = tracker.TryUse("expiring-token")
-		if err != nil {
-			t.Errorf("TryUse() after expiry error = %v, want nil", err)
-		}
+		assert.NoError(t, err)
 	})
 }
 
@@ -162,9 +132,7 @@ func TestTokenTracker_Cleanup(t *testing.T) {
 		MaxAge:          50 * time.Millisecond, // Very short for testing
 		CleanupInterval: 1 * time.Hour,         // Don't auto-cleanup
 	})
-	if err != nil {
-		t.Fatalf("NewTokenTracker() error = %v", err)
-	}
+	require.NoError(t, err)
 	defer tracker.Close()
 
 	// Add tokens
@@ -172,26 +140,19 @@ func TestTokenTracker_Cleanup(t *testing.T) {
 	tracker.TryUse("token-2")
 
 	// Verify tokens are tracked (replay should fail)
-	if err := tracker.TryUse("token-1"); err != ErrTokenAlreadyUsed {
-		t.Fatalf("TryUse() before expiry error = %v, want ErrTokenAlreadyUsed", err)
-	}
+	err = tracker.TryUse("token-1")
+	require.Equal(t, ErrTokenAlreadyUsed, err, "TryUse() before expiry should return ErrTokenAlreadyUsed")
 
 	// Wait for expiry
 	time.Sleep(60 * time.Millisecond)
 
 	// Manual cleanup
 	err = tracker.cleanup()
-	if err != nil {
-		t.Fatalf("cleanup() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// After cleanup, tokens should be reusable (they were cleaned up)
-	if err := tracker.TryUse("token-1"); err != nil {
-		t.Errorf("TryUse() after cleanup error = %v, want nil (token should be reusable)", err)
-	}
-	if err := tracker.TryUse("token-2"); err != nil {
-		t.Errorf("TryUse() after cleanup error = %v, want nil (token should be reusable)", err)
-	}
+	assert.NoError(t, tracker.TryUse("token-1"), "token should be reusable")
+	assert.NoError(t, tracker.TryUse("token-2"), "token should be reusable")
 }
 
 func TestTokenTracker_Persistence(t *testing.T) {
@@ -202,14 +163,10 @@ func TestTokenTracker_Persistence(t *testing.T) {
 		DBPath: dbPath,
 		MaxAge: 1 * time.Minute,
 	})
-	if err != nil {
-		t.Fatalf("NewTokenTracker() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = tracker1.TryUse("persistent-token")
-	if err != nil {
-		t.Fatalf("TryUse() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Close first tracker
 	tracker1.Close()
@@ -219,16 +176,12 @@ func TestTokenTracker_Persistence(t *testing.T) {
 		DBPath: dbPath,
 		MaxAge: 1 * time.Minute,
 	})
-	if err != nil {
-		t.Fatalf("NewTokenTracker() second error = %v", err)
-	}
+	require.NoError(t, err)
 	defer tracker2.Close()
 
 	// Token should still be marked as used
 	err = tracker2.TryUse("persistent-token")
-	if err != ErrTokenAlreadyUsed {
-		t.Errorf("TryUse() after restart error = %v, want ErrTokenAlreadyUsed", err)
-	}
+	assert.Equal(t, ErrTokenAlreadyUsed, err)
 }
 
 func TestTokenTracker_Close(t *testing.T) {
@@ -238,15 +191,11 @@ func TestTokenTracker_Close(t *testing.T) {
 			DBPath: dbPath,
 			MaxAge: 1 * time.Minute,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// Close should not error
 		err = tracker.Close()
-		if err != nil {
-			t.Errorf("Close() error = %v", err)
-		}
+		assert.NoError(t, err)
 	})
 
 	t.Run("close_is_idempotent", func(t *testing.T) {
@@ -255,27 +204,19 @@ func TestTokenTracker_Close(t *testing.T) {
 			DBPath: dbPath,
 			MaxAge: 1 * time.Minute,
 		})
-		if err != nil {
-			t.Fatalf("NewTokenTracker() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		// First close
 		err = tracker.Close()
-		if err != nil {
-			t.Errorf("Close() first call error = %v", err)
-		}
+		assert.NoError(t, err)
 
 		// Second close should not error (idempotent)
 		err = tracker.Close()
-		if err != nil {
-			t.Errorf("Close() second call error = %v", err)
-		}
+		assert.NoError(t, err)
 
 		// Third close should also be fine
 		err = tracker.Close()
-		if err != nil {
-			t.Errorf("Close() third call error = %v", err)
-		}
+		assert.NoError(t, err)
 	})
 }
 
@@ -286,15 +227,11 @@ func TestTimeConversion(t *testing.T) {
 	restored := util.BytesToTime(bytes)
 
 	// UnixNano precision
-	if original.UnixNano() != restored.UnixNano() {
-		t.Errorf("time round-trip failed: original=%v, restored=%v", original.UnixNano(), restored.UnixNano())
-	}
+	assert.Equal(t, original.UnixNano(), restored.UnixNano(), "time round-trip failed")
 }
 
 func TestBytesToTime_InvalidInput(t *testing.T) {
 	// Invalid length should return zero time
 	result := util.BytesToTime([]byte{1, 2, 3}) // Only 3 bytes, need 8
-	if !result.IsZero() {
-		t.Errorf("BytesToTime(short) = %v, want zero time", result)
-	}
+	assert.True(t, result.IsZero())
 }

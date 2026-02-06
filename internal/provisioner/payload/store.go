@@ -1,11 +1,8 @@
-package provisioner
+package payload
 
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,15 +31,6 @@ const (
 	writeChannelSize = 1000
 )
 
-const (
-	// DefaultPayloadTTL is the default time-to-live for stored payloads.
-	// Payloads older than this are considered stale and will be cleaned up.
-	DefaultPayloadTTL = 1 * time.Hour
-
-	// DefaultPayloadCleanupInterval is how often to clean up stale payloads.
-	DefaultPayloadCleanupInterval = 10 * time.Minute
-)
-
 var (
 	// payloadBucketName is the bbolt bucket for storing payloads.
 	payloadBucketName = []byte("payloads")
@@ -58,7 +46,6 @@ const (
 	opStore writeOpType = iota
 	opDelete
 	opPop
-	opCleanup
 )
 
 // writeOp represents a write operation to be batched.
@@ -78,16 +65,14 @@ type writeResult struct {
 	err     error
 }
 
-// PayloadStore stores pending payloads for leases awaiting provisioning.
+// Store stores pending payloads for leases awaiting provisioning.
 // Payloads are persisted to bbolt to survive restarts.
 // The chain's MetaHash remains the source of truth for validation.
 //
 // Write operations are batched through a dedicated writer goroutine to reduce
 // bbolt lock contention under high concurrency.
-type PayloadStore struct {
-	db              *bolt.DB
-	ttl             time.Duration
-	cleanupInterval time.Duration
+type Store struct {
+	db *bolt.DB
 
 	// Write batching
 	writeCh       chan writeOp
@@ -95,29 +80,27 @@ type PayloadStore struct {
 	flushInterval time.Duration
 
 	// For graceful shutdown
-	cancel context.CancelFunc
-	wg     *sync.WaitGroup // Pointer to avoid copy-by-value issues
+	ctx       context.Context    // store-level context; Done channel used by write methods to avoid blocking after Close
+	cancel    context.CancelFunc
+	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
+	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
 }
 
-// PayloadStoreConfig configures the payload store.
-type PayloadStoreConfig struct {
-	DBPath          string        // Path to bbolt database file
-	TTL             time.Duration // How long to keep payloads before cleanup (default: 1 hour)
-	CleanupInterval time.Duration // How often to clean up stale payloads (default: 10 minutes)
-	BatchSize       int           // Max operations per batch (default: 50)
-	FlushInterval   time.Duration // Max wait before flushing batch (default: 50ms)
+// StoreConfig configures the payload store.
+type StoreConfig struct {
+	DBPath        string        // Path to bbolt database file
+	BatchSize     int           // Max operations per batch (default: 50)
+	FlushInterval time.Duration // Max wait before flushing batch (default: 50ms)
 }
 
-// NewPayloadStore creates a new payload store with bbolt persistence.
-func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
+// NewStore creates a new payload store with bbolt persistence.
+func NewStore(cfg StoreConfig) (*Store, error) {
 	if cfg.DBPath == "" {
 		return nil, errors.New("db path is required")
 	}
 
 	// Apply defaults using cmp.Or (returns first non-zero value)
 	// For batchSize and flushInterval, use max() to convert negative values to 0
-	ttl := cmp.Or(cfg.TTL, DefaultPayloadTTL)
-	cleanupInterval := cmp.Or(cfg.CleanupInterval, DefaultPayloadCleanupInterval)
 	batchSize := cmp.Or(max(cfg.BatchSize, 0), DefaultBatchSize)
 	flushInterval := cmp.Or(max(cfg.FlushInterval, 0), DefaultFlushInterval)
 
@@ -144,35 +127,25 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &PayloadStore{
-		db:              db,
-		ttl:             ttl,
-		cleanupInterval: cleanupInterval,
-		writeCh:         make(chan writeOp, writeChannelSize),
-		batchSize:       batchSize,
-		flushInterval:   flushInterval,
-		cancel:          cancel,
-		wg:              &sync.WaitGroup{},
+	s := &Store{
+		db:            db,
+		writeCh:       make(chan writeOp, writeChannelSize),
+		batchSize:     batchSize,
+		flushInterval: flushInterval,
+		ctx:           ctx,
+		cancel:        cancel,
+		wg:            &sync.WaitGroup{},
+		closeOnce:     &sync.Once{},
 	}
 
 	// Start the batching writer goroutine (using WaitGroup.Go for Go 1.25+)
 	s.wg.Go(func() { s.writerLoop(ctx) })
-
-	// Start background cleanup (using WaitGroup.Go for Go 1.25+)
-	s.wg.Go(func() { s.cleanupLoop(ctx) })
-
-	// Run initial cleanup to remove any stale entries from previous run
-	if err := s.cleanupDirect(); err != nil {
-		slog.Warn("initial payload cleanup failed", "error", err)
-	}
 
 	// Initialize the stored count metric based on current database state
 	metrics.PayloadStoredCount.Set(float64(s.Count()))
 
 	slog.Info("payload store initialized",
 		"db_path", cfg.DBPath,
-		"ttl", ttl,
-		"cleanup_interval", cleanupInterval,
 		"batch_size", batchSize,
 		"flush_interval", flushInterval,
 		"initial_count", s.Count(),
@@ -188,7 +161,7 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 // is full (>1000 pending operations), it will block until space is available.
 // This provides backpressure under extreme load. Callers should not hold locks
 // when calling this method.
-func (s *PayloadStore) Store(leaseUUID string, payload []byte) bool {
+func (s *Store) Store(leaseUUID string, payload []byte) bool {
 	resultCh := make(chan writeResult, 1)
 
 	op := writeOp{
@@ -199,24 +172,35 @@ func (s *PayloadStore) Store(leaseUUID string, payload []byte) bool {
 		resultCh: resultCh,
 	}
 
-	s.writeCh <- op
-	result := <-resultCh
-
-	if result.err != nil {
-		slog.Error("failed to store payload", "lease_uuid", leaseUUID, "error", result.err)
+	select {
+	case s.writeCh <- op:
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed, cannot store", "lease_uuid", leaseUUID)
 		return false
 	}
 
-	if result.stored {
-		metrics.PayloadStoredCount.Inc()
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			slog.Error("failed to store payload", "lease_uuid", leaseUUID, "error", result.err)
+			return false
+		}
+		if result.stored {
+			metrics.PayloadStoredCount.Inc()
+		}
+		return result.stored
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed during store", "lease_uuid", leaseUUID)
+		return false
 	}
-
-	return result.stored
 }
 
 // Get retrieves a payload for a lease without removing it.
-// Returns nil if no payload exists.
-func (s *PayloadStore) Get(leaseUUID string) []byte {
+// Returns (nil, nil) if no payload exists.
+// Returns a non-nil error if the database read fails — callers must not treat
+// errors the same as "not found" to avoid closing active leases on transient
+// disk failures.
+func (s *Store) Get(leaseUUID string) ([]byte, error) {
 	key := []byte(leaseUUID)
 	var payload []byte
 
@@ -232,11 +216,10 @@ func (s *PayloadStore) Get(leaseUUID string) []byte {
 	})
 
 	if err != nil {
-		slog.Error("failed to get payload", "lease_uuid", leaseUUID, "error", err)
-		return nil
+		return nil, fmt.Errorf("failed to get payload for %s: %w", leaseUUID, err)
 	}
 
-	return payload
+	return payload, nil
 }
 
 // Pop retrieves and removes a payload for a lease.
@@ -246,7 +229,7 @@ func (s *PayloadStore) Get(leaseUUID string) []byte {
 // is full (>1000 pending operations), it will block until space is available.
 // This provides backpressure under extreme load. Callers should not hold locks
 // when calling this method.
-func (s *PayloadStore) Pop(leaseUUID string) []byte {
+func (s *Store) Pop(leaseUUID string) []byte {
 	resultCh := make(chan writeResult, 1)
 
 	op := writeOp{
@@ -255,23 +238,33 @@ func (s *PayloadStore) Pop(leaseUUID string) []byte {
 		resultCh: resultCh,
 	}
 
-	s.writeCh <- op
-	result := <-resultCh
-
-	if result.err != nil {
-		slog.Error("failed to pop payload", "lease_uuid", leaseUUID, "error", result.err)
+	select {
+	case s.writeCh <- op:
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed, cannot pop", "lease_uuid", leaseUUID)
 		return nil
 	}
 
-	if result.payload != nil {
-		metrics.PayloadStoredCount.Dec()
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			slog.Error("failed to pop payload", "lease_uuid", leaseUUID, "error", result.err)
+			return nil
+		}
+		if result.payload != nil {
+			metrics.PayloadStoredCount.Dec()
+		}
+		return result.payload
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed during pop", "lease_uuid", leaseUUID)
+		return nil
 	}
-
-	return result.payload
 }
 
 // Has checks if a payload exists for a lease.
-func (s *PayloadStore) Has(leaseUUID string) bool {
+// Returns an error if the database read fails — callers must not treat
+// errors the same as "not found" to avoid incorrect provisioning decisions.
+func (s *Store) Has(leaseUUID string) (bool, error) {
 	key := []byte(leaseUUID)
 	var exists bool
 
@@ -282,11 +275,10 @@ func (s *PayloadStore) Has(leaseUUID string) bool {
 	})
 
 	if err != nil {
-		slog.Error("failed to check payload", "lease_uuid", leaseUUID, "error", err)
-		return false
+		return false, fmt.Errorf("failed to check payload for %s: %w", leaseUUID, err)
 	}
 
-	return exists
+	return exists, nil
 }
 
 // Delete removes a payload for a lease.
@@ -295,7 +287,7 @@ func (s *PayloadStore) Has(leaseUUID string) bool {
 // is full (>1000 pending operations), it will block until space is available.
 // This provides backpressure under extreme load. Callers should not hold locks
 // when calling this method.
-func (s *PayloadStore) Delete(leaseUUID string) {
+func (s *Store) Delete(leaseUUID string) {
 	resultCh := make(chan writeResult, 1)
 
 	op := writeOp{
@@ -304,21 +296,29 @@ func (s *PayloadStore) Delete(leaseUUID string) {
 		resultCh: resultCh,
 	}
 
-	s.writeCh <- op
-	result := <-resultCh
-
-	if result.err != nil {
-		slog.Error("failed to delete payload", "lease_uuid", leaseUUID, "error", result.err)
+	select {
+	case s.writeCh <- op:
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed, cannot delete", "lease_uuid", leaseUUID)
 		return
 	}
 
-	if result.existed {
-		metrics.PayloadStoredCount.Dec()
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			slog.Error("failed to delete payload", "lease_uuid", leaseUUID, "error", result.err)
+			return
+		}
+		if result.existed {
+			metrics.PayloadStoredCount.Dec()
+		}
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed during delete", "lease_uuid", leaseUUID)
 	}
 }
 
 // Count returns the number of stored payloads.
-func (s *PayloadStore) Count() int {
+func (s *Store) Count() int {
 	var count int
 
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -337,7 +337,7 @@ func (s *PayloadStore) Count() int {
 
 // List returns all lease UUIDs that have stored payloads.
 // This is used by the reconciler to check for orphaned payloads.
-func (s *PayloadStore) List() []string {
+func (s *Store) List() []string {
 	var leaseUUIDs []string
 
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -357,23 +357,41 @@ func (s *PayloadStore) List() []string {
 	return leaseUUIDs
 }
 
+// Healthy checks if the bbolt database is accessible and both buckets exist.
+func (s *Store) Healthy() error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(payloadBucketName) == nil {
+			return errors.New("payload bucket missing")
+		}
+		if tx.Bucket(payloadMetaBucketName) == nil {
+			return errors.New("payload metadata bucket missing")
+		}
+		return nil
+	})
+}
+
 // Close shuts down the payload store gracefully.
 // It waits for all pending writes to complete before closing the database.
-func (s *PayloadStore) Close() error {
-	// Signal shutdown - this will cause writerLoop and cleanupLoop to exit
-	s.cancel()
+// Close is idempotent and safe to call multiple times.
+func (s *Store) Close() error {
+	var closeErr error
+	s.closeOnce.Do(func() {
+		// Signal shutdown - this will cause writerLoop to exit
+		s.cancel()
 
-	// Wait for all goroutines to finish (writer will flush pending ops)
-	s.wg.Wait()
+		// Wait for all goroutines to finish (writer will flush pending ops)
+		s.wg.Wait()
 
-	return s.db.Close()
+		closeErr = s.db.Close()
+	})
+	return closeErr
 }
 
 // writerLoop is the dedicated writer goroutine that batches write operations.
 // All write operations (Store, Pop, Delete) are serialized through this goroutine
 // to eliminate bbolt lock contention.
 // Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
-func (s *PayloadStore) writerLoop(ctx context.Context) {
+func (s *Store) writerLoop(ctx context.Context) {
 
 	batch := make([]writeOp, 0, s.batchSize)
 	ticker := time.NewTicker(s.flushInterval)
@@ -499,104 +517,4 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 			flush()
 		}
 	}
-}
-
-// cleanupLoop periodically removes stale payloads.
-// Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
-func (s *PayloadStore) cleanupLoop(ctx context.Context) {
-	util.StartCleanupLoop(ctx, s.cleanupInterval, s.cleanupDirect, "payload")
-}
-
-// cleanupDirect removes stale payloads from the database.
-// This is called directly (not through the batching writer) since cleanup
-// is already serialized through cleanupLoop and runs infrequently.
-func (s *PayloadStore) cleanupDirect() error {
-	now := time.Now()
-	cutoff := now.Add(-s.ttl)
-	var staleCount int
-
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		payloadBucket := tx.Bucket(payloadBucketName)
-		metaBucket := tx.Bucket(payloadMetaBucketName)
-		c := metaBucket.Cursor()
-
-		// Collect keys to delete
-		var toDelete [][]byte
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			storedAt := util.BytesToTime(v)
-			if storedAt.Before(cutoff) {
-				// Make a copy of the key since cursor reuses the slice
-				keyCopy := make([]byte, len(k))
-				copy(keyCopy, k)
-				toDelete = append(toDelete, keyCopy)
-			}
-		}
-
-		// Delete stale entries from both buckets
-		for _, k := range toDelete {
-			if err := payloadBucket.Delete(k); err != nil {
-				return err
-			}
-			if err := metaBucket.Delete(k); err != nil {
-				return err
-			}
-		}
-
-		staleCount = len(toDelete)
-		return nil
-	})
-
-	if err == nil && staleCount > 0 {
-		metrics.PayloadStoredCount.Sub(float64(staleCount))
-		slog.Info("cleaned up stale payloads", "count", staleCount)
-	}
-
-	return err
-}
-
-// PayloadEvent represents a payload upload event for Watermill.
-type PayloadEvent struct {
-	LeaseUUID   string `json:"lease_uuid"`
-	Tenant      string `json:"tenant"`
-	MetaHashHex string `json:"meta_hash_hex"` // Hex-encoded SHA-256
-}
-
-// VerifyPayloadHash computes the SHA-256 hash of payload and compares it against expectedHash
-// using constant-time comparison to prevent timing attacks.
-// Returns nil if the hash matches, otherwise returns an error with the mismatched hashes.
-func VerifyPayloadHash(payload, expectedHash []byte) error {
-	if len(expectedHash) == 0 {
-		return errors.New("expected hash is empty")
-	}
-
-	actualHash := sha256.Sum256(payload)
-	if subtle.ConstantTimeCompare(actualHash[:], expectedHash) != 1 {
-		return &HashMismatchError{
-			Expected: expectedHash,
-			Actual:   actualHash[:],
-		}
-	}
-	return nil
-}
-
-// VerifyPayloadHashHex computes the SHA-256 hash of payload and compares it against expectedHashHex
-// (a hex-encoded hash string) using constant-time comparison.
-// Returns nil if the hash matches, otherwise returns an error.
-func VerifyPayloadHashHex(payload []byte, expectedHashHex string) error {
-	expectedHash, err := hex.DecodeString(expectedHashHex)
-	if err != nil {
-		return fmt.Errorf("invalid expected hash hex: %w", err)
-	}
-	return VerifyPayloadHash(payload, expectedHash)
-}
-
-// HashMismatchError is returned when a payload hash doesn't match the expected hash.
-type HashMismatchError struct {
-	Expected []byte
-	Actual   []byte
-}
-
-func (e *HashMismatchError) Error() string {
-	return fmt.Sprintf("payload hash mismatch: expected %s, got %s",
-		hex.EncodeToString(e.Expected), hex.EncodeToString(e.Actual))
 }

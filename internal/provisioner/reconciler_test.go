@@ -2,16 +2,21 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
-	"strings"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // mockReconcilerBackend implements backend.Backend for testing.
@@ -66,6 +71,18 @@ func (m *mockReconcilerBackend) ListProvisions(ctx context.Context) ([]backend.P
 
 func (m *mockReconcilerBackend) Health(ctx context.Context) error {
 	return nil
+}
+
+func (m *mockReconcilerBackend) RefreshState(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockReconcilerBackend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
+func (m *mockReconcilerBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	return nil, backend.ErrNotProvisioned
 }
 
 func TestNewReconciler_Validation(t *testing.T) {
@@ -123,15 +140,10 @@ func TestNewReconciler_Validation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := NewReconciler(tt.cfg, tt.chainClient, tt.router, nil)
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("NewReconciler() error = %v, want nil", err)
-				}
+				assert.NoError(t, err)
 			} else {
-				if err == nil {
-					t.Errorf("NewReconciler() error = nil, want error containing %q", tt.wantErr)
-				} else if err.Error() != tt.wantErr {
-					t.Errorf("NewReconciler() error = %q, want %q", err.Error(), tt.wantErr)
-				}
+				require.Error(t, err)
+				assert.Equal(t, tt.wantErr, err.Error())
 			}
 		})
 	}
@@ -159,24 +171,16 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify provisioning was started
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 1 {
-		t.Errorf("expected 1 provision call, got %d", len(mockBackend.provisionCalls))
-	}
-	if mockBackend.provisionCalls[0].LeaseUUID != "lease-1" {
-		t.Errorf("expected lease-1, got %s", mockBackend.provisionCalls[0].LeaseUUID)
-	}
+	assert.Len(t, mockBackend.provisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.provisionCalls[0].LeaseUUID)
 }
 
 func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
@@ -212,24 +216,16 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was acknowledged
 	mu.Lock()
 	defer mu.Unlock()
-	if len(acknowledgedLeases) != 1 {
-		t.Errorf("expected 1 acknowledged lease, got %d", len(acknowledgedLeases))
-	}
-	if acknowledgedLeases[0] != "lease-1" {
-		t.Errorf("expected lease-1, got %s", acknowledgedLeases[0])
-	}
+	assert.Len(t, acknowledgedLeases, 1)
+	assert.Equal(t, "lease-1", acknowledgedLeases[0])
 }
 
 func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
@@ -254,21 +250,15 @@ func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify provisioning was attempted (anomaly recovery)
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 1 {
-		t.Errorf("expected 1 provision call (anomaly recovery), got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Len(t, mockBackend.provisionCalls, 1)
 }
 
 func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
@@ -304,14 +294,10 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify nothing was done
 	mockBackend.mu.Lock()
@@ -323,15 +309,9 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	ackCount := acknowledgeCount
 	mu.Unlock()
 
-	if provisionCount != 0 {
-		t.Errorf("expected 0 provision calls, got %d", provisionCount)
-	}
-	if deprovisionCount != 0 {
-		t.Errorf("expected 0 deprovision calls, got %d", deprovisionCount)
-	}
-	if ackCount != 0 {
-		t.Errorf("expected 0 acknowledge calls, got %d", ackCount)
-	}
+	assert.Equal(t, 0, provisionCount)
+	assert.Equal(t, 0, deprovisionCount)
+	assert.Equal(t, 0, ackCount)
 }
 
 func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
@@ -354,24 +334,16 @@ func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify orphan was deprovisioned
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.deprovisionCalls) != 1 {
-		t.Errorf("expected 1 deprovision call, got %d", len(mockBackend.deprovisionCalls))
-	}
-	if mockBackend.deprovisionCalls[0] != "orphan-lease" {
-		t.Errorf("expected orphan-lease, got %s", mockBackend.deprovisionCalls[0])
-	}
+	assert.Len(t, mockBackend.deprovisionCalls, 1)
+	assert.Equal(t, "orphan-lease", mockBackend.deprovisionCalls[0])
 }
 
 func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
@@ -418,17 +390,12 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 				ProviderUUID:    "provider-1",
 				CallbackBaseURL: "http://localhost:8080",
 			}, mockChain, router, nil)
-			if err != nil {
-				t.Fatalf("NewReconciler() error = %v", err)
-			}
+			require.NoError(t, err)
 
 			ctx := context.Background()
 			err = reconciler.ReconcileAll(ctx)
-			if err == nil {
-				t.Errorf("ReconcileAll() error = nil, want error containing %q", tt.wantErr)
-			} else if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("ReconcileAll() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -451,18 +418,14 @@ func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Cancel context before calling ReconcileAll
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	err = reconciler.ReconcileAll(ctx)
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
-	}
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestReconciler_Start_ContextCancellation(t *testing.T) {
@@ -478,9 +441,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		Interval:        100 * time.Millisecond, // Short interval for test
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -497,9 +458,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 	// Should exit with context.Canceled
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("Start() error = %v, want context.Canceled", err)
-		}
+		assert.ErrorIs(t, err, context.Canceled)
 	case <-time.After(1 * time.Second):
 		t.Error("Start() did not exit after context cancellation")
 	}
@@ -518,14 +477,10 @@ func TestReconciler_DefaultInterval(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		// Interval not set
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Verify default interval is 5 minutes
-	if reconciler.interval != 5*time.Minute {
-		t.Errorf("default interval = %v, want %v", reconciler.interval, 5*time.Minute)
-	}
+	assert.Equal(t, 5*time.Minute, reconciler.interval)
 }
 
 func TestReconciler_RunOnce(t *testing.T) {
@@ -549,21 +504,15 @@ func TestReconciler_RunOnce(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.RunOnce(ctx); err != nil {
-		t.Errorf("RunOnce() error = %v", err)
-	}
+	assert.NoError(t, reconciler.RunOnce(ctx))
 
 	// Verify provisioning was started
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 1 {
-		t.Errorf("expected 1 provision call after RunOnce, got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Len(t, mockBackend.provisionCalls, 1)
 }
 
 func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
@@ -594,21 +543,15 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, manager)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify provisioning was NOT started (lease is in-flight)
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	if len(mockBackend.provisionCalls) != 0 {
-		t.Errorf("expected 0 provision calls (lease in-flight), got %d", len(mockBackend.provisionCalls))
-	}
+	assert.Empty(t, mockBackend.provisionCalls)
 }
 
 func TestReconciler_MultipleBackends(t *testing.T) {
@@ -639,14 +582,10 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Both orphans should be deprovisioned
 	backend1.mu.Lock()
@@ -658,9 +597,7 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 	backend2.mu.Unlock()
 
 	// Total deprovisions should be 2
-	if b1Calls+b2Calls != 2 {
-		t.Errorf("expected 2 total deprovision calls, got %d", b1Calls+b2Calls)
-	}
+	assert.Equal(t, 2, b1Calls+b2Calls)
 }
 
 func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
@@ -696,14 +633,10 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify no actions were taken
 	mockBackend.mu.Lock()
@@ -715,15 +648,9 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 	ackCount := acknowledgeCount
 	mu.Unlock()
 
-	if provisionCount != 0 {
-		t.Errorf("expected 0 provision calls (already provisioning), got %d", provisionCount)
-	}
-	if deprovisionCount != 0 {
-		t.Errorf("expected 0 deprovision calls, got %d", deprovisionCount)
-	}
-	if ackCount != 0 {
-		t.Errorf("expected 0 acknowledge calls (not ready yet), got %d", ackCount)
-	}
+	assert.Equal(t, 0, provisionCount)
+	assert.Equal(t, 0, deprovisionCount)
+	assert.Equal(t, 0, ackCount)
 }
 
 func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
@@ -761,14 +688,10 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify no provisioning or deprovisioning
 	mockBackend.mu.Lock()
@@ -776,25 +699,17 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 	deprovisionCount := len(mockBackend.deprovisionCalls)
 	mockBackend.mu.Unlock()
 
-	if provisionCount != 0 {
-		t.Errorf("expected 0 provision calls, got %d", provisionCount)
-	}
-	if deprovisionCount != 0 {
-		t.Errorf("expected 0 deprovision calls, got %d", deprovisionCount)
-	}
+	assert.Equal(t, 0, provisionCount)
+	assert.Equal(t, 0, deprovisionCount)
 
 	// Verify lease was rejected
 	mu.Lock()
 	defer mu.Unlock()
-	if len(rejectedLeases) != 1 {
-		t.Errorf("expected 1 rejected lease, got %d", len(rejectedLeases))
+	assert.Len(t, rejectedLeases, 1)
+	if len(rejectedLeases) > 0 {
+		assert.Equal(t, "lease-1", rejectedLeases[0])
 	}
-	if len(rejectedLeases) > 0 && rejectedLeases[0] != "lease-1" {
-		t.Errorf("expected lease-1 to be rejected, got %s", rejectedLeases[0])
-	}
-	if rejectedReason != "provisioning failed" {
-		t.Errorf("expected rejection reason 'provisioning failed', got %q", rejectedReason)
-	}
+	assert.Equal(t, "provisioning failed", rejectedReason)
 }
 
 func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
@@ -827,17 +742,13 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	// ReconcileAll should succeed even if individual acknowledges fail
 	// (errors are logged, not propagated)
 	err = reconciler.ReconcileAll(ctx)
-	if err != nil {
-		t.Errorf("ReconcileAll() error = %v, want nil (acknowledge errors should be logged, not returned)", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
@@ -863,26 +774,20 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	// ReconcileAll should succeed even if deprovisions fail
 	// (errors are logged, not propagated)
 	err = reconciler.ReconcileAll(ctx)
-	if err != nil {
-		t.Errorf("ReconcileAll() error = %v, want nil (deprovision errors should be logged, not returned)", err)
-	}
+	assert.NoError(t, err)
 
 	// Verify both deprovisions were attempted
 	mockBackend.mu.Lock()
 	deprovisionCount := len(mockBackend.deprovisionCalls)
 	mockBackend.mu.Unlock()
 
-	if deprovisionCount != 2 {
-		t.Errorf("expected 2 deprovision attempts (even with errors), got %d", deprovisionCount)
-	}
+	assert.Equal(t, 2, deprovisionCount)
 }
 
 func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
@@ -910,14 +815,10 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify only our orphans were deprovisioned (not the other provider's)
 	mockBackend.mu.Lock()
@@ -926,16 +827,10 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 
 	// Should have deprovisioned 2 leases: our-orphan-lease and legacy-orphan-lease
 	// Should NOT have deprovisioned other-provider-lease
-	if len(deprovisionCalls) != 2 {
-		t.Errorf("expected 2 deprovision calls, got %d: %v", len(deprovisionCalls), deprovisionCalls)
-	}
+	assert.Len(t, deprovisionCalls, 2)
 
 	// Verify the other provider's lease was NOT deprovisioned
-	for _, call := range deprovisionCalls {
-		if call == "other-provider-lease" {
-			t.Error("should NOT have deprovisioned lease belonging to other provider")
-		}
-	}
+	assert.NotContains(t, deprovisionCalls, "other-provider-lease")
 }
 
 // TestReconciler_ConcurrentProvisioningRace is a regression test for the TOCTOU race
@@ -970,17 +865,13 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, &chain.MockClient{})
-	if err != nil {
-		t.Fatalf("NewManager() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, manager)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Simulate concurrent provisioning attempts
 	const numGoroutines = 50
@@ -1020,14 +911,10 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	provisionCount := len(mockBackend.provisionCalls)
 	mockBackend.mu.Unlock()
 
-	if provisionCount != 1 {
-		t.Errorf("expected exactly 1 provision call, got %d (race condition detected!)", provisionCount)
-	}
+	assert.Equal(t, 1, provisionCount, "race condition detected!")
 
 	// The lease should be tracked
-	if !manager.IsInFlight(leaseUUID) {
-		t.Error("IsInFlight() = false after concurrent provisioning, want true")
-	}
+	assert.True(t, manager.IsInFlight(leaseUUID))
 
 	// Now test that reconciler.ReconcileAll also respects the in-flight tracking
 	// Reset the mock to track new calls
@@ -1036,17 +923,13 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	mockBackend.mu.Unlock()
 
 	// Run reconciliation - should NOT provision again (already in-flight)
-	if err := reconciler.ReconcileAll(context.Background()); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(context.Background()))
 
 	mockBackend.mu.Lock()
 	additionalProvisions := len(mockBackend.provisionCalls)
 	mockBackend.mu.Unlock()
 
-	if additionalProvisions != 0 {
-		t.Errorf("ReconcileAll() made %d additional provision calls, want 0 (lease is in-flight)", additionalProvisions)
-	}
+	assert.Equal(t, 0, additionalProvisions, "lease is in-flight")
 }
 
 func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
@@ -1073,9 +956,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Start first reconciliation in background
 	firstDone := make(chan error, 1)
@@ -1092,28 +973,20 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	secondDuration := time.Since(secondStart)
 
 	// Second call should return quickly (not block waiting for first)
-	if secondDuration > 100*time.Millisecond {
-		t.Errorf("concurrent ReconcileAll() took %v, expected to return immediately", secondDuration)
-	}
+	assert.Less(t, secondDuration, 100*time.Millisecond)
 
 	// No error expected - it just skips
-	if err != nil {
-		t.Errorf("concurrent ReconcileAll() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 
 	// Let first reconciliation complete
 	close(reconcileCanContinue)
-	if err := <-firstDone; err != nil {
-		t.Errorf("first ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, <-firstDone)
 
 	// After first completes, a new reconciliation should be allowed
 	mockChain.GetPendingLeasesFunc = func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 		return nil, nil
 	}
-	if err := reconciler.ReconcileAll(context.Background()); err != nil {
-		t.Errorf("subsequent ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(context.Background()))
 }
 
 func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
@@ -1157,16 +1030,12 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = reconciler.ReconcileAll(ctx)
 
 	// Should return context.Canceled
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
-	}
+	assert.ErrorIs(t, err, context.Canceled)
 
 	// With sequential processing (MaxWorkers=1), should process exactly 1 before cancellation
 	mu.Lock()
@@ -1174,9 +1043,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 	mu.Unlock()
 
 	// First provision triggers cancel, second should see cancelled context
-	if finalCount != 1 {
-		t.Errorf("expected exactly 1 provision call before cancellation, got %d", finalCount)
-	}
+	assert.Equal(t, 1, finalCount)
 }
 
 func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) {
@@ -1218,16 +1085,12 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = reconciler.ReconcileAll(ctx)
 
 	// Should return context.Canceled
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ReconcileAll() error = %v, want context.Canceled", err)
-	}
+	assert.ErrorIs(t, err, context.Canceled)
 
 	// With sequential processing (MaxWorkers=1), should process exactly 1 before cancellation
 	mu.Lock()
@@ -1235,9 +1098,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 	mu.Unlock()
 
 	// First deprovision triggers cancel, second should see cancelled context
-	if finalCount != 1 {
-		t.Errorf("expected exactly 1 deprovision call before cancellation, got %d", finalCount)
-	}
+	assert.Equal(t, 1, finalCount)
 }
 
 // mockCancellingBackend is a test backend with callback hooks for testing cancellation behavior.
@@ -1276,6 +1137,18 @@ func (m *mockCancellingBackend) ListProvisions(ctx context.Context) ([]backend.P
 
 func (m *mockCancellingBackend) Health(ctx context.Context) error {
 	return nil
+}
+
+func (m *mockCancellingBackend) RefreshState(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockCancellingBackend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
+func (m *mockCancellingBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	return nil, backend.ErrNotProvisioned
 }
 
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
@@ -1322,28 +1195,20 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify GPU lease went to GPU backend
 	gpuBackend.mu.Lock()
 	gpuCalls := gpuBackend.provisionCalls
 	gpuBackend.mu.Unlock()
 
-	if len(gpuCalls) != 1 {
-		t.Errorf("expected 1 provision call to GPU backend, got %d", len(gpuCalls))
-	}
-	if len(gpuCalls) > 0 && gpuCalls[0].LeaseUUID != "gpu-lease" {
-		t.Errorf("expected gpu-lease, got %s", gpuCalls[0].LeaseUUID)
-	}
-	if len(gpuCalls) > 0 && gpuCalls[0].RoutingSKU() != "gpu-a100-4x" {
-		t.Errorf("expected SKU gpu-a100-4x, got %s", gpuCalls[0].RoutingSKU())
+	assert.Len(t, gpuCalls, 1)
+	if len(gpuCalls) > 0 {
+		assert.Equal(t, "gpu-lease", gpuCalls[0].LeaseUUID)
+		assert.Equal(t, "gpu-a100-4x", gpuCalls[0].RoutingSKU())
 	}
 
 	// Verify K8s and unknown leases went to K8s backend (default)
@@ -1351,21 +1216,15 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	k8sCalls := k8sBackend.provisionCalls
 	k8sBackend.mu.Unlock()
 
-	if len(k8sCalls) != 2 {
-		t.Errorf("expected 2 provision calls to K8s backend (k8s + unknown), got %d", len(k8sCalls))
-	}
+	assert.Len(t, k8sCalls, 2)
 
 	// Verify the SKUs are passed correctly
 	skus := make(map[string]bool)
 	for _, call := range k8sCalls {
 		skus[call.RoutingSKU()] = true
 	}
-	if !skus["k8s-small"] {
-		t.Error("expected k8s-small SKU in K8s backend calls")
-	}
-	if !skus["unknown-sku"] {
-		t.Error("expected unknown-sku in K8s backend calls (routed to default)")
-	}
+	assert.True(t, skus["k8s-small"])
+	assert.True(t, skus["unknown-sku"])
 }
 
 func TestReconciler_MaxWorkers_Default(t *testing.T) {
@@ -1382,13 +1241,9 @@ func TestReconciler_MaxWorkers_Default(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		// MaxWorkers not set - should use default
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if reconciler.maxWorkers != DefaultReconcileWorkers {
-		t.Errorf("maxWorkers = %d, want %d (default)", reconciler.maxWorkers, DefaultReconcileWorkers)
-	}
+	assert.Equal(t, DefaultReconcileWorkers, reconciler.maxWorkers)
 }
 
 func TestReconciler_MaxWorkers_Custom(t *testing.T) {
@@ -1405,13 +1260,9 @@ func TestReconciler_MaxWorkers_Custom(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5,
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if reconciler.maxWorkers != 5 {
-		t.Errorf("maxWorkers = %d, want 5", reconciler.maxWorkers)
-	}
+	assert.Equal(t, 5, reconciler.maxWorkers)
 }
 
 func TestReconciler_ParallelProcessing(t *testing.T) {
@@ -1468,32 +1319,22 @@ func TestReconciler_ParallelProcessing(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5, // Limit to 5 concurrent workers
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Verify all leases were processed
-	if totalProcessed != 20 {
-		t.Errorf("totalProcessed = %d, want 20", totalProcessed)
-	}
+	assert.Equal(t, 20, totalProcessed)
 
 	// Verify parallel processing occurred (more than 1 concurrent worker)
-	if concurrentMax < 2 {
-		t.Errorf("concurrentMax = %d, expected parallel processing (> 1)", concurrentMax)
-	}
+	assert.GreaterOrEqual(t, concurrentMax, 2)
 
 	// Verify MaxWorkers limit was respected
-	if concurrentMax > 5 {
-		t.Errorf("concurrentMax = %d, exceeded MaxWorkers limit of 5", concurrentMax)
-	}
+	assert.LessOrEqual(t, concurrentMax, 5)
 }
 
 func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
@@ -1548,32 +1389,22 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      4, // Limit to 4 concurrent workers
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Verify all orphans were processed
-	if totalProcessed != 15 {
-		t.Errorf("totalProcessed = %d, want 15", totalProcessed)
-	}
+	assert.Equal(t, 15, totalProcessed)
 
 	// Verify parallel processing occurred
-	if concurrentMax < 2 {
-		t.Errorf("concurrentMax = %d, expected parallel processing (> 1)", concurrentMax)
-	}
+	assert.GreaterOrEqual(t, concurrentMax, 2)
 
 	// Verify MaxWorkers limit was respected
-	if concurrentMax > 4 {
-		t.Errorf("concurrentMax = %d, exceeded MaxWorkers limit of 4", concurrentMax)
-	}
+	assert.LessOrEqual(t, concurrentMax, 4)
 }
 
 func TestReconciler_ParallelBackendFetching(t *testing.T) {
@@ -1658,27 +1489,19 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Errorf("ReconcileAll() error = %v", err)
-	}
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Verify all backends were fetched
-	if fetchCount != 3 {
-		t.Errorf("fetchCount = %d, want 3", fetchCount)
-	}
+	assert.Equal(t, 3, fetchCount)
 
 	// Verify parallel fetching occurred (all 3 should run concurrently)
-	if concurrentMax < 2 {
-		t.Errorf("concurrentMax = %d, expected parallel backend fetching (> 1)", concurrentMax)
-	}
+	assert.GreaterOrEqual(t, concurrentMax, 2)
 }
 
 // mockConcurrencyBackend is a test backend for verifying parallel execution.
@@ -1723,14 +1546,26 @@ func (m *mockConcurrencyBackend) Health(ctx context.Context) error {
 	return nil
 }
 
+func (m *mockConcurrencyBackend) RefreshState(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockConcurrencyBackend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
+func (m *mockConcurrencyBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
 // mockInFlightTracker implements ReconcilerTracker for testing orphaned payload cleanup.
 type mockInFlightTracker struct {
-	payloadStore *PayloadStore
+	payloadStore *payload.Store
 	inFlight     map[string]InFlightProvision
 	mu           sync.Mutex
 }
 
-func newMockInFlightTracker(payloadStore *PayloadStore) *mockInFlightTracker {
+func newMockInFlightTracker(payloadStore *payload.Store) *mockInFlightTracker {
 	return &mockInFlightTracker{
 		payloadStore: payloadStore,
 		inFlight:     make(map[string]InFlightProvision),
@@ -1817,39 +1652,35 @@ func (m *mockInFlightTracker) GetTimedOutProvisions(timeout time.Duration) []InF
 	return nil
 }
 
-func (m *mockInFlightTracker) HasPayload(leaseUUID string) bool {
+func (m *mockInFlightTracker) HasPayload(leaseUUID string) (bool, error) {
 	if m.payloadStore == nil {
-		return false
+		return false, nil
 	}
 	return m.payloadStore.Has(leaseUUID)
 }
 
-func (m *mockInFlightTracker) PayloadStore() *PayloadStore {
+func (m *mockInFlightTracker) PayloadStore() *payload.Store {
 	return m.payloadStore
 }
 
 func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	// Create a temp dir for the payload store
 	tmpDir := t.TempDir()
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: tmpDir + "/payloads.db",
 	})
-	if err != nil {
-		t.Fatalf("NewPayloadStore() error = %v", err)
-	}
+	require.NoError(t, err)
 	defer payloadStore.Close()
 
 	// Store payloads for various leases
 	// pending-awaiting: pending lease with MetaHash but hasn't uploaded payload yet - simulates
 	// a lease that's still waiting for payload (payload won't be in store, so nothing to clean)
-	payloadStore.Store("closed-lease", []byte("closed payload"))      // Will be cleaned (lease is closed)
+	payloadStore.Store("closed-lease", []byte("closed payload"))      // Will be cleaned (lease is closed/not found)
 	payloadStore.Store("nonexistent-lease", []byte("orphan payload")) // Will be cleaned (lease doesn't exist)
-	payloadStore.Store("active-lease", []byte("active payload"))      // Will be cleaned (lease is active, not pending)
+	payloadStore.Store("active-lease", []byte("active payload"))      // Retained for re-provisioning
 
 	// Verify all payloads are stored
-	if count := payloadStore.Count(); count != 3 {
-		t.Fatalf("expected 3 payloads stored, got %d", count)
-	}
+	require.Equal(t, 3, payloadStore.Count())
 
 	mockChain := &chain.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
@@ -1877,39 +1708,139 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, router, mockTracker)
-	if err != nil {
-		t.Fatalf("NewReconciler() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	if err := reconciler.ReconcileAll(ctx); err != nil {
-		t.Fatalf("ReconcileAll() error = %v", err)
-	}
+	require.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify orphaned payloads were cleaned up
-	// active-lease: payload should be cleaned (lease is active, not pending)
-	if payloadStore.Has("active-lease") {
-		t.Error("expected active-lease payload to be cleaned up (lease is no longer pending)")
-	}
+	// active-lease: payload should be RETAINED (active leases keep payload for re-provisioning)
+	hasActive, err := payloadStore.Has("active-lease")
+	require.NoError(t, err)
+	assert.True(t, hasActive, "expected active-lease payload to be retained for re-provisioning")
 
 	// closed-lease: payload should be cleaned (lease doesn't exist in chain query results)
-	if payloadStore.Has("closed-lease") {
-		t.Error("expected closed-lease payload to be cleaned up (lease not found)")
-	}
+	hasClosed, err := payloadStore.Has("closed-lease")
+	require.NoError(t, err)
+	assert.False(t, hasClosed, "expected closed-lease payload to be cleaned up (lease not found)")
 
 	// nonexistent-lease: payload should be cleaned (lease doesn't exist)
-	if payloadStore.Has("nonexistent-lease") {
-		t.Error("expected nonexistent-lease payload to be cleaned up (lease not found)")
-	}
+	hasNonexistent, err := payloadStore.Has("nonexistent-lease")
+	require.NoError(t, err)
+	assert.False(t, hasNonexistent, "expected nonexistent-lease payload to be cleaned up (lease not found)")
 
-	// Verify count - all orphaned payloads should be cleaned
-	if count := payloadStore.Count(); count != 0 {
-		t.Errorf("expected 0 payloads remaining (all orphans cleaned), got %d", count)
-	}
+	// Verify count - only active-lease payload should remain
+	assert.Equal(t, 1, payloadStore.Count())
 }
 
 // TestReconciler_ConcurrentReconcileAll tests that concurrent ReconcileAll calls
 // are properly serialized by the atomic flag.
+func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
+	// Setup: Active lease on chain, failed provision with FailCount >= maxReprovisionAttempts
+	// Expected: Close the lease and deprovision the backend resources
+	var closedLeases []string
+	var closedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			closedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   3, // >= DefaultMaxReprovisionAttempts (3)
+				BackendName: "test",
+			},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was closed (not rejected — it's ACTIVE, not PENDING)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, closedLeases, 1)
+	assert.Equal(t, "lease-1", closedLeases[0])
+	assert.Contains(t, closedReason, "failed 3 times")
+
+	// Verify backend resources were released immediately
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	require.Len(t, mockBackend.deprovisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.deprovisionCalls[0])
+
+	// Verify NO re-provisioning was attempted
+	assert.Empty(t, mockBackend.provisionCalls)
+}
+
+func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
+	// Setup: Active lease on chain, failed provision with FailCount < maxReprovisionAttempts
+	// Expected: Attempt re-provisioning (not close)
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   1, // < DefaultMaxReprovisionAttempts (3)
+				BackendName: "test",
+			},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify re-provisioning was attempted (not closed)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Len(t, mockBackend.provisionCalls, 1)
+	assert.Equal(t, "lease-1", mockBackend.provisionCalls[0].LeaseUUID)
+
+	// No deprovisions (that happens after close, not re-provision)
+	assert.Empty(t, mockBackend.deprovisionCalls)
+}
+
 func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	// Create mock chain client that returns one pending lease.
 	// Add a delay to ensure reconciliation takes some time, which allows us to
@@ -1943,9 +1874,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080/callbacks",
 		MaxWorkers:      2,
 	}, mockChain, router, nil)
-	if err != nil {
-		t.Fatalf("NewReconciler() failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	// Start multiple concurrent ReconcileAll calls
 	const numGoroutines = 10
@@ -1977,9 +1906,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	}
 
 	// All should complete (either by running or skipping)
-	if completedCount != numGoroutines {
-		t.Errorf("expected %d goroutines to complete, got %d", numGoroutines, completedCount)
-	}
+	assert.Equal(t, numGoroutines, completedCount)
 
 	// At most ONE provision call should have been made
 	// (the atomic flag prevents concurrent reconciliation)
@@ -1987,7 +1914,218 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	provisionCount := len(mockBackend.provisionCalls)
 	mockBackend.mu.Unlock()
 
-	if provisionCount > 1 {
-		t.Errorf("expected at most 1 provision call, got %d (concurrent reconciliation not prevented!)", provisionCount)
+	assert.LessOrEqual(t, provisionCount, 1, "concurrent reconciliation not prevented!")
+}
+
+func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
+	// Setup: Pending lease on chain, not provisioned, backend returns ErrValidation
+	// Expected: Reject the lease immediately (not retry forever)
+	var rejectedLeases []string
+	var rejectedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
 	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: fmt.Errorf("%w: unknown SKU: bad-sku", backend.ErrValidation),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was rejected (not left to retry forever)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, rejectedLeases, 1)
+	assert.Equal(t, "lease-1", rejectedLeases[0])
+	assert.Equal(t, rejectReasonInvalidSKU, rejectedReason)
+}
+
+func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *testing.T) {
+	// Setup: Pending lease with MetaHash, payload available, backend returns ErrValidation
+	// Expected: Reject the lease immediately
+	var rejectedLeases []string
+	var rejectedReason string
+	var mu sync.Mutex
+
+	tmpDir := t.TempDir()
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: tmpDir + "/payloads.db",
+	})
+	require.NoError(t, err)
+	defer payloadStore.Close()
+
+	payloadData := []byte("test payload")
+	payloadHash := sha256.Sum256(payloadData)
+	payloadStore.Store("lease-1", payloadData)
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_PENDING,
+					MetaHash: payloadHash[:], // SHA-256 of payloadData
+				},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: fmt.Errorf("%w: invalid manifest: bad yaml", backend.ErrValidation),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	mockTracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, mockTracker)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was rejected
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, rejectedLeases, 1)
+	assert.Equal(t, "lease-1", rejectedLeases[0])
+	assert.Equal(t, rejectReasonInvalidManifest, rejectedReason)
+}
+
+func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *testing.T) {
+	// Setup: Active lease on chain, not provisioned (anomaly), backend returns ErrValidation
+	// Expected: Close the lease (not reject — it's ACTIVE)
+	var closedLeases []string
+	var closedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			closedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: fmt.Errorf("%w: image from registry %q is not allowed", backend.ErrValidation, "evil.io"),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was closed (not rejected — it's ACTIVE)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, closedLeases, 1)
+	assert.Equal(t, "lease-1", closedLeases[0])
+	assert.Equal(t, rejectReasonImageNotAllowed, closedReason)
+}
+
+func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T) {
+	// Setup: Active lease, failed provision with FailCount < max, re-provision returns ErrValidation
+	// Expected: Close the lease immediately (not keep retrying)
+	var closedLeases []string
+	var closedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			closedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   1, // Below max — would normally re-provision
+				BackendName: "test",
+			},
+		},
+		provisionErr: fmt.Errorf("%w: unknown SKU: removed-sku", backend.ErrValidation),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was closed (validation error is permanent)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, closedLeases, 1)
+	assert.Equal(t, "lease-1", closedLeases[0])
+	assert.Equal(t, rejectReasonInvalidSKU, closedReason)
 }

@@ -247,15 +247,20 @@ func (b *AckBatcher) batchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			// Flush remaining requests before shutdown
 			flush()
-			// Send cancellation error to any remaining requests in the channel
-			close(b.requests)
-			for req := range b.requests {
+			// Drain remaining requests from channel buffer without closing it.
+			// Closing the channel would risk a panic if a concurrent Acknowledge()
+			// call races with the shutdown (send on closed channel).
+			for {
 				select {
-				case req.resultCh <- ackResult{err: context.Canceled}:
+				case req := <-b.requests:
+					select {
+					case req.resultCh <- ackResult{err: context.Canceled}:
+					default:
+					}
 				default:
+					return
 				}
 			}
-			return
 
 		case req := <-b.requests:
 			pending = append(pending, req)

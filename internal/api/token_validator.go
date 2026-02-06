@@ -67,8 +67,21 @@ func (v *tokenValidator) validateCommon(signData []byte, bech32Prefix string) er
 		return fmt.Errorf("failed to decode signature: %w", err)
 	}
 
-	// Verify ADR-036 signature
-	if err := adr036.VerifySignature(pubKeyBytes, signData, sigBytes, v.tenant); err != nil {
+	// Normalize signature to low-S canonical form before verification and storage.
+	// This prevents signature malleability: ECDSA signatures have two valid forms
+	// (r, s) and (r, N-s). Without normalization, an attacker could flip the S value
+	// to create a different-but-valid signature that bypasses replay deduplication.
+	normalizedSig := adr036.NormalizeToLowS(sigBytes)
+	if normalizedSig == nil {
+		return fmt.Errorf("invalid signature length: expected 64, got %d", len(sigBytes))
+	}
+	// Update the stored signature to the canonical form so the replay tracker
+	// always sees the same key regardless of which S-variant the client sent.
+	v.signature = base64.StdEncoding.EncodeToString(normalizedSig)
+
+	// Verify ADR-036 signature (also normalizes internally, but we pre-normalize
+	// above to ensure v.signature is updated before returning to the caller)
+	if err := adr036.VerifySignature(pubKeyBytes, signData, normalizedSig, v.tenant); err != nil {
 		return fmt.Errorf("signature verification failed: %w", err)
 	}
 

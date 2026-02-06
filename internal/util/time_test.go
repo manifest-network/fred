@@ -3,6 +3,8 @@ package util
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestTimeToBytes_RoundTrip(t *testing.T) {
@@ -10,9 +12,7 @@ func TestTimeToBytes_RoundTrip(t *testing.T) {
 	bytes := TimeToBytes(original)
 	restored := BytesToTime(bytes)
 
-	if original.UnixNano() != restored.UnixNano() {
-		t.Errorf("round-trip failed: original=%v, restored=%v", original.UnixNano(), restored.UnixNano())
-	}
+	assert.Equal(t, original.UnixNano(), restored.UnixNano())
 }
 
 func TestBytesToTime_InvalidInput(t *testing.T) {
@@ -29,16 +29,12 @@ func TestBytesToTime_InvalidInput(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := BytesToTime(tt.input)
-			if !result.IsZero() {
-				t.Errorf("BytesToTime(%v) = %v, want zero time", tt.input, result)
-			}
+			assert.True(t, result.IsZero())
 		})
 	}
 }
 
 func TestTimeToBytes_Length(t *testing.T) {
 	bytes := TimeToBytes(time.Now())
-	if len(bytes) != 8 {
-		t.Errorf("TimeToBytes() returned %d bytes, want 8", len(bytes))
-	}
+	assert.Len(t, bytes, 8)
 }

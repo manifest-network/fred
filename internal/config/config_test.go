@@ -3,9 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsValidUUID_Valid(t *testing.T) {
@@ -18,9 +20,7 @@ func TestIsValidUUID_Valid(t *testing.T) {
 	}
 
 	for _, uuid := range validUUIDs {
-		if !IsValidUUID(uuid) {
-			t.Errorf("IsValidUUID(%q) = false, want true", uuid)
-		}
+		assert.True(t, IsValidUUID(uuid), "IsValidUUID(%q) = false, want true", uuid)
 	}
 }
 
@@ -38,17 +38,13 @@ func TestIsValidUUID_Invalid(t *testing.T) {
 	}
 
 	for _, uuid := range invalidUUIDs {
-		if IsValidUUID(uuid) {
-			t.Errorf("IsValidUUID(%q) = true, want false", uuid)
-		}
+		assert.False(t, IsValidUUID(uuid), "IsValidUUID(%q) = true, want false", uuid)
 	}
 }
 
 func TestIsValidUUID_WithoutDashes(t *testing.T) {
 	// google/uuid accepts UUIDs without dashes (valid per RFC 4122)
-	if !IsValidUUID("0123456789abcdef0123456789abcdef") {
-		t.Error("IsValidUUID should accept UUIDs without dashes")
-	}
+	assert.True(t, IsValidUUID("0123456789abcdef0123456789abcdef"), "IsValidUUID should accept UUIDs without dashes")
 }
 
 func TestConfig_Validate_MissingRequired(t *testing.T) {
@@ -108,13 +104,8 @@ func TestConfig_Validate_MissingRequired(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.cfg.Validate()
-			if err == nil {
-				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
-				return
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err, "Validate() = nil, want error containing %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -154,9 +145,7 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
 	}
 
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate() = %v, want nil", err)
-	}
+	assert.NoError(t, cfg.Validate())
 }
 
 func TestConfig_Validate_NoBackends(t *testing.T) {
@@ -191,13 +180,8 @@ func TestConfig_Validate_NoBackends(t *testing.T) {
 	}
 
 	err := cfg.Validate()
-	if err == nil {
-		t.Error("Validate() = nil, want error about missing backends")
-		return
-	}
-	if !strings.Contains(err.Error(), "at least one backend must be configured") {
-		t.Errorf("Validate() error = %q, want error containing 'at least one backend must be configured'", err.Error())
-	}
+	require.Error(t, err, "Validate() = nil, want error about missing backends")
+	assert.Contains(t, err.Error(), "at least one backend must be configured")
 }
 
 func TestConfig_Validate_CallbackSecret(t *testing.T) {
@@ -267,18 +251,11 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 			cfg.CallbackSecret = tt.callbackSecret
 			err := cfg.Validate()
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("Validate() = %v, want nil", err)
-				}
+				assert.NoError(t, err)
 				return
 			}
-			if err == nil {
-				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
-				return
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err, "Validate() = nil, want error containing %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -407,13 +384,8 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			cfg := baseConfig()
 			tt.modify(&cfg)
 			err := cfg.Validate()
-			if err == nil {
-				t.Errorf("Validate() = nil, want error %q", tt.wantErr)
-				return
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err, "Validate() = nil, want error %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -501,18 +473,11 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			tt.modify(&cfg)
 			err := cfg.Validate()
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("Validate() = %v, want nil", err)
-				}
+				assert.NoError(t, err)
 				return
 			}
-			if err == nil {
-				t.Errorf("Validate() = nil, want error %q", tt.wantErr)
-				return
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err, "Validate() = nil, want error %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -592,18 +557,11 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			tt.modify(&cfg)
 			err := cfg.Validate()
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("Validate() = %v, want nil", err)
-				}
+				assert.NoError(t, err)
 				return
 			}
-			if err == nil {
-				t.Errorf("Validate() = nil, want error %q", tt.wantErr)
-				return
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err, "Validate() = nil, want error %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -641,9 +599,7 @@ func TestConfig_TLSEnabled(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.cfg.TLSEnabled(); got != tt.expected {
-				t.Errorf("TLSEnabled() = %v, want %v", got, tt.expected)
-			}
+			assert.Equal(t, tt.expected, tt.cfg.TLSEnabled())
 		})
 	}
 }
@@ -664,40 +620,20 @@ backends:
     url: "http://localhost:9000"
     default: true
 `
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatalf("Failed to write config file: %v", err)
-	}
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
 
 	cfg, err := Load(configPath)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Check defaults
-	if cfg.ChainID != "manifest-1" {
-		t.Errorf("ChainID = %q, want %q", cfg.ChainID, "manifest-1")
-	}
-	if cfg.GRPCEndpoint != "localhost:9090" {
-		t.Errorf("GRPCEndpoint = %q, want %q", cfg.GRPCEndpoint, "localhost:9090")
-	}
-	if cfg.WebSocketURL != "ws://localhost:26657/websocket" {
-		t.Errorf("WebSocketURL = %q, want %q", cfg.WebSocketURL, "ws://localhost:26657/websocket")
-	}
-	if cfg.KeyringBackend != "file" {
-		t.Errorf("KeyringBackend = %q, want %q", cfg.KeyringBackend, "file")
-	}
-	if cfg.APIListenAddr != ":8080" {
-		t.Errorf("APIListenAddr = %q, want %q", cfg.APIListenAddr, ":8080")
-	}
-	if cfg.Bech32Prefix != "manifest" {
-		t.Errorf("Bech32Prefix = %q, want %q", cfg.Bech32Prefix, "manifest")
-	}
-	if cfg.RateLimitRPS != 10.0 {
-		t.Errorf("RateLimitRPS = %v, want %v", cfg.RateLimitRPS, 10.0)
-	}
-	if cfg.RateLimitBurst != 20 {
-		t.Errorf("RateLimitBurst = %v, want %v", cfg.RateLimitBurst, 20)
-	}
+	assert.Equal(t, "manifest-1", cfg.ChainID)
+	assert.Equal(t, "localhost:9090", cfg.GRPCEndpoint)
+	assert.Equal(t, "ws://localhost:26657/websocket", cfg.WebSocketURL)
+	assert.Equal(t, "file", cfg.KeyringBackend)
+	assert.Equal(t, ":8080", cfg.APIListenAddr)
+	assert.Equal(t, "manifest", cfg.Bech32Prefix)
+	assert.Equal(t, 10.0, cfg.RateLimitRPS)
+	assert.Equal(t, 20, cfg.RateLimitBurst)
 }
 
 func TestLoad_ConfigOverrides(t *testing.T) {
@@ -718,21 +654,13 @@ backends:
     url: "http://localhost:9000"
     default: true
 `
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatalf("Failed to write config file: %v", err)
-	}
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
 
 	cfg, err := Load(configPath)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if cfg.ChainID != "test-chain-1" {
-		t.Errorf("ChainID = %q, want %q", cfg.ChainID, "test-chain-1")
-	}
-	if cfg.RateLimitRPS != 50.0 {
-		t.Errorf("RateLimitRPS = %v, want %v", cfg.RateLimitRPS, 50.0)
-	}
+	assert.Equal(t, "test-chain-1", cfg.ChainID)
+	assert.Equal(t, 50.0, cfg.RateLimitRPS)
 }
 
 func TestConfig_Validate_BackendURLs(t *testing.T) {
@@ -845,18 +773,11 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			tt.modify(&cfg)
 			err := cfg.Validate()
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("Validate() = %v, want nil", err)
-				}
+				assert.NoError(t, err)
 				return
 			}
-			if err == nil {
-				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
-				return
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err, "Validate() = nil, want error containing %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -927,14 +848,8 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			cfg.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
 			cfg.CallbackBaseURL = tt.input
 
-			err := cfg.Validate()
-			if err != nil {
-				t.Fatalf("Validate() = %v, want nil", err)
-			}
-
-			if cfg.CallbackBaseURL != tt.expected {
-				t.Errorf("CallbackBaseURL = %q, want %q", cfg.CallbackBaseURL, tt.expected)
-			}
+			require.NoError(t, cfg.Validate())
+			assert.Equal(t, tt.expected, cfg.CallbackBaseURL)
 		})
 	}
 }
@@ -1169,18 +1084,11 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			tt.modify(&cfg)
 			err := cfg.Validate()
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("Validate() = %v, want nil", err)
-				}
+				assert.NoError(t, err)
 				return
 			}
-			if err == nil {
-				t.Errorf("Validate() = nil, want error containing %q", tt.wantErr)
-				return
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.wantErr)
-			}
+			require.Error(t, err, "Validate() = nil, want error containing %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -1205,25 +1113,13 @@ backends:
     url: "http://localhost:9000"
     default: true
 `
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatalf("Failed to write config file: %v", err)
-	}
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
 
 	cfg, err := Load(configPath)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if cfg.ChainID != "file-chain-1" {
-		t.Errorf("ChainID = %q, want %q", cfg.ChainID, "file-chain-1")
-	}
-	if cfg.GRPCEndpoint != "file-endpoint:9090" {
-		t.Errorf("GRPCEndpoint = %q, want %q", cfg.GRPCEndpoint, "file-endpoint:9090")
-	}
-	if cfg.ProviderUUID != "abcdef01-2345-6789-abcd-ef0123456789" {
-		t.Errorf("ProviderUUID = %q, want %q", cfg.ProviderUUID, "abcdef01-2345-6789-abcd-ef0123456789")
-	}
-	if cfg.RateLimitRPS != 100.0 {
-		t.Errorf("RateLimitRPS = %v, want %v", cfg.RateLimitRPS, 100.0)
-	}
+	assert.Equal(t, "file-chain-1", cfg.ChainID)
+	assert.Equal(t, "file-endpoint:9090", cfg.GRPCEndpoint)
+	assert.Equal(t, "abcdef01-2345-6789-abcd-ef0123456789", cfg.ProviderUUID)
+	assert.Equal(t, 100.0, cfg.RateLimitRPS)
 }

@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -22,30 +24,18 @@ import (
 func TestBuildTLSConfig_Defaults(t *testing.T) {
 	// Test with no CA file and no skip verify
 	cfg, err := buildTLSConfig("", false)
-	if err != nil {
-		t.Fatalf("buildTLSConfig() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if cfg == nil {
-		t.Fatal("buildTLSConfig() returned nil config")
-	}
-	if cfg.InsecureSkipVerify {
-		t.Error("InsecureSkipVerify should be false by default")
-	}
-	if cfg.RootCAs != nil {
-		t.Error("RootCAs should be nil when no CA file specified")
-	}
+	require.NotNil(t, cfg)
+	assert.False(t, cfg.InsecureSkipVerify)
+	assert.Nil(t, cfg.RootCAs)
 }
 
 func TestBuildTLSConfig_SkipVerify(t *testing.T) {
 	cfg, err := buildTLSConfig("", true)
-	if err != nil {
-		t.Fatalf("buildTLSConfig() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if !cfg.InsecureSkipVerify {
-		t.Error("InsecureSkipVerify should be true when skip_verify is set")
-	}
+	assert.True(t, cfg.InsecureSkipVerify)
 }
 
 func TestBuildTLSConfig_WithCAFile(t *testing.T) {
@@ -56,26 +46,19 @@ func TestBuildTLSConfig_WithCAFile(t *testing.T) {
 	// Generate a valid self-signed certificate for testing
 	testCert := generateTestCertificate(t)
 
-	if err := os.WriteFile(caFile, testCert, 0600); err != nil {
-		t.Fatalf("failed to write test CA file: %v", err)
-	}
+	err := os.WriteFile(caFile, testCert, 0600)
+	require.NoError(t, err)
 
 	cfg, err := buildTLSConfig(caFile, false)
-	if err != nil {
-		t.Fatalf("buildTLSConfig() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if cfg.RootCAs == nil {
-		t.Error("RootCAs should be set when CA file is provided")
-	}
+	assert.NotNil(t, cfg.RootCAs)
 }
 
 func TestBuildTLSConfig_InvalidCAFile(t *testing.T) {
 	// Test with non-existent CA file
 	_, err := buildTLSConfig("/nonexistent/ca.pem", false)
-	if err == nil {
-		t.Error("buildTLSConfig() should fail with non-existent CA file")
-	}
+	assert.Error(t, err)
 }
 
 func TestBuildTLSConfig_InvalidCertificate(t *testing.T) {
@@ -83,14 +66,11 @@ func TestBuildTLSConfig_InvalidCertificate(t *testing.T) {
 	tempDir := t.TempDir()
 	caFile := filepath.Join(tempDir, "invalid.pem")
 
-	if err := os.WriteFile(caFile, []byte("not a valid certificate"), 0600); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
+	err := os.WriteFile(caFile, []byte("not a valid certificate"), 0600)
+	require.NoError(t, err)
 
-	_, err := buildTLSConfig(caFile, false)
-	if err == nil {
-		t.Error("buildTLSConfig() should fail with invalid certificate")
-	}
+	_, err = buildTLSConfig(caFile, false)
+	assert.Error(t, err)
 }
 
 func TestClientConfig_Defaults(t *testing.T) {
@@ -158,24 +138,16 @@ func TestClientConfig_Defaults(t *testing.T) {
 				queryPageLimit = 100
 			}
 
-			if txPollInterval != tt.wantPollInterval {
-				t.Errorf("txPollInterval = %v, want %v", txPollInterval, tt.wantPollInterval)
-			}
-			if txTimeout != tt.wantTimeout {
-				t.Errorf("txTimeout = %v, want %v", txTimeout, tt.wantTimeout)
-			}
-			if uint64(queryPageLimit) != tt.wantQueryPageLimit {
-				t.Errorf("queryPageLimit = %d, want %d", queryPageLimit, tt.wantQueryPageLimit)
-			}
+			assert.Equal(t, tt.wantPollInterval, txPollInterval)
+			assert.Equal(t, tt.wantTimeout, txTimeout)
+			assert.Equal(t, tt.wantQueryPageLimit, uint64(queryPageLimit))
 		})
 	}
 }
 
 func TestMaxLeasesPerBatch(t *testing.T) {
 	// Verify the constant is set to expected value
-	if maxLeasesPerBatch != 100 {
-		t.Errorf("maxLeasesPerBatch = %d, want 100", maxLeasesPerBatch)
-	}
+	assert.Equal(t, 100, maxLeasesPerBatch)
 }
 
 func TestBatchBoundaries(t *testing.T) {
@@ -234,9 +206,7 @@ func TestBatchBoundaries(t *testing.T) {
 				batchCount++
 			}
 
-			if batchCount != tt.wantCount {
-				t.Errorf("batch count = %d, want %d", batchCount, tt.wantCount)
-			}
+			assert.Equal(t, tt.wantCount, batchCount)
 		})
 	}
 }
@@ -385,26 +355,16 @@ func TestIsRetryableTxError(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := client.isRetryableTxError(tt.err)
-			if got != tt.wantRetry {
-				t.Errorf("isRetryableTxError() = %v, want %v", got, tt.wantRetry)
-			}
+			assert.Equal(t, tt.wantRetry, got)
 		})
 	}
 }
 
 func TestTxRetryConstants(t *testing.T) {
 	// Verify retry constants are reasonable
-	if txMaxRetries < 1 || txMaxRetries > 10 {
-		t.Errorf("txMaxRetries = %d, expected between 1 and 10", txMaxRetries)
-	}
-
-	if txInitialBackoff < 100*time.Millisecond || txInitialBackoff > 5*time.Second {
-		t.Errorf("txInitialBackoff = %v, expected between 100ms and 5s", txInitialBackoff)
-	}
-
-	if txMaxBackoff < txInitialBackoff {
-		t.Error("txMaxBackoff should be >= txInitialBackoff")
-	}
+	assert.True(t, txMaxRetries >= 1 && txMaxRetries <= 10)
+	assert.True(t, txInitialBackoff >= 100*time.Millisecond && txInitialBackoff <= 5*time.Second)
+	assert.True(t, txMaxBackoff >= txInitialBackoff)
 }
 
 // generateTestCertificate creates a valid self-signed certificate for testing.

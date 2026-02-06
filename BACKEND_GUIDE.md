@@ -118,6 +118,7 @@ Start provisioning a resource asynchronously.
 **Error Responses:**
 - `400 Bad Request` - Invalid request body
 - `409 Conflict` - Lease already provisioned
+- `503 Service Unavailable` - Insufficient resources
 
 ### GET /info/{lease_uuid}
 
@@ -190,6 +191,51 @@ List all currently provisioned resources. Used by Fred for reconciliation.
 - `ready` - Resource is available
 - `failed` - Provisioning failed
 
+### GET /provisions/{lease_uuid}
+
+Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/leases/{uuid}/provision` to tenants. Falls back to persisted diagnostics (bbolt) when the provision is no longer in memory.
+
+**Response:** `200 OK`
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "status": "failed",
+  "fail_count": 3,
+  "last_error": "container exited with code 1 (OOM killed)",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Fields:**
+- `status` - Provision status: `provisioning`, `ready`, or `failed`
+- `fail_count` - Number of provision failures
+- `last_error` - Full diagnostic error message (exit codes, OOM, truncated logs)
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned (or diagnostics expired)
+
+### GET /logs/{lease_uuid}
+
+Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{uuid}/logs` to tenants. Falls back to persisted logs when containers no longer exist.
+
+**Query Parameters:**
+- `tail` - Number of log lines per container (default: 100)
+
+**Response:** `200 OK`
+```json
+{
+  "0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
+  "1": "2024-01-15 10:30:00 Redis ready\n"
+}
+```
+
+**Fields:**
+- Keys are container instance indices (`"0"`, `"1"`, ...), values are log output strings
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned (or logs expired)
+
 ### GET /health
 
 Simple health check endpoint.
@@ -197,6 +243,12 @@ Simple health check endpoint.
 **Response:** `200 OK`
 
 Return 200 if your backend can accept requests. Fred uses this for health monitoring.
+
+### POST /refresh-state (Optional)
+
+Synchronize in-memory provision state with the underlying infrastructure. Fred's HTTP client does **not** call this endpoint — it is a no-op for HTTP backends because the backend server is expected to maintain its own state. This endpoint exists in the `Backend` interface (`RefreshState`) for in-process backends (like the Docker backend) that need to re-read container/VM state before the reconciler calls `ListProvisions`.
+
+If your backend maintains an in-memory cache of provisions, you may choose to expose this endpoint so an external trigger can force a state refresh. Otherwise, you can safely ignore it.
 
 ### GET /stats (Optional)
 
@@ -290,7 +342,7 @@ The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration.
 
 ### In-Memory Pattern (Recommended for Starting)
 
-Follow the pattern from `internal/backend/mock.go`:
+Follow the pattern from `cmd/mock-backend/main.go` (the HTTP reference implementation):
 
 ```go
 type MyBackend struct {
@@ -376,6 +428,8 @@ func main() {
     mux := http.NewServeMux()
     mux.HandleFunc("POST /provision", b.handleProvision)
     mux.HandleFunc("GET /info/{lease_uuid}", b.handleGetInfo)
+    mux.HandleFunc("GET /provisions/{lease_uuid}", b.handleGetProvision)
+    mux.HandleFunc("GET /logs/{lease_uuid}", b.handleGetLogs)
     mux.HandleFunc("POST /deprovision", b.handleDeprovision)
     mux.HandleFunc("GET /provisions", b.handleListProvisions)
     mux.HandleFunc("GET /health", b.handleHealth)
@@ -477,7 +531,7 @@ curl -X POST http://localhost:9001/deprovision \
 
 Before deploying your backend:
 
-- [ ] All 5 required HTTP endpoints implemented (`/provision`, `/info/{uuid}`, `/deprovision`, `/provisions`, `/health`)
+- [ ] All 7 required HTTP endpoints implemented (`/provision`, `/info/{uuid}`, `/provisions/{uuid}`, `/logs/{uuid}`, `/deprovision`, `/provisions`, `/health`)
 - [ ] Provision returns 202 and works asynchronously
 - [ ] Callbacks signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent

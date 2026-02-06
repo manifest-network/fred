@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -39,7 +39,7 @@ type CallbackPublisher interface {
 // StatusChecker provides status information about provisioning.
 // Typically implemented by the provisioner.Manager.
 type StatusChecker interface {
-	HasPayload(leaseUUID string) bool
+	HasPayload(leaseUUID string) (bool, error)
 	IsInFlight(leaseUUID string) bool
 }
 
@@ -104,7 +104,13 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		slog.Warn("token replay protection disabled (no TokenTrackerDBPath configured)")
 	}
 
-	handlers := NewHandlers(client, backendRouter, tokenTracker, statusChecker, cfg.ProviderUUID, cfg.Bech32Prefix)
+	// Avoid the nil-concrete-pointer-in-interface gotcha: only pass
+	// the tracker as the interface when it is actually non-nil.
+	var tracker TokenTrackerInterface
+	if tokenTracker != nil {
+		tracker = tokenTracker
+	}
+	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, cfg.ProviderUUID, cfg.Bech32Prefix)
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
 	var trustedProxies *TrustedProxyConfig
@@ -124,23 +130,10 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		)
 	}
 
-	// Apply default for max request body size
-	maxBodySize := cfg.MaxRequestBodySize
-	if maxBodySize <= 0 {
-		maxBodySize = config.DefaultMaxRequestBodySize
-	}
-
-	// Apply default for request timeout
-	requestTimeout := cfg.RequestTimeout
-	if requestTimeout <= 0 {
-		requestTimeout = defaultRequestTimeout
-	}
-
-	// Apply default for shutdown timeout
-	shutdownTimeout := cfg.ShutdownTimeout
-	if shutdownTimeout <= 0 {
-		shutdownTimeout = defaultShutdownTimeout
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	maxBodySize := cmp.Or(max(cfg.MaxRequestBodySize, 0), config.DefaultMaxRequestBodySize)
+	requestTimeout := cmp.Or(max(cfg.RequestTimeout, 0), defaultRequestTimeout)
+	shutdownTimeout := cmp.Or(max(cfg.ShutdownTimeout, 0), defaultShutdownTimeout)
 
 	// Create callback authenticator if secret is provided
 	var callbackAuth *CallbackAuthenticator
@@ -157,8 +150,6 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if payloadPublisher != nil {
 		payloadHandler = NewPayloadHandler(client, payloadPublisher, cfg.ProviderUUID, cfg.Bech32Prefix)
 	}
-
-	router := mux.NewRouter()
 
 	s := &Server{
 		addr:                  cfg.Addr,
@@ -178,32 +169,39 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		statusChecker:         statusChecker,
 	}
 
-	// Register routes - unauthenticated endpoints
-	router.HandleFunc("/health", handlers.HealthCheck).Methods("GET")
-	router.Handle("/metrics", promhttp.Handler()).Methods("GET")
-	router.HandleFunc("/callbacks/provision", s.handleProvisionCallback).Methods("POST")
+	mux := http.NewServeMux()
 
-	// Create a subrouter for authenticated endpoints with tenant rate limiting
-	authRouter := router.PathPrefix("/v1").Subrouter()
-	authRouter.HandleFunc("/leases/{lease_uuid}/connection", handlers.GetLeaseConnection).Methods("GET")
-	authRouter.HandleFunc("/leases/{lease_uuid}/status", handlers.GetLeaseStatus).Methods("GET")
-	authRouter.HandleFunc("/leases/{lease_uuid}/data", s.handlePayloadUpload).Methods("POST")
+	// Unauthenticated routes
+	mux.HandleFunc("GET /health", handlers.HealthCheck)
+	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("POST /callbacks/provision", s.handleProvisionCallback)
 
-	// Apply tenant rate limiting to authenticated endpoints only
-	if tenantRateLimiter != nil {
-		authRouter.Use(tenantRateLimiter.Middleware(cfg.Bech32Prefix))
+	// Authenticated routes with optional tenant rate limiting
+	withTenantRL := func(h http.HandlerFunc) http.Handler {
+		if tenantRateLimiter != nil {
+			return tenantRateLimiter.Middleware()(h)
+		}
+		return h
 	}
+	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTenantRL(handlers.GetLeaseConnection))
+	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTenantRL(handlers.GetLeaseStatus))
+	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTenantRL(handlers.GetLeaseProvision))
+	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTenantRL(handlers.GetLeaseLogs))
+	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTenantRL(s.handlePayloadUpload))
 
-	// Add global middleware (order matters: security headers, rate limit, timeout, body size, logging)
-	router.Use(securityHeadersMiddleware)
-	router.Use(rateLimiter.Middleware)
-	router.Use(requestTimeoutMiddleware(requestTimeout))
-	router.Use(maxBodySizeMiddleware(maxBodySize))
-	router.Use(loggingMiddleware)
+	// Apply global middleware. Each wrapper becomes the new outermost layer,
+	// so the last-applied middleware runs first. Execution order:
+	// securityHeaders → rateLimiter → timeout → maxBody → logging → handler
+	var handler http.Handler = mux
+	handler = loggingMiddleware(handler)
+	handler = maxBodySizeMiddleware(maxBodySize)(handler)
+	handler = requestTimeoutMiddleware(requestTimeout)(handler)
+	handler = rateLimiter.Middleware(handler)
+	handler = securityHeadersMiddleware(handler)
 
 	s.server = &http.Server{
 		Addr:         cfg.Addr,
-		Handler:      router,
+		Handler:      handler,
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 		IdleTimeout:  cfg.IdleTimeout,

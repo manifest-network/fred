@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gorilla/mux"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -29,6 +28,7 @@ type ChainClient interface {
 // This interface allows for testing with mock implementations.
 type TokenTrackerInterface interface {
 	TryUse(signature string) error
+	Healthy() error
 	Close() error
 }
 
@@ -187,8 +187,7 @@ const (
 
 // GetLeaseConnection handles GET /v1/leases/{lease_uuid}/connection
 func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	leaseUUID := vars["lease_uuid"]
+	leaseUUID := r.PathValue("lease_uuid")
 
 	// Authenticate and authorize the request (requires active lease, checks replay)
 	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
@@ -258,8 +257,7 @@ type LeaseStatusResponse struct {
 
 // GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
 func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	leaseUUID := vars["lease_uuid"]
+	leaseUUID := r.PathValue("lease_uuid")
 
 	// Authenticate and authorize the request (any lease state, no replay check for read-heavy endpoint)
 	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
@@ -283,7 +281,11 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Check provisioning status if checker is available
 	if h.statusChecker != nil {
-		response.PayloadReceived = h.statusChecker.HasPayload(leaseUUID)
+		hasPayload, err := h.statusChecker.HasPayload(leaseUUID)
+		if err != nil {
+			slog.Warn("failed to check payload status", "lease_uuid", leaseUUID, "error", err)
+		}
+		response.PayloadReceived = hasPayload
 		response.ProvisioningStarted = h.statusChecker.IsInFlight(leaseUUID)
 	}
 
@@ -291,6 +293,146 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		"lease_uuid", leaseUUID,
 		"tenant", auth.Token.Tenant,
 		"state", response.State,
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
+// LeaseProvisionResponse represents the response for provision diagnostics.
+type LeaseProvisionResponse struct {
+	LeaseUUID    string `json:"lease_uuid"`
+	Tenant       string `json:"tenant"`
+	ProviderUUID string `json:"provider_uuid"`
+	Status       string `json:"status"`
+	FailCount    int    `json:"fail_count"`
+	LastError    string `json:"last_error,omitempty"`
+}
+
+// LeaseLogsResponse represents the response for container logs.
+type LeaseLogsResponse struct {
+	LeaseUUID    string            `json:"lease_uuid"`
+	Tenant       string            `json:"tenant"`
+	ProviderUUID string            `json:"provider_uuid"`
+	Logs         map[string]string `json:"logs"`
+}
+
+// GetLeaseProvision handles GET /v1/leases/{lease_uuid}/provision
+func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (any lease state, no replay check for read endpoint)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.backendRouter.Route(sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	info, err := backendClient.GetProvision(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "provision not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to get provision from backend", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	response := LeaseProvisionResponse{
+		LeaseUUID:    leaseUUID,
+		Tenant:       auth.Token.Tenant,
+		ProviderUUID: h.providerUUID,
+		Status:       string(info.Status),
+		FailCount:    info.FailCount,
+		LastError:    info.LastError,
+	}
+
+	slog.Info("lease provision info served",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"status", info.Status,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
+// GetLeaseLogs handles GET /v1/leases/{lease_uuid}/logs
+func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (any lease state, no replay check for read endpoint)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Parse tail parameter
+	tail := 100 // default
+	if v := r.URL.Query().Get("tail"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n < 1 {
+			writeError(w, "tail must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		if n > 10000 {
+			writeError(w, "tail must not exceed 10000", http.StatusBadRequest)
+			return
+		}
+		tail = n
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.backendRouter.Route(sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	logs, err := backendClient.GetLogs(r.Context(), leaseUUID, tail)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "logs not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to get logs from backend", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	response := LeaseLogsResponse{
+		LeaseUUID:    leaseUUID,
+		Tenant:       auth.Token.Tenant,
+		ProviderUUID: h.providerUUID,
+		Logs:         logs,
+	}
+
+	slog.Info("lease logs served",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
 	)
 
 	writeJSON(w, response, http.StatusOK)
@@ -317,9 +459,10 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	// Check chain connectivity
 	if h.client != nil {
 		if err := h.client.Ping(r.Context()); err != nil {
+			slog.Warn("health check: chain unhealthy", "error", err)
 			checks["chain"] = &CheckResult{
 				Status:  "unhealthy",
-				Message: err.Error(),
+				Message: "chain connectivity failed",
 			}
 			overallHealthy = false
 		} else {
@@ -339,14 +482,31 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 					Status: "healthy",
 				}
 			} else {
+				slog.Warn("health check: backend unhealthy", "backend", result.Name, "error", result.Error)
 				checks[checkKey] = &CheckResult{
 					Status:  "unhealthy",
-					Message: result.Error,
+					Message: "backend health check failed",
 				}
 			}
 		}
 		if !backendsHealthy {
 			overallHealthy = false
+		}
+	}
+
+	// Check token tracker (bbolt database)
+	if h.tokenTracker != nil {
+		if err := h.tokenTracker.Healthy(); err != nil {
+			slog.Warn("health check: token tracker unhealthy", "error", err)
+			checks["token_tracker"] = &CheckResult{
+				Status:  "unhealthy",
+				Message: "token tracker unavailable",
+			}
+			overallHealthy = false
+		} else {
+			checks["token_tracker"] = &CheckResult{
+				Status: "healthy",
+			}
 		}
 	}
 

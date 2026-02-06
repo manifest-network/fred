@@ -3,11 +3,18 @@ package adr036_test
 import (
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/adr036"
 	"github.com/manifest-network/fred/internal/testutil"
 )
+
+// secp256k1N is the curve order, used in tests to flip S values.
+var secp256k1N, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
 
 func TestVerifySignature_Valid(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-seed-1")
@@ -15,14 +22,10 @@ func TestVerifySignature_Valid(t *testing.T) {
 	message := []byte("test message")
 	signBytes := adr036.CreateSignBytes(message, kp.Address)
 	sig, err := kp.PrivKey.Sign(signBytes)
-	if err != nil {
-		t.Fatalf("Sign() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, sig, kp.Address)
-	if err != nil {
-		t.Errorf("VerifySignature() error = %v, want nil", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestVerifySignature_InvalidPubKeyLength(t *testing.T) {
@@ -40,14 +43,9 @@ func TestVerifySignature_InvalidPubKeyLength(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			pubKey := make([]byte, tt.pubKeyLen)
 			err := adr036.VerifySignature(pubKey, []byte("test"), []byte("sig"), "signer")
-			if err == nil {
-				t.Error("VerifySignature() = nil, want error")
-			}
+			assert.Error(t, err)
 			if err != nil && tt.pubKeyLen != 33 {
-				expected := "invalid public key length"
-				if err.Error()[:len(expected)] != expected {
-					t.Errorf("VerifySignature() error = %q, want to start with %q", err.Error(), expected)
-				}
+				assert.Contains(t, err.Error(), "invalid public key length")
 			}
 		})
 	}
@@ -60,9 +58,7 @@ func TestVerifySignature_InvalidSignature(t *testing.T) {
 	wrongSig := make([]byte, 64) // Invalid signature
 
 	err := adr036.VerifySignature(kp.PubKey.Bytes(), message, wrongSig, kp.Address)
-	if err == nil {
-		t.Error("VerifySignature() = nil, want error")
-	}
+	assert.Error(t, err)
 }
 
 func TestVerifySignature_WrongMessage(t *testing.T) {
@@ -71,16 +67,12 @@ func TestVerifySignature_WrongMessage(t *testing.T) {
 	originalMessage := []byte("original message")
 	signBytes := adr036.CreateSignBytes(originalMessage, kp.Address)
 	sig, err := kp.PrivKey.Sign(signBytes)
-	if err != nil {
-		t.Fatalf("Sign() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Try to verify with different message
 	differentMessage := []byte("different message")
 	err = adr036.VerifySignature(kp.PubKey.Bytes(), differentMessage, sig, kp.Address)
-	if err == nil {
-		t.Error("VerifySignature() = nil, want error for wrong message")
-	}
+	assert.Error(t, err)
 }
 
 func TestVerifySignature_WrongSigner(t *testing.T) {
@@ -90,15 +82,11 @@ func TestVerifySignature_WrongSigner(t *testing.T) {
 	// Sign with correct signer
 	signBytes := adr036.CreateSignBytes(message, kp.Address)
 	sig, err := kp.PrivKey.Sign(signBytes)
-	if err != nil {
-		t.Fatalf("Sign() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	// Verify with wrong signer address
 	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, sig, "manifest1wrongaddress")
-	if err == nil {
-		t.Error("VerifySignature() = nil, want error for wrong signer")
-	}
+	assert.Error(t, err)
 }
 
 func TestCreateSignBytes(t *testing.T) {
@@ -106,50 +94,27 @@ func TestCreateSignBytes(t *testing.T) {
 	signer := "manifest1abc123"
 
 	signBytes := adr036.CreateSignBytes(message, signer)
-	if signBytes == nil {
-		t.Fatal("CreateSignBytes() = nil")
-	}
+	require.NotNil(t, signBytes)
 
 	// Verify it's valid JSON
 	var doc adr036.SignDoc
-	if err := json.Unmarshal(signBytes, &doc); err != nil {
-		t.Fatalf("CreateSignBytes() produced invalid JSON: %v", err)
-	}
+	err := json.Unmarshal(signBytes, &doc)
+	require.NoError(t, err)
 
 	// Verify structure
-	if doc.AccountNumber != "0" {
-		t.Errorf("AccountNumber = %q, want %q", doc.AccountNumber, "0")
-	}
-	if doc.ChainID != "" {
-		t.Errorf("ChainID = %q, want empty string", doc.ChainID)
-	}
-	if doc.Sequence != "0" {
-		t.Errorf("Sequence = %q, want %q", doc.Sequence, "0")
-	}
-	if doc.Fee.Gas != "0" {
-		t.Errorf("Fee.Gas = %q, want %q", doc.Fee.Gas, "0")
-	}
-	if len(doc.Fee.Amount) != 0 {
-		t.Errorf("Fee.Amount length = %d, want 0", len(doc.Fee.Amount))
-	}
-	if len(doc.Msgs) != 1 {
-		t.Fatalf("Msgs length = %d, want 1", len(doc.Msgs))
-	}
-	if doc.Msgs[0].Type != "sign/MsgSignData" {
-		t.Errorf("Msgs[0].Type = %q, want %q", doc.Msgs[0].Type, "sign/MsgSignData")
-	}
-	if doc.Msgs[0].Value.Signer != signer {
-		t.Errorf("Msgs[0].Value.Signer = %q, want %q", doc.Msgs[0].Value.Signer, signer)
-	}
+	assert.Equal(t, "0", doc.AccountNumber)
+	assert.Equal(t, "", doc.ChainID)
+	assert.Equal(t, "0", doc.Sequence)
+	assert.Equal(t, "0", doc.Fee.Gas)
+	assert.Len(t, doc.Fee.Amount, 0)
+	require.Len(t, doc.Msgs, 1)
+	assert.Equal(t, "sign/MsgSignData", doc.Msgs[0].Type)
+	assert.Equal(t, signer, doc.Msgs[0].Value.Signer)
 
 	// Verify data is base64 encoded message
 	decodedData, err := base64.StdEncoding.DecodeString(doc.Msgs[0].Value.Data)
-	if err != nil {
-		t.Fatalf("Failed to decode data: %v", err)
-	}
-	if string(decodedData) != string(message) {
-		t.Errorf("Decoded data = %q, want %q", string(decodedData), string(message))
-	}
+	require.NoError(t, err)
+	assert.Equal(t, string(message), string(decodedData))
 }
 
 func TestCreateSignDoc(t *testing.T) {
@@ -157,30 +122,16 @@ func TestCreateSignDoc(t *testing.T) {
 	signer := "manifest1xyz789"
 
 	doc := adr036.CreateSignDoc(message, signer)
-	if doc == nil {
-		t.Fatal("CreateSignDoc() = nil")
-	}
+	require.NotNil(t, doc)
 
-	if doc.AccountNumber != "0" {
-		t.Errorf("AccountNumber = %q, want %q", doc.AccountNumber, "0")
-	}
-	if doc.ChainID != "" {
-		t.Errorf("ChainID = %q, want empty string", doc.ChainID)
-	}
-	if doc.Memo != "" {
-		t.Errorf("Memo = %q, want empty string", doc.Memo)
-	}
-	if len(doc.Msgs) != 1 {
-		t.Fatalf("Msgs length = %d, want 1", len(doc.Msgs))
-	}
-	if doc.Msgs[0].Value.Signer != signer {
-		t.Errorf("Signer = %q, want %q", doc.Msgs[0].Value.Signer, signer)
-	}
+	assert.Equal(t, "0", doc.AccountNumber)
+	assert.Equal(t, "", doc.ChainID)
+	assert.Equal(t, "", doc.Memo)
+	require.Len(t, doc.Msgs, 1)
+	assert.Equal(t, signer, doc.Msgs[0].Value.Signer)
 
 	expectedData := base64.StdEncoding.EncodeToString(message)
-	if doc.Msgs[0].Value.Data != expectedData {
-		t.Errorf("Data = %q, want %q", doc.Msgs[0].Value.Data, expectedData)
-	}
+	assert.Equal(t, expectedData, doc.Msgs[0].Value.Data)
 }
 
 func TestCreateSignBytes_Deterministic(t *testing.T) {
@@ -192,7 +143,107 @@ func TestCreateSignBytes_Deterministic(t *testing.T) {
 	result2 := adr036.CreateSignBytes(message, signer)
 	result3 := adr036.CreateSignBytes(message, signer)
 
-	if string(result1) != string(result2) || string(result2) != string(result3) {
-		t.Error("CreateSignBytes() is not deterministic")
+	assert.True(t, string(result1) == string(result2) && string(result2) == string(result3))
+}
+
+// flipS returns a new 64-byte signature with S replaced by N-S (the high-S form).
+func flipS(sig []byte) []byte {
+	if len(sig) != 64 {
+		panic("flipS: expected 64-byte signature")
+	}
+	s := new(big.Int).SetBytes(sig[32:64])
+	flipped := new(big.Int).Sub(secp256k1N, s)
+	out := make([]byte, 64)
+	copy(out[:32], sig[:32])
+	fBytes := flipped.Bytes()
+	copy(out[64-len(fBytes):64], fBytes)
+	return out
+}
+
+func TestNormalizeToLowS_AlreadyLow(t *testing.T) {
+	kp := testutil.NewTestKeyPair("low-s-test")
+	message := []byte("low-s message")
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	require.NoError(t, err)
+
+	// Cosmos SDK's secp256k1 may produce either form.
+	// Normalize first to get the canonical low-S.
+	normalized := adr036.NormalizeToLowS(sig)
+	require.NotNil(t, normalized)
+
+	// Normalizing an already-normalized signature should return the same bytes.
+	doubleNormalized := adr036.NormalizeToLowS(normalized)
+	assert.Equal(t, normalized, doubleNormalized, "double normalization should be idempotent")
+}
+
+func TestNormalizeToLowS_HighS(t *testing.T) {
+	kp := testutil.NewTestKeyPair("high-s-test")
+	message := []byte("high-s message")
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	require.NoError(t, err)
+
+	// Get canonical low-S form
+	lowS := adr036.NormalizeToLowS(sig)
+	require.NotNil(t, lowS)
+
+	// Flip S to get the high-S variant
+	highS := flipS(lowS)
+	assert.NotEqual(t, lowS, highS, "flipped signature should differ")
+
+	// Normalizing the high-S form should produce the same canonical low-S
+	normalizedHighS := adr036.NormalizeToLowS(highS)
+	assert.Equal(t, lowS, normalizedHighS, "high-S should normalize to same low-S form")
+}
+
+func TestNormalizeToLowS_InvalidLength(t *testing.T) {
+	assert.Nil(t, adr036.NormalizeToLowS(nil))
+	assert.Nil(t, adr036.NormalizeToLowS([]byte{}))
+	assert.Nil(t, adr036.NormalizeToLowS(make([]byte, 63)))
+	assert.Nil(t, adr036.NormalizeToLowS(make([]byte, 65)))
+}
+
+func TestVerifySignature_AcceptsBothSForms(t *testing.T) {
+	kp := testutil.NewTestKeyPair("both-s-test")
+	message := []byte("both S forms")
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	require.NoError(t, err)
+
+	// Get canonical low-S
+	lowS := adr036.NormalizeToLowS(sig)
+	require.NotNil(t, lowS)
+
+	// Flip to high-S
+	highS := flipS(lowS)
+
+	// Both forms should verify
+	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, lowS, kp.Address)
+	assert.NoError(t, err, "low-S signature should verify")
+
+	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, highS, kp.Address)
+	assert.NoError(t, err, "high-S signature should verify")
+}
+
+func TestNormalizeToLowS_BothFormsProduceSameCanonical(t *testing.T) {
+	// Test with multiple key pairs to increase confidence
+	for _, seed := range []string{"seed-a", "seed-b", "seed-c", "seed-d", "seed-e"} {
+		t.Run(seed, func(t *testing.T) {
+			kp := testutil.NewTestKeyPair(seed)
+			message := []byte("canonical form test " + seed)
+			signBytes := adr036.CreateSignBytes(message, kp.Address)
+			sig, err := kp.PrivKey.Sign(signBytes)
+			require.NoError(t, err)
+
+			lowS := adr036.NormalizeToLowS(sig)
+			highS := flipS(lowS)
+
+			fromLow := adr036.NormalizeToLowS(lowS)
+			fromHigh := adr036.NormalizeToLowS(highS)
+
+			assert.Equal(t, fromLow, fromHigh,
+				"normalizing both S forms should produce identical canonical signatures")
+		})
 	}
 }

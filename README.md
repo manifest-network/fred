@@ -168,6 +168,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `log_level` | Log verbosity (debug, info, warn, error) | `info` |
 | `production_mode` | Enforce security requirements at startup (TLS, replay protection, SSRF) | `false` |
 | `chain_id` | Chain identifier | `manifest-1` |
 | `grpc_endpoint` | Chain gRPC endpoint | `localhost:9090` |
@@ -191,8 +192,6 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
-| `payload_store_ttl` | TTL for stored payloads | `1h` |
-| `payload_store_cleanup_freq` | How often to clean up expired payloads | `10m` |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 ### Advanced Configuration
@@ -251,6 +250,9 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 
 # Or use environment variables
 ./build/providerd
+
+# Print version
+./build/providerd --version
 ```
 
 ## API Endpoints
@@ -303,8 +305,8 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   "connection": {
     "host": "compute-alpha.example.com",
     "ports": {
-      "8080/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"},
-      "443/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}
+      "8080/tcp": {"host_ip": "0.0.0.0", "host_port": 32768},
+      "443/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}
     },
     "protocol": "https",
     "metadata": {
@@ -329,14 +331,14 @@ Returns connection details for an active lease from the backend. Requires ADR-03
         "container_id": "abc123",
         "image": "nginx:latest",
         "status": "running",
-        "ports": {"80/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"}}
+        "ports": {"80/tcp": {"host_ip": "0.0.0.0", "host_port": 32768}}
       },
       {
         "instance_index": 1,
         "container_id": "def456",
         "image": "redis:alpine",
         "status": "running",
-        "ports": {"6379/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}}
+        "ports": {"6379/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}}
       }
     ],
     "metadata": {"backend": "docker"}
@@ -374,6 +376,73 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `requires_payload` - True if lease has meta_hash (expects payload upload)
 - `payload_received` - True if payload has been uploaded
 - `provisioning_started` - True if provisioning is in progress
+
+### Get Provision Diagnostics
+
+```
+GET /v1/leases/{lease_uuid}/provision
+Authorization: Bearer <token>
+```
+
+Returns provision diagnostics for a lease, including status, error details, and failure count. Works for both active and non-active leases (e.g., after rejection or closure), falling back to persisted diagnostics when the provision is no longer in memory.
+
+**Response:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "status": "failed",
+  "fail_count": 3,
+  "last_error": "container exited with code 1 (OOM killed)"
+}
+```
+
+**Fields:**
+- `status` - Provision status: `provisioning`, `ready`, or `failed`
+- `fail_count` - Number of provision attempts that failed
+- `last_error` - Detailed error message (only present on failure)
+
+**Response Codes:**
+- `200 OK` - Provision found
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Provision not found (never provisioned or diagnostics expired)
+
+### Get Container Logs
+
+```
+GET /v1/leases/{lease_uuid}/logs?tail=100
+Authorization: Bearer <token>
+```
+
+Returns container logs for a lease. Works for both active and non-active leases, falling back to persisted logs when the provision is no longer in memory.
+
+**Query Parameters:**
+- `tail` - Number of log lines to return per container (default: 100, max: 10000)
+
+**Response:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "logs": {
+    "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
+    "1": "2024-01-15 Redis ready\n"
+  }
+}
+```
+
+**Fields:**
+- `logs` - Map of container instance index to log output
+
+**Response Codes:**
+- `200 OK` - Logs found
+- `400 Bad Request` - Invalid tail parameter (negative, zero, or exceeds max)
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Provision not found (never provisioned or logs expired)
 
 ### Upload Payload
 
@@ -536,6 +605,41 @@ Deprovision a resource (idempotent).
 ```
 
 **Response:** `200 OK`
+
+### GET /provisions/{lease_uuid}
+
+Get provision diagnostics for a specific lease.
+
+**Response:** `200 OK`
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "status": "failed",
+  "fail_count": 3,
+  "last_error": "container exited with code 1 (OOM killed)",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**Response:** `404 Not Found` if not provisioned.
+
+### GET /logs/{lease_uuid}
+
+Get container logs for a specific lease.
+
+**Query Parameters:**
+- `tail` - Number of log lines per container (default: 100)
+
+**Response:** `200 OK`
+```json
+{
+  "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
+  "1": "2024-01-15 Redis ready\n"
+}
+```
+
+**Response:** `404 Not Found` if not provisioned.
 
 ### GET /provisions
 
@@ -709,6 +813,7 @@ internal/
 ├── adr036/             # ADR-036 signature verification
 ├── api/                # HTTP server, handlers, rate limiting
 ├── auth/               # Shared authentication utilities
+├── hmacauth/           # HMAC-SHA256 signing and verification
 ├── backend/            # Backend client and router
 │   ├── client.go       # HTTP client for backends (with circuit breaker)
 │   ├── router.go       # SKU-based routing
@@ -742,7 +847,7 @@ Fred uses **level-triggered reconciliation** to ensure consistency between chain
 
 ### How It Works
 
-Instead of replaying missed events (edge-triggered), reconciliation queries current state:
+Instead of replaying missed events (edge-triggered), reconciliation queries current state. Before reading provisions, the reconciler calls `RefreshState` on each backend to ensure in-memory state is synchronized with the actual infrastructure (e.g., Docker container status).
 
 ```
 Chain State (leases)     Backend State (provisions)
@@ -750,18 +855,21 @@ Chain State (leases)     Backend State (provisions)
         └──────────┬───────────────┘
                    │
                    ▼
+         RefreshState (each backend)
+                   │
+                   ▼
             Reconciler compares
                    │
-        ┌──────────┼──────────┐
-        ▼          ▼          ▼
-    PENDING     ACTIVE      CLOSED
-    + not      + not       + still
-    provisioned provisioned provisioned
-        │          │          │
-        ▼          ▼          ▼
-     Start      Anomaly:   Deprovision
-   provisioning  log &      (orphan
-                provision   cleanup)
+        ┌──────────┼──────────┬──────────┐
+        ▼          ▼          ▼          ▼
+    PENDING     ACTIVE      ACTIVE     CLOSED
+    + not      + not       + failed   + still
+    provisioned provisioned provision  provisioned
+        │          │          │          │
+        ▼          ▼          ▼          ▼
+     Start      Anomaly:  Re-provision Deprovision
+   provisioning  log &    (with limit)  (orphan
+                provision               cleanup)
 ```
 
 ### Reconciliation Triggers
@@ -777,7 +885,8 @@ Chain State (leases)     Backend State (provisions)
 | PENDING + meta_hash | Not provisioned | Await payload upload |
 | PENDING (no hash) | Not provisioned | Start provisioning |
 | PENDING | Provisioned + ready | Acknowledge lease |
-| ACTIVE | Provisioned | Healthy - no action |
+| ACTIVE | Provisioned + ready | Healthy - no action |
+| ACTIVE | Provisioned + failed | Anomaly: re-provision (with attempt limit) |
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |

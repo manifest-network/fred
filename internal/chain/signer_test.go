@@ -12,6 +12,8 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	authtx "github.com/cosmos/cosmos-sdk/x/auth/tx"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
@@ -81,9 +83,7 @@ func newTestAccountAny(t *testing.T, addr sdk.AccAddress, accNum, seq uint64) *c
 func TestNewSigner_Success(t *testing.T) {
 	s := newTestSigner(t)
 
-	if s.address == "" {
-		t.Error("address is empty, want non-empty bech32 address")
-	}
+	assert.NotEmpty(t, s.address)
 }
 
 func TestNewSigner_KeyNotFound(t *testing.T) {
@@ -93,9 +93,7 @@ func TestNewSigner_KeyNotFound(t *testing.T) {
 		KeyName:        "nonexistent",
 		ChainID:        "test-1",
 	})
-	if err == nil {
-		t.Error("NewSigner() with missing key should return error")
-	}
+	assert.Error(t, err)
 }
 
 func TestNewSigner_InvalidBackend(t *testing.T) {
@@ -105,62 +103,43 @@ func TestNewSigner_InvalidBackend(t *testing.T) {
 		KeyName:        "testkey",
 		ChainID:        "test-1",
 	})
-	if err == nil {
-		t.Error("NewSigner() with invalid backend should return error")
-	}
+	assert.Error(t, err)
 }
 
 func TestSigner_Address(t *testing.T) {
 	s := newTestSigner(t)
 
 	addr := s.Address()
-	if addr == "" {
-		t.Fatal("Address() returned empty string")
-	}
+	require.NotEmpty(t, addr)
 
 	// The address should start with the default cosmos prefix or manifest prefix
 	// depending on SDK config. Just verify it's non-empty and parseable.
 	_, err := sdk.AccAddressFromBech32(addr)
-	if err != nil {
-		t.Errorf("Address() returned invalid bech32 address %q: %v", addr, err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestSigner_SignTx(t *testing.T) {
 	s := newTestSigner(t)
 
 	addr, err := sdk.AccAddressFromBech32(s.address)
-	if err != nil {
-		t.Fatalf("invalid signer address: %v", err)
-	}
+	require.NoError(t, err)
 
 	accountAny := newTestAccountAny(t, addr, 42, 7)
 
 	txBytes, err := s.SignTx(context.Background(), newTestMsg(s.address), accountAny)
-	if err != nil {
-		t.Fatalf("SignTx() error = %v", err)
-	}
-
-	if len(txBytes) == 0 {
-		t.Fatal("SignTx() returned empty bytes")
-	}
+	require.NoError(t, err)
+	require.NotEmpty(t, txBytes)
 
 	// Decode and verify the transaction
 	tx, err := s.txConfig.TxDecoder()(txBytes)
-	if err != nil {
-		t.Fatalf("failed to decode tx: %v", err)
-	}
+	require.NoError(t, err)
 
 	feeTx, ok := tx.(sdk.FeeTx)
-	if !ok {
-		t.Fatal("decoded tx does not implement sdk.FeeTx")
-	}
+	require.True(t, ok)
 
 	// gasLimit=200000, gasPrice=100 -> 200000*100/1_000_000 = 20
 	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(20)))
-	if !feeTx.GetFee().Equal(expectedFee) {
-		t.Errorf("fee = %v, want %v", feeTx.GetFee(), expectedFee)
-	}
+	assert.True(t, feeTx.GetFee().Equal(expectedFee))
 }
 
 func TestSigner_SignTx_MinimumFee(t *testing.T) {
@@ -170,32 +149,22 @@ func TestSigner_SignTx_MinimumFee(t *testing.T) {
 	s.gasPrice = 1
 
 	addr, err := sdk.AccAddressFromBech32(s.address)
-	if err != nil {
-		t.Fatalf("invalid signer address: %v", err)
-	}
+	require.NoError(t, err)
 
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
 	txBytes, err := s.SignTx(context.Background(), newTestMsg(s.address), accountAny)
-	if err != nil {
-		t.Fatalf("SignTx() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	tx, err := s.txConfig.TxDecoder()(txBytes)
-	if err != nil {
-		t.Fatalf("failed to decode tx: %v", err)
-	}
+	require.NoError(t, err)
 
 	feeTx, ok := tx.(sdk.FeeTx)
-	if !ok {
-		t.Fatal("decoded tx does not implement sdk.FeeTx")
-	}
+	require.True(t, ok)
 
 	// Fee should be clamped to minimum of 1
 	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(1)))
-	if !feeTx.GetFee().Equal(expectedFee) {
-		t.Errorf("fee = %v, want minimum fee %v", feeTx.GetFee(), expectedFee)
-	}
+	assert.True(t, feeTx.GetFee().Equal(expectedFee))
 }
 
 func TestSigner_SignTx_InvalidAccount(t *testing.T) {
@@ -208,7 +177,5 @@ func TestSigner_SignTx_InvalidAccount(t *testing.T) {
 	}
 
 	_, err := s.SignTx(context.Background(), newTestMsg(s.address), wrongAny)
-	if err == nil {
-		t.Error("SignTx() with invalid account Any should return error")
-	}
+	assert.Error(t, err)
 }

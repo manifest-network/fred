@@ -1,6 +1,8 @@
 package provisioner
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // HandlerDeps contains the dependencies needed by the handler set.
@@ -20,7 +23,7 @@ type HandlerDeps struct {
 	Orchestrator *ProvisionOrchestrator
 	Tracker      InFlightTracker
 	Acknowledger Acknowledger
-	PayloadStore *PayloadStore
+	PayloadStore *payload.Store
 }
 
 // HandlerSet contains the Watermill message handlers for the provisioner.
@@ -32,6 +35,25 @@ type HandlerSet struct {
 // NewHandlerSet creates a new HandlerSet with the given dependencies.
 func NewHandlerSet(deps HandlerDeps) *HandlerSet {
 	return &HandlerSet{deps: deps}
+}
+
+// rejectOnValidationError rejects a lease on chain after a validation error.
+// Returns nil on success, or an error to trigger Watermill retry on rejection failure.
+func (h *HandlerSet) rejectOnValidationError(ctx context.Context, lease *billingtypes.Lease, err error) error {
+	slog.Warn("provisioning failed with validation error, rejecting lease",
+		"lease_uuid", lease.Uuid,
+		"tenant", lease.Tenant,
+		"error", err,
+	)
+	_, _, rejectErr := h.deps.ChainClient.RejectLeases(ctx, []string{lease.Uuid}, validationErrorToRejectReason(err))
+	if rejectErr != nil {
+		slog.Error("failed to reject lease after validation error",
+			"lease_uuid", lease.Uuid,
+			"error", rejectErr,
+		)
+		return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
+	}
+	return nil
 }
 
 // HandleLeaseCreated processes new lease events.
@@ -73,26 +95,49 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning without payload
-	return h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+	if err != nil {
+		if errors.Is(err, backend.ErrValidation) {
+			return h.rejectOnValidationError(msg.Context(), lease, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // HandleLeaseClosed processes lease closure events.
 func (h *HandlerSet) HandleLeaseClosed(msg *message.Message) (err error) {
 	defer func() { recordWatermillMetrics(TopicLeaseClosed, err) }()
+	return h.processLeaseClose(msg, TopicLeaseClosed)
+}
 
-	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseClosed)
+// HandleLeaseExpired processes lease expiration events.
+// Same logic as HandleLeaseClosed but records metrics under the correct topic.
+func (h *HandlerSet) HandleLeaseExpired(msg *message.Message) (err error) {
+	defer func() { recordWatermillMetrics(TopicLeaseExpired, err) }()
+	return h.processLeaseClose(msg, TopicLeaseExpired)
+}
+
+// processLeaseClose is the shared implementation for HandleLeaseClosed and HandleLeaseExpired.
+func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error {
+	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, topic)
 	if !ok {
 		return nil
 	}
 
-	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant)
+	slog.Info("processing lease close", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant, "topic", topic)
 
 	// Clean up any stored payload for this lease.
 	// This handles the case where a tenant uploaded a payload but canceled the lease
 	// before provisioning started, or any other scenario where payload exists but
 	// the lease is no longer valid.
 	if h.deps.PayloadStore != nil {
-		if h.deps.PayloadStore.Has(event.LeaseUUID) {
+		if exists, err := h.deps.PayloadStore.Has(event.LeaseUUID); err != nil {
+			slog.Warn("failed to check payload store during lease close",
+				"lease_uuid", event.LeaseUUID,
+				"error", err,
+			)
+		} else if exists {
 			h.deps.PayloadStore.Delete(event.LeaseUUID)
 			slog.Info("cleaned up stored payload for closed lease",
 				"lease_uuid", event.LeaseUUID,
@@ -117,12 +162,6 @@ func (h *HandlerSet) HandleLeaseClosed(msg *message.Message) (err error) {
 
 	// Delegate to orchestrator for deprovisioning
 	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID, skuHint)
-}
-
-// HandleLeaseExpired processes lease expiration events.
-func (h *HandlerSet) HandleLeaseExpired(msg *message.Message) error {
-	// Same handling as closed - deprovision the resource
-	return h.HandleLeaseClosed(msg)
 }
 
 // HandleBackendCallback processes callbacks from backends.
@@ -196,10 +235,10 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		recordDuration()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
 
-		// Clean up payload now that provisioning is confirmed successful
-		if h.deps.PayloadStore != nil {
-			h.deps.PayloadStore.Delete(callback.LeaseUUID)
-		}
+		// Payload is intentionally NOT deleted here. The lease is now ACTIVE
+		// but the container could crash later, requiring re-provisioning with
+		// the same manifest. Payload cleanup happens when the lease is closed
+		// (HandleLeaseClosed) or rejected (failure callback above).
 
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
@@ -209,14 +248,41 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		)
 
 	case backend.CallbackStatusFailed:
-		// Reject the lease on chain FIRST, before untracking.
-		// This prevents a race where the reconciler sees a PENDING lease that's
-		// not in-flight and tries to provision it again.
 		reason := callback.Error
 		if reason == "" {
 			reason = "provisioning failed"
 		}
-		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, reason)
+
+		// Check if this is a re-provision of an ACTIVE lease. Rejecting only
+		// applies to PENDING leases. For ACTIVE leases, just untrack and let
+		// the reconciler handle it (it will retry or reject based on FailCount).
+		lease, err := h.deps.ChainClient.GetLease(msg.Context(), callback.LeaseUUID)
+		if err != nil {
+			slog.Error("failed to fetch lease state for failure callback, keeping in-flight",
+				"lease_uuid", callback.LeaseUUID,
+				"error", err,
+			)
+			return fmt.Errorf("failed to fetch lease %s: %w", callback.LeaseUUID, err)
+		}
+		if lease != nil && lease.State == billingtypes.LEASE_STATE_ACTIVE {
+			// Lease is ACTIVE — this was a re-provision attempt. Untrack and
+			// let the reconciler detect the still-failed backend state.
+			h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+			recordDuration()
+			metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+
+			slog.Warn("re-provision failed for active lease, deferring to reconciler",
+				"lease_uuid", callback.LeaseUUID,
+				"tenant", provision.Tenant,
+				"reason", reason,
+			)
+			return nil
+		}
+
+		// PENDING lease — reject on chain FIRST, before untracking.
+		// This prevents a race where the reconciler sees a PENDING lease that's
+		// not in-flight and tries to provision it again.
+		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, truncateRejectReason(reason))
 		if err != nil {
 			// Keep in-flight so reconciler doesn't try to re-provision.
 			// The timeout checker or next reconciliation will retry.
@@ -278,7 +344,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return nil // Don't retry - configuration issue
 	}
 
-	event, ok := unmarshalMessagePayload[PayloadEvent](msg, TopicPayloadReceived)
+	event, ok := unmarshalMessagePayload[payload.Event](msg, TopicPayloadReceived)
 	if !ok {
 		return nil
 	}
@@ -323,8 +389,15 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	// Note: Payload is NOT deleted here. It will be deleted by HandleBackendCallback
 	// after the backend reports success or failure. This ensures the payload remains
 	// available for retry if the backend fails or crashes before sending a callback.
-	payload := h.deps.PayloadStore.Get(event.LeaseUUID)
-	if payload == nil {
+	payloadData, err := h.deps.PayloadStore.Get(event.LeaseUUID)
+	if err != nil {
+		slog.Error("failed to read payload from store",
+			"lease_uuid", event.LeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("payload store read error: %w", err)
+	}
+	if payloadData == nil {
 		// This shouldn't happen in normal operation since payload is stored
 		// before publishing the event, but handle it gracefully
 		slog.Warn("payload not found in store, proceeding without payload",
@@ -334,7 +407,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	} else if event.MetaHashHex != "" {
 		// Re-verify payload hash before provisioning to catch any corruption.
 		// The payload was validated on upload, but disk corruption could occur.
-		if err := VerifyPayloadHashHex(payload, event.MetaHashHex); err != nil {
+		if err := payload.VerifyHashHex(payloadData, event.MetaHashHex); err != nil {
 			h.deps.PayloadStore.Delete(event.LeaseUUID)
 			slog.Error("payload hash mismatch - possible corruption",
 				"lease_uuid", event.LeaseUUID,
@@ -345,8 +418,16 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning with payload
-	return h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
-		Payload:     payload,
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
+		Payload:     payloadData,
 		PayloadHash: event.MetaHashHex,
 	})
+	if err != nil {
+		if errors.Is(err, backend.ErrValidation) {
+			h.deps.PayloadStore.Delete(event.LeaseUUID)
+			return h.rejectOnValidationError(msg.Context(), lease, err)
+		}
+		return err
+	}
+	return nil
 }

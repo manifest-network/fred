@@ -1,4 +1,4 @@
-package provisioner
+package payload
 
 import (
 	"crypto/rand"
@@ -8,14 +8,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // waitForFlush polls until the specified key is visible in the store.
 // This is more reliable than time.Sleep for synchronization.
-func waitForFlush(t testing.TB, store *PayloadStore, key string, timeout time.Duration) {
+func waitForFlush(t testing.TB, store *Store, key string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if store.Get(key) != nil {
+		data, _ := store.Get(key)
+		if data != nil {
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -23,14 +27,13 @@ func waitForFlush(t testing.TB, store *PayloadStore, key string, timeout time.Du
 	t.Fatalf("timeout waiting for key %q to be flushed", key)
 }
 
-// BenchmarkPayloadStore_Write benchmarks single payload writes.
-func BenchmarkPayloadStore_Write(b *testing.B) {
+// BenchmarkStore_Write benchmarks single payload writes.
+func BenchmarkStore_Write(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
-		FlushInterval:   time.Millisecond,
+	store, err := NewStore(StoreConfig{
+		DBPath: filepath.Join(dir, "payload.db"),
+
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -51,15 +54,14 @@ func BenchmarkPayloadStore_Write(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_Write_Parallel benchmarks concurrent payload writes.
-func BenchmarkPayloadStore_Write_Parallel(b *testing.B) {
+// BenchmarkStore_Write_Parallel benchmarks concurrent payload writes.
+func BenchmarkStore_Write_Parallel(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
-		BatchSize:       100,
-		FlushInterval:   time.Millisecond,
+	store, err := NewStore(StoreConfig{
+		DBPath: filepath.Join(dir, "payload.db"),
+
+		BatchSize:     100,
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -81,14 +83,13 @@ func BenchmarkPayloadStore_Write_Parallel(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_Read benchmarks payload reads.
-func BenchmarkPayloadStore_Read(b *testing.B) {
+// BenchmarkStore_Read benchmarks payload reads.
+func BenchmarkStore_Read(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
-		FlushInterval:   time.Millisecond,
+	store, err := NewStore(StoreConfig{
+		DBPath: filepath.Join(dir, "payload.db"),
+
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -111,20 +112,19 @@ func BenchmarkPayloadStore_Read(b *testing.B) {
 	i := 0
 	for b.Loop() {
 		leaseUUID := fmt.Sprintf("lease-%d", i%numEntries)
-		store.Get(leaseUUID)
+		_, _ = store.Get(leaseUUID)
 		i++
 	}
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_Read_Parallel benchmarks concurrent payload reads.
-func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
+// BenchmarkStore_Read_Parallel benchmarks concurrent payload reads.
+func BenchmarkStore_Read_Parallel(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
-		FlushInterval:   time.Millisecond,
+	store, err := NewStore(StoreConfig{
+		DBPath: filepath.Join(dir, "payload.db"),
+
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -149,25 +149,24 @@ func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
 		for pb.Next() {
 			id := counter.Add(1)
 			leaseUUID := fmt.Sprintf("lease-%d", id%numEntries)
-			store.Get(leaseUUID)
+			_, _ = store.Get(leaseUUID)
 		}
 	})
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_BatchEfficiency compares different batch sizes.
-func BenchmarkPayloadStore_BatchEfficiency(b *testing.B) {
+// BenchmarkStore_BatchEfficiency compares different batch sizes.
+func BenchmarkStore_BatchEfficiency(b *testing.B) {
 	batchSizes := []int{1, 10, 50, 100, 200}
 
 	for _, batchSize := range batchSizes {
 		b.Run(fmt.Sprintf("batch=%d", batchSize), func(b *testing.B) {
 			dir := b.TempDir()
-			store, err := NewPayloadStore(PayloadStoreConfig{
-				DBPath:          filepath.Join(dir, "payload.db"),
-				TTL:             time.Hour,
-				CleanupInterval: time.Hour,
-				BatchSize:       batchSize,
-				FlushInterval:   time.Millisecond,
+			store, err := NewStore(StoreConfig{
+				DBPath: filepath.Join(dir, "payload.db"),
+
+				BatchSize:     batchSize,
+				FlushInterval: time.Millisecond,
 			})
 			if err != nil {
 				b.Fatal(err)
@@ -190,8 +189,8 @@ func BenchmarkPayloadStore_BatchEfficiency(b *testing.B) {
 	}
 }
 
-// BenchmarkPayloadStore_LargePayload benchmarks large payload handling.
-func BenchmarkPayloadStore_LargePayload(b *testing.B) {
+// BenchmarkStore_LargePayload benchmarks large payload handling.
+func BenchmarkStore_LargePayload(b *testing.B) {
 	sizes := []struct {
 		name string
 		size int
@@ -205,11 +204,10 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 	for _, tc := range sizes {
 		b.Run(tc.name, func(b *testing.B) {
 			dir := b.TempDir()
-			store, err := NewPayloadStore(PayloadStoreConfig{
-				DBPath:          filepath.Join(dir, "payload.db"),
-				TTL:             time.Hour,
-				CleanupInterval: time.Hour,
-				FlushInterval:   time.Millisecond,
+			store, err := NewStore(StoreConfig{
+				DBPath: filepath.Join(dir, "payload.db"),
+
+				FlushInterval: time.Millisecond,
 			})
 			if err != nil {
 				b.Fatal(err)
@@ -233,15 +231,14 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 	}
 }
 
-// BenchmarkPayloadStore_MixedWorkload simulates realistic read/write mix.
-func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
+// BenchmarkStore_MixedWorkload simulates realistic read/write mix.
+func BenchmarkStore_MixedWorkload(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
-		BatchSize:       50,
-		FlushInterval:   time.Millisecond,
+	store, err := NewStore(StoreConfig{
+		DBPath: filepath.Join(dir, "payload.db"),
+
+		BatchSize:     50,
+		FlushInterval: time.Millisecond,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -273,31 +270,28 @@ func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
 				id := writeCounter.Add(1) + numEntries
 				store.Store(fmt.Sprintf("lease-%d", id), localPayload)
 			} else {
-				store.Get(fmt.Sprintf("lease-%d", opCount%numEntries))
+				_, _ = store.Get(fmt.Sprintf("lease-%d", opCount%numEntries))
 			}
 		}
 	})
 	b.StopTimer()
 }
 
-// TestPayloadStore_StressTest performs a stress test with concurrent operations.
+// TestStore_StressTest performs a stress test with concurrent operations.
 // Use -short to skip this test.
-func TestPayloadStore_StressTest(t *testing.T) {
+func TestStore_StressTest(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in short mode")
 	}
 
 	dir := t.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
-		BatchSize:       100,
-		FlushInterval:   time.Millisecond,
+	store, err := NewStore(StoreConfig{
+		DBPath: filepath.Join(dir, "payload.db"),
+
+		BatchSize:     100,
+		FlushInterval: time.Millisecond,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer store.Close()
 
 	// Reduced from 100 goroutines x 1000 ops to avoid long test times
@@ -328,7 +322,7 @@ func TestPayloadStore_StressTest(t *testing.T) {
 					store.Delete(leaseUUID)
 					deleteOps.Add(1)
 				default: // 60% reads
-					store.Get(leaseUUID)
+					_, _ = store.Get(leaseUUID)
 					readOps.Add(1)
 				}
 			}
@@ -348,24 +342,21 @@ func TestPayloadStore_StressTest(t *testing.T) {
 	t.Logf("  Deletes: %d", deleteOps.Load())
 }
 
-// TestPayloadStore_HighConcurrencyWrites tests behavior under write-heavy load.
+// TestStore_HighConcurrencyWrites tests behavior under write-heavy load.
 // Use -short to skip this test.
-func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
+func TestStore_HighConcurrencyWrites(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping high concurrency test in short mode")
 	}
 
 	dir := t.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
-		DBPath:          filepath.Join(dir, "payload.db"),
-		TTL:             time.Hour,
-		CleanupInterval: time.Hour,
-		BatchSize:       200,
-		FlushInterval:   time.Millisecond,
+	store, err := NewStore(StoreConfig{
+		DBPath: filepath.Join(dir, "payload.db"),
+
+		BatchSize:     200,
+		FlushInterval: time.Millisecond,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer store.Close()
 
 	// Reduced from 200 goroutines x 500 writes
@@ -410,8 +401,8 @@ func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
 	// Verify data integrity - sample check
 	for g := 0; g < 10; g++ {
 		leaseUUID := fmt.Sprintf("lease-%d-0", g)
-		if data := store.Get(leaseUUID); data == nil {
-			t.Errorf("failed to retrieve lease %s", leaseUUID)
-		}
+		got, err := store.Get(leaseUUID)
+		assert.NoError(t, err, "Get error for lease %s", leaseUUID)
+		assert.NotNil(t, got, "failed to retrieve lease %s", leaseUUID)
 	}
 }

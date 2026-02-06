@@ -35,6 +35,13 @@
 production_mode: false
 
 # =============================================================================
+# LOGGING
+# =============================================================================
+# Log verbosity level. Valid values: debug, info, warn, error
+# Default: info
+log_level: "info"
+
+# =============================================================================
 # CHAIN CONNECTION
 # =============================================================================
 # Settings for connecting to the Manifest blockchain.
@@ -287,10 +294,11 @@ token_tracker_db_path: "/var/lib/fred/tokens.db"
 # =============================================================================
 # PAYLOAD STORE (required for deployment manifests)
 # =============================================================================
-# Stores tenant-uploaded payloads (deployment manifests) awaiting provisioning.
+# Stores tenant-uploaded payloads (deployment manifests).
 
 # Path to bbolt database file for storing payloads.
-# Payloads are stored temporarily until the lease is provisioned, then deleted.
+# Payloads are retained for the lifetime of the lease to support re-provisioning
+# if a container crashes. Cleanup happens when the lease is closed or rejected.
 #
 # If not set, the payload upload endpoint rejects all uploads.
 # Tenants creating leases with meta_hash won't be able to upload their manifests.
@@ -298,16 +306,6 @@ token_tracker_db_path: "/var/lib/fred/tokens.db"
 # The database file is created automatically. Ensure the directory exists
 # and fred has write permissions.
 payload_store_db_path: "/var/lib/fred/payloads.db"
-
-# Maximum time to keep payloads before automatic cleanup.
-# Payloads older than this are deleted even if not yet provisioned.
-# This prevents unbounded storage growth from abandoned uploads.
-# Should be longer than your chain's lease acknowledgment timeout.
-payload_store_ttl: "1h"
-
-# How often to scan for and delete stale payloads.
-# Stale = older than payload_store_ttl and not yet provisioned.
-payload_store_cleanup_freq: "10m"
 
 # =============================================================================
 # ADVANCED: HTTP SERVER TIMEOUTS

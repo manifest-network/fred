@@ -7,10 +7,12 @@
 //
 // # Backend Interface
 //
-// Any backend must implement the Backend interface, which defines six operations:
+// Any backend must implement the Backend interface, which defines eight operations:
 //
 //   - Provision: Start async provisioning, backend calls callback URL when done
 //   - GetInfo: Retrieve connection details for a provisioned resource
+//   - GetProvision: Retrieve provision diagnostics (status, error, fail count)
+//   - GetLogs: Retrieve container logs for a provision
 //   - Deprovision: Clean up resources (must be idempotent)
 //   - ListProvisions: Return all provisioned resources (for reconciliation)
 //   - Health: Report whether the backend can accept requests

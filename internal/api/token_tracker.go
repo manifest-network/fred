@@ -160,6 +160,16 @@ func (t *TokenTracker) TryUse(key string) error {
 	return err
 }
 
+// Healthy checks if the bbolt database is accessible and the token bucket exists.
+func (t *TokenTracker) Healthy() error {
+	return t.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketName) == nil {
+			return errors.New("token bucket missing")
+		}
+		return nil
+	})
+}
+
 // Close shuts down the token tracker gracefully.
 // Close is idempotent and safe to call multiple times.
 func (t *TokenTracker) Close() error {

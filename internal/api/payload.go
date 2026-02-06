@@ -11,17 +11,16 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/gorilla/mux"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
-	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // PayloadPublisher publishes payload events to the provisioner.
 type PayloadPublisher interface {
-	PublishPayload(event provisioner.PayloadEvent) error
+	PublishPayload(event payload.Event) error
 	StorePayload(leaseUUID string, payload []byte) bool
 	DeletePayload(leaseUUID string) // Used for rollback on publish failure
 }
@@ -46,8 +45,7 @@ func NewPayloadHandler(client ChainClient, publisher PayloadPublisher, providerU
 
 // HandlePayloadUpload handles POST /v1/leases/{lease_uuid}/data
 func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	leaseUUID := vars["lease_uuid"]
+	leaseUUID := r.PathValue("lease_uuid")
 
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {
@@ -127,7 +125,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 
 	// Read the payload body with context awareness
 	// This allows the read to be aborted if the request times out
-	payload, err := readBodyWithContext(r.Context(), r.Body)
+	body, err := readBodyWithContext(r.Context(), r.Body)
 	if err != nil {
 		if r.Context().Err() != nil {
 			if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
@@ -145,16 +143,16 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if len(payload) == 0 {
+	if len(body) == 0 {
 		writeError(w, "payload is empty", http.StatusBadRequest)
 		return
 	}
 
 	// Compute SHA-256 hash of the payload and verify using constant-time comparison
-	payloadHash := sha256.Sum256(payload)
-	if subtle.ConstantTimeCompare(payloadHash[:], lease.MetaHash) != 1 {
+	bodyHash := sha256.Sum256(body)
+	if subtle.ConstantTimeCompare(bodyHash[:], lease.MetaHash) != 1 {
 		slog.Warn("payload hash mismatch",
-			"payload_hash", hex.EncodeToString(payloadHash[:]),
+			"payload_hash", hex.EncodeToString(bodyHash[:]),
 			"expected_hash", hex.EncodeToString(lease.MetaHash),
 			"lease_uuid", leaseUUID,
 		)
@@ -164,7 +162,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Store the payload (also serves as idempotency check)
-	if !h.publisher.StorePayload(leaseUUID, payload) {
+	if !h.publisher.StorePayload(leaseUUID, body) {
 		slog.Warn("payload already received", "lease_uuid", leaseUUID)
 		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
 		writeError(w, "payload already received", http.StatusConflict)
@@ -172,7 +170,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Publish payload event to Watermill
-	event := provisioner.PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   leaseUUID,
 		Tenant:      lease.Tenant,
 		MetaHashHex: hex.EncodeToString(lease.MetaHash),
@@ -189,12 +187,12 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 
 	// Record success metrics
 	metrics.PayloadUploadsTotal.WithLabelValues("success").Inc()
-	metrics.PayloadSizeBytes.Observe(float64(len(payload)))
+	metrics.PayloadSizeBytes.Observe(float64(len(body)))
 
 	slog.Info("payload received and validated",
 		"lease_uuid", leaseUUID,
 		"tenant", token.Tenant,
-		"payload_size", len(payload),
+		"payload_size", len(body),
 	)
 
 	w.WriteHeader(http.StatusAccepted)

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/testutil"
@@ -30,15 +32,9 @@ func TestNew(t *testing.T) {
 
 	w := New(nil, nil, providerUUID)
 
-	if w == nil {
-		t.Fatal("New() returned nil")
-	}
-	if w.providerUUID != providerUUID {
-		t.Errorf("providerUUID = %q, want %q", w.providerUUID, providerUUID)
-	}
-	if w.tenantLeaseCounts == nil {
-		t.Error("tenantLeaseCounts map is nil")
-	}
+	require.NotNil(t, w, "New() returned nil")
+	assert.Equal(t, providerUUID, w.providerUUID)
+	assert.NotNil(t, w.tenantLeaseCounts, "tenantLeaseCounts map is nil")
 }
 
 func TestAddActiveTenant(t *testing.T) {
@@ -53,9 +49,7 @@ func TestAddActiveTenant(t *testing.T) {
 	count := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 1 {
-		t.Errorf("addActiveTenant() count = %d, want 1", count)
-	}
+	assert.Equal(t, 1, count, "addActiveTenant() count mismatch")
 
 	// Add same tenant again - count should increment
 	w.addActiveTenant(tenant)
@@ -64,9 +58,7 @@ func TestAddActiveTenant(t *testing.T) {
 	count = w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 2 {
-		t.Errorf("addActiveTenant() second call count = %d, want 2", count)
-	}
+	assert.Equal(t, 2, count, "addActiveTenant() second call count mismatch")
 }
 
 func TestAddActiveTenant_Empty(t *testing.T) {
@@ -81,9 +73,7 @@ func TestAddActiveTenant_Empty(t *testing.T) {
 	count := len(w.tenantLeaseCounts)
 	w.mu.Unlock()
 
-	if count != 0 {
-		t.Errorf("addActiveTenant(\"\") should not add empty tenant, got count %d", count)
-	}
+	assert.Equal(t, 0, count, "addActiveTenant(\"\") should not add empty tenant")
 }
 
 func TestAddActiveTenant_ThreadSafe(t *testing.T) {
@@ -110,9 +100,7 @@ func TestAddActiveTenant_ThreadSafe(t *testing.T) {
 	count := len(w.tenantLeaseCounts)
 	w.mu.Unlock()
 
-	if count != len(tenants) {
-		t.Errorf("tenantLeaseCounts count = %d, want %d", count, len(tenants))
-	}
+	assert.Equal(t, len(tenants), count)
 }
 
 func TestHandleEvent_LeaseAcknowledged(t *testing.T) {
@@ -136,9 +124,7 @@ func TestHandleEvent_LeaseAcknowledged(t *testing.T) {
 	count := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 1 {
-		t.Errorf("handleEvent(LeaseAcknowledged) count = %d, want 1", count)
-	}
+	assert.Equal(t, 1, count)
 }
 
 func TestHandleEvent_LeaseAutoClosed_CrossProvider(t *testing.T) {
@@ -164,9 +150,7 @@ func TestHandleEvent_LeaseAutoClosed_CrossProvider(t *testing.T) {
 
 	w.handleEvent(event)
 
-	if !triggered {
-		t.Error("handleEvent(LeaseAutoClosed) from other provider should trigger withdrawal")
-	}
+	assert.True(t, triggered, "handleEvent(LeaseAutoClosed) from other provider should trigger withdrawal")
 }
 
 func TestHandleEvent_LeaseAutoClosed_OwnProvider(t *testing.T) {
@@ -191,18 +175,14 @@ func TestHandleEvent_LeaseAutoClosed_OwnProvider(t *testing.T) {
 
 	w.handleEvent(event)
 
-	if triggered {
-		t.Error("handleEvent(LeaseAutoClosed) from own provider should NOT trigger withdrawal")
-	}
+	assert.False(t, triggered, "handleEvent(LeaseAutoClosed) from own provider should NOT trigger withdrawal")
 
 	// Verify tenant was removed (count was 1, now should be 0/deleted)
 	w.mu.Lock()
 	count := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 0 {
-		t.Errorf("handleEvent(LeaseAutoClosed) from own provider should remove tenant, got count %d", count)
-	}
+	assert.Equal(t, 0, count, "handleEvent(LeaseAutoClosed) from own provider should remove tenant")
 }
 
 func TestHandleEvent_LeaseAutoClosed_NoActiveLease(t *testing.T) {
@@ -228,9 +208,7 @@ func TestHandleEvent_LeaseAutoClosed_NoActiveLease(t *testing.T) {
 
 	w.handleEvent(event)
 
-	if triggered {
-		t.Error("handleEvent(LeaseAutoClosed) for unknown tenant should NOT trigger withdrawal")
-	}
+	assert.False(t, triggered, "handleEvent(LeaseAutoClosed) for unknown tenant should NOT trigger withdrawal")
 }
 
 func TestSetWithdrawTrigger(t *testing.T) {
@@ -238,9 +216,7 @@ func TestSetWithdrawTrigger(t *testing.T) {
 		tenantLeaseCounts: make(map[string]int),
 	}
 
-	if w.withdrawTrigger != nil {
-		t.Error("withdrawTrigger should be nil initially")
-	}
+	assert.Nil(t, w.withdrawTrigger, "withdrawTrigger should be nil initially")
 
 	called := false
 	trigger := func() {
@@ -249,14 +225,10 @@ func TestSetWithdrawTrigger(t *testing.T) {
 
 	w.SetWithdrawTrigger(trigger)
 
-	if w.withdrawTrigger == nil {
-		t.Error("SetWithdrawTrigger() should set withdrawTrigger")
-	}
+	assert.NotNil(t, w.withdrawTrigger, "SetWithdrawTrigger() should set withdrawTrigger")
 
 	w.withdrawTrigger()
-	if !called {
-		t.Error("withdrawTrigger was not called")
-	}
+	assert.True(t, called, "withdrawTrigger was not called")
 }
 
 func TestHandleEvent_UnhandledEventTypes(t *testing.T) {
@@ -295,9 +267,7 @@ func TestRemoveActiveTenant(t *testing.T) {
 	count := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 2 {
-		t.Errorf("initial count = %d, want 2", count)
-	}
+	assert.Equal(t, 2, count, "initial count mismatch")
 
 	// Remove one lease
 	w.removeActiveTenant(tenant)
@@ -306,9 +276,7 @@ func TestRemoveActiveTenant(t *testing.T) {
 	count = w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 1 {
-		t.Errorf("after first remove count = %d, want 1", count)
-	}
+	assert.Equal(t, 1, count, "after first remove count mismatch")
 
 	// Remove last lease - tenant should be deleted
 	w.removeActiveTenant(tenant)
@@ -317,9 +285,7 @@ func TestRemoveActiveTenant(t *testing.T) {
 	_, exists := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if exists {
-		t.Error("tenant should be removed when count reaches 0")
-	}
+	assert.False(t, exists, "tenant should be removed when count reaches 0")
 }
 
 func TestRemoveActiveTenant_Empty(t *testing.T) {
@@ -357,9 +323,7 @@ func TestHandleEvent_LeaseClosed(t *testing.T) {
 	count := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 1 {
-		t.Errorf("handleEvent(LeaseClosed) count = %d, want 1", count)
-	}
+	assert.Equal(t, 1, count)
 }
 
 func TestHandleEvent_LeaseExpired(t *testing.T) {
@@ -385,9 +349,7 @@ func TestHandleEvent_LeaseExpired(t *testing.T) {
 	_, exists := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if exists {
-		t.Error("handleEvent(LeaseExpired) should remove tenant when last lease expires")
-	}
+	assert.False(t, exists, "handleEvent(LeaseExpired) should remove tenant when last lease expires")
 }
 
 func TestHandleEvent_IgnoresOtherProviderLeaseClose(t *testing.T) {
@@ -414,9 +376,7 @@ func TestHandleEvent_IgnoresOtherProviderLeaseClose(t *testing.T) {
 	count := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
-	if count != 1 {
-		t.Errorf("handleEvent(LeaseClosed) from other provider should not decrement, got count %d", count)
-	}
+	assert.Equal(t, 1, count, "handleEvent(LeaseClosed) from other provider should not decrement")
 }
 
 // TestLoadActiveTenants tests the initial tenant loading from chain.
@@ -426,9 +386,7 @@ func TestLoadActiveTenants(t *testing.T) {
 	t.Run("loads_tenants_from_chain", func(t *testing.T) {
 		client := &mockChainClient{
 			getActiveLeasesByProviderFunc: func(ctx context.Context, uuid string) ([]billingtypes.Lease, error) {
-				if uuid != providerUUID {
-					t.Errorf("GetActiveLeasesByProvider called with wrong UUID: %q", uuid)
-				}
+				assert.Equal(t, providerUUID, uuid, "GetActiveLeasesByProvider called with wrong UUID")
 				return []billingtypes.Lease{
 					{Tenant: "tenant1"},
 					{Tenant: "tenant1"}, // Same tenant, 2 leases
@@ -440,19 +398,13 @@ func TestLoadActiveTenants(t *testing.T) {
 		w := New(client, nil, providerUUID)
 
 		err := w.loadActiveTenants(context.Background())
-		if err != nil {
-			t.Fatalf("loadActiveTenants() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		w.mu.Lock()
 		defer w.mu.Unlock()
 
-		if w.tenantLeaseCounts["tenant1"] != 2 {
-			t.Errorf("tenant1 count = %d, want 2", w.tenantLeaseCounts["tenant1"])
-		}
-		if w.tenantLeaseCounts["tenant2"] != 1 {
-			t.Errorf("tenant2 count = %d, want 1", w.tenantLeaseCounts["tenant2"])
-		}
+		assert.Equal(t, 2, w.tenantLeaseCounts["tenant1"])
+		assert.Equal(t, 1, w.tenantLeaseCounts["tenant2"])
 	})
 
 	t.Run("handles_empty_leases", func(t *testing.T) {
@@ -465,17 +417,13 @@ func TestLoadActiveTenants(t *testing.T) {
 		w := New(client, nil, providerUUID)
 
 		err := w.loadActiveTenants(context.Background())
-		if err != nil {
-			t.Fatalf("loadActiveTenants() error = %v", err)
-		}
+		require.NoError(t, err)
 
 		w.mu.Lock()
 		count := len(w.tenantLeaseCounts)
 		w.mu.Unlock()
 
-		if count != 0 {
-			t.Errorf("tenant count = %d, want 0", count)
-		}
+		assert.Equal(t, 0, count)
 	})
 
 	t.Run("returns_error_on_chain_failure", func(t *testing.T) {
@@ -488,9 +436,7 @@ func TestLoadActiveTenants(t *testing.T) {
 		w := New(client, nil, providerUUID)
 
 		err := w.loadActiveTenants(context.Background())
-		if err == nil {
-			t.Error("loadActiveTenants() should return error on chain failure")
-		}
+		assert.Error(t, err, "loadActiveTenants() should return error on chain failure")
 	})
 }
 
@@ -505,9 +451,7 @@ func TestWatcher_Start(t *testing.T) {
 			URL:          "ws://localhost:26657/websocket",
 			ProviderUUID: providerUUID,
 		})
-		if err != nil {
-			t.Fatalf("NewEventSubscriber() error = %v", err)
-		}
+		require.NoError(t, err)
 		return eventSub
 	}
 
@@ -538,9 +482,7 @@ func TestWatcher_Start(t *testing.T) {
 		// Wait for Start to return
 		select {
 		case err := <-errCh:
-			if err != context.Canceled {
-				t.Errorf("Start() error = %v, want context.Canceled", err)
-			}
+			assert.ErrorIs(t, err, context.Canceled)
 		case <-time.After(time.Second):
 			t.Error("Start() did not return after context cancellation")
 		}
@@ -571,9 +513,7 @@ func TestWatcher_Start(t *testing.T) {
 		select {
 		case err := <-errCh:
 			// Should return context.Canceled, not the load error
-			if err != context.Canceled {
-				t.Errorf("Start() error = %v, want context.Canceled", err)
-			}
+			assert.ErrorIs(t, err, context.Canceled)
 		case <-time.After(time.Second):
 			t.Error("Start() did not return")
 		}
@@ -608,9 +548,7 @@ func TestWatcher_Start(t *testing.T) {
 		select {
 		case err := <-errCh:
 			// Should return nil (not context.Canceled) when channel is closed
-			if err != nil {
-				t.Errorf("Start() error = %v, want nil", err)
-			}
+			assert.NoError(t, err)
 		case <-time.After(time.Second):
 			t.Error("Start() did not return after channel close")
 		}

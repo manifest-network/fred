@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/manifest-network/fred/internal/chain"
 )
 
@@ -44,15 +47,9 @@ func TestNewEventBridge(t *testing.T) {
 
 	bridge := NewEventBridge(subscriber, publisher)
 
-	if bridge == nil {
-		t.Fatal("NewEventBridge() returned nil")
-	}
-	if bridge.subscriber != subscriber {
-		t.Error("bridge.subscriber not set correctly")
-	}
-	if bridge.publisher != publisher {
-		t.Error("bridge.publisher not set correctly")
-	}
+	require.NotNil(t, bridge, "NewEventBridge() returned nil")
+	assert.Equal(t, subscriber, bridge.subscriber, "bridge.subscriber not set correctly")
+	assert.Equal(t, publisher, bridge.publisher, "bridge.publisher not set correctly")
 }
 
 func TestEventBridge_Start_ForwardsEvents(t *testing.T) {
@@ -85,9 +82,7 @@ func TestEventBridge_Start_ForwardsEvents(t *testing.T) {
 	// Bridge should exit
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("Start() error = %v, want context.Canceled", err)
-		}
+		assert.ErrorIs(t, err, context.Canceled, "Start() error")
 	case <-time.After(2 * time.Second):
 		t.Error("Start() did not exit after context cancellation")
 	}
@@ -124,9 +119,7 @@ func TestEventBridge_Start_ChannelClosed(t *testing.T) {
 	select {
 	case err := <-errCh:
 		// Should return nil when channel is closed
-		if err != nil {
-			t.Errorf("Start() error = %v, want nil when channel closed", err)
-		}
+		assert.NoError(t, err, "Start() should return nil when channel closed")
 	case <-time.After(2 * time.Second):
 		t.Error("Start() did not exit after subscriber closed")
 	}
@@ -165,9 +158,7 @@ func TestEventBridge_Start_PublishError(t *testing.T) {
 	// Bridge should exit (publish errors shouldn't stop it)
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("Start() error = %v, want context.Canceled", err)
-		}
+		assert.ErrorIs(t, err, context.Canceled, "Start() error")
 	case <-time.After(2 * time.Second):
 		t.Error("Start() did not exit after context cancellation")
 	}
