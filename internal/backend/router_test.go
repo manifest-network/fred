@@ -309,8 +309,45 @@ func TestRouter_RouteRoundRobin_NoMatch_FallsBackToDefault(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	b := router.RouteRoundRobin("unknown-sku")
-	assert.Equal(t, "default", b.Name())
+	// Repeated calls with unmatched SKU always return default (no divide-by-zero)
+	for i := 0; i < 10; i++ {
+		b := router.RouteRoundRobin("unknown-sku")
+		assert.Equal(t, "default", b.Name())
+	}
+}
+
+func TestRouter_RouteRoundRobin_InterleavedSKUs(t *testing.T) {
+	gpuA := NewMockBackend(MockBackendConfig{Name: "gpu-a"})
+	gpuB := NewMockBackend(MockBackendConfig{Name: "gpu-b"})
+	k8s := NewMockBackend(MockBackendConfig{Name: "k8s"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: gpuA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: gpuB, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: k8s, Match: MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// The global counter is shared across SKU groups. Interleaving calls
+	// for different SKUs advances the counter for all groups, so the
+	// per-group distribution is not perfectly even.
+	gpuCounts := map[string]int{}
+	for i := 0; i < 100; i++ {
+		b := router.RouteRoundRobin("gpu-a100")
+		gpuCounts[b.Name()]++
+
+		// Interleave a single-backend SKU — advances the shared counter
+		k := router.RouteRoundRobin("k8s-small")
+		assert.Equal(t, "k8s", k.Name())
+	}
+
+	// Both GPU backends must be hit, but the distribution is uneven
+	// because the k8s calls consume every other counter tick.
+	assert.Greater(t, gpuCounts["gpu-a"], 0)
+	assert.Greater(t, gpuCounts["gpu-b"], 0)
+	assert.Equal(t, 100, gpuCounts["gpu-a"]+gpuCounts["gpu-b"])
 }
 
 // unhealthyMockBackend is a mock backend that returns an error on Health check.

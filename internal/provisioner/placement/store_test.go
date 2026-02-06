@@ -116,6 +116,12 @@ func TestStore_Healthy(t *testing.T) {
 	assert.NoError(t, s.Healthy())
 }
 
+func TestStore_Healthy_AfterClose(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.Close())
+	assert.Error(t, s.Healthy())
+}
+
 func TestNewStore_EmptyPath(t *testing.T) {
 	_, err := NewStore("")
 	require.Error(t, err)
