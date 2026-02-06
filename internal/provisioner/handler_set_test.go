@@ -697,6 +697,10 @@ func TestValidationErrorToRejectReason(t *testing.T) {
 		{"unknown SKU nested", fmt.Errorf("%w: %w", backend.ErrValidation, fmt.Errorf("%w: bad-sku", backend.ErrUnknownSKU)), rejectReasonInvalidSKU},
 		{"invalid manifest nested", fmt.Errorf("%w: %w", backend.ErrValidation, fmt.Errorf("%w: bad yaml", backend.ErrInvalidManifest)), rejectReasonInvalidManifest},
 		{"image not allowed nested", fmt.Errorf("%w: %w", backend.ErrValidation, fmt.Errorf("%w: evil.io/malware", backend.ErrImageNotAllowed)), rejectReasonImageNotAllowed},
+		// HTTPClient path (sentinel wrapping message from parsed JSON response)
+		{"unknown SKU via HTTP", fmt.Errorf("%w: validation error: unknown SKU: bad-sku", backend.ErrUnknownSKU), rejectReasonInvalidSKU},
+		{"invalid manifest via HTTP", fmt.Errorf("%w: validation error: invalid manifest: bad json", backend.ErrInvalidManifest), rejectReasonInvalidManifest},
+		{"image not allowed via HTTP", fmt.Errorf("%w: validation error: image not allowed: evil.io", backend.ErrImageNotAllowed), rejectReasonImageNotAllowed},
 		// Catch-all
 		{"unknown error", fmt.Errorf("%w: something unexpected", backend.ErrValidation), rejectReasonValidationError},
 	}
