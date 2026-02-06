@@ -2410,19 +2410,24 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	// Use the manager's PublishCallback method which publishes to the internal topic
 	require.NoError(t, manager.PublishCallback(callback), "failed to publish callback")
 
-	// Wait for callback to be processed
+	// Wait for the full handler flow to complete: message → handler → batcher →
+	// chain ack → handler untrack. We poll on the final observable state
+	// (!IsInFlight) rather than an intermediate signal (ackCalled) to avoid
+	// a race where the chain mock has been called but the handler hasn't yet
+	// called UntrackInFlight.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if ackCalled.Load() {
+		if !manager.IsInFlight("lease-after") {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	assert.True(t, ackCalled.Load(), "REGRESSION: callback was not processed after Running() - handlers may not be subscribed")
-
-	// Verify lease was removed from in-flight (callback was processed)
+	// Verify lease was removed from in-flight (full handler flow completed)
 	assert.False(t, manager.IsInFlight("lease-after"), "lease should not be in-flight after successful callback")
+
+	// If the lease was untracked, the acknowledge must have been called
+	assert.True(t, ackCalled.Load(), "REGRESSION: callback was not processed after Running() - handlers may not be subscribed")
 
 	// Clean up
 	cancel()
