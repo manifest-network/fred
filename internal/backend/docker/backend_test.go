@@ -919,11 +919,11 @@ func TestCheckDaemonCapabilities(t *testing.T) {
 func TestUpdateResourceMetrics(t *testing.T) {
 	t.Run("sets ratios correctly", func(t *testing.T) {
 		updateResourceMetrics(shared.ResourceStats{
-			TotalCPU:        8.0,
-			AllocatedCPU:    2.0,
-			TotalMemoryMB:   16384,
+			TotalCPU:          8.0,
+			AllocatedCPU:      2.0,
+			TotalMemoryMB:     16384,
 			AllocatedMemoryMB: 4096,
-			TotalDiskMB:     102400,
+			TotalDiskMB:       102400,
 			AllocatedDiskMB:   51200,
 		})
 

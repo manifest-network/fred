@@ -101,7 +101,6 @@ func TestProvision_Success(t *testing.T) {
 		},
 	}
 
-
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -174,7 +173,6 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
 	}
-
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {
@@ -1938,7 +1936,6 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 	cbStore.Close()
 }
 
-
 func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_empty.db")
 	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: dbPath})
@@ -2621,4 +2618,3 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, entry, "stale diagnostic entry should be removed on successful re-provision")
 }
-

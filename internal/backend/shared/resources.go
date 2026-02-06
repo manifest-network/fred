@@ -186,13 +186,13 @@ func (p *ResourcePool) Stats() ResourceStats {
 	defer p.mu.Unlock()
 
 	return ResourceStats{
-		TotalCPU:        p.totalCPU,
-		TotalMemoryMB:   p.totalMemory,
-		TotalDiskMB:     p.totalDisk,
-		AllocatedCPU:    p.allocatedCPU,
+		TotalCPU:          p.totalCPU,
+		TotalMemoryMB:     p.totalMemory,
+		TotalDiskMB:       p.totalDisk,
+		AllocatedCPU:      p.allocatedCPU,
 		AllocatedMemoryMB: p.allocatedMemory,
 		AllocatedDiskMB:   p.allocatedDisk,
-		AllocationCount: len(p.allocations),
+		AllocationCount:   len(p.allocations),
 	}
 }
 
@@ -203,7 +203,7 @@ func (p *ResourcePool) TenantStats(tenant string) ResourceStats {
 
 	usage := p.tenantUsage[tenant]
 	stats := ResourceStats{
-		AllocatedCPU:    usage.CPUCores,
+		AllocatedCPU:      usage.CPUCores,
 		AllocatedMemoryMB: usage.MemoryMB,
 		AllocatedDiskMB:   usage.DiskMB,
 	}
@@ -217,13 +217,13 @@ func (p *ResourcePool) TenantStats(tenant string) ResourceStats {
 
 // ResourceStats contains resource usage statistics.
 type ResourceStats struct {
-	TotalCPU        float64
-	TotalMemoryMB   int64
-	TotalDiskMB     int64
-	AllocatedCPU    float64
+	TotalCPU          float64
+	TotalMemoryMB     int64
+	TotalDiskMB       int64
+	AllocatedCPU      float64
 	AllocatedMemoryMB int64
 	AllocatedDiskMB   int64
-	AllocationCount int
+	AllocationCount   int
 }
 
 // AvailableCPU returns available CPU cores.

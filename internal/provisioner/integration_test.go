@@ -80,8 +80,8 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
-		ProviderUUID:    providerUUID,
-		CallbackBaseURL: "http://localhost:8080",
+		ProviderUUID:     providerUUID,
+		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
 	}, mockBackend, mockChain)
@@ -159,8 +159,8 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
-		ProviderUUID:    providerUUID,
-		CallbackBaseURL: "http://localhost:8080",
+		ProviderUUID:     providerUUID,
+		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
 	}, mockBackend, mockChain)
@@ -233,8 +233,8 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
-		ProviderUUID:    providerUUID,
-		CallbackBaseURL: "http://localhost:8080",
+		ProviderUUID:     providerUUID,
+		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
 	}, mockBackend, mockChain)
@@ -342,8 +342,8 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 	require.NoError(t, err)
 
 	manager := startTestManager(t, ManagerConfig{
-		ProviderUUID:    providerUUID,
-		CallbackBaseURL: "http://localhost:8080",
+		ProviderUUID:     providerUUID,
+		CallbackBaseURL:  "http://localhost:8080",
 		PayloadStore:     payloadStore,
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
@@ -390,4 +390,3 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 	assert.Equal(t, payloadData, req.Payload, "provision request should include the payload")
 	assert.Equal(t, payloadHashHex, req.PayloadHash, "provision request should include the payload hash")
 }
-
