@@ -20,6 +20,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // hashPayload computes the SHA-256 hash of a payload and returns it as a hex string.
@@ -1414,7 +1415,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 
 	// Create a real PayloadStore using temp directory
 	tempDir := t.TempDir()
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	require.NoError(t, err)
@@ -1433,7 +1434,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	payloadStore.Store("lease-1", testPayload)
 
 	// Create a payload event message
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: testPayloadHash,
@@ -1476,7 +1477,7 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 	}, router, mockChain)
 	require.NoError(t, err)
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: "abc123",
@@ -1502,7 +1503,7 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	mockChain := &chain.MockClient{}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1539,7 +1540,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1554,7 +1555,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	// Store a payload
 	payloadStore.Store("lease-1", []byte("payload data"))
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: "abc123",
@@ -1592,7 +1593,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1607,7 +1608,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	// Store a payload
 	payloadStore.Store("lease-1", []byte("payload data"))
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: "abc123",
@@ -1641,7 +1642,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1653,7 +1654,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	}, router, mockChain)
 	require.NoError(t, err)
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: "abc123",
@@ -1684,7 +1685,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1701,7 +1702,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	testPayloadHash := hashPayload(testPayload)
 	payloadStore.Store("lease-1", testPayload)
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: testPayloadHash,
@@ -1738,7 +1739,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1753,7 +1754,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	// Pre-track the lease (simulating concurrent processing)
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: "abc123",
@@ -1788,7 +1789,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1802,7 +1803,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 
 	// DON'T store a payload - simulate race where payload was cleaned up
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: "abc123",
@@ -1847,7 +1848,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, _ := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, _ := payload.NewStore(payload.StoreConfig{
 		DBPath: tempDir + "/payloads.db",
 	})
 	defer payloadStore.Close()
@@ -1864,7 +1865,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	testPayloadHash := hashPayload(testPayload)
 	payloadStore.Store("gpu-lease-1", testPayload)
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "gpu-lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: testPayloadHash,
@@ -2127,7 +2128,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 		},
 	}
 
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: t.TempDir() + "/payloads.db",
 	})
 	require.NoError(t, err)
@@ -2144,7 +2145,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	require.True(t, payloadStore.Store("lease-1", testPayload), "failed to store payload")
 
 	// Step 1: Send payload received event to trigger provisioning
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: testPayloadHash,
@@ -2212,7 +2213,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 		},
 	}
 
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: t.TempDir() + "/payloads.db",
 	})
 	require.NoError(t, err)
@@ -2229,7 +2230,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	require.True(t, payloadStore.Store("lease-1", testPayload), "failed to store payload")
 
 	// Trigger provisioning
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: testPayloadHash,
@@ -2285,7 +2286,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	// Use a persistent temp dir for the payload store
 	dbPath := t.TempDir() + "/payloads.db"
 
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: dbPath,
 	})
 	require.NoError(t, err)
@@ -2300,7 +2301,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	// Store payload and trigger provisioning
 	require.True(t, payloadStore.Store("lease-1", testPayload), "failed to store payload")
 
-	event := PayloadEvent{
+	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: testPayloadHash,
@@ -2321,7 +2322,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	payloadStore.Close()
 
 	// "Restart" - create new payload store from same DB file
-	payloadStore2, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore2, err := payload.NewStore(payload.StoreConfig{
 		DBPath: dbPath,
 	})
 	require.NoError(t, err)

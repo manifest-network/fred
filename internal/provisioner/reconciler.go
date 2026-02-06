@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // Default concurrency limits for reconciliation.
@@ -373,7 +374,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		if req.Payload != nil && len(lease.MetaHash) > 0 {
 			// Re-verify payload hash before provisioning to catch any corruption.
 			// The payload was validated on upload, but disk corruption could occur.
-			if err := VerifyPayloadHash(req.Payload, lease.MetaHash); err != nil {
+			if err := payload.VerifyHash(req.Payload, lease.MetaHash); err != nil {
 				// Payload is corrupted - delete it and fail
 				r.tracker.PayloadStore().Delete(lease.Uuid)
 				r.tracker.UntrackInFlight(lease.Uuid)

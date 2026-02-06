@@ -15,6 +15,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // startTestManager creates a Manager with the given mocks, starts it, and
@@ -337,7 +338,7 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 
 	// Create payload store in temp dir.
 	dbPath := filepath.Join(t.TempDir(), "payload-test.db")
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{DBPath: dbPath})
+	payloadStore, err := payload.NewStore(payload.StoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	manager := startTestManager(t, ManagerConfig{
@@ -367,7 +368,7 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 	stored := manager.StorePayload(leaseUUID, payloadData)
 	assert.True(t, stored)
 
-	err = manager.PublishPayload(PayloadEvent{
+	err = manager.PublishPayload(payload.Event{
 		LeaseUUID:   leaseUUID,
 		Tenant:      tenant,
 		MetaHashHex: payloadHashHex,

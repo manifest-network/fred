@@ -1,11 +1,8 @@
-package provisioner
+package payload
 
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -68,13 +65,13 @@ type writeResult struct {
 	err     error
 }
 
-// PayloadStore stores pending payloads for leases awaiting provisioning.
+// Store stores pending payloads for leases awaiting provisioning.
 // Payloads are persisted to bbolt to survive restarts.
 // The chain's MetaHash remains the source of truth for validation.
 //
 // Write operations are batched through a dedicated writer goroutine to reduce
 // bbolt lock contention under high concurrency.
-type PayloadStore struct {
+type Store struct {
 	db *bolt.DB
 
 	// Write batching
@@ -88,15 +85,15 @@ type PayloadStore struct {
 	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
 }
 
-// PayloadStoreConfig configures the payload store.
-type PayloadStoreConfig struct {
+// StoreConfig configures the payload store.
+type StoreConfig struct {
 	DBPath        string        // Path to bbolt database file
 	BatchSize     int           // Max operations per batch (default: 50)
 	FlushInterval time.Duration // Max wait before flushing batch (default: 50ms)
 }
 
-// NewPayloadStore creates a new payload store with bbolt persistence.
-func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
+// NewStore creates a new payload store with bbolt persistence.
+func NewStore(cfg StoreConfig) (*Store, error) {
 	if cfg.DBPath == "" {
 		return nil, errors.New("db path is required")
 	}
@@ -129,7 +126,7 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &PayloadStore{
+	s := &Store{
 		db:            db,
 		writeCh:       make(chan writeOp, writeChannelSize),
 		batchSize:     batchSize,
@@ -162,7 +159,7 @@ func NewPayloadStore(cfg PayloadStoreConfig) (*PayloadStore, error) {
 // is full (>1000 pending operations), it will block until space is available.
 // This provides backpressure under extreme load. Callers should not hold locks
 // when calling this method.
-func (s *PayloadStore) Store(leaseUUID string, payload []byte) bool {
+func (s *Store) Store(leaseUUID string, payload []byte) bool {
 	resultCh := make(chan writeResult, 1)
 
 	op := writeOp{
@@ -193,7 +190,7 @@ func (s *PayloadStore) Store(leaseUUID string, payload []byte) bool {
 // Returns a non-nil error if the database read fails — callers must not treat
 // errors the same as "not found" to avoid closing active leases on transient
 // disk failures.
-func (s *PayloadStore) Get(leaseUUID string) ([]byte, error) {
+func (s *Store) Get(leaseUUID string) ([]byte, error) {
 	key := []byte(leaseUUID)
 	var payload []byte
 
@@ -222,7 +219,7 @@ func (s *PayloadStore) Get(leaseUUID string) ([]byte, error) {
 // is full (>1000 pending operations), it will block until space is available.
 // This provides backpressure under extreme load. Callers should not hold locks
 // when calling this method.
-func (s *PayloadStore) Pop(leaseUUID string) []byte {
+func (s *Store) Pop(leaseUUID string) []byte {
 	resultCh := make(chan writeResult, 1)
 
 	op := writeOp{
@@ -247,7 +244,7 @@ func (s *PayloadStore) Pop(leaseUUID string) []byte {
 }
 
 // Has checks if a payload exists for a lease.
-func (s *PayloadStore) Has(leaseUUID string) bool {
+func (s *Store) Has(leaseUUID string) bool {
 	key := []byte(leaseUUID)
 	var exists bool
 
@@ -271,7 +268,7 @@ func (s *PayloadStore) Has(leaseUUID string) bool {
 // is full (>1000 pending operations), it will block until space is available.
 // This provides backpressure under extreme load. Callers should not hold locks
 // when calling this method.
-func (s *PayloadStore) Delete(leaseUUID string) {
+func (s *Store) Delete(leaseUUID string) {
 	resultCh := make(chan writeResult, 1)
 
 	op := writeOp{
@@ -294,7 +291,7 @@ func (s *PayloadStore) Delete(leaseUUID string) {
 }
 
 // Count returns the number of stored payloads.
-func (s *PayloadStore) Count() int {
+func (s *Store) Count() int {
 	var count int
 
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -313,7 +310,7 @@ func (s *PayloadStore) Count() int {
 
 // List returns all lease UUIDs that have stored payloads.
 // This is used by the reconciler to check for orphaned payloads.
-func (s *PayloadStore) List() []string {
+func (s *Store) List() []string {
 	var leaseUUIDs []string
 
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -334,7 +331,7 @@ func (s *PayloadStore) List() []string {
 }
 
 // Healthy checks if the bbolt database is accessible and both buckets exist.
-func (s *PayloadStore) Healthy() error {
+func (s *Store) Healthy() error {
 	return s.db.View(func(tx *bolt.Tx) error {
 		if tx.Bucket(payloadBucketName) == nil {
 			return errors.New("payload bucket missing")
@@ -349,7 +346,7 @@ func (s *PayloadStore) Healthy() error {
 // Close shuts down the payload store gracefully.
 // It waits for all pending writes to complete before closing the database.
 // Close is idempotent and safe to call multiple times.
-func (s *PayloadStore) Close() error {
+func (s *Store) Close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {
 		// Signal shutdown - this will cause writerLoop to exit
@@ -367,7 +364,7 @@ func (s *PayloadStore) Close() error {
 // All write operations (Store, Pop, Delete) are serialized through this goroutine
 // to eliminate bbolt lock contention.
 // Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
-func (s *PayloadStore) writerLoop(ctx context.Context) {
+func (s *Store) writerLoop(ctx context.Context) {
 
 	batch := make([]writeOp, 0, s.batchSize)
 	ticker := time.NewTicker(s.flushInterval)
@@ -493,51 +490,4 @@ func (s *PayloadStore) writerLoop(ctx context.Context) {
 			flush()
 		}
 	}
-}
-
-// PayloadEvent represents a payload upload event for Watermill.
-type PayloadEvent struct {
-	LeaseUUID   string `json:"lease_uuid"`
-	Tenant      string `json:"tenant"`
-	MetaHashHex string `json:"meta_hash_hex"` // Hex-encoded SHA-256
-}
-
-// VerifyPayloadHash computes the SHA-256 hash of payload and compares it against expectedHash
-// using constant-time comparison to prevent timing attacks.
-// Returns nil if the hash matches, otherwise returns an error with the mismatched hashes.
-func VerifyPayloadHash(payload, expectedHash []byte) error {
-	if len(expectedHash) == 0 {
-		return errors.New("expected hash is empty")
-	}
-
-	actualHash := sha256.Sum256(payload)
-	if subtle.ConstantTimeCompare(actualHash[:], expectedHash) != 1 {
-		return &HashMismatchError{
-			Expected: expectedHash,
-			Actual:   actualHash[:],
-		}
-	}
-	return nil
-}
-
-// VerifyPayloadHashHex computes the SHA-256 hash of payload and compares it against expectedHashHex
-// (a hex-encoded hash string) using constant-time comparison.
-// Returns nil if the hash matches, otherwise returns an error.
-func VerifyPayloadHashHex(payload []byte, expectedHashHex string) error {
-	expectedHash, err := hex.DecodeString(expectedHashHex)
-	if err != nil {
-		return fmt.Errorf("invalid expected hash hex: %w", err)
-	}
-	return VerifyPayloadHash(payload, expectedHash)
-}
-
-// HashMismatchError is returned when a payload hash doesn't match the expected hash.
-type HashMismatchError struct {
-	Expected []byte
-	Actual   []byte
-}
-
-func (e *HashMismatchError) Error() string {
-	return fmt.Sprintf("payload hash mismatch: expected %s, got %s",
-		hex.EncodeToString(e.Expected), hex.EncodeToString(e.Actual))
 }

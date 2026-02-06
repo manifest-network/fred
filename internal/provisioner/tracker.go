@@ -10,6 +10,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // InFlightProvision represents a lease that is currently being provisioned.
@@ -84,7 +85,7 @@ type ReconcilerTracker interface {
 
 	// PayloadStore returns the payload store for direct access.
 	// May return nil if payload store is not configured.
-	PayloadStore() *PayloadStore
+	PayloadStore() *payload.Store
 }
 
 // DefaultInFlightTracker is the default implementation of InFlightTracker.

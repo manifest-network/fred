@@ -20,19 +20,20 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // testReconcilerTracker adapts InFlightTracker + PayloadStore to satisfy ReconcilerTracker.
 type testReconcilerTracker struct {
 	provisioner.InFlightTracker
-	store *provisioner.PayloadStore
+	store *payload.Store
 }
 
 func (t *testReconcilerTracker) HasPayload(leaseUUID string) bool {
 	return t.store.Has(leaseUUID)
 }
 
-func (t *testReconcilerTracker) PayloadStore() *provisioner.PayloadStore {
+func (t *testReconcilerTracker) PayloadStore() *payload.Store {
 	return t.store
 }
 
@@ -67,7 +68,7 @@ func testReconcilerSetup(t *testing.T, chainClient *chain.MockClient) *reconcile
 	require.NoError(t, err)
 
 	// Create payload store in temp directory
-	store, err := provisioner.NewPayloadStore(provisioner.PayloadStoreConfig{
+	store, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
 	})
 	require.NoError(t, err)
@@ -691,7 +692,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	})
 	require.NoError(t, err)
 
-	store, err := provisioner.NewPayloadStore(provisioner.PayloadStoreConfig{
+	store, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
 	})
 	require.NoError(t, err)

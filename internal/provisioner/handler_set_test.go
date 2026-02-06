@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // mockAcknowledger implements Acknowledger for testing.
@@ -37,7 +38,7 @@ func newTestHandlerSet(
 	chainClient *chain.MockClient,
 	mb *mockManagerBackend,
 	ack *mockAcknowledger,
-	payloadStore *PayloadStore,
+	payloadStore *payload.Store,
 ) (*HandlerSet, *DefaultInFlightTracker) {
 	tracker := NewInFlightTracker()
 	router := &mockBackendRouter{
@@ -204,7 +205,7 @@ func TestHandlerSet_HandleLeaseClosed_CleansUpPayload(t *testing.T) {
 	mockChain := &chain.MockClient{}
 
 	tempDir := t.TempDir()
-	ps, err := NewPayloadStore(PayloadStoreConfig{
+	ps, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err)
@@ -491,21 +492,21 @@ func TestHandlerSet_HandlePayloadReceived_Success(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	ps, err := NewPayloadStore(PayloadStoreConfig{
+	ps, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err)
 	defer ps.Close()
 
-	payload := []byte(`{"image":"nginx:latest"}`)
-	ps.Store("lease-1", payload)
+	payloadData := []byte(`{"image":"nginx:latest"}`)
+	ps.Store("lease-1", payloadData)
 
 	hs, tracker := newTestHandlerSet(mockChain, mb, nil, ps)
 
-	msg := newPayloadEventMsg(t, PayloadEvent{
+	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-a",
-		MetaHashHex: hashPayload(payload),
+		MetaHashHex: hashPayload(payloadData),
 	})
 
 	err = hs.HandlePayloadReceived(msg)
@@ -516,7 +517,7 @@ func TestHandlerSet_HandlePayloadReceived_Success(t *testing.T) {
 	req := mb.provisionCalls[0]
 	mb.mu.Unlock()
 
-	assert.Equal(t, payload, req.Payload)
+	assert.Equal(t, payloadData, req.Payload)
 	assert.True(t, tracker.IsInFlight("lease-1"))
 }
 
@@ -524,7 +525,7 @@ func TestHandlerSet_HandlePayloadReceived_NilPayloadStore(t *testing.T) {
 	mockChain := &chain.MockClient{}
 	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
 
-	msg := newPayloadEventMsg(t, PayloadEvent{
+	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
 	})
 
@@ -540,7 +541,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	ps, err := NewPayloadStore(PayloadStoreConfig{
+	ps, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err)
@@ -549,7 +550,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	ps.Store("lease-1", []byte("data"))
 
 	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
-	msg := newPayloadEventMsg(t, PayloadEvent{
+	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
 	})
 
@@ -569,7 +570,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	ps, err := NewPayloadStore(PayloadStoreConfig{
+	ps, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err)
@@ -578,7 +579,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	ps.Store("lease-1", []byte("data"))
 
 	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
-	msg := newPayloadEventMsg(t, PayloadEvent{
+	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
 	})
 
@@ -595,7 +596,7 @@ func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	ps, err := NewPayloadStore(PayloadStoreConfig{
+	ps, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err)
@@ -604,7 +605,7 @@ func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
 	ps.Store("lease-1", []byte("data"))
 
 	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
-	msg := newPayloadEventMsg(t, PayloadEvent{
+	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
 	})
 
@@ -629,7 +630,7 @@ func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	ps, err := NewPayloadStore(PayloadStoreConfig{
+	ps, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err)
@@ -638,7 +639,7 @@ func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 	ps.Store("lease-1", []byte("data"))
 
 	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
-	msg := newPayloadEventMsg(t, PayloadEvent{
+	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID:   "lease-1",
 		MetaHashHex: "0000000000000000000000000000000000000000000000000000000000000000",
 	})

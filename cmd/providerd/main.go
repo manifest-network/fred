@@ -19,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/scheduler"
 	"github.com/manifest-network/fred/internal/watcher"
 )
@@ -199,9 +200,9 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create payload store if database path is configured
-	var payloadStore *provisioner.PayloadStore
+	var payloadStore *payload.Store
 	if cfg.PayloadStoreDBPath != "" {
-		payloadStore, err = provisioner.NewPayloadStore(provisioner.PayloadStoreConfig{
+		payloadStore, err = payload.NewStore(payload.StoreConfig{
 			DBPath: cfg.PayloadStoreDBPath,
 		})
 		if err != nil {

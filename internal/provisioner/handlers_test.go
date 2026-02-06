@@ -17,22 +17,23 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // newLeaseEventMsg creates a Watermill message from a LeaseEvent.
 func newLeaseEventMsg(t *testing.T, event chain.LeaseEvent) *message.Message {
 	t.Helper()
-	payload, err := json.Marshal(event)
+	data, err := json.Marshal(event)
 	require.NoError(t, err, "failed to marshal event")
-	return message.NewMessage(watermill.NewUUID(), payload)
+	return message.NewMessage(watermill.NewUUID(), data)
 }
 
-// newPayloadEventMsg creates a Watermill message from a PayloadEvent.
-func newPayloadEventMsg(t *testing.T, event PayloadEvent) *message.Message {
+// newPayloadEventMsg creates a Watermill message from a payload.Event.
+func newPayloadEventMsg(t *testing.T, event payload.Event) *message.Message {
 	t.Helper()
-	payload, err := json.Marshal(event)
+	data, err := json.Marshal(event)
 	require.NoError(t, err, "failed to marshal event")
-	return message.NewMessage(watermill.NewUUID(), payload)
+	return message.NewMessage(watermill.NewUUID(), data)
 }
 
 func TestUnmarshalMessagePayload_Valid(t *testing.T) {
@@ -292,7 +293,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	mockChain := &chain.MockClient{}
 
 	tempDir := t.TempDir()
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err, "NewPayloadStore()")
@@ -339,7 +340,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(tempDir, "payloads.db"),
 	})
 	require.NoError(t, err, "NewPayloadStore()")
@@ -357,7 +358,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	payloadStore.Store("lease-1", testPayload)
 
 	// Use a wrong hash (64 hex zeros)
-	msg := newPayloadEventMsg(t, PayloadEvent{
+	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
 		MetaHashHex: strings.Repeat("0", 64),

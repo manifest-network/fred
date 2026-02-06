@@ -15,17 +15,17 @@ import (
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
-	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // mockPayloadPublisher implements PayloadPublisher for testing.
 type mockPayloadPublisher struct {
-	publishPayloadFunc func(event provisioner.PayloadEvent) error
+	publishPayloadFunc func(event payload.Event) error
 	storePayloadFunc   func(leaseUUID string, payload []byte) bool
 	deletePayloadFunc  func(leaseUUID string)
 
-	publishedEvents []provisioner.PayloadEvent
+	publishedEvents []payload.Event
 	storedPayloads  map[string][]byte
 	deletedUUIDs    []string
 }
@@ -36,7 +36,7 @@ func newMockPayloadPublisher() *mockPayloadPublisher {
 	}
 }
 
-func (m *mockPayloadPublisher) PublishPayload(event provisioner.PayloadEvent) error {
+func (m *mockPayloadPublisher) PublishPayload(event payload.Event) error {
 	if m.publishPayloadFunc != nil {
 		return m.publishPayloadFunc(event)
 	}
@@ -447,8 +447,8 @@ func TestPayloadHandler_Success(t *testing.T) {
 
 func TestPayloadHandler_PublishFailureRollback(t *testing.T) {
 	kp := testutil.NewTestKeyPair("payload-handler-test-11")
-	payload := []byte("test payload")
-	metaHash := testutil.ComputePayloadHash(payload)
+	payloadData := []byte("test payload")
+	metaHash := testutil.ComputePayloadHash(payloadData)
 	metaHashBytes, _ := hex.DecodeString(metaHash)
 
 	client := &mockPayloadChainClient{
@@ -464,14 +464,14 @@ func TestPayloadHandler_PublishFailureRollback(t *testing.T) {
 	}
 
 	publisher := newMockPayloadPublisher()
-	publisher.publishPayloadFunc = func(event provisioner.PayloadEvent) error {
+	publisher.publishPayloadFunc = func(event payload.Event) error {
 		return http.ErrAbortHandler // Simulate publish failure
 	}
 
 	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest")
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
-	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
+	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payloadData, "Bearer "+tokenStr)
 	rr := httptest.NewRecorder()
 
 	handler.HandlePayloadUpload(rr, req)

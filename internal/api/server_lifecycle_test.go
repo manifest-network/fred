@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // freePort binds :0, extracts the port, and returns "127.0.0.1:<port>".
@@ -180,7 +180,7 @@ func TestServer_ShutdownClosesTokenTracker(t *testing.T) {
 // testPayloadPublisher implements PayloadPublisher for server lifecycle tests.
 type testPayloadPublisher struct{}
 
-func (m *testPayloadPublisher) PublishPayload(event provisioner.PayloadEvent) error {
+func (m *testPayloadPublisher) PublishPayload(event payload.Event) error {
 	return nil
 }
 

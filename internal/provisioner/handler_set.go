@@ -13,6 +13,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // HandlerDeps contains the dependencies needed by the handler set.
@@ -21,7 +22,7 @@ type HandlerDeps struct {
 	Orchestrator *ProvisionOrchestrator
 	Tracker      InFlightTracker
 	Acknowledger Acknowledger
-	PayloadStore *PayloadStore
+	PayloadStore *payload.Store
 }
 
 // HandlerSet contains the Watermill message handlers for the provisioner.
@@ -330,7 +331,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return nil // Don't retry - configuration issue
 	}
 
-	event, ok := unmarshalMessagePayload[PayloadEvent](msg, TopicPayloadReceived)
+	event, ok := unmarshalMessagePayload[payload.Event](msg, TopicPayloadReceived)
 	if !ok {
 		return nil
 	}
@@ -375,7 +376,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	// Note: Payload is NOT deleted here. It will be deleted by HandleBackendCallback
 	// after the backend reports success or failure. This ensures the payload remains
 	// available for retry if the backend fails or crashes before sending a callback.
-	payload, err := h.deps.PayloadStore.Get(event.LeaseUUID)
+	payloadData, err := h.deps.PayloadStore.Get(event.LeaseUUID)
 	if err != nil {
 		slog.Error("failed to read payload from store",
 			"lease_uuid", event.LeaseUUID,
@@ -383,7 +384,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		)
 		return fmt.Errorf("payload store read error: %w", err)
 	}
-	if payload == nil {
+	if payloadData == nil {
 		// This shouldn't happen in normal operation since payload is stored
 		// before publishing the event, but handle it gracefully
 		slog.Warn("payload not found in store, proceeding without payload",
@@ -393,7 +394,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	} else if event.MetaHashHex != "" {
 		// Re-verify payload hash before provisioning to catch any corruption.
 		// The payload was validated on upload, but disk corruption could occur.
-		if err := VerifyPayloadHashHex(payload, event.MetaHashHex); err != nil {
+		if err := payload.VerifyHashHex(payloadData, event.MetaHashHex); err != nil {
 			h.deps.PayloadStore.Delete(event.LeaseUUID)
 			slog.Error("payload hash mismatch - possible corruption",
 				"lease_uuid", event.LeaseUUID,
@@ -405,7 +406,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 
 	// Start provisioning with payload
 	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
-		Payload:     payload,
+		Payload:     payloadData,
 		PayloadHash: event.MetaHashHex,
 	})
 	if err != nil {

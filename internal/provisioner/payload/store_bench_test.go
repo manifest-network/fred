@@ -1,4 +1,4 @@
-package provisioner
+package payload
 
 import (
 	"crypto/rand"
@@ -15,7 +15,7 @@ import (
 
 // waitForFlush polls until the specified key is visible in the store.
 // This is more reliable than time.Sleep for synchronization.
-func waitForFlush(t testing.TB, store *PayloadStore, key string, timeout time.Duration) {
+func waitForFlush(t testing.TB, store *Store, key string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		data, _ := store.Get(key)
@@ -27,10 +27,10 @@ func waitForFlush(t testing.TB, store *PayloadStore, key string, timeout time.Du
 	t.Fatalf("timeout waiting for key %q to be flushed", key)
 }
 
-// BenchmarkPayloadStore_Write benchmarks single payload writes.
-func BenchmarkPayloadStore_Write(b *testing.B) {
+// BenchmarkStore_Write benchmarks single payload writes.
+func BenchmarkStore_Write(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
+	store, err := NewStore(StoreConfig{
 		DBPath: filepath.Join(dir, "payload.db"),
 
 		FlushInterval: time.Millisecond,
@@ -54,10 +54,10 @@ func BenchmarkPayloadStore_Write(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_Write_Parallel benchmarks concurrent payload writes.
-func BenchmarkPayloadStore_Write_Parallel(b *testing.B) {
+// BenchmarkStore_Write_Parallel benchmarks concurrent payload writes.
+func BenchmarkStore_Write_Parallel(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
+	store, err := NewStore(StoreConfig{
 		DBPath: filepath.Join(dir, "payload.db"),
 
 		BatchSize:     100,
@@ -83,10 +83,10 @@ func BenchmarkPayloadStore_Write_Parallel(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_Read benchmarks payload reads.
-func BenchmarkPayloadStore_Read(b *testing.B) {
+// BenchmarkStore_Read benchmarks payload reads.
+func BenchmarkStore_Read(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
+	store, err := NewStore(StoreConfig{
 		DBPath: filepath.Join(dir, "payload.db"),
 
 		FlushInterval: time.Millisecond,
@@ -118,10 +118,10 @@ func BenchmarkPayloadStore_Read(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_Read_Parallel benchmarks concurrent payload reads.
-func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
+// BenchmarkStore_Read_Parallel benchmarks concurrent payload reads.
+func BenchmarkStore_Read_Parallel(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
+	store, err := NewStore(StoreConfig{
 		DBPath: filepath.Join(dir, "payload.db"),
 
 		FlushInterval: time.Millisecond,
@@ -155,14 +155,14 @@ func BenchmarkPayloadStore_Read_Parallel(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkPayloadStore_BatchEfficiency compares different batch sizes.
-func BenchmarkPayloadStore_BatchEfficiency(b *testing.B) {
+// BenchmarkStore_BatchEfficiency compares different batch sizes.
+func BenchmarkStore_BatchEfficiency(b *testing.B) {
 	batchSizes := []int{1, 10, 50, 100, 200}
 
 	for _, batchSize := range batchSizes {
 		b.Run(fmt.Sprintf("batch=%d", batchSize), func(b *testing.B) {
 			dir := b.TempDir()
-			store, err := NewPayloadStore(PayloadStoreConfig{
+			store, err := NewStore(StoreConfig{
 				DBPath: filepath.Join(dir, "payload.db"),
 
 				BatchSize:     batchSize,
@@ -189,8 +189,8 @@ func BenchmarkPayloadStore_BatchEfficiency(b *testing.B) {
 	}
 }
 
-// BenchmarkPayloadStore_LargePayload benchmarks large payload handling.
-func BenchmarkPayloadStore_LargePayload(b *testing.B) {
+// BenchmarkStore_LargePayload benchmarks large payload handling.
+func BenchmarkStore_LargePayload(b *testing.B) {
 	sizes := []struct {
 		name string
 		size int
@@ -204,7 +204,7 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 	for _, tc := range sizes {
 		b.Run(tc.name, func(b *testing.B) {
 			dir := b.TempDir()
-			store, err := NewPayloadStore(PayloadStoreConfig{
+			store, err := NewStore(StoreConfig{
 				DBPath: filepath.Join(dir, "payload.db"),
 
 				FlushInterval: time.Millisecond,
@@ -231,10 +231,10 @@ func BenchmarkPayloadStore_LargePayload(b *testing.B) {
 	}
 }
 
-// BenchmarkPayloadStore_MixedWorkload simulates realistic read/write mix.
-func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
+// BenchmarkStore_MixedWorkload simulates realistic read/write mix.
+func BenchmarkStore_MixedWorkload(b *testing.B) {
 	dir := b.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
+	store, err := NewStore(StoreConfig{
 		DBPath: filepath.Join(dir, "payload.db"),
 
 		BatchSize:     50,
@@ -277,15 +277,15 @@ func BenchmarkPayloadStore_MixedWorkload(b *testing.B) {
 	b.StopTimer()
 }
 
-// TestPayloadStore_StressTest performs a stress test with concurrent operations.
+// TestStore_StressTest performs a stress test with concurrent operations.
 // Use -short to skip this test.
-func TestPayloadStore_StressTest(t *testing.T) {
+func TestStore_StressTest(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in short mode")
 	}
 
 	dir := t.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
+	store, err := NewStore(StoreConfig{
 		DBPath: filepath.Join(dir, "payload.db"),
 
 		BatchSize:     100,
@@ -342,15 +342,15 @@ func TestPayloadStore_StressTest(t *testing.T) {
 	t.Logf("  Deletes: %d", deleteOps.Load())
 }
 
-// TestPayloadStore_HighConcurrencyWrites tests behavior under write-heavy load.
+// TestStore_HighConcurrencyWrites tests behavior under write-heavy load.
 // Use -short to skip this test.
-func TestPayloadStore_HighConcurrencyWrites(t *testing.T) {
+func TestStore_HighConcurrencyWrites(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping high concurrency test in short mode")
 	}
 
 	dir := t.TempDir()
-	store, err := NewPayloadStore(PayloadStoreConfig{
+	store, err := NewStore(StoreConfig{
 		DBPath: filepath.Join(dir, "payload.db"),
 
 		BatchSize:     200,

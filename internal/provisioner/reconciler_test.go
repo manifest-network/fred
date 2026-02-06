@@ -16,6 +16,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // mockReconcilerBackend implements backend.Backend for testing.
@@ -1559,12 +1560,12 @@ func (m *mockConcurrencyBackend) GetLogs(ctx context.Context, leaseUUID string, 
 
 // mockInFlightTracker implements ReconcilerTracker for testing orphaned payload cleanup.
 type mockInFlightTracker struct {
-	payloadStore *PayloadStore
+	payloadStore *payload.Store
 	inFlight     map[string]InFlightProvision
 	mu           sync.Mutex
 }
 
-func newMockInFlightTracker(payloadStore *PayloadStore) *mockInFlightTracker {
+func newMockInFlightTracker(payloadStore *payload.Store) *mockInFlightTracker {
 	return &mockInFlightTracker{
 		payloadStore: payloadStore,
 		inFlight:     make(map[string]InFlightProvision),
@@ -1658,14 +1659,14 @@ func (m *mockInFlightTracker) HasPayload(leaseUUID string) bool {
 	return m.payloadStore.Has(leaseUUID)
 }
 
-func (m *mockInFlightTracker) PayloadStore() *PayloadStore {
+func (m *mockInFlightTracker) PayloadStore() *payload.Store {
 	return m.payloadStore
 }
 
 func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	// Create a temp dir for the payload store
 	tmpDir := t.TempDir()
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: tmpDir + "/payloads.db",
 	})
 	require.NoError(t, err)
@@ -1965,7 +1966,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	var mu sync.Mutex
 
 	tmpDir := t.TempDir()
-	payloadStore, err := NewPayloadStore(PayloadStoreConfig{
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: tmpDir + "/payloads.db",
 	})
 	require.NoError(t, err)
