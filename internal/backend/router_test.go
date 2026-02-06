@@ -207,6 +207,149 @@ func TestRouter_NilBackend(t *testing.T) {
 	}
 }
 
+func TestRouter_RouteAll(t *testing.T) {
+	backendA := NewMockBackend(MockBackendConfig{Name: "backend-a"})
+	backendB := NewMockBackend(MockBackendConfig{Name: "backend-b"})
+	backendC := NewMockBackend(MockBackendConfig{Name: "backend-c"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: backendB, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: backendC, Match: MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// Two backends match gpu-
+	matches := router.RouteAll("gpu-a100")
+	assert.Len(t, matches, 2)
+	names := []string{matches[0].Name(), matches[1].Name()}
+	assert.Contains(t, names, "backend-a")
+	assert.Contains(t, names, "backend-b")
+
+	// One backend matches k8s-
+	matches = router.RouteAll("k8s-small")
+	assert.Len(t, matches, 1)
+	assert.Equal(t, "backend-c", matches[0].Name())
+
+	// No match returns nil
+	matches = router.RouteAll("unknown-sku")
+	assert.Nil(t, matches)
+}
+
+func TestRouter_RouteAll_Deduplicates(t *testing.T) {
+	backendA := NewMockBackend(MockBackendConfig{Name: "shared"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}, IsDefault: true},
+			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-a100"}},
+		},
+	})
+	require.NoError(t, err)
+
+	// Same backend registered twice for matching prefixes — should deduplicate
+	matches := router.RouteAll("gpu-a100-4x")
+	assert.Len(t, matches, 1)
+	assert.Equal(t, "shared", matches[0].Name())
+}
+
+func TestRouter_RouteRoundRobin_Distribution(t *testing.T) {
+	backendA := NewMockBackend(MockBackendConfig{Name: "backend-a"})
+	backendB := NewMockBackend(MockBackendConfig{Name: "backend-b"})
+	backendC := NewMockBackend(MockBackendConfig{Name: "backend-c"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: backendB, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: backendC, Match: MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// Round-robin across two GPU backends
+	counts := map[string]int{}
+	for i := 0; i < 100; i++ {
+		b := router.RouteRoundRobin("gpu-a100")
+		counts[b.Name()]++
+	}
+
+	assert.Equal(t, 50, counts["backend-a"])
+	assert.Equal(t, 50, counts["backend-b"])
+}
+
+func TestRouter_RouteRoundRobin_SingleMatch(t *testing.T) {
+	backendA := NewMockBackend(MockBackendConfig{Name: "solo"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// Single match always returns the same backend
+	for i := 0; i < 10; i++ {
+		b := router.RouteRoundRobin("gpu-a100")
+		assert.Equal(t, "solo", b.Name())
+	}
+}
+
+func TestRouter_RouteRoundRobin_NoMatch_FallsBackToDefault(t *testing.T) {
+	backendA := NewMockBackend(MockBackendConfig{Name: "gpu-backend"})
+	defaultBackend := NewMockBackend(MockBackendConfig{Name: "default"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: defaultBackend, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// Repeated calls with unmatched SKU always return default (no divide-by-zero)
+	for i := 0; i < 10; i++ {
+		b := router.RouteRoundRobin("unknown-sku")
+		assert.Equal(t, "default", b.Name())
+	}
+}
+
+func TestRouter_RouteRoundRobin_InterleavedSKUs(t *testing.T) {
+	gpuA := NewMockBackend(MockBackendConfig{Name: "gpu-a"})
+	gpuB := NewMockBackend(MockBackendConfig{Name: "gpu-b"})
+	k8s := NewMockBackend(MockBackendConfig{Name: "k8s"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: gpuA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: gpuB, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: k8s, Match: MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// The global counter is shared across SKU groups. Interleaving calls
+	// for different SKUs advances the counter for all groups, so the
+	// per-group distribution is not perfectly even.
+	gpuCounts := map[string]int{}
+	for i := 0; i < 100; i++ {
+		b := router.RouteRoundRobin("gpu-a100")
+		gpuCounts[b.Name()]++
+
+		// Interleave a single-backend SKU — advances the shared counter
+		k := router.RouteRoundRobin("k8s-small")
+		assert.Equal(t, "k8s", k.Name())
+	}
+
+	// Both GPU backends must be hit, but the distribution is uneven
+	// because the k8s calls consume every other counter tick.
+	assert.Greater(t, gpuCounts["gpu-a"], 0)
+	assert.Greater(t, gpuCounts["gpu-b"], 0)
+	assert.Equal(t, 100, gpuCounts["gpu-a"]+gpuCounts["gpu-b"])
+}
+
 // unhealthyMockBackend is a mock backend that returns an error on Health check.
 type unhealthyMockBackend struct {
 	*MockBackend

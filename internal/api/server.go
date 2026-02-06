@@ -87,7 +87,7 @@ type ServerConfig struct {
 
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker) (*Server, error) {
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup) (*Server, error) {
 	// Create token tracker if path is configured (enables replay protection)
 	var tokenTracker *TokenTracker
 	if cfg.TokenTrackerDBPath != "" {
@@ -110,7 +110,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if tokenTracker != nil {
 		tracker = tokenTracker
 	}
-	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, cfg.ProviderUUID, cfg.Bech32Prefix)
+	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, cfg.ProviderUUID, cfg.Bech32Prefix)
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
 	var trustedProxies *TrustedProxyConfig

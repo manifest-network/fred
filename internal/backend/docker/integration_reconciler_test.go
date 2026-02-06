@@ -93,6 +93,7 @@ func testReconcilerSetup(t *testing.T, chainClient *chain.MockClient) *reconcile
 		chainClient,
 		router,
 		tracker,
+		nil,
 	)
 	require.NoError(t, err)
 
@@ -715,6 +716,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 		mockChain,
 		router,
 		tracker,
+		nil,
 	)
 	require.NoError(t, err)
 

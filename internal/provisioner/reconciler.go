@@ -56,6 +56,7 @@ type Reconciler struct {
 	chainClient     ReconcilerChainClient
 	backendRouter   *backend.Router
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
+	placementStore  PlacementStore    // Optional placement store for round-robin routing
 
 	interval               time.Duration
 	maxWorkers             int         // Maximum concurrent workers for lease processing
@@ -78,7 +79,8 @@ type ReconcilerConfig struct {
 
 // NewReconciler creates a new reconciler.
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
-func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker ReconcilerTracker) (*Reconciler, error) {
+// The placementStore parameter is optional - if nil, round-robin placement tracking is disabled.
+func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker ReconcilerTracker, placementStore PlacementStore) (*Reconciler, error) {
 	if chainClient == nil {
 		return nil, errors.New("chain client is required")
 	}
@@ -103,6 +105,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 		chainClient:            chainClient,
 		backendRouter:          backendRouter,
 		tracker:                tracker,
+		placementStore:         placementStore,
 		interval:               interval,
 		maxWorkers:             maxWorkers,
 		maxReprovisionAttempts: maxReprovision,
@@ -184,6 +187,26 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	}
 
 	slog.Info("fetched backend provisions", "total", len(allProvisions))
+
+	// Sync placements from actual backend state (handles cold start and drift).
+	// NOTE: This only adds/updates — it never prunes stale records for leases
+	// that completed while fred was down. A naive prune is unsafe because a
+	// concurrent StartProvisioning may have just Set a placement that backends
+	// haven't reported yet. Stale records are harmless (reads fall back to SKU
+	// routing) and grow only by the number of leases that close during downtime.
+	if r.placementStore != nil && len(allProvisions) > 0 {
+		placements := make(map[string]string, len(allProvisions))
+		for leaseUUID, provision := range allProvisions {
+			if provision.BackendName != "" {
+				placements[leaseUUID] = provision.BackendName
+			}
+		}
+		if len(placements) > 0 {
+			if err := r.placementStore.SetBatch(placements); err != nil {
+				slog.Warn("failed to sync placements from backend state", "error", err)
+			}
+		}
+	}
 
 	// Check for cancellation before reconciliation loop
 	if err := ctx.Err(); err != nil {
@@ -324,8 +347,8 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// Extract SKU for routing
 	sku := ExtractRoutingSKU(&lease)
 
-	// Route to appropriate backend based on SKU (Route already falls back to default)
-	backendClient := r.backendRouter.Route(sku)
+	// Route to appropriate backend using round-robin for load distribution
+	backendClient := r.backendRouter.RouteRoundRobin(sku)
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}
@@ -402,6 +425,17 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// after the backend reports success or failure. This ensures the payload remains
 	// available for retry if the backend fails or crashes before sending a callback.
 
+	// Record placement so read operations can find this lease's backend
+	if r.placementStore != nil {
+		if err := r.placementStore.Set(lease.Uuid, backendClient.Name()); err != nil {
+			slog.Warn("failed to record placement",
+				"lease_uuid", lease.Uuid,
+				"backend", backendClient.Name(),
+				"error", err,
+			)
+		}
+	}
+
 	if withPayload {
 		slog.Info("reconcile: started provisioning with payload",
 			"lease_uuid", lease.Uuid,
@@ -445,12 +479,7 @@ func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) 
 		return err
 	}
 
-	// Clean up stored payload — the lease is terminal.
-	if r.tracker != nil {
-		if ps := r.tracker.PayloadStore(); ps != nil {
-			ps.Delete(leaseUUID)
-		}
-	}
+	r.cleanupTerminalLease(leaseUUID)
 
 	slog.Info("reconcile: rejected lease",
 		"lease_uuid", leaseUUID,
@@ -469,12 +498,7 @@ func (r *Reconciler) closeLease(ctx context.Context, leaseUUID, reason string) e
 		return err
 	}
 
-	// Clean up stored payload — the lease is terminal.
-	if r.tracker != nil {
-		if ps := r.tracker.PayloadStore(); ps != nil {
-			ps.Delete(leaseUUID)
-		}
-	}
+	r.cleanupTerminalLease(leaseUUID)
 
 	slog.Info("reconcile: closed lease",
 		"lease_uuid", leaseUUID,
@@ -484,6 +508,19 @@ func (r *Reconciler) closeLease(ctx context.Context, leaseUUID, reason string) e
 	)
 
 	return nil
+}
+
+// cleanupTerminalLease removes stored payload and placement records for a
+// lease that has reached a terminal state (rejected or closed).
+func (r *Reconciler) cleanupTerminalLease(leaseUUID string) {
+	if r.tracker != nil {
+		if ps := r.tracker.PayloadStore(); ps != nil {
+			ps.Delete(leaseUUID)
+		}
+	}
+	if r.placementStore != nil {
+		r.placementStore.Delete(leaseUUID)
+	}
 }
 
 // fetchAllProvisions retrieves provisions from all backends in parallel.
@@ -824,6 +861,12 @@ func (r *Reconciler) processOrphan(
 			"error", err,
 		)
 		leaseErrors.Add(1)
+		return
+	}
+
+	// Clean up placement record
+	if r.placementStore != nil {
+		r.placementStore.Delete(leaseUUID)
 	}
 }
 

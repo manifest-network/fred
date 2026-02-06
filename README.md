@@ -5,7 +5,7 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 ## Features
 
 - **Lease Lifecycle Management**: Watches chain events and orchestrates provisioning through backends
-- **Multi-Backend Support**: Route leases to different backends based on SKU prefix
+- **Multi-Backend Support**: Route leases to different backends based on SKU prefix, with round-robin distribution across backends sharing the same prefix
 - **Event-Driven Architecture**: Uses Watermill for internal event routing with retries and middleware
 - **Tenant Authentication API**: HTTP/HTTPS API with ADR-036 signature verification for tenant access
 - **Periodic Withdrawals**: Configurable scheduled withdrawal of accumulated fees from active leases
@@ -45,7 +45,8 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 |  +------------------+             v                               |
 |                           +------------------+                    |
 |                           | Backend Router   |                    |
-|                           | (SKU routing)    |                    |
+|                           | (SKU routing +   |                    |
+|                           |  round-robin)    |                    |
 |                           +------------------+                    |
 |                                   |                               |
 +------------------------------------------------------------------+
@@ -133,7 +134,7 @@ All required fields are validated at startup. The daemon will fail to start with
 | `provider_address` | Provider management address |
 | `keyring_dir` | Directory containing keyring |
 | `key_name` | Key name for signing transactions |
-| `backends` | At least one backend must be configured |
+| `backends` | At least one backend must be configured (multiple backends may share a `sku_prefix` for round-robin) |
 | `callback_base_url` | URL where backends send callbacks (must be absolute http/https URL) |
 | `callback_secret` | Shared secret for HMAC callback authentication (minimum 32 characters) |
 
@@ -154,8 +155,20 @@ backends:
     timeout: 60s
     sku_prefix: "gpu-"
 
+  # Round-robin: multiple backends can share the same sku_prefix.
+  # New provisions are distributed across them; reads are routed
+  # to the correct backend via the placement store.
+  # - name: gpu-2
+  #   url: "http://gpu-backend-2:9000"
+  #   timeout: 60s
+  #   sku_prefix: "gpu-"
+
 callback_base_url: "http://fred.provider.example.com:8080"
 callback_secret: "your-32-character-or-longer-secret-here"
+
+# Required for round-robin setups (multiple backends per SKU prefix).
+# Records which backend serves each lease so reads hit the right machine.
+# placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
 **Validation rules:**
@@ -192,6 +205,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
+| `placement_store_db_path` | Path to bbolt database for lease→backend placement tracking (required for round-robin) | (optional) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 ### Advanced Configuration
@@ -833,8 +847,9 @@ internal/
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
 │   ├── payload.go      # Temporary payload storage (bbolt)
+│   ├── placement/      # Lease→backend placement store (bbolt)
 │   ├── bridge.go       # Chain events -> Watermill
-│   └── interfaces.go   # BackendRouter, LeaseRejecter interfaces
+│   └── interfaces.go   # BackendRouter, LeaseRejecter, PlacementStore interfaces
 ├── scheduler/          # Periodic withdrawal and credit monitoring
 ├── testutil/           # Test fixtures and helpers
 ├── util/               # Shared utility functions

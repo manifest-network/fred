@@ -24,15 +24,17 @@ type ProvisionOrchestrator struct {
 	callbackBaseURL string
 	router          BackendRouter
 	tracker         InFlightTracker
+	placementStore  PlacementStore
 }
 
 // NewProvisionOrchestrator creates a new ProvisionOrchestrator.
-func NewProvisionOrchestrator(providerUUID, callbackBaseURL string, router BackendRouter, tracker InFlightTracker) *ProvisionOrchestrator {
+func NewProvisionOrchestrator(providerUUID, callbackBaseURL string, router BackendRouter, tracker InFlightTracker, placementStore PlacementStore) *ProvisionOrchestrator {
 	return &ProvisionOrchestrator{
 		providerUUID:    providerUUID,
 		callbackBaseURL: callbackBaseURL,
 		router:          router,
 		tracker:         tracker,
+		placementStore:  placementStore,
 	}
 }
 
@@ -48,8 +50,8 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	sku := ExtractRoutingSKU(lease)
 	totalQuantity := TotalLeaseQuantity(lease)
 
-	// Route to appropriate backend based on SKU (Route already falls back to default)
-	backendClient := o.router.Route(sku)
+	// Route to appropriate backend using round-robin for load distribution
+	backendClient := o.router.RouteRoundRobin(sku)
 	if backendClient == nil {
 		slog.Error("no backend available for provisioning",
 			"lease_uuid", lease.Uuid,
@@ -97,6 +99,17 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 		return fmt.Errorf("%w: %w", ErrProvisioningFailed, err)
 	}
 
+	// Record placement so read operations can find this lease's backend
+	if o.placementStore != nil {
+		if err := o.placementStore.Set(lease.Uuid, backendClient.Name()); err != nil {
+			slog.Warn("failed to record placement",
+				"lease_uuid", lease.Uuid,
+				"backend", backendClient.Name(),
+				"error", err,
+			)
+		}
+	}
+
 	// Log success with appropriate detail level
 	if opts.Payload != nil {
 		slog.Info("provisioning started with payload",
@@ -120,11 +133,21 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	return nil
 }
 
+// DeletePlacement removes the placement record for a lease. Called when a
+// lease reaches a terminal state (e.g., rejected after a failure callback)
+// without going through the full Deprovision flow.
+func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
+	if o.placementStore != nil {
+		o.placementStore.Delete(leaseUUID)
+	}
+}
+
 // Deprovision handles deprovisioning a lease from the appropriate backend.
 // It tries to determine the backend in this order:
-// 1. From in-flight tracking (most reliable - we know exactly where it's provisioned)
-// 2. Route by SKU using the provided skuHint (consistent with provisioning path)
-// 3. Fallback: deprovision from all backends (ensures cleanup even if routing differs)
+//  0. From the placement store (most reliable for completed provisions)
+//  1. From in-flight tracking (reliable for provisions still awaiting callback)
+//  2. Route by SKU using the provided skuHint (consistent with provisioning path)
+//  3. Fallback: deprovision from all backends (ensures cleanup even if routing differs)
 //
 // Returns nil on success or if the lease was not provisioned anywhere.
 // Returns an error only if all deprovision attempts fail.
@@ -134,7 +157,25 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 
 	var backendClient backend.Backend
 
-	if wasInFlight && provision.Backend != "" {
+	// Case 0: Check placement store (most reliable for completed provisions)
+	if o.placementStore != nil {
+		if placedBackend := o.placementStore.Get(leaseUUID); placedBackend != "" {
+			backendClient = o.router.GetBackendByName(placedBackend)
+			if backendClient != nil {
+				slog.Debug("routing deprovision by placement",
+					"lease_uuid", leaseUUID,
+					"backend", placedBackend,
+				)
+			} else {
+				slog.Warn("placement backend not found, will try other methods",
+					"lease_uuid", leaseUUID,
+					"backend_name", placedBackend,
+				)
+			}
+		}
+	}
+
+	if backendClient == nil && wasInFlight && provision.Backend != "" {
 		// Case 1: Was in-flight - use the tracked backend
 		backendClient = o.router.GetBackendByName(provision.Backend)
 		if backendClient == nil {
@@ -168,6 +209,11 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, err)
 		}
 
+		// Clean up placement record
+		if o.placementStore != nil {
+			o.placementStore.Delete(leaseUUID)
+		}
+
 		slog.Info("deprovisioned successfully",
 			"lease_uuid", leaseUUID,
 			"backend", backendClient.Name(),
@@ -198,6 +244,12 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			)
 			deprovisioned = true
 		}
+	}
+
+	// Always clean up placement record after fallback deprovision —
+	// if we reached the fallback path, the placement was already stale.
+	if o.placementStore != nil {
+		o.placementStore.Delete(leaseUUID)
 	}
 
 	if !deprovisioned && lastErr != nil {
