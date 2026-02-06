@@ -34,6 +34,8 @@ func ParseAuthToken(encoded string) (*AuthToken, error) {
 
 // Validate verifies the token's timestamp and ADR-036 signature.
 // The bech32Prefix is used to verify the tenant address matches the public key.
+// On success, t.Signature is updated to the low-S canonical form to ensure
+// consistent replay tracking regardless of which signature variant was submitted.
 func (t *AuthToken) Validate(bech32Prefix string) error {
 	// Validate required fields
 	if t.LeaseUUID == "" {
@@ -48,7 +50,13 @@ func (t *AuthToken) Validate(bech32Prefix string) error {
 		signature: t.Signature,
 	}
 
-	return v.validateCommon(t.createSignData(), bech32Prefix)
+	if err := v.validateCommon(t.createSignData(), bech32Prefix); err != nil {
+		return err
+	}
+
+	// Copy back the normalized signature for consistent replay tracking
+	t.Signature = v.signature
+	return nil
 }
 
 // createSignData creates the message data to be signed.

@@ -3,6 +3,7 @@ package adr036_test
 import (
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,9 @@ import (
 	"github.com/manifest-network/fred/internal/adr036"
 	"github.com/manifest-network/fred/internal/testutil"
 )
+
+// secp256k1N is the curve order, used in tests to flip S values.
+var secp256k1N, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
 
 func TestVerifySignature_Valid(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-seed-1")
@@ -140,4 +144,106 @@ func TestCreateSignBytes_Deterministic(t *testing.T) {
 	result3 := adr036.CreateSignBytes(message, signer)
 
 	assert.True(t, string(result1) == string(result2) && string(result2) == string(result3))
+}
+
+// flipS returns a new 64-byte signature with S replaced by N-S (the high-S form).
+func flipS(sig []byte) []byte {
+	if len(sig) != 64 {
+		panic("flipS: expected 64-byte signature")
+	}
+	s := new(big.Int).SetBytes(sig[32:64])
+	flipped := new(big.Int).Sub(secp256k1N, s)
+	out := make([]byte, 64)
+	copy(out[:32], sig[:32])
+	fBytes := flipped.Bytes()
+	copy(out[64-len(fBytes):64], fBytes)
+	return out
+}
+
+func TestNormalizeToLowS_AlreadyLow(t *testing.T) {
+	kp := testutil.NewTestKeyPair("low-s-test")
+	message := []byte("low-s message")
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	require.NoError(t, err)
+
+	// Cosmos SDK's secp256k1 may produce either form.
+	// Normalize first to get the canonical low-S.
+	normalized := adr036.NormalizeToLowS(sig)
+	require.NotNil(t, normalized)
+
+	// Normalizing an already-normalized signature should return the same bytes.
+	doubleNormalized := adr036.NormalizeToLowS(normalized)
+	assert.Equal(t, normalized, doubleNormalized, "double normalization should be idempotent")
+}
+
+func TestNormalizeToLowS_HighS(t *testing.T) {
+	kp := testutil.NewTestKeyPair("high-s-test")
+	message := []byte("high-s message")
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	require.NoError(t, err)
+
+	// Get canonical low-S form
+	lowS := adr036.NormalizeToLowS(sig)
+	require.NotNil(t, lowS)
+
+	// Flip S to get the high-S variant
+	highS := flipS(lowS)
+	assert.NotEqual(t, lowS, highS, "flipped signature should differ")
+
+	// Normalizing the high-S form should produce the same canonical low-S
+	normalizedHighS := adr036.NormalizeToLowS(highS)
+	assert.Equal(t, lowS, normalizedHighS, "high-S should normalize to same low-S form")
+}
+
+func TestNormalizeToLowS_InvalidLength(t *testing.T) {
+	assert.Nil(t, adr036.NormalizeToLowS(nil))
+	assert.Nil(t, adr036.NormalizeToLowS([]byte{}))
+	assert.Nil(t, adr036.NormalizeToLowS(make([]byte, 63)))
+	assert.Nil(t, adr036.NormalizeToLowS(make([]byte, 65)))
+}
+
+func TestVerifySignature_AcceptsBothSForms(t *testing.T) {
+	kp := testutil.NewTestKeyPair("both-s-test")
+	message := []byte("both S forms")
+	signBytes := adr036.CreateSignBytes(message, kp.Address)
+	sig, err := kp.PrivKey.Sign(signBytes)
+	require.NoError(t, err)
+
+	// Get canonical low-S
+	lowS := adr036.NormalizeToLowS(sig)
+	require.NotNil(t, lowS)
+
+	// Flip to high-S
+	highS := flipS(lowS)
+
+	// Both forms should verify
+	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, lowS, kp.Address)
+	assert.NoError(t, err, "low-S signature should verify")
+
+	err = adr036.VerifySignature(kp.PubKey.Bytes(), message, highS, kp.Address)
+	assert.NoError(t, err, "high-S signature should verify")
+}
+
+func TestNormalizeToLowS_BothFormsProduceSameCanonical(t *testing.T) {
+	// Test with multiple key pairs to increase confidence
+	for _, seed := range []string{"seed-a", "seed-b", "seed-c", "seed-d", "seed-e"} {
+		t.Run(seed, func(t *testing.T) {
+			kp := testutil.NewTestKeyPair(seed)
+			message := []byte("canonical form test " + seed)
+			signBytes := adr036.CreateSignBytes(message, kp.Address)
+			sig, err := kp.PrivKey.Sign(signBytes)
+			require.NoError(t, err)
+
+			lowS := adr036.NormalizeToLowS(sig)
+			highS := flipS(lowS)
+
+			fromLow := adr036.NormalizeToLowS(lowS)
+			fromHigh := adr036.NormalizeToLowS(highS)
+
+			assert.Equal(t, fromLow, fromHigh,
+				"normalizing both S forms should produce identical canonical signatures")
+		})
+	}
 }

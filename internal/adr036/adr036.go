@@ -11,8 +11,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+)
+
+// secp256k1 curve order N and half-order N/2 for low-S normalization.
+// These are the standard values for the secp256k1 curve used by Bitcoin and Cosmos.
+var (
+	secp256k1N, _        = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+	secp256k1HalfN       = new(big.Int).Rsh(secp256k1N, 1)
 )
 
 // SignDoc represents the ADR-036 sign document structure.
@@ -50,7 +58,40 @@ type MsgValue struct {
 	Signer string `json:"signer"` // Bech32 address of the signer
 }
 
+// NormalizeToLowS normalizes a 64-byte secp256k1 signature to low-S canonical form.
+// ECDSA signatures have two valid forms: (r, s) and (r, N-s). This function
+// ensures the S value is in the lower half of the curve order, producing a
+// unique canonical representation. This prevents signature malleability where
+// an attacker flips the S value to create a different-but-valid signature.
+//
+// Returns the normalized signature (may be the same slice if already low-S),
+// or nil if the input is not a valid 64-byte signature.
+func NormalizeToLowS(sig []byte) []byte {
+	if len(sig) != 64 {
+		return nil
+	}
+
+	// Extract S from the second 32 bytes
+	s := new(big.Int).SetBytes(sig[32:64])
+
+	// If S > N/2, replace with N - S
+	if s.Cmp(secp256k1HalfN) > 0 {
+		s.Sub(secp256k1N, s)
+		normalized := make([]byte, 64)
+		copy(normalized[:32], sig[:32]) // R unchanged
+		sBytes := s.Bytes()
+		// Left-pad S to 32 bytes
+		copy(normalized[64-len(sBytes):64], sBytes)
+		return normalized
+	}
+
+	return sig
+}
+
 // VerifySignature verifies an ADR-036 off-chain signature.
+// The signature is normalized to low-S canonical form before verification
+// to accept both (r, s) and (r, N-s) forms.
+//
 // Parameters:
 //   - pubKeyBytes: 33-byte compressed secp256k1 public key
 //   - message: the original message that was signed
@@ -69,9 +110,16 @@ func VerifySignature(pubKeyBytes, message, signature []byte, signer string) erro
 		return fmt.Errorf("failed to create sign bytes")
 	}
 
+	// Normalize signature to low-S form before verification.
+	// This ensures both (r, s) and (r, N-s) forms are accepted.
+	normalized := NormalizeToLowS(signature)
+	if normalized == nil {
+		return fmt.Errorf("invalid signature length: expected 64, got %d", len(signature))
+	}
+
 	// Create secp256k1 public key and verify
 	pubKey := &secp256k1.PubKey{Key: pubKeyBytes}
-	if !pubKey.VerifySignature(signBytes, signature) {
+	if !pubKey.VerifySignature(signBytes, normalized) {
 		return fmt.Errorf("signature verification failed")
 	}
 

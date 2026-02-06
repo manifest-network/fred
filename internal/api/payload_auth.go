@@ -49,7 +49,13 @@ func (t *PayloadAuthToken) Validate(bech32Prefix string) error {
 		signature: t.Signature,
 	}
 
-	return v.validateCommon(t.createSignData(), bech32Prefix)
+	if err := v.validateCommon(t.createSignData(), bech32Prefix); err != nil {
+		return err
+	}
+
+	// Copy back the normalized signature for consistent replay tracking
+	t.Signature = v.signature
+	return nil
 }
 
 // createSignData creates the message data to be signed for payload upload.
