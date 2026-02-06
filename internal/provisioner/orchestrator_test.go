@@ -552,12 +552,12 @@ func TestOrchestrator_DeletePlacement_NilStore(t *testing.T) {
 // type for the variable (not the concrete type) to ensure a true nil.
 // See: https://go.dev/doc/faq#nil_error
 func TestOrchestrator_TypedNilPlacementStore_Panics(t *testing.T) {
-	var ps *placement.Store // typed nil
+	var ps *placement.Store //nolint:staticcheck // intentionally testing typed-nil interface behavior
 	var iface PlacementStore = ps
 
-	// Precondition: a plain Go != nil check passes (this is the bug)
+	// Precondition: a plain Go != nil check passes (this is the bug).
 	// Note: testify's require.NotNil uses reflect and sees through the wrapper.
-	require.False(t, iface == nil, "typed-nil interface must not be == nil")
+	require.False(t, iface == nil, "typed-nil interface must not be == nil") //nolint:staticcheck // intentionally testing this exact condition
 
 	mb := &mockManagerBackend{name: "test-backend"}
 	router := &mockBackendRouter{
