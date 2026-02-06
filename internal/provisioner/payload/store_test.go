@@ -17,6 +17,14 @@ import (
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
+// mustHas is a test helper that calls Has() and fails the test on error.
+func mustHas(t *testing.T, store *Store, leaseUUID string) bool {
+	t.Helper()
+	has, err := store.Has(leaseUUID)
+	require.NoError(t, err)
+	return has
+}
+
 // newTestStore creates a Store for testing with a temp database.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -36,7 +44,7 @@ func TestStore_Store_Success(t *testing.T) {
 	ok := store.Store(testutil.ValidUUID1, payload)
 	assert.True(t, ok, "Store() = false, want true for new payload")
 
-	assert.True(t, store.Has(testutil.ValidUUID1), "Has() = false after Store()")
+	assert.True(t, mustHas(t, store, testutil.ValidUUID1), "Has() = false after Store()")
 }
 
 func TestStore_Store_Conflict(t *testing.T) {
@@ -67,7 +75,7 @@ func TestStore_Get(t *testing.T) {
 	assert.Equal(t, string(payload), string(got))
 
 	// Get should not remove the payload
-	assert.True(t, store.Has(testutil.ValidUUID1), "Has() = false after Get()")
+	assert.True(t, mustHas(t, store, testutil.ValidUUID1), "Has() = false after Get()")
 }
 
 func TestStore_Get_NotFound(t *testing.T) {
@@ -88,7 +96,7 @@ func TestStore_Pop(t *testing.T) {
 	assert.Equal(t, string(payload), string(got))
 
 	// Pop should remove the payload
-	assert.False(t, store.Has(testutil.ValidUUID1), "Has() = true after Pop()")
+	assert.False(t, mustHas(t, store, testutil.ValidUUID1), "Has() = true after Pop()")
 }
 
 func TestStore_Pop_NotFound(t *testing.T) {
@@ -101,11 +109,11 @@ func TestStore_Pop_NotFound(t *testing.T) {
 func TestStore_Has(t *testing.T) {
 	store := newTestStore(t)
 
-	assert.False(t, store.Has(testutil.ValidUUID1), "Has() = true for empty store")
+	assert.False(t, mustHas(t, store, testutil.ValidUUID1), "Has() = true for empty store")
 
 	store.Store(testutil.ValidUUID1, []byte("test"))
 
-	assert.True(t, store.Has(testutil.ValidUUID1), "Has() = false after Store()")
+	assert.True(t, mustHas(t, store, testutil.ValidUUID1), "Has() = false after Store()")
 }
 
 func TestStore_Delete(t *testing.T) {
@@ -115,7 +123,7 @@ func TestStore_Delete(t *testing.T) {
 	store.Store(testutil.ValidUUID1, payload)
 	store.Delete(testutil.ValidUUID1)
 
-	assert.False(t, store.Has(testutil.ValidUUID1), "Has() = true after Delete()")
+	assert.False(t, mustHas(t, store, testutil.ValidUUID1), "Has() = true after Delete()")
 }
 
 func TestStore_Delete_NotFound(t *testing.T) {
@@ -181,7 +189,7 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 				case 1:
 					_, _ = store.Get(uuid)
 				case 2:
-					store.Has(uuid)
+					_, _ = store.Has(uuid)
 				case 3:
 					store.Pop(uuid)
 				case 4:
@@ -463,7 +471,7 @@ func TestStore_FlushIntervalTriggersWrite(t *testing.T) {
 
 	// Poll until flush interval writes the data
 	deadline := time.After(5 * time.Second)
-	for !store.Has("interval-test") {
+	for !mustHas(t, store, "interval-test") {
 		select {
 		case <-deadline:
 			require.Fail(t, "timed out waiting for flush")
@@ -473,7 +481,7 @@ func TestStore_FlushIntervalTriggersWrite(t *testing.T) {
 	}
 
 	// Data should be written
-	assert.True(t, store.Has("interval-test"), "Has() = false after flush interval")
+	assert.True(t, mustHas(t, store, "interval-test"), "Has() = false after flush interval")
 }
 
 // Tests for VerifyHash and VerifyHashHex

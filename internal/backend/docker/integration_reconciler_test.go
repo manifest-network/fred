@@ -29,7 +29,7 @@ type testReconcilerTracker struct {
 	store *payload.Store
 }
 
-func (t *testReconcilerTracker) HasPayload(leaseUUID string) bool {
+func (t *testReconcilerTracker) HasPayload(leaseUUID string) (bool, error) {
 	return t.store.Has(leaseUUID)
 }
 

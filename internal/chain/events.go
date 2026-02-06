@@ -78,7 +78,7 @@ type EventSubscriber struct {
 
 	// closed is set to 1 when Close() is called to prevent races between
 	// broadcast() and Close(). Using atomic to avoid lock contention.
-	closed atomic.Int32
+	closed atomic.Bool
 
 	// broadcastWg tracks in-flight broadcasts so Close() can wait for them
 	// to complete before closing channels. This prevents sending to closed channels.
@@ -132,7 +132,7 @@ func NewEventSubscriber(cfg EventSubscriberConfig) (*EventSubscriber, error) {
 // Returns nil if the subscriber has been closed.
 func (s *EventSubscriber) Subscribe() chan LeaseEvent {
 	// Check closed state before subscribing
-	if s.closed.Load() != 0 {
+	if s.closed.Load() {
 		slog.Warn("attempted to subscribe to closed event subscriber")
 		return nil
 	}
@@ -141,7 +141,7 @@ func (s *EventSubscriber) Subscribe() chan LeaseEvent {
 
 	s.subscribersMu.Lock()
 	// Double-check closed state under lock
-	if s.closed.Load() != 0 {
+	if s.closed.Load() {
 		s.subscribersMu.Unlock()
 		slog.Warn("attempted to subscribe to closed event subscriber")
 		return nil
@@ -189,7 +189,7 @@ func (s *EventSubscriber) broadcast(event LeaseEvent) {
 	defer s.broadcastWg.Done()
 
 	// Check if closed - if so, return early (Done() is deferred)
-	if s.closed.Load() != 0 {
+	if s.closed.Load() {
 		return
 	}
 
@@ -454,7 +454,7 @@ func (s *EventSubscriber) trackInvalidMessage(reason string, err error) {
 	s.lastInvalidMsgTime = time.Now()
 
 	// Build log attributes
-	attrs := []interface{}{"reason", reason}
+	attrs := []any{"reason", reason}
 	if err != nil {
 		attrs = append(attrs, "error", err)
 	}
@@ -563,7 +563,7 @@ func getEventAttribute(events map[string][]string, key string) string {
 func (s *EventSubscriber) Close() {
 	// Set closed flag first to stop any new broadcasts from starting.
 	// Use CompareAndSwap to ensure Close() is idempotent.
-	if !s.closed.CompareAndSwap(0, 1) {
+	if !s.closed.CompareAndSwap(false, true) {
 		return // Already closed
 	}
 

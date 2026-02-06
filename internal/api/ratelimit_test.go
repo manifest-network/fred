@@ -369,7 +369,7 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	middleware := tl.Middleware("manifest")(handler)
+	middleware := tl.Middleware()(handler)
 
 	t.Run("rate_limits_per_tenant", func(t *testing.T) {
 		// Create a valid auth token for testing
@@ -401,7 +401,7 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 	t.Run("different_tenants_independent", func(t *testing.T) {
 		// Use fresh rate limiter
 		tl2 := NewTenantRateLimiter(1, 1)
-		middleware2 := tl2.Middleware("manifest")(handler)
+		middleware2 := tl2.Middleware()(handler)
 
 		// Create tokens for two different tenants
 		kp1 := testutil.NewTestKeyPair("tenant-1")
@@ -436,7 +436,7 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusOK)
 		})
-		middleware3 := tl3.Middleware("manifest")(contextHandler)
+		middleware3 := tl3.Middleware()(contextHandler)
 
 		kp := testutil.NewTestKeyPair("context-test")
 		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
@@ -451,7 +451,7 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 
 	t.Run("no_auth_header_proceeds_without_tenant_limiting", func(t *testing.T) {
 		tl4 := NewTenantRateLimiter(1, 1)
-		middleware4 := tl4.Middleware("manifest")(handler)
+		middleware4 := tl4.Middleware()(handler)
 
 		// Request without auth header should proceed (IP limiting still applies separately)
 		req := httptest.NewRequest("GET", "/test", nil)
@@ -463,7 +463,7 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 
 	t.Run("invalid_token_proceeds_without_tenant_limiting", func(t *testing.T) {
 		tl5 := NewTenantRateLimiter(1, 1)
-		middleware5 := tl5.Middleware("manifest")(handler)
+		middleware5 := tl5.Middleware()(handler)
 
 		// Request with invalid token should proceed (tenant extraction fails gracefully)
 		req := httptest.NewRequest("GET", "/test", nil)
@@ -495,14 +495,14 @@ func TestExtractTenantFromAuth(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		tenant := extractTenantFromAuth(req, "manifest")
+		tenant := extractTenantFromAuth(req)
 		assert.Equal(t, kp.Address, tenant)
 	})
 
 	t.Run("missing_auth_returns_empty", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 
-		tenant := extractTenantFromAuth(req, "manifest")
+		tenant := extractTenantFromAuth(req)
 		assert.Equal(t, "", tenant)
 	})
 
@@ -510,23 +510,25 @@ func TestExtractTenantFromAuth(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer not-valid-base64-json")
 
-		tenant := extractTenantFromAuth(req, "manifest")
+		tenant := extractTenantFromAuth(req)
 		assert.Equal(t, "", tenant)
 	})
 
-	t.Run("wrong_prefix_returns_empty", func(t *testing.T) {
+	t.Run("any_parseable_token_extracts_tenant", func(t *testing.T) {
 		kp := testutil.NewTestKeyPair("prefix-test")
 		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
 
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		// Use wrong prefix - validation should fail
-		tenant := extractTenantFromAuth(req, "cosmos")
-		assert.Equal(t, "", tenant, "wrong prefix")
+		// extractTenantFromAuth skips crypto validation and returns the
+		// self-reported tenant for rate-limit bucketing only.
+		// The handler's real authentication validates the signature.
+		tenant := extractTenantFromAuth(req)
+		assert.Equal(t, kp.Address, tenant)
 	})
 
-	t.Run("expired_token_returns_empty", func(t *testing.T) {
+	t.Run("expired_token_still_extracts_tenant", func(t *testing.T) {
 		kp := testutil.NewTestKeyPair("expired-test")
 		// Create token with old timestamp
 		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now().Add(-1*time.Hour))
@@ -534,8 +536,10 @@ func TestExtractTenantFromAuth(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		tenant := extractTenantFromAuth(req, "manifest")
-		assert.Equal(t, "", tenant, "expired token")
+		// Expired tokens still return a tenant for rate-limit bucketing.
+		// The handler's real authentication will reject expired tokens.
+		tenant := extractTenantFromAuth(req)
+		assert.Equal(t, kp.Address, tenant)
 	})
 }
 

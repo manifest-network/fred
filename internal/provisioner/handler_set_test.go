@@ -221,7 +221,9 @@ func TestHandlerSet_HandleLeaseClosed_CleansUpPayload(t *testing.T) {
 
 	err = hs.HandleLeaseClosed(msg)
 	assert.NoError(t, err)
-	assert.False(t, ps.Has("lease-1"), "payload should be cleaned up")
+	hasPayload, err := ps.Has("lease-1")
+	require.NoError(t, err)
+	assert.False(t, hasPayload, "payload should be cleaned up")
 }
 
 func TestHandlerSet_HandleLeaseExpired_DelegatesToClosed(t *testing.T) {
@@ -556,7 +558,9 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 
 	err = hs.HandlePayloadReceived(msg)
 	assert.NoError(t, err)
-	assert.False(t, ps.Has("lease-1"), "payload should be cleaned up")
+	hasPayload, err := ps.Has("lease-1")
+	require.NoError(t, err)
+	assert.False(t, hasPayload, "payload should be cleaned up")
 }
 
 func TestHandlerSet_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
@@ -585,7 +589,9 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 
 	err = hs.HandlePayloadReceived(msg)
 	assert.NoError(t, err)
-	assert.False(t, ps.Has("lease-1"), "payload should be cleaned up")
+	hasPayload, err := ps.Has("lease-1")
+	require.NoError(t, err)
+	assert.False(t, hasPayload, "payload should be cleaned up")
 }
 
 func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
@@ -613,7 +619,9 @@ func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
 	assert.Error(t, err, "should return error for retry")
 
 	// Payload should be preserved for retry
-	assert.True(t, ps.Has("lease-1"))
+	hasPayloadRetry, errRetry := ps.Has("lease-1")
+	require.NoError(t, errRetry)
+	assert.True(t, hasPayloadRetry)
 }
 
 func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
@@ -646,7 +654,9 @@ func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 
 	err = hs.HandlePayloadReceived(msg)
 	assert.Error(t, err, "should return error for hash mismatch")
-	assert.False(t, ps.Has("lease-1"), "payload should be deleted on hash mismatch")
+	hasPayloadHash, errHash := ps.Has("lease-1")
+	require.NoError(t, errHash)
+	assert.False(t, hasPayloadHash, "payload should be deleted on hash mismatch")
 }
 
 // --- truncateRejectReason tests ---

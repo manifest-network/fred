@@ -1652,9 +1652,9 @@ func (m *mockInFlightTracker) GetTimedOutProvisions(timeout time.Duration) []InF
 	return nil
 }
 
-func (m *mockInFlightTracker) HasPayload(leaseUUID string) bool {
+func (m *mockInFlightTracker) HasPayload(leaseUUID string) (bool, error) {
 	if m.payloadStore == nil {
-		return false
+		return false, nil
 	}
 	return m.payloadStore.Has(leaseUUID)
 }
@@ -1715,13 +1715,19 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 
 	// Verify orphaned payloads were cleaned up
 	// active-lease: payload should be RETAINED (active leases keep payload for re-provisioning)
-	assert.True(t, payloadStore.Has("active-lease"), "expected active-lease payload to be retained for re-provisioning")
+	hasActive, err := payloadStore.Has("active-lease")
+	require.NoError(t, err)
+	assert.True(t, hasActive, "expected active-lease payload to be retained for re-provisioning")
 
 	// closed-lease: payload should be cleaned (lease doesn't exist in chain query results)
-	assert.False(t, payloadStore.Has("closed-lease"), "expected closed-lease payload to be cleaned up (lease not found)")
+	hasClosed, err := payloadStore.Has("closed-lease")
+	require.NoError(t, err)
+	assert.False(t, hasClosed, "expected closed-lease payload to be cleaned up (lease not found)")
 
 	// nonexistent-lease: payload should be cleaned (lease doesn't exist)
-	assert.False(t, payloadStore.Has("nonexistent-lease"), "expected nonexistent-lease payload to be cleaned up (lease not found)")
+	hasNonexistent, err := payloadStore.Has("nonexistent-lease")
+	require.NoError(t, err)
+	assert.False(t, hasNonexistent, "expected nonexistent-lease payload to be cleaned up (lease not found)")
 
 	// Verify count - only active-lease payload should remain
 	assert.Equal(t, 1, payloadStore.Count())

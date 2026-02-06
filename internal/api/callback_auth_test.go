@@ -589,8 +589,8 @@ type mockIdempotencyStatusChecker struct {
 	isInFlight map[string]bool
 }
 
-func (m *mockIdempotencyStatusChecker) HasPayload(leaseUUID string) bool {
-	return false
+func (m *mockIdempotencyStatusChecker) HasPayload(leaseUUID string) (bool, error) {
+	return false, nil
 }
 
 func (m *mockIdempotencyStatusChecker) IsInFlight(leaseUUID string) bool {

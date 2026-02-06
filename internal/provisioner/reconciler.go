@@ -80,16 +80,16 @@ type ReconcilerConfig struct {
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
 func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker ReconcilerTracker) (*Reconciler, error) {
 	if chainClient == nil {
-		return nil, fmt.Errorf("chain client is required")
+		return nil, errors.New("chain client is required")
 	}
 	if backendRouter == nil {
-		return nil, fmt.Errorf("backend router is required")
+		return nil, errors.New("backend router is required")
 	}
 	if cfg.ProviderUUID == "" {
-		return nil, fmt.Errorf("provider UUID is required")
+		return nil, errors.New("provider UUID is required")
 	}
 	if cfg.CallbackBaseURL == "" {
-		return nil, fmt.Errorf("callback base URL is required")
+		return nil, errors.New("callback base URL is required")
 	}
 
 	// Apply defaults using cmp.Or (returns first non-zero value)
@@ -140,7 +140,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	startTime := time.Now()
 	defer func() {
 		metrics.ReconciliationDuration.Observe(time.Since(startTime).Seconds())
-		if retErr != nil && retErr != context.Canceled {
+		if retErr != nil && !errors.Is(retErr, context.Canceled) {
 			metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeError).Inc()
 		}
 	}()
@@ -548,6 +548,69 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 	return allProvisions, nil
 }
 
+// handleProvisionError handles errors from provisioning attempts during reconciliation.
+// It determines the appropriate action based on error type and lease state:
+//   - errLeaseAlreadyInFlight: skip (not a real error)
+//   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
+//   - ErrValidation: reject (PENDING) or close (ACTIVE) the lease
+//   - other errors: log and flag for retry next cycle
+func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseUUID string, lease billingtypes.Lease, hadError *bool) {
+	if errors.Is(err, errLeaseAlreadyInFlight) {
+		slog.Debug("reconcile: lease already in-flight, skipping", "lease_uuid", leaseUUID)
+		return
+	}
+
+	// Determine the termination reason for permanent errors
+	var reason string
+	switch {
+	case errors.Is(err, errPayloadNotAvailable):
+		reason = "payload not available for re-provisioning"
+	case errors.Is(err, backend.ErrValidation):
+		reason = validationErrorToRejectReason(err)
+	default:
+		// Transient error — log and retry next cycle
+		slog.Error("reconcile: provisioning failed",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+			"error", err,
+		)
+		*hadError = true
+		return
+	}
+
+	// Permanent error — terminate the lease
+	isPending := lease.State == billingtypes.LEASE_STATE_PENDING
+	if isPending {
+		slog.Warn("reconcile: permanent provisioning error, rejecting pending lease",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+			"reason", reason,
+			"error", err,
+		)
+		if rejectErr := r.rejectLease(ctx, leaseUUID, reason); rejectErr != nil {
+			slog.Error("reconcile: failed to reject lease",
+				"lease_uuid", leaseUUID,
+				"error", rejectErr,
+			)
+			*hadError = true
+		}
+	} else {
+		slog.Error("reconcile: permanent provisioning error, closing active lease",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+			"reason", reason,
+			"error", err,
+		)
+		if closeErr := r.closeLease(ctx, leaseUUID, reason); closeErr != nil {
+			slog.Error("reconcile: failed to close lease",
+				"lease_uuid", leaseUUID,
+				"error", closeErr,
+			)
+			*hadError = true
+		}
+	}
+}
+
 // processLease handles reconciliation logic for a single lease.
 func (r *Reconciler) processLease(
 	ctx context.Context,
@@ -576,39 +639,26 @@ func (r *Reconciler) processLease(
 		// Check if lease requires a payload (has MetaHash)
 		if len(lease.MetaHash) > 0 {
 			// Lease needs a payload - check if we have one stored
-			if r.tracker != nil && r.tracker.HasPayload(leaseUUID) {
+			hasPayload := false
+			if r.tracker != nil {
+				var err error
+				hasPayload, err = r.tracker.HasPayload(leaseUUID)
+				if err != nil {
+					slog.Error("reconcile: failed to check payload store",
+						"lease_uuid", leaseUUID,
+						"error", err,
+					)
+					hadError = true
+				}
+			}
+			if hasPayload {
 				// We have the payload - start provisioning with it
 				if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
-					if errors.Is(err, errLeaseAlreadyInFlight) {
-						slog.Debug("reconcile: lease already in-flight, skipping",
-							"lease_uuid", leaseUUID,
-						)
-					} else if errors.Is(err, backend.ErrValidation) {
-						// Validation errors are permanent — reject immediately to stop
-						// retrying every reconciliation cycle.
-						slog.Warn("reconcile: validation error, rejecting pending lease",
-							"lease_uuid", leaseUUID,
-							"tenant", lease.Tenant,
-							"error", err,
-						)
-						if rejectErr := r.rejectLease(ctx, leaseUUID, validationErrorToRejectReason(err)); rejectErr != nil {
-							slog.Error("reconcile: failed to reject lease after validation error",
-								"lease_uuid", leaseUUID,
-								"error", rejectErr,
-							)
-							hadError = true
-						}
-					} else {
-						slog.Error("reconcile: failed to start provisioning with payload",
-							"lease_uuid", leaseUUID,
-							"error", err,
-						)
-						hadError = true
-					}
+					r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 				} else {
 					provisioned.Add(1)
 				}
-			} else {
+			} else if !hadError {
 				// No payload yet - wait for tenant to upload
 				slog.Debug("reconcile: lease awaiting payload upload",
 					"lease_uuid", leaseUUID,
@@ -619,32 +669,7 @@ func (r *Reconciler) processLease(
 		} else {
 			// No MetaHash - start provisioning immediately
 			if err := r.startProvisioning(ctx, lease); err != nil {
-				if errors.Is(err, errLeaseAlreadyInFlight) {
-					slog.Debug("reconcile: lease already in-flight, skipping",
-						"lease_uuid", leaseUUID,
-					)
-				} else if errors.Is(err, backend.ErrValidation) {
-					// Validation errors are permanent — reject immediately to stop
-					// retrying every reconciliation cycle.
-					slog.Warn("reconcile: validation error, rejecting pending lease",
-						"lease_uuid", leaseUUID,
-						"tenant", lease.Tenant,
-						"error", err,
-					)
-					if rejectErr := r.rejectLease(ctx, leaseUUID, validationErrorToRejectReason(err)); rejectErr != nil {
-						slog.Error("reconcile: failed to reject lease after validation error",
-							"lease_uuid", leaseUUID,
-							"error", rejectErr,
-						)
-						hadError = true
-					}
-				} else {
-					slog.Error("reconcile: failed to start provisioning",
-						"lease_uuid", leaseUUID,
-						"error", err,
-					)
-					hadError = true
-				}
+				r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 			} else {
 				provisioned.Add(1)
 			}
@@ -692,41 +717,7 @@ func (r *Reconciler) processLease(
 		anomalies.Add(1)
 		// Attempt to provision (with payload — Docker backend needs the manifest)
 		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
-			if errors.Is(err, errPayloadNotAvailable) {
-				// Payload is permanently missing — close the lease since
-				// we cannot re-provision without the manifest.
-				slog.Error("reconcile: closing anomalous lease - payload not available",
-					"lease_uuid", leaseUUID,
-					"tenant", lease.Tenant,
-				)
-				if closeErr := r.closeLease(ctx, leaseUUID, "payload not available for re-provisioning"); closeErr != nil {
-					slog.Error("reconcile: failed to close anomalous lease",
-						"lease_uuid", leaseUUID,
-						"error", closeErr,
-					)
-					hadError = true
-				}
-			} else if errors.Is(err, backend.ErrValidation) {
-				// Validation errors are permanent — close the active lease.
-				slog.Error("reconcile: closing anomalous lease - validation error",
-					"lease_uuid", leaseUUID,
-					"tenant", lease.Tenant,
-					"error", err,
-				)
-				if closeErr := r.closeLease(ctx, leaseUUID, validationErrorToRejectReason(err)); closeErr != nil {
-					slog.Error("reconcile: failed to close anomalous lease after validation error",
-						"lease_uuid", leaseUUID,
-						"error", closeErr,
-					)
-					hadError = true
-				}
-			} else if !errors.Is(err, errLeaseAlreadyInFlight) {
-				slog.Error("reconcile: failed to provision anomalous lease",
-					"lease_uuid", leaseUUID,
-					"error", err,
-				)
-				hadError = true
-			}
+			r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 		}
 
 	case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned && provision.Status == backend.ProvisionStatusFailed:
@@ -774,41 +765,7 @@ func (r *Reconciler) processLease(
 			"max_attempts", r.maxReprovisionAttempts,
 		)
 		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
-			if errors.Is(err, errPayloadNotAvailable) {
-				slog.Error("reconcile: closing failed lease - payload not available",
-					"lease_uuid", leaseUUID,
-					"tenant", lease.Tenant,
-					"backend", provision.BackendName,
-				)
-				if closeErr := r.closeLease(ctx, leaseUUID, "payload not available for re-provisioning"); closeErr != nil {
-					slog.Error("reconcile: failed to close lease with missing payload",
-						"lease_uuid", leaseUUID,
-						"error", closeErr,
-					)
-					hadError = true
-				}
-			} else if errors.Is(err, backend.ErrValidation) {
-				// Validation errors are permanent — close the active lease.
-				slog.Error("reconcile: closing failed lease - validation error",
-					"lease_uuid", leaseUUID,
-					"tenant", lease.Tenant,
-					"backend", provision.BackendName,
-					"error", err,
-				)
-				if closeErr := r.closeLease(ctx, leaseUUID, validationErrorToRejectReason(err)); closeErr != nil {
-					slog.Error("reconcile: failed to close lease after validation error",
-						"lease_uuid", leaseUUID,
-						"error", closeErr,
-					)
-					hadError = true
-				}
-			} else if !errors.Is(err, errLeaseAlreadyInFlight) {
-				slog.Error("reconcile: failed to re-provision failed active lease",
-					"lease_uuid", leaseUUID,
-					"error", err,
-				)
-				hadError = true
-			}
+			r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 		}
 
 	case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned:

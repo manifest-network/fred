@@ -80,6 +80,7 @@ type Store struct {
 	flushInterval time.Duration
 
 	// For graceful shutdown
+	ctx       context.Context    // store-level context; Done channel used by write methods to avoid blocking after Close
 	cancel    context.CancelFunc
 	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
 	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
@@ -131,6 +132,7 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 		writeCh:       make(chan writeOp, writeChannelSize),
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
+		ctx:           ctx,
 		cancel:        cancel,
 		wg:            &sync.WaitGroup{},
 		closeOnce:     &sync.Once{},
@@ -170,19 +172,27 @@ func (s *Store) Store(leaseUUID string, payload []byte) bool {
 		resultCh: resultCh,
 	}
 
-	s.writeCh <- op
-	result := <-resultCh
-
-	if result.err != nil {
-		slog.Error("failed to store payload", "lease_uuid", leaseUUID, "error", result.err)
+	select {
+	case s.writeCh <- op:
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed, cannot store", "lease_uuid", leaseUUID)
 		return false
 	}
 
-	if result.stored {
-		metrics.PayloadStoredCount.Inc()
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			slog.Error("failed to store payload", "lease_uuid", leaseUUID, "error", result.err)
+			return false
+		}
+		if result.stored {
+			metrics.PayloadStoredCount.Inc()
+		}
+		return result.stored
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed during store", "lease_uuid", leaseUUID)
+		return false
 	}
-
-	return result.stored
 }
 
 // Get retrieves a payload for a lease without removing it.
@@ -228,23 +238,33 @@ func (s *Store) Pop(leaseUUID string) []byte {
 		resultCh: resultCh,
 	}
 
-	s.writeCh <- op
-	result := <-resultCh
-
-	if result.err != nil {
-		slog.Error("failed to pop payload", "lease_uuid", leaseUUID, "error", result.err)
+	select {
+	case s.writeCh <- op:
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed, cannot pop", "lease_uuid", leaseUUID)
 		return nil
 	}
 
-	if result.payload != nil {
-		metrics.PayloadStoredCount.Dec()
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			slog.Error("failed to pop payload", "lease_uuid", leaseUUID, "error", result.err)
+			return nil
+		}
+		if result.payload != nil {
+			metrics.PayloadStoredCount.Dec()
+		}
+		return result.payload
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed during pop", "lease_uuid", leaseUUID)
+		return nil
 	}
-
-	return result.payload
 }
 
 // Has checks if a payload exists for a lease.
-func (s *Store) Has(leaseUUID string) bool {
+// Returns an error if the database read fails — callers must not treat
+// errors the same as "not found" to avoid incorrect provisioning decisions.
+func (s *Store) Has(leaseUUID string) (bool, error) {
 	key := []byte(leaseUUID)
 	var exists bool
 
@@ -255,11 +275,10 @@ func (s *Store) Has(leaseUUID string) bool {
 	})
 
 	if err != nil {
-		slog.Error("failed to check payload", "lease_uuid", leaseUUID, "error", err)
-		return false
+		return false, fmt.Errorf("failed to check payload for %s: %w", leaseUUID, err)
 	}
 
-	return exists
+	return exists, nil
 }
 
 // Delete removes a payload for a lease.
@@ -277,16 +296,24 @@ func (s *Store) Delete(leaseUUID string) {
 		resultCh: resultCh,
 	}
 
-	s.writeCh <- op
-	result := <-resultCh
-
-	if result.err != nil {
-		slog.Error("failed to delete payload", "lease_uuid", leaseUUID, "error", result.err)
+	select {
+	case s.writeCh <- op:
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed, cannot delete", "lease_uuid", leaseUUID)
 		return
 	}
 
-	if result.existed {
-		metrics.PayloadStoredCount.Dec()
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			slog.Error("failed to delete payload", "lease_uuid", leaseUUID, "error", result.err)
+			return
+		}
+		if result.existed {
+			metrics.PayloadStoredCount.Dec()
+		}
+	case <-s.ctx.Done():
+		slog.Warn("payload store closed during delete", "lease_uuid", leaseUUID)
 	}
 }
 

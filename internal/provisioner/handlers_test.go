@@ -319,7 +319,9 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	assert.NoError(t, err, "handleLeaseClosed()")
 
 	// Payload should be cleaned up
-	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted when lease closes")
+	hasP, errP := payloadStore.Has("lease-1")
+	require.NoError(t, errP)
+	assert.False(t, hasP, "payload should be deleted when lease closes")
 }
 
 func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
@@ -368,7 +370,9 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	assert.Error(t, err, "handlePayloadReceived() should return error for hash mismatch")
 
 	// Payload should be deleted on hash mismatch
-	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted on hash mismatch")
+	hasP2, errP2 := payloadStore.Has("lease-1")
+	require.NoError(t, errP2)
+	assert.False(t, hasP2, "payload should be deleted on hash mismatch")
 
 	// Lease should not be in-flight
 	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after hash mismatch")

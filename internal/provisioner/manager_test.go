@@ -1459,7 +1459,9 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 
 	// Verify payload is still in store - it should only be deleted after callback
 	// This ensures the payload is available for retry if provisioning fails
-	assert.True(t, payloadStore.Has("lease-1"), "payload should remain in store until callback is received")
+	hasP, errP := payloadStore.Has("lease-1")
+	require.NoError(t, errP)
+	assert.True(t, hasP, "payload should remain in store until callback is received")
 }
 
 func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
@@ -1568,7 +1570,9 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	assert.NoError(t, err, "should return nil for lease not found")
 
 	// Verify payload was cleaned up
-	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted when lease not found")
+	hasP2, errP2 := payloadStore.Has("lease-1")
+	require.NoError(t, errP2)
+	assert.False(t, hasP2, "payload should be deleted when lease not found")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
@@ -1621,7 +1625,9 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	assert.NoError(t, err, "should return nil for non-pending lease")
 
 	// Verify payload was cleaned up
-	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted when lease is not pending")
+	hasP3, errP3 := payloadStore.Has("lease-1")
+	require.NoError(t, errP3)
+	assert.False(t, hasP3, "payload should be deleted when lease is not pending")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
@@ -1719,7 +1725,9 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after provision error")
 
 	// Verify payload was NOT deleted (kept for retry)
-	assert.True(t, payloadStore.Has("lease-1"), "payload should be kept for retry after provision error")
+	hasP4, errP4 := payloadStore.Has("lease-1")
+	require.NoError(t, errP4)
+	assert.True(t, hasP4, "payload should be kept for retry after provision error")
 }
 
 func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
@@ -2158,7 +2166,9 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 
 	// Step 2: REGRESSION CHECK - Payload must still exist after Provision() returns
 	// Previously, the payload was deleted here, causing data loss if callback failed
-	require.True(t, payloadStore.Has("lease-1"), "REGRESSION: payload was deleted after Provision() - should persist until callback")
+	hasP5, errP5 := payloadStore.Has("lease-1")
+	require.NoError(t, errP5)
+	require.True(t, hasP5, "REGRESSION: payload was deleted after Provision() - should persist until callback")
 
 	// Verify provisioning was called
 	mockBackend.mu.Lock()
@@ -2182,7 +2192,9 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	// Payload should persist after successful callback — it's retained for
 	// potential re-provisioning if the container crashes after acknowledgment.
 	// Cleanup happens when the lease is closed or rejected.
-	assert.True(t, payloadStore.Has("lease-1"), "payload should persist after successful callback for re-provisioning")
+	hasP6, errP6 := payloadStore.Has("lease-1")
+	require.NoError(t, errP6)
+	assert.True(t, hasP6, "payload should persist after successful callback for re-provisioning")
 
 	// Lease should no longer be in-flight
 	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after successful callback")
@@ -2242,7 +2254,9 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	require.NoError(t, err)
 
 	// Payload should still exist
-	require.True(t, payloadStore.Has("lease-1"), "payload should exist after provisioning started")
+	hasP7, errP7 := payloadStore.Has("lease-1")
+	require.NoError(t, errP7)
+	require.True(t, hasP7, "payload should exist after provisioning started")
 
 	// Simulate failed callback
 	callback := backend.CallbackPayload{
@@ -2257,7 +2271,9 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	require.NoError(t, err)
 
 	// Payload should be deleted after failed callback (no point keeping it)
-	assert.False(t, payloadStore.Has("lease-1"), "payload should be deleted after failed callback")
+	hasP8, errP8 := payloadStore.Has("lease-1")
+	require.NoError(t, errP8)
+	assert.False(t, hasP8, "payload should be deleted after failed callback")
 }
 
 // TestPayloadSurvivesRestartForReconciliation verifies that if a provider restarts
@@ -2330,7 +2346,9 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 
 	// KEY ASSERTION: Payload should still exist after "restart"
 	// This is what allows reconciliation to retry provisioning
-	require.True(t, payloadStore2.Has("lease-1"), "REGRESSION: payload was lost after restart - reconciliation cannot retry")
+	hasP9, errP9 := payloadStore2.Has("lease-1")
+	require.NoError(t, errP9)
+	require.True(t, hasP9, "REGRESSION: payload was lost after restart - reconciliation cannot retry")
 
 	// Verify we can retrieve the payload with correct content
 	retrievedPayload, err := payloadStore2.Get("lease-1")

@@ -281,7 +281,11 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Check provisioning status if checker is available
 	if h.statusChecker != nil {
-		response.PayloadReceived = h.statusChecker.HasPayload(leaseUUID)
+		hasPayload, err := h.statusChecker.HasPayload(leaseUUID)
+		if err != nil {
+			slog.Warn("failed to check payload status", "lease_uuid", leaseUUID, "error", err)
+		}
+		response.PayloadReceived = hasPayload
 		response.ProvisioningStarted = h.statusChecker.IsInFlight(leaseUUID)
 	}
 

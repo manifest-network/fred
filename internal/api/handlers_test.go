@@ -1218,11 +1218,11 @@ type mockStatusChecker struct {
 	isInFlight map[string]bool
 }
 
-func (m *mockStatusChecker) HasPayload(leaseUUID string) bool {
+func (m *mockStatusChecker) HasPayload(leaseUUID string) (bool, error) {
 	if m.hasPayload == nil {
-		return false
+		return false, nil
 	}
-	return m.hasPayload[leaseUUID]
+	return m.hasPayload[leaseUUID], nil
 }
 
 func (m *mockStatusChecker) IsInFlight(leaseUUID string) bool {

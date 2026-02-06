@@ -225,15 +225,13 @@ Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{
 **Response:** `200 OK`
 ```json
 {
-  "logs": {
-    "0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
-    "1": "2024-01-15 10:30:00 Redis ready\n"
-  }
+  "0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
+  "1": "2024-01-15 10:30:00 Redis ready\n"
 }
 ```
 
 **Fields:**
-- `logs` - Map of container instance index (`"0"`, `"1"`, ...) to log output string
+- Keys are container instance indices (`"0"`, `"1"`, ...), values are log output strings
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or logs expired)

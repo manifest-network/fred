@@ -305,8 +305,8 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   "connection": {
     "host": "compute-alpha.example.com",
     "ports": {
-      "8080/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"},
-      "443/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}
+      "8080/tcp": {"host_ip": "0.0.0.0", "host_port": 32768},
+      "443/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}
     },
     "protocol": "https",
     "metadata": {
@@ -331,14 +331,14 @@ Returns connection details for an active lease from the backend. Requires ADR-03
         "container_id": "abc123",
         "image": "nginx:latest",
         "status": "running",
-        "ports": {"80/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"}}
+        "ports": {"80/tcp": {"host_ip": "0.0.0.0", "host_port": 32768}}
       },
       {
         "instance_index": 1,
         "container_id": "def456",
         "image": "redis:alpine",
         "status": "running",
-        "ports": {"6379/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}}
+        "ports": {"6379/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}}
       }
     ],
     "metadata": {"backend": "docker"}
@@ -634,10 +634,8 @@ Get container logs for a specific lease.
 **Response:** `200 OK`
 ```json
 {
-  "logs": {
-    "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
-    "1": "2024-01-15 Redis ready\n"
-  }
+  "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
+  "1": "2024-01-15 Redis ready\n"
 }
 ```
 

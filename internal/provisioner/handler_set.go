@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,6 +35,25 @@ type HandlerSet struct {
 // NewHandlerSet creates a new HandlerSet with the given dependencies.
 func NewHandlerSet(deps HandlerDeps) *HandlerSet {
 	return &HandlerSet{deps: deps}
+}
+
+// rejectOnValidationError rejects a lease on chain after a validation error.
+// Returns nil on success, or an error to trigger Watermill retry on rejection failure.
+func (h *HandlerSet) rejectOnValidationError(ctx context.Context, lease *billingtypes.Lease, err error) error {
+	slog.Warn("provisioning failed with validation error, rejecting lease",
+		"lease_uuid", lease.Uuid,
+		"tenant", lease.Tenant,
+		"error", err,
+	)
+	_, _, rejectErr := h.deps.ChainClient.RejectLeases(ctx, []string{lease.Uuid}, validationErrorToRejectReason(err))
+	if rejectErr != nil {
+		slog.Error("failed to reject lease after validation error",
+			"lease_uuid", lease.Uuid,
+			"error", rejectErr,
+		)
+		return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
+	}
+	return nil
 }
 
 // HandleLeaseCreated processes new lease events.
@@ -77,25 +97,8 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	// Start provisioning without payload
 	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
 	if err != nil {
-		// Check if this is a validation error (e.g., unknown SKU, invalid manifest)
-		// Validation errors are permanent - retrying won't help. Reject the lease
-		// and acknowledge the message to stop Watermill from retrying forever.
 		if errors.Is(err, backend.ErrValidation) {
-			slog.Warn("provisioning failed with validation error, rejecting lease",
-				"lease_uuid", lease.Uuid,
-				"tenant", lease.Tenant,
-				"error", err,
-			)
-			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, validationErrorToRejectReason(err))
-			if rejectErr != nil {
-				slog.Error("failed to reject lease after validation error",
-					"lease_uuid", lease.Uuid,
-					"error", rejectErr,
-				)
-				// Return the reject error to retry the rejection
-				return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
-			}
-			return nil // Acknowledged - don't retry
+			return h.rejectOnValidationError(msg.Context(), lease, err)
 		}
 		return err
 	}
@@ -105,20 +108,36 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 // HandleLeaseClosed processes lease closure events.
 func (h *HandlerSet) HandleLeaseClosed(msg *message.Message) (err error) {
 	defer func() { recordWatermillMetrics(TopicLeaseClosed, err) }()
+	return h.processLeaseClose(msg, TopicLeaseClosed)
+}
 
-	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseClosed)
+// HandleLeaseExpired processes lease expiration events.
+// Same logic as HandleLeaseClosed but records metrics under the correct topic.
+func (h *HandlerSet) HandleLeaseExpired(msg *message.Message) (err error) {
+	defer func() { recordWatermillMetrics(TopicLeaseExpired, err) }()
+	return h.processLeaseClose(msg, TopicLeaseExpired)
+}
+
+// processLeaseClose is the shared implementation for HandleLeaseClosed and HandleLeaseExpired.
+func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error {
+	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, topic)
 	if !ok {
 		return nil
 	}
 
-	slog.Info("processing lease closed", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant)
+	slog.Info("processing lease close", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant, "topic", topic)
 
 	// Clean up any stored payload for this lease.
 	// This handles the case where a tenant uploaded a payload but canceled the lease
 	// before provisioning started, or any other scenario where payload exists but
 	// the lease is no longer valid.
 	if h.deps.PayloadStore != nil {
-		if h.deps.PayloadStore.Has(event.LeaseUUID) {
+		if exists, err := h.deps.PayloadStore.Has(event.LeaseUUID); err != nil {
+			slog.Warn("failed to check payload store during lease close",
+				"lease_uuid", event.LeaseUUID,
+				"error", err,
+			)
+		} else if exists {
 			h.deps.PayloadStore.Delete(event.LeaseUUID)
 			slog.Info("cleaned up stored payload for closed lease",
 				"lease_uuid", event.LeaseUUID,
@@ -143,12 +162,6 @@ func (h *HandlerSet) HandleLeaseClosed(msg *message.Message) (err error) {
 
 	// Delegate to orchestrator for deprovisioning
 	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID, skuHint)
-}
-
-// HandleLeaseExpired processes lease expiration events.
-func (h *HandlerSet) HandleLeaseExpired(msg *message.Message) error {
-	// Same handling as closed - deprovision the resource
-	return h.HandleLeaseClosed(msg)
 }
 
 // HandleBackendCallback processes callbacks from backends.
@@ -410,28 +423,9 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		PayloadHash: event.MetaHashHex,
 	})
 	if err != nil {
-		// Check if this is a validation error (e.g., unknown SKU, invalid manifest)
-		// Validation errors are permanent - retrying won't help. Reject the lease
-		// and acknowledge the message to stop Watermill from retrying forever.
 		if errors.Is(err, backend.ErrValidation) {
-			slog.Warn("provisioning failed with validation error, rejecting lease",
-				"lease_uuid", lease.Uuid,
-				"tenant", lease.Tenant,
-				"error", err,
-			)
-			// Clean up the stored payload
 			h.deps.PayloadStore.Delete(event.LeaseUUID)
-
-			_, _, rejectErr := h.deps.ChainClient.RejectLeases(msg.Context(), []string{lease.Uuid}, validationErrorToRejectReason(err))
-			if rejectErr != nil {
-				slog.Error("failed to reject lease after validation error",
-					"lease_uuid", lease.Uuid,
-					"error", rejectErr,
-				)
-				// Return the reject error to retry the rejection
-				return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
-			}
-			return nil // Acknowledged - don't retry
+			return h.rejectOnValidationError(msg.Context(), lease, err)
 		}
 		return err
 	}

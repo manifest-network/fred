@@ -340,9 +340,9 @@ func (m *Manager) StorePayload(leaseUUID string, payload []byte) bool {
 
 // HasPayload checks if a payload exists for a lease.
 // Returns false if the payload store is not configured.
-func (m *Manager) HasPayload(leaseUUID string) bool {
+func (m *Manager) HasPayload(leaseUUID string) (bool, error) {
 	if m.payloadStore == nil {
-		return false
+		return false, nil
 	}
 	return m.payloadStore.Has(leaseUUID)
 }

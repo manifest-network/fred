@@ -81,7 +81,8 @@ type ReconcilerTracker interface {
 	InFlightTracker
 
 	// HasPayload checks if a payload exists for a lease.
-	HasPayload(leaseUUID string) bool
+	// Returns an error if the underlying store read fails.
+	HasPayload(leaseUUID string) (bool, error)
 
 	// PayloadStore returns the payload store for direct access.
 	// May return nil if payload store is not configured.

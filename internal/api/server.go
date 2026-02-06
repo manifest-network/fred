@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -38,7 +39,7 @@ type CallbackPublisher interface {
 // StatusChecker provides status information about provisioning.
 // Typically implemented by the provisioner.Manager.
 type StatusChecker interface {
-	HasPayload(leaseUUID string) bool
+	HasPayload(leaseUUID string) (bool, error)
 	IsInFlight(leaseUUID string) bool
 }
 
@@ -129,23 +130,10 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		)
 	}
 
-	// Apply default for max request body size
-	maxBodySize := cfg.MaxRequestBodySize
-	if maxBodySize <= 0 {
-		maxBodySize = config.DefaultMaxRequestBodySize
-	}
-
-	// Apply default for request timeout
-	requestTimeout := cfg.RequestTimeout
-	if requestTimeout <= 0 {
-		requestTimeout = defaultRequestTimeout
-	}
-
-	// Apply default for shutdown timeout
-	shutdownTimeout := cfg.ShutdownTimeout
-	if shutdownTimeout <= 0 {
-		shutdownTimeout = defaultShutdownTimeout
-	}
+	// Apply defaults using cmp.Or (returns first non-zero value)
+	maxBodySize := cmp.Or(max(cfg.MaxRequestBodySize, 0), config.DefaultMaxRequestBodySize)
+	requestTimeout := cmp.Or(max(cfg.RequestTimeout, 0), defaultRequestTimeout)
+	shutdownTimeout := cmp.Or(max(cfg.ShutdownTimeout, 0), defaultShutdownTimeout)
 
 	// Create callback authenticator if secret is provided
 	var callbackAuth *CallbackAuthenticator
@@ -191,7 +179,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	// Authenticated routes with optional tenant rate limiting
 	withTenantRL := func(h http.HandlerFunc) http.Handler {
 		if tenantRateLimiter != nil {
-			return tenantRateLimiter.Middleware(cfg.Bech32Prefix)(h)
+			return tenantRateLimiter.Middleware()(h)
 		}
 		return h
 	}

@@ -255,11 +255,11 @@ func ContextWithTenant(ctx context.Context, tenant string) context.Context {
 // TenantRateLimitMiddleware returns middleware that applies per-tenant rate limiting.
 // It extracts the tenant from the Authorization header and applies the limit.
 // If tenant cannot be extracted, the request proceeds without tenant-based limiting.
-func (tl *TenantRateLimiter) Middleware(bech32Prefix string) func(http.Handler) http.Handler {
+func (tl *TenantRateLimiter) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Try to extract tenant from bearer token
-			tenant := extractTenantFromAuth(r, bech32Prefix)
+			tenant := extractTenantFromAuth(r)
 			if tenant == "" {
 				// No tenant info available - proceed without tenant rate limiting
 				// (IP-based rate limiting still applies)
@@ -287,7 +287,18 @@ func (tl *TenantRateLimiter) Middleware(bech32Prefix string) func(http.Handler) 
 
 // extractTenantFromAuth attempts to extract the tenant address from the Authorization header.
 // Returns empty string if extraction fails (request proceeds without tenant rate limiting).
-func extractTenantFromAuth(r *http.Request, bech32Prefix string) string {
+//
+// This intentionally skips full signature verification (secp256k1 + ADR-036) because:
+// 1. The downstream handler performs full authentication — this is only for rate-limit bucketing
+// 2. Avoiding redundant crypto verification saves significant CPU per request
+// 3. A spoofed tenant in an unsigned token only affects rate-limit bucketing;
+//    the request will still be rejected by the handler's real authentication
+//
+// Security note: without signature verification, an attacker can forge tokens with
+// arbitrary tenant addresses to distribute requests across rate-limit buckets. This
+// is acceptable because IP-based rate limiting still applies, and the handler's full
+// authentication will reject any forged token before data is returned.
+func extractTenantFromAuth(r *http.Request) string {
 	tokenStr, err := extractBearerToken(r)
 	if err != nil {
 		slog.Debug("tenant extraction: no bearer token", "error", err)
@@ -297,12 +308,6 @@ func extractTenantFromAuth(r *http.Request, bech32Prefix string) string {
 	token, err := ParseAuthToken(tokenStr)
 	if err != nil {
 		slog.Debug("tenant extraction: token parse failed", "error", err)
-		return ""
-	}
-
-	// Validate the token to ensure it's properly signed
-	if err := token.Validate(bech32Prefix); err != nil {
-		slog.Debug("tenant extraction: token validation failed", "error", err)
 		return ""
 	}
 
