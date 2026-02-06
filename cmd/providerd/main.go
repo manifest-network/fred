@@ -213,14 +213,17 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
 
-	// Create placement store if database path is configured (enables round-robin routing)
-	var placementStore *placement.Store
+	// Create placement store if database path is configured (enables round-robin routing).
+	// Use the interface type so that an unset store remains a true nil interface
+	// (a typed nil *placement.Store would pass != nil checks and panic).
+	var placementStore provisioner.PlacementStore
 	if cfg.PlacementStoreDBPath != "" {
-		placementStore, err = placement.NewStore(cfg.PlacementStoreDBPath)
+		ps, err := placement.NewStore(cfg.PlacementStoreDBPath)
 		if err != nil {
 			return fmt.Errorf("failed to create placement store: %w", err)
 		}
-		defer placementStore.Close()
+		defer ps.Close()
+		placementStore = ps
 		slog.Info("placement store enabled", "db_path", cfg.PlacementStoreDBPath)
 	} else {
 		slog.Warn("placement store disabled (no placement_store_db_path configured)")
