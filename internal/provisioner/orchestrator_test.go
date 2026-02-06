@@ -11,6 +11,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // mockBackendRouter implements BackendRouter for testing.
@@ -543,6 +544,36 @@ func TestOrchestrator_DeletePlacement_NilStore(t *testing.T) {
 
 	// Should not panic
 	orch.DeletePlacement("lease-1")
+}
+
+// Regression test: a typed-nil *placement.Store assigned to the PlacementStore
+// interface is non-nil (Go interface holds type info). The orchestrator's
+// != nil guards don't protect against this, so callers must use the interface
+// type for the variable (not the concrete type) to ensure a true nil.
+// See: https://go.dev/doc/faq#nil_error
+func TestOrchestrator_TypedNilPlacementStore_Panics(t *testing.T) {
+	var ps *placement.Store //nolint:staticcheck // intentionally testing typed-nil interface behavior
+	var iface PlacementStore = ps
+
+	// Precondition: a plain Go != nil check passes (this is the bug).
+	// Note: testify's require.NotNil uses reflect and sees through the wrapper.
+	require.False(t, iface == nil, "typed-nil interface must not be == nil") //nolint:staticcheck // intentionally testing this exact condition
+
+	mb := &mockManagerBackend{name: "test-backend"}
+	router := &mockBackendRouter{
+		routeRoundRobinFn: func(string) backend.Backend { return mb },
+	}
+	tracker := NewInFlightTracker()
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, iface)
+
+	// StartProvisioning passes the != nil check and calls Set on a nil receiver → panic
+	assert.Panics(t, func() {
+		_ = orch.StartProvisioning(context.Background(), &billingtypes.Lease{
+			Uuid:   "lease-typed-nil",
+			Tenant: "tenant-a",
+			Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+		}, ProvisionOpts{})
+	})
 }
 
 // errorPlacementStore is a PlacementStore that returns errors on write operations.
