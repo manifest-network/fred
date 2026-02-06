@@ -188,7 +188,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 	slog.Info("fetched backend provisions", "total", len(allProvisions))
 
-	// Sync placements from actual backend state (handles cold start and drift)
+	// Sync placements from actual backend state (handles cold start and drift).
+	// NOTE: This only adds/updates — it never prunes stale records for leases
+	// that completed while fred was down. A naive prune is unsafe because a
+	// concurrent StartProvisioning may have just Set a placement that backends
+	// haven't reported yet. Stale records are harmless (reads fall back to SKU
+	// routing) and grow only by the number of leases that close during downtime.
 	if r.placementStore != nil && len(allProvisions) > 0 {
 		placements := make(map[string]string, len(allProvisions))
 		for leaseUUID, provision := range allProvisions {

@@ -144,7 +144,7 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 			if b := h.backendRouter.GetBackendByName(name); b != nil {
 				return b
 			}
-			slog.Warn("stale placement record, falling back to SKU routing",
+			slog.Debug("stale placement record, falling back to SKU routing",
 				"lease_uuid", leaseUUID,
 				"placement_backend", name,
 			)
