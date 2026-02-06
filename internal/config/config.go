@@ -100,6 +100,9 @@ type Config struct {
 	// Payload store configuration
 	PayloadStoreDBPath string `mapstructure:"payload_store_db_path"`
 
+	// Placement store configuration (enables round-robin backend routing)
+	PlacementStoreDBPath string `mapstructure:"placement_store_db_path"`
+
 	// Shutdown configuration
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
 

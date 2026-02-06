@@ -16,6 +16,7 @@ import (
 // mockBackendRouter implements BackendRouter for testing.
 type mockBackendRouter struct {
 	routeFn            func(sku string) backend.Backend
+	routeRoundRobinFn  func(sku string) backend.Backend
 	getBackendByNameFn func(name string) backend.Backend
 	backendsFn         func() []backend.Backend
 }
@@ -34,6 +35,14 @@ func (m *mockBackendRouter) GetBackendByName(name string) backend.Backend {
 	return nil
 }
 
+func (m *mockBackendRouter) RouteRoundRobin(sku string) backend.Backend {
+	if m.routeRoundRobinFn != nil {
+		return m.routeRoundRobinFn(sku)
+	}
+	// Default: fall back to Route for backward-compatible tests
+	return m.Route(sku)
+}
+
 func (m *mockBackendRouter) Backends() []backend.Backend {
 	if m.backendsFn != nil {
 		return m.backendsFn()
@@ -49,7 +58,7 @@ func TestOrchestrator_StartProvisioning_Success(t *testing.T) {
 		routeFn: func(sku string) backend.Backend { return mb },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	lease := &billingtypes.Lease{
 		Uuid:   "lease-1",
@@ -85,7 +94,7 @@ func TestOrchestrator_StartProvisioning_WithPayload(t *testing.T) {
 		routeFn: func(sku string) backend.Backend { return mb },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	lease := &billingtypes.Lease{
 		Uuid:   "lease-1",
@@ -116,7 +125,7 @@ func TestOrchestrator_StartProvisioning_PayloadHashRequiresBothFields(t *testing
 		routeFn: func(sku string) backend.Backend { return mb },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	lease := &billingtypes.Lease{
 		Uuid:   "lease-1",
@@ -142,7 +151,7 @@ func TestOrchestrator_StartProvisioning_NoBackend(t *testing.T) {
 		routeFn: func(sku string) backend.Backend { return nil },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	lease := &billingtypes.Lease{
 		Uuid:   "lease-1",
@@ -164,7 +173,7 @@ func TestOrchestrator_StartProvisioning_AlreadyInFlight(t *testing.T) {
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	lease := &billingtypes.Lease{
 		Uuid:   "lease-1",
@@ -187,7 +196,7 @@ func TestOrchestrator_StartProvisioning_BackendFails(t *testing.T) {
 		routeFn: func(sku string) backend.Backend { return mb },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	lease := &billingtypes.Lease{
 		Uuid:   "lease-1",
@@ -218,7 +227,7 @@ func TestOrchestrator_Deprovision_ViaInFlightTracking(t *testing.T) {
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	err := orch.Deprovision(context.Background(), "lease-1", "")
 	require.NoError(t, err)
@@ -242,7 +251,7 @@ func TestOrchestrator_Deprovision_ViaSKURouting(t *testing.T) {
 		},
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	err := orch.Deprovision(context.Background(), "lease-1", "sku-1")
 	require.NoError(t, err)
@@ -259,7 +268,7 @@ func TestOrchestrator_Deprovision_FallbackAllBackends(t *testing.T) {
 		backendsFn: func() []backend.Backend { return []backend.Backend{mb1, mb2} },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	err := orch.Deprovision(context.Background(), "lease-1", "")
 	require.NoError(t, err)
@@ -280,7 +289,7 @@ func TestOrchestrator_Deprovision_AllBackendsFail(t *testing.T) {
 		backendsFn: func() []backend.Backend { return []backend.Backend{mb1, mb2} },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	err := orch.Deprovision(context.Background(), "lease-1", "")
 	require.Error(t, err)
@@ -294,7 +303,7 @@ func TestOrchestrator_Deprovision_PartialBackendSuccess(t *testing.T) {
 		backendsFn: func() []backend.Backend { return []backend.Backend{mb1, mb2} },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	// At least one succeeds -> no error
 	err := orch.Deprovision(context.Background(), "lease-1", "")
@@ -317,7 +326,7 @@ func TestOrchestrator_Deprovision_InFlightBackendNotFound_FallsToSKU(t *testing.
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "t", testItems("sku-1"), "deleted-backend")
 
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	err := orch.Deprovision(context.Background(), "lease-1", "sku-1")
 	require.NoError(t, err)
@@ -333,7 +342,7 @@ func TestOrchestrator_Deprovision_SKURoutingFails(t *testing.T) {
 		routeFn: func(sku string) backend.Backend { return mb },
 	}
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	err := orch.Deprovision(context.Background(), "lease-1", "sku-1")
 	require.Error(t, err)

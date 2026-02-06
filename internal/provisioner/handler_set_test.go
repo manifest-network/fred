@@ -62,7 +62,7 @@ func newTestHandlerSet(
 		},
 	}
 
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 	hs := NewHandlerSet(HandlerDeps{
 		ChainClient:  chainClient,
 		Orchestrator: orch,

@@ -138,7 +138,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewReconciler(tt.cfg, tt.chainClient, tt.router, nil)
+			_, err := NewReconciler(tt.cfg, tt.chainClient, tt.router, nil, nil)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
@@ -170,7 +170,7 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -215,7 +215,7 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -249,7 +249,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -293,7 +293,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -333,7 +333,7 @@ func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -389,7 +389,7 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 			reconciler, err := NewReconciler(ReconcilerConfig{
 				ProviderUUID:    "provider-1",
 				CallbackBaseURL: "http://localhost:8080",
-			}, mockChain, router, nil)
+			}, mockChain, router, nil, nil)
 			require.NoError(t, err)
 
 			ctx := context.Background()
@@ -417,7 +417,7 @@ func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	// Cancel context before calling ReconcileAll
@@ -440,7 +440,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		Interval:        100 * time.Millisecond, // Short interval for test
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -476,7 +476,7 @@ func TestReconciler_DefaultInterval(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// Interval not set
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	// Verify default interval is 5 minutes
@@ -503,7 +503,7 @@ func TestReconciler_RunOnce(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -542,7 +542,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, manager)
+	}, mockChain, router, manager, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -581,7 +581,7 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -632,7 +632,7 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -687,7 +687,7 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -741,7 +741,7 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -773,7 +773,7 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -814,7 +814,7 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -870,7 +870,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, manager)
+	}, mockChain, router, manager, nil)
 	require.NoError(t, err)
 
 	// Simulate concurrent provisioning attempts
@@ -955,7 +955,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	// Start first reconciliation in background
@@ -1029,7 +1029,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	err = reconciler.ReconcileAll(ctx)
@@ -1084,7 +1084,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	err = reconciler.ReconcileAll(ctx)
@@ -1194,7 +1194,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1240,7 +1240,7 @@ func TestReconciler_MaxWorkers_Default(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// MaxWorkers not set - should use default
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, DefaultReconcileWorkers, reconciler.maxWorkers)
@@ -1259,7 +1259,7 @@ func TestReconciler_MaxWorkers_Custom(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5,
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, 5, reconciler.maxWorkers)
@@ -1318,7 +1318,7 @@ func TestReconciler_ParallelProcessing(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5, // Limit to 5 concurrent workers
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1388,7 +1388,7 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      4, // Limit to 4 concurrent workers
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1488,7 +1488,7 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1707,7 +1707,7 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, mockTracker)
+	}, mockChain, router, mockTracker, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1774,7 +1774,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1825,7 +1825,7 @@ func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1873,7 +1873,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080/callbacks",
 		MaxWorkers:      2,
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	// Start multiple concurrent ReconcileAll calls
@@ -1950,7 +1950,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -2015,7 +2015,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, mockTracker)
+	}, mockChain, router, mockTracker, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -2062,7 +2062,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -2116,7 +2116,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil)
+	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()

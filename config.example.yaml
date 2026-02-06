@@ -308,6 +308,24 @@ token_tracker_db_path: "/var/lib/fred/tokens.db"
 payload_store_db_path: "/var/lib/fred/payloads.db"
 
 # =============================================================================
+# PLACEMENT STORE (optional — enables round-robin load balancing)
+# =============================================================================
+# Records which backend is serving each lease so that read operations
+# (connection details, logs, provision diagnostics) are routed correctly.
+#
+# Required when multiple backends share the same sku_prefix and you want
+# round-robin distribution across them. Without this, new provisions are
+# still distributed round-robin, but reads fall back to SKU-based routing
+# (first match) and may hit the wrong backend.
+#
+# If not set, the placement store is disabled and all routing uses the
+# existing SKU-prefix logic. This is fine for single-backend-per-SKU setups.
+#
+# The database file is created automatically. Ensure the directory exists
+# and fred has write permissions.
+# placement_store_db_path: "/var/lib/fred/placements.db"
+
+# =============================================================================
 # ADVANCED: HTTP SERVER TIMEOUTS
 # =============================================================================
 # Fine-tune HTTP server behavior. Defaults are suitable for most deployments.

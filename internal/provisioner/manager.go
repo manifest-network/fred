@@ -32,6 +32,7 @@ type Manager struct {
 	publisher       message.Publisher
 	wmRouter        *message.Router
 	payloadStore    *payload.Store
+	placementStore  PlacementStore
 	ackBatcher      *AckBatcher
 
 	// Track in-flight provisions (ephemeral - recovered via reconciliation)
@@ -56,6 +57,7 @@ type ManagerConfig struct {
 	ProviderUUID         string
 	CallbackBaseURL      string         // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
 	PayloadStore         *payload.Store // Optional external payload store (if nil, manager won't handle payloads)
+	PlacementStore       PlacementStore // Optional placement store for round-robin routing (nil = disabled)
 	CallbackTimeout      time.Duration  // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
 	TimeoutCheckInterval time.Duration  // How often to check for timeouts (default: 1 minute)
 	AckBatchInterval     time.Duration  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
@@ -126,7 +128,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	ackBatcher.Start(context.Background())
 
 	tracker := NewInFlightTracker()
-	orchestrator := NewProvisionOrchestrator(cfg.ProviderUUID, cfg.CallbackBaseURL, router, tracker)
+	orchestrator := NewProvisionOrchestrator(cfg.ProviderUUID, cfg.CallbackBaseURL, router, tracker, cfg.PlacementStore)
 	handlers := NewHandlerSet(HandlerDeps{
 		ChainClient:  chainClient,
 		Orchestrator: orchestrator,
@@ -149,6 +151,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		publisher:            pubSub,
 		wmRouter:             wmRouter,
 		payloadStore:         cfg.PayloadStore,
+		placementStore:       cfg.PlacementStore,
 		ackBatcher:           ackBatcher,
 		tracker:              tracker,
 		orchestrator:         orchestrator,

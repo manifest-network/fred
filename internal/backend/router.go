@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
 
 // Router routes requests to backends based on SKU matching.
@@ -11,6 +12,7 @@ type Router struct {
 	backends       []backendEntry
 	backendsByName map[string]Backend // O(1) lookup by name
 	defaultBackend Backend
+	counter        atomic.Uint64 // round-robin counter for RouteRoundRobin
 }
 
 type backendEntry struct {
@@ -86,6 +88,38 @@ func (r *Router) Route(sku string) Backend {
 		}
 	}
 	return r.defaultBackend
+}
+
+// RouteAll returns all backends that match the given SKU, deduplicated by name.
+// If no backends match, returns nil.
+func (r *Router) RouteAll(sku string) []Backend {
+	seen := make(map[string]bool)
+	var matches []Backend
+	for _, entry := range r.backends {
+		if r.matches(sku, entry.match) {
+			name := entry.backend.Name()
+			if !seen[name] {
+				seen[name] = true
+				matches = append(matches, entry.backend)
+			}
+		}
+	}
+	return matches
+}
+
+// RouteRoundRobin distributes requests across all backends matching the SKU
+// using round-robin selection. Falls back to the default backend if no match.
+func (r *Router) RouteRoundRobin(sku string) Backend {
+	matches := r.RouteAll(sku)
+	switch len(matches) {
+	case 0:
+		return r.defaultBackend
+	case 1:
+		return matches[0]
+	default:
+		idx := r.counter.Add(1) - 1
+		return matches[idx%uint64(len(matches))]
+	}
 }
 
 // matches checks if a SKU matches the given criteria.

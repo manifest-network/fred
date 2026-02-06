@@ -32,27 +32,36 @@ type TokenTrackerInterface interface {
 	Close() error
 }
 
+// PlacementLookup provides lease→backend mapping for read-path routing.
+type PlacementLookup interface {
+	Get(leaseUUID string) string
+	Healthy() error
+}
+
 // Handlers contains HTTP request handlers.
 type Handlers struct {
-	client        ChainClient
-	backendRouter *backend.Router
-	tokenTracker  TokenTrackerInterface
-	statusChecker StatusChecker
-	providerUUID  string
-	bech32Prefix  string
+	client          ChainClient
+	backendRouter   *backend.Router
+	tokenTracker    TokenTrackerInterface
+	statusChecker   StatusChecker
+	placementLookup PlacementLookup
+	providerUUID    string
+	bech32Prefix    string
 }
 
 // NewHandlers creates a new Handlers instance.
 // tokenTracker is optional but recommended for replay attack protection.
 // statusChecker is optional but required for the /status endpoint.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, providerUUID, bech32Prefix string) *Handlers {
+// placementLookup is optional — used for routing reads to the correct backend.
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, providerUUID, bech32Prefix string) *Handlers {
 	return &Handlers{
-		client:        client,
-		backendRouter: backendRouter,
-		tokenTracker:  tokenTracker,
-		statusChecker: statusChecker,
-		providerUUID:  providerUUID,
-		bech32Prefix:  bech32Prefix,
+		client:          client,
+		backendRouter:   backendRouter,
+		tokenTracker:    tokenTracker,
+		statusChecker:   statusChecker,
+		placementLookup: placementLookup,
+		providerUUID:    providerUUID,
+		bech32Prefix:    bech32Prefix,
 	}
 }
 
@@ -125,6 +134,23 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 		Token: token,
 		Lease: lease,
 	}, http.StatusOK, nil
+}
+
+// resolveBackend determines the correct backend for a lease.
+// Checks placement first (handles round-robin routing), falls back to SKU routing.
+func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
+	if h.placementLookup != nil {
+		if name := h.placementLookup.Get(leaseUUID); name != "" {
+			if b := h.backendRouter.GetBackendByName(name); b != nil {
+				return b
+			}
+			slog.Warn("stale placement record, falling back to SKU routing",
+				"lease_uuid", leaseUUID,
+				"placement_backend", name,
+			)
+		}
+	}
+	return h.backendRouter.Route(sku)
 }
 
 // ConnectionResponse represents the response for connection details.
@@ -206,8 +232,8 @@ func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
 	// Extract SKU for routing (use first item's SKU - all items share same provider)
 	sku := provisioner.ExtractRoutingSKU(auth.Lease)
 
-	// Route to appropriate backend based on SKU (Route already falls back to default)
-	backendClient := h.backendRouter.Route(sku)
+	// Resolve backend: placement first, then SKU routing
+	backendClient := h.resolveBackend(leaseUUID, sku)
 	if backendClient == nil {
 		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
 		writeError(w, "service unavailable", http.StatusServiceUnavailable)
@@ -334,7 +360,7 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-	backendClient := h.backendRouter.Route(sku)
+	backendClient := h.resolveBackend(leaseUUID, sku)
 	if backendClient == nil {
 		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
 		writeError(w, "service unavailable", http.StatusServiceUnavailable)
@@ -404,7 +430,7 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-	backendClient := h.backendRouter.Route(sku)
+	backendClient := h.resolveBackend(leaseUUID, sku)
 	if backendClient == nil {
 		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
 		writeError(w, "service unavailable", http.StatusServiceUnavailable)
@@ -505,6 +531,22 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 			overallHealthy = false
 		} else {
 			checks["token_tracker"] = &CheckResult{
+				Status: "healthy",
+			}
+		}
+	}
+
+	// Check placement store (bbolt database)
+	if h.placementLookup != nil {
+		if err := h.placementLookup.Healthy(); err != nil {
+			slog.Warn("health check: placement store unhealthy", "error", err)
+			checks["placement_store"] = &CheckResult{
+				Status:  "unhealthy",
+				Message: "placement store unavailable",
+			}
+			overallHealthy = false
+		} else {
+			checks["placement_store"] = &CheckResult{
 				Status: "healthy",
 			}
 		}

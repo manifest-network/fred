@@ -146,7 +146,8 @@ Manager (coordinator)
 ├── ChainClient          interface → chain.Client
 ├── BackendRouter        *backend.Router (passed to Orchestrator via interface)
 ├── InFlightTracker      interface → inFlightMap (sync.RWMutex-protected map)
-├── Orchestrator         struct    → uses BackendRouter + InFlightTracker
+├── PlacementStore       interface → placement.Store (bbolt + cache, optional)
+├── Orchestrator         struct    → uses BackendRouter + InFlightTracker + PlacementStore
 ├── HandlerSet           struct    → uses Orchestrator + Tracker + AckBatcher
 ├── AckBatcher           struct    → uses ChainClient
 ├── TimeoutChecker       struct    → uses InFlightTracker + LeaseRejecter
@@ -155,7 +156,12 @@ Manager (coordinator)
 Reconciler (independent)
 ├── ReconcilerChainClient  interface → chain.Client
 ├── BackendRouter          *backend.Router
+├── PlacementStore         interface → placement.Store (syncs on startup)
 └── ReconcilerTracker      interface → Manager (extends InFlightTracker)
+
+API Handlers
+├── PlacementLookup        interface → placement.Store (read-only, optional)
+└── BackendRouter          *backend.Router
 ```
 
 Key interfaces defined where they're consumed:
@@ -167,6 +173,8 @@ Key interfaces defined where they're consumed:
 | `BackendRouter` | `provisioner/interfaces.go` | Orchestrator |
 | `InFlightTracker` | `provisioner/tracker.go` | Orchestrator, HandlerSet, TimeoutChecker |
 | `ReconcilerTracker` | `provisioner/tracker.go` | Reconciler |
+| `PlacementStore` | `provisioner/interfaces.go` | Orchestrator, Reconciler |
+| `PlacementLookup` | `api/handlers.go` | API read handlers |
 | `LeaseRejecter` | `provisioner/interfaces.go` | TimeoutChecker |
 | `CallbackPublisher` | `api/server.go` | API callback handler |
 | `StatusChecker` | `api/server.go` | API status handler |
@@ -182,9 +190,9 @@ Key interfaces defined where they're consumed:
 4. Event Bridge publishes to Watermill topic
 5. handleLeaseCreated:
    a. Check if lease already in-flight (idempotency)
-   b. Route to backend by SKU
+   b. Route to backend by SKU (round-robin if multiple backends match)
    c. Call backend POST /provision with callback URL
-   d. Track as in-flight
+   d. Track as in-flight, record placement (lease→backend)
 6. Backend provisions resource asynchronously
 7. Backend calls POST /callbacks/provision
 8. handleBackendCallback:
@@ -291,24 +299,27 @@ The startup order is critical to avoid race conditions:
 
 ### Router Design
 
-The backend router matches leases to backends by SKU prefix:
+The backend router matches leases to backends by SKU prefix. When multiple backends share the same prefix, `RouteRoundRobin` distributes new provisions across them using an atomic counter. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
 
 ```go
 type Router struct {
     backends       []backendEntry
     backendsByName map[string]Backend
     defaultBackend Backend
+    counter        atomic.Uint64  // round-robin counter
 }
 
-func (r *Router) Route(sku string) Backend {
-    for _, entry := range r.backends {
-        if r.matches(sku, entry.match) {
-            return entry.backend
-        }
-    }
-    return r.defaultBackend // Always falls back to default
-}
+func (r *Router) Route(sku string) Backend       // first match (deterministic)
+func (r *Router) RouteAll(sku string) []Backend   // all matching backends
+func (r *Router) RouteRoundRobin(sku string) Backend // round-robin across matches
 ```
+
+**Routing strategies:**
+- `Route` — returns the first matching backend (used for deprovision fallback and read-path when no placement exists)
+- `RouteRoundRobin` — distributes across all matching backends (used for new provisions)
+- **Placement lookup** — maps `lease_uuid → backend_name` for read-path routing (connection, logs, diagnostics)
+
+When a single backend matches a SKU prefix, all three strategies behave identically.
 
 ### Circuit Breaker
 
@@ -331,6 +342,15 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
 This ensures that tenant requests for unprovisioned leases don't accidentally trip the circuit breaker and block backend operations.
 
 ## Data Flow
+
+### Placement Store
+
+Tracks which backend serves each lease (bbolt + in-memory cache):
+- Written when provisioning starts (after `RouteRoundRobin` picks a backend)
+- Read on every tenant API call (connection, logs, diagnostics) to route to the correct backend
+- Deleted on deprovision or lease closure
+- Rebuilt on startup: the reconciler calls `SetBatch` with placements from all backends' `ListProvisions`
+- Optional — only needed when multiple backends share a SKU prefix
 
 ### Payload Store
 

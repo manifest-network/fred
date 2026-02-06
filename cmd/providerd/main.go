@@ -20,6 +20,7 @@ import (
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/scheduler"
 	"github.com/manifest-network/fred/internal/watcher"
 )
@@ -212,11 +213,47 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
 
+	// Create placement store if database path is configured (enables round-robin routing)
+	var placementStore *placement.Store
+	if cfg.PlacementStoreDBPath != "" {
+		placementStore, err = placement.NewStore(cfg.PlacementStoreDBPath)
+		if err != nil {
+			return fmt.Errorf("failed to create placement store: %w", err)
+		}
+		defer placementStore.Close()
+		slog.Info("placement store enabled", "db_path", cfg.PlacementStoreDBPath)
+	} else {
+		slog.Warn("placement store disabled (no placement_store_db_path configured)")
+	}
+
+	// Warn if multiple backends share the same SKU prefix without a placement store.
+	// Round-robin will still distribute provisions, but read operations (connection,
+	// logs, provision diagnostics) may route to the wrong backend.
+	if placementStore == nil {
+		prefixCount := make(map[string]int)
+		for _, bcfg := range cfg.Backends {
+			prefixCount[bcfg.SKUPrefix]++
+		}
+		for prefix, count := range prefixCount {
+			if count > 1 {
+				label := prefix
+				if label == "" {
+					label = "(default)"
+				}
+				slog.Warn("multiple backends share the same SKU prefix without a placement store; read operations may route incorrectly",
+					"sku_prefix", label,
+					"backend_count", count,
+				)
+			}
+		}
+	}
+
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:    cfg.ProviderUUID,
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		PayloadStore:    payloadStore,
+		PlacementStore:  placementStore,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -252,7 +289,7 @@ func run(cmd *cobra.Command, args []string) error {
 		MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		CallbackSecret:       cfg.CallbackSecret,
 		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,
-	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr)
+	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr, placementStore)
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
 	}
@@ -271,7 +308,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ProviderUUID:    cfg.ProviderUUID,
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		Interval:        cfg.ReconciliationInterval,
-	}, chainClient, backendRouter, provisionMgr)
+	}, chainClient, backendRouter, provisionMgr, placementStore)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)
 	}
