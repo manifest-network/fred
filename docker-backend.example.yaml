@@ -70,8 +70,8 @@ sku_profiles:
   # Stateful SKU profiles — containers with disk_mb > 0 get bind-mounted
   # volumes with quota enforcement (btrfs subvolumes, xfs project quotas, or
   # zfs datasets). Image VOLUME paths (e.g., /data for redis) are automatically
-  # discovered and bind-mounted. Data persists across container restarts but
-  # is lost on deprovision.
+  # discovered and bind-mounted. Data persists across container restarts and
+  # re-provisions but is destroyed on deprovision.
   docker-redis:
     cpu_cores: 0.5
     memory_mb: 512

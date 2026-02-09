@@ -645,10 +645,10 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	manifestPayload, err := json.Marshal(manifest)
 	require.NoError(t, err)
 
-	hash := sha256.Sum256(payload)
+	hash := sha256.Sum256(manifestPayload)
 
 	var mu sync.Mutex
 	leaseState := billingtypes.LEASE_STATE_PENDING
@@ -721,7 +721,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	require.NoError(t, err)
 
 	// Store payload
-	stored := store.Store(leaseUUID, payload)
+	stored := store.Store(leaseUUID, manifestPayload)
 	require.True(t, stored)
 
 	ctx := context.Background()

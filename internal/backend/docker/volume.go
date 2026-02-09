@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -12,11 +13,17 @@ import (
 // volumeManager manages quota-enforced host directories for container volumes.
 type volumeManager interface {
 	// Create creates a quota-enforced directory for a container.
-	// Returns the host path. sizeMB is the quota in megabytes.
-	Create(ctx context.Context, id string, sizeMB int64) (hostPath string, err error)
+	// Idempotent: if the volume already exists, updates the quota and returns
+	// the existing path. Returns the host path, whether the volume was newly
+	// created (vs reused), and any error. sizeMB is the quota in megabytes.
+	Create(ctx context.Context, id string, sizeMB int64) (hostPath string, created bool, err error)
 
 	// Destroy removes the directory and quota. Idempotent.
 	Destroy(ctx context.Context, id string) error
+
+	// List returns the IDs of all managed volumes in the data directory.
+	// Used for orphan detection at startup.
+	List() ([]string, error)
 
 	// Validate checks filesystem support and permissions. Called at startup.
 	Validate() error
@@ -27,12 +34,16 @@ type volumeManager interface {
 // Destroy is a no-op; Validate always succeeds.
 type noopVolumeManager struct{}
 
-func (n *noopVolumeManager) Create(_ context.Context, _ string, _ int64) (string, error) {
-	return "", fmt.Errorf("noop volume manager cannot create volumes")
+func (n *noopVolumeManager) Create(_ context.Context, _ string, _ int64) (string, bool, error) {
+	return "", false, fmt.Errorf("noop volume manager cannot create volumes")
 }
 
 func (n *noopVolumeManager) Destroy(_ context.Context, _ string) error {
 	return nil
+}
+
+func (n *noopVolumeManager) List() ([]string, error) {
+	return nil, nil
 }
 
 func (n *noopVolumeManager) Validate() error {
@@ -92,6 +103,29 @@ func newVolumeManager(dataPath, filesystem string, logger *slog.Logger) (volumeM
 	default:
 		return nil, fmt.Errorf("unsupported volume_filesystem %q; must be btrfs, xfs, or zfs", filesystem)
 	}
+}
+
+// volumePrefix is the naming prefix for all managed volume directories.
+const volumePrefix = "fred-"
+
+// listVolumeIDs returns the names of all managed volume subdirectories in dataPath.
+// Only directories with the "fred-" prefix are returned — other directories
+// (e.g., lost+found, .snapshots) are ignored to avoid accidental deletion.
+func listVolumeIDs(dataPath string) ([]string, error) {
+	entries, err := os.ReadDir(dataPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read volume data directory %s: %w", dataPath, err)
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), volumePrefix) {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
 }
 
 // sanitizeVolumePath converts a container volume path to a safe subdirectory name.

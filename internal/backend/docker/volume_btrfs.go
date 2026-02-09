@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -16,16 +17,29 @@ type btrfsVolumeManager struct {
 	logger   *slog.Logger
 }
 
-func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, error) {
+func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
 	subvolPath := filepath.Join(b.dataPath, id)
+	quota := fmt.Sprintf("%dm", sizeMB)
+
+	// Idempotent: if subvolume already exists, update quota and return.
+	_, statErr := os.Stat(subvolPath)
+	if statErr == nil {
+		if out, err := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", quota, subvolPath).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("btrfs qgroup limit %s on existing %s: %w: %s", quota, subvolPath, err, out)
+		}
+		b.logger.Debug("reusing existing btrfs subvolume", "path", subvolPath, "quota_mb", sizeMB)
+		return subvolPath, false, nil
+	}
+	if !os.IsNotExist(statErr) {
+		return "", false, fmt.Errorf("stat subvolume %s: %w", subvolPath, statErr)
+	}
 
 	// Create btrfs subvolume
 	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", subvolPath).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("btrfs subvolume create %s: %w: %s", subvolPath, err, out)
+		return "", false, fmt.Errorf("btrfs subvolume create %s: %w: %s", subvolPath, err, out)
 	}
 
 	// Set quota on the subvolume
-	quota := fmt.Sprintf("%dm", sizeMB)
 	if out, err := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", quota, subvolPath).CombinedOutput(); err != nil {
 		// Clean up the subvolume on quota failure. Use background context
 		// because the caller's context may already be canceled (which could
@@ -36,11 +50,11 @@ func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "btrfs", "subvolume", "delete", subvolPath).CombinedOutput(); cleanupErr != nil {
 			b.logger.Warn("failed to cleanup subvolume after quota failure", "path", subvolPath, "error", cleanupErr, "output", string(cleanupOut))
 		}
-		return "", fmt.Errorf("btrfs qgroup limit %s on %s: %w: %s", quota, subvolPath, err, out)
+		return "", false, fmt.Errorf("btrfs qgroup limit %s on %s: %w: %s", quota, subvolPath, err, out)
 	}
 
 	b.logger.Debug("created btrfs subvolume", "path", subvolPath, "quota_mb", sizeMB)
-	return subvolPath, nil
+	return subvolPath, true, nil
 }
 
 func (b *btrfsVolumeManager) Destroy(ctx context.Context, id string) error {
@@ -63,6 +77,10 @@ func (b *btrfsVolumeManager) Destroy(ctx context.Context, id string) error {
 
 	b.logger.Debug("destroyed btrfs subvolume", "path", subvolPath)
 	return nil
+}
+
+func (b *btrfsVolumeManager) List() ([]string, error) {
+	return listVolumeIDs(b.dataPath)
 }
 
 func (b *btrfsVolumeManager) Validate() error {

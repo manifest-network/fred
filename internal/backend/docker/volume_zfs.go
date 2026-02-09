@@ -31,9 +31,37 @@ func resolveParentDataset(ctx context.Context, dataPath string) (string, error) 
 	return name, nil
 }
 
-func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, error) {
+func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
 	dataset := z.parentDataset + "/" + id
+	mountpoint := filepath.Join(z.dataPath, id)
 	quota := fmt.Sprintf("%dM", sizeMB)
+
+	// Idempotent: if dataset already exists (mountpoint present), update quota and return.
+	_, statErr := os.Stat(mountpoint)
+	if statErr == nil {
+		if out, err := exec.CommandContext(ctx, "zfs", "set", "quota="+quota, dataset).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("zfs set quota on existing %s: %w: %s", dataset, err, out)
+		}
+		z.logger.Debug("reusing existing zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
+		return mountpoint, false, nil
+	}
+	if !os.IsNotExist(statErr) {
+		return "", false, fmt.Errorf("stat mountpoint %s: %w", mountpoint, statErr)
+	}
+
+	// Mountpoint absent — check if the dataset exists but is unmounted
+	// (e.g., after a pool import anomaly or manual zfs unmount). If so,
+	// mount it and update quota rather than creating a new dataset.
+	if existing, _ := exec.CommandContext(ctx, "zfs", "list", "-H", "-o", "name", dataset).CombinedOutput(); strings.TrimSpace(string(existing)) == dataset {
+		if out, err := exec.CommandContext(ctx, "zfs", "mount", dataset).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("zfs mount existing unmounted dataset %s: %w: %s", dataset, err, out)
+		}
+		if out, err := exec.CommandContext(ctx, "zfs", "set", "quota="+quota, dataset).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("zfs set quota on remounted %s: %w: %s", dataset, err, out)
+		}
+		z.logger.Info("remounted existing zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
+		return mountpoint, false, nil
+	}
 
 	if out, err := exec.CommandContext(ctx, "zfs", "create", "-o", "quota="+quota, dataset).CombinedOutput(); err != nil {
 		// Cleanup partially created dataset (zfs create is not atomic with quota).
@@ -42,25 +70,24 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "zfs", "destroy", "-f", dataset).CombinedOutput(); cleanupErr != nil {
 			z.logger.Warn("failed to cleanup zfs dataset after create failure", "dataset", dataset, "error", cleanupErr, "output", string(cleanupOut))
 		}
-		return "", fmt.Errorf("zfs create %s (quota=%s): %w: %s", dataset, quota, err, out)
+		return "", false, fmt.Errorf("zfs create %s (quota=%s): %w: %s", dataset, quota, err, out)
 	}
 
 	// The dataset mountpoint is the child of the parent mountpoint.
 	// Verify it actually exists — a non-default mountpoint property or
 	// canmount=noauto would cause data to land on the parent filesystem
 	// without quota enforcement.
-	mountpoint := filepath.Join(z.dataPath, id)
 	if _, err := os.Stat(mountpoint); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "zfs", "destroy", "-f", dataset).CombinedOutput(); cleanupErr != nil {
 			z.logger.Warn("failed to cleanup zfs dataset after mountpoint check failure", "dataset", dataset, "error", cleanupErr, "output", string(cleanupOut))
 		}
-		return "", fmt.Errorf("zfs dataset %s created but mountpoint %s not found: %w", dataset, mountpoint, err)
+		return "", false, fmt.Errorf("zfs dataset %s created but mountpoint %s not found: %w", dataset, mountpoint, err)
 	}
 
 	z.logger.Debug("created zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
-	return mountpoint, nil
+	return mountpoint, true, nil
 }
 
 func (z *zfsVolumeManager) Destroy(ctx context.Context, id string) error {
@@ -78,6 +105,10 @@ func (z *zfsVolumeManager) Destroy(ctx context.Context, id string) error {
 
 	z.logger.Debug("destroyed zfs dataset", "dataset", dataset)
 	return nil
+}
+
+func (z *zfsVolumeManager) List() ([]string, error) {
+	return listVolumeIDs(z.dataPath)
 }
 
 func (z *zfsVolumeManager) Validate() error {

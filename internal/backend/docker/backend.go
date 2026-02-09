@@ -297,6 +297,12 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
 
+	// Clean up orphaned volumes (created but no matching provision).
+	// Must run after recoverState so the provision map is populated.
+	if err := b.cleanupOrphanedVolumes(ctx); err != nil {
+		return fmt.Errorf("orphaned volume cleanup failed: %w", err)
+	}
+
 	// Replay any pending callbacks from a previous run
 	b.callbackSender.ReplayPendingCallbacks()
 
@@ -433,18 +439,13 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		for i := 0; i < oldQuantity; i++ {
 			b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 		}
-		// Remove containers first so bind mounts are released, then destroy volumes.
+		// Remove old containers but keep volumes — stateful data persists
+		// across re-provisions. Volumes are reused via idempotent Create in
+		// doProvision, and only destroyed on explicit deprovision.
 		for _, cid := range oldContainerIDs {
 			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
 				logger.Warn("failed to remove old container during re-provision",
 					"container_id", shortID(cid), "error", err)
-			}
-		}
-		for i := 0; i < oldQuantity; i++ {
-			volumeID := fmt.Sprintf("fred-%s-%d", req.LeaseUUID, i)
-			if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
-				logger.Warn("failed to destroy old volume during re-provision",
-					"volume_id", volumeID, "error", volErr)
 			}
 		}
 		logger.Info("replacing failed provision",
@@ -690,14 +691,18 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			var volumeBinds map[string]string
 			if profile.DiskMB > 0 && len(imageVolumes) > 0 {
 				volumeID := fmt.Sprintf("fred-%s-%d", req.LeaseUUID, instanceIndex)
-				hostPath, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
+				hostPath, volCreated, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
 				if volErr != nil {
 					instanceLogger.Error("failed to create volume", "error", volErr)
 					err = fmt.Errorf("volume creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, volErr)
 					callbackErr = "volume creation failed"
 					return
 				}
-				createdVolumeIDs = append(createdVolumeIDs, volumeID)
+				// Only track newly created volumes for cleanup on failure.
+				// Reused volumes (from a previous provision) must not be destroyed.
+				if volCreated {
+					createdVolumeIDs = append(createdVolumeIDs, volumeID)
+				}
 				volumeBinds = make(map[string]string, len(imageVolumes))
 				for _, volPath := range imageVolumes {
 					sanitized := sanitizeVolumePath(volPath)
@@ -1227,7 +1232,21 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// Preserve provisions without containers that need to remain visible
 	// to fred's reconciler.
 	for uuid, existing := range b.provisions {
-		if _, hasContainers := recovered[uuid]; hasContainers {
+		if rec, hasContainers := recovered[uuid]; hasContainers {
+			if existing.Status == backend.ProvisionStatusProvisioning {
+				// In-flight re-provision: the containers in recovered belong to the
+				// previous (failed) provision and carry stale FailCount labels. The
+				// old containers are being removed by Provision() concurrently.
+				// Preserve the in-flight entry with its correct FailCount so the
+				// next container creation picks up the right value.
+				recovered[uuid] = existing
+			} else if existing.FailCount > rec.FailCount {
+				// Container labels carry the FailCount from creation time. When
+				// recoverState increments FailCount in-memory (e.g., ready→failed
+				// transition), subsequent recoverState calls re-read the stale label
+				// value. Preserve the higher in-memory count to prevent regression.
+				rec.FailCount = existing.FailCount
+			}
 			continue // Already recovered from containers
 		}
 		switch existing.Status {
@@ -1332,6 +1351,48 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.cleanupOrphanedNetworks(ctx, recovered)
 	}
 
+	return nil
+}
+
+// cleanupOrphanedVolumes destroys volumes on disk that have no matching provision.
+// This catches volumes leaked by crashes between volume creation and container creation,
+// or between container removal and volume destruction. Called once at startup after
+// recoverState populates the provision map.
+func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
+	volumeIDs, err := b.volumes.List()
+	if err != nil {
+		return fmt.Errorf("list volumes: %w", err)
+	}
+	if len(volumeIDs) == 0 {
+		return nil
+	}
+
+	// Build set of expected volume IDs from recovered provisions.
+	expected := make(map[string]bool)
+	b.provisionsMu.RLock()
+	for leaseUUID, prov := range b.provisions {
+		for i := 0; i < prov.Quantity; i++ {
+			expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
+		}
+	}
+	b.provisionsMu.RUnlock()
+
+	var orphanCount, failCount int
+	for _, id := range volumeIDs {
+		if expected[id] {
+			continue
+		}
+		b.logger.Info("destroying orphaned volume", "volume_id", id)
+		if err := b.volumes.Destroy(ctx, id); err != nil {
+			b.logger.Error("failed to destroy orphaned volume", "volume_id", id, "error", err)
+			failCount++
+		} else {
+			orphanCount++
+		}
+	}
+	if orphanCount > 0 || failCount > 0 {
+		b.logger.Info("orphaned volume cleanup complete", "destroyed", orphanCount, "failed", failCount)
+	}
 	return nil
 }
 

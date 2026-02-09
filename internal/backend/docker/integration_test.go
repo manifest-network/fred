@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -48,9 +49,22 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	cfg.StartupVerifyDuration = 1 * time.Second
 	cfg.ReconcileInterval = 1 * time.Hour // disable during tests
 	cfg.ProvisionTimeout = 2 * time.Minute
+	// Isolate DB stores per test to avoid replaying stale callbacks from previous runs.
+	tmpDir := t.TempDir()
+	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
 
 	if cfgFn != nil {
 		cfgFn(&cfg)
+	}
+
+	// If the test didn't set VolumeDataPath, zero out DiskMB on all profiles
+	// so config validation doesn't require a volume filesystem.
+	if cfg.VolumeDataPath == "" {
+		for name, p := range cfg.SKUProfiles {
+			p.DiskMB = 0
+			cfg.SKUProfiles[name] = p
+		}
 	}
 
 	logger := slog.Default()
@@ -811,6 +825,13 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	cfg.ReconcileInterval = 1 * time.Hour
 	cfg.ProvisionTimeout = 2 * time.Minute
 	cfg.NetworkIsolation = ptrBool(false)
+	tmpDir := t.TempDir()
+	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	for name, p := range cfg.SKUProfiles {
+		p.DiskMB = 0
+		cfg.SKUProfiles[name] = p
+	}
 
 	logger := slog.Default()
 	b, err := New(cfg, logger)
@@ -894,6 +915,13 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	cfg.ReconcileInterval = 1 * time.Hour
 	cfg.ProvisionTimeout = 2 * time.Minute
 	cfg.NetworkIsolation = ptrBool(false)
+	tmpDir := t.TempDir()
+	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	for name, p := range cfg.SKUProfiles {
+		p.DiskMB = 0
+		cfg.SKUProfiles[name] = p
+	}
 
 	logger := slog.Default()
 	b, err := New(cfg, logger)

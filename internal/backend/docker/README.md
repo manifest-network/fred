@@ -228,10 +228,10 @@ A health check defined in the Dockerfile but not in the manifest does **not** tr
 When a provision has `status=failed` (e.g., a container crashed and was detected by the reconciler), a new `Provision` call for the same lease UUID is allowed. The re-provision flow:
 
 1. The existing `FailCount` is carried over from the failed provision record.
-2. Resource allocations are released, old containers are removed, and old managed volumes are destroyed.
+2. Resource allocations are released and old containers are removed. Managed volumes are **kept** — stateful data persists across re-provisions.
 3. A new provision record is created with `FailCount` preserved.
-4. The full provisioning flow runs again (image pull, image inspect, volume setup, container create/start, startup verification).
-5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label.
+4. The full provisioning flow runs again (image pull, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
+5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label. Only newly created volumes are cleaned up; reused volumes are preserved.
 
 ## State Recovery
 
@@ -244,6 +244,8 @@ On startup, at each `ReconcileInterval`, and on every reconciler cycle (via `Ref
 5. **Preserve in-flight provisions** -- provisions with `status=provisioning` that have no containers yet are kept to avoid dropping active async work.
 6. **Reset resource pool** -- `pool.Reset()` clears all allocations and rebuilds them from the recovered containers' SKU profiles.
 7. **Orphaned network cleanup** -- if `NetworkIsolation` is enabled, removes any managed networks whose tenant has no active provisions and no connected containers.
+
+After state recovery, the backend also runs **orphaned volume cleanup**: lists all `fred-` prefixed directories in `volume_data_path`, compares against expected volumes from recovered provisions, and destroys any that have no matching provision. This catches volumes leaked by crashes between volume creation and container creation, or between container removal and volume destruction.
 
 ## Callback Protocol
 

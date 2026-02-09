@@ -188,7 +188,7 @@ The simplest valid manifest:
 
 ## Redis Example
 
-Requires a stateful SKU with `disk_mb > 0` (configured by the operator). The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts but is lost on deprovision.
+Requires a stateful SKU with `disk_mb > 0` (configured by the operator). The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts and re-provisions but is destroyed on deprovision.
 
 ```json
 {
