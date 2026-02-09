@@ -30,6 +30,7 @@ type mockDockerClient struct {
 	DaemonInfoFn                 func(ctx context.Context) (DaemonSecurityInfo, error)
 	CloseFn                      func() error
 	PullImageFn                  func(ctx context.Context, imageName string, timeout time.Duration) error
+	InspectImageFn               func(ctx context.Context, imageName string) (*ImageInfo, error)
 	CreateContainerFn            func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainerFn             func(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainerFn            func(ctx context.Context, containerID string) error
@@ -57,6 +58,7 @@ func (m *mockDockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, 
 		StorageDriver:     "overlay2",
 		BackingFilesystem: "xfs",
 		SecurityOptions:   []string{"name=seccomp,profile=default"},
+		IPv4Forwarding:    true,
 	}, nil
 }
 
@@ -72,6 +74,14 @@ func (m *mockDockerClient) PullImage(ctx context.Context, imageName string, time
 		return m.PullImageFn(ctx, imageName, timeout)
 	}
 	panic("unexpected call to PullImage")
+}
+
+func (m *mockDockerClient) InspectImage(ctx context.Context, imageName string) (*ImageInfo, error) {
+	if m.InspectImageFn != nil {
+		return m.InspectImageFn(ctx, imageName)
+	}
+	// Default: return empty volumes so existing tests don't break.
+	return &ImageInfo{Volumes: map[string]struct{}{}}, nil
 }
 
 func (m *mockDockerClient) CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
@@ -164,6 +174,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		cfg:        cfg,
 		docker:     mock,
 		pool:       pool,
+		volumes:    &noopVolumeManager{},
 		logger:     slog.Default(),
 		provisions: provs,
 		stopCtx:    stopCtx,
@@ -824,6 +835,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 			cfg:        cfg,
 			docker:     mock,
 			pool:       pool,
+			volumes:    &noopVolumeManager{},
 			logger:     slog.Default(),
 			provisions: make(map[string]*provision),
 			stopCtx:    stopCtx,
@@ -874,6 +886,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 			cfg:        cfg,
 			docker:     mock,
 			pool:       pool,
+			volumes:    &noopVolumeManager{},
 			logger:     slog.Default(),
 			provisions: make(map[string]*provision),
 			stopCtx:    stopCtx,
@@ -912,6 +925,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 			cfg:        cfg,
 			docker:     mock,
 			pool:       pool,
+			volumes:    &noopVolumeManager{},
 			logger:     slog.Default(),
 			provisions: make(map[string]*provision),
 			stopCtx:    stopCtx,

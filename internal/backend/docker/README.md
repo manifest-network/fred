@@ -98,34 +98,60 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | ContainerReadonlyRootfs | `container_readonly_rootfs` | *bool | `true` | Read-only root filesystem |
 | ContainerPidsLimit | `container_pids_limit` | *int64 | `256` | Maximum PIDs per container |
 | ContainerTmpfsSizeMB | `container_tmpfs_size_mb` | int | `64` | Tmpfs size (MB) for `/tmp` and `/run` when readonly rootfs is enabled |
-| ContainerDiskQuota | `container_disk_quota` | *bool | `true` | Enable Docker overlay2 storage driver disk quotas |
 
-#### Disk Quota Requirements
+### Volume Management
 
-The `container_disk_quota` option enables per-container disk quotas using Docker's `--storage-opt size=` feature. **This requires specific filesystem configuration:**
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| VolumeDataPath | `volume_data_path` | string | *(empty)* | Host directory for managed volumes. Required when any SKU has `disk_mb > 0` |
+| VolumeFilesystem | `volume_filesystem` | string | *(auto-detected)* | Filesystem type: `btrfs`, `xfs`, or `zfs`. Auto-detected from `volume_data_path` if empty |
 
-- Docker must use the `overlay2` storage driver
-- The underlying filesystem must be **XFS**
-- XFS must be mounted with the `pquota` (project quota) option
+When any SKU profile has `disk_mb > 0`, the backend manages quota-enforced host directories that are bind-mounted into containers at their Dockerfile VOLUME paths.
 
-To check if your system supports disk quotas:
+#### Supported Filesystems
 
-```bash
-# Check storage driver (should show "overlay2")
-docker info | grep "Storage Driver"
+| Filesystem | Mechanism | Requirements |
+|---|---|---|
+| **btrfs** | Subvolumes with qgroup quotas | `btrfs quota enable` on the filesystem |
+| **xfs** | Project quotas | `pquota` mount option, `xfs_quota` binary |
+| **zfs** | Child datasets with quota property | Parent dataset exists, `zfs` binary |
 
-# Check if /var/lib/docker is on XFS with pquota
-mount | grep "$(df /var/lib/docker --output=source | tail -1)"
-# Should include "pquota" in mount options
+#### Stateful vs Ephemeral Containers
+
+| SKU `disk_mb` | Behavior | Image VOLUME paths |
+|---|---|---|
+| `> 0` (stateful) | Quota-enforced host directory created per container | Bind-mounted from host directory |
+| `0` (ephemeral) | No host directory | Overridden with tmpfs (prevents anonymous volumes) |
+
+All containers always have a readonly root filesystem. Stateful containers write to bind-mounted volumes; ephemeral containers write to tmpfs.
+
+**Example stateful SKU:**
+
+```yaml
+volume_data_path: "/var/lib/fred/volumes"
+# volume_filesystem: "btrfs"  # optional, auto-detected
+
+sku_profiles:
+  docker-redis:
+    cpu_cores: 0.5
+    memory_mb: 512
+    disk_mb: 2048
 ```
 
-If your system doesn't meet these requirements, you'll see errors like:
+When provisioning `redis:latest` on this SKU:
+1. Image inspected — discovers `VOLUME /data`
+2. Host directory created: `/var/lib/fred/volumes/fred-<lease>-0/` with 2048 MB quota
+3. Subdirectory `data/` bind-mounted to container `/data`
+4. Redis writes to `/data` — quota enforced by kernel
+5. On deprovision: host directory destroyed
 
-```
---storage-opt is supported only for overlay over xfs with 'pquota' mount option
-```
+### SKU Profile Fields
 
-**To disable disk quotas**, set `container_disk_quota: false` in your configuration. Containers will still have CPU and memory limits enforced via cgroups, but won't have storage limits at the Docker level.
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| CPUCores | `cpu_cores` | float64 | — | CPU cores allocated to each container |
+| MemoryMB | `memory_mb` | int64 | — | Memory in MB allocated to each container |
+| DiskMB | `disk_mb` | int64 | `0` | Disk budget in MB. When `> 0`, a quota-enforced host directory is bind-mounted to image VOLUME paths (requires `volume_data_path`). When `0`, image VOLUME paths are overridden with tmpfs |
 
 ## Tenant Manifest Reference
 
@@ -142,8 +168,11 @@ See [TENANT_MANIFEST.md](TENANT_MANIFEST.md) for the full tenant-facing manifest
 
 2. **Asynchronous provisioning** -- runs in a goroutine tracked by a `WaitGroup`:
    - Pulls the image (once, shared across all containers in the lease)
+   - Inspects the image to discover Dockerfile `VOLUME` declarations
    - Creates/ensures the per-tenant network (if `NetworkIsolation` is enabled)
    - For each item in the lease (supports multi-SKU), for each unit (supports multi-unit):
+     - For stateful SKUs (`disk_mb > 0`): creates a quota-enforced host directory and bind-mounts image VOLUME paths into it
+     - For ephemeral SKUs (`disk_mb == 0`): overrides image VOLUME paths with tmpfs to prevent anonymous volumes
      - Creates a container with the appropriate SKU profile, hardening settings, and labels
      - Starts the container
    - Verifies startup (see [Startup Verification](#startup-verification) for the two paths)
@@ -167,7 +196,7 @@ Every container is created with the following security measures:
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | Memory (no swap) | `MemorySwap == Memory` | Prevents swap usage entirely |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
-| Network isolation | Per-tenant internal bridge | Configurable via `network_isolation` |
+| Network isolation | Per-tenant bridge network | Configurable via `network_isolation` |
 
 ## Startup Verification
 
@@ -199,9 +228,9 @@ A health check defined in the Dockerfile but not in the manifest does **not** tr
 When a provision has `status=failed` (e.g., a container crashed and was detected by the reconciler), a new `Provision` call for the same lease UUID is allowed. The re-provision flow:
 
 1. The existing `FailCount` is carried over from the failed provision record.
-2. Old containers are removed and their resource allocations are released.
+2. Resource allocations are released, old containers are removed, and old managed volumes are destroyed.
 3. A new provision record is created with `FailCount` preserved.
-4. The full provisioning flow runs again (image pull, container create/start, startup verification).
+4. The full provisioning flow runs again (image pull, image inspect, volume setup, container create/start, startup verification).
 5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label.
 
 ## State Recovery
@@ -288,7 +317,7 @@ Starts async container provisioning. Pre-flight validation (SKU, manifest, image
 
 ### `POST /deprovision` (authenticated)
 
-Removes all containers for a lease and releases resources. Idempotent — deprovisioning a nonexistent lease returns success.
+Removes all containers and managed volumes for a lease and releases resources. Idempotent — deprovisioning a nonexistent lease returns success.
 
 **Request:**
 
@@ -444,10 +473,20 @@ The resource pool tracks CPU, memory, and disk allocations.
 
 ## Tenant Network Isolation
 
-When `network_isolation` is enabled (default), each tenant's containers are placed in a dedicated Docker bridge network.
+When `network_isolation` is enabled (default), each tenant's containers are placed in a dedicated Docker bridge network. This provides:
+
+- **Same-tenant communication**: containers on the same tenant bridge can reach each other directly.
+- **Cross-tenant isolation**: Docker's `DOCKER-ISOLATION` iptables chains DROP forwarded traffic between different bridge networks. Containers from different tenants cannot communicate directly.
+- **Outbound internet**: containers can reach the internet (required for port bindings).
+- **Port bindings**: inbound traffic to published ports works normally. Cross-tenant communication is only possible through public-facing endpoints (published ports on the host).
+
+> **Prerequisite**: Docker must have iptables enabled (the default). If the daemon runs with `--iptables=false`, cross-tenant isolation is lost. Fred logs daemon warnings at startup to help detect this.
+
+> **Why not `Internal: true`?** Docker's `Internal` network flag prevents port publishing entirely ([moby#36174](https://github.com/moby/moby/issues/36174)), which would make tenant services unreachable.
+
+### Network lifecycle
 
 - **Naming**: `fred-tenant-<hex(sha256(tenant)[:8])>` -- first 8 bytes of the SHA-256 hash, hex-encoded to 16 characters. Deterministic, derived from the tenant address.
-- **Network type**: internal bridge (`Internal: true`), no external connectivity.
 - **Creation**: `EnsureTenantNetwork` creates the network on first use, or returns the existing one.
 - **Removal**: `RemoveTenantNetworkIfEmpty` removes the network when no containers are connected. Called during deprovision.
 - **Orphan cleanup**: during state recovery, managed networks with no active provisions and no connected containers are removed.

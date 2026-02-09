@@ -1542,7 +1542,7 @@ func TestListProvisions_IncludesLastError(t *testing.T) {
 
 // --- Disk quota container creation tests ---
 
-func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
+func TestDoProvision_EphemeralProfileWithoutDiskMB(t *testing.T) {
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1559,6 +1559,9 @@ func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
 		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
 			capturedParams = params
@@ -1580,71 +1583,22 @@ func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
 			CallbackURL: callbackServer.URL,
 		},
 	})
-	b.cfg.ContainerDiskQuota = ptrBool(true)
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
 	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+	// Ephemeral profile with DiskMB=0 — no volume binds, image volumes get tmpfs
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
 	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
 	<-callbackReceived
 
-	assert.True(t, capturedParams.DiskQuota, "DiskQuota should be true")
-	assert.Equal(t, int64(1024), capturedParams.Profile.DiskMB)
-}
-
-func TestDoProvision_DiskQuotaDisabled(t *testing.T) {
-
-	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		select {
-		case <-callbackReceived:
-		default:
-			close(callbackReceived)
-		}
-	}))
-	defer callbackServer.Close()
-
-	var capturedParams CreateContainerParams
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
-			Status:      backend.ProvisionStatusProvisioning,
-			Quantity:    1,
-			CallbackURL: callbackServer.URL,
-		},
-	})
-	b.cfg.ContainerDiskQuota = ptrBool(false)
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
-	<-callbackReceived
-
-	assert.False(t, capturedParams.DiskQuota, "DiskQuota should be false")
+	assert.True(t, capturedParams.ReadonlyRootfs, "ReadonlyRootfs should be true")
+	assert.Equal(t, int64(0), capturedParams.Profile.DiskMB, "DiskMB should be zero")
+	assert.Nil(t, capturedParams.VolumeBinds, "VolumeBinds should be nil for ephemeral")
+	assert.Equal(t, []string{"/data"}, capturedParams.ImageVolumes, "ImageVolumes should contain /data")
 }
 
 func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
@@ -1704,7 +1658,6 @@ func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
 
 	// Verify the manifest tmpfs paths were passed through
 	assert.Equal(t, []string{"/var/cache/nginx", "/var/log/nginx"}, capturedParams.Manifest.Tmpfs)
-	assert.True(t, capturedParams.ReadonlyRootfs, "ReadonlyRootfs should be true")
 }
 
 // --- Callback persistence tests ---

@@ -14,6 +14,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
@@ -42,6 +43,8 @@ type DaemonSecurityInfo struct {
 	StorageDriver     string
 	BackingFilesystem string
 	SecurityOptions   []string
+	IPv4Forwarding    bool
+	Warnings          []string
 }
 
 // ContainerInfo holds information about a managed container.
@@ -122,7 +125,30 @@ func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, erro
 		StorageDriver:     info.Driver,
 		BackingFilesystem: backingFS,
 		SecurityOptions:   info.SecurityOptions,
+		IPv4Forwarding:    info.IPv4Forwarding,
+		Warnings:          info.Warnings,
 	}, nil
+}
+
+// ImageInfo holds metadata from a container image inspection.
+type ImageInfo struct {
+	// Volumes are the VOLUME declarations from the Dockerfile.
+	Volumes map[string]struct{}
+}
+
+// InspectImage inspects a pulled image and returns its metadata.
+func (d *DockerClient) InspectImage(ctx context.Context, imageName string) (*ImageInfo, error) {
+	inspect, _, err := d.client.ImageInspectWithRaw(ctx, imageName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect image %s: %w", imageName, err)
+	}
+	volumes := make(map[string]struct{})
+	if inspect.Config != nil {
+		for v := range inspect.Config.Volumes {
+			volumes[v] = struct{}{}
+		}
+	}
+	return &ImageInfo{Volumes: volumes}, nil
 }
 
 // PullImage pulls a container image with timeout.
@@ -167,8 +193,16 @@ type CreateContainerParams struct {
 	ReadonlyRootfs bool
 	PidsLimit      *int64
 	TmpfsSizeMB    int
-	DiskQuota      bool // Enable overlay2 storage driver disk quota
 	NetworkConfig  *networktypes.NetworkingConfig
+
+	// VolumeBinds are bind mounts from host to container for managed volumes.
+	// Each entry maps a host path to a container path.
+	// Used for stateful containers (disk_mb > 0).
+	VolumeBinds map[string]string
+
+	// ImageVolumes are VOLUME paths from the image that need tmpfs overrides
+	// (for ephemeral containers only, when VolumeBinds is nil).
+	ImageVolumes []string
 }
 
 // portBindRetries is the number of times to retry container creation when
@@ -298,13 +332,8 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		SecurityOpt:    []string{"no-new-privileges:true"},
 		ReadonlyRootfs: params.ReadonlyRootfs,
 	}
-	if params.DiskQuota {
-		hostConfig.StorageOpt = map[string]string{
-			"size": fmt.Sprintf("%dM", params.Profile.DiskMB),
-		}
-	}
+	tmpfsSize := fmt.Sprintf("size=%dM", params.TmpfsSizeMB)
 	if params.ReadonlyRootfs {
-		tmpfsSize := fmt.Sprintf("size=%dM", params.TmpfsSizeMB)
 		hostConfig.Tmpfs = map[string]string{
 			"/tmp": tmpfsSize,
 			"/run": tmpfsSize,
@@ -312,6 +341,29 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		// Add tenant-requested tmpfs mounts (validated in manifest.Validate)
 		for _, p := range params.Manifest.Tmpfs {
 			hostConfig.Tmpfs[p] = tmpfsSize
+		}
+	}
+
+	// Ephemeral: override image VOLUME paths with tmpfs to prevent Docker
+	// from creating anonymous volumes that bypass quotas. Applied regardless
+	// of ReadonlyRootfs to ensure VOLUME paths are always controlled.
+	if len(params.VolumeBinds) == 0 && len(params.ImageVolumes) > 0 {
+		if hostConfig.Tmpfs == nil {
+			hostConfig.Tmpfs = make(map[string]string)
+		}
+		for _, volPath := range params.ImageVolumes {
+			hostConfig.Tmpfs[volPath] = tmpfsSize
+		}
+	}
+
+	// Stateful: bind mount managed volume dirs to image VOLUME paths
+	if len(params.VolumeBinds) > 0 {
+		for hostPath, containerPath := range params.VolumeBinds {
+			hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
+				Type:   mount.TypeBind,
+				Source: hostPath,
+				Target: containerPath,
+			})
 		}
 	}
 
@@ -554,7 +606,10 @@ func TenantNetworkName(tenant string) string {
 }
 
 // EnsureTenantNetwork creates or returns the existing network for a tenant.
-// The network is an internal bridge with no external connectivity.
+// The network is a per-tenant bridge that provides inter-tenant isolation.
+// Note: Internal must be false because Docker internal networks do not
+// support port publishing (moby/moby#36174). Outbound internet access
+// from containers is a side effect.
 func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
 	name := TenantNetworkName(tenant)
 
@@ -576,7 +631,7 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 	// Docker API returns a conflict error. Handle this by re-listing.
 	resp, err := d.client.NetworkCreate(ctx, name, networktypes.CreateOptions{
 		Driver:   "bridge",
-		Internal: false,
+		Internal: false, // Must be false: Internal:true prevents port publishing (moby#36174)
 		Labels: map[string]string{
 			LabelManaged: "true",
 			LabelTenant:  tenant,
@@ -646,7 +701,7 @@ func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.
 		inspected, err := d.client.NetworkInspect(ctx, s.ID, networktypes.InspectOptions{})
 		if err != nil {
 			if !client.IsErrNotFound(err) {
-				slog.Warn("failed to inspect network during list", "network_id", s.ID, "error", err)
+				slog.Warn("failed to inspect network during list; network excluded from results", "network_id", s.ID, "error", err)
 			}
 			continue
 		}
