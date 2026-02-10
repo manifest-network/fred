@@ -143,6 +143,21 @@ diagnostics_db_path: "diagnostics.db"
 diagnostics_max_age: 168h
 
 # =============================================================================
+# RELEASE HISTORY
+# =============================================================================
+# Tracks deployment releases (provision, updates) per lease. The
+# GET /releases/{lease_uuid} endpoint returns this history. Releases are
+# persisted to a bbolt database so they survive backend restarts.
+
+# Path to bbolt database for persisting release history.
+# Default: "releases.db"
+releases_db_path: "releases.db"
+
+# Maximum age of persisted release entries. Entries older than this are
+# removed by background cleanup. Default: 90 days (2160h).
+releases_max_age: 2160h
+
+# =============================================================================
 # HOST CONFIGURATION
 # =============================================================================
 

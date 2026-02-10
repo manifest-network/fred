@@ -33,6 +33,9 @@ config-*.yaml
 .env
 .env.*
 
+# Runtime database files
+*.db
+
 # OS files
 .DS_Store
 Thumbs.db

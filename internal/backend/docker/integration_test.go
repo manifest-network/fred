@@ -2362,3 +2362,88 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
 }
+
+func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.VolumeDataPath = mountPath
+		cfg.VolumeFilesystem = "btrfs"
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("update-vol-%d", time.Now().UnixNano())
+
+	// redis:7 declares VOLUME /data
+	manifest := DockerManifest{
+		Image:   "redis:7",
+		Command: []string{"redis-server", "--save", "1", "1"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	// Provision with stateful SKU (docker-small has DiskMB > 0)
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(3 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// Write data to redis
+	containerID := getContainerID(t, leaseUUID)
+	execInContainer(t, containerID, []string{"redis-cli", "SET", "update_key", "update_value"})
+	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
+
+	// Update to a different redis tag (same VOLUME /data declaration)
+	newManifest := DockerManifest{
+		Image:   "redis:7-alpine",
+		Command: []string{"redis-server", "--save", "1", "1"},
+	}
+	newPayload, err := json.Marshal(newManifest)
+	require.NoError(t, err)
+
+	err = b.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+		Payload:     newPayload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(3 * time.Minute):
+		t.Fatal("timeout waiting for update callback")
+	}
+
+	// Verify new container ID (container was recreated)
+	newContainerID := getContainerID(t, leaseUUID)
+	assert.NotEqual(t, containerID, newContainerID, "update should create a new container")
+
+	// Verify the new container is running the updated image
+	containersAfter := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersAfter, 1)
+	assert.Contains(t, containersAfter[0].Image, "redis:7-alpine", "container should be running redis:7-alpine after update")
+
+	// Read data back from redis — volume should have persisted the data across update
+	result := execInContainer(t, newContainerID, []string{"redis-cli", "GET", "update_key"})
+	assert.Contains(t, result, "update_value",
+		"data should persist across update (volume preserved)")
+
+	// Cleanup
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}

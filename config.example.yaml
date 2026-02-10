@@ -194,10 +194,13 @@ tenant_rate_limit_burst: 10
 #
 # BACKEND API:
 #   Backends must implement the Provider Backend API:
-#   - POST /provision      - Start provisioning a resource
-#   - GET  /info/{uuid}    - Get connection details for a provisioned resource
-#   - POST /deprovision    - Remove a provisioned resource
-#   - GET  /provisions     - List all provisioned resources (for reconciliation)
+#   - POST /provision          - Start provisioning a resource
+#   - GET  /info/{uuid}        - Get connection details for a provisioned resource
+#   - POST /deprovision        - Remove a provisioned resource
+#   - GET  /provisions         - List all provisioned resources (for reconciliation)
+#   - POST /restart            - Restart a provisioned resource
+#   - POST /update             - Update a provisioned resource with a new manifest
+#   - GET  /releases/{uuid}    - Get release history for a provisioned resource
 
 backends:
   # Default backend - receives all leases that don't match other prefixes
