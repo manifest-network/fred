@@ -590,6 +590,7 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 //   - errLeaseAlreadyInFlight: skip (not a real error)
 //   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
 //   - ErrValidation: reject (PENDING) or close (ACTIVE) the lease
+//   - ErrCircuitOpen: reject (PENDING) or close (ACTIVE) the lease
 //   - other errors: log and flag for retry next cycle
 func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseUUID string, lease billingtypes.Lease, hadError *bool) {
 	if errors.Is(err, errLeaseAlreadyInFlight) {
@@ -604,6 +605,8 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		reason = "payload not available for re-provisioning"
 	case errors.Is(err, backend.ErrValidation):
 		reason = validationErrorToRejectReason(err)
+	case errors.Is(err, backend.ErrCircuitOpen):
+		reason = "backend unavailable"
 	default:
 		// Transient error — log and retry next cycle
 		slog.Error("reconcile: provisioning failed",

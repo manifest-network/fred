@@ -1964,6 +1964,53 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	assert.Equal(t, rejectReasonInvalidSKU, rejectedReason)
 }
 
+func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
+	// Setup: Pending lease on chain, not provisioned, backend returns ErrCircuitOpen
+	// Expected: Reject the lease immediately (not left pending forever)
+	var rejectedLeases []string
+	var rejectedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: backend.ErrCircuitOpen,
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was rejected (not left pending forever)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, rejectedLeases, 1)
+	assert.Equal(t, "lease-1", rejectedLeases[0])
+	assert.Equal(t, "backend unavailable", rejectedReason)
+}
+
 func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *testing.T) {
 	// Setup: Pending lease with MetaHash, payload available, backend returns ErrValidation
 	// Expected: Reject the lease immediately
