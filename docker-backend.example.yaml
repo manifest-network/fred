@@ -67,6 +67,20 @@ sku_profiles:
     memory_mb: 2048
     disk_mb: 4096
 
+  # Stateful SKU profiles — containers with disk_mb > 0 get bind-mounted
+  # volumes with quota enforcement (btrfs subvolumes, xfs project quotas, or
+  # zfs datasets). Image VOLUME paths (e.g., /data for redis) are automatically
+  # discovered and bind-mounted. Data persists across container restarts and
+  # re-provisions but is destroyed on deprovision.
+  docker-redis:
+    cpu_cores: 0.5
+    memory_mb: 512
+    disk_mb: 2048
+  docker-postgres:
+    cpu_cores: 1.0
+    memory_mb: 1024
+    disk_mb: 4096
+
 # =============================================================================
 # TENANT QUOTAS (optional)
 # =============================================================================
@@ -148,8 +162,8 @@ host_address: "0.0.0.0"
 # All defaults are secure-by-default.
 
 # Enable per-tenant Docker network isolation. Each tenant's containers
-# are placed in a separate internal bridge network with no external
-# connectivity between tenants. Default: true.
+# are placed in a separate bridge network. Cross-tenant isolation is
+# provided by Docker's DOCKER-ISOLATION iptables chains. Default: true.
 # network_isolation: true
 
 # Set the container's root filesystem to read-only. When enabled,
@@ -164,18 +178,22 @@ host_address: "0.0.0.0"
 # enabled. Default: 64.
 # container_tmpfs_size_mb: 64
 
-# Enable Docker overlay2 storage driver disk quotas on containers.
-# REQUIRES: overlay2 storage driver with XFS filesystem mounted with 'pquota' option.
-# If your Docker host doesn't meet these requirements, set to false.
-# Default: true.
+# =============================================================================
+# VOLUME MANAGEMENT
+# =============================================================================
+# When any SKU profile has disk_mb > 0, you must configure a volume data path.
+# Each container gets a quota-enforced subdirectory on the host. Image VOLUME
+# paths (e.g., /data in redis:latest) are auto-discovered and bind-mounted.
 #
-# To check if your system supports disk quotas:
-#   docker info | grep "Storage Driver"  # Should show "overlay2"
-#   mount | grep /var/lib/docker         # Should show "pquota" in mount options
+# The filesystem of the volume_data_path must be btrfs, xfs, or zfs.
+# If volume_filesystem is not set, it is auto-detected.
 #
-# If unsupported, you'll see errors like:
-#   "--storage-opt is supported only for overlay over xfs with 'pquota' mount option"
-container_disk_quota: true
+# Supported configurations:
+#   - btrfs: subvolumes with qgroup quotas
+#   - xfs: project quotas (requires pquota mount option)
+#   - zfs: child datasets with quota property
+volume_data_path: "/var/lib/fred/volumes"
+# volume_filesystem: "btrfs"  # optional, auto-detected from volume_data_path
 
 # =============================================================================
 # TIMEOUTS

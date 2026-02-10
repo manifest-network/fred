@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -634,6 +636,426 @@ func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
 	assert.Equal(t, 0, stats.AllocationCount)
 }
 
+// --- Volume-aware provision tests ---
+
+func TestDoProvision_StatefulSKUCreatesVolume(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var createID string
+	var createSizeMB int64
+	volDir := t.TempDir()
+	vm := &mockVolumeManager{
+		defaultDir: volDir,
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			createID = id
+			createSizeMB = sizeMB
+			return volDir, true, nil
+		},
+	}
+
+	var capturedParams CreateContainerParams
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Verify volume was created with correct ID and size
+	assert.Equal(t, "fred-lease-1-0", createID)
+	assert.Equal(t, int64(1024), createSizeMB)
+
+	// Verify VolumeBinds maps host subdir to container path
+	require.Len(t, capturedParams.VolumeBinds, 1)
+	expectedHostPath := filepath.Join(volDir, "data")
+	assert.Equal(t, "/data", capturedParams.VolumeBinds[expectedHostPath])
+
+	// Verify ImageVolumes passed through
+	assert.Equal(t, []string{"/data"}, capturedParams.ImageVolumes)
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+func TestDoProvision_StatefulSKUMultipleVolumes(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	createCalls := 0
+	volDir := t.TempDir()
+	vm := &mockVolumeManager{
+		defaultDir: volDir,
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			createCalls++
+			return volDir, true, nil
+		},
+	}
+
+	var capturedParams CreateContainerParams
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{
+				"/data":    {},
+				"/var/log": {},
+			}}, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 2048}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Single volume.Create per container (not per image VOLUME path)
+	assert.Equal(t, 1, createCalls)
+
+	// VolumeBinds should have 2 entries mapping subdirectories
+	require.Len(t, capturedParams.VolumeBinds, 2)
+	assert.Equal(t, "/data", capturedParams.VolumeBinds[filepath.Join(volDir, "data")])
+	assert.Equal(t, "/var/log", capturedParams.VolumeBinds[filepath.Join(volDir, "var/log")])
+}
+
+func TestDoProvision_VolumeCreateFailure(t *testing.T) {
+	var callbackPayload backend.CallbackPayload
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	vm := &mockVolumeManager{
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			return "", false, fmt.Errorf("disk full")
+		},
+	}
+
+	createCalled := false
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			createCalled = true
+			return "container-1", nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Provision should be marked failed
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Contains(t, prov.LastError, "volume creation failed")
+
+	// Callback should report failure
+	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
+	assert.Equal(t, "volume creation failed", callbackPayload.Error)
+
+	// No containers should have been created
+	assert.False(t, createCalled, "no containers should be created when volume creation fails")
+}
+
+func TestDoProvision_CleanupOnlyDestroysNewVolumes(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	volDir := t.TempDir()
+	var destroyedIDs []string
+	createCall := 0
+	vm := &mockVolumeManager{
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			createCall++
+			if createCall == 1 {
+				// First container: volume already exists (reused)
+				return volDir, false, nil
+			}
+			// Second container: newly created
+			return volDir, true, nil
+		},
+		DestroyFn: func(ctx context.Context, id string) error {
+			destroyedIDs = append(destroyedIDs, id)
+			return nil
+		},
+	}
+
+	containerCreateCall := 0
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			containerCreateCall++
+			return fmt.Sprintf("container-%d", containerCreateCall), nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			if containerID == "container-2" {
+				return fmt.Errorf("port already in use")
+			}
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  2,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      validManifestJSON("nginx:latest"),
+	}
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Destroy should only be called for the newly created volume (index 1), not the reused one (index 0)
+	assert.Equal(t, []string{"fred-lease-1-1"}, destroyedIDs,
+		"only newly created volumes should be destroyed on failure cleanup")
+}
+
+func TestDoProvision_StatefulSKUNoImageVolumes(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	createCalled := false
+	vm := &mockVolumeManager{
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			createCalled = true
+			return "", true, nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			// Image has NO VOLUME declarations
+			return &ImageInfo{Volumes: map[string]struct{}{}}, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			// VolumeBinds should be nil for images without VOLUMEs
+			assert.Nil(t, params.VolumeBinds)
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// volumes.Create should NOT be called when image has no VOLUME paths
+	assert.False(t, createCalled, "volumes.Create should not be called when image has no VOLUME paths")
+
+	// Provision should still succeed
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
+	destroyCalled := false
+	vm := &mockVolumeManager{
+		defaultDir: t.TempDir(),
+		DestroyFn: func(ctx context.Context, id string) error {
+			destroyCalled = true
+			return nil
+		},
+	}
+
+	removedContainers := make(map[string]bool)
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			removedContainers[containerID] = true
+			return nil
+		},
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "new-container", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Status:       backend.ProvisionStatusFailed,
+			FailCount:    1,
+			Quantity:     1,
+			ContainerIDs: []string{"old-container"},
+		},
+	})
+	b.volumes = vm
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	<-callbackReceived
+
+	// Old container should be removed during re-provision cleanup
+	assert.True(t, removedContainers["old-container"], "old container should be removed")
+
+	// volumes.Destroy should NOT be called during re-provision — volumes persist
+	assert.False(t, destroyCalled, "volumes should not be destroyed during re-provision")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
 // --- Deprovision tests ---
 
 func TestDeprovision_Success(t *testing.T) {
@@ -787,6 +1209,88 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 	err := b.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 	assert.True(t, networkCleanupCalled)
+}
+
+// --- Deprovision volume tests ---
+
+func TestDeprovision_DestroysVolumes(t *testing.T) {
+	var destroyedIDs []string
+	vm := &mockVolumeManager{
+		DestroyFn: func(ctx context.Context, id string) error {
+			destroyedIDs = append(destroyedIDs, id)
+			return nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     2,
+			ContainerIDs: []string{"c1", "c2"},
+		},
+	})
+	b.volumes = vm
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{"fred-lease-1-0", "fred-lease-1-1"}, destroyedIDs)
+
+	// Provision should be fully removed
+	b.provisionsMu.RLock()
+	_, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, exists)
+}
+
+func TestDeprovision_VolumeDestroyFailure(t *testing.T) {
+	vm := &mockVolumeManager{
+		DestroyFn: func(ctx context.Context, id string) error {
+			return fmt.Errorf("device busy")
+		},
+	}
+
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     2,
+			ContainerIDs: []string{"c1", "c2"},
+		},
+	})
+	b.volumes = vm
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "volume cleanup failed")
+
+	// Provision should remain in map with Status=Failed and ContainerIDs=nil
+	b.provisionsMu.RLock()
+	prov, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	require.True(t, exists, "provision should remain in map after volume destroy failure")
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Nil(t, prov.ContainerIDs, "containers should be nil since they were removed")
+	assert.Contains(t, prov.LastError, "volume cleanup failed")
 }
 
 // --- GetInfo tests ---
@@ -1542,7 +2046,7 @@ func TestListProvisions_IncludesLastError(t *testing.T) {
 
 // --- Disk quota container creation tests ---
 
-func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
+func TestDoProvision_EphemeralProfileWithoutDiskMB(t *testing.T) {
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1559,6 +2063,9 @@ func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
 		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
 			capturedParams = params
@@ -1580,71 +2087,22 @@ func TestDoProvision_DiskQuotaEnabled(t *testing.T) {
 			CallbackURL: callbackServer.URL,
 		},
 	})
-	b.cfg.ContainerDiskQuota = ptrBool(true)
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
 	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+	// Ephemeral profile with DiskMB=0 — no volume binds, image volumes get tmpfs
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
 	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
 	<-callbackReceived
 
-	assert.True(t, capturedParams.DiskQuota, "DiskQuota should be true")
-	assert.Equal(t, int64(1024), capturedParams.Profile.DiskMB)
-}
-
-func TestDoProvision_DiskQuotaDisabled(t *testing.T) {
-
-	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		select {
-		case <-callbackReceived:
-		default:
-			close(callbackReceived)
-		}
-	}))
-	defer callbackServer.Close()
-
-	var capturedParams CreateContainerParams
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
-			Status:      backend.ProvisionStatusProvisioning,
-			Quantity:    1,
-			CallbackURL: callbackServer.URL,
-		},
-	})
-	b.cfg.ContainerDiskQuota = ptrBool(false)
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
-	<-callbackReceived
-
-	assert.False(t, capturedParams.DiskQuota, "DiskQuota should be false")
+	assert.True(t, capturedParams.ReadonlyRootfs, "ReadonlyRootfs should be true")
+	assert.Equal(t, int64(0), capturedParams.Profile.DiskMB, "DiskMB should be zero")
+	assert.Nil(t, capturedParams.VolumeBinds, "VolumeBinds should be nil for ephemeral")
+	assert.Equal(t, []string{"/data"}, capturedParams.ImageVolumes, "ImageVolumes should contain /data")
 }
 
 func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
@@ -1704,7 +2162,6 @@ func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
 
 	// Verify the manifest tmpfs paths were passed through
 	assert.Equal(t, []string{"/var/cache/nginx", "/var/log/nginx"}, capturedParams.Manifest.Tmpfs)
-	assert.True(t, capturedParams.ReadonlyRootfs, "ReadonlyRootfs should be true")
 }
 
 // --- Callback persistence tests ---
@@ -2617,4 +3074,140 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	entry, err := diagStore.Get("lease-reprov")
 	require.NoError(t, err)
 	assert.Nil(t, entry, "stale diagnostic entry should be removed on successful re-provision")
+}
+
+func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
+	// Verify that doProvision chowns volume subdirectories to the image's
+	// runtime UID/GID when ResolveImageUser returns a non-root user.
+	if os.Getuid() != 0 {
+		t.Skip("chown requires root")
+	}
+
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	volDir := t.TempDir()
+	vm := &mockVolumeManager{
+		defaultDir: volDir,
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			return volDir, true, nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 999, 999, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-chown": {
+			LeaseUUID: "lease-chown",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-chown"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-chown-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifestPayload, _ := json.Marshal(DockerManifest{Image: "postgres:16", User: "999:999"})
+	manifest, _ := ParseManifest(manifestPayload)
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-chown", "tenant-a", "docker-small", 1, manifestPayload)
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Verify volume subdir is owned by UID/GID 999.
+	subdir := filepath.Join(volDir, "data")
+	info, err := os.Stat(subdir)
+	require.NoError(t, err)
+	stat := info.Sys().(*syscall.Stat_t)
+	assert.Equal(t, uint32(999), stat.Uid, "volume subdir should be owned by UID 999")
+	assert.Equal(t, uint32(999), stat.Gid, "volume subdir should be owned by GID 999")
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-chown"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
+	// Verify that doProvision does NOT chown when ResolveImageUser returns root (0, 0).
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	volDir := t.TempDir()
+	vm := &mockVolumeManager{
+		defaultDir: volDir,
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			return volDir, true, nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 0, 0, nil // root
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-root": {
+			LeaseUUID: "lease-root",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-root"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-root-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-root", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Verify provision succeeded — ownership stays as created by MkdirAll
+	// (no chown call since UID/GID are 0).
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-root"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 }

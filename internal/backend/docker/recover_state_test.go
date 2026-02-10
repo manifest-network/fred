@@ -22,6 +22,48 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
+// mockVolumeManager implements volumeManager for testing. Unlike mockDockerClient,
+// methods default to sensible no-ops (not panics) since most tests don't care
+// about volumes. Tests that need to observe volume calls set the Fn fields.
+type mockVolumeManager struct {
+	CreateFn   func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
+	DestroyFn  func(ctx context.Context, id string) error
+	ListFn     func() ([]string, error)
+	ValidateFn func() error
+
+	// defaultDir is returned by Create when CreateFn is nil.
+	// Set this to t.TempDir() in tests that need real paths.
+	defaultDir string
+}
+
+func (m *mockVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+	if m.CreateFn != nil {
+		return m.CreateFn(ctx, id, sizeMB)
+	}
+	return m.defaultDir, true, nil
+}
+
+func (m *mockVolumeManager) Destroy(ctx context.Context, id string) error {
+	if m.DestroyFn != nil {
+		return m.DestroyFn(ctx, id)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) List() ([]string, error) {
+	if m.ListFn != nil {
+		return m.ListFn()
+	}
+	return nil, nil
+}
+
+func (m *mockVolumeManager) Validate() error {
+	if m.ValidateFn != nil {
+		return m.ValidateFn()
+	}
+	return nil
+}
+
 // mockDockerClient implements dockerClient for testing. Each method delegates to
 // the corresponding Fn field; an unexpected call (nil Fn) panics so tests fail
 // loudly rather than silently returning zero values.
@@ -30,6 +72,7 @@ type mockDockerClient struct {
 	DaemonInfoFn                 func(ctx context.Context) (DaemonSecurityInfo, error)
 	CloseFn                      func() error
 	PullImageFn                  func(ctx context.Context, imageName string, timeout time.Duration) error
+	InspectImageFn               func(ctx context.Context, imageName string) (*ImageInfo, error)
 	CreateContainerFn            func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainerFn             func(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainerFn            func(ctx context.Context, containerID string) error
@@ -39,6 +82,7 @@ type mockDockerClient struct {
 	EnsureTenantNetworkFn        func(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
 	ListManagedNetworksFn        func(ctx context.Context) ([]networktypes.Inspect, error)
+	ResolveImageUserFn           func(ctx context.Context, imageName string, userOverride string) (int, int, error)
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {
@@ -57,6 +101,7 @@ func (m *mockDockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, 
 		StorageDriver:     "overlay2",
 		BackingFilesystem: "xfs",
 		SecurityOptions:   []string{"name=seccomp,profile=default"},
+		IPv4Forwarding:    true,
 	}, nil
 }
 
@@ -72,6 +117,14 @@ func (m *mockDockerClient) PullImage(ctx context.Context, imageName string, time
 		return m.PullImageFn(ctx, imageName, timeout)
 	}
 	panic("unexpected call to PullImage")
+}
+
+func (m *mockDockerClient) InspectImage(ctx context.Context, imageName string) (*ImageInfo, error) {
+	if m.InspectImageFn != nil {
+		return m.InspectImageFn(ctx, imageName)
+	}
+	// Default: return empty volumes so existing tests don't break.
+	return &ImageInfo{Volumes: map[string]struct{}{}}, nil
 }
 
 func (m *mockDockerClient) CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
@@ -130,6 +183,13 @@ func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenan
 	panic("unexpected call to RemoveTenantNetworkIfEmpty")
 }
 
+func (m *mockDockerClient) ResolveImageUser(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+	if m.ResolveImageUserFn != nil {
+		return m.ResolveImageUserFn(ctx, imageName, userOverride)
+	}
+	return 0, 0, nil // default: root
+}
+
 func (m *mockDockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
 	if m.ListManagedNetworksFn != nil {
 		return m.ListManagedNetworksFn(ctx)
@@ -164,6 +224,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		cfg:        cfg,
 		docker:     mock,
 		pool:       pool,
+		volumes:    &noopVolumeManager{},
 		logger:     slog.Default(),
 		provisions: provs,
 		stopCtx:    stopCtx,
@@ -824,6 +885,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 			cfg:        cfg,
 			docker:     mock,
 			pool:       pool,
+			volumes:    &noopVolumeManager{},
 			logger:     slog.Default(),
 			provisions: make(map[string]*provision),
 			stopCtx:    stopCtx,
@@ -874,6 +936,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 			cfg:        cfg,
 			docker:     mock,
 			pool:       pool,
+			volumes:    &noopVolumeManager{},
 			logger:     slog.Default(),
 			provisions: make(map[string]*provision),
 			stopCtx:    stopCtx,
@@ -912,6 +975,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 			cfg:        cfg,
 			docker:     mock,
 			pool:       pool,
+			volumes:    &noopVolumeManager{},
 			logger:     slog.Default(),
 			provisions: make(map[string]*provision),
 			stopCtx:    stopCtx,
@@ -1100,4 +1164,131 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	require.NotNil(t, prov)
 	assert.Contains(t, prov.LastError, "exit_code=1")
 	assert.Contains(t, prov.LastError, secret)
+}
+
+func TestRecoverState_InFlightReProvisionPreservesFailCount(t *testing.T) {
+	// Regression test: recoverState must not overwrite an in-flight
+	// PROVISIONING entry with stale container labels.
+	//
+	// Scenario: a re-provision is in-flight (Status=PROVISIONING, FailCount=2)
+	// while old dead containers (FailCount=0 in labels) still exist.
+	// recoverState should keep the PROVISIONING entry with its correct FailCount.
+	now := time.Now()
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{
+					ContainerID:   "old-dead-container",
+					LeaseUUID:     "lease-1",
+					Tenant:        "tenant-a",
+					ProviderUUID:  "prov-1",
+					SKU:           "docker-small",
+					InstanceIndex: 0,
+					Image:         "nginx:latest",
+					Status:        "exited",
+					CreatedAt:     now,
+					FailCount:     0, // stale: was written before failures accumulated
+				},
+			}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
+	}
+
+	// Existing in-memory state: in-flight re-provision with accumulated FailCount.
+	existing := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusProvisioning,
+			Quantity:     1,
+			ContainerIDs: []string{}, // new provision hasn't created containers yet
+			FailCount:    2,
+			CreatedAt:    now,
+		},
+	}
+	b := newBackendForTest(mock, existing)
+
+	err := b.recoverState(context.Background())
+	require.NoError(t, err)
+
+	// The PROVISIONING entry should be preserved with the correct FailCount,
+	// not overwritten by the stale container label value (0).
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+
+	require.True(t, ok, "provision should still exist")
+	assert.Equal(t, backend.ProvisionStatusProvisioning, prov.Status,
+		"should preserve PROVISIONING status, not replace with Failed from dead container")
+	assert.Equal(t, 2, prov.FailCount,
+		"should preserve in-flight FailCount (2), not stale label value (0)")
+}
+
+func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
+	// Regression test: when recoverState runs multiple times against the same
+	// dead container, the FailCount must not regress to the stale label value.
+	//
+	// Scenario: first recoverState detects ready→failed and increments FailCount
+	// to 1. A second recoverState call (e.g., from RefreshState) re-reads the
+	// container with FailCount=0 in labels. The in-memory value (1) must be
+	// preserved.
+	now := time.Now()
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{
+					ContainerID:   "dead-container",
+					LeaseUUID:     "lease-1",
+					Tenant:        "tenant-a",
+					ProviderUUID:  "prov-1",
+					SKU:           "docker-small",
+					InstanceIndex: 0,
+					Image:         "nginx:latest",
+					Status:        "exited",
+					CreatedAt:     now,
+					FailCount:     0, // stale label from container creation
+				},
+			}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
+	}
+
+	// Existing in-memory state: recoverState already ran once and incremented
+	// FailCount to 1. Provision has Status=Failed (transition already detected).
+	existing := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusFailed,
+			Quantity:     1,
+			ContainerIDs: []string{"dead-container"},
+			FailCount:    1,
+			CreatedAt:    now,
+		},
+	}
+	b := newBackendForTest(mock, existing)
+
+	err := b.recoverState(context.Background())
+	require.NoError(t, err)
+
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+
+	require.True(t, ok, "provision should still exist")
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Equal(t, 1, prov.FailCount,
+		"should preserve in-memory FailCount (1), not regress to stale label value (0)")
 }

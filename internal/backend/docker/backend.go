@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +30,8 @@ type dockerClient interface {
 	DaemonInfo(ctx context.Context) (DaemonSecurityInfo, error)
 	Close() error
 	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
+	InspectImage(ctx context.Context, imageName string) (*ImageInfo, error)
+	ResolveImageUser(ctx context.Context, imageName string, userOverride string) (uid, gid int, err error)
 	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainer(ctx context.Context, containerID string) error
@@ -40,10 +45,11 @@ type dockerClient interface {
 
 // Backend implements the backend.Backend interface for Docker containers.
 type Backend struct {
-	cfg    Config
-	docker dockerClient
-	pool   *shared.ResourcePool
-	logger *slog.Logger
+	cfg     Config
+	docker  dockerClient
+	pool    *shared.ResourcePool
+	volumes volumeManager
+	logger  *slog.Logger
 
 	// provisions tracks active provisions by lease UUID
 	provisions   map[string]*provision
@@ -234,10 +240,18 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to open diagnostics store: %w", err)
 	}
 
+	volumes, err := newVolumeManager(cfg.VolumeDataPath, cfg.VolumeFilesystem, logger)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		return nil, fmt.Errorf("failed to create volume manager: %w", err)
+	}
+
 	b := &Backend{
 		cfg:              cfg,
 		docker:           docker,
 		pool:             pool,
+		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
 		provisions:       make(map[string]*provision),
 		callbackStore:    cbStore,
@@ -271,12 +285,23 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
+	// Validate volume manager (filesystem support, permissions)
+	if err := b.volumes.Validate(); err != nil {
+		return fmt.Errorf("volume manager validation failed: %w", err)
+	}
+
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(ctx)
 
 	// Recover state from existing containers
 	if err := b.recoverState(ctx); err != nil {
 		return fmt.Errorf("failed to recover state: %w", err)
+	}
+
+	// Clean up orphaned volumes (created but no matching provision).
+	// Must run after recoverState so the provision map is populated.
+	if err := b.cleanupOrphanedVolumes(ctx); err != nil {
+		return fmt.Errorf("orphaned volume cleanup failed: %w", err)
 	}
 
 	// Replay any pending callbacks from a previous run
@@ -303,16 +328,6 @@ func (b *Backend) checkDaemonCapabilities(ctx context.Context) {
 		return
 	}
 
-	// Check disk quota prerequisites
-	if b.cfg.IsDiskQuota() {
-		if info.StorageDriver != "overlay2" || info.BackingFilesystem != "xfs" {
-			b.logger.Warn("disk quotas enabled but storage configuration incompatible; quotas require overlay2 on xfs with pquota mount option",
-				"storage_driver", info.StorageDriver,
-				"backing_filesystem", info.BackingFilesystem,
-			)
-		}
-	}
-
 	// Check seccomp availability
 	hasSeccomp := false
 	for _, opt := range info.SecurityOptions {
@@ -323,6 +338,20 @@ func (b *Backend) checkDaemonCapabilities(ctx context.Context) {
 	}
 	if !hasSeccomp {
 		b.logger.Warn("Docker daemon has seccomp disabled; containers will not have syscall filtering")
+	}
+
+	// Check IPv4 forwarding — required for container networking (outbound
+	// internet, port bindings, and inter-container communication).
+	if !info.IPv4Forwarding {
+		b.logger.Warn("IPv4 forwarding is disabled; container networking will not function correctly (enable with: sysctl net.ipv4.ip_forward=1)")
+	}
+
+	// Surface any daemon warnings (e.g., iptables misconfiguration).
+	// Docker's DOCKER-ISOLATION iptables chains provide cross-tenant
+	// network isolation; if iptables is disabled, tenants can reach
+	// each other directly.
+	for _, w := range info.Warnings {
+		b.logger.Warn("Docker daemon warning", "message", w)
 	}
 }
 
@@ -411,6 +440,9 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		for i := 0; i < oldQuantity; i++ {
 			b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 		}
+		// Remove old containers but keep volumes — stateful data persists
+		// across re-provisions. Volumes are reused via idempotent Create in
+		// doProvision, and only destroyed on explicit deprovision.
 		for _, cid := range oldContainerIDs {
 			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
 				logger.Warn("failed to remove old container during re-provision",
@@ -520,6 +552,7 @@ func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
 func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
+	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
 	var err error
 	var callbackErr string // hardcoded message for callbacks (safe for on-chain)
 	provisionStart := time.Now()
@@ -554,6 +587,13 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				}
 			}
 
+			// Destroy only volumes that were actually created during this attempt.
+			for _, volumeID := range createdVolumeIDs {
+				if volErr := b.volumes.Destroy(cleanupCtx, volumeID); volErr != nil {
+					logger.Warn("failed to cleanup volume after error", "volume_id", volumeID, "error", volErr)
+				}
+			}
+
 			// Send hardcoded callback message — never includes logs or dynamic data.
 			// Full diagnostics remain in prov.LastError for authenticated API access.
 			b.sendCallback(req.LeaseUUID, false, callbackErr)
@@ -573,7 +613,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		// Remove any stale diagnostic entry from a previous failure
 		// (e.g., re-provision after a crash).
 		if b.diagnosticsStore != nil {
-			_ = b.diagnosticsStore.Delete(req.LeaseUUID)
+			if delErr := b.diagnosticsStore.Delete(req.LeaseUUID); delErr != nil {
+				b.logger.Warn("failed to remove stale diagnostic entry", "lease", req.LeaseUUID, "error", delErr)
+			}
 		}
 
 		updateResourceMetrics(b.pool.Stats())
@@ -598,6 +640,41 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		return
 	}
 	imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())
+
+	// Inspect image to discover VOLUME declarations
+	imageInfo, inspectErr := b.docker.InspectImage(ctx, manifest.Image)
+	if inspectErr != nil {
+		logger.Error("failed to inspect image", "error", inspectErr)
+		err = fmt.Errorf("image inspect failed: %w", inspectErr)
+		callbackErr = "image inspect failed"
+		return
+	}
+	var imageVolumes []string
+	for v := range imageInfo.Volumes {
+		imageVolumes = append(imageVolumes, v)
+	}
+	sort.Strings(imageVolumes)
+
+	// Resolve container user to numeric UID/GID.
+	// When the manifest specifies a user (e.g., "postgres" or "999:999"),
+	// the container runs as that user directly and volumes are pre-chowned.
+	// This is required for images whose entrypoint starts as root and tries
+	// to chown data directories — CapDrop ALL removes CAP_CHOWN.
+	var volumeUID, volumeGID int
+	var containerUser string
+	if manifest.User != "" || imageInfo.User != "" {
+		volumeUID, volumeGID, err = b.docker.ResolveImageUser(ctx, manifest.Image, manifest.User)
+		if err != nil {
+			logger.Error("failed to resolve image user", "error", err)
+			err = fmt.Errorf("image user resolution failed: %w", err)
+			callbackErr = "image user resolution failed"
+			return
+		}
+		if volumeUID != 0 || volumeGID != 0 {
+			containerUser = fmt.Sprintf("%d:%d", volumeUID, volumeGID)
+			logger.Info("resolved container user", "uid", volumeUID, "gid", volumeGID)
+		}
+	}
 
 	// Set up per-tenant network isolation if enabled
 	var networkConfig *networktypes.NetworkingConfig
@@ -632,6 +709,53 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			}
 			b.provisionsMu.RUnlock()
 
+			// Create managed volume for stateful SKUs (disk_mb > 0).
+			var volumeBinds map[string]string
+			if profile.DiskMB > 0 && len(imageVolumes) > 0 {
+				volumeID := fmt.Sprintf("fred-%s-%d", req.LeaseUUID, instanceIndex)
+				hostPath, volCreated, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
+				if volErr != nil {
+					instanceLogger.Error("failed to create volume", "error", volErr)
+					err = fmt.Errorf("volume creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, volErr)
+					callbackErr = "volume creation failed"
+					return
+				}
+				// Only track newly created volumes for cleanup on failure.
+				// Reused volumes (from a previous provision) must not be destroyed.
+				if volCreated {
+					createdVolumeIDs = append(createdVolumeIDs, volumeID)
+				}
+				volumeBinds = make(map[string]string, len(imageVolumes))
+				for _, volPath := range imageVolumes {
+					sanitized := sanitizeVolumePath(volPath)
+					if sanitized == "" {
+						err = fmt.Errorf("image declares unsupported VOLUME path %q that cannot be quota-enforced (instance %d, sku %s)", volPath, instanceIndex, item.SKU)
+						callbackErr = "image has unsupported VOLUME path"
+						return
+					}
+					subdir := filepath.Join(hostPath, sanitized)
+					if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
+						instanceLogger.Error("failed to create volume subdir", "path", subdir, "error", mkErr)
+						err = fmt.Errorf("volume subdir creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, mkErr)
+						callbackErr = "volume creation failed"
+						return
+					}
+					// Pre-chown for non-root container users (CapDrop ALL prevents in-container chown).
+					if volumeUID != 0 || volumeGID != 0 {
+						if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
+							instanceLogger.Error("failed to chown volume subdir", "path", subdir, "uid", volumeUID, "gid", volumeGID, "error", chownErr)
+							err = fmt.Errorf("volume subdir chown failed (instance %d, sku %s): %w", instanceIndex, item.SKU, chownErr)
+							callbackErr = "volume creation failed"
+							return
+						}
+					}
+					volumeBinds[subdir] = volPath
+				}
+			} else if profile.DiskMB > 0 && len(imageVolumes) == 0 {
+				instanceLogger.Warn("stateful SKU has disk_mb > 0 but image declares no VOLUME paths; disk budget is allocated but unused",
+					"disk_mb", profile.DiskMB)
+			}
+
 			createStart := time.Now()
 			containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
 				LeaseUUID:      req.LeaseUUID,
@@ -647,8 +771,10 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				ReadonlyRootfs: b.cfg.IsReadonlyRootfs(),
 				PidsLimit:      b.cfg.GetPidsLimit(),
 				TmpfsSizeMB:    b.cfg.GetTmpfsSizeMB(),
-				DiskQuota:      b.cfg.IsDiskQuota(),
 				NetworkConfig:  networkConfig,
+				VolumeBinds:    volumeBinds,
+				ImageVolumes:   imageVolumes,
+				User:           containerUser,
 			}, b.cfg.ContainerCreateTimeout)
 			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
 			if createErr != nil {
@@ -892,7 +1018,29 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
 	}
 
-	// All containers removed successfully — delete provision from map.
+	// Destroy managed volumes for all instances.
+	var volumeErrs []error
+	for i := 0; i < prov.Quantity; i++ {
+		volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
+		if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
+			logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
+			volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
+		}
+	}
+
+	if len(volumeErrs) > 0 {
+		// Volume cleanup failed — keep provision visible for retry.
+		b.provisionsMu.Lock()
+		if p, ok := b.provisions[leaseUUID]; ok {
+			p.Status = backend.ProvisionStatusFailed
+			p.ContainerIDs = nil // containers are gone
+			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
+		}
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("volume cleanup failed: %w", errors.Join(volumeErrs...))
+	}
+
+	// All containers and volumes removed — delete provision from map.
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
 	b.provisionsMu.Unlock()
@@ -1116,7 +1264,21 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// Preserve provisions without containers that need to remain visible
 	// to fred's reconciler.
 	for uuid, existing := range b.provisions {
-		if _, hasContainers := recovered[uuid]; hasContainers {
+		if rec, hasContainers := recovered[uuid]; hasContainers {
+			if existing.Status == backend.ProvisionStatusProvisioning {
+				// In-flight re-provision: the containers in recovered belong to the
+				// previous (failed) provision and carry stale FailCount labels. The
+				// old containers are being removed by Provision() concurrently.
+				// Preserve the in-flight entry with its correct FailCount so the
+				// next container creation picks up the right value.
+				recovered[uuid] = existing
+			} else if existing.FailCount > rec.FailCount {
+				// Container labels carry the FailCount from creation time. When
+				// recoverState increments FailCount in-memory (e.g., ready→failed
+				// transition), subsequent recoverState calls re-read the stale label
+				// value. Preserve the higher in-memory count to prevent regression.
+				rec.FailCount = existing.FailCount
+			}
 			continue // Already recovered from containers
 		}
 		switch existing.Status {
@@ -1162,6 +1324,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		for _, cid := range containerIDs {
 			info, inspErr := b.docker.InspectContainer(ctx, cid)
 			if inspErr != nil {
+				b.logger.Warn("failed to inspect container during diagnostics gathering", "lease", uuid, "container_id", shortID(cid), "error", inspErr)
 				continue
 			}
 			if containerStatusToProvisionStatus(info.Status) == backend.ProvisionStatusFailed {
@@ -1220,6 +1383,48 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.cleanupOrphanedNetworks(ctx, recovered)
 	}
 
+	return nil
+}
+
+// cleanupOrphanedVolumes destroys volumes on disk that have no matching provision.
+// This catches volumes leaked by crashes between volume creation and container creation,
+// or between container removal and volume destruction. Called once at startup after
+// recoverState populates the provision map.
+func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
+	volumeIDs, err := b.volumes.List()
+	if err != nil {
+		return fmt.Errorf("list volumes: %w", err)
+	}
+	if len(volumeIDs) == 0 {
+		return nil
+	}
+
+	// Build set of expected volume IDs from recovered provisions.
+	expected := make(map[string]bool)
+	b.provisionsMu.RLock()
+	for leaseUUID, prov := range b.provisions {
+		for i := 0; i < prov.Quantity; i++ {
+			expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
+		}
+	}
+	b.provisionsMu.RUnlock()
+
+	var orphanCount, failCount int
+	for _, id := range volumeIDs {
+		if expected[id] {
+			continue
+		}
+		b.logger.Info("destroying orphaned volume", "volume_id", id)
+		if err := b.volumes.Destroy(ctx, id); err != nil {
+			b.logger.Error("failed to destroy orphaned volume", "volume_id", id, "error", err)
+			failCount++
+		} else {
+			orphanCount++
+		}
+	}
+	if orphanCount > 0 || failCount > 0 {
+		b.logger.Info("orphaned volume cleanup complete", "destroyed", orphanCount, "failed", failCount)
+	}
 	return nil
 }
 

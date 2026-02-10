@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker install clean deps test test-integration test-coverage lint run run-mock run-mock-delay run-docker fmt generate verify help
+.PHONY: all build build-mock build-docker install clean deps test test-volume test-integration test-integration-volume test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -68,15 +68,33 @@ test:
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
 
+# Run volume unit tests (no special requirements)
+test-volume:
+	@echo "Running volume unit tests..."
+	$(GOTEST) -v ./internal/backend/docker/ -run "TestDoProvision_Stateful|TestDoProvision_Volume|TestDoProvision_Cleanup|TestProvision_ReProvisionKeeps|TestDeprovision_Destroys|TestDeprovision_Volume|TestCleanupOrphaned"
+
 # Run Docker integration tests (requires Docker daemon)
 test-integration:
 	@echo "Running Docker integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout 5m
 
-# Run tests with coverage
+# Run volume integration tests (requires root + Docker + btrfs-progs)
+# Usage: sudo make test-integration-volume
+test-integration-volume:
+	@echo "Running volume integration tests (requires root + Docker + btrfs-progs)..."
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota)" -timeout 10m
+
+# Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
 	@echo "Running tests with coverage..."
-	$(GOTEST) -tags integration -v -coverprofile=coverage.out ./...
+	$(GOTEST) -tags integration -v -coverprofile=coverage.out -timeout 5m ./...
+	$(GOCMD) tool cover -html=coverage.out -o coverage.html
+
+# Run all tests with coverage including volume integration tests
+# Usage: sudo make test-coverage-all
+test-coverage-all:
+	@echo "Running all tests with coverage (requires root + Docker + btrfs-progs)..."
+	$(GOTEST) -tags integration -v -coverprofile=coverage.out -timeout 10m ./...
 	$(GOCMD) tool cover -html=coverage.out -o coverage.html
 
 # Run linter
@@ -135,9 +153,12 @@ help:
 	@echo "  install          - Install binaries to GOPATH/bin"
 	@echo "  clean            - Clean build artifacts"
 	@echo "  deps             - Download and tidy dependencies"
-	@echo "  test             - Run tests"
-	@echo "  test-integration - Run Docker integration tests (requires Docker)"
-	@echo "  test-coverage    - Run tests with coverage report"
+	@echo "  test                    - Run tests"
+	@echo "  test-volume             - Run volume unit tests"
+	@echo "  test-integration        - Run Docker integration tests (requires Docker)"
+	@echo "  test-integration-volume - Run volume integration tests (sudo, Docker, btrfs-progs)"
+	@echo "  test-coverage           - Run tests with coverage report"
+	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"
 	@echo "  lint             - Run linter"
 	@echo "  run              - Build and run providerd with example config"
 	@echo "  run-mock         - Build and run mock-backend"

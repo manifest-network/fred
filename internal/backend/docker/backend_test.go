@@ -182,6 +182,8 @@ func TestConfigValidation(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.CallbackSecret = "this-is-a-32-character-secret!!x" // 33 chars
 		cfg.HostAddress = "192.168.1.100"
+		cfg.VolumeDataPath = "/var/lib/fred/volumes"
+		cfg.VolumeFilesystem = "btrfs"
 		return cfg
 	}
 
@@ -254,6 +256,85 @@ func TestConfigValidation(t *testing.T) {
 		cfg := validConfig()
 		cfg.HostAddress = "backend.example.com"
 		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("sku_mapping references unknown profile", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUMapping = map[string]string{
+			"uuid-1": "nonexistent-profile",
+		}
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "references unknown profile")
+	})
+
+	t.Run("sku_profile without sku_mapping entry", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUMapping = map[string]string{
+			"uuid-1": "docker-micro",
+		}
+		// DefaultConfig has docker-micro, docker-small, docker-medium, docker-large
+		// Only docker-micro is mapped — the rest are unreachable
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "has no sku_mapping entry")
+	})
+
+	t.Run("all sku_profiles mapped", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUMapping = map[string]string{
+			"uuid-1": "docker-micro",
+			"uuid-2": "docker-small",
+			"uuid-3": "docker-medium",
+			"uuid-4": "docker-large",
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("no sku_mapping skips reachability check", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUMapping = nil
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("readonly profile without disk_mb passes", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUProfiles = map[string]SKUProfile{
+			"docker-small": {CPUCores: 0.5, MemoryMB: 512},
+		}
+		cfg.SKUMapping = nil
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("profile with disk_mb passes", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUProfiles = map[string]SKUProfile{
+			"docker-redis": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 2048},
+		}
+		cfg.SKUMapping = nil
+		cfg.VolumeDataPath = "/var/lib/fred/volumes"
+		cfg.VolumeFilesystem = "btrfs"
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("stateful SKU without volume_data_path fails", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUProfiles = map[string]SKUProfile{
+			"docker-redis": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 2048},
+		}
+		cfg.SKUMapping = nil
+		cfg.VolumeDataPath = ""
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "volume_data_path is required")
+	})
+
+	t.Run("volume_data_path with whitespace fails", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.VolumeDataPath = "/var/lib/fred volumes"
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "whitespace")
 	})
 }
 
@@ -431,7 +512,6 @@ func TestConfigHardeningDefaults(t *testing.T) {
 	assert.Equal(t, int64(256), *cfg.GetPidsLimit())
 	assert.Equal(t, 64, cfg.GetTmpfsSizeMB())
 	assert.Equal(t, "0.0.0.0", cfg.GetHostBindIP())
-	assert.True(t, cfg.IsDiskQuota())
 	assert.Equal(t, "callbacks.db", cfg.CallbackDBPath)
 	assert.Equal(t, "diagnostics.db", cfg.DiagnosticsDBPath)
 	assert.Equal(t, 7*24*time.Hour, cfg.DiagnosticsMaxAge)
@@ -450,14 +530,6 @@ func TestConfigHardeningOverrides(t *testing.T) {
 	assert.Equal(t, int64(512), *cfg.GetPidsLimit())
 	assert.Equal(t, 128, cfg.GetTmpfsSizeMB())
 	assert.Equal(t, "127.0.0.1", cfg.GetHostBindIP())
-
-	cfg.ContainerDiskQuota = ptrBool(false)
-	assert.False(t, cfg.IsDiskQuota())
-}
-
-func TestIsDiskQuota_NilDefaultsTrue(t *testing.T) {
-	cfg := Config{}
-	assert.True(t, cfg.IsDiskQuota())
 }
 
 func TestConfigHardeningValidation(t *testing.T) {
@@ -465,6 +537,8 @@ func TestConfigHardeningValidation(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.CallbackSecret = "this-is-a-32-character-secret!!x"
 		cfg.HostAddress = "192.168.1.100"
+		cfg.VolumeDataPath = "/var/lib/fred/volumes"
+		cfg.VolumeFilesystem = "btrfs"
 		return cfg
 	}
 
@@ -831,51 +905,6 @@ func TestTenantNetworkName(t *testing.T) {
 }
 
 func TestCheckDaemonCapabilities(t *testing.T) {
-	t.Run("disk quota warning on non-xfs", func(t *testing.T) {
-		mock := &mockDockerClient{
-			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
-				return DaemonSecurityInfo{
-					StorageDriver:     "overlay2",
-					BackingFilesystem: "ext4",
-					SecurityOptions:   []string{"name=seccomp,profile=default"},
-				}, nil
-			},
-		}
-		b := newBackendForTest(mock, nil)
-		// disk quota is true by default — should warn about ext4
-		b.checkDaemonCapabilities(context.Background())
-		// Verify no panic; warning is logged (not assertable without a test logger).
-	})
-
-	t.Run("disk quota warning on non-overlay2", func(t *testing.T) {
-		mock := &mockDockerClient{
-			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
-				return DaemonSecurityInfo{
-					StorageDriver:     "devicemapper",
-					BackingFilesystem: "xfs",
-					SecurityOptions:   []string{"name=seccomp,profile=default"},
-				}, nil
-			},
-		}
-		b := newBackendForTest(mock, nil)
-		b.checkDaemonCapabilities(context.Background())
-	})
-
-	t.Run("no disk quota warning when disabled", func(t *testing.T) {
-		mock := &mockDockerClient{
-			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
-				return DaemonSecurityInfo{
-					StorageDriver:     "devicemapper",
-					BackingFilesystem: "ext4",
-					SecurityOptions:   []string{"name=seccomp,profile=default"},
-				}, nil
-			},
-		}
-		b := newBackendForTest(mock, nil)
-		b.cfg.ContainerDiskQuota = ptrBool(false)
-		b.checkDaemonCapabilities(context.Background())
-	})
-
 	t.Run("seccomp warning when missing", func(t *testing.T) {
 		mock := &mockDockerClient{
 			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
@@ -883,6 +912,7 @@ func TestCheckDaemonCapabilities(t *testing.T) {
 					StorageDriver:     "overlay2",
 					BackingFilesystem: "xfs",
 					SecurityOptions:   []string{"name=apparmor"},
+					IPv4Forwarding:    true,
 				}, nil
 			},
 		}
@@ -897,11 +927,45 @@ func TestCheckDaemonCapabilities(t *testing.T) {
 					StorageDriver:     "overlay2",
 					BackingFilesystem: "xfs",
 					SecurityOptions:   []string{"name=seccomp,profile=default"},
+					IPv4Forwarding:    true,
 				}, nil
 			},
 		}
 		b := newBackendForTest(mock, nil)
 		b.checkDaemonCapabilities(context.Background())
+	})
+
+	t.Run("ipv4 forwarding warning when disabled", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{
+					StorageDriver:     "overlay2",
+					BackingFilesystem: "xfs",
+					SecurityOptions:   []string{"name=seccomp,profile=default"},
+					IPv4Forwarding:    false,
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.checkDaemonCapabilities(context.Background())
+		// Should not panic; warning is logged.
+	})
+
+	t.Run("daemon warnings are surfaced", func(t *testing.T) {
+		mock := &mockDockerClient{
+			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
+				return DaemonSecurityInfo{
+					StorageDriver:     "overlay2",
+					BackingFilesystem: "xfs",
+					SecurityOptions:   []string{"name=seccomp,profile=default"},
+					IPv4Forwarding:    true,
+					Warnings:          []string{"WARNING: No iptables support"},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.checkDaemonCapabilities(context.Background())
+		// Should not panic; daemon warnings are logged.
 	})
 
 	t.Run("daemon info error is non-fatal", func(t *testing.T) {

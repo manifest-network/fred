@@ -1,6 +1,8 @@
 package docker
 
 import (
+	"archive/tar"
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
@@ -42,6 +45,8 @@ type DaemonSecurityInfo struct {
 	StorageDriver     string
 	BackingFilesystem string
 	SecurityOptions   []string
+	IPv4Forwarding    bool
+	Warnings          []string
 }
 
 // ContainerInfo holds information about a managed container.
@@ -122,7 +127,236 @@ func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, erro
 		StorageDriver:     info.Driver,
 		BackingFilesystem: backingFS,
 		SecurityOptions:   info.SecurityOptions,
+		IPv4Forwarding:    info.IPv4Forwarding,
+		Warnings:          info.Warnings,
 	}, nil
+}
+
+// ImageInfo holds metadata from a container image inspection.
+type ImageInfo struct {
+	// Volumes are the VOLUME declarations from the Dockerfile.
+	Volumes map[string]struct{}
+	// User is the USER directive from the Dockerfile (may be name, uid, uid:gid, or name:group).
+	User string
+}
+
+// InspectImage inspects a pulled image and returns its metadata.
+func (d *DockerClient) InspectImage(ctx context.Context, imageName string) (*ImageInfo, error) {
+	inspect, _, err := d.client.ImageInspectWithRaw(ctx, imageName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect image %s: %w", imageName, err)
+	}
+	volumes := make(map[string]struct{})
+	if inspect.Config != nil {
+		for v := range inspect.Config.Volumes {
+			volumes[v] = struct{}{}
+		}
+	}
+	info := &ImageInfo{Volumes: volumes}
+	if inspect.Config != nil {
+		info.User = inspect.Config.User
+	}
+	return info, nil
+}
+
+// ResolveImageUser resolves a container user specification to numeric UID/GID.
+// If userOverride is non-empty, it is used instead of the image's Config.User.
+// This is needed for images like postgres that start as root and expect to
+// chown data directories — since we drop CAP_CHOWN, the manifest must
+// specify the target user explicitly.
+// If both userOverride and Config.User are empty, returns (0, 0, nil) (root).
+// Numeric UID/GID values are parsed directly. Non-numeric usernames are
+// resolved by reading /etc/passwd (and optionally /etc/group) from a
+// temporary container created from the image.
+func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName string, userOverride string) (uid, gid int, err error) {
+	userStr := userOverride
+	if userStr == "" {
+		inspect, _, inspectErr := d.client.ImageInspectWithRaw(ctx, imageName)
+		if inspectErr != nil {
+			return 0, 0, fmt.Errorf("failed to inspect image %s: %w", imageName, inspectErr)
+		}
+		if inspect.Config != nil {
+			userStr = inspect.Config.User
+		}
+	}
+	if userStr == "" {
+		return 0, 0, nil
+	}
+
+	user, group := splitUserGroup(userStr)
+
+	// Try numeric UID.
+	numUID, uidErr := strconv.Atoi(user)
+	if uidErr == nil {
+		// UID is numeric. Resolve GID.
+		if group == "" {
+			return numUID, numUID, nil
+		}
+		numGID, gidErr := strconv.Atoi(group)
+		if gidErr == nil {
+			return numUID, numGID, nil
+		}
+		// Group is a name — need to read /etc/group from the image.
+		gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group)
+		if err != nil {
+			return 0, 0, err
+		}
+		return numUID, gidResolved, nil
+	}
+
+	// Username is non-numeric — read /etc/passwd from the image.
+	passwdUID, passwdGID, err := d.resolveUserFromImage(ctx, imageName, user)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if group == "" {
+		return passwdUID, passwdGID, nil
+	}
+
+	// Explicit group override.
+	numGID, gidErr := strconv.Atoi(group)
+	if gidErr == nil {
+		return passwdUID, numGID, nil
+	}
+	gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group)
+	if err != nil {
+		return 0, 0, err
+	}
+	return passwdUID, gidResolved, nil
+}
+
+// resolveUserFromImage reads /etc/passwd from a temporary container to resolve
+// a username to UID/GID.
+func (d *DockerClient) resolveUserFromImage(ctx context.Context, imageName, username string) (uid, gid int, err error) {
+	data, err := d.readFileFromImage(ctx, imageName, "/etc/passwd")
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read /etc/passwd from image %s: %w", imageName, err)
+	}
+	return parsePasswdForUser(strings.NewReader(string(data)), username)
+}
+
+// resolveGroupFromImage reads /etc/group from a temporary container to resolve
+// a group name to GID.
+func (d *DockerClient) resolveGroupFromImage(ctx context.Context, imageName, groupName string) (int, error) {
+	data, err := d.readFileFromImage(ctx, imageName, "/etc/group")
+	if err != nil {
+		return 0, fmt.Errorf("failed to read /etc/group from image %s: %w", imageName, err)
+	}
+	return parseGroupForName(strings.NewReader(string(data)), groupName)
+}
+
+// readFileFromImage creates a temporary container (never started), extracts a
+// file via CopyFromContainer, and removes the container.
+func (d *DockerClient) readFileFromImage(ctx context.Context, imageName, path string) ([]byte, error) {
+	resp, err := d.client.ContainerCreate(ctx, &container.Config{
+		Image: imageName,
+	}, nil, nil, nil, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp container: %w", err)
+	}
+	defer func() {
+		_ = d.client.ContainerRemove(ctx, resp.ID, container.RemoveOptions{})
+	}()
+
+	return readFileFromContainer(ctx, d.client, resp.ID, path)
+}
+
+// readFileFromContainer extracts a single file from a container using
+// CopyFromContainer and returns its contents.
+func readFileFromContainer(ctx context.Context, cli *client.Client, containerID, path string) ([]byte, error) {
+	rc, _, err := cli.CopyFromContainer(ctx, containerID, path)
+	if err != nil {
+		return nil, fmt.Errorf("CopyFromContainer %s: %w", path, err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	tr := tar.NewReader(rc)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil, fmt.Errorf("file %s not found in tar stream", path)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading tar: %w", err)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, fmt.Errorf("reading %s: %w", path, err)
+			}
+			return data, nil
+		}
+	}
+}
+
+// splitUserGroup splits a Docker USER string into user and group parts.
+// "user:group" → ("user", "group"), "user" → ("user", "").
+func splitUserGroup(s string) (user, group string) {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return s, ""
+}
+
+// parsePasswdForUser parses /etc/passwd content and returns the UID and primary
+// GID for the given username. Returns an error if the user is not found.
+func parsePasswdForUser(r io.Reader, username string) (uid, gid int, err error) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[0] != username {
+			continue
+		}
+		uid, err = strconv.Atoi(fields[2])
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid UID %q for user %s: %w", fields[2], username, err)
+		}
+		gid, err = strconv.Atoi(fields[3])
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid GID %q for user %s: %w", fields[3], username, err)
+		}
+		return uid, gid, nil
+	}
+	if err = scanner.Err(); err != nil {
+		return 0, 0, fmt.Errorf("reading passwd: %w", err)
+	}
+	return 0, 0, fmt.Errorf("user %q not found in /etc/passwd", username)
+}
+
+// parseGroupForName parses /etc/group content and returns the GID for the
+// given group name. Returns an error if the group is not found.
+func parseGroupForName(r io.Reader, groupName string) (gid int, err error) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[0] != groupName {
+			continue
+		}
+		gid, err = strconv.Atoi(fields[2])
+		if err != nil {
+			return 0, fmt.Errorf("invalid GID %q for group %s: %w", fields[2], groupName, err)
+		}
+		return gid, nil
+	}
+	if err = scanner.Err(); err != nil {
+		return 0, fmt.Errorf("reading group: %w", err)
+	}
+	return 0, fmt.Errorf("group %q not found in /etc/group", groupName)
 }
 
 // PullImage pulls a container image with timeout.
@@ -167,8 +401,22 @@ type CreateContainerParams struct {
 	ReadonlyRootfs bool
 	PidsLimit      *int64
 	TmpfsSizeMB    int
-	DiskQuota      bool // Enable overlay2 storage driver disk quota
 	NetworkConfig  *networktypes.NetworkingConfig
+
+	// VolumeBinds are bind mounts from host to container for managed volumes.
+	// Each entry maps a host path to a container path.
+	// Used for stateful containers (disk_mb > 0).
+	VolumeBinds map[string]string
+
+	// ImageVolumes are VOLUME paths from the image that need tmpfs overrides
+	// (for ephemeral containers only, when VolumeBinds is nil).
+	ImageVolumes []string
+
+	// User overrides the container's runtime user (e.g., "999:999").
+	// When set, container.Config.User is set to this value so the container
+	// runs directly as the target user instead of relying on the entrypoint
+	// to switch users (which requires CAP_CHOWN that we drop).
+	User string
 }
 
 // portBindRetries is the number of times to retry container creation when
@@ -263,6 +511,11 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		ExposedPorts: exposedPorts,
 	}
 
+	// Set container user if provided (bypasses entrypoint user switching)
+	if params.User != "" {
+		config.User = params.User
+	}
+
 	// Set command and args if provided
 	if len(params.Manifest.Command) > 0 {
 		config.Entrypoint = params.Manifest.Command
@@ -298,13 +551,8 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		SecurityOpt:    []string{"no-new-privileges:true"},
 		ReadonlyRootfs: params.ReadonlyRootfs,
 	}
-	if params.DiskQuota {
-		hostConfig.StorageOpt = map[string]string{
-			"size": fmt.Sprintf("%dM", params.Profile.DiskMB),
-		}
-	}
+	tmpfsSize := fmt.Sprintf("size=%dM", params.TmpfsSizeMB)
 	if params.ReadonlyRootfs {
-		tmpfsSize := fmt.Sprintf("size=%dM", params.TmpfsSizeMB)
 		hostConfig.Tmpfs = map[string]string{
 			"/tmp": tmpfsSize,
 			"/run": tmpfsSize,
@@ -312,6 +560,29 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		// Add tenant-requested tmpfs mounts (validated in manifest.Validate)
 		for _, p := range params.Manifest.Tmpfs {
 			hostConfig.Tmpfs[p] = tmpfsSize
+		}
+	}
+
+	// Ephemeral: override image VOLUME paths with tmpfs to prevent Docker
+	// from creating anonymous volumes that bypass quotas. Applied regardless
+	// of ReadonlyRootfs to ensure VOLUME paths are always controlled.
+	if len(params.VolumeBinds) == 0 && len(params.ImageVolumes) > 0 {
+		if hostConfig.Tmpfs == nil {
+			hostConfig.Tmpfs = make(map[string]string)
+		}
+		for _, volPath := range params.ImageVolumes {
+			hostConfig.Tmpfs[volPath] = tmpfsSize
+		}
+	}
+
+	// Stateful: bind mount managed volume dirs to image VOLUME paths
+	if len(params.VolumeBinds) > 0 {
+		for hostPath, containerPath := range params.VolumeBinds {
+			hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
+				Type:   mount.TypeBind,
+				Source: hostPath,
+				Target: containerPath,
+			})
 		}
 	}
 
@@ -554,7 +825,10 @@ func TenantNetworkName(tenant string) string {
 }
 
 // EnsureTenantNetwork creates or returns the existing network for a tenant.
-// The network is an internal bridge with no external connectivity.
+// The network is a per-tenant bridge that provides inter-tenant isolation.
+// Note: Internal must be false because Docker internal networks do not
+// support port publishing (moby/moby#36174). Outbound internet access
+// from containers is a side effect.
 func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
 	name := TenantNetworkName(tenant)
 
@@ -576,7 +850,7 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 	// Docker API returns a conflict error. Handle this by re-listing.
 	resp, err := d.client.NetworkCreate(ctx, name, networktypes.CreateOptions{
 		Driver:   "bridge",
-		Internal: false,
+		Internal: false, // Must be false: Internal:true prevents port publishing (moby#36174)
 		Labels: map[string]string{
 			LabelManaged: "true",
 			LabelTenant:  tenant,
@@ -646,7 +920,7 @@ func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.
 		inspected, err := d.client.NetworkInspect(ctx, s.ID, networktypes.InspectOptions{})
 		if err != nil {
 			if !client.IsErrNotFound(err) {
-				slog.Warn("failed to inspect network during list", "network_id", s.ID, "error", err)
+				slog.Warn("failed to inspect network during list; network excluded from results", "network_id", s.ID, "error", err)
 			}
 			continue
 		}

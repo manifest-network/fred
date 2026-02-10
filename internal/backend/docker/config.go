@@ -84,7 +84,9 @@ type Config struct {
 	HostBindIP string `yaml:"host_bind_ip"`
 
 	// NetworkIsolation enables per-tenant Docker network isolation.
-	// When true, each tenant's containers are placed in a separate internal bridge network.
+	// When true, each tenant's containers are placed in a separate bridge network.
+	// Provides inter-tenant isolation; containers retain outbound internet access
+	// because Docker's Internal flag prevents port publishing (moby#36174).
 	// Defaults to true.
 	NetworkIsolation *bool `yaml:"network_isolation"`
 
@@ -111,11 +113,14 @@ type Config struct {
 	// When set, prevents any single tenant from consuming the entire pool.
 	TenantQuota *TenantQuotaConfig `yaml:"tenant_quota"`
 
-	// ContainerDiskQuota enables Docker overlay2 storage driver disk quotas
-	// on containers. Requires overlay2 with xfs + pquota mount option.
-	// When enabled, StorageOpt is set on the container's HostConfig.
-	// Defaults to true. Set to false on unsupported filesystems.
-	ContainerDiskQuota *bool `yaml:"container_disk_quota"`
+	// VolumeDataPath is the host directory for managed volumes.
+	// Required when any SKU profile has DiskMB > 0.
+	// Each container gets a quota-enforced subdirectory under this path.
+	VolumeDataPath string `yaml:"volume_data_path"`
+
+	// VolumeFilesystem specifies the filesystem type for volume quota enforcement.
+	// Supported values: "btrfs", "xfs", "zfs". If empty, auto-detected from VolumeDataPath.
+	VolumeFilesystem string `yaml:"volume_filesystem"`
 
 	// CallbackMaxAge is the maximum age of a persisted callback entry.
 	// Entries older than this are removed by the callback store's background cleanup.
@@ -178,13 +183,15 @@ func (c *Config) GetTmpfsSizeMB() int {
 	return 64
 }
 
-// IsDiskQuota returns whether container disk quotas are enabled.
-// Defaults to true. Requires overlay2 with xfs + pquota.
-func (c *Config) IsDiskQuota() bool {
-	if c.ContainerDiskQuota != nil {
-		return *c.ContainerDiskQuota
+// HasStatefulSKUs returns true if any SKU profile has DiskMB > 0,
+// indicating that volume management is needed.
+func (c *Config) HasStatefulSKUs() bool {
+	for _, p := range c.SKUProfiles {
+		if p.DiskMB > 0 {
+			return true
+		}
 	}
-	return true
+	return false
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -206,7 +213,6 @@ func DefaultConfig() Config {
 		ContainerReadonlyRootfs: ptrBool(true),
 		ContainerPidsLimit:      ptrInt64(256),
 		ContainerTmpfsSizeMB:    64,
-		ContainerDiskQuota:      ptrBool(true),
 		CallbackMaxAge:          24 * time.Hour,
 		DiagnosticsDBPath:       "diagnostics.db",
 		DiagnosticsMaxAge:       7 * 24 * time.Hour,
@@ -282,6 +288,20 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate that all SKU profiles are reachable via sku_mapping.
+	// On-chain SKUs are UUIDs — profiles without a mapping are unreachable.
+	if len(c.SKUMapping) > 0 {
+		mapped := make(map[string]bool, len(c.SKUMapping))
+		for _, profileName := range c.SKUMapping {
+			mapped[profileName] = true
+		}
+		for name := range c.SKUProfiles {
+			if !mapped[name] {
+				return fmt.Errorf("sku_profiles[%s] has no sku_mapping entry and is unreachable from on-chain SKUs", name)
+			}
+		}
+	}
+
 	if len(c.AllowedRegistries) == 0 {
 		return fmt.Errorf("at least one allowed registry is required")
 	}
@@ -353,6 +373,22 @@ func (c *Config) Validate() error {
 
 	if c.DiagnosticsMaxAge < 0 {
 		return fmt.Errorf("diagnostics_max_age must be non-negative")
+	}
+
+	// Volume management validation
+	if c.HasStatefulSKUs() && c.VolumeDataPath == "" {
+		return fmt.Errorf("volume_data_path is required when any SKU profile has disk_mb > 0")
+	}
+	if strings.ContainsAny(c.VolumeDataPath, " \t\n") {
+		return fmt.Errorf("volume_data_path must not contain whitespace (got %q)", c.VolumeDataPath)
+	}
+	if c.VolumeFilesystem != "" {
+		switch c.VolumeFilesystem {
+		case "btrfs", "xfs", "zfs":
+			// valid
+		default:
+			return fmt.Errorf("volume_filesystem must be btrfs, xfs, or zfs (got %q)", c.VolumeFilesystem)
+		}
 	}
 
 	if c.TenantQuota != nil {

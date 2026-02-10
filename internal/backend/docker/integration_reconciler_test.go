@@ -645,10 +645,10 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	manifestPayload, err := json.Marshal(manifest)
 	require.NoError(t, err)
 
-	hash := sha256.Sum256(payload)
+	hash := sha256.Sum256(manifestPayload)
 
 	var mu sync.Mutex
 	leaseState := billingtypes.LEASE_STATE_PENDING
@@ -721,7 +721,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	require.NoError(t, err)
 
 	// Store payload
-	stored := store.Store(leaseUUID, payload)
+	stored := store.Store(leaseUUID, manifestPayload)
 	require.True(t, stored)
 
 	ctx := context.Background()
@@ -749,6 +749,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.NotEmpty(t, containers)
 	killContainer(t, containers[0].ID)
+	waitForContainerExited(t, containers[0].ID)
 
 	// 4. Do NOT wait for recoverState — with ReconcileInterval=1h it won't run.
 	//    Immediately call RunOnce. The reconciler's fetchAllProvisions calls
@@ -771,14 +772,21 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 
 	// 5. The reconciler should have detected the failure (via RefreshState)
 	//    and re-provisioned. Wait for the success callback.
-	select {
-	case cb := <-callbackCh:
-		assert.Equal(t, leaseUUID, cb.LeaseUUID)
-		assert.Equal(t, backend.CallbackStatusSuccess, cb.Status,
-			"reconciler should detect failure via RefreshState and re-provision")
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for re-provision success callback — " +
-			"RefreshState may not be called before ListProvisions")
+	//    RefreshState may fire a "failed" callback first when it detects the
+	//    crashed container, so skip any failed callbacks until we get success.
+	successTimeout := time.After(2 * time.Minute)
+	gotSuccess := false
+	for !gotSuccess {
+		select {
+		case cb := <-callbackCh:
+			if cb.Status == backend.CallbackStatusSuccess {
+				assert.Equal(t, leaseUUID, cb.LeaseUUID)
+				gotSuccess = true
+			}
+		case <-successTimeout:
+			t.Fatal("timeout waiting for re-provision success callback — " +
+				"RefreshState may not be called before ListProvisions")
+		}
 	}
 
 	drainCallbacks()

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -48,9 +49,22 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	cfg.StartupVerifyDuration = 1 * time.Second
 	cfg.ReconcileInterval = 1 * time.Hour // disable during tests
 	cfg.ProvisionTimeout = 2 * time.Minute
+	// Isolate DB stores per test to avoid replaying stale callbacks from previous runs.
+	tmpDir := t.TempDir()
+	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
 
 	if cfgFn != nil {
 		cfgFn(&cfg)
+	}
+
+	// If the test didn't set VolumeDataPath, zero out DiskMB on all profiles
+	// so config validation doesn't require a volume filesystem.
+	if cfg.VolumeDataPath == "" {
+		for name, p := range cfg.SKUProfiles {
+			p.DiskMB = 0
+			cfg.SKUProfiles[name] = p
+		}
 	}
 
 	logger := slog.Default()
@@ -811,6 +825,13 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	cfg.ReconcileInterval = 1 * time.Hour
 	cfg.ProvisionTimeout = 2 * time.Minute
 	cfg.NetworkIsolation = ptrBool(false)
+	tmpDir := t.TempDir()
+	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	for name, p := range cfg.SKUProfiles {
+		p.DiskMB = 0
+		cfg.SKUProfiles[name] = p
+	}
 
 	logger := slog.Default()
 	b, err := New(cfg, logger)
@@ -894,6 +915,13 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	cfg.ReconcileInterval = 1 * time.Hour
 	cfg.ProvisionTimeout = 2 * time.Minute
 	cfg.NetworkIsolation = ptrBool(false)
+	tmpDir := t.TempDir()
+	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	for name, p := range cfg.SKUProfiles {
+		p.DiskMB = 0
+		cfg.SKUProfiles[name] = p
+	}
 
 	logger := slog.Default()
 	b, err := New(cfg, logger)
@@ -1064,4 +1092,372 @@ func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
 	for _, id := range networkIDs[1:] {
 		assert.Equal(t, networkIDs[0], id, "all goroutines should return the same network ID")
 	}
+}
+
+// TestIntegration_Docker_UnknownSKU_Rejected verifies that a provision request
+// with an unknown SKU is rejected synchronously with ErrValidation, and no
+// containers or resources are leaked.
+func TestIntegration_Docker_UnknownSKU_Rejected(t *testing.T) {
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("bad-sku-%d", time.Now().UnixNano())
+
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "nonexistent-sku-xyz", Quantity: 1}},
+		CallbackURL:  "http://localhost:9999/callback",
+		Payload:      payload,
+	})
+
+	// Should fail synchronously with a validation error
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrValidation, "unknown SKU should return ErrValidation")
+
+	// No containers should have been created
+	containers := inspectProvisionContainers(t, leaseUUID)
+	assert.Empty(t, containers, "no containers should exist after SKU rejection")
+
+	// ListProvisions should not include this lease
+	provisions, listErr := b.ListProvisions(ctx)
+	require.NoError(t, listErr)
+	for _, p := range provisions {
+		assert.NotEqual(t, leaseUUID, p.LeaseUUID, "rejected lease should not appear in ListProvisions")
+	}
+}
+
+// TestIntegration_Docker_InvalidManifest_Rejected verifies that a provision
+// request with an invalid manifest (missing image) or a disallowed image
+// registry is rejected synchronously, with no resource leaks.
+func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+
+	t.Run("empty_manifest", func(t *testing.T) {
+		leaseUUID := fmt.Sprintf("bad-manifest-%d", time.Now().UnixNano())
+
+		// Manifest with empty image
+		manifest := DockerManifest{
+			Image:   "",
+			Command: []string{"sleep", "3600"},
+		}
+		payload, err := json.Marshal(manifest)
+		require.NoError(t, err)
+
+		err = b.Provision(ctx, backend.ProvisionRequest{
+			LeaseUUID:    leaseUUID,
+			Tenant:       "test-tenant",
+			ProviderUUID: "test-provider",
+			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:  "http://localhost:9999/callback",
+			Payload:      payload,
+		})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, backend.ErrInvalidManifest, "empty image should return ErrInvalidManifest")
+
+		containers := inspectProvisionContainers(t, leaseUUID)
+		assert.Empty(t, containers, "no containers should exist after manifest rejection")
+	})
+
+	t.Run("disallowed_registry", func(t *testing.T) {
+		leaseUUID := fmt.Sprintf("bad-registry-%d", time.Now().UnixNano())
+
+		// Use an image from a registry not in AllowedRegistries
+		manifest := DockerManifest{
+			Image:   "registry.evil.com/malware:latest",
+			Command: []string{"sleep", "3600"},
+		}
+		payload, err := json.Marshal(manifest)
+		require.NoError(t, err)
+
+		err = b.Provision(ctx, backend.ProvisionRequest{
+			LeaseUUID:    leaseUUID,
+			Tenant:       "test-tenant",
+			ProviderUUID: "test-provider",
+			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:  "http://localhost:9999/callback",
+			Payload:      payload,
+		})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, backend.ErrValidation, "disallowed registry should return ErrValidation")
+
+		containers := inspectProvisionContainers(t, leaseUUID)
+		assert.Empty(t, containers, "no containers should exist after registry rejection")
+	})
+
+	t.Run("garbage_payload", func(t *testing.T) {
+		leaseUUID := fmt.Sprintf("garbage-%d", time.Now().UnixNano())
+
+		err := b.Provision(ctx, backend.ProvisionRequest{
+			LeaseUUID:    leaseUUID,
+			Tenant:       "test-tenant",
+			ProviderUUID: "test-provider",
+			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:  "http://localhost:9999/callback",
+			Payload:      []byte("not valid json"),
+		})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, backend.ErrInvalidManifest, "garbage payload should return ErrInvalidManifest")
+	})
+}
+
+// TestIntegration_Docker_DuplicateProvision_Rejected verifies that provisioning
+// the same lease UUID twice returns ErrAlreadyProvisioned while the first
+// provision is still active.
+func TestIntegration_Docker_DuplicateProvision_Rejected(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("dup-%d", time.Now().UnixNano())
+
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	req := backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	}
+
+	// First provision should succeed
+	err = b.Provision(ctx, req)
+	require.NoError(t, err)
+
+	// Wait for the first provision to complete
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for first provision callback")
+	}
+
+	// Second provision with same lease UUID should be rejected
+	err = b.Provision(ctx, req)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned,
+		"duplicate provision should return ErrAlreadyProvisioned")
+
+	// Should still have exactly 1 container (the first provision)
+	containers := inspectProvisionContainers(t, leaseUUID)
+	assert.Len(t, containers, 1, "duplicate provision should not create extra containers")
+
+	// Original provision should still be healthy
+	info := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, info.Status)
+}
+
+// TestIntegration_Docker_ResourceExhaustion_Rejected verifies that when
+// the resource pool is full, new provisions are rejected synchronously with
+// ErrInsufficientResources and previously allocated resources are rolled back.
+func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	// Create a backend with very limited resources (only enough for 1 micro container)
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.TotalCPUCores = 0.25  // exactly 1 docker-micro (0.25 cores)
+		cfg.TotalMemoryMB = 256   // exactly 1 docker-micro (256 MB)
+	})
+
+	ctx := context.Background()
+
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	// First provision should succeed (uses all resources)
+	leaseUUID1 := fmt.Sprintf("exhaust-1-%d", time.Now().UnixNano())
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID1,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for first provision callback")
+	}
+
+	// Second provision should fail — pool is exhausted
+	leaseUUID2 := fmt.Sprintf("exhaust-2-%d", time.Now().UnixNano())
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID2,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInsufficientResources,
+		"exhausted pool should return ErrInsufficientResources")
+
+	// No containers should have been created for the second lease
+	containers := inspectProvisionContainers(t, leaseUUID2)
+	assert.Empty(t, containers, "rejected lease should have no containers")
+
+	// The rejected lease should not appear in ListProvisions
+	provisions, listErr := b.ListProvisions(ctx)
+	require.NoError(t, listErr)
+	for _, p := range provisions {
+		assert.NotEqual(t, leaseUUID2, p.LeaseUUID, "rejected lease should not appear in ListProvisions")
+	}
+
+	// First provision should still be healthy
+	info := getProvisionInfo(t, b, leaseUUID1)
+	assert.Equal(t, backend.ProvisionStatusReady, info.Status)
+
+	// After deprovisioning the first lease, the second should succeed
+	err = b.Deprovision(ctx, leaseUUID1)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID2,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for second provision callback after freeing resources")
+	}
+}
+
+// TestIntegration_Docker_SameTenantNetwork_Shared verifies that two leases
+// belonging to the same tenant share a single Docker network, while different
+// tenants get separate networks.
+func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(true)
+	})
+
+	ctx := context.Background()
+	tenant := fmt.Sprintf("shared-net-%d", time.Now().UnixNano())
+	otherTenant := fmt.Sprintf("other-net-%d", time.Now().UnixNano())
+	leaseUUID1 := fmt.Sprintf("same-net-1-%d", time.Now().UnixNano())
+	leaseUUID2 := fmt.Sprintf("same-net-2-%d", time.Now().UnixNano())
+	leaseUUID3 := fmt.Sprintf("other-net-%d", time.Now().UnixNano())
+
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	// Provision two leases for the same tenant
+	for _, uuid := range []string{leaseUUID1, leaseUUID2} {
+		err = b.Provision(ctx, backend.ProvisionRequest{
+			LeaseUUID:    uuid,
+			Tenant:       tenant,
+			ProviderUUID: "test-provider",
+			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:  callbackServer.URL,
+			Payload:      payload,
+		})
+		require.NoError(t, err)
+	}
+
+	// Provision one lease for a different tenant
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID3,
+		Tenant:       otherTenant,
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	// Wait for all 3 callbacks
+	received := 0
+	for received < 3 {
+		select {
+		case cb := <-callbackCh:
+			assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+			received++
+		case <-time.After(2 * time.Minute):
+			t.Fatalf("timeout waiting for callbacks, got %d/3", received)
+		}
+	}
+
+	// Inspect container networks via Docker API
+	docker, err := NewDockerClient("")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+
+	getContainerNetwork := func(leaseUUID string) string {
+		t.Helper()
+		containers := inspectProvisionContainers(t, leaseUUID)
+		require.Len(t, containers, 1, "expected 1 container for lease %s", leaseUUID)
+		// Container's NetworkSettings.Networks is a map of network names
+		for netName := range containers[0].NetworkSettings.Networks {
+			return netName
+		}
+		t.Fatalf("container for lease %s has no network", leaseUUID)
+		return ""
+	}
+
+	net1 := getContainerNetwork(leaseUUID1)
+	net2 := getContainerNetwork(leaseUUID2)
+	net3 := getContainerNetwork(leaseUUID3)
+
+	// Same tenant leases should share the same network
+	assert.Equal(t, net1, net2, "same-tenant leases should share a network")
+
+	// Different tenant should have a different network
+	assert.NotEqual(t, net1, net3, "different-tenant leases should have separate networks")
+
+	// Verify the network names follow the expected naming convention
+	expectedTenantNet := TenantNetworkName(tenant)
+	assert.Equal(t, expectedTenantNet, net1, "network name should match TenantNetworkName convention")
+
+	expectedOtherNet := TenantNetworkName(otherTenant)
+	assert.Equal(t, expectedOtherNet, net3, "other tenant network should match convention")
 }

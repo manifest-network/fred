@@ -29,6 +29,7 @@ type mockReconcilerBackend struct {
 	provisionErr     error
 	deprovisionErr   error
 	listErr          error
+	refreshErr       error
 }
 
 func (m *mockReconcilerBackend) Name() string {
@@ -74,7 +75,7 @@ func (m *mockReconcilerBackend) Health(ctx context.Context) error {
 }
 
 func (m *mockReconcilerBackend) RefreshState(ctx context.Context) error {
-	return nil
+	return m.refreshErr
 }
 
 func (m *mockReconcilerBackend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
@@ -1560,9 +1561,11 @@ func (m *mockConcurrencyBackend) GetLogs(ctx context.Context, leaseUUID string, 
 
 // mockInFlightTracker implements ReconcilerTracker for testing orphaned payload cleanup.
 type mockInFlightTracker struct {
-	payloadStore *payload.Store
-	inFlight     map[string]InFlightProvision
-	mu           sync.Mutex
+	payloadStore   *payload.Store
+	inFlight       map[string]InFlightProvision
+	mu             sync.Mutex
+	hasPayloadErr  error
+	hasPayloadFunc func(leaseUUID string) (bool, error) // optional override
 }
 
 func newMockInFlightTracker(payloadStore *payload.Store) *mockInFlightTracker {
@@ -1653,6 +1656,12 @@ func (m *mockInFlightTracker) GetTimedOutProvisions(timeout time.Duration) []InF
 }
 
 func (m *mockInFlightTracker) HasPayload(leaseUUID string) (bool, error) {
+	if m.hasPayloadErr != nil {
+		return false, m.hasPayloadErr
+	}
+	if m.hasPayloadFunc != nil {
+		return m.hasPayloadFunc(leaseUUID)
+	}
 	if m.payloadStore == nil {
 		return false, nil
 	}
@@ -1962,6 +1971,53 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	require.Len(t, rejectedLeases, 1)
 	assert.Equal(t, "lease-1", rejectedLeases[0])
 	assert.Equal(t, rejectReasonInvalidSKU, rejectedReason)
+}
+
+func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
+	// Setup: Pending lease on chain, not provisioned, backend returns ErrCircuitOpen
+	// Expected: Reject the lease immediately (not left pending forever)
+	var rejectedLeases []string
+	var rejectedReason string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			rejectedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: backend.ErrCircuitOpen,
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was rejected (not left pending forever)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, rejectedLeases, 1)
+	assert.Equal(t, "lease-1", rejectedLeases[0])
+	assert.Equal(t, "backend unavailable", rejectedReason)
 }
 
 func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *testing.T) {
@@ -2318,4 +2374,428 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after lease close")
+}
+
+// --- Gap tests: fetchAllProvisions, payload lifecycle, RefreshState ---
+
+func TestReconciler_ReconcileAll_ListProvisionError_AbortsReconciliation(t *testing.T) {
+	// When ListProvisions fails on any backend, ReconcileAll should abort entirely.
+	// Partial data would cause the reconciler to misidentify running containers
+	// as orphans and deprovision them.
+	mockChain := &chain.MockClient{
+		// Return an active lease so that a false orphan would be detected
+		// if we proceeded with partial data.
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:    "test",
+		listErr: errors.New("docker daemon unavailable"),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	err = reconciler.ReconcileAll(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "incomplete backend data")
+
+	// Verify no provisioning or deprovisioning occurred
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls)
+	assert.Empty(t, mockBackend.deprovisionCalls)
+}
+
+func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Closes(t *testing.T) {
+	// ACTIVE lease with failed provision (FailCount < max). Re-provisioning
+	// requires a payload (MetaHash is set), but the payload store is empty.
+	// errPayloadNotAvailable is a permanent failure — the lease should be closed.
+	var closedLeases []string
+	var closedReason string
+	var mu sync.Mutex
+
+	payloadHash := sha256.Sum256([]byte("some manifest"))
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_ACTIVE,
+					MetaHash: payloadHash[:],
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			closedReason = reason
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{
+				LeaseUUID:   "lease-1",
+				Status:      backend.ProvisionStatusFailed,
+				FailCount:   1, // Below max — would normally re-provision
+				BackendName: "test",
+			},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	// Empty payload store — no payload available for re-provisioning
+	tmpDir := t.TempDir()
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: tmpDir + "/payloads.db",
+	})
+	require.NoError(t, err)
+	defer payloadStore.Close()
+
+	tracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, tracker, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify the lease was closed (permanent failure, not transient)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, closedLeases, 1)
+	assert.Equal(t, "lease-1", closedLeases[0])
+	assert.Contains(t, closedReason, "payload not available")
+
+	// Verify no provisioning was attempted (error happened before Provision call)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls)
+}
+
+func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.T) {
+	// PENDING lease with MetaHash but the payload hasn't been uploaded yet.
+	// The reconciler should do nothing — no provisioning, no rejection.
+	// It just waits for the tenant to upload the payload.
+	var rejectedLeases []string
+	var mu sync.Mutex
+
+	payloadHash := sha256.Sum256([]byte("future manifest"))
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_PENDING,
+					MetaHash: payloadHash[:],
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			return 0, nil, errors.New("should not be called")
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{}, // Not provisioned yet
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	// Empty payload store — payload not yet uploaded
+	tmpDir := t.TempDir()
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: tmpDir + "/payloads.db",
+	})
+	require.NoError(t, err)
+	defer payloadStore.Close()
+
+	tracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, tracker, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify no actions were taken — waiting for payload upload
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls, "should not provision without payload")
+	assert.Empty(t, mockBackend.deprovisionCalls, "should not deprovision")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Empty(t, rejectedLeases, "should not reject — lease is just waiting for payload")
+}
+
+func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *testing.T) {
+	// Payload is in the store but its hash doesn't match the lease's MetaHash.
+	// This simulates disk corruption. The reconciler should:
+	// 1. Delete the corrupt payload from the store
+	// 2. NOT call Provision (hash check happens before)
+	// 3. Treat it as an error (transient — payload needs re-upload)
+	payloadData := []byte("original manifest payload")
+	wrongHash := sha256.Sum256([]byte("different payload entirely"))
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_PENDING,
+					MetaHash: wrongHash[:], // Doesn't match payloadData
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	tmpDir := t.TempDir()
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: tmpDir + "/payloads.db",
+	})
+	require.NoError(t, err)
+	defer payloadStore.Close()
+
+	// Store payload that will fail hash verification
+	payloadStore.Store("lease-1", payloadData)
+	has, err := payloadStore.Has("lease-1")
+	require.NoError(t, err)
+	require.True(t, has)
+
+	tracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, tracker, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	// ReconcileAll succeeds even with per-lease errors
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify corrupt payload was deleted from store
+	has, err = payloadStore.Has("lease-1")
+	require.NoError(t, err)
+	assert.False(t, has, "corrupt payload should be deleted from store")
+
+	// Verify no provisioning was attempted (hash check happens before Provision)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls)
+}
+
+func TestReconciler_ReconcileAll_PayloadStoreGetError_TransientError(t *testing.T) {
+	// When PayloadStore.Get() returns a database error (not nil payload),
+	// the reconciler should treat it as a transient error — NOT close the lease.
+	// This prevents a disk hiccup from permanently terminating active leases.
+	//
+	// Uses ACTIVE + not provisioned (anomaly) to bypass HasPayload and go
+	// directly to startProvisioningWithPayload → doStartProvisioning → Get().
+	var closedLeases []string
+	var mu sync.Mutex
+
+	payloadData := []byte("test manifest")
+	payloadHash := sha256.Sum256(payloadData)
+
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_ACTIVE,
+					MetaHash: payloadHash[:],
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{}, // Not provisioned (anomaly path)
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	// Create payload store, store data, then close it to force Get() errors
+	tmpDir := t.TempDir()
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: tmpDir + "/payloads.db",
+	})
+	require.NoError(t, err)
+	payloadStore.Store("lease-1", payloadData)
+	require.NoError(t, payloadStore.Close()) // Force "database not open" on Get()
+
+	tracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, tracker, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	// ReconcileAll succeeds even with per-lease errors
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify lease was NOT closed (transient error, should retry next cycle)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Empty(t, closedLeases, "DB error is transient — lease should NOT be closed")
+
+	// Verify no provisioning was attempted (error aborted before Provision call)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls)
+}
+
+func TestReconciler_ReconcileAll_RefreshStateError_ContinuesWithStaleData(t *testing.T) {
+	// When RefreshState returns an error, reconciliation should continue
+	// using stale data rather than aborting. Stale state may be slightly
+	// out of date but is far better than no reconciliation at all.
+	mockChain := &chain.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		},
+		refreshErr: errors.New("docker daemon busy"),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	err = reconciler.ReconcileAll(ctx)
+	assert.NoError(t, err, "should succeed despite RefreshState error")
+
+	// Verify no unnecessary actions (ACTIVE + Ready → healthy with stale data)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls)
+	assert.Empty(t, mockBackend.deprovisionCalls)
+}
+
+func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
+	// When tracker.HasPayload() returns a database error, the reconciler
+	// should not attempt provisioning and should count it as a lease error.
+	// It should NOT reject the lease (the error is transient, not permanent).
+	var rejectedLeases []string
+	var mu sync.Mutex
+
+	payloadHash := sha256.Sum256([]byte("some manifest"))
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_PENDING,
+					MetaHash: payloadHash[:],
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{}, // Not provisioned
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	tracker := newMockInFlightTracker(nil) // no payload store needed
+	tracker.hasPayloadErr = errors.New("disk I/O error")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, tracker, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	// ReconcileAll succeeds even with per-lease errors
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// Verify no provisioning was attempted
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls, "should not provision when HasPayload errors")
+
+	// Verify lease was NOT rejected (transient error, not permanent)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Empty(t, rejectedLeases, "should not reject — HasPayload error is transient")
 }

@@ -11,7 +11,7 @@ type SKUProfile struct {
 	DiskMB   int64   `yaml:"disk_mb"`
 }
 
-// Validate checks that the profile's resource values are positive.
+// Validate checks that the profile's resource values are valid.
 func (p SKUProfile) Validate() error {
 	if p.CPUCores <= 0 {
 		return fmt.Errorf("cpu_cores must be positive")
@@ -19,8 +19,8 @@ func (p SKUProfile) Validate() error {
 	if p.MemoryMB <= 0 {
 		return fmt.Errorf("memory_mb must be positive")
 	}
-	if p.DiskMB <= 0 {
-		return fmt.Errorf("disk_mb must be positive")
+	if p.DiskMB < 0 {
+		return fmt.Errorf("disk_mb must be non-negative")
 	}
 	return nil
 }

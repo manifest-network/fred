@@ -185,3 +185,47 @@ The simplest valid manifest:
   "tmpfs": ["/var/cache/app"]
 }
 ```
+
+## Redis Example
+
+Requires a stateful SKU with `disk_mb > 0` (configured by the operator). The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts and re-provisions but is destroyed on deprovision.
+
+```json
+{
+  "image": "redis:7",
+  "ports": {
+    "6379/tcp": {}
+  },
+  "health_check": {
+    "test": ["CMD", "redis-cli", "ping"],
+    "interval": "10s",
+    "timeout": "3s",
+    "retries": 3,
+    "start_period": "5s"
+  }
+}
+```
+
+## PostgreSQL Example
+
+Requires a stateful SKU with `disk_mb > 0`. The image's VOLUME paths (`/var/lib/postgresql/data`) are automatically discovered and bind-mounted to a quota-enforced host directory.
+
+```json
+{
+  "image": "postgres:16",
+  "ports": {
+    "5432/tcp": {}
+  },
+  "env": {
+    "POSTGRES_PASSWORD": "changeme",
+    "POSTGRES_DB": "myapp"
+  },
+  "health_check": {
+    "test": ["CMD-SHELL", "pg_isready -U postgres"],
+    "interval": "10s",
+    "timeout": "5s",
+    "retries": 5,
+    "start_period": "30s"
+  }
+}
+```

@@ -12,11 +12,13 @@ func TestSKUProfile_Validate(t *testing.T) {
 		profile SKUProfile
 		wantErr string
 	}{
-		{name: "valid", profile: SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		{name: "valid with disk", profile: SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		{name: "valid without disk", profile: SKUProfile{CPUCores: 1, MemoryMB: 512}},
+		{name: "valid zero disk", profile: SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 0}},
+		{name: "negative disk_mb", profile: SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: -1}, wantErr: "disk_mb must be non-negative"},
 		{name: "zero cpu", profile: SKUProfile{CPUCores: 0, MemoryMB: 512, DiskMB: 1024}, wantErr: "cpu_cores"},
 		{name: "negative cpu", profile: SKUProfile{CPUCores: -1, MemoryMB: 512, DiskMB: 1024}, wantErr: "cpu_cores"},
 		{name: "zero memory", profile: SKUProfile{CPUCores: 1, MemoryMB: 0, DiskMB: 1024}, wantErr: "memory_mb"},
-		{name: "zero disk", profile: SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 0}, wantErr: "disk_mb"},
 		{name: "zero value", profile: SKUProfile{}, wantErr: "cpu_cores"},
 	}
 	for _, tt := range tests {
