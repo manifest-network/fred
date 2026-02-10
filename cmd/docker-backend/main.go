@@ -172,6 +172,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /logs/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetLogs)))
 	mux.Handle("GET /provisions/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetProvision)))
 	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
+	mux.Handle("POST /restart", authMw(http.HandlerFunc(s.handleRestart)))
+	mux.Handle("POST /update", authMw(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("GET /releases/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetReleases)))
 
 	// Operational endpoints — no auth required (monitoring, health checks).
 	mux.HandleFunc("GET /health", s.handleHealth)
@@ -312,6 +315,113 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(StatusResponse{Status: "ok"})
+}
+
+func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+	var req backend.RestartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.LeaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+	if req.CallbackURL == "" {
+		s.errorResponse(w, http.StatusBadRequest, "callback_url is required")
+		return
+	}
+	if err := validateCallbackURL(req.CallbackURL); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
+		return
+	}
+
+	err := s.backend.Restart(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponse(w, http.StatusConflict, "invalid state for restart")
+			return
+		}
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(StatusResponse{Status: "restarting"})
+}
+
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	var req backend.UpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.LeaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+	if req.CallbackURL == "" {
+		s.errorResponse(w, http.StatusBadRequest, "callback_url is required")
+		return
+	}
+	if err := validateCallbackURL(req.CallbackURL); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
+		return
+	}
+	if len(req.Payload) == 0 {
+		s.errorResponse(w, http.StatusBadRequest, "payload is required")
+		return
+	}
+
+	err := s.backend.Update(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponse(w, http.StatusConflict, "invalid state for update")
+			return
+		}
+		if errors.Is(err, backend.ErrValidation) {
+			s.validationErrorResponse(w, err)
+			return
+		}
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(StatusResponse{Status: "updating"})
+}
+
+func (s *Server) handleGetReleases(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+	if leaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+
+	releases, err := s.backend.GetReleases(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(releases)
 }
 
 // StatsResponse is the response body for /stats.

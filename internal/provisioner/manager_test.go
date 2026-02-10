@@ -89,6 +89,18 @@ func (m *mockManagerBackend) GetLogs(ctx context.Context, leaseUUID string, tail
 	return nil, backend.ErrNotProvisioned
 }
 
+func (m *mockManagerBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	return nil
+}
+
+func (m *mockManagerBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	return nil
+}
+
+func (m *mockManagerBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
 func TestNewManager_Validation(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{

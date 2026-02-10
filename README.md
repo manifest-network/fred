@@ -11,6 +11,7 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 - **Periodic Withdrawals**: Configurable scheduled withdrawal of accumulated fees from active leases
 - **Credit Monitoring**: Tracks tenant credit balances and auto-closes leases when credit is depleted
 - **Cross-Provider Credit Detection**: Responds to credit depletion events from other providers
+- **Live Operations**: Restart containers or deploy new manifests (update) on active leases with full release history tracking
 - **Security**: Rate limiting, request size limits, input validation, and optional TLS
 
 ## Architecture Overview
@@ -92,6 +93,23 @@ sequenceDiagram
     F->>F: Verify signature & lease ownership
     F->>B: GET /info/{uuid}
     F-->>T: Connection details
+
+    Note over T,B: Restart (same manifest)
+    T->>F: POST /v1/leases/{uuid}/restart
+    F->>B: POST /restart
+    B->>B: Stop, recreate containers (async)
+    B->>F: POST /callbacks/provision (success)
+
+    Note over T,B: Update (new manifest)
+    T->>F: POST /v1/leases/{uuid}/update
+    F->>B: POST /update
+    B->>B: Pull image, replace containers (async)
+    B->>F: POST /callbacks/provision (success)
+
+    Note over T,B: Release History
+    T->>F: GET /v1/leases/{uuid}/releases
+    F->>B: GET /releases/{uuid}
+    F-->>T: Release history
 
     Note over T,B: Lease Closure
     T->>C: Close Lease (or credit depleted)
@@ -207,6 +225,8 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
 | `placement_store_db_path` | Path to bbolt database for lease→backend placement tracking (required for round-robin) | (optional) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
+| `releases_db_path` | Path to bbolt database for release history (docker-backend) | `releases.db` |
+| `releases_max_age` | Maximum age of persisted release entries (docker-backend) | `90d` |
 
 ### Advanced Configuration
 
@@ -491,6 +511,106 @@ The signed message format is: `manifest lease data {lease_uuid} {meta_hash_hex} 
 - `404 Not Found` - Lease not found or not PENDING
 - `409 Conflict` - Payload already received
 
+### Restart Lease
+
+```
+POST /v1/leases/{lease_uuid}/restart
+Authorization: Bearer <token>
+```
+
+Restart containers for a lease without changing the manifest. Containers are stopped, removed, and recreated with the same configuration. Volumes are preserved.
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "restarting"
+}
+```
+
+**Response Codes:**
+- `202 Accepted` - Restart initiated
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Lease is in a state that cannot be restarted (e.g., already restarting or updating)
+
+### Update Lease
+
+```
+POST /v1/leases/{lease_uuid}/update
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "payload": "<base64-encoded-manifest>"
+}
+```
+
+Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are removed and new ones are created from the updated manifest. Volumes are preserved.
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "updating"
+}
+```
+
+**Response Codes:**
+- `202 Accepted` - Update initiated
+- `400 Bad Request` - Invalid payload or manifest validation error
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Lease is in a state that cannot be updated (e.g., currently restarting)
+
+### Get Release History
+
+```
+GET /v1/leases/{lease_uuid}/releases
+Authorization: Bearer <token>
+```
+
+Returns the release (deployment) history for a lease, showing each version that was deployed.
+
+**Response:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "releases": [
+    {
+      "version": 1,
+      "image": "nginx:1.24",
+      "status": "superseded",
+      "created_at": "2024-01-15T10:30:00Z",
+      "manifest": "<base64-encoded-manifest>"
+    },
+    {
+      "version": 2,
+      "image": "nginx:1.25",
+      "status": "active",
+      "created_at": "2024-01-16T14:00:00Z",
+      "manifest": "<base64-encoded-manifest>"
+    }
+  ]
+}
+```
+
+**Fields:**
+- `version` - Monotonically increasing version number
+- `image` - Container image used in this release
+- `status` - Release status: `deploying`, `active`, `superseded`, or `failed`
+- `created_at` - When this release was created
+- `error` - Error message (only present on failed releases)
+- `manifest` - The manifest payload used for this release
+
+**Response Codes:**
+- `200 OK` - Releases found (may be an empty array)
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Lease not provisioned
+
 ### Provision Callback (Backend -> Fred)
 
 ```
@@ -671,6 +791,81 @@ List all provisions (for reconciliation).
   ]
 }
 ```
+
+### POST /restart
+
+Restart containers for a lease without changing the manifest (async).
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision"
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "restarting"
+}
+```
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Invalid state for restart (e.g., already restarting or updating)
+
+### POST /update
+
+Deploy a new manifest for a lease, replacing containers (async).
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision",
+  "payload": "<base64-encoded-manifest>",
+  "payload_hash": "sha256-hex-string"
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "updating"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` - Invalid manifest or validation error
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Invalid state for update
+
+### GET /releases/{lease_uuid}
+
+Get release (deployment) history for a lease.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "version": 1,
+    "image": "nginx:1.24",
+    "status": "superseded",
+    "created_at": "2024-01-15T10:30:00Z",
+    "manifest": "<base64-encoded-manifest>"
+  },
+  {
+    "version": 2,
+    "image": "nginx:1.25",
+    "status": "active",
+    "created_at": "2024-01-16T14:00:00Z",
+    "manifest": "<base64-encoded-manifest>"
+  }
+]
+```
+
+**Response:** `404 Not Found` if not provisioned.
 
 ## Running E2E Tests with Mock Backend
 
@@ -901,6 +1096,8 @@ Chain State (leases)     Backend State (provisions)
 | PENDING (no hash) | Not provisioned | Start provisioning |
 | PENDING | Provisioned + ready | Acknowledge lease |
 | ACTIVE | Provisioned + ready | Healthy - no action |
+| ACTIVE | Provisioned + restarting | In-flight restart - no action |
+| ACTIVE | Provisioned + updating | In-flight update - no action |
 | ACTIVE | Provisioned + failed | Anomaly: re-provision (with attempt limit) |
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |

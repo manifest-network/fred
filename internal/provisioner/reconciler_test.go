@@ -85,6 +85,15 @@ func (m *mockReconcilerBackend) GetProvision(ctx context.Context, leaseUUID stri
 func (m *mockReconcilerBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
 	return nil, backend.ErrNotProvisioned
 }
+func (m *mockReconcilerBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	return nil
+}
+func (m *mockReconcilerBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	return nil
+}
+func (m *mockReconcilerBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
 
 func TestNewReconciler_Validation(t *testing.T) {
 	mockChain := &chain.MockClient{}
@@ -1151,6 +1160,15 @@ func (m *mockCancellingBackend) GetProvision(ctx context.Context, leaseUUID stri
 func (m *mockCancellingBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
 	return nil, backend.ErrNotProvisioned
 }
+func (m *mockCancellingBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	return nil
+}
+func (m *mockCancellingBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	return nil
+}
+func (m *mockCancellingBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
 
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
@@ -1556,6 +1574,15 @@ func (m *mockConcurrencyBackend) GetProvision(ctx context.Context, leaseUUID str
 }
 
 func (m *mockConcurrencyBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	return nil, backend.ErrNotProvisioned
+}
+func (m *mockConcurrencyBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	return nil
+}
+func (m *mockConcurrencyBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	return nil
+}
+func (m *mockConcurrencyBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
 	return nil, backend.ErrNotProvisioned
 }
 

@@ -34,6 +34,7 @@ type dockerClient interface {
 	ResolveImageUser(ctx context.Context, imageName string, userOverride string) (uid, gid int, err error)
 	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
+	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainer(ctx context.Context, containerID string) error
 	InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error)
 	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
@@ -67,6 +68,9 @@ type Backend struct {
 	// diagnosticsStore persists failure diagnostics in bbolt
 	diagnosticsStore *shared.DiagnosticsStore
 
+	// releaseStore persists release history in bbolt
+	releaseStore *shared.ReleaseStore
+
 	// callbackSender handles callback delivery with retry and HMAC
 	callbackSender *shared.CallbackSender
 
@@ -88,6 +92,7 @@ type provision struct {
 	SKU          string
 	ContainerIDs []string // Multiple containers for multi-unit leases
 	Image        string
+	Manifest     *DockerManifest // Stored for restart/update operations
 	Status       backend.ProvisionStatus
 	Quantity     int // Expected number of containers
 	CreatedAt    time.Time
@@ -240,10 +245,21 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to open diagnostics store: %w", err)
 	}
 
+	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: cfg.ReleasesDBPath,
+		MaxAge: cfg.ReleasesMaxAge,
+	})
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		return nil, fmt.Errorf("failed to open release store: %w", err)
+	}
+
 	volumes, err := newVolumeManager(cfg.VolumeDataPath, cfg.VolumeFilesystem, logger)
 	if err != nil {
 		_ = cbStore.Close()
 		_ = diagStore.Close()
+		_ = releaseStore.Close()
 		return nil, fmt.Errorf("failed to create volume manager: %w", err)
 	}
 
@@ -256,6 +272,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		provisions:       make(map[string]*provision),
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
+		releaseStore:     releaseStore,
 		httpClient:       httpClient,
 	}
 
@@ -368,6 +385,11 @@ func (b *Backend) Stop() error {
 	if b.diagnosticsStore != nil {
 		if err := b.diagnosticsStore.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing diagnostics store: %w", err))
+		}
+	}
+	if b.releaseStore != nil {
+		if err := b.releaseStore.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing release store: %w", err))
 		}
 	}
 	if err := b.docker.Close(); err != nil {
@@ -607,8 +629,21 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		if prov, ok := b.provisions[req.LeaseUUID]; ok {
 			prov.ContainerIDs = containerIDs
 			prov.Status = backend.ProvisionStatusReady
+			prov.Manifest = manifest
 		}
 		b.provisionsMu.Unlock()
+
+		// Record initial release
+		if b.releaseStore != nil {
+			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
+				Manifest:  req.Payload,
+				Image:     manifest.Image,
+				Status:    "active",
+				CreatedAt: time.Now(),
+			}); relErr != nil {
+				b.logger.Warn("failed to record initial release", "lease", req.LeaseUUID, "error", relErr)
+			}
+		}
 
 		// Remove any stale diagnostic entry from a previous failure
 		// (e.g., re-provision after a crash).
@@ -911,6 +946,607 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 	}
 }
 
+// Restart restarts containers for a lease without changing the manifest.
+// State machine: Ready → Restarting → Ready|Failed
+func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	logger := b.logger.With("lease_uuid", req.LeaseUUID)
+
+	// Synchronous phase: validate state and transition to Restarting
+	b.provisionsMu.Lock()
+	prov, exists := b.provisions[req.LeaseUUID]
+	if !exists {
+		b.provisionsMu.Unlock()
+		return backend.ErrNotProvisioned
+	}
+	if prov.Status != backend.ProvisionStatusReady {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, prov.Status)
+	}
+	if prov.Manifest == nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: no stored manifest for restart", backend.ErrInvalidState)
+	}
+	prov.Status = backend.ProvisionStatusRestarting
+	if req.CallbackURL != "" {
+		prov.CallbackURL = req.CallbackURL
+	}
+	manifest := prov.Manifest
+	containerIDs := prov.ContainerIDs
+	sku := prov.SKU
+	b.provisionsMu.Unlock()
+
+	// Async phase
+	b.wg.Go(func() {
+		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+		defer cancel()
+
+		stop := context.AfterFunc(b.stopCtx, cancel)
+		defer stop()
+
+		b.doRestart(ctx, req.LeaseUUID, manifest, containerIDs, sku, logger)
+	})
+
+	return nil
+}
+
+// doRestart performs the actual container restart asynchronously.
+func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku string, logger *slog.Logger) {
+	var err error
+	var callbackErr string
+	var newContainerIDs []string
+
+	defer func() {
+		if err != nil {
+			b.provisionsMu.Lock()
+			if prov, ok := b.provisions[leaseUUID]; ok {
+				prov.Status = backend.ProvisionStatusFailed
+				prov.FailCount++
+				prov.LastError = err.Error()
+				b.persistDiagnostics(leaseUUID, prov, newContainerIDs)
+			}
+			b.provisionsMu.Unlock()
+			b.sendCallback(leaseUUID, false, callbackErr)
+			return
+		}
+
+		b.provisionsMu.Lock()
+		if prov, ok := b.provisions[leaseUUID]; ok {
+			prov.ContainerIDs = newContainerIDs
+			prov.Status = backend.ProvisionStatusReady
+		}
+		b.provisionsMu.Unlock()
+		b.sendCallback(leaseUUID, true, "")
+	}()
+
+	profile, profErr := b.cfg.GetSKUProfile(sku)
+	if profErr != nil {
+		err = fmt.Errorf("SKU profile lookup failed: %w", profErr)
+		callbackErr = "restart failed"
+		return
+	}
+
+	// Stop and remove old containers
+	stopTimeout := cmp.Or(b.cfg.ContainerStartTimeout, 30*time.Second)
+	for _, cid := range oldContainerIDs {
+		logger.Info("stopping container for restart", "container_id", shortID(cid))
+		if stopErr := b.docker.StopContainer(ctx, cid, stopTimeout); stopErr != nil {
+			logger.Warn("failed to stop container gracefully", "container_id", shortID(cid), "error", stopErr)
+		}
+		if rmErr := b.docker.RemoveContainer(ctx, cid); rmErr != nil {
+			logger.Warn("failed to remove container during restart", "container_id", shortID(cid), "error", rmErr)
+		}
+	}
+
+	// Read current fail count
+	b.provisionsMu.RLock()
+	failCount := 0
+	tenant := ""
+	providerUUID := ""
+	callbackURL := ""
+	if prov, ok := b.provisions[leaseUUID]; ok {
+		failCount = prov.FailCount
+		tenant = prov.Tenant
+		providerUUID = prov.ProviderUUID
+		callbackURL = prov.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
+
+	// Inspect image for VOLUMEs
+	imageInfo, inspectErr := b.docker.InspectImage(ctx, manifest.Image)
+	if inspectErr != nil {
+		err = fmt.Errorf("image inspect failed: %w", inspectErr)
+		callbackErr = "restart failed"
+		return
+	}
+	var imageVolumes []string
+	for v := range imageInfo.Volumes {
+		imageVolumes = append(imageVolumes, v)
+	}
+	sort.Strings(imageVolumes)
+
+	// Resolve container user
+	var volumeUID, volumeGID int
+	var containerUser string
+	if manifest.User != "" || imageInfo.User != "" {
+		volumeUID, volumeGID, err = b.docker.ResolveImageUser(ctx, manifest.Image, manifest.User)
+		if err != nil {
+			err = fmt.Errorf("image user resolution failed: %w", err)
+			callbackErr = "restart failed"
+			return
+		}
+		if volumeUID != 0 || volumeGID != 0 {
+			containerUser = fmt.Sprintf("%d:%d", volumeUID, volumeGID)
+		}
+	}
+
+	// Set up networking
+	var networkConfig *networktypes.NetworkingConfig
+	if b.cfg.IsNetworkIsolation() {
+		networkID, netErr := b.docker.EnsureTenantNetwork(ctx, tenant)
+		if netErr != nil {
+			err = fmt.Errorf("tenant network setup failed: %w", netErr)
+			callbackErr = "restart failed"
+			return
+		}
+		networkConfig = buildNetworkConfig(networkID)
+	}
+
+	// Recreate containers
+	newContainerIDs = make([]string, 0, len(oldContainerIDs))
+	for i := range oldContainerIDs {
+		// Reuse volumes via idempotent Create
+		var volumeBinds map[string]string
+		if profile.DiskMB > 0 && len(imageVolumes) > 0 {
+			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
+			hostPath, _, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
+			if volErr != nil {
+				err = fmt.Errorf("volume access failed (instance %d): %w", i, volErr)
+				callbackErr = "restart failed"
+				return
+			}
+			volumeBinds = make(map[string]string, len(imageVolumes))
+			for _, volPath := range imageVolumes {
+				sanitized := sanitizeVolumePath(volPath)
+				if sanitized == "" {
+					continue
+				}
+				subdir := filepath.Join(hostPath, sanitized)
+				if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
+					err = fmt.Errorf("volume subdir creation failed (instance %d): %w", i, mkErr)
+					callbackErr = "restart failed"
+					return
+				}
+				if volumeUID != 0 || volumeGID != 0 {
+					if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
+						err = fmt.Errorf("volume subdir chown failed (instance %d): %w", i, chownErr)
+						callbackErr = "restart failed"
+						return
+					}
+				}
+				volumeBinds[subdir] = volPath
+			}
+		}
+
+		containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
+			LeaseUUID:      leaseUUID,
+			Tenant:         tenant,
+			ProviderUUID:   providerUUID,
+			SKU:            sku,
+			Manifest:       manifest,
+			Profile:        profile,
+			InstanceIndex:  i,
+			FailCount:      failCount,
+			CallbackURL:    callbackURL,
+			HostBindIP:     b.cfg.GetHostBindIP(),
+			ReadonlyRootfs: b.cfg.IsReadonlyRootfs(),
+			PidsLimit:      b.cfg.GetPidsLimit(),
+			TmpfsSizeMB:    b.cfg.GetTmpfsSizeMB(),
+			NetworkConfig:  networkConfig,
+			VolumeBinds:    volumeBinds,
+			ImageVolumes:   imageVolumes,
+			User:           containerUser,
+		}, b.cfg.ContainerCreateTimeout)
+		if createErr != nil {
+			err = fmt.Errorf("container creation failed (instance %d): %w", i, createErr)
+			callbackErr = "restart failed"
+			return
+		}
+		newContainerIDs = append(newContainerIDs, containerID)
+
+		if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
+			err = fmt.Errorf("container start failed (instance %d): %w", i, startErr)
+			callbackErr = "restart failed"
+			return
+		}
+	}
+
+	// Startup verification
+	if manifest.HasActiveHealthCheck() {
+		if err = b.waitForHealthy(ctx, newContainerIDs, logger); err != nil {
+			callbackErr = healthErrorToCallbackMsg(err)
+			return
+		}
+	} else {
+		startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
+		select {
+		case <-ctx.Done():
+			err = fmt.Errorf("restart canceled during startup verification: %w", ctx.Err())
+			callbackErr = "restart failed"
+			return
+		case <-time.After(startupVerify):
+		}
+
+		for i, containerID := range newContainerIDs {
+			info, inspErr := b.docker.InspectContainer(ctx, containerID)
+			if inspErr != nil {
+				err = fmt.Errorf("failed to verify container %d after restart: %w", i, inspErr)
+				callbackErr = "restart failed"
+				return
+			}
+			status := containerStatusToProvisionStatus(info.Status)
+			if status != backend.ProvisionStatusReady {
+				diag := b.containerFailureDiagnostics(ctx, containerID, info)
+				err = fmt.Errorf("container %d exited during restart (status: %s): %s", i, info.Status, diag)
+				callbackErr = "restart failed"
+				return
+			}
+		}
+	}
+
+	logger.Info("restart completed", "containers", len(newContainerIDs))
+}
+
+// Update deploys a new manifest for a lease, replacing containers.
+// State machine: Ready|Failed → Updating → Ready|Failed
+func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	logger := b.logger.With("lease_uuid", req.LeaseUUID)
+
+	// Synchronous phase: validate state and new manifest
+	b.provisionsMu.Lock()
+	prov, exists := b.provisions[req.LeaseUUID]
+	if !exists {
+		b.provisionsMu.Unlock()
+		return backend.ErrNotProvisioned
+	}
+	if prov.Status != backend.ProvisionStatusReady && prov.Status != backend.ProvisionStatusFailed {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, prov.Status)
+	}
+
+	// Parse and validate new manifest
+	manifest, parseErr := ParseManifest(req.Payload)
+	if parseErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
+	}
+
+	// Validate image against allowlist
+	if imgErr := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); imgErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrValidation, imgErr)
+	}
+
+	// Validate SKU profile
+	profile, profErr := b.cfg.GetSKUProfile(prov.SKU)
+	if profErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
+	}
+
+	oldContainerIDs := prov.ContainerIDs
+	prov.Status = backend.ProvisionStatusUpdating
+	if req.CallbackURL != "" {
+		prov.CallbackURL = req.CallbackURL
+	}
+	b.provisionsMu.Unlock()
+
+	// Record release as deploying
+	if b.releaseStore != nil {
+		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
+			Manifest:  req.Payload,
+			Image:     manifest.Image,
+			Status:    "deploying",
+			CreatedAt: time.Now(),
+		}); relErr != nil {
+			logger.Warn("failed to record release", "error", relErr)
+		}
+	}
+
+	// Async phase
+	b.wg.Go(func() {
+		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+		defer cancel()
+
+		stop := context.AfterFunc(b.stopCtx, cancel)
+		defer stop()
+
+		b.doUpdate(ctx, req.LeaseUUID, manifest, req.Payload, profile, oldContainerIDs, logger)
+	})
+
+	return nil
+}
+
+// doUpdate performs the actual container update asynchronously.
+func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *DockerManifest, payload []byte, profile SKUProfile, oldContainerIDs []string, logger *slog.Logger) {
+	var err error
+	var callbackErr string
+	var newContainerIDs []string
+
+	defer func() {
+		if err != nil {
+			b.provisionsMu.Lock()
+			if prov, ok := b.provisions[leaseUUID]; ok {
+				prov.Status = backend.ProvisionStatusFailed
+				prov.FailCount++
+				prov.LastError = err.Error()
+				b.persistDiagnostics(leaseUUID, prov, newContainerIDs)
+			}
+			b.provisionsMu.Unlock()
+
+			// Mark release as failed
+			if b.releaseStore != nil {
+				if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", err.Error()); relErr != nil {
+					logger.Warn("failed to update release status", "error", relErr)
+				}
+			}
+
+			// Clean up any new containers created
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			for _, cid := range newContainerIDs {
+				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
+					logger.Warn("failed to cleanup container after update error", "container_id", shortID(cid), "error", rmErr)
+				}
+			}
+
+			b.sendCallback(leaseUUID, false, callbackErr)
+			return
+		}
+
+		// Success: update provision
+		b.provisionsMu.Lock()
+		if prov, ok := b.provisions[leaseUUID]; ok {
+			prov.ContainerIDs = newContainerIDs
+			prov.Status = backend.ProvisionStatusReady
+			prov.Image = manifest.Image
+			prov.Manifest = manifest
+		}
+		b.provisionsMu.Unlock()
+
+		// Mark release as active, previous as superseded
+		if b.releaseStore != nil {
+			releases, listErr := b.releaseStore.List(leaseUUID)
+			if listErr == nil && len(releases) >= 2 {
+				// Mark all previous as superseded
+				for i := 0; i < len(releases)-1; i++ {
+					if releases[i].Status == "active" {
+						releases[i].Status = "superseded"
+					}
+				}
+				releases[len(releases)-1].Status = "active"
+				// Rewrite (we need to delete and re-append)
+				// Instead, just update the latest status
+			}
+			if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "active", ""); relErr != nil {
+				logger.Warn("failed to update release status", "error", relErr)
+			}
+		}
+
+		b.sendCallback(leaseUUID, true, "")
+	}()
+
+	// Pull new image
+	logger.Info("pulling image for update", "image", manifest.Image)
+	if err = b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); err != nil {
+		err = fmt.Errorf("image pull failed: %w", err)
+		callbackErr = "image pull failed"
+		return
+	}
+
+	// Inspect image for VOLUMEs
+	imageInfo, inspectErr := b.docker.InspectImage(ctx, manifest.Image)
+	if inspectErr != nil {
+		err = fmt.Errorf("image inspect failed: %w", inspectErr)
+		callbackErr = "image inspect failed"
+		return
+	}
+	var imageVolumes []string
+	for v := range imageInfo.Volumes {
+		imageVolumes = append(imageVolumes, v)
+	}
+	sort.Strings(imageVolumes)
+
+	// Resolve container user
+	var volumeUID, volumeGID int
+	var containerUser string
+	if manifest.User != "" || imageInfo.User != "" {
+		volumeUID, volumeGID, err = b.docker.ResolveImageUser(ctx, manifest.Image, manifest.User)
+		if err != nil {
+			err = fmt.Errorf("image user resolution failed: %w", err)
+			callbackErr = "image user resolution failed"
+			return
+		}
+		if volumeUID != 0 || volumeGID != 0 {
+			containerUser = fmt.Sprintf("%d:%d", volumeUID, volumeGID)
+		}
+	}
+
+	// Read provision metadata
+	b.provisionsMu.RLock()
+	failCount := 0
+	tenant := ""
+	providerUUID := ""
+	callbackURL := ""
+	sku := ""
+	quantity := len(oldContainerIDs)
+	if prov, ok := b.provisions[leaseUUID]; ok {
+		failCount = prov.FailCount
+		tenant = prov.Tenant
+		providerUUID = prov.ProviderUUID
+		callbackURL = prov.CallbackURL
+		sku = prov.SKU
+		quantity = prov.Quantity
+	}
+	b.provisionsMu.RUnlock()
+
+	// Set up networking
+	var networkConfig *networktypes.NetworkingConfig
+	if b.cfg.IsNetworkIsolation() {
+		networkID, netErr := b.docker.EnsureTenantNetwork(ctx, tenant)
+		if netErr != nil {
+			err = fmt.Errorf("tenant network setup failed: %w", netErr)
+			callbackErr = "update failed"
+			return
+		}
+		networkConfig = buildNetworkConfig(networkID)
+	}
+
+	// Remove old containers
+	for _, cid := range oldContainerIDs {
+		if rmErr := b.docker.RemoveContainer(ctx, cid); rmErr != nil {
+			logger.Warn("failed to remove old container during update", "container_id", shortID(cid), "error", rmErr)
+		}
+	}
+
+	// Create new containers
+	newContainerIDs = make([]string, 0, quantity)
+	for i := 0; i < quantity; i++ {
+		var volumeBinds map[string]string
+		if profile.DiskMB > 0 && len(imageVolumes) > 0 {
+			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
+			hostPath, _, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
+			if volErr != nil {
+				err = fmt.Errorf("volume access failed (instance %d): %w", i, volErr)
+				callbackErr = "update failed"
+				return
+			}
+			volumeBinds = make(map[string]string, len(imageVolumes))
+			for _, volPath := range imageVolumes {
+				sanitized := sanitizeVolumePath(volPath)
+				if sanitized == "" {
+					continue
+				}
+				subdir := filepath.Join(hostPath, sanitized)
+				if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
+					err = fmt.Errorf("volume subdir creation failed (instance %d): %w", i, mkErr)
+					callbackErr = "update failed"
+					return
+				}
+				if volumeUID != 0 || volumeGID != 0 {
+					if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
+						err = fmt.Errorf("volume subdir chown failed (instance %d): %w", i, chownErr)
+						callbackErr = "update failed"
+						return
+					}
+				}
+				volumeBinds[subdir] = volPath
+			}
+		}
+
+		containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
+			LeaseUUID:      leaseUUID,
+			Tenant:         tenant,
+			ProviderUUID:   providerUUID,
+			SKU:            sku,
+			Manifest:       manifest,
+			Profile:        profile,
+			InstanceIndex:  i,
+			FailCount:      failCount,
+			CallbackURL:    callbackURL,
+			HostBindIP:     b.cfg.GetHostBindIP(),
+			ReadonlyRootfs: b.cfg.IsReadonlyRootfs(),
+			PidsLimit:      b.cfg.GetPidsLimit(),
+			TmpfsSizeMB:    b.cfg.GetTmpfsSizeMB(),
+			NetworkConfig:  networkConfig,
+			VolumeBinds:    volumeBinds,
+			ImageVolumes:   imageVolumes,
+			User:           containerUser,
+		}, b.cfg.ContainerCreateTimeout)
+		if createErr != nil {
+			err = fmt.Errorf("container creation failed (instance %d): %w", i, createErr)
+			callbackErr = "container creation failed"
+			return
+		}
+		newContainerIDs = append(newContainerIDs, containerID)
+
+		if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
+			err = fmt.Errorf("container start failed (instance %d): %w", i, startErr)
+			callbackErr = "container start failed"
+			return
+		}
+	}
+
+	// Startup verification
+	if manifest.HasActiveHealthCheck() {
+		if err = b.waitForHealthy(ctx, newContainerIDs, logger); err != nil {
+			callbackErr = healthErrorToCallbackMsg(err)
+			return
+		}
+	} else {
+		startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
+		select {
+		case <-ctx.Done():
+			err = fmt.Errorf("update canceled during startup verification: %w", ctx.Err())
+			callbackErr = "update failed"
+			return
+		case <-time.After(startupVerify):
+		}
+
+		for i, containerID := range newContainerIDs {
+			info, inspErr := b.docker.InspectContainer(ctx, containerID)
+			if inspErr != nil {
+				err = fmt.Errorf("failed to verify container %d after update: %w", i, inspErr)
+				callbackErr = "container exited during startup"
+				return
+			}
+			status := containerStatusToProvisionStatus(info.Status)
+			if status != backend.ProvisionStatusReady {
+				diag := b.containerFailureDiagnostics(ctx, containerID, info)
+				err = fmt.Errorf("container %d exited during update (status: %s): %s", i, info.Status, diag)
+				callbackErr = "container exited during startup"
+				return
+			}
+		}
+	}
+
+	logger.Info("update completed", "image", manifest.Image, "containers", len(newContainerIDs))
+}
+
+// GetReleases returns the release history for a lease.
+func (b *Backend) GetReleases(_ context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	b.provisionsMu.RLock()
+	_, exists := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+
+	if !exists {
+		return nil, backend.ErrNotProvisioned
+	}
+
+	if b.releaseStore == nil {
+		return nil, nil
+	}
+
+	releases, err := b.releaseStore.List(leaseUUID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list releases: %w", err)
+	}
+
+	result := make([]backend.ReleaseInfo, len(releases))
+	for i, r := range releases {
+		result[i] = backend.ReleaseInfo{
+			Version:   r.Version,
+			Image:     r.Image,
+			Status:    r.Status,
+			CreatedAt: r.CreatedAt,
+			Error:     r.Error,
+			Manifest:  r.Manifest,
+		}
+	}
+	return result, nil
+}
+
 // GetInfo returns lease information including connection details.
 // For multi-unit leases, returns an "instances" array with each container's info.
 func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
@@ -1038,6 +1674,13 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 		}
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("volume cleanup failed: %w", errors.Join(volumeErrs...))
+	}
+
+	// Clean up release history
+	if b.releaseStore != nil {
+		if err := b.releaseStore.Delete(leaseUUID); err != nil {
+			logger.Warn("failed to delete release history", "error", err)
+		}
 	}
 
 	// All containers and volumes removed — delete provision from map.
@@ -1265,7 +1908,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// to fred's reconciler.
 	for uuid, existing := range b.provisions {
 		if rec, hasContainers := recovered[uuid]; hasContainers {
-			if existing.Status == backend.ProvisionStatusProvisioning {
+			if existing.Status == backend.ProvisionStatusProvisioning || existing.Status == backend.ProvisionStatusRestarting || existing.Status == backend.ProvisionStatusUpdating {
 				// In-flight re-provision: the containers in recovered belong to the
 				// previous (failed) provision and carry stale FailCount labels. The
 				// old containers are being removed by Provision() concurrently.
@@ -1282,8 +1925,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			continue // Already recovered from containers
 		}
 		switch existing.Status {
-		case backend.ProvisionStatusProvisioning:
-			// In-flight provision that hasn't produced containers yet — preserve it.
+		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+			// In-flight operation that hasn't produced containers yet — preserve it.
 			recovered[uuid] = existing
 		case backend.ProvisionStatusFailed:
 			// Failed provision whose containers have been cleaned up (e.g., after

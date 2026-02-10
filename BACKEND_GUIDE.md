@@ -200,6 +200,8 @@ List all currently provisioned resources. Used by Fred for reconciliation.
 - `provisioning` - Resource is being created
 - `ready` - Resource is available
 - `failed` - Provisioning failed
+- `restarting` - Containers are being restarted
+- `updating` - New manifest is being deployed
 
 ### GET /provisions/{lease_uuid}
 
@@ -245,6 +247,107 @@ Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or logs expired)
+
+### POST /restart
+
+Restart containers for a lease without changing the manifest. Stops existing containers, recreates them with the same configuration, and sends a callback on completion. Volumes are preserved across restarts.
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "callback_url": "http://fred:8080/callbacks/provision"
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "restarting"
+}
+```
+
+**Behavior:**
+1. Validate the lease exists and is in a restartable state (`ready`)
+2. Return 202 immediately
+3. Stop and remove existing containers in a background goroutine
+4. Recreate containers with the same manifest and configuration
+5. Run startup verification (health checks or startup delay)
+6. POST callback to `callback_url` with success or failure
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Invalid state for restart (e.g., already restarting, updating, or provisioning)
+
+### POST /update
+
+Deploy a new manifest for a lease, replacing containers with a new image/configuration. Pulls the new image, removes old containers, creates new ones, and sends a callback on completion. Volumes are preserved.
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "callback_url": "http://fred:8080/callbacks/provision",
+  "payload": "base64-encoded-manifest",
+  "payload_hash": "sha256-hex-string"
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "updating"
+}
+```
+
+**Behavior:**
+1. Validate the lease exists and is in an updatable state (`ready` or `failed`)
+2. Parse and validate the new manifest
+3. Return 202 immediately
+4. Pull the new image in a background goroutine
+5. Remove old containers
+6. Create and start new containers from the updated manifest
+7. Run startup verification
+8. POST callback to `callback_url` with success or failure
+
+**Error Responses:**
+- `400 Bad Request` - Invalid manifest or validation error
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Invalid state for update (e.g., currently restarting or provisioning)
+
+### GET /releases/{lease_uuid}
+
+Get the release (deployment) history for a lease. Each provision, restart, or update creates a release entry.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "version": 1,
+    "image": "nginx:1.24",
+    "status": "superseded",
+    "created_at": "2024-01-15T10:30:00Z",
+    "manifest": "base64-encoded-manifest"
+  },
+  {
+    "version": 2,
+    "image": "nginx:1.25",
+    "status": "active",
+    "created_at": "2024-01-16T14:00:00Z",
+    "manifest": "base64-encoded-manifest"
+  }
+]
+```
+
+**Fields:**
+- `version` - Monotonically increasing version number (starting at 1)
+- `image` - Container image used in this release
+- `status` - Release status: `deploying`, `active`, `superseded`, or `failed`
+- `error` - Error message (only present for failed releases)
+- `manifest` - The raw manifest payload used for this release
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned
 
 ### GET /health
 
@@ -442,6 +545,9 @@ func main() {
     mux.HandleFunc("GET /logs/{lease_uuid}", b.handleGetLogs)
     mux.HandleFunc("POST /deprovision", b.handleDeprovision)
     mux.HandleFunc("GET /provisions", b.handleListProvisions)
+    mux.HandleFunc("POST /restart", b.handleRestart)
+    mux.HandleFunc("POST /update", b.handleUpdate)
+    mux.HandleFunc("GET /releases/{lease_uuid}", b.handleGetReleases)
     mux.HandleFunc("GET /health", b.handleHealth)
 
     http.ListenAndServe(":9001", mux)
@@ -550,4 +656,7 @@ Before deploying your backend:
 - [ ] Callback URLs stored per-lease (not globally)
 - [ ] Health endpoint returns 200 when operational
 - [ ] Graceful shutdown (finish in-flight provisions)
+- [ ] (Optional) `/restart` endpoint for container restart without manifest change
+- [ ] (Optional) `/update` endpoint for deploying new manifests
+- [ ] (Optional) `/releases/{uuid}` endpoint for release history tracking
 - [ ] (Optional) `/stats` endpoint for resource monitoring

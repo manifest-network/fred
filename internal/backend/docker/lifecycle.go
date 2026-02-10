@@ -633,6 +633,19 @@ func (d *DockerClient) StartContainer(ctx context.Context, containerID string, t
 	return nil
 }
 
+// StopContainer gracefully stops a running container with a timeout.
+// After the timeout, the container is forcefully killed.
+func (d *DockerClient) StopContainer(ctx context.Context, containerID string, timeout time.Duration) error {
+	timeoutSeconds := int(timeout.Seconds())
+	stopOpts := container.StopOptions{
+		Timeout: &timeoutSeconds,
+	}
+	if err := d.client.ContainerStop(ctx, containerID, stopOpts); err != nil {
+		return fmt.Errorf("failed to stop container: %w", err)
+	}
+	return nil
+}
+
 // ContainerLogs returns the last `tail` lines of combined stdout/stderr for
 // a container. If tail is <= 0 it defaults to 100.
 func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, tail int) (string, error) {

@@ -135,6 +135,15 @@ type Config struct {
 	// Entries older than this are removed by the diagnostics store's background cleanup.
 	// Defaults to 7 days.
 	DiagnosticsMaxAge time.Duration `yaml:"diagnostics_max_age"`
+
+	// ReleasesDBPath is the path to the bbolt database for persisting release history.
+	// Defaults to "releases.db".
+	ReleasesDBPath string `yaml:"releases_db_path"`
+
+	// ReleasesMaxAge is the maximum age of a persisted release entry.
+	// Entries older than this are removed by the release store's background cleanup.
+	// Defaults to 90 days.
+	ReleasesMaxAge time.Duration `yaml:"releases_max_age"`
 }
 
 func ptrBool(b bool) *bool    { return &b }
@@ -216,6 +225,8 @@ func DefaultConfig() Config {
 		CallbackMaxAge:          24 * time.Hour,
 		DiagnosticsDBPath:       "diagnostics.db",
 		DiagnosticsMaxAge:       7 * 24 * time.Hour,
+		ReleasesDBPath:          "releases.db",
+		ReleasesMaxAge:          90 * 24 * time.Hour,
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
 				CPUCores: 0.25,
@@ -373,6 +384,10 @@ func (c *Config) Validate() error {
 
 	if c.DiagnosticsMaxAge < 0 {
 		return fmt.Errorf("diagnostics_max_age must be non-negative")
+	}
+
+	if c.ReleasesMaxAge < 0 {
+		return fmt.Errorf("releases_max_age must be non-negative")
 	}
 
 	// Volume management validation

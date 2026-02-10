@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,6 +208,177 @@ func TestStats_NoAuthRequired(t *testing.T) {
 	req := httptest.NewRequest("GET", "/stats", nil)
 	w := httptest.NewRecorder()
 	// Passes without auth, panics on nil backend.
+	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
+}
+
+// --- Restart handler tests ---
+
+func TestRestart_RequiresAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("POST", "/restart", strings.NewReader(`{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "missing signature")
+}
+
+func TestRestart_MissingLeaseUUID(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"callback_url":"http://localhost/cb"}`)
+	req := httptest.NewRequest("POST", "/restart", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "lease_uuid is required")
+}
+
+func TestRestart_MissingCallbackURL(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-1"}`)
+	req := httptest.NewRequest("POST", "/restart", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "callback_url is required")
+}
+
+func TestRestart_InvalidCallbackURL(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-1","callback_url":"ftp://invalid/cb"}`)
+	req := httptest.NewRequest("POST", "/restart", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid callback_url")
+}
+
+func TestRestart_PassesValidation(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`)
+	req := httptest.NewRequest("POST", "/restart", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	// Passes validation, panics on nil backend.
+	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
+}
+
+// --- Update handler tests ---
+
+func TestUpdate_RequiresAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("POST", "/update", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestUpdate_MissingLeaseUUID(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"callback_url":"http://localhost/cb","payload":"eyJpbWFnZSI6Im5naW54In0="}`)
+	req := httptest.NewRequest("POST", "/update", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "lease_uuid is required")
+}
+
+func TestUpdate_MissingCallbackURL(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-1","payload":"eyJpbWFnZSI6Im5naW54In0="}`)
+	req := httptest.NewRequest("POST", "/update", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "callback_url is required")
+}
+
+func TestUpdate_MissingPayload(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`)
+	req := httptest.NewRequest("POST", "/update", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "payload is required")
+}
+
+func TestUpdate_InvalidCallbackURL(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-1","callback_url":"ftp://invalid","payload":"eyJpbWFnZSI6Im5naW54In0="}`)
+	req := httptest.NewRequest("POST", "/update", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid callback_url")
+}
+
+func TestUpdate_PassesValidation(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-1","callback_url":"http://localhost/cb","payload":"eyJpbWFnZSI6Im5naW54In0="}`)
+	req := httptest.NewRequest("POST", "/update", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	// Passes validation, panics on nil backend.
+	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
+}
+
+// --- GetReleases handler tests ---
+
+func TestGetReleases_RequiresAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("GET", "/releases/lease-1", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "missing signature")
+}
+
+func TestGetReleases_PassesAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("GET", "/releases/lease-1", nil)
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+
+	w := httptest.NewRecorder()
+	// Passes auth, panics on nil backend.
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
 }
 

@@ -142,6 +142,81 @@ func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
 	}
 }
 
+// RestartProvision restarts containers for a lease through the appropriate backend.
+// Resolves the backend from placement store or SKU routing and calls Restart.
+func (o *ProvisionOrchestrator) RestartProvision(ctx context.Context, leaseUUID, skuHint string) error {
+	backendClient := o.resolveBackend(leaseUUID, skuHint)
+	if backendClient == nil {
+		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, leaseUUID)
+	}
+
+	err := backendClient.Restart(ctx, backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: BuildCallbackURL(o.callbackBaseURL),
+	})
+	if err != nil {
+		slog.Error("failed to restart provision",
+			"lease_uuid", leaseUUID,
+			"backend", backendClient.Name(),
+			"error", err,
+		)
+		return err
+	}
+
+	slog.Info("restart initiated",
+		"lease_uuid", leaseUUID,
+		"backend", backendClient.Name(),
+	)
+	return nil
+}
+
+// UpdateProvision deploys a new manifest for a lease through the appropriate backend.
+// Resolves the backend from placement store or SKU routing and calls Update.
+func (o *ProvisionOrchestrator) UpdateProvision(ctx context.Context, leaseUUID, skuHint string, payload []byte, payloadHash string) error {
+	backendClient := o.resolveBackend(leaseUUID, skuHint)
+	if backendClient == nil {
+		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, leaseUUID)
+	}
+
+	err := backendClient.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: BuildCallbackURL(o.callbackBaseURL),
+		Payload:     payload,
+		PayloadHash: payloadHash,
+	})
+	if err != nil {
+		slog.Error("failed to update provision",
+			"lease_uuid", leaseUUID,
+			"backend", backendClient.Name(),
+			"error", err,
+		)
+		return err
+	}
+
+	slog.Info("update initiated",
+		"lease_uuid", leaseUUID,
+		"backend", backendClient.Name(),
+		"payload_size", len(payload),
+	)
+	return nil
+}
+
+// resolveBackend determines the correct backend for a lease.
+// Checks placement first, then falls back to SKU routing.
+func (o *ProvisionOrchestrator) resolveBackend(leaseUUID, skuHint string) backend.Backend {
+	if o.placementStore != nil {
+		if name := o.placementStore.Get(leaseUUID); name != "" {
+			if b := o.router.GetBackendByName(name); b != nil {
+				return b
+			}
+		}
+	}
+	if skuHint != "" {
+		return o.router.Route(skuHint)
+	}
+	return nil
+}
+
 // Deprovision handles deprovisioning a lease from the appropriate backend.
 // It tries to determine the backend in this order:
 //  0. From the placement store (most reliable for completed provisions)

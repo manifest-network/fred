@@ -47,13 +47,15 @@ type Handlers struct {
 	placementLookup PlacementLookup
 	providerUUID    string
 	bech32Prefix    string
+	callbackBaseURL string
 }
 
 // NewHandlers creates a new Handlers instance.
 // tokenTracker is optional but recommended for replay attack protection.
 // statusChecker is optional but required for the /status endpoint.
 // placementLookup is optional — used for routing reads to the correct backend.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, providerUUID, bech32Prefix string) *Handlers {
+// callbackBaseURL is used for restart/update callbacks to the backend.
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, providerUUID, bech32Prefix, callbackBaseURL string) *Handlers {
 	return &Handlers{
 		client:          client,
 		backendRouter:   backendRouter,
@@ -62,6 +64,7 @@ func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker
 		placementLookup: placementLookup,
 		providerUUID:    providerUUID,
 		bech32Prefix:    bech32Prefix,
+		callbackBaseURL: callbackBaseURL,
 	}
 }
 
@@ -458,6 +461,190 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 	slog.Info("lease logs served",
 		"lease_uuid", leaseUUID,
 		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
+// LeaseReleasesResponse represents the response for release history.
+type LeaseReleasesResponse struct {
+	LeaseUUID    string               `json:"lease_uuid"`
+	Tenant       string               `json:"tenant"`
+	ProviderUUID string               `json:"provider_uuid"`
+	Releases     []backend.ReleaseInfo `json:"releases"`
+}
+
+// RestartLease handles POST /v1/leases/{lease_uuid}/restart
+func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (requires active lease, checks replay)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.resolveBackend(leaseUUID, sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	err = backendClient.Restart(r.Context(), backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
+	})
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "lease not yet provisioned", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			writeError(w, "invalid state for restart", http.StatusConflict)
+			return
+		}
+		slog.Error("failed to restart lease", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("lease restart initiated",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, map[string]string{"status": "restarting"}, http.StatusAccepted)
+}
+
+// UpdateLease handles POST /v1/leases/{lease_uuid}/update
+func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (requires active lease, checks replay)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Read the request body (new manifest payload)
+	var updateReq struct {
+		Payload []byte `json:"payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&updateReq); err != nil {
+		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(updateReq.Payload) == 0 {
+		writeError(w, "payload is required", http.StatusBadRequest)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.resolveBackend(leaseUUID, sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	err = backendClient.Update(r.Context(), backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
+		Payload:     updateReq.Payload,
+	})
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "lease not yet provisioned", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			writeError(w, "invalid state for update", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, backend.ErrValidation) {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		slog.Error("failed to update lease", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("lease update initiated",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+		"payload_size", len(updateReq.Payload),
+	)
+
+	writeJSON(w, map[string]string{"status": "updating"}, http.StatusAccepted)
+}
+
+// GetLeaseReleases handles GET /v1/leases/{lease_uuid}/releases
+func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (any lease state, no replay check for read endpoint)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.resolveBackend(leaseUUID, sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	releases, err := backendClient.GetReleases(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "lease not yet provisioned", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to get releases from backend", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	response := LeaseReleasesResponse{
+		LeaseUUID:    leaseUUID,
+		Tenant:       auth.Token.Tenant,
+		ProviderUUID: h.providerUUID,
+		Releases:     releases,
+	}
+
+	slog.Info("lease releases served",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"release_count", len(releases),
 		"backend", backendClient.Name(),
 	)
 

@@ -479,6 +479,15 @@ func (m *mockLatencyBackend) GetProvision(ctx context.Context, leaseUUID string)
 func (m *mockLatencyBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
 	return nil, backend.ErrNotProvisioned
 }
+func (m *mockLatencyBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	return nil
+}
+func (m *mockLatencyBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	return nil
+}
+func (m *mockLatencyBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
 
 // TestManager_HighConcurrencySustained tests sustained high concurrency.
 func TestManager_HighConcurrencySustained(t *testing.T) {

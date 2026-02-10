@@ -83,6 +83,7 @@ type ServerConfig struct {
 	MaxRequestBodySize   int64
 	CallbackSecret       string // HMAC secret for callback authentication
 	TokenTrackerDBPath   string // Path to token tracker database (enables replay protection)
+	CallbackBaseURL      string // Base URL for backend callbacks (used by restart/update)
 }
 
 // NewServer creates a new API server.
@@ -110,7 +111,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if tokenTracker != nil {
 		tracker = tokenTracker
 	}
-	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, cfg.ProviderUUID, cfg.Bech32Prefix)
+	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.CallbackBaseURL)
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
 	var trustedProxies *TrustedProxyConfig
@@ -188,6 +189,9 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTenantRL(handlers.GetLeaseProvision))
 	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTenantRL(handlers.GetLeaseLogs))
 	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTenantRL(s.handlePayloadUpload))
+	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTenantRL(handlers.RestartLease))
+	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTenantRL(handlers.UpdateLease))
+	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTenantRL(handlers.GetLeaseReleases))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:
