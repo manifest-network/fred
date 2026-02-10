@@ -53,6 +53,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	tmpDir := t.TempDir()
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db")
 
 	if cfgFn != nil {
 		cfgFn(&cfg)
@@ -1460,4 +1461,573 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 
 	expectedOtherNet := TenantNetworkName(otherTenant)
 	assert.Equal(t, expectedOtherNet, net3, "other tenant network should match convention")
+}
+
+// --- Restart, Update, and GetReleases integration tests ---
+
+func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("restart-%d", time.Now().UnixNano())
+
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	// Provision
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	// Wait for provision callback
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// Record container IDs before restart
+	containersBefore := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersBefore, 1)
+	oldContainerID := containersBefore[0].ID
+
+	// Restart
+	err = b.Restart(ctx, backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err)
+
+	// Wait for restart callback
+	select {
+	case cb := <-callbackCh:
+		assert.Equal(t, leaseUUID, cb.LeaseUUID)
+		assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for restart callback")
+	}
+
+	// Verify new container is running with different ID
+	containersAfter := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersAfter, 1)
+	newContainerID := containersAfter[0].ID
+	assert.NotEqual(t, oldContainerID, newContainerID, "restart should create a new container")
+	assert.Equal(t, "running", containersAfter[0].State)
+
+	// Verify same lease UUID in labels
+	assert.Equal(t, leaseUUID, containersAfter[0].Labels[LabelLeaseUUID])
+
+	// GetInfo still returns valid connection details
+	info, err := b.GetInfo(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.Equal(t, "127.0.0.1", (*info)["host"])
+
+	// Status is Ready after restart
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	// Cleanup
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("update-%d", time.Now().UnixNano())
+
+	// Provision with busybox
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// Record container IDs before update
+	containersBefore := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersBefore, 1)
+	oldContainerID := containersBefore[0].ID
+
+	// Update to alpine
+	newManifest := DockerManifest{
+		Image:   "alpine:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	newPayload, err := json.Marshal(newManifest)
+	require.NoError(t, err)
+
+	err = b.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+		Payload:     newPayload,
+	})
+	require.NoError(t, err)
+
+	// Wait for update callback
+	select {
+	case cb := <-callbackCh:
+		assert.Equal(t, leaseUUID, cb.LeaseUUID)
+		assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for update callback")
+	}
+
+	// Verify new containers running with alpine image
+	containersAfter := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersAfter, 1)
+	assert.NotEqual(t, oldContainerID, containersAfter[0].ID, "update should create a new container")
+	assert.Equal(t, "running", containersAfter[0].State)
+	assert.Contains(t, containersAfter[0].Image, "alpine", "container should be running alpine image")
+
+	// GetInfo still works
+	info, err := b.GetInfo(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+
+	// Status is Ready
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	// Cleanup
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Docker_GetReleases_History(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("releases-%d", time.Now().UnixNano())
+
+	// Provision with busybox
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// Update to alpine
+	newManifest := DockerManifest{
+		Image:   "alpine:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	newPayload, err := json.Marshal(newManifest)
+	require.NoError(t, err)
+
+	err = b.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+		Payload:     newPayload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for update callback")
+	}
+
+	// GetReleases should return 2 releases
+	releases, err := b.GetReleases(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, releases, 2, "expected 2 releases after provision + update")
+
+	// Release 1: version=1, busybox, active (initial provision release)
+	assert.Equal(t, 1, releases[0].Version)
+	assert.Equal(t, "busybox:latest", releases[0].Image)
+	assert.Equal(t, "active", releases[0].Status)
+
+	// Release 2: version=2, alpine, active
+	assert.Equal(t, 2, releases[1].Version)
+	assert.Equal(t, "alpine:latest", releases[1].Image)
+	assert.Equal(t, "active", releases[1].Status)
+
+	// Cleanup
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.ReconcileInterval = 2 * time.Second // fast detection
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("update-failed-%d", time.Now().UnixNano())
+
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	// Provision
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// Kill container to trigger failure
+	containers := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containers, 1)
+	killContainer(t, containers[0].ID)
+
+	// Wait for failure detection by reconcile loop
+	select {
+	case cb := <-callbackCh:
+		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for failure callback")
+	}
+
+	// Confirm status is Failed
+	prov := getProvisionInfo(t, b, leaseUUID)
+	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+
+	// Update with new manifest (should be allowed from Failed state)
+	newManifest := DockerManifest{
+		Image:   "alpine:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	newPayload, err := json.Marshal(newManifest)
+	require.NoError(t, err)
+
+	err = b.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+		Payload:     newPayload,
+	})
+	require.NoError(t, err)
+
+	// Wait for update success callback
+	select {
+	case cb := <-callbackCh:
+		assert.Equal(t, leaseUUID, cb.LeaseUUID)
+		assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for update callback")
+	}
+
+	// Verify containers running with new image
+	containersAfter := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersAfter, 1)
+	assert.Equal(t, "running", containersAfter[0].State)
+	assert.Contains(t, containersAfter[0].Image, "alpine")
+
+	// Status is Ready (recovered from Failed)
+	prov = getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	// Cleanup
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Docker_RestartInvalidState_FromFailed(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.ReconcileInterval = 2 * time.Second // fast detection
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("restart-invalid-%d", time.Now().UnixNano())
+
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	// Provision
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// Kill container to trigger failure
+	containers := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containers, 1)
+	killContainer(t, containers[0].ID)
+
+	// Wait for failure detection
+	select {
+	case cb := <-callbackCh:
+		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for failure callback")
+	}
+
+	// Confirm status is Failed
+	prov := getProvisionInfo(t, b, leaseUUID)
+	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+
+	// Attempt Restart from Failed state → should return ErrInvalidState
+	err = b.Restart(ctx, backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInvalidState, "restart from Failed should return ErrInvalidState")
+
+	// Cleanup
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Docker_FullLifecycle(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("full-%d", time.Now().UnixNano())
+
+	// 1. Provision with busybox
+	manifest := DockerManifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// 2. Update to alpine
+	newManifest := DockerManifest{
+		Image:   "alpine:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	newPayload, err := json.Marshal(newManifest)
+	require.NoError(t, err)
+
+	err = b.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+		Payload:     newPayload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for update callback")
+	}
+
+	// 3. Restart
+	err = b.Restart(ctx, backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for restart callback")
+	}
+
+	// 4. GetReleases → verify history
+	releases, err := b.GetReleases(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, releases, 2, "expected 2 releases (provision update + update)")
+
+	// 5. Verify final state
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	containersAfter := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersAfter, 1)
+	assert.Equal(t, "running", containersAfter[0].State)
+
+	// 6. Deprovision
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+
+	// 7. Releases cleaned up after deprovision
+	_, err = b.GetReleases(ctx, leaseUUID)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned, "GetReleases should return ErrNotProvisioned after deprovision")
+}
+
+func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.VolumeDataPath = mountPath
+		cfg.VolumeFilesystem = "btrfs"
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("restart-vol-%d", time.Now().UnixNano())
+
+	// redis:7 declares VOLUME /data
+	manifest := DockerManifest{
+		Image:   "redis:7",
+		Command: []string{"redis-server", "--save", "1", "1"},
+	}
+	payload, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	// Provision with stateful SKU (docker-small has DiskMB > 0)
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(3 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	// Write data to redis
+	containerID := getContainerID(t, leaseUUID)
+	execInContainer(t, containerID, []string{"redis-cli", "SET", "restart_key", "restart_value"})
+	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
+
+	// Restart
+	err = b.Restart(ctx, backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err)
+
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(3 * time.Minute):
+		t.Fatal("timeout waiting for restart callback")
+	}
+
+	// Verify new container ID (container was recreated)
+	newContainerID := getContainerID(t, leaseUUID)
+	assert.NotEqual(t, containerID, newContainerID, "restart should create a new container")
+
+	// Read data back from redis — volume should have persisted the data
+	result := execInContainer(t, newContainerID, []string{"redis-cli", "GET", "restart_key"})
+	assert.Contains(t, result, "restart_value",
+		"data should persist across restart (volume preserved)")
+
+	// Cleanup
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
 }
