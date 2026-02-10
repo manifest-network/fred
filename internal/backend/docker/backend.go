@@ -568,6 +568,122 @@ func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
 	b.callbackSender.SendCallback(leaseUUID, callbackURL, success, errMsg)
 }
 
+// imageSetup holds the results of image inspection needed for container creation.
+type imageSetup struct {
+	Volumes       []string // sorted VOLUME paths declared by the image
+	ContainerUser string   // numeric "uid:gid" or "" for root
+	VolumeUID     int      // UID for volume ownership
+	VolumeGID     int      // GID for volume ownership
+}
+
+// inspectImageForSetup inspects an image and resolves its VOLUME declarations
+// and container user. This combines the image inspect, volume discovery, and
+// user resolution steps that are common to doProvision, doRestart, and doUpdate.
+func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manifestUser string) (*imageSetup, error) {
+	imageInfo, err := b.docker.InspectImage(ctx, image)
+	if err != nil {
+		return nil, fmt.Errorf("image inspect failed: %w", err)
+	}
+
+	var volumes []string
+	for v := range imageInfo.Volumes {
+		volumes = append(volumes, v)
+	}
+	sort.Strings(volumes)
+
+	result := &imageSetup{Volumes: volumes}
+
+	if manifestUser != "" || imageInfo.User != "" {
+		uid, gid, resolveErr := b.docker.ResolveImageUser(ctx, image, manifestUser)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("image user resolution failed: %w", resolveErr)
+		}
+		result.VolumeUID = uid
+		result.VolumeGID = gid
+		if uid != 0 || gid != 0 {
+			result.ContainerUser = fmt.Sprintf("%d:%d", uid, gid)
+		}
+	}
+
+	return result, nil
+}
+
+// ensureNetworkConfig sets up per-tenant network isolation if enabled.
+// Returns nil config when isolation is disabled.
+func (b *Backend) ensureNetworkConfig(ctx context.Context, tenant string) (*networktypes.NetworkingConfig, error) {
+	if !b.cfg.IsNetworkIsolation() {
+		return nil, nil
+	}
+	networkID, err := b.docker.EnsureTenantNetwork(ctx, tenant)
+	if err != nil {
+		return nil, fmt.Errorf("tenant network setup failed: %w", err)
+	}
+	return buildNetworkConfig(networkID), nil
+}
+
+// setupVolumeBinds creates volume bind mounts for a single container instance.
+// Returns nil when no volumes are needed (diskMB <= 0 or no image volumes).
+// Volumes are created idempotently — existing volumes are reused.
+func (b *Backend) setupVolumeBinds(ctx context.Context, leaseUUID string, instanceIndex int, diskMB int64, imageVolumes []string, volumeUID, volumeGID int) (map[string]string, error) {
+	if diskMB <= 0 || len(imageVolumes) == 0 {
+		return nil, nil
+	}
+
+	volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, instanceIndex)
+	hostPath, _, err := b.volumes.Create(ctx, volumeID, diskMB)
+	if err != nil {
+		return nil, fmt.Errorf("volume access failed (instance %d): %w", instanceIndex, err)
+	}
+
+	binds := make(map[string]string, len(imageVolumes))
+	for _, volPath := range imageVolumes {
+		sanitized := sanitizeVolumePath(volPath)
+		if sanitized == "" {
+			continue
+		}
+		subdir := filepath.Join(hostPath, sanitized)
+		if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
+			return nil, fmt.Errorf("volume subdir creation failed (instance %d): %w", instanceIndex, mkErr)
+		}
+		if volumeUID != 0 || volumeGID != 0 {
+			if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
+				return nil, fmt.Errorf("volume subdir chown failed (instance %d): %w", instanceIndex, chownErr)
+			}
+		}
+		binds[subdir] = volPath
+	}
+	return binds, nil
+}
+
+// verifyStartup checks that containers started successfully.
+// Uses health-check-aware polling when the manifest declares an active health check,
+// otherwise falls back to a fixed-wait + inspect check.
+func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, containerIDs []string, logger *slog.Logger) error {
+	if manifest.HasActiveHealthCheck() {
+		return b.waitForHealthy(ctx, containerIDs, logger)
+	}
+
+	startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("canceled during startup verification: %w", ctx.Err())
+	case <-time.After(startupVerify):
+	}
+
+	for i, containerID := range containerIDs {
+		info, err := b.docker.InspectContainer(ctx, containerID)
+		if err != nil {
+			return fmt.Errorf("failed to verify container %d after startup: %w", i, err)
+		}
+		status := containerStatusToProvisionStatus(info.Status)
+		if status != backend.ProvisionStatusReady {
+			diag := b.containerFailureDiagnostics(ctx, containerID, info)
+			return fmt.Errorf("container %d exited during startup (status: %s): %s", i, info.Status, diag)
+		}
+	}
+	return nil
+}
+
 // doProvision performs the actual container creation asynchronously.
 // For multi-unit leases, it creates multiple containers.
 // For multi-SKU leases, each container gets the appropriate resource profile.
@@ -676,53 +792,28 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 	imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())
 
-	// Inspect image to discover VOLUME declarations
-	imageInfo, inspectErr := b.docker.InspectImage(ctx, manifest.Image)
-	if inspectErr != nil {
-		logger.Error("failed to inspect image", "error", inspectErr)
-		err = fmt.Errorf("image inspect failed: %w", inspectErr)
+	// Inspect image and resolve user
+	imgSetup, setupErr := b.inspectImageForSetup(ctx, manifest.Image, manifest.User)
+	if setupErr != nil {
+		logger.Error("image setup failed", "error", setupErr)
+		err = setupErr
 		callbackErr = "image inspect failed"
 		return
 	}
-	var imageVolumes []string
-	for v := range imageInfo.Volumes {
-		imageVolumes = append(imageVolumes, v)
-	}
-	sort.Strings(imageVolumes)
-
-	// Resolve container user to numeric UID/GID.
-	// When the manifest specifies a user (e.g., "postgres" or "999:999"),
-	// the container runs as that user directly and volumes are pre-chowned.
-	// This is required for images whose entrypoint starts as root and tries
-	// to chown data directories — CapDrop ALL removes CAP_CHOWN.
-	var volumeUID, volumeGID int
-	var containerUser string
-	if manifest.User != "" || imageInfo.User != "" {
-		volumeUID, volumeGID, err = b.docker.ResolveImageUser(ctx, manifest.Image, manifest.User)
-		if err != nil {
-			logger.Error("failed to resolve image user", "error", err)
-			err = fmt.Errorf("image user resolution failed: %w", err)
-			callbackErr = "image user resolution failed"
-			return
-		}
-		if volumeUID != 0 || volumeGID != 0 {
-			containerUser = fmt.Sprintf("%d:%d", volumeUID, volumeGID)
-			logger.Info("resolved container user", "uid", volumeUID, "gid", volumeGID)
-		}
+	if imgSetup.ContainerUser != "" {
+		logger.Info("resolved container user", "uid", imgSetup.VolumeUID, "gid", imgSetup.VolumeGID)
 	}
 
-	// Set up per-tenant network isolation if enabled
-	var networkConfig *networktypes.NetworkingConfig
-	if b.cfg.IsNetworkIsolation() {
-		networkID, netErr := b.docker.EnsureTenantNetwork(ctx, req.Tenant)
-		if netErr != nil {
-			logger.Error("failed to create tenant network", "error", netErr)
-			err = fmt.Errorf("tenant network setup failed: %w", netErr)
-			callbackErr = "tenant network setup failed"
-			return
-		}
-		networkConfig = buildNetworkConfig(networkID)
-		logger.Info("tenant network ready", "network_id", shortID(networkID))
+	// Set up per-tenant network isolation
+	networkConfig, netErr := b.ensureNetworkConfig(ctx, req.Tenant)
+	if netErr != nil {
+		logger.Error("failed to create tenant network", "error", netErr)
+		err = netErr
+		callbackErr = "tenant network setup failed"
+		return
+	}
+	if networkConfig != nil {
+		logger.Info("tenant network ready")
 	}
 
 	// Create and start containers for each item/unit
@@ -745,8 +836,12 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			b.provisionsMu.RUnlock()
 
 			// Create managed volume for stateful SKUs (disk_mb > 0).
+			// doProvision uses inline volume creation to track newly-created volumes
+			// for selective cleanup (reused volumes from a previous provision must not
+			// be destroyed). doRestart/doUpdate use setupVolumeBinds which treats
+			// volumes as idempotent.
 			var volumeBinds map[string]string
-			if profile.DiskMB > 0 && len(imageVolumes) > 0 {
+			if profile.DiskMB > 0 && len(imgSetup.Volumes) > 0 {
 				volumeID := fmt.Sprintf("fred-%s-%d", req.LeaseUUID, instanceIndex)
 				hostPath, volCreated, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
 				if volErr != nil {
@@ -755,13 +850,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 					callbackErr = "volume creation failed"
 					return
 				}
-				// Only track newly created volumes for cleanup on failure.
-				// Reused volumes (from a previous provision) must not be destroyed.
 				if volCreated {
 					createdVolumeIDs = append(createdVolumeIDs, volumeID)
 				}
-				volumeBinds = make(map[string]string, len(imageVolumes))
-				for _, volPath := range imageVolumes {
+				volumeBinds = make(map[string]string, len(imgSetup.Volumes))
+				for _, volPath := range imgSetup.Volumes {
 					sanitized := sanitizeVolumePath(volPath)
 					if sanitized == "" {
 						err = fmt.Errorf("image declares unsupported VOLUME path %q that cannot be quota-enforced (instance %d, sku %s)", volPath, instanceIndex, item.SKU)
@@ -775,10 +868,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 						callbackErr = "volume creation failed"
 						return
 					}
-					// Pre-chown for non-root container users (CapDrop ALL prevents in-container chown).
-					if volumeUID != 0 || volumeGID != 0 {
-						if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
-							instanceLogger.Error("failed to chown volume subdir", "path", subdir, "uid", volumeUID, "gid", volumeGID, "error", chownErr)
+					if imgSetup.VolumeUID != 0 || imgSetup.VolumeGID != 0 {
+						if chownErr := os.Chown(subdir, imgSetup.VolumeUID, imgSetup.VolumeGID); chownErr != nil {
+							instanceLogger.Error("failed to chown volume subdir", "path", subdir, "uid", imgSetup.VolumeUID, "gid", imgSetup.VolumeGID, "error", chownErr)
 							err = fmt.Errorf("volume subdir chown failed (instance %d, sku %s): %w", instanceIndex, item.SKU, chownErr)
 							callbackErr = "volume creation failed"
 							return
@@ -786,7 +878,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 					}
 					volumeBinds[subdir] = volPath
 				}
-			} else if profile.DiskMB > 0 && len(imageVolumes) == 0 {
+			} else if profile.DiskMB > 0 && len(imgSetup.Volumes) == 0 {
 				instanceLogger.Warn("stateful SKU has disk_mb > 0 but image declares no VOLUME paths; disk budget is allocated but unused",
 					"disk_mb", profile.DiskMB)
 			}
@@ -808,8 +900,8 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				TmpfsSizeMB:    b.cfg.GetTmpfsSizeMB(),
 				NetworkConfig:  networkConfig,
 				VolumeBinds:    volumeBinds,
-				ImageVolumes:   imageVolumes,
-				User:           containerUser,
+				ImageVolumes:   imgSetup.Volumes,
+				User:           imgSetup.ContainerUser,
 			}, b.cfg.ContainerCreateTimeout)
 			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
 			if createErr != nil {
@@ -834,46 +926,10 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 	}
 
-	// Startup verification: two paths based on whether the manifest declares
-	// an active health check.
-	if manifest.HasActiveHealthCheck() {
-		// Health-aware path: poll until all containers report "healthy".
-		// Bounded by the existing ProvisionTimeout context.
-		logger.Info("waiting for health checks to pass")
-		if err = b.waitForHealthy(ctx, containerIDs, logger); err != nil {
-			callbackErr = healthErrorToCallbackMsg(err)
-			return
-		}
-	} else {
-		// Fixed-wait path: wait StartupVerifyDuration then check containers
-		// are still running. Catches immediate crashes before sending a
-		// success callback.
-		startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
-		logger.Info("waiting for startup verification", "duration", startupVerify)
-
-		select {
-		case <-ctx.Done():
-			err = fmt.Errorf("provisioning canceled during startup verification: %w", ctx.Err())
-			callbackErr = "provisioning canceled"
-			return
-		case <-time.After(startupVerify):
-		}
-
-		for i, containerID := range containerIDs {
-			info, inspectErr := b.docker.InspectContainer(ctx, containerID)
-			if inspectErr != nil {
-				err = fmt.Errorf("failed to verify container %d after startup: %w", i, inspectErr)
-				callbackErr = "container exited during startup"
-				return
-			}
-			status := containerStatusToProvisionStatus(info.Status)
-			if status != backend.ProvisionStatusReady {
-				diag := b.containerFailureDiagnostics(ctx, containerID, info)
-				err = fmt.Errorf("container %d exited during startup (status: %s): %s", i, info.Status, diag)
-				callbackErr = "container exited during startup"
-				return
-			}
-		}
+	// Startup verification
+	if err = b.verifyStartup(ctx, manifest, containerIDs, logger); err != nil {
+		callbackErr = startupErrorToCallbackMsg(err)
+		return
 	}
 
 	logger.Info("all containers provisioned and verified", "count", len(containerIDs))
@@ -882,17 +938,21 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 // healthPollInterval is the interval between health check polls during startup verification.
 const healthPollInterval = 2 * time.Second
 
-// healthErrorToCallbackMsg maps a waitForHealthy error to a hardcoded callback
-// message safe for on-chain surfacing.
-func healthErrorToCallbackMsg(err error) string {
+// startupErrorToCallbackMsg maps a verifyStartup or waitForHealthy error to a
+// hardcoded callback message safe for on-chain surfacing.
+func startupErrorToCallbackMsg(err error) string {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "unhealthy"):
 		return "container reported unhealthy"
+	case strings.Contains(msg, "exited during startup"):
+		return "container exited during startup"
+	case strings.Contains(msg, "canceled during startup verification"):
+		return "container startup verification canceled"
 	case strings.Contains(msg, "exited"):
 		return "container exited during health check"
 	default:
-		return "container exited during health check"
+		return "container exited during startup"
 	}
 }
 
@@ -1027,7 +1087,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 	}
 
 	// Stop and remove old containers
-	stopTimeout := cmp.Or(b.cfg.ContainerStartTimeout, 30*time.Second)
+	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 	for _, cid := range oldContainerIDs {
 		logger.Info("stopping container for restart", "container_id", shortID(cid))
 		if stopErr := b.docker.StopContainer(ctx, cid, stopTimeout); stopErr != nil {
@@ -1052,80 +1112,30 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 	}
 	b.provisionsMu.RUnlock()
 
-	// Inspect image for VOLUMEs
-	imageInfo, inspectErr := b.docker.InspectImage(ctx, manifest.Image)
-	if inspectErr != nil {
-		err = fmt.Errorf("image inspect failed: %w", inspectErr)
+	// Inspect image and resolve user
+	imgSetup, setupErr := b.inspectImageForSetup(ctx, manifest.Image, manifest.User)
+	if setupErr != nil {
+		err = setupErr
 		callbackErr = "restart failed"
 		return
 	}
-	var imageVolumes []string
-	for v := range imageInfo.Volumes {
-		imageVolumes = append(imageVolumes, v)
-	}
-	sort.Strings(imageVolumes)
-
-	// Resolve container user
-	var volumeUID, volumeGID int
-	var containerUser string
-	if manifest.User != "" || imageInfo.User != "" {
-		volumeUID, volumeGID, err = b.docker.ResolveImageUser(ctx, manifest.Image, manifest.User)
-		if err != nil {
-			err = fmt.Errorf("image user resolution failed: %w", err)
-			callbackErr = "restart failed"
-			return
-		}
-		if volumeUID != 0 || volumeGID != 0 {
-			containerUser = fmt.Sprintf("%d:%d", volumeUID, volumeGID)
-		}
-	}
 
 	// Set up networking
-	var networkConfig *networktypes.NetworkingConfig
-	if b.cfg.IsNetworkIsolation() {
-		networkID, netErr := b.docker.EnsureTenantNetwork(ctx, tenant)
-		if netErr != nil {
-			err = fmt.Errorf("tenant network setup failed: %w", netErr)
-			callbackErr = "restart failed"
-			return
-		}
-		networkConfig = buildNetworkConfig(networkID)
+	networkConfig, netErr := b.ensureNetworkConfig(ctx, tenant)
+	if netErr != nil {
+		err = netErr
+		callbackErr = "restart failed"
+		return
 	}
 
 	// Recreate containers
 	newContainerIDs = make([]string, 0, len(oldContainerIDs))
 	for i := range oldContainerIDs {
-		// Reuse volumes via idempotent Create
-		var volumeBinds map[string]string
-		if profile.DiskMB > 0 && len(imageVolumes) > 0 {
-			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
-			hostPath, _, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
-			if volErr != nil {
-				err = fmt.Errorf("volume access failed (instance %d): %w", i, volErr)
-				callbackErr = "restart failed"
-				return
-			}
-			volumeBinds = make(map[string]string, len(imageVolumes))
-			for _, volPath := range imageVolumes {
-				sanitized := sanitizeVolumePath(volPath)
-				if sanitized == "" {
-					continue
-				}
-				subdir := filepath.Join(hostPath, sanitized)
-				if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
-					err = fmt.Errorf("volume subdir creation failed (instance %d): %w", i, mkErr)
-					callbackErr = "restart failed"
-					return
-				}
-				if volumeUID != 0 || volumeGID != 0 {
-					if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
-						err = fmt.Errorf("volume subdir chown failed (instance %d): %w", i, chownErr)
-						callbackErr = "restart failed"
-						return
-					}
-				}
-				volumeBinds[subdir] = volPath
-			}
+		volumeBinds, volErr := b.setupVolumeBinds(ctx, leaseUUID, i, profile.DiskMB, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+		if volErr != nil {
+			err = volErr
+			callbackErr = "restart failed"
+			return
 		}
 
 		containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
@@ -1144,8 +1154,8 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 			TmpfsSizeMB:    b.cfg.GetTmpfsSizeMB(),
 			NetworkConfig:  networkConfig,
 			VolumeBinds:    volumeBinds,
-			ImageVolumes:   imageVolumes,
-			User:           containerUser,
+			ImageVolumes:   imgSetup.Volumes,
+			User:           imgSetup.ContainerUser,
 		}, b.cfg.ContainerCreateTimeout)
 		if createErr != nil {
 			err = fmt.Errorf("container creation failed (instance %d): %w", i, createErr)
@@ -1162,36 +1172,9 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 	}
 
 	// Startup verification
-	if manifest.HasActiveHealthCheck() {
-		if err = b.waitForHealthy(ctx, newContainerIDs, logger); err != nil {
-			callbackErr = healthErrorToCallbackMsg(err)
-			return
-		}
-	} else {
-		startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
-		select {
-		case <-ctx.Done():
-			err = fmt.Errorf("restart canceled during startup verification: %w", ctx.Err())
-			callbackErr = "restart failed"
-			return
-		case <-time.After(startupVerify):
-		}
-
-		for i, containerID := range newContainerIDs {
-			info, inspErr := b.docker.InspectContainer(ctx, containerID)
-			if inspErr != nil {
-				err = fmt.Errorf("failed to verify container %d after restart: %w", i, inspErr)
-				callbackErr = "restart failed"
-				return
-			}
-			status := containerStatusToProvisionStatus(info.Status)
-			if status != backend.ProvisionStatusReady {
-				diag := b.containerFailureDiagnostics(ctx, containerID, info)
-				err = fmt.Errorf("container %d exited during restart (status: %s): %s", i, info.Status, diag)
-				callbackErr = "restart failed"
-				return
-			}
-		}
+	if err = b.verifyStartup(ctx, manifest, newContainerIDs, logger); err != nil {
+		callbackErr = startupErrorToCallbackMsg(err)
+		return
 	}
 
 	logger.Info("restart completed", "containers", len(newContainerIDs))
@@ -1317,19 +1300,7 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 
 		// Mark release as active, previous as superseded
 		if b.releaseStore != nil {
-			releases, listErr := b.releaseStore.List(leaseUUID)
-			if listErr == nil && len(releases) >= 2 {
-				// Mark all previous as superseded
-				for i := 0; i < len(releases)-1; i++ {
-					if releases[i].Status == "active" {
-						releases[i].Status = "superseded"
-					}
-				}
-				releases[len(releases)-1].Status = "active"
-				// Rewrite (we need to delete and re-append)
-				// Instead, just update the latest status
-			}
-			if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "active", ""); relErr != nil {
+			if relErr := b.releaseStore.ActivateLatest(leaseUUID); relErr != nil {
 				logger.Warn("failed to update release status", "error", relErr)
 			}
 		}
@@ -1345,32 +1316,12 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 		return
 	}
 
-	// Inspect image for VOLUMEs
-	imageInfo, inspectErr := b.docker.InspectImage(ctx, manifest.Image)
-	if inspectErr != nil {
-		err = fmt.Errorf("image inspect failed: %w", inspectErr)
+	// Inspect image and resolve user
+	imgSetup, setupErr := b.inspectImageForSetup(ctx, manifest.Image, manifest.User)
+	if setupErr != nil {
+		err = setupErr
 		callbackErr = "image inspect failed"
 		return
-	}
-	var imageVolumes []string
-	for v := range imageInfo.Volumes {
-		imageVolumes = append(imageVolumes, v)
-	}
-	sort.Strings(imageVolumes)
-
-	// Resolve container user
-	var volumeUID, volumeGID int
-	var containerUser string
-	if manifest.User != "" || imageInfo.User != "" {
-		volumeUID, volumeGID, err = b.docker.ResolveImageUser(ctx, manifest.Image, manifest.User)
-		if err != nil {
-			err = fmt.Errorf("image user resolution failed: %w", err)
-			callbackErr = "image user resolution failed"
-			return
-		}
-		if volumeUID != 0 || volumeGID != 0 {
-			containerUser = fmt.Sprintf("%d:%d", volumeUID, volumeGID)
-		}
 	}
 
 	// Read provision metadata
@@ -1392,19 +1343,20 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 	b.provisionsMu.RUnlock()
 
 	// Set up networking
-	var networkConfig *networktypes.NetworkingConfig
-	if b.cfg.IsNetworkIsolation() {
-		networkID, netErr := b.docker.EnsureTenantNetwork(ctx, tenant)
-		if netErr != nil {
-			err = fmt.Errorf("tenant network setup failed: %w", netErr)
-			callbackErr = "update failed"
-			return
-		}
-		networkConfig = buildNetworkConfig(networkID)
+	networkConfig, netErr := b.ensureNetworkConfig(ctx, tenant)
+	if netErr != nil {
+		err = netErr
+		callbackErr = "update failed"
+		return
 	}
 
-	// Remove old containers
+	// Stop and remove old containers
+	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 	for _, cid := range oldContainerIDs {
+		logger.Info("stopping container for update", "container_id", shortID(cid))
+		if stopErr := b.docker.StopContainer(ctx, cid, stopTimeout); stopErr != nil {
+			logger.Warn("failed to stop container gracefully", "container_id", shortID(cid), "error", stopErr)
+		}
 		if rmErr := b.docker.RemoveContainer(ctx, cid); rmErr != nil {
 			logger.Warn("failed to remove old container during update", "container_id", shortID(cid), "error", rmErr)
 		}
@@ -1413,36 +1365,11 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 	// Create new containers
 	newContainerIDs = make([]string, 0, quantity)
 	for i := 0; i < quantity; i++ {
-		var volumeBinds map[string]string
-		if profile.DiskMB > 0 && len(imageVolumes) > 0 {
-			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
-			hostPath, _, volErr := b.volumes.Create(ctx, volumeID, profile.DiskMB)
-			if volErr != nil {
-				err = fmt.Errorf("volume access failed (instance %d): %w", i, volErr)
-				callbackErr = "update failed"
-				return
-			}
-			volumeBinds = make(map[string]string, len(imageVolumes))
-			for _, volPath := range imageVolumes {
-				sanitized := sanitizeVolumePath(volPath)
-				if sanitized == "" {
-					continue
-				}
-				subdir := filepath.Join(hostPath, sanitized)
-				if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
-					err = fmt.Errorf("volume subdir creation failed (instance %d): %w", i, mkErr)
-					callbackErr = "update failed"
-					return
-				}
-				if volumeUID != 0 || volumeGID != 0 {
-					if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
-						err = fmt.Errorf("volume subdir chown failed (instance %d): %w", i, chownErr)
-						callbackErr = "update failed"
-						return
-					}
-				}
-				volumeBinds[subdir] = volPath
-			}
+		volumeBinds, volErr := b.setupVolumeBinds(ctx, leaseUUID, i, profile.DiskMB, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+		if volErr != nil {
+			err = volErr
+			callbackErr = "update failed"
+			return
 		}
 
 		containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
@@ -1461,8 +1388,8 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 			TmpfsSizeMB:    b.cfg.GetTmpfsSizeMB(),
 			NetworkConfig:  networkConfig,
 			VolumeBinds:    volumeBinds,
-			ImageVolumes:   imageVolumes,
-			User:           containerUser,
+			ImageVolumes:   imgSetup.Volumes,
+			User:           imgSetup.ContainerUser,
 		}, b.cfg.ContainerCreateTimeout)
 		if createErr != nil {
 			err = fmt.Errorf("container creation failed (instance %d): %w", i, createErr)
@@ -1479,36 +1406,9 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 	}
 
 	// Startup verification
-	if manifest.HasActiveHealthCheck() {
-		if err = b.waitForHealthy(ctx, newContainerIDs, logger); err != nil {
-			callbackErr = healthErrorToCallbackMsg(err)
-			return
-		}
-	} else {
-		startupVerify := cmp.Or(b.cfg.StartupVerifyDuration, 5*time.Second)
-		select {
-		case <-ctx.Done():
-			err = fmt.Errorf("update canceled during startup verification: %w", ctx.Err())
-			callbackErr = "update failed"
-			return
-		case <-time.After(startupVerify):
-		}
-
-		for i, containerID := range newContainerIDs {
-			info, inspErr := b.docker.InspectContainer(ctx, containerID)
-			if inspErr != nil {
-				err = fmt.Errorf("failed to verify container %d after update: %w", i, inspErr)
-				callbackErr = "container exited during startup"
-				return
-			}
-			status := containerStatusToProvisionStatus(info.Status)
-			if status != backend.ProvisionStatusReady {
-				diag := b.containerFailureDiagnostics(ctx, containerID, info)
-				err = fmt.Errorf("container %d exited during update (status: %s): %s", i, info.Status, diag)
-				callbackErr = "container exited during startup"
-				return
-			}
-		}
+	if err = b.verifyStartup(ctx, manifest, newContainerIDs, logger); err != nil {
+		callbackErr = startupErrorToCallbackMsg(err)
+		return
 	}
 
 	logger.Info("update completed", "image", manifest.Image, "containers", len(newContainerIDs))

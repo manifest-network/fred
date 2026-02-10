@@ -116,6 +116,93 @@ func TestReleaseStore(t *testing.T) {
 	})
 }
 
+func TestReleaseStore_ActivateLatest(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "activate_releases.db")
+
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Create 3 releases: v1 active, v2 active, v3 deploying
+	require.NoError(t, store.Append("lease-1", Release{
+		Image:     "nginx:1.0",
+		Status:    "active",
+		CreatedAt: time.Now(),
+	}))
+	require.NoError(t, store.Append("lease-1", Release{
+		Image:     "nginx:2.0",
+		Status:    "active",
+		CreatedAt: time.Now(),
+	}))
+	require.NoError(t, store.Append("lease-1", Release{
+		Image:     "nginx:3.0",
+		Status:    "deploying",
+		CreatedAt: time.Now(),
+	}))
+
+	// Activate latest: v1,v2 should become superseded, v3 should become active
+	err = store.ActivateLatest("lease-1")
+	require.NoError(t, err)
+
+	releases, err := store.List("lease-1")
+	require.NoError(t, err)
+	require.Len(t, releases, 3)
+	assert.Equal(t, "superseded", releases[0].Status, "v1 should be superseded")
+	assert.Equal(t, "superseded", releases[1].Status, "v2 should be superseded")
+	assert.Equal(t, "active", releases[2].Status, "v3 should be active")
+	assert.Empty(t, releases[2].Error, "v3 should have no error")
+
+	t.Run("nonexistent is no-op", func(t *testing.T) {
+		err := store.ActivateLatest("nonexistent")
+		require.NoError(t, err)
+	})
+
+	t.Run("single release", func(t *testing.T) {
+		require.NoError(t, store.Append("lease-single", Release{
+			Image:     "redis:7",
+			Status:    "deploying",
+			CreatedAt: time.Now(),
+		}))
+
+		err := store.ActivateLatest("lease-single")
+		require.NoError(t, err)
+
+		releases, err := store.List("lease-single")
+		require.NoError(t, err)
+		require.Len(t, releases, 1)
+		assert.Equal(t, "active", releases[0].Status)
+	})
+
+	t.Run("failed releases stay failed", func(t *testing.T) {
+		require.NoError(t, store.Append("lease-mixed", Release{
+			Image:     "app:1.0",
+			Status:    "active",
+			CreatedAt: time.Now(),
+		}))
+		require.NoError(t, store.Append("lease-mixed", Release{
+			Image:     "app:2.0",
+			Status:    "failed",
+			Error:     "crash",
+			CreatedAt: time.Now(),
+		}))
+		require.NoError(t, store.Append("lease-mixed", Release{
+			Image:     "app:3.0",
+			Status:    "deploying",
+			CreatedAt: time.Now(),
+		}))
+
+		err := store.ActivateLatest("lease-mixed")
+		require.NoError(t, err)
+
+		releases, err := store.List("lease-mixed")
+		require.NoError(t, err)
+		require.Len(t, releases, 3)
+		assert.Equal(t, "superseded", releases[0].Status, "v1 active->superseded")
+		assert.Equal(t, "failed", releases[1].Status, "v2 stays failed")
+		assert.Equal(t, "active", releases[2].Status, "v3 deploying->active")
+	})
+}
+
 func TestReleaseStore_Persistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "persist_releases.db")
 

@@ -192,6 +192,40 @@ func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status, errMsg string) erro
 	})
 }
 
+// ActivateLatest marks the most recent release as "active" and all previous
+// "active" releases as "superseded" in a single transaction.
+func (s *ReleaseStore) ActivateLatest(leaseUUID string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(releasesBucketName)
+		data := b.Get([]byte(leaseUUID))
+		if data == nil {
+			return nil
+		}
+
+		var releases []Release
+		if err := json.Unmarshal(data, &releases); err != nil {
+			return fmt.Errorf("failed to unmarshal releases: %w", err)
+		}
+		if len(releases) == 0 {
+			return nil
+		}
+
+		for i := 0; i < len(releases)-1; i++ {
+			if releases[i].Status == "active" {
+				releases[i].Status = "superseded"
+			}
+		}
+		releases[len(releases)-1].Status = "active"
+		releases[len(releases)-1].Error = ""
+
+		encoded, err := json.Marshal(releases)
+		if err != nil {
+			return fmt.Errorf("failed to marshal releases: %w", err)
+		}
+		return b.Put([]byte(leaseUUID), encoded)
+	})
+}
+
 // Delete removes all releases for a lease. No-op if not found.
 func (s *ReleaseStore) Delete(leaseUUID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {

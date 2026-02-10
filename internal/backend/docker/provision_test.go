@@ -2863,20 +2863,22 @@ func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
 	assert.Contains(t, prov.LastError, "registry.example.com")
 }
 
-func TestHealthErrorToCallbackMsg(t *testing.T) {
+func TestStartupErrorToCallbackMsg(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
 		want string
 	}{
 		{"unhealthy", fmt.Errorf("container 0 reported unhealthy: exit_code=1; logs: oops"), "container reported unhealthy"},
+		{"exited during startup", fmt.Errorf("container 0 exited during startup (status: exited): exit_code=1"), "container exited during startup"},
 		{"exited during health", fmt.Errorf("container 0 exited while waiting for healthy"), "container exited during health check"},
-		{"timeout", fmt.Errorf("timed out waiting for containers to become healthy"), "container exited during health check"},
-		{"inspect failure", fmt.Errorf("failed to inspect container 0 during health check"), "container exited during health check"},
+		{"timeout", fmt.Errorf("timed out waiting for containers to become healthy"), "container exited during startup"},
+		{"canceled during verification", fmt.Errorf("canceled during startup verification: context canceled"), "container startup verification canceled"},
+		{"inspect failure", fmt.Errorf("failed to inspect container 0 during health check"), "container exited during startup"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, healthErrorToCallbackMsg(tt.err))
+			assert.Equal(t, tt.want, startupErrorToCallbackMsg(tt.err))
 		})
 	}
 }

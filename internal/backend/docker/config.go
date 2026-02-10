@@ -63,6 +63,11 @@ type Config struct {
 	// ContainerStartTimeout is the timeout for starting containers.
 	ContainerStartTimeout time.Duration `yaml:"container_start_timeout"`
 
+	// ContainerStopTimeout is the grace period for stopping containers.
+	// Containers receive SIGTERM and have this long to shut down gracefully
+	// before being force-killed (SIGKILL). Defaults to 30 seconds.
+	ContainerStopTimeout time.Duration `yaml:"container_stop_timeout"`
+
 	// ReconcileInterval is how often to reconcile state with Docker.
 	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
 
@@ -215,6 +220,7 @@ func DefaultConfig() Config {
 		ImagePullTimeout:        5 * time.Minute,
 		ContainerCreateTimeout:  30 * time.Second,
 		ContainerStartTimeout:   30 * time.Second,
+		ContainerStopTimeout:    30 * time.Second,
 		ReconcileInterval:       5 * time.Minute,
 		ProvisionTimeout:        10 * time.Minute,
 		CallbackDBPath:          "callbacks.db",
