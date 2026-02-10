@@ -82,6 +82,7 @@ type mockDockerClient struct {
 	EnsureTenantNetworkFn        func(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
 	ListManagedNetworksFn        func(ctx context.Context) ([]networktypes.Inspect, error)
+	ResolveImageUserFn           func(ctx context.Context, imageName string, userOverride string) (int, int, error)
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {
@@ -180,6 +181,13 @@ func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenan
 		return m.RemoveTenantNetworkIfEmptyFn(ctx, tenant)
 	}
 	panic("unexpected call to RemoveTenantNetworkIfEmpty")
+}
+
+func (m *mockDockerClient) ResolveImageUser(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+	if m.ResolveImageUserFn != nil {
+		return m.ResolveImageUserFn(ctx, imageName, userOverride)
+	}
+	return 0, 0, nil // default: root
 }
 
 func (m *mockDockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {

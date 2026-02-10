@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3072,4 +3074,140 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	entry, err := diagStore.Get("lease-reprov")
 	require.NoError(t, err)
 	assert.Nil(t, entry, "stale diagnostic entry should be removed on successful re-provision")
+}
+
+func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
+	// Verify that doProvision chowns volume subdirectories to the image's
+	// runtime UID/GID when ResolveImageUser returns a non-root user.
+	if os.Getuid() != 0 {
+		t.Skip("chown requires root")
+	}
+
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	volDir := t.TempDir()
+	vm := &mockVolumeManager{
+		defaultDir: volDir,
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			return volDir, true, nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 999, 999, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-chown": {
+			LeaseUUID: "lease-chown",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-chown"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-chown-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifestPayload, _ := json.Marshal(DockerManifest{Image: "postgres:16", User: "999:999"})
+	manifest, _ := ParseManifest(manifestPayload)
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-chown", "tenant-a", "docker-small", 1, manifestPayload)
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Verify volume subdir is owned by UID/GID 999.
+	subdir := filepath.Join(volDir, "data")
+	info, err := os.Stat(subdir)
+	require.NoError(t, err)
+	stat := info.Sys().(*syscall.Stat_t)
+	assert.Equal(t, uint32(999), stat.Uid, "volume subdir should be owned by UID 999")
+	assert.Equal(t, uint32(999), stat.Gid, "volume subdir should be owned by GID 999")
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-chown"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
+	// Verify that doProvision does NOT chown when ResolveImageUser returns root (0, 0).
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	volDir := t.TempDir()
+	vm := &mockVolumeManager{
+		defaultDir: volDir,
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			return volDir, true, nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 0, 0, nil // root
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-root": {
+			LeaseUUID: "lease-root",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.volumes = vm
+	b.provisions["lease-root"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-root-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
+
+	req := newProvisionRequest("lease-root", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Verify provision succeeded — ownership stays as created by MkdirAll
+	// (no chown call since UID/GID are 0).
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-root"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 }

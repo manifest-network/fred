@@ -46,6 +46,15 @@ type DockerManifest struct {
 	// directories (e.g., "/var/cache/nginx", "/var/log/nginx").
 	// Each mount uses the operator-configured tmpfs size limit.
 	Tmpfs []string `json:"tmpfs,omitempty"`
+
+	// User overrides the container's runtime user. Required for images like
+	// postgres whose entrypoint starts as root and tries to chown data
+	// directories — since CapDrop ALL removes CAP_CHOWN, the container must
+	// run directly as the target user instead.
+	// Accepts the same formats as Docker's USER directive: "uid", "uid:gid",
+	// "username", or "username:group". When set, volumes are pre-chowned to
+	// the resolved UID/GID and container.Config.User is set accordingly.
+	User string `json:"user,omitempty"`
 }
 
 // PortConfig specifies port mapping configuration.
@@ -165,6 +174,29 @@ func (m *DockerManifest) Validate() error {
 		return err
 	}
 
+	// Validate user field if present
+	if m.User != "" {
+		if err := validateUserSpec(m.User); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateUserSpec validates a Docker USER specification.
+// Valid formats: "uid", "uid:gid", "username", "username:group".
+func validateUserSpec(user string) error {
+	if strings.ContainsAny(user, " \t\n\r") {
+		return fmt.Errorf("user: must not contain whitespace: %q", user)
+	}
+	parts := strings.SplitN(user, ":", 2)
+	if parts[0] == "" {
+		return fmt.Errorf("user: user part cannot be empty: %q", user)
+	}
+	if len(parts) == 2 && parts[1] == "" {
+		return fmt.Errorf("user: group part cannot be empty after colon: %q", user)
+	}
 	return nil
 }
 

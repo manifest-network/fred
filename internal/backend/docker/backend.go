@@ -31,6 +31,7 @@ type dockerClient interface {
 	Close() error
 	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
 	InspectImage(ctx context.Context, imageName string) (*ImageInfo, error)
+	ResolveImageUser(ctx context.Context, imageName string, userOverride string) (uid, gid int, err error)
 	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainer(ctx context.Context, containerID string) error
@@ -654,6 +655,27 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 	sort.Strings(imageVolumes)
 
+	// Resolve container user to numeric UID/GID.
+	// When the manifest specifies a user (e.g., "postgres" or "999:999"),
+	// the container runs as that user directly and volumes are pre-chowned.
+	// This is required for images whose entrypoint starts as root and tries
+	// to chown data directories — CapDrop ALL removes CAP_CHOWN.
+	var volumeUID, volumeGID int
+	var containerUser string
+	if manifest.User != "" || imageInfo.User != "" {
+		volumeUID, volumeGID, err = b.docker.ResolveImageUser(ctx, manifest.Image, manifest.User)
+		if err != nil {
+			logger.Error("failed to resolve image user", "error", err)
+			err = fmt.Errorf("image user resolution failed: %w", err)
+			callbackErr = "image user resolution failed"
+			return
+		}
+		if volumeUID != 0 || volumeGID != 0 {
+			containerUser = fmt.Sprintf("%d:%d", volumeUID, volumeGID)
+			logger.Info("resolved container user", "uid", volumeUID, "gid", volumeGID)
+		}
+	}
+
 	// Set up per-tenant network isolation if enabled
 	var networkConfig *networktypes.NetworkingConfig
 	if b.cfg.IsNetworkIsolation() {
@@ -718,6 +740,15 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 						callbackErr = "volume creation failed"
 						return
 					}
+					// Pre-chown for non-root container users (CapDrop ALL prevents in-container chown).
+					if volumeUID != 0 || volumeGID != 0 {
+						if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
+							instanceLogger.Error("failed to chown volume subdir", "path", subdir, "uid", volumeUID, "gid", volumeGID, "error", chownErr)
+							err = fmt.Errorf("volume subdir chown failed (instance %d, sku %s): %w", instanceIndex, item.SKU, chownErr)
+							callbackErr = "volume creation failed"
+							return
+						}
+					}
 					volumeBinds[subdir] = volPath
 				}
 			} else if profile.DiskMB > 0 && len(imageVolumes) == 0 {
@@ -743,6 +774,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				NetworkConfig:  networkConfig,
 				VolumeBinds:    volumeBinds,
 				ImageVolumes:   imageVolumes,
+				User:           containerUser,
 			}, b.cfg.ContainerCreateTimeout)
 			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
 			if createErr != nil {
