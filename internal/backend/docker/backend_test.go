@@ -328,6 +328,14 @@ func TestConfigValidation(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "volume_data_path is required")
 	})
+
+	t.Run("volume_data_path with whitespace fails", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.VolumeDataPath = "/var/lib/fred volumes"
+		err := cfg.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "whitespace")
+	})
 }
 
 func TestDuration(t *testing.T) {

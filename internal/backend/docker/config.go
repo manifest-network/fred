@@ -379,6 +379,9 @@ func (c *Config) Validate() error {
 	if c.HasStatefulSKUs() && c.VolumeDataPath == "" {
 		return fmt.Errorf("volume_data_path is required when any SKU profile has disk_mb > 0")
 	}
+	if strings.ContainsAny(c.VolumeDataPath, " \t\n") {
+		return fmt.Errorf("volume_data_path must not contain whitespace (got %q)", c.VolumeDataPath)
+	}
 	if c.VolumeFilesystem != "" {
 		switch c.VolumeFilesystem {
 		case "btrfs", "xfs", "zfs":
