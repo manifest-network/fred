@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // projectIDFile is the marker file written inside each volume directory
@@ -214,7 +215,9 @@ func (x *xfsVolumeManager) Validate() error {
 	}
 
 	// Check pquota mount option by attempting a quota report.
-	out, err := exec.Command("xfs_quota", "-x", "-c", "report -p", x.dataPath).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "xfs_quota", "-x", "-c", "report -p", x.dataPath).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("xfs project quotas not available at %s (mount with pquota option): %w: %s",
 			x.dataPath, err, out)

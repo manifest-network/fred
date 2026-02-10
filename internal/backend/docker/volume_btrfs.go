@@ -90,7 +90,9 @@ func (b *btrfsVolumeManager) Validate() error {
 	}
 
 	// Check quotas are enabled on the filesystem
-	out, err := exec.Command("btrfs", "qgroup", "show", b.dataPath).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "btrfs", "qgroup", "show", b.dataPath).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("btrfs quotas not enabled at %s (run 'btrfs quota enable %s'): %w: %s",
 			b.dataPath, b.dataPath, err, out)
