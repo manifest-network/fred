@@ -712,7 +712,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 						return
 					}
 					subdir := filepath.Join(hostPath, sanitized)
-					if mkErr := os.MkdirAll(subdir, 0o777); mkErr != nil {
+					if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
 						instanceLogger.Error("failed to create volume subdir", "path", subdir, "error", mkErr)
 						err = fmt.Errorf("volume subdir creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, mkErr)
 						callbackErr = "volume creation failed"

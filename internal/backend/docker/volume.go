@@ -25,7 +25,8 @@ type volumeManager interface {
 	// Used for orphan detection at startup.
 	List() ([]string, error)
 
-	// Validate checks filesystem support and permissions. Called at startup.
+	// Validate checks filesystem support and permissions, and rebuilds any
+	// internal state (e.g. active project IDs) from on-disk volumes. Called at startup.
 	Validate() error
 }
 
@@ -97,7 +98,12 @@ func newVolumeManager(dataPath, filesystem string, logger *slog.Logger) (volumeM
 	case "btrfs":
 		return &btrfsVolumeManager{dataPath: dataPath, logger: logger}, nil
 	case "xfs":
-		return &xfsVolumeManager{dataPath: dataPath, logger: logger}, nil
+		return &xfsVolumeManager{
+			dataPath:   dataPath,
+			logger:     logger,
+			activeIDs:  make(map[uint32]string),
+			volumeToID: make(map[string]uint32),
+		}, nil
 	case "zfs":
 		return &zfsVolumeManager{dataPath: dataPath, logger: logger}, nil
 	default:

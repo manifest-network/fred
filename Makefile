@@ -82,7 +82,7 @@ test-integration:
 # Usage: sudo make test-integration-volume
 test-integration-volume:
 	@echo "Running volume integration tests (requires root + Docker + btrfs-progs)..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_Stateful|TestIntegration_Docker_VolumePersists|TestIntegration_Docker_EphemeralVolume" -timeout 5m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota)" -timeout 10m
 
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
