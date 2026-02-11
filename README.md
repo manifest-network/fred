@@ -225,8 +225,8 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
 | `placement_store_db_path` | Path to bbolt database for lease→backend placement tracking (required for round-robin) | (optional) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
-| `releases_db_path` | Path to bbolt database for release history (docker-backend) | `releases.db` |
-| `releases_max_age` | Maximum age of persisted release entries (docker-backend) | `90d` |
+
+> **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
 
 ### Advanced Configuration
 
@@ -253,18 +253,7 @@ These options have sensible defaults but can be tuned for specific environments:
 
 ### TLS Configuration
 
-**API Server TLS:**
-```yaml
-tls_cert_file: "/path/to/cert.pem"
-tls_key_file: "/path/to/key.pem"
-```
-
-**gRPC to Chain TLS:**
-```yaml
-grpc_tls_enabled: true
-grpc_tls_ca_file: "/path/to/ca.pem"  # Optional, uses system CAs if empty
-grpc_tls_skip_verify: false          # For testing only
-```
+See [SECURITY.md](SECURITY.md#transport-security) for TLS configuration details (API server HTTPS, gRPC to chain).
 
 ### Environment Variables
 
@@ -290,6 +279,31 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 ```
 
 ## API Endpoints
+
+### Endpoint Reference
+
+#### Tenant API
+
+| Method | Path | Auth | Replay | Lease State | Notes |
+|--------|------|------|--------|-------------|-------|
+| `GET` | `/v1/leases/{uuid}/connection` | ADR-036 | Yes | Active | Returns sensitive connection details |
+| `GET` | `/v1/leases/{uuid}/status` | ADR-036 | No | Any | Idempotent read |
+| `GET` | `/v1/leases/{uuid}/provision` | ADR-036 | No | Any | Idempotent read |
+| `GET` | `/v1/leases/{uuid}/logs` | ADR-036 | No | Any | Idempotent read |
+| `GET` | `/v1/leases/{uuid}/releases` | ADR-036 | No | Any | Idempotent read |
+| `POST` | `/v1/leases/{uuid}/data` | ADR-036 | No | Pending | Has own idempotency (409 on duplicate) |
+| `POST` | `/v1/leases/{uuid}/restart` | ADR-036 | Yes | Active | Mutating — replaying would restart again |
+| `POST` | `/v1/leases/{uuid}/update` | ADR-036 | Yes | Active | Mutating — replaying would redeploy again |
+
+#### Operational
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| `GET` | `/health` | None | Chain connectivity, backend health, DB health |
+| `GET` | `/metrics` | None | Prometheus metrics |
+| `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
+
+See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
 
 ### Health Check
 
@@ -317,18 +331,7 @@ GET /v1/leases/{lease_uuid}/connection
 Authorization: Bearer <token>
 ```
 
-Returns connection details for an active lease from the backend. Requires ADR-036 signed authentication token.
-
-**Token Format** (base64-encoded JSON):
-```json
-{
-  "tenant": "manifest1...",
-  "lease_uuid": "...",
-  "timestamp": 1234567890,
-  "pub_key": "<base64-encoded-pubkey>",
-  "signature": "<base64-encoded-signature>"
-}
-```
+Returns connection details for an active lease from the backend. Requires ADR-036 signed bearer token. See [SECURITY.md](SECURITY.md#tenant-authentication-adr-036) for token format and signing details.
 
 **Response (single instance):**
 ```json
@@ -488,21 +491,7 @@ Content-Type: application/octet-stream
 <raw payload bytes>
 ```
 
-Upload deployment configuration for a lease that was created with a `meta_hash`. The payload is validated against the on-chain hash before provisioning starts.
-
-**Token Format** (base64-encoded JSON):
-```json
-{
-  "tenant": "manifest1...",
-  "lease_uuid": "...",
-  "meta_hash": "abc123...",
-  "timestamp": 1234567890,
-  "pub_key": "<base64-encoded-pubkey>",
-  "signature": "<base64-encoded-signature>"
-}
-```
-
-The signed message format is: `manifest lease data {lease_uuid} {meta_hash_hex} {unix_timestamp}`
+Upload deployment configuration for a lease that was created with a `meta_hash`. The payload is validated against the on-chain hash before provisioning starts. Requires a payload-specific ADR-036 token that includes the `meta_hash` field. See [SECURITY.md](SECURITY.md#tenant-authentication-adr-036) for token details.
 
 **Response Codes:**
 - `202 Accepted` - Payload received, provisioning started
@@ -546,7 +535,7 @@ Content-Type: application/json
 }
 ```
 
-Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are removed and new ones are created from the updated manifest. Volumes are preserved.
+Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are stopped, new ones are created from the updated manifest, and old containers are cleaned up after verification. On failure, the operation rolls back to the previous containers. Volumes are preserved.
 
 **Response:** `202 Accepted`
 ```json
@@ -619,20 +608,7 @@ Content-Type: application/json
 X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
 ```
 
-Called by backends to report provisioning status. Requires HMAC-SHA256 authentication with timestamp-based replay protection.
-
-**Authentication:**
-The `X-Fred-Signature` header contains a timestamped HMAC-SHA256 signature. Format: `t=<unix-timestamp>,sha256=<hex>`.
-
-The HMAC is computed over `<timestamp>.<body>` to bind the timestamp to the signature:
-```
-signedPayload = fmt.Sprintf("%d.%s", timestamp, body)
-signature = HMAC-SHA256(signedPayload, callback_secret)
-```
-
-**Replay Protection:**
-- Callbacks older than 5 minutes are rejected
-- Timestamps up to 1 minute in the future are accepted (clock skew tolerance)
+Called by backends to report provisioning status. Requires HMAC-SHA256 authentication via the `X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
 
 **Request:**
 ```json
@@ -666,6 +642,32 @@ for debugging purposes, while maintaining idempotent semantics.
 ## Backend API Specification
 
 Any backend must implement these HTTP endpoints. For a comprehensive implementation guide including SKU handling, callback signing, state management, and reconciliation, see [BACKEND_GUIDE.md](BACKEND_GUIDE.md).
+
+### Endpoint Reference
+
+All endpoints except `/health`, `/stats`, and `/metrics` require HMAC-SHA256 signature authentication via the `X-Fred-Signature` header.
+
+#### Required
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/provision` | HMAC | Create resource (async, callback on completion) |
+| `POST` | `/deprovision` | HMAC | Remove resource (idempotent) |
+| `GET` | `/info/{uuid}` | HMAC | Connection details (host, ports) |
+| `GET` | `/provisions` | HMAC | List all provisions (reconciliation) |
+| `GET` | `/provisions/{uuid}` | HMAC | Provision diagnostics (status, errors) |
+| `GET` | `/logs/{uuid}` | HMAC | Container logs |
+| `GET` | `/health` | None | Health check |
+
+#### Optional
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/restart` | HMAC | Restart containers (async, callback on completion) |
+| `POST` | `/update` | HMAC | Deploy new manifest (async, callback on completion) |
+| `GET` | `/releases/{uuid}` | HMAC | Release history |
+| `GET` | `/stats` | None | Resource capacity and usage |
+| `GET` | `/metrics` | None | Prometheus metrics |
 
 ### POST /provision
 
@@ -1103,20 +1105,18 @@ Chain State (leases)     Backend State (provisions)
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |
 
-## Security Features
+## Security
 
-- **Rate Limiting**: Per-IP and per-tenant token bucket rate limiting (configurable RPS and burst)
-- **Request Size Limits**: Configurable max request body size (default 1MB)
-- **Input Validation**: UUID format validation on all inputs
-- **Error Sanitization**: Generic error messages to clients, detailed logs server-side
-- **TLS Support**: Optional HTTPS for API and TLS for gRPC
-- **ADR-036 Authentication**: Cryptographic signature verification for tenant access
-- **Token Expiry**: 30-second validity window on authentication tokens
-- **Token Replay Protection**: Used tokens tracked in persistent database to prevent replay attacks. Uses fail-closed semantics: database errors result in 503 Service Unavailable rather than proceeding without protection
-- **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
-- **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
-- **Security Headers**: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Cache-Control headers on all responses
-- **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection, loopback/link-local/unspecified URLs). SSRF checks validate IP literals and the `localhost` hostname only — private IPs (RFC 1918) are allowed since backends commonly run on private networks. DNS resolution is not performed, so hostnames resolving to blocked addresses are not caught. Use network-level controls for defense in depth.
+- **Tenant Authentication**: ADR-036 secp256k1 signatures with 30-second token expiry and low-S normalization
+- **Replay Protection**: Persistent token tracking (bbolt) with fail-closed semantics on mutating endpoints
+- **Callback Authentication**: HMAC-SHA256 with timestamp-based replay protection (5-minute window)
+- **Rate Limiting**: Dual-layer token bucket — global per-IP (10 RPS) and per-tenant (5 RPS)
+- **Container Hardening**: Drop all capabilities, no-new-privileges, read-only rootfs, PID limits, network isolation
+- **Input Validation**: UUID format checks, URL scheme/host validation, manifest parsing, image allowlisting
+- **Production Mode**: Enforces replay protection, blocks TLS skip-verify, SSRF checks on all URLs
+- **Constant-Time Comparisons**: `hmac.Equal` and `subtle.ConstantTimeCompare` for all secret comparisons
+
+See [SECURITY.md](SECURITY.md) for the full security architecture, authentication flows, replay protection rationale, and known limitations.
 
 ## Performance
 

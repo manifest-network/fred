@@ -2,11 +2,13 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
@@ -24,6 +26,7 @@ type HandlerDeps struct {
 	Tracker      InFlightTracker
 	Acknowledger Acknowledger
 	PayloadStore *payload.Store
+	Publisher    message.Publisher // For publishing to TopicLeaseEvent (optional)
 }
 
 // HandlerSet contains the Watermill message handlers for the provisioner.
@@ -102,6 +105,8 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 		}
 		return err
 	}
+
+	h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusProvisioning, "")
 	return nil
 }
 
@@ -240,6 +245,8 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		// the same manifest. Payload cleanup happens when the lease is closed
 		// (HandleLeaseClosed) or rejected (failure callback above).
 
+		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
+
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
 			"tenant", provision.Tenant,
@@ -270,6 +277,8 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
 			recordDuration()
 			metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+
+			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, reason)
 
 			slog.Warn("re-provision failed for active lease, deferring to reconciler",
 				"lease_uuid", callback.LeaseUUID,
@@ -308,6 +317,8 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			h.deps.PayloadStore.Delete(callback.LeaseUUID)
 		}
 		h.deps.Orchestrator.DeletePlacement(callback.LeaseUUID)
+
+		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, reason)
 
 		slog.Info("lease rejected after provisioning failure",
 			"lease_uuid", callback.LeaseUUID,
@@ -434,4 +445,30 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return err
 	}
 	return nil
+}
+
+// publishLeaseEvent publishes a LeaseStatusEvent to TopicLeaseEvent for SSE delivery.
+// Best-effort: errors are logged but do not affect the handler's return value.
+func (h *HandlerSet) publishLeaseEvent(leaseUUID string, status backend.ProvisionStatus, errMsg string) {
+	if h.deps.Publisher == nil {
+		return
+	}
+
+	event := backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    status,
+		Error:     errMsg,
+		Timestamp: time.Now(),
+	}
+
+	data, err := json.Marshal(event)
+	if err != nil {
+		slog.Warn("failed to marshal lease event", "lease_uuid", leaseUUID, "error", err)
+		return
+	}
+
+	msg := message.NewMessage(watermill.NewUUID(), data)
+	if err := h.deps.Publisher.Publish(TopicLeaseEvent, msg); err != nil {
+		slog.Warn("failed to publish lease event", "lease_uuid", leaseUUID, "error", err)
+	}
 }

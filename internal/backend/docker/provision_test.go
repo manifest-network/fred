@@ -1,10 +1,12 @@
 package docker
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3210,6 +3212,978 @@ func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
 	// (no chown call since UID/GID are 0).
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-root"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+func TestInspectImageForSetup_AutoDetectVolumeOwner(t *testing.T) {
+	// Mongo-like image: root USER, volumes owned by UID 999.
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:abc123",
+				Volumes: map[string]struct{}{"/data/db": {}, "/data/configdb": {}},
+			}, nil
+		},
+		DetectVolumeOwnerFn: func(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+			return 999, 999, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	result, err := b.inspectImageForSetup(context.Background(), "mongo:latest", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "999:999", result.ContainerUser)
+	assert.Equal(t, 999, result.VolumeUID)
+	assert.Equal(t, 999, result.VolumeGID)
+}
+
+func TestInspectImageForSetup_AutoDetectCacheHit(t *testing.T) {
+	// Second call with same image ID should not invoke DetectVolumeOwner.
+	var detectCalls int
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:cached",
+				Volumes: map[string]struct{}{"/data": {}},
+			}, nil
+		},
+		DetectVolumeOwnerFn: func(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+			detectCalls++
+			return 999, 999, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	_, err := b.inspectImageForSetup(context.Background(), "mongo:latest", "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, detectCalls)
+
+	// Second call — cache hit, no additional DetectVolumeOwner call.
+	result, err := b.inspectImageForSetup(context.Background(), "mongo:latest", "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, detectCalls, "DetectVolumeOwner should not be called again")
+	assert.Equal(t, "999:999", result.ContainerUser)
+}
+
+func TestInspectImageForSetup_AutoDetectRootOwnership(t *testing.T) {
+	// Volumes owned by root → no override.
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:rootowned",
+				Volumes: map[string]struct{}{"/data": {}},
+			}, nil
+		},
+		DetectVolumeOwnerFn: func(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+			return 0, 0, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	result, err := b.inspectImageForSetup(context.Background(), "alpine:latest", "")
+	require.NoError(t, err)
+
+	assert.Empty(t, result.ContainerUser)
+	assert.Equal(t, 0, result.VolumeUID)
+	assert.Equal(t, 0, result.VolumeGID)
+}
+
+func TestInspectImageForSetup_AutoDetectError(t *testing.T) {
+	// DetectVolumeOwner fails → graceful fallback, no error propagated.
+	// Errors are NOT cached, so a subsequent call retries.
+	var detectCalls int
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:errorcase",
+				Volumes: map[string]struct{}{"/data": {}},
+			}, nil
+		},
+		DetectVolumeOwnerFn: func(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+			detectCalls++
+			if detectCalls == 1 {
+				return 0, 0, errors.New("docker daemon unreachable")
+			}
+			return 999, 999, nil // succeeds on retry
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	// First call: error → defaults to root.
+	result, err := b.inspectImageForSetup(context.Background(), "mongo:latest", "")
+	require.NoError(t, err)
+	assert.Empty(t, result.ContainerUser)
+	assert.Equal(t, 1, detectCalls)
+
+	// Second call: retries (error was not cached) → succeeds.
+	result, err = b.inspectImageForSetup(context.Background(), "mongo:latest", "")
+	require.NoError(t, err)
+	assert.Equal(t, "999:999", result.ContainerUser)
+	assert.Equal(t, 2, detectCalls, "should retry after transient error")
+}
+
+func TestInspectImageForSetup_ExplicitUserSkipsAutoDetect(t *testing.T) {
+	// Manifest user set → DetectVolumeOwner NOT called.
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:explicituser",
+				Volumes: map[string]struct{}{"/data": {}},
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 1000, 1000, nil
+		},
+		DetectVolumeOwnerFn: func(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+			t.Fatal("DetectVolumeOwner should not be called when manifest user is set")
+			return 0, 0, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	result, err := b.inspectImageForSetup(context.Background(), "postgres:16", "1000:1000")
+	require.NoError(t, err)
+
+	assert.Equal(t, "1000:1000", result.ContainerUser)
+	assert.Equal(t, 1000, result.VolumeUID)
+	assert.Equal(t, 1000, result.VolumeGID)
+}
+
+func TestInspectImageForSetup_NoVolumesSkipsAutoDetect(t *testing.T) {
+	// No VOLUME paths → DetectVolumeOwner NOT called.
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:novolumes",
+				Volumes: map[string]struct{}{},
+			}, nil
+		},
+		DetectVolumeOwnerFn: func(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+			t.Fatal("DetectVolumeOwner should not be called when there are no volumes")
+			return 0, 0, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	result, err := b.inspectImageForSetup(context.Background(), "nginx:latest", "")
+	require.NoError(t, err)
+
+	assert.Empty(t, result.ContainerUser)
+	assert.Equal(t, 0, result.VolumeUID)
+	assert.Equal(t, 0, result.VolumeGID)
+}
+
+// --- WritablePaths tests ---
+
+func TestInspectImageForSetup_DetectsWritablePaths(t *testing.T) {
+	// Grafana-like image: non-root user (472), no VOLUMEs.
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:grafana123",
+				Volumes: map[string]struct{}{},
+				User:    "472",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 472, 472, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			assert.Equal(t, 472, uid)
+			return []string{"/var/lib/grafana", "/var/log/grafana"}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	result, err := b.inspectImageForSetup(context.Background(), "grafana/grafana:latest", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "472:472", result.ContainerUser)
+	assert.Equal(t, []string{"/var/lib/grafana", "/var/log/grafana"}, result.WritablePaths)
+	assert.Empty(t, result.Volumes)
+}
+
+func TestInspectImageForSetup_WritablePathsDetectedWithVolumes(t *testing.T) {
+	// MySQL-like image: has VOLUMEs AND needs /var/run/mysqld writable.
+	// Detection must still run even when VOLUMEs are declared.
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:mysql9",
+				Volumes: map[string]struct{}{"/var/lib/mysql": {}},
+				User:    "999",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 999, 999, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			return []string{"/var/run/mysqld"}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	result, err := b.inspectImageForSetup(context.Background(), "mysql:9", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"/var/run/mysqld"}, result.WritablePaths)
+	assert.Equal(t, []string{"/var/lib/mysql"}, result.Volumes)
+	assert.Equal(t, "999:999", result.ContainerUser)
+}
+
+func TestInspectImageForSetup_WritablePathsDetectedForRoot(t *testing.T) {
+	// Root user → writable path detection is called with uid=0,
+	// matching directories owned by any non-root user (e.g., neo4j).
+	var detectedUID int
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:rootuser",
+				Volumes: map[string]struct{}{"/data": {}},
+			}, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			detectedUID = uid
+			return []string{"/var/lib/neo4j"}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	result, err := b.inspectImageForSetup(context.Background(), "neo4j:latest", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, detectedUID, "should pass uid=0 for root images")
+	assert.Equal(t, []string{"/var/lib/neo4j"}, result.WritablePaths)
+	assert.Empty(t, result.ContainerUser)
+}
+
+func TestInspectImageForSetup_WritablePathsCacheHit(t *testing.T) {
+	// Second call with same image ID should not invoke DetectWritablePaths.
+	var detectCalls int
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:grafana-cached",
+				Volumes: map[string]struct{}{},
+				User:    "472",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 472, 472, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			detectCalls++
+			return []string{"/var/lib/grafana"}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	_, err := b.inspectImageForSetup(context.Background(), "grafana/grafana:latest", "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, detectCalls)
+
+	// Second call — cache hit, no additional DetectWritablePaths call.
+	result, err := b.inspectImageForSetup(context.Background(), "grafana/grafana:latest", "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, detectCalls, "DetectWritablePaths should not be called again")
+	assert.Equal(t, []string{"/var/lib/grafana"}, result.WritablePaths)
+}
+
+func TestInspectImageForSetup_WritablePathsErrorNotCached(t *testing.T) {
+	// Error → no cache, retry succeeds.
+	var detectCalls int
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:grafana-retry",
+				Volumes: map[string]struct{}{},
+				User:    "472",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 472, 472, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			detectCalls++
+			if detectCalls == 1 {
+				return nil, errors.New("docker daemon unreachable")
+			}
+			return []string{"/var/lib/grafana"}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+
+	// First call: error → nil writable paths.
+	result, err := b.inspectImageForSetup(context.Background(), "grafana/grafana:latest", "")
+	require.NoError(t, err)
+	assert.Nil(t, result.WritablePaths)
+	assert.Equal(t, 1, detectCalls)
+
+	// Second call: retries (error was not cached) → succeeds.
+	result, err = b.inspectImageForSetup(context.Background(), "grafana/grafana:latest", "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/var/lib/grafana"}, result.WritablePaths)
+	assert.Equal(t, 2, detectCalls, "should retry after transient error")
+}
+
+func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
+	// End-to-end: detected writable paths flow through to CreateContainerParams
+	// as WritablePathBinds (bind mounts from managed volume).
+	var capturedParams CreateContainerParams
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:grafana-e2e",
+				Volumes: map[string]struct{}{},
+				User:    "472",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 472, 472, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			return []string{"/var/lib/grafana"}, nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	tmpDir := t.TempDir()
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.SKUProfiles = map[string]SKUProfile{
+		"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0},
+	}
+	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
+
+	req := newProvisionRequest("lease-wp", "tenant-a", "docker-small", 1, validManifestJSON("grafana/grafana:latest"))
+	req.CallbackURL = callbackServer.URL
+
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	<-callbackReceived
+
+	// WritablePathBinds should map host path → container path.
+	require.NotNil(t, capturedParams.WritablePathBinds)
+	assert.Contains(t, capturedParams.WritablePathBinds, filepath.Join(tmpDir, "_wp", "var/lib/grafana"))
+	assert.Equal(t, "/var/lib/grafana", capturedParams.WritablePathBinds[filepath.Join(tmpDir, "_wp", "var/lib/grafana")])
+	assert.Equal(t, "472:472", capturedParams.User)
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestInspectImageForSetup_FilterSubpaths(t *testing.T) {
+	// Verify that writable paths that overlap VOLUME paths are filtered out.
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID: "sha256:neo4j-test",
+				Volumes: map[string]struct{}{
+					"/data": {},
+				},
+				User: "7474",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 7474, 7474, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			// /data/transactions is a subtree of VOLUME /data → should be filtered
+			return []string{"/var/lib/neo4j", "/data/transactions"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
+
+	imgSetup, err := b.inspectImageForSetup(context.Background(), "neo4j:latest", "")
+	require.NoError(t, err)
+
+	// /data/transactions should be filtered out (subtree of /data)
+	// /var/lib/neo4j should remain
+	assert.Equal(t, []string{"/var/lib/neo4j"}, imgSetup.WritablePaths)
+}
+
+func TestWritablePathBindsNoOverlap(t *testing.T) {
+	// Verify that writable path binds don't include paths already covered
+	// by VOLUME bind mounts. This is handled upstream by filterSubpaths
+	// in inspectImageForSetup — writable paths that overlap VOLUME paths
+	// are removed before they reach doProvision.
+
+	// filterSubpaths should remove /var/lib/mysql (equal to VOLUME path)
+	volumes := []string{"/var/lib/mysql"}
+	writablePaths := []string{"/var/lib/mysql", "/var/run/mysqld"}
+	filtered := filterSubpaths(writablePaths, volumes)
+
+	assert.NotContains(t, filtered, "/var/lib/mysql",
+		"/var/lib/mysql should be filtered (covered by VOLUME)")
+	assert.Contains(t, filtered, "/var/run/mysqld",
+		"/var/run/mysqld should remain (not covered by VOLUME)")
+}
+
+// --- filterSubpaths tests ---
+
+func TestFilterSubpaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+		parents    []string
+		want       []string
+	}{
+		{
+			name:       "no overlap",
+			candidates: []string{"/var/lib/grafana", "/var/run/mysqld"},
+			parents:    []string{"/data"},
+			want:       []string{"/var/lib/grafana", "/var/run/mysqld"},
+		},
+		{
+			name:       "exact match removed",
+			candidates: []string{"/data", "/var/lib/app"},
+			parents:    []string{"/data"},
+			want:       []string{"/var/lib/app"},
+		},
+		{
+			name:       "subtree removed",
+			candidates: []string{"/data/transactions", "/var/lib/app"},
+			parents:    []string{"/data"},
+			want:       []string{"/var/lib/app"},
+		},
+		{
+			name:       "multiple parents",
+			candidates: []string{"/data/tx", "/logs/app", "/var/lib/app"},
+			parents:    []string{"/data", "/logs"},
+			want:       []string{"/var/lib/app"},
+		},
+		{
+			name:       "nil candidates",
+			candidates: nil,
+			parents:    []string{"/data"},
+			want:       nil,
+		},
+		{
+			name:       "nil parents",
+			candidates: []string{"/var/lib/app"},
+			parents:    nil,
+			want:       []string{"/var/lib/app"},
+		},
+		{
+			name:       "prefix but not subtree",
+			candidates: []string{"/data-extra"},
+			parents:    []string{"/data"},
+			want:       []string{"/data-extra"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterSubpaths(tt.candidates, tt.parents)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// --- sanitizeAndExtractTar tests ---
+
+func TestSanitizeAndExtractTar(t *testing.T) {
+	t.Run("extracts regular files and dirs", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "conf/", Typeflag: tar.TypeDir, Mode: 0o755, Uid: 1000, Gid: 1000},
+			{Name: "conf/app.conf", Typeflag: tar.TypeReg, Mode: 0o644, Uid: 1000, Gid: 1000, Content: "key=value"},
+		})
+
+		written, skipped, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		require.NoError(t, err)
+		assert.Empty(t, skipped)
+		assert.Equal(t, int64(9), written) // len("key=value")
+
+		content, readErr := os.ReadFile(filepath.Join(destDir, "conf", "app.conf"))
+		require.NoError(t, readErr)
+		assert.Equal(t, "key=value", string(content))
+	})
+
+	t.Run("rejects absolute path", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "/etc/passwd", Typeflag: tar.TypeReg, Mode: 0o644, Content: "evil"},
+		})
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		assert.ErrorContains(t, err, "unsafe path")
+	})
+
+	t.Run("rejects path traversal", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "../escape", Typeflag: tar.TypeReg, Mode: 0o644, Content: "evil"},
+		})
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		assert.ErrorContains(t, err, "unsafe path")
+	})
+
+	t.Run("rejects device node", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "dev/null", Typeflag: tar.TypeBlock, Mode: 0o666},
+		})
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		assert.ErrorContains(t, err, "disallowed type")
+	})
+
+	t.Run("enforces size limit", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "big.bin", Typeflag: tar.TypeReg, Mode: 0o644, Content: strings.Repeat("x", 100)},
+		})
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 50)
+		assert.ErrorContains(t, err, "exceeds")
+	})
+
+	t.Run("strips setuid bits", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "suid-binary", Typeflag: tar.TypeReg, Mode: 0o4755, Content: "binary"},
+		})
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		require.NoError(t, err)
+
+		info, statErr := os.Stat(filepath.Join(destDir, "suid-binary"))
+		require.NoError(t, statErr)
+		// Setuid bit should be stripped
+		assert.Zero(t, info.Mode()&os.ModeSetuid)
+	})
+
+	t.Run("creates absolute symlink and reports it", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "conf/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "conf/real.conf", Typeflag: tar.TypeReg, Mode: 0o644, Content: "data"},
+			{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"},
+		})
+		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"link -> /etc/passwd"}, outOfScope)
+		// Symlink is created (dangling on host, resolves inside container).
+		assert.FileExists(t, filepath.Join(destDir, "conf", "real.conf"))
+		linkTarget, readlinkErr := os.Readlink(filepath.Join(destDir, "link"))
+		require.NoError(t, readlinkErr)
+		assert.Equal(t, "/etc/passwd", linkTarget)
+	})
+
+	t.Run("creates traversal symlink and reports it", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "a/b/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "a/b/file.txt", Typeflag: tar.TypeReg, Mode: 0o644, Content: "ok"},
+			{Name: "a/b/link", Typeflag: tar.TypeSymlink, Linkname: "../../../etc/passwd"},
+		})
+		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a/b/link -> ../../../etc/passwd"}, outOfScope)
+		assert.FileExists(t, filepath.Join(destDir, "a", "b", "file.txt"))
+		linkTarget, readlinkErr := os.Readlink(filepath.Join(destDir, "a", "b", "link"))
+		require.NoError(t, readlinkErr)
+		assert.Equal(t, "../../../etc/passwd", linkTarget)
+	})
+
+	t.Run("creates parent-escape symlink and reports it", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "keepme.txt", Typeflag: tar.TypeReg, Mode: 0o644, Content: "kept"},
+			{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: ".."},
+		})
+		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"escape -> .."}, outOfScope)
+		assert.FileExists(t, filepath.Join(destDir, "keepme.txt"))
+		linkTarget, readlinkErr := os.Readlink(filepath.Join(destDir, "escape"))
+		require.NoError(t, readlinkErr)
+		assert.Equal(t, "..", linkTarget)
+	})
+
+	t.Run("allows safe symlink", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "conf/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "conf/real.conf", Typeflag: tar.TypeReg, Mode: 0o644, Content: "data"},
+			{Name: "conf/link.conf", Typeflag: tar.TypeSymlink, Linkname: "real.conf"},
+		})
+		_, skipped, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		require.NoError(t, err)
+		assert.Empty(t, skipped)
+
+		target, readlinkErr := os.Readlink(filepath.Join(destDir, "conf", "link.conf"))
+		require.NoError(t, readlinkErr)
+		assert.Equal(t, "real.conf", target)
+	})
+
+	t.Run("preserves ownership", func(t *testing.T) {
+		if os.Getuid() != 0 {
+			t.Skip("chown requires root")
+		}
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "owned.txt", Typeflag: tar.TypeReg, Mode: 0o644, Uid: 1000, Gid: 1000, Content: "data"},
+		})
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		require.NoError(t, err)
+
+		info, statErr := os.Stat(filepath.Join(destDir, "owned.txt"))
+		require.NoError(t, statErr)
+		stat := info.Sys().(*syscall.Stat_t)
+		assert.Equal(t, uint32(1000), stat.Uid)
+		assert.Equal(t, uint32(1000), stat.Gid)
+	})
+}
+
+// testTarEntry describes a single tar entry for test helpers.
+type testTarEntry struct {
+	Name     string
+	Typeflag byte
+	Mode     int64
+	Uid, Gid int
+	Content  string
+	Linkname string
+}
+
+// createTestTar builds an in-memory tar archive from test entries.
+func createTestTar(t *testing.T, entries []testTarEntry) io.Reader {
+	t.Helper()
+	var buf strings.Builder
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		hdr := &tar.Header{
+			Name:     e.Name,
+			Typeflag: e.Typeflag,
+			Mode:     e.Mode,
+			Uid:      e.Uid,
+			Gid:      e.Gid,
+			Linkname: e.Linkname,
+			Size:     int64(len(e.Content)),
+		}
+		require.NoError(t, tw.WriteHeader(hdr))
+		if e.Content != "" {
+			_, err := tw.Write([]byte(e.Content))
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, tw.Close())
+	return strings.NewReader(buf.String())
+}
+
+// --- WritablePathBinds tests ---
+
+func TestDoProvision_WritablePathBinds(t *testing.T) {
+	// Volume created, content extracted, bind mounts set.
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var extractCalled bool
+	var capturedParams CreateContainerParams
+	tmpDir := t.TempDir()
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:abc",
+				Volumes: map[string]struct{}{},
+				User:    "1000",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 1000, 1000, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			return []string{"/var/lib/neo4j"}, nil
+		},
+		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+			extractCalled = true
+			assert.Equal(t, "nginx:latest", imageName)
+			assert.Equal(t, []string{"/var/lib/neo4j"}, paths)
+			assert.Contains(t, destDir, "_wp")
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
+	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	assert.True(t, extractCalled, "ExtractImageContent should be called for writable paths")
+	require.NotNil(t, capturedParams.WritablePathBinds)
+	assert.Equal(t, "/var/lib/neo4j", capturedParams.WritablePathBinds[filepath.Join(tmpDir, "_wp", "var/lib/neo4j")])
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+func TestDoProvision_WritablePathBinds_PartialFailure(t *testing.T) {
+	// When ExtractImageContent fails for some paths, only successful paths
+	// appear in WritablePathBinds; failed paths are omitted gracefully.
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var capturedParams CreateContainerParams
+	tmpDir := t.TempDir()
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:abc",
+				Volumes: map[string]struct{}{},
+				User:    "1000",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 1000, 1000, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			return []string{"/var/lib/app", "/var/log/app"}, nil
+		},
+		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+			return map[string]error{
+				"/var/log/app": fmt.Errorf("path does not exist in image"),
+			}
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedParams = params
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
+	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Successful path should be in binds, failed path should be omitted.
+	require.NotNil(t, capturedParams.WritablePathBinds)
+	assert.Equal(t, "/var/lib/app", capturedParams.WritablePathBinds[filepath.Join(tmpDir, "_wp", "var/lib/app")])
+	for hostPath, containerPath := range capturedParams.WritablePathBinds {
+		assert.NotEqual(t, "/var/log/app", containerPath, "failed path should not be in binds: %s", hostPath)
+	}
+}
+
+func TestDoRestart_WritablePathBinds(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var extractCalled bool
+	tmpDir := t.TempDir()
+	mock := &mockDockerClient{
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:abc",
+				Volumes: map[string]struct{}{},
+				User:    "1000",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 1000, 1000, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			return []string{"/var/lib/grafana"}, nil
+		},
+		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+			extractCalled = true
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "new-container", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusRestarting,
+			Quantity:     1,
+			ContainerIDs: []string{"old-container"},
+			CallbackURL:  callbackServer.URL,
+		},
+	})
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
+	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	b.doRestart(context.Background(), "lease-1", manifest, []string{"old-container"}, "docker-small", b.logger)
+
+	assert.True(t, extractCalled, "ExtractImageContent should be called on restart")
+}
+
+func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
+	// Ephemeral SKU (DiskMB=0) with writable paths should create a small volume.
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	tmpDir := t.TempDir()
+	var volumeCreated bool
+	var createdSizeMB int64
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
+			return &ImageInfo{
+				ID:      "sha256:abc",
+				Volumes: map[string]struct{}{},
+				User:    "1000",
+			}, nil
+		},
+		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+			return 1000, 1000, nil
+		},
+		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+			return []string{"/var/lib/app"}, nil
+		},
+		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "container-1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  1,
+		},
+	})
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
+	b.volumes = &mockVolumeManager{
+		defaultDir: tmpDir,
+		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
+			volumeCreated = true
+			createdSizeMB = sizeMB
+			return tmpDir, true, nil
+		},
+	}
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}} // ephemeral
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	assert.True(t, volumeCreated, "volume should be created for ephemeral SKU with writable paths")
+	assert.Equal(t, int64(b.cfg.GetTmpfsSizeMB()), createdSizeMB, "ephemeral writable volume should use TmpfsSizeMB")
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 }

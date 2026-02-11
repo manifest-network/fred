@@ -43,6 +43,20 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 	})
 }
 
+// sseBrokerAdapter bridges api.SSEBroker to the provisioner.LeaseEventSink interface.
+type sseBrokerAdapter struct {
+	broker *api.SSEBroker
+}
+
+func (a *sseBrokerAdapter) Publish(event provisioner.LeaseEventPayload) {
+	a.broker.Publish(api.SSEEvent{
+		LeaseUUID: event.LeaseUUID,
+		Status:    event.Status,
+		Error:     event.Error,
+		Timestamp: event.Timestamp,
+	})
+}
+
 var version = "dev"
 
 var (
@@ -251,12 +265,16 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Create SSE broker for real-time lease event delivery
+	sseBroker := api.NewSSEBroker()
+
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:    cfg.ProviderUUID,
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		PayloadStore:    payloadStore,
 		PlacementStore:  placementStore,
+		LeaseEventSink:  &sseBrokerAdapter{broker: sseBroker},
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -293,7 +311,7 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackSecret:       cfg.CallbackSecret,
 		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,
 		CallbackBaseURL:      cfg.CallbackBaseURL,
-	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr, placementStore)
+	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr, placementStore, sseBroker)
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
 	}

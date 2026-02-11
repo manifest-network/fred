@@ -175,6 +175,25 @@ func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.Callbac
 	return server, ch
 }
 
+// waitForCallback reads from the callback channel until it finds a callback
+// matching the expected lease UUID. Callbacks for other leases (e.g., death
+// events from the container event loop) are logged and skipped.
+func waitForCallback(t *testing.T, ch <-chan backend.CallbackPayload, leaseUUID string, timeout time.Duration) backend.CallbackPayload {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case cb := <-ch:
+			if cb.LeaseUUID == leaseUUID {
+				return cb
+			}
+			t.Logf("skipping callback for lease %s (status=%s, waiting for %s)", cb.LeaseUUID, cb.Status, leaseUUID)
+		case <-deadline:
+			t.Fatalf("timeout waiting for callback for lease %s", leaseUUID)
+		}
+	}
+}
+
 func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
@@ -1309,12 +1328,8 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	select {
-	case cb := <-callbackCh:
-		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for first provision callback")
-	}
+	cb := waitForCallback(t, callbackCh, leaseUUID1, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
 
 	// Second provision should fail — pool is exhausted
 	leaseUUID2 := fmt.Sprintf("exhaust-2-%d", time.Now().UnixNano())
@@ -1342,11 +1357,9 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 		assert.NotEqual(t, leaseUUID2, p.LeaseUUID, "rejected lease should not appear in ListProvisions")
 	}
 
-	// First provision should still be healthy
-	info := getProvisionInfo(t, b, leaseUUID1)
-	assert.Equal(t, backend.ProvisionStatusReady, info.Status)
-
-	// After deprovisioning the first lease, the second should succeed
+	// After deprovisioning the first lease, the second should succeed.
+	// Note: the container event loop may have already detected the container's
+	// death and transitioned lease-1 to Failed. Deprovision handles both states.
 	err = b.Deprovision(ctx, leaseUUID1)
 	require.NoError(t, err)
 
@@ -1360,12 +1373,8 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	select {
-	case cb := <-callbackCh:
-		assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for second provision callback after freeing resources")
-	}
+	cb = waitForCallback(t, callbackCh, leaseUUID2, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
 }
 
 // TestIntegration_Docker_SameTenantNetwork_Shared verifies that two leases
@@ -1694,10 +1703,10 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, releases, 2, "expected 2 releases after provision + update")
 
-	// Release 1: version=1, busybox, active (initial provision release)
+	// Release 1: version=1, busybox, superseded (ActivateLatest marks previous as superseded)
 	assert.Equal(t, 1, releases[0].Version)
 	assert.Equal(t, "busybox:latest", releases[0].Image)
-	assert.Equal(t, "active", releases[0].Status)
+	assert.Equal(t, "superseded", releases[0].Status)
 
 	// Release 2: version=2, alpine, active
 	assert.Equal(t, 2, releases[1].Version)

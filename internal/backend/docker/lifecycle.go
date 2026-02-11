@@ -4,16 +4,21 @@ import (
 	"archive/tar"
 	"bufio"
 	"context"
+	"errors"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -134,6 +139,9 @@ func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, erro
 
 // ImageInfo holds metadata from a container image inspection.
 type ImageInfo struct {
+	// ID is the content-addressable image ID (e.g., "sha256:...").
+	// Immutable for a given image build, suitable as a cache key.
+	ID string
 	// Volumes are the VOLUME declarations from the Dockerfile.
 	Volumes map[string]struct{}
 	// User is the USER directive from the Dockerfile (may be name, uid, uid:gid, or name:group).
@@ -152,7 +160,7 @@ func (d *DockerClient) InspectImage(ctx context.Context, imageName string) (*Ima
 			volumes[v] = struct{}{}
 		}
 	}
-	info := &ImageInfo{Volumes: volumes}
+	info := &ImageInfo{ID: inspect.ID, Volumes: volumes}
 	if inspect.Config != nil {
 		info.User = inspect.Config.User
 	}
@@ -260,6 +268,343 @@ func (d *DockerClient) readFileFromImage(ctx context.Context, imageName, path st
 	}()
 
 	return readFileFromContainer(ctx, d.client, resp.ID, path)
+}
+
+// DetectVolumeOwner inspects the ownership of VOLUME directories inside an
+// image by creating a temporary container (never started) and reading the tar
+// headers from CopyFromContainer. If all volume paths share the same non-root
+// UID:GID, those values are returned. If the paths have mixed ownership, are
+// owned by root, or a path doesn't exist, (0, 0, nil) is returned.
+func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (uid, gid int, err error) {
+	if len(volumePaths) == 0 {
+		return 0, 0, nil
+	}
+
+	resp, err := d.client.ContainerCreate(ctx, &container.Config{
+		Image: imageName,
+	}, nil, nil, nil, "")
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create temp container for volume owner detection: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{})
+	}()
+
+	firstUID, firstGID := -1, -1
+	for _, volPath := range volumePaths {
+		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, volPath)
+		if copyErr != nil {
+			if errdefs.IsNotFound(copyErr) {
+				// Path genuinely doesn't exist in image.
+				return 0, 0, nil
+			}
+			return 0, 0, fmt.Errorf("CopyFromContainer %s: %w", volPath, copyErr)
+		}
+
+		tr := tar.NewReader(rc)
+		hdr, tarErr := tr.Next()
+		_ = rc.Close()
+		if tarErr != nil {
+			if tarErr == io.EOF {
+				// Empty tar stream — directory exists but has no entries.
+				return 0, 0, nil
+			}
+			return 0, 0, fmt.Errorf("reading tar header for %s: %w", volPath, tarErr)
+		}
+
+		if firstUID == -1 {
+			firstUID = hdr.Uid
+			firstGID = hdr.Gid
+		} else if hdr.Uid != firstUID || hdr.Gid != firstGID {
+			// Mixed ownership across volume paths.
+			return 0, 0, nil
+		}
+	}
+
+	if firstUID == 0 || firstGID == 0 {
+		return 0, 0, nil
+	}
+
+	return firstUID, firstGID, nil
+}
+
+// candidateWritableParents are common parent directories scanned for
+// subdirectories owned by the container user (e.g., grafana/grafana
+// chowns /var/lib/grafana, mysql:9 chowns /var/run/mysqld).
+var candidateWritableParents = []string{"/var/lib", "/var/log", "/var/run", "/var/cache", "/data", "/home", "/opt", "/srv"}
+
+// maxDetectedWritablePaths caps the number of auto-detected writable paths
+// to limit tmpfs mounts on images with many user-owned directories.
+const maxDetectedWritablePaths = 4
+
+// maxTarEntriesPerParent caps the number of tar entries scanned per candidate
+// parent to bound I/O on large directories.
+const maxTarEntriesPerParent = 500
+
+// DetectWritablePaths scans candidate parent directories inside an image for
+// depth-1 subdirectories owned by uid. When uid is 0 (root image), it matches
+// directories owned by any non-root user — this handles images like neo4j that
+// run as root but chown directories to a service user during build.
+func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+	if len(candidateParents) == 0 {
+		return nil, nil
+	}
+
+	resp, err := d.client.ContainerCreate(ctx, &container.Config{
+		Image: imageName,
+	}, nil, nil, nil, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp container for writable path detection: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{})
+	}()
+
+	var paths []string
+	for _, parent := range candidateParents {
+		if len(paths) >= maxDetectedWritablePaths {
+			break
+		}
+
+		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, parent)
+		if copyErr != nil {
+			if !errdefs.IsNotFound(copyErr) {
+				// Non-"not found" errors (daemon unreachable, context canceled, etc.)
+				// mean detection is incomplete — return what we have so far.
+				return paths, fmt.Errorf("CopyFromContainer %s: %w", parent, copyErr)
+			}
+			// Parent doesn't exist in image — skip.
+			continue
+		}
+
+		tr := tar.NewReader(rc)
+		scanned := 0
+		for scanned < maxTarEntriesPerParent {
+			hdr, tarErr := tr.Next()
+			if tarErr != nil {
+				break // EOF or read error — either way, done with this parent
+			}
+			scanned++
+
+			if hdr.Typeflag != tar.TypeDir {
+				continue
+			}
+
+			// CopyFromContainer("/var/lib") returns entries like:
+			//   "lib/"            (the parent itself)
+			//   "lib/grafana/"    (depth-1 child — what we want)
+			//   "lib/grafana/plugins/" (depth-2 — too deep)
+			// We match entries with exactly 2 path components.
+			name := strings.TrimSuffix(hdr.Name, "/")
+			parts := strings.Split(name, "/")
+			if len(parts) != 2 {
+				continue
+			}
+
+			// Match specific uid, or any non-root uid when uid == 0.
+			match := (uid != 0 && hdr.Uid == uid) || (uid == 0 && hdr.Uid != 0)
+			if match {
+				fullPath := parent + "/" + parts[1]
+				paths = append(paths, fullPath)
+				if len(paths) >= maxDetectedWritablePaths {
+					break
+				}
+			}
+		}
+		_ = rc.Close()
+	}
+
+	return paths, nil
+}
+
+// ExtractImageContent extracts pre-existing image content for the given paths
+// into destDir on the host filesystem. For each path, it creates a temporary
+// container from the image (never started), streams the tar archive of that
+// path via CopyFromContainer, sanitizes the tar stream, and extracts it to
+// the appropriate subdirectory under destDir.
+//
+// Returns nil on full success, or a map of path → error for failures.
+// Callers should log failures but not fail the provision (graceful degradation).
+func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	// Create a temp container from the image to read original content.
+	resp, err := d.client.ContainerCreate(ctx, &container.Config{
+		Image: imageName,
+	}, nil, nil, nil, "")
+	if err != nil {
+		// All paths fail with the same error.
+		failures := make(map[string]error, len(paths))
+		for _, p := range paths {
+			failures[p] = fmt.Errorf("failed to create temp container for extraction: %w", err)
+		}
+		return failures
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{})
+	}()
+
+	var failures map[string]error
+	remainingBytes := maxBytes
+	for _, path := range paths {
+		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, path)
+		if copyErr != nil {
+			if errdefs.IsNotFound(copyErr) {
+				continue // Path doesn't exist in image — skip
+			}
+			if failures == nil {
+				failures = make(map[string]error)
+			}
+			failures[path] = fmt.Errorf("CopyFromContainer %s: %w", path, copyErr)
+			continue
+		}
+
+		// CopyFromContainer("/var/lib/neo4j") returns tar entries like
+		// "neo4j/conf/neo4j.conf". Extract to destDir/var/lib/ so content
+		// ends up at destDir/var/lib/neo4j/conf/neo4j.conf.
+		sanitized := sanitizeVolumePath(path)
+		extractDir := filepath.Join(destDir, filepath.Dir(sanitized))
+		if mkErr := os.MkdirAll(extractDir, 0o700); mkErr != nil {
+			_ = rc.Close()
+			if failures == nil {
+				failures = make(map[string]error)
+			}
+			failures[path] = fmt.Errorf("mkdir %s: %w", extractDir, mkErr)
+			continue
+		}
+
+		written, skippedSymlinks, extractErr := sanitizeAndExtractTar(rc, extractDir, remainingBytes)
+		_ = rc.Close()
+		if extractErr != nil {
+			if failures == nil {
+				failures = make(map[string]error)
+			}
+			failures[path] = fmt.Errorf("extract %s: %w", path, extractErr)
+			continue
+		}
+		for _, sl := range skippedSymlinks {
+			slog.Debug("extracted symlink with out-of-scope target", "path", path, "symlink", sl)
+		}
+		remainingBytes -= written
+	}
+
+	return failures
+}
+
+// sanitizeAndExtractTar reads a tar stream and extracts entries into destDir
+// with security checks. It rejects absolute paths, path traversal via "..",
+// and device nodes. Setuid/setgid bits are stripped. Total bytes written are
+// tracked and an error is returned if maxBytes is exceeded. File ownership
+// from tar headers is preserved when running as root; EPERM errors from chown
+// are silently ignored.
+//
+// Symlinks whose targets point outside destDir (absolute paths, ".." traversal)
+// are still created — they resolve correctly inside the container once
+// bind-mounted. The returned slice contains descriptions of such out-of-scope
+// symlinks (e.g., "name -> target") for caller-side debug logging.
+func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64, []string, error) {
+	tr := tar.NewReader(src)
+	var totalBytes int64
+	var outOfScope []string
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return totalBytes, outOfScope, fmt.Errorf("reading tar header: %w", err)
+		}
+
+		// Reject absolute paths and path traversal.
+		clean := filepath.Clean(hdr.Name)
+		if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+			return totalBytes, outOfScope, fmt.Errorf("tar entry has unsafe path: %q", hdr.Name)
+		}
+
+		target := filepath.Join(destDir, clean)
+		// Verify resolved path stays within destDir.
+		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(filepath.Separator)) && target != filepath.Clean(destDir) {
+			return totalBytes, outOfScope, fmt.Errorf("tar entry escapes destination: %q", hdr.Name)
+		}
+
+		// Strip setuid/setgid bits.
+		hdr.Mode &^= 0o6000
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if mkErr := os.MkdirAll(target, os.FileMode(hdr.Mode)&os.ModePerm|0o700); mkErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("mkdir %s: %w", clean, mkErr)
+			}
+			if chErr := os.Chown(target, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
+				return totalBytes, outOfScope, fmt.Errorf("chown dir %s: %w", clean, chErr)
+			}
+
+		case tar.TypeReg:
+			if totalBytes+hdr.Size > maxBytes {
+				return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d byte limit", maxBytes)
+			}
+			if mkErr := os.MkdirAll(filepath.Dir(target), 0o700); mkErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("mkdir for %s: %w", clean, mkErr)
+			}
+			f, fErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&os.ModePerm)
+			if fErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("create %s: %w", clean, fErr)
+			}
+			n, copyErr := io.Copy(f, tr)
+			closeErr := f.Close()
+			if copyErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("write %s: %w", clean, copyErr)
+			}
+			if closeErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("close %s: %w", clean, closeErr)
+			}
+			totalBytes += n
+			if chErr := os.Chown(target, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
+				return totalBytes, outOfScope, fmt.Errorf("chown %s: %w", clean, chErr)
+			}
+
+		case tar.TypeSymlink:
+			// Symlinks with out-of-scope targets (absolute or ..-prefixed) are
+			// created as-is. They'll be dangling on the host but resolve correctly
+			// inside the container once bind-mounted (e.g., neo4j: data -> /data).
+			// Docker's CopyFromContainer doesn't follow symlinks when building the
+			// tar, so subsequent entries won't traverse through them on the host.
+			escaped := filepath.IsAbs(hdr.Linkname) || strings.HasPrefix(filepath.Clean(hdr.Linkname), "..")
+			if !escaped {
+				// For relative symlinks, verify the resolved target stays within destDir.
+				resolved := filepath.Join(filepath.Dir(target), hdr.Linkname)
+				if !strings.HasPrefix(resolved, filepath.Clean(destDir)+string(filepath.Separator)) && resolved != filepath.Clean(destDir) {
+					escaped = true
+				}
+			}
+			if escaped {
+				outOfScope = append(outOfScope, fmt.Sprintf("%s -> %s", hdr.Name, hdr.Linkname))
+			}
+			if mkErr := os.MkdirAll(filepath.Dir(target), 0o700); mkErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("mkdir for symlink %s: %w", clean, mkErr)
+			}
+			if symlinkErr := os.Symlink(hdr.Linkname, target); symlinkErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("symlink %s -> %s: %w", clean, hdr.Linkname, symlinkErr)
+			}
+			if chErr := os.Lchown(target, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
+				return totalBytes, outOfScope, fmt.Errorf("lchown symlink %s: %w", clean, chErr)
+			}
+
+		default:
+			// Reject device nodes, char devices, sockets, etc.
+			return totalBytes, outOfScope, fmt.Errorf("tar entry has disallowed type %d: %q", hdr.Typeflag, hdr.Name)
+		}
+	}
+	return totalBytes, outOfScope, nil
 }
 
 // readFileFromContainer extracts a single file from a container using
@@ -411,6 +756,11 @@ type CreateContainerParams struct {
 	// ImageVolumes are VOLUME paths from the image that need tmpfs overrides
 	// (for ephemeral containers only, when VolumeBinds is nil).
 	ImageVolumes []string
+
+	// WritablePathBinds are bind mounts from managed volume subdirectories
+	// to auto-detected writable directories in the container. Each entry
+	// maps a host path (with pre-extracted image content) to a container path.
+	WritablePathBinds map[string]string
 
 	// User overrides the container's runtime user (e.g., "999:999").
 	// When set, container.Config.User is set to this value so the container
@@ -575,6 +925,20 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		}
 	}
 
+	// Auto-detected writable paths for non-root images (e.g.,
+	// grafana/grafana's /var/lib/grafana, mysql's /var/run/mysqld).
+	// Bind mount from managed volume subdirectories that contain
+	// pre-extracted image content.
+	if len(params.WritablePathBinds) > 0 {
+		for hostPath, containerPath := range params.WritablePathBinds {
+			hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
+				Type:   mount.TypeBind,
+				Source: hostPath,
+				Target: containerPath,
+			})
+		}
+	}
+
 	// Stateful: bind mount managed volume dirs to image VOLUME paths
 	if len(params.VolumeBinds) > 0 {
 		for hostPath, containerPath := range params.VolumeBinds {
@@ -642,6 +1006,17 @@ func (d *DockerClient) StopContainer(ctx context.Context, containerID string, ti
 	}
 	if err := d.client.ContainerStop(ctx, containerID, stopOpts); err != nil {
 		return fmt.Errorf("failed to stop container: %w", err)
+	}
+	return nil
+}
+
+// RenameContainer changes the name of a container. The container can be
+// running or stopped. This is used during updates/restarts to free the
+// canonical name for the replacement container while keeping the old one
+// available for rollback.
+func (d *DockerClient) RenameContainer(ctx context.Context, containerID string, newName string) error {
+	if err := d.client.ContainerRename(ctx, containerID, newName); err != nil {
+		return fmt.Errorf("failed to rename container: %w", err)
 	}
 	return nil
 }
@@ -964,6 +1339,59 @@ const (
 	HealthStatusStarting  HealthStatus = "starting"
 	HealthStatusNone      HealthStatus = "" // No health check configured
 )
+
+// ContainerEvents subscribes to Docker container lifecycle events, filtering
+// for "die" events on containers managed by fred (label managed-by=fred).
+// Returns a channel of ContainerEvent and a channel of errors. Both channels
+// are closed when the context is canceled or the Docker event stream closes.
+func (d *DockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error) {
+	filter := filters.NewArgs(
+		filters.Arg("type", string(events.ContainerEventType)),
+		filters.Arg("event", "die"),
+		filters.Arg("label", LabelManaged+"=true"),
+	)
+
+	dockerEvents, dockerErrs := d.client.Events(ctx, events.ListOptions{Filters: filter})
+
+	out := make(chan ContainerEvent)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(out)
+		defer close(errCh)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-dockerEvents:
+				if !ok {
+					return
+				}
+				select {
+				case out <- ContainerEvent{
+					ContainerID: event.Actor.ID,
+					Action:      string(event.Action),
+				}:
+				case <-ctx.Done():
+					return
+				}
+			case err, ok := <-dockerErrs:
+				if !ok {
+					return
+				}
+				select {
+				case errCh <- err:
+				case <-ctx.Done():
+					return
+				}
+				return
+			}
+		}
+	}()
+
+	return out, errCh
+}
 
 // containerStatusToProvisionStatus converts Docker status to provision status.
 func containerStatusToProvisionStatus(status string) backend.ProvisionStatus {

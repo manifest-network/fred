@@ -5,10 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -45,6 +47,7 @@ type Handlers struct {
 	tokenTracker    TokenTrackerInterface
 	statusChecker   StatusChecker
 	placementLookup PlacementLookup
+	sseBroker       *SSEBroker
 	providerUUID    string
 	bech32Prefix    string
 	callbackBaseURL string
@@ -55,13 +58,15 @@ type Handlers struct {
 // statusChecker is optional but required for the /status endpoint.
 // placementLookup is optional — used for routing reads to the correct backend.
 // callbackBaseURL is used for restart/update callbacks to the backend.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, providerUUID, bech32Prefix, callbackBaseURL string) *Handlers {
+// sseBroker is optional — if nil, the SSE endpoint will return 501.
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, sseBroker *SSEBroker, providerUUID, bech32Prefix, callbackBaseURL string) *Handlers {
 	return &Handlers{
 		client:          client,
 		backendRouter:   backendRouter,
 		tokenTracker:    tokenTracker,
 		statusChecker:   statusChecker,
 		placementLookup: placementLookup,
+		sseBroker:       sseBroker,
 		providerUUID:    providerUUID,
 		bech32Prefix:    bech32Prefix,
 		callbackBaseURL: callbackBaseURL,
@@ -282,6 +287,9 @@ type LeaseStatusResponse struct {
 	MetaHashHex         string `json:"meta_hash_hex,omitempty"` // For debugging - shows the expected payload hash
 	PayloadReceived     bool   `json:"payload_received"`
 	ProvisioningStarted bool   `json:"provisioning_started"`
+	ProvisionStatus     string `json:"provision_status,omitempty"`
+	FailCount           int    `json:"fail_count,omitempty"`
+	LastError           string `json:"error,omitempty"`
 }
 
 // GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
@@ -316,6 +324,21 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		response.PayloadReceived = hasPayload
 		response.ProvisioningStarted = h.statusChecker.IsInFlight(leaseUUID)
+	}
+
+	// For active leases, include provision status from the backend
+	if h.backendRouter != nil && auth.Lease.State == billingtypes.LEASE_STATE_ACTIVE {
+		sku := provisioner.ExtractRoutingSKU(auth.Lease)
+		if backendClient := h.resolveBackend(leaseUUID, sku); backendClient != nil {
+			info, err := backendClient.GetProvision(r.Context(), leaseUUID)
+			if err == nil {
+				response.ProvisionStatus = string(info.Status)
+				response.FailCount = info.FailCount
+				response.LastError = info.LastError
+			}
+			// Errors are intentionally ignored — provision status is best-effort.
+			// ErrNotProvisioned during initial setup is expected and safe to skip.
+		}
 	}
 
 	slog.Info("lease status served",
@@ -960,6 +983,68 @@ var (
 	errMissingAuth       = errors.New("missing authorization header")
 	errInvalidAuthFormat = errors.New("invalid authorization format, expected 'Bearer <token>'")
 )
+
+// StreamLeaseEvents serves an SSE stream of lease status events.
+// GET /v1/leases/{lease_uuid}/events
+func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
+	if h.sseBroker == nil {
+		writeError(w, "SSE not enabled", http.StatusNotImplemented)
+		return
+	}
+
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate: no replay check, any lease state.
+	_, statusCode, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), statusCode)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ch := h.sseBroker.Subscribe(leaseUUID)
+	defer h.sseBroker.Unsubscribe(leaseUUID, ch)
+
+	keepalive := time.NewTicker(30 * time.Second)
+	defer keepalive.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(event)
+			if err != nil {
+				slog.Error("failed to marshal SSE event", "lease_uuid", leaseUUID, "error", err)
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-keepalive.C:
+			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
 
 // extractBearerToken extracts the raw token string from a Bearer authorization header.
 // Returns the token string or an error if the header is missing or malformed.

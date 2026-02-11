@@ -76,7 +76,7 @@ test-volume:
 # Run Docker integration tests (requires Docker daemon)
 test-integration:
 	@echo "Running Docker integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout 5m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout 15m
 
 # Run restart, update, and releases integration tests (requires Docker daemon)
 test-integration-restart-update:

@@ -124,7 +124,7 @@ func (s *ReleaseStore) Append(leaseUUID string, r Release) error {
 		data := b.Get([]byte(leaseUUID))
 		if data != nil {
 			if err := json.Unmarshal(data, &releases); err != nil {
-				releases = nil
+				return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
 			}
 		}
 
@@ -245,6 +245,10 @@ func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var releases []Release
 			if err := json.Unmarshal(v, &releases); err != nil {
+				slog.Warn("deleting corrupted release entry during cleanup",
+					"lease_uuid", string(k),
+					"error", err,
+				)
 				if delErr := c.Delete(); delErr != nil {
 					return delErr
 				}

@@ -270,10 +270,10 @@ Restart containers for a lease without changing the manifest. Stops existing con
 **Behavior:**
 1. Validate the lease exists and is in a restartable state (`ready`)
 2. Return 202 immediately
-3. Stop and remove existing containers in a background goroutine
+3. Stop and rename existing containers (kept for rollback) in a background goroutine
 4. Recreate containers with the same manifest and configuration
 5. Run startup verification (health checks or startup delay)
-6. POST callback to `callback_url` with success or failure
+6. On success: remove old containers and POST success callback. On failure: rollback to old containers and POST failure callback
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned
@@ -281,7 +281,7 @@ Restart containers for a lease without changing the manifest. Stops existing con
 
 ### POST /update
 
-Deploy a new manifest for a lease, replacing containers with a new image/configuration. Pulls the new image, removes old containers, creates new ones, and sends a callback on completion. Volumes are preserved.
+Deploy a new manifest for a lease, replacing containers with a new image/configuration. Pulls the new image, stops old containers (kept for rollback), creates new ones, and sends a callback on completion. On failure, rolls back to the previous containers. Volumes are preserved.
 
 **Request:**
 ```json
@@ -305,10 +305,10 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 2. Parse and validate the new manifest
 3. Return 202 immediately
 4. Pull the new image in a background goroutine
-5. Remove old containers
+5. Stop and rename old containers (kept for rollback)
 6. Create and start new containers from the updated manifest
 7. Run startup verification
-8. POST callback to `callback_url` with success or failure
+8. On success: remove old containers and POST success callback. On failure: rollback to old containers and POST failure callback
 
 **Error Responses:**
 - `400 Bad Request` - Invalid manifest or validation error
@@ -317,7 +317,7 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 
 ### GET /releases/{lease_uuid}
 
-Get the release (deployment) history for a lease. Each provision, restart, or update creates a release entry.
+Get the release (deployment) history for a lease. Each provision or update creates a release entry. Restarts reuse the existing manifest and do not create a new release.
 
 **Response:** `200 OK`
 ```json

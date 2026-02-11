@@ -88,7 +88,8 @@ type ServerConfig struct {
 
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup) (*Server, error) {
+// sseBroker is optional — if nil, the SSE endpoint returns 501.
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup, sseBroker *SSEBroker) (*Server, error) {
 	// Create token tracker if path is configured (enables replay protection)
 	var tokenTracker *TokenTracker
 	if cfg.TokenTrackerDBPath != "" {
@@ -111,7 +112,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if tokenTracker != nil {
 		tracker = tokenTracker
 	}
-	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.CallbackBaseURL)
+	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, sseBroker, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.CallbackBaseURL)
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
 	var trustedProxies *TrustedProxyConfig
@@ -192,6 +193,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTenantRL(handlers.RestartLease))
 	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTenantRL(handlers.UpdateLease))
 	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTenantRL(handlers.GetLeaseReleases))
+	mux.Handle("GET /v1/leases/{lease_uuid}/events", withTenantRL(handlers.StreamLeaseEvents))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:

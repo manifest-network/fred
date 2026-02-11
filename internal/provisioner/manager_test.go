@@ -2624,3 +2624,81 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 		t.Error("manager.Start() did not return after cancel")
 	}
 }
+
+// --- forwardToSSE tests ---
+
+// mockLeaseEventSink captures events published to the SSE sink.
+type mockLeaseEventSink struct {
+	mu     sync.Mutex
+	events []LeaseEventPayload
+}
+
+func (s *mockLeaseEventSink) Publish(event LeaseEventPayload) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
+}
+
+func TestForwardToSSE_ForwardsToSink(t *testing.T) {
+	sink := &mockLeaseEventSink{}
+	m := &Manager{leaseEventSink: sink}
+
+	event := backend.LeaseStatusEvent{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusReady,
+		Error:     "",
+		Timestamp: time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC),
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := message.NewMessage(watermill.NewUUID(), data)
+	err = m.forwardToSSE(msg)
+	assert.NoError(t, err)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	require.Len(t, sink.events, 1)
+	assert.Equal(t, "lease-1", sink.events[0].LeaseUUID)
+	assert.Equal(t, string(backend.ProvisionStatusReady), sink.events[0].Status)
+	assert.Empty(t, sink.events[0].Error)
+	assert.Equal(t, "2026-01-15T10:30:00Z", sink.events[0].Timestamp)
+}
+
+func TestForwardToSSE_IncludesError(t *testing.T) {
+	sink := &mockLeaseEventSink{}
+	m := &Manager{leaseEventSink: sink}
+
+	event := backend.LeaseStatusEvent{
+		LeaseUUID: "lease-2",
+		Status:    backend.ProvisionStatusFailed,
+		Error:     "OOM killed",
+		Timestamp: time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC),
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := message.NewMessage(watermill.NewUUID(), data)
+	err = m.forwardToSSE(msg)
+	assert.NoError(t, err)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	require.Len(t, sink.events, 1)
+	assert.Equal(t, "lease-2", sink.events[0].LeaseUUID)
+	assert.Equal(t, string(backend.ProvisionStatusFailed), sink.events[0].Status)
+	assert.Equal(t, "OOM killed", sink.events[0].Error)
+}
+
+func TestForwardToSSE_MalformedMessage(t *testing.T) {
+	sink := &mockLeaseEventSink{}
+	m := &Manager{leaseEventSink: sink}
+
+	msg := message.NewMessage(watermill.NewUUID(), []byte("not json"))
+	err := m.forwardToSSE(msg)
+	assert.NoError(t, err, "should return nil for malformed messages (don't retry)")
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	assert.Empty(t, sink.events, "no events should reach the sink")
+}

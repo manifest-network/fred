@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestReleaseStore(t *testing.T) {
@@ -285,6 +286,35 @@ func TestReleaseStore_RemoveOlderThan(t *testing.T) {
 	releases, err = store.List("old-lease")
 	require.NoError(t, err)
 	assert.Nil(t, releases)
+}
+
+func TestReleaseStore_AppendCorruptedData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "corrupt_releases.db")
+
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Write corrupted (non-JSON) data directly into the bucket.
+	err = store.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(releasesBucketName)
+		return b.Put([]byte("corrupt-lease"), []byte("not valid json"))
+	})
+	require.NoError(t, err)
+
+	// Append should detect the corruption and return an error instead of
+	// silently discarding existing data.
+	err = store.Append("corrupt-lease", Release{
+		Image:     "nginx:latest",
+		Status:    "deploying",
+		CreatedAt: time.Now(),
+	})
+	require.Error(t, err, "Append should fail when existing data is corrupted")
+	assert.Contains(t, err.Error(), "corrupted release data")
+
+	// List should also return an error for the corrupted key.
+	_, err = store.List("corrupt-lease")
+	require.Error(t, err, "List should fail when data is corrupted")
 }
 
 func TestReleaseStore_InitialCleanup(t *testing.T) {

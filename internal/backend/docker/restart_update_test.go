@@ -138,6 +138,13 @@ func TestRestart_SetsRestartingStatus(t *testing.T) {
 		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
 			return "", fmt.Errorf("intentional test abort")
 		},
+		// Provide InspectContainerFn and StartContainerFn for rollback path
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
 	}
 
 	b := newBackendForProvisionTest(t, mock, provisions)
@@ -272,6 +279,9 @@ func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 		},
 		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
 			return fmt.Errorf("container start failed: OCI runtime error")
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
 		},
 	}
 
@@ -414,6 +424,13 @@ func TestRestart_UpdatesCallbackURL(t *testing.T) {
 		// Provide CreateContainerFn so the goroutine exits cleanly
 		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
 			return "", fmt.Errorf("intentional test abort")
+		},
+		// Provide InspectContainerFn and StartContainerFn for rollback path
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
 		},
 	}
 
@@ -761,6 +778,7 @@ func TestUpdate_Failure_ImagePullFails(t *testing.T) {
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
+	// Update failure always marks status as Failed (desired state was not achieved).
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 	assert.Equal(t, 1, prov.FailCount)
 	assert.Contains(t, prov.LastError, "registry unreachable")
@@ -922,6 +940,9 @@ func TestUpdate_CleansUpNewContainersOnFailure(t *testing.T) {
 		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
 			return fmt.Errorf("start failed")
 		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
 	}
 
 	callbackReceived := make(chan struct{})
@@ -948,9 +969,9 @@ func TestUpdate_CleansUpNewContainersOnFailure(t *testing.T) {
 		t.Fatal("timeout waiting for callback")
 	}
 
-	// Old container should be removed during update, plus new container should be cleaned up on failure
-	assert.Contains(t, removedContainers, "old-c1", "old container should be removed")
+	// New container should be cleaned up on failure; old container is kept for rollback.
 	assert.Contains(t, removedContainers, "new-c1", "new container should be cleaned up on failure")
+	assert.NotContains(t, removedContainers, "old-c1", "old container should be kept for rollback")
 }
 
 func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
@@ -1261,4 +1282,152 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 	assert.Equal(t, 1, releases[0].Version)
 	assert.Equal(t, "nginx:latest", releases[0].Image)
 	assert.Equal(t, "active", releases[0].Status)
+}
+
+// --- rollbackContainers tests ---
+
+func TestRollbackContainers_AllStopped(t *testing.T) {
+	var renamed, started []string
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
+		RenameContainerFn: func(ctx context.Context, containerID string, newName string) error {
+			renamed = append(renamed, containerID)
+			return nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			started = append(started, containerID)
+			return nil
+		},
+	}
+
+	b := newBackendForTest(mock, nil)
+	ok := b.rollbackContainers("lease-1", []string{"c1", "c2"}, b.logger)
+
+	assert.True(t, ok, "rollback should succeed when all containers are restored")
+	assert.Equal(t, []string{"c1", "c2"}, renamed)
+	assert.Equal(t, []string{"c1", "c2"}, started)
+}
+
+func TestRollbackContainers_PartialStop_SomeRunning(t *testing.T) {
+	// Simulates partial-stop scenario: c1 was stopped, c2 is still running.
+	var started []string
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			if containerID == "c1" {
+				return &ContainerInfo{ContainerID: "c1", Status: "exited"}, nil
+			}
+			return &ContainerInfo{ContainerID: "c2", Status: "running"}, nil
+		},
+		RenameContainerFn: func(ctx context.Context, containerID string, newName string) error {
+			return nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			started = append(started, containerID)
+			return nil
+		},
+	}
+
+	b := newBackendForTest(mock, nil)
+	ok := b.rollbackContainers("lease-1", []string{"c1", "c2"}, b.logger)
+
+	assert.True(t, ok, "rollback should succeed: c1 restarted, c2 already running")
+	assert.Equal(t, []string{"c1"}, started, "only stopped container should be started")
+}
+
+func TestRollbackContainers_StartFails(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
+		RenameContainerFn: func(ctx context.Context, containerID string, newName string) error {
+			return nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return fmt.Errorf("docker daemon error")
+		},
+	}
+
+	b := newBackendForTest(mock, nil)
+	ok := b.rollbackContainers("lease-1", []string{"c1"}, b.logger)
+
+	assert.False(t, ok, "rollback should fail when start fails")
+}
+
+func TestRollbackContainers_InspectFails(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return nil, fmt.Errorf("container not found")
+		},
+	}
+
+	b := newBackendForTest(mock, nil)
+	ok := b.rollbackContainers("lease-1", []string{"c1"}, b.logger)
+
+	assert.False(t, ok, "rollback should fail when inspect fails")
+}
+
+func TestRestart_RollbackClearsLastError(t *testing.T) {
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     manifest,
+			ContainerIDs: []string{"old-c1"},
+		},
+	}
+
+	mock := &mockDockerClient{
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "", fmt.Errorf("create failed")
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	err := b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err)
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status, "should be ready after successful rollback")
+	assert.Empty(t, prov.LastError, "LastError should be cleared after successful rollback")
+	assert.Equal(t, 1, prov.FailCount, "FailCount should still reflect the failed attempt")
 }

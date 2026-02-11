@@ -48,6 +48,7 @@ func newTestServer(t *testing.T, addr string) *Server {
 		nil, // no payload publisher
 		&mockStatusChecker{},
 		nil, // no placement lookup
+		nil, // no SSE broker
 	)
 	require.NoError(t, err)
 	return s
@@ -169,6 +170,7 @@ func TestServer_ShutdownClosesTokenTracker(t *testing.T) {
 		nil,
 		&mockStatusChecker{},
 		nil, // no placement lookup
+		nil, // no SSE broker
 	)
 	require.NoError(t, err)
 
@@ -213,6 +215,7 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 			nil, // No payload publisher - handler won't be set
 			&mockStatusChecker{},
 			nil, // no placement lookup
+			nil, // no SSE broker
 		)
 		require.NoError(t, err)
 
@@ -251,6 +254,7 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 			payloadPub, // Provide publisher so handler is configured
 			&mockStatusChecker{},
 			nil, // no placement lookup
+			nil, // no SSE broker
 		)
 		require.NoError(t, err)
 
@@ -412,6 +416,7 @@ func TestServer_StartBackground(t *testing.T) {
 			nil,
 			&mockStatusChecker{},
 			nil, // no placement lookup
+			nil, // no SSE broker
 		)
 		require.NoError(t, err)
 

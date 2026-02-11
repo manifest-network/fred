@@ -226,10 +226,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return 202 Accepted
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(backend.ProvisionResponse{
+	s.writeJSON(w, http.StatusAccepted, backend.ProvisionResponse{
 		ProvisionID: req.LeaseUUID,
 	})
 }
@@ -251,8 +248,7 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	s.writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
@@ -286,8 +282,7 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
+	s.writeJSON(w, http.StatusOK, logs)
 }
 
 // DeprovisionRequest is the request body for /deprovision.
@@ -312,9 +307,7 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(StatusResponse{Status: "ok"})
+	s.writeJSON(w, http.StatusOK, StatusResponse{Status: "ok"})
 }
 
 func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
@@ -351,9 +344,7 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(StatusResponse{Status: "restarting"})
+	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "restarting"})
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -398,9 +389,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(StatusResponse{Status: "updating"})
+	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "updating"})
 }
 
 func (s *Server) handleGetReleases(w http.ResponseWriter, r *http.Request) {
@@ -420,8 +409,7 @@ func (s *Server) handleGetReleases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(releases)
+	s.writeJSON(w, http.StatusOK, releases)
 }
 
 // StatsResponse is the response body for /stats.
@@ -460,8 +448,7 @@ func (s *Server) handleGetProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	s.writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
@@ -471,8 +458,7 @@ func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
+	s.writeJSON(w, http.StatusOK, backend.ListProvisionsResponse{
 		Provisions: provisions,
 	})
 }
@@ -483,15 +469,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(StatusResponse{Status: "healthy"})
+	s.writeJSON(w, http.StatusOK, StatusResponse{Status: "healthy"})
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.backend.Stats()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(StatsResponse{
+	s.writeJSON(w, http.StatusOK, StatsResponse{
 		TotalCPUCores:     stats.TotalCPU,
 		TotalMemoryMB:     stats.TotalMemoryMB,
 		TotalDiskMB:       stats.TotalDiskMB,
@@ -511,18 +495,28 @@ type ErrorResponse struct {
 	ValidationCode backend.ValidationCode `json:"validation_code,omitempty"`
 }
 
-func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
+func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		s.logger.Error("failed to encode response", "error", err)
+		http.Error(w, `{"error":"internal encoding error"}`, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+	if _, writeErr := w.Write(encoded); writeErr != nil {
+		s.logger.Debug("failed to write response body", "error", writeErr)
+	}
+}
+
+func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
+	s.writeJSON(w, status, ErrorResponse{Error: message})
 }
 
 // validationErrorResponse writes a 400 response with a validation_code field
 // so the HTTPClient can reconstruct the correct sentinel error.
 func (s *Server) validationErrorResponse(w http.ResponseWriter, err error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	json.NewEncoder(w).Encode(ErrorResponse{
+	s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 		Error:          err.Error(),
 		ValidationCode: backend.ClassifyValidationError(err),
 	})

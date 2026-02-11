@@ -76,6 +76,7 @@ type mockDockerClient struct {
 	CreateContainerFn            func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainerFn             func(ctx context.Context, containerID string, timeout time.Duration) error
 	StopContainerFn              func(ctx context.Context, containerID string, timeout time.Duration) error
+	RenameContainerFn            func(ctx context.Context, containerID string, newName string) error
 	RemoveContainerFn            func(ctx context.Context, containerID string) error
 	InspectContainerFn           func(ctx context.Context, containerID string) (*ContainerInfo, error)
 	ContainerLogsFn              func(ctx context.Context, containerID string, tail int) (string, error)
@@ -84,6 +85,10 @@ type mockDockerClient struct {
 	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
 	ListManagedNetworksFn        func(ctx context.Context) ([]networktypes.Inspect, error)
 	ResolveImageUserFn           func(ctx context.Context, imageName string, userOverride string) (int, int, error)
+	DetectVolumeOwnerFn          func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
+	DetectWritablePathsFn        func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
+	ExtractImageContentFn        func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error
+	ContainerEventsFn            func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {
@@ -149,6 +154,13 @@ func (m *mockDockerClient) StopContainer(ctx context.Context, containerID string
 	return nil
 }
 
+func (m *mockDockerClient) RenameContainer(ctx context.Context, containerID string, newName string) error {
+	if m.RenameContainerFn != nil {
+		return m.RenameContainerFn(ctx, containerID, newName)
+	}
+	return nil // default: rename succeeds silently
+}
+
 func (m *mockDockerClient) RemoveContainer(ctx context.Context, containerID string) error {
 	if m.RemoveContainerFn != nil {
 		return m.RemoveContainerFn(ctx, containerID)
@@ -203,6 +215,42 @@ func (m *mockDockerClient) ListManagedNetworks(ctx context.Context) ([]networkty
 		return m.ListManagedNetworksFn(ctx)
 	}
 	panic("unexpected call to ListManagedNetworks")
+}
+
+func (m *mockDockerClient) DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+	if m.DetectVolumeOwnerFn != nil {
+		return m.DetectVolumeOwnerFn(ctx, imageName, volumePaths)
+	}
+	return 0, 0, nil // default: root (auto-detect path entered but produces no override)
+}
+
+func (m *mockDockerClient) DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+	if m.DetectWritablePathsFn != nil {
+		return m.DetectWritablePathsFn(ctx, imageName, uid, candidateParents)
+	}
+	return nil, nil // default: no writable paths detected
+}
+
+func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+	if m.ExtractImageContentFn != nil {
+		return m.ExtractImageContentFn(ctx, imageName, paths, destDir, maxBytes)
+	}
+	return nil // default: extraction succeeds silently
+}
+
+func (m *mockDockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error) {
+	if m.ContainerEventsFn != nil {
+		return m.ContainerEventsFn(ctx)
+	}
+	// Default: return channels that block until context is canceled (no-op).
+	ch := make(chan ContainerEvent)
+	errCh := make(chan error)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+		close(errCh)
+	}()
+	return ch, errCh
 }
 
 // newBackendForTest creates a Backend suitable for unit testing. It wires up a
