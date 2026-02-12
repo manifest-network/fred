@@ -294,6 +294,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | `POST` | `/v1/leases/{uuid}/data` | ADR-036 | No | Pending | Has own idempotency (409 on duplicate) |
 | `POST` | `/v1/leases/{uuid}/restart` | ADR-036 | Yes | Active | Mutating — replaying would restart again |
 | `POST` | `/v1/leases/{uuid}/update` | ADR-036 | Yes | Active | Mutating — replaying would redeploy again |
+| `GET` | `/v1/leases/{uuid}/events` | ADR-036 | No | Any | SSE stream of lease status events |
 
 #### Operational
 
@@ -599,6 +600,37 @@ Returns the release (deployment) history for a lease, showing each version that 
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
+
+### Stream Lease Events (SSE)
+
+```
+GET /v1/leases/{lease_uuid}/events
+Authorization: Bearer <token>
+```
+
+Opens a Server-Sent Events stream for real-time lease status updates. Events are pushed when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`).
+
+**Response:** `200 OK` with `Content-Type: text/event-stream`
+
+```
+data: {"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:30:00Z"}
+
+data: {"lease_uuid":"...","status":"restarting","timestamp":"2024-01-15T10:31:00Z"}
+
+data: {"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:31:30Z"}
+```
+
+**Behavior:**
+- Events are delivered as SSE `data:` lines containing JSON
+- A keepalive comment (`: keepalive`) is sent every 30 seconds
+- Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
+- The stream ends when the client disconnects
+
+**Response Codes:**
+- `200 OK` - Stream opened
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `501 Not Implemented` - SSE not enabled on this deployment
 
 ### Provision Callback (Backend -> Fred)
 

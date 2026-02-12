@@ -340,7 +340,8 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusConflict, "invalid state for restart")
 			return
 		}
-		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		s.logger.Error("restart failed", "lease_uuid", req.LeaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -385,7 +386,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			s.validationErrorResponse(w, err)
 			return
 		}
-		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		s.logger.Error("update failed", "lease_uuid", req.LeaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -405,7 +407,8 @@ func (s *Server) handleGetReleases(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
 		}
-		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		s.logger.Error("get releases failed", "lease_uuid", leaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
