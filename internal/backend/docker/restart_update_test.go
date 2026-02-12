@@ -45,20 +45,59 @@ func TestRestart_InvalidState_Provisioning(t *testing.T) {
 	assert.Contains(t, err.Error(), "provisioning")
 }
 
-func TestRestart_InvalidState_Failed(t *testing.T) {
+func TestRestart_AllowedFromFailed(t *testing.T) {
+	manifest := &DockerManifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusFailed,
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusFailed,
+			Manifest:     manifest,
+			ContainerIDs: []string{"old-c1"},
 		},
 	}
-	b := newBackendForTest(&mockDockerClient{}, provisions)
+
+	// Block the async phase so we can observe the Restarting state.
+	stopStarted := make(chan struct{})
+	stopRelease := make(chan struct{})
+	mock := &mockDockerClient{
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			close(stopStarted)
+			<-stopRelease
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "", fmt.Errorf("intentional test abort")
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
 
 	err := b.Restart(context.Background(), backend.RestartRequest{
 		LeaseUUID: "lease-1",
 	})
-	assert.ErrorIs(t, err, backend.ErrInvalidState)
-	assert.Contains(t, err.Error(), "failed")
+	assert.NoError(t, err, "restart should be accepted from Failed status")
+
+	<-stopStarted
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status)
+
+	close(stopRelease)
+	b.stopCancel()
 }
 
 func TestRestart_InvalidState_Restarting(t *testing.T) {
@@ -312,7 +351,8 @@ func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 
 	// Verify failure callback
 	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
-	assert.Equal(t, "restart failed", callbackPayload.Error)
+	assert.Contains(t, callbackPayload.Error, "restart failed")
+	assert.Contains(t, callbackPayload.Error, "rollback failed")
 
 	// Verify failure state
 	b.provisionsMu.RLock()
@@ -1093,6 +1133,186 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 
 	assert.Equal(t, "redis:7", prov.Image, "image should be updated")
 	assert.Equal(t, "redis:7", prov.Manifest.Image, "manifest should be updated")
+}
+
+func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
+	oldManifest := &DockerManifest{Image: "postgres:17", Command: []string{"postgres"}}
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     oldManifest,
+			Image:        "postgres:17",
+			ContainerIDs: []string{"old-c1"},
+			Quantity:     1,
+		},
+	}
+
+	startCalls := 0
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "new-c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			startCalls++
+			if startCalls == 1 {
+				// First start (update's new container) fails
+				return fmt.Errorf("postgres:18 incompatible data directory")
+			}
+			// Subsequent starts (rollback of old container) succeed
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	var callbackPayload backend.CallbackPayload
+	updateCallbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case updateCallbackReceived <- struct{}{}:
+		default:
+		}
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	// 1. Update to postgres:18 — should fail and rollback
+	err := b.Update(context.Background(), backend.UpdateRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+		Payload:     validManifestJSON("postgres:18"),
+	})
+	require.NoError(t, err)
+
+	select {
+	case <-updateCallbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for update failure callback")
+	}
+
+	// 2. Verify status is Ready (containers are running after rollback)
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,
+		"status should be Ready because old containers were restored")
+	assert.Equal(t, 1, prov.FailCount)
+	assert.Contains(t, prov.LastError, "incompatible data directory",
+		"LastError should describe why the update failed")
+	assert.Equal(t, "postgres:17", prov.Manifest.Image,
+		"manifest should still be the old image after failed update")
+
+	// 3. Callback should indicate failure with rollback context
+	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
+	assert.Contains(t, callbackPayload.Error, "rolled back to previous version",
+		"callback error should mention rollback")
+
+	// 4. Restart should be accepted from Ready status
+	err = b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	})
+	assert.NoError(t, err, "restart should be allowed from Ready status after rollback")
+}
+
+func TestUpdate_RollbackFailed_SetsStatusFailed(t *testing.T) {
+	oldManifest := &DockerManifest{Image: "postgres:17", Command: []string{"postgres"}}
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     oldManifest,
+			Image:        "postgres:17",
+			ContainerIDs: []string{"old-c1"},
+			Quantity:     1,
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "new-c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			// Both new container start and rollback start fail
+			return fmt.Errorf("docker daemon unavailable")
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+		},
+	}
+
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{}, 1)
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackReceived <- struct{}{}:
+		default:
+		}
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	err := b.Update(context.Background(), backend.UpdateRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+		Payload:     validManifestJSON("postgres:18"),
+	})
+	require.NoError(t, err)
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
+		"status should be Failed when rollback also fails")
+	assert.Contains(t, prov.LastError, "docker daemon unavailable")
+
+	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
+	assert.Contains(t, callbackPayload.Error, "rollback failed",
+		"callback error should mention rollback failure")
 }
 
 // --- GetReleases tests ---

@@ -1246,7 +1246,7 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 }
 
 // Restart restarts containers for a lease without changing the manifest.
-// State machine: Ready → Restarting → Ready|Failed
+// State machine: Ready|Failed → Restarting → Ready|Failed
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
 
@@ -1257,7 +1257,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		b.provisionsMu.Unlock()
 		return backend.ErrNotProvisioned
 	}
-	if prov.Status != backend.ProvisionStatusReady {
+	if prov.Status != backend.ProvisionStatusReady && prov.Status != backend.ProvisionStatusFailed {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, prov.Status)
 	}
@@ -1323,7 +1323,6 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 		Quantity:        len(oldContainerIDs),
 		Operation:       "restart",
 		Logger:          logger,
-		RollbackToReady: true,
 	})
 }
 
@@ -1338,11 +1337,6 @@ type replaceContainersOp struct {
 	Quantity        int    // Number of new containers to create
 	Operation       string // "restart" or "update" — used in log and callback messages
 	Logger          *slog.Logger
-
-	// RollbackToReady controls status after failed rollback:
-	// true (restart): set Ready if old containers are restored, Failed if not.
-	// false (update): always set Failed since the desired state was not achieved.
-	RollbackToReady bool
 
 	// OnSuccess is called under provisionsMu lock after successful replacement.
 	// Used by update to set Image/Manifest on the provision. May be nil.
@@ -1420,9 +1414,11 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			restored := !oldStopped || b.rollbackContainers(op.LeaseUUID, op.OldContainerIDs, op.Logger)
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[op.LeaseUUID]; ok {
-				if op.RollbackToReady && restored {
+				if restored {
 					prov.Status = backend.ProvisionStatusReady
-					if oldStopped {
+					// Restart: clear error — we're back to the exact same state.
+					// Update: keep LastError so the UI shows why the update failed.
+					if oldStopped && op.Operation == "restart" {
 						prov.LastError = ""
 					}
 				} else {
@@ -1433,6 +1429,12 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				}
 			}
 			b.provisionsMu.Unlock()
+
+			if restored {
+				callbackErr += "; rolled back to previous version"
+			} else if oldStopped {
+				callbackErr += "; rollback failed"
+			}
 
 			b.sendCallback(op.LeaseUUID, false, callbackErr)
 			return
@@ -1689,7 +1691,6 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 		Quantity:        quantity,
 		Operation:       "update",
 		Logger:          logger,
-		RollbackToReady: false,
 		OnSuccess: func(prov *provision) {
 			prov.Image = manifest.Image
 			prov.Manifest = manifest
@@ -2022,10 +2023,12 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				ContainerIDs: make([]string, 0),
 			}
 
-			// Restore manifest from the release store so restart/update
-			// work after a cold start (manifest is not stored in labels).
+			// Restore manifest from the last successful (active) release so
+			// restart/update work after a cold start (manifest is not stored
+			// in labels). Using LatestActive avoids picking up a failed
+			// release (e.g., a failed update to a newer image).
 			if b.releaseStore != nil {
-				if rel, relErr := b.releaseStore.Latest(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
+				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
 					var m DockerManifest
 					if jsonErr := json.Unmarshal(rel.Manifest, &m); jsonErr == nil {
 						prov.Manifest = &m
