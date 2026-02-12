@@ -344,6 +344,74 @@ func TestStreamLeaseEvents_SurvivesBeyondRequestTimeout(t *testing.T) {
 	require.NotEmpty(t, sseData, "expected SSE event to arrive after delay")
 }
 
+func TestStreamLeaseEvents_WorksThroughLoggingMiddleware(t *testing.T) {
+	// Regression test: loggingMiddleware wraps ResponseWriter with responseWriter,
+	// which must implement http.Flusher for SSE to work.
+	broker := NewSSEBroker()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       kp.Address,
+				ProviderUuid: providerUUID,
+				State:        billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+
+	h := &Handlers{
+		client:       chainClient,
+		sseBroker:    broker,
+		providerUUID: providerUUID,
+		bech32Prefix: "manifest",
+	}
+
+	// Wrap SSE handler with loggingMiddleware — the same chain as production.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/leases/{lease_uuid}/events", h.StreamLeaseEvents)
+	server := httptest.NewServer(loggingMiddleware(mux))
+	defer server.Close()
+
+	req, err := http.NewRequest("GET", server.URL+"/v1/leases/"+leaseUUID+"/events", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+validToken)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"SSE should work through loggingMiddleware (responseWriter must implement http.Flusher)")
+	assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+
+	// Verify an event can actually be received (not just headers).
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		broker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusReady,
+			Timestamp: time.Now(),
+		})
+	}()
+
+	scanner := bufio.NewScanner(resp.Body)
+	var sseData string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			sseData = strings.TrimPrefix(line, "data: ")
+			break
+		}
+	}
+	require.NotEmpty(t, sseData, "expected SSE data through loggingMiddleware")
+}
+
 func TestStreamLeaseEvents_TimeoutMiddlewareBreaksSSE(t *testing.T) {
 	// This test documents WHY the SSE endpoint must not use requestTimeoutMiddleware.
 	// http.TimeoutHandler wraps the ResponseWriter with a buffered writer that does

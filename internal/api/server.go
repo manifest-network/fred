@@ -475,6 +475,20 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap returns the underlying ResponseWriter so http.ResponseController
+// and interface assertions (e.g., http.Flusher) see through the wrapper.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+// Flush implements http.Flusher by delegating to the underlying writer.
+// Required for SSE streaming through the logging middleware.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // requestTimeoutMiddleware applies a timeout to request processing.
 // This is separate from HTTP server timeouts (ReadTimeout/WriteTimeout) and applies
 // to the handler logic itself. Uses http.TimeoutHandler which properly buffers the
