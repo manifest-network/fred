@@ -14,24 +14,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/testutil"
 )
+
+func testEvent(leaseUUID string, status backend.ProvisionStatus) backend.LeaseStatusEvent {
+	return backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    status,
+		Timestamp: time.Now(),
+	}
+}
 
 func TestSSEBroker_SubscribeAndPublish(t *testing.T) {
 	broker := NewSSEBroker()
 	ch := broker.Subscribe("lease-1")
 
-	event := SSEEvent{
-		LeaseUUID: "lease-1",
-		Status:    "ready",
-		Timestamp: time.Now().Format(time.RFC3339),
-	}
+	event := testEvent("lease-1", backend.ProvisionStatusReady)
 	broker.Publish(event)
 
 	select {
 	case received := <-ch:
 		assert.Equal(t, "lease-1", received.LeaseUUID)
-		assert.Equal(t, "ready", received.Status)
+		assert.Equal(t, backend.ProvisionStatusReady, received.Status)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for event")
 	}
@@ -42,19 +47,19 @@ func TestSSEBroker_MultipleClientsForSameLease(t *testing.T) {
 	ch1 := broker.Subscribe("lease-1")
 	ch2 := broker.Subscribe("lease-1")
 
-	event := SSEEvent{
+	event := backend.LeaseStatusEvent{
 		LeaseUUID: "lease-1",
-		Status:    "failed",
+		Status:    backend.ProvisionStatusFailed,
 		Error:     "container exited",
-		Timestamp: time.Now().Format(time.RFC3339),
+		Timestamp: time.Now(),
 	}
 	broker.Publish(event)
 
-	for _, ch := range []<-chan SSEEvent{ch1, ch2} {
+	for _, ch := range []<-chan backend.LeaseStatusEvent{ch1, ch2} {
 		select {
 		case received := <-ch:
 			assert.Equal(t, "lease-1", received.LeaseUUID)
-			assert.Equal(t, "failed", received.Status)
+			assert.Equal(t, backend.ProvisionStatusFailed, received.Status)
 		case <-time.After(time.Second):
 			t.Fatal("timed out waiting for event on one of the clients")
 		}
@@ -68,10 +73,7 @@ func TestSSEBroker_UnsubscribeStopsDelivery(t *testing.T) {
 	broker.Unsubscribe("lease-1", ch)
 
 	// Publish after unsubscribe — should not be received (channel is closed).
-	broker.Publish(SSEEvent{
-		LeaseUUID: "lease-1",
-		Status:    "ready",
-	})
+	broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
 
 	// Channel should be closed.
 	_, ok := <-ch
@@ -84,10 +86,7 @@ func TestSSEBroker_SlowClientDropsEvents(t *testing.T) {
 
 	// Fill the buffer (sseChannelBuffer = 16).
 	for i := 0; i < sseChannelBuffer+5; i++ {
-		broker.Publish(SSEEvent{
-			LeaseUUID: "lease-1",
-			Status:    "ready",
-		})
+		broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
 	}
 
 	// Should not panic or block. We should get exactly sseChannelBuffer events.
@@ -109,10 +108,7 @@ func TestSSEBroker_DifferentLeasesAreIsolated(t *testing.T) {
 	ch1 := broker.Subscribe("lease-1")
 	ch2 := broker.Subscribe("lease-2")
 
-	broker.Publish(SSEEvent{
-		LeaseUUID: "lease-1",
-		Status:    "ready",
-	})
+	broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
 
 	// ch1 should get the event.
 	select {
@@ -133,7 +129,7 @@ func TestSSEBroker_DifferentLeasesAreIsolated(t *testing.T) {
 
 func TestSSEBroker_UnsubscribeNonexistentLease(t *testing.T) {
 	broker := NewSSEBroker()
-	ch := make(chan SSEEvent)
+	ch := make(chan backend.LeaseStatusEvent)
 
 	// Should not panic.
 	require.NotPanics(t, func() {
@@ -146,10 +142,35 @@ func TestSSEBroker_PublishToNoSubscribers(t *testing.T) {
 
 	// Should not panic.
 	require.NotPanics(t, func() {
-		broker.Publish(SSEEvent{
-			LeaseUUID: "lease-1",
-			Status:    "ready",
-		})
+		broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
+	})
+}
+
+func TestSSEBroker_Close(t *testing.T) {
+	broker := NewSSEBroker()
+	ch1 := broker.Subscribe("lease-1")
+	ch2 := broker.Subscribe("lease-2")
+
+	broker.Close()
+
+	// All channels should be closed.
+	_, ok1 := <-ch1
+	assert.False(t, ok1, "expected ch1 to be closed after broker.Close()")
+	_, ok2 := <-ch2
+	assert.False(t, ok2, "expected ch2 to be closed after broker.Close()")
+
+	// Subscribe after close returns nil.
+	ch3 := broker.Subscribe("lease-3")
+	assert.Nil(t, ch3, "expected nil channel from Subscribe after Close")
+
+	// Publish after close should not panic.
+	require.NotPanics(t, func() {
+		broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
+	})
+
+	// Double close should not panic.
+	require.NotPanics(t, func() {
+		broker.Close()
 	})
 }
 
@@ -234,10 +255,10 @@ func TestStreamLeaseEvents_ReceivesEvent(t *testing.T) {
 	// Publish an event after a short delay to ensure the client is subscribed.
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		broker.Publish(SSEEvent{
+		broker.Publish(backend.LeaseStatusEvent{
 			LeaseUUID: leaseUUID,
-			Status:    "ready",
-			Timestamp: time.Now().Format(time.RFC3339),
+			Status:    backend.ProvisionStatusReady,
+			Timestamp: time.Now(),
 		})
 	}()
 
@@ -253,8 +274,8 @@ func TestStreamLeaseEvents_ReceivesEvent(t *testing.T) {
 	}
 	require.NotEmpty(t, sseData, "expected to receive SSE data line")
 
-	var event SSEEvent
+	var event backend.LeaseStatusEvent
 	require.NoError(t, json.Unmarshal([]byte(sseData), &event))
 	assert.Equal(t, leaseUUID, event.LeaseUUID)
-	assert.Equal(t, "ready", event.Status)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
 }

@@ -2630,10 +2630,10 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 // mockLeaseEventSink captures events published to the SSE sink.
 type mockLeaseEventSink struct {
 	mu     sync.Mutex
-	events []LeaseEventPayload
+	events []backend.LeaseStatusEvent
 }
 
-func (s *mockLeaseEventSink) Publish(event LeaseEventPayload) {
+func (s *mockLeaseEventSink) Publish(event backend.LeaseStatusEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = append(s.events, event)
@@ -2660,9 +2660,9 @@ func TestForwardToSSE_ForwardsToSink(t *testing.T) {
 	defer sink.mu.Unlock()
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, "lease-1", sink.events[0].LeaseUUID)
-	assert.Equal(t, string(backend.ProvisionStatusReady), sink.events[0].Status)
+	assert.Equal(t, backend.ProvisionStatusReady, sink.events[0].Status)
 	assert.Empty(t, sink.events[0].Error)
-	assert.Equal(t, "2026-01-15T10:30:00Z", sink.events[0].Timestamp)
+	assert.Equal(t, time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC), sink.events[0].Timestamp)
 }
 
 func TestForwardToSSE_IncludesError(t *testing.T) {
@@ -2686,7 +2686,7 @@ func TestForwardToSSE_IncludesError(t *testing.T) {
 	defer sink.mu.Unlock()
 	require.Len(t, sink.events, 1)
 	assert.Equal(t, "lease-2", sink.events[0].LeaseUUID)
-	assert.Equal(t, string(backend.ProvisionStatusFailed), sink.events[0].Status)
+	assert.Equal(t, backend.ProvisionStatusFailed, sink.events[0].Status)
 	assert.Equal(t, "OOM killed", sink.events[0].Error)
 }
 

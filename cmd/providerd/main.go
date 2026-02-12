@@ -43,19 +43,6 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 	})
 }
 
-// sseBrokerAdapter bridges api.SSEBroker to the provisioner.LeaseEventSink interface.
-type sseBrokerAdapter struct {
-	broker *api.SSEBroker
-}
-
-func (a *sseBrokerAdapter) Publish(event provisioner.LeaseEventPayload) {
-	a.broker.Publish(api.SSEEvent{
-		LeaseUUID: event.LeaseUUID,
-		Status:    event.Status,
-		Error:     event.Error,
-		Timestamp: event.Timestamp,
-	})
-}
 
 var version = "dev"
 
@@ -274,7 +261,7 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		PayloadStore:    payloadStore,
 		PlacementStore:  placementStore,
-		LeaseEventSink:  &sseBrokerAdapter{broker: sseBroker},
+		LeaseEventSink:  sseBroker,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)

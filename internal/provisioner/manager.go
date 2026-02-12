@@ -57,15 +57,7 @@ type Manager struct {
 
 // LeaseEventSink receives lease status events for real-time delivery (e.g., SSE).
 type LeaseEventSink interface {
-	Publish(event LeaseEventPayload)
-}
-
-// LeaseEventPayload is the data forwarded to SSE clients.
-type LeaseEventPayload struct {
-	LeaseUUID string `json:"lease_uuid"`
-	Status    string `json:"status"`
-	Error     string `json:"error,omitempty"`
-	Timestamp string `json:"timestamp"`
+	Publish(event backend.LeaseStatusEvent)
 }
 
 // ManagerConfig configures the provision manager.
@@ -255,13 +247,7 @@ func (m *Manager) forwardToSSE(msg *message.Message) error {
 		return nil // Don't retry malformed messages
 	}
 
-	m.leaseEventSink.Publish(LeaseEventPayload{
-		LeaseUUID: event.LeaseUUID,
-		Status:    string(event.Status),
-		Error:     event.Error,
-		Timestamp: event.Timestamp.Format(time.RFC3339),
-	})
-
+	m.leaseEventSink.Publish(event)
 	return nil
 }
 
