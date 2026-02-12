@@ -1014,6 +1014,9 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ch := h.sseBroker.Subscribe(leaseUUID)
+	if ch == nil {
+		return // Broker closed; headers already sent so just end the connection.
+	}
 	defer h.sseBroker.Unsubscribe(leaseUUID, ch)
 
 	keepalive := time.NewTicker(30 * time.Second)

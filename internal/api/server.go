@@ -54,7 +54,6 @@ type Server struct {
 	bech32Prefix          string
 	tlsCertFile           string
 	tlsKeyFile            string
-	requestTimeout        time.Duration
 	shutdownTimeout       time.Duration
 	rateLimiter           *RateLimiter
 	tenantRateLimiter     *TenantRateLimiter
@@ -162,7 +161,6 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		bech32Prefix:          cfg.Bech32Prefix,
 		tlsCertFile:           cfg.TLSCertFile,
 		tlsKeyFile:            cfg.TLSKeyFile,
-		requestTimeout:        requestTimeout,
 		shutdownTimeout:       shutdownTimeout,
 		rateLimiter:           rateLimiter,
 		tenantRateLimiter:     tenantRateLimiter,
@@ -173,10 +171,15 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 
 	mux := http.NewServeMux()
 
+	// Per-route timeout wrapper. Applied explicitly to each route so that
+	// streaming endpoints (SSE) can opt out. Routes without withTimeout
+	// still have connection-level safety via http.Server.ReadTimeout/WriteTimeout.
+	withTimeout := requestTimeoutMiddleware(requestTimeout)
+
 	// Unauthenticated routes
-	mux.HandleFunc("GET /health", handlers.HealthCheck)
-	mux.Handle("GET /metrics", promhttp.Handler())
-	mux.HandleFunc("POST /callbacks/provision", s.handleProvisionCallback)
+	mux.Handle("GET /health", withTimeout(http.HandlerFunc(handlers.HealthCheck)))
+	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
+	mux.Handle("POST /callbacks/provision", withTimeout(http.HandlerFunc(s.handleProvisionCallback)))
 
 	// Authenticated routes with optional tenant rate limiting
 	withTenantRL := func(h http.HandlerFunc) http.Handler {
@@ -185,23 +188,26 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		}
 		return h
 	}
-	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTenantRL(handlers.GetLeaseConnection))
-	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTenantRL(handlers.GetLeaseStatus))
-	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTenantRL(handlers.GetLeaseProvision))
-	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTenantRL(handlers.GetLeaseLogs))
-	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTenantRL(s.handlePayloadUpload))
-	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTenantRL(handlers.RestartLease))
-	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTenantRL(handlers.UpdateLease))
-	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTenantRL(handlers.GetLeaseReleases))
+	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTimeout(withTenantRL(handlers.GetLeaseConnection)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTimeout(withTenantRL(handlers.GetLeaseStatus)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTimeout(withTenantRL(handlers.GetLeaseProvision)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTimeout(withTenantRL(handlers.GetLeaseLogs)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTimeout(withTenantRL(s.handlePayloadUpload)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withTenantRL(handlers.RestartLease)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTimeout(withTenantRL(handlers.UpdateLease)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTimeout(withTenantRL(handlers.GetLeaseReleases)))
+	// SSE endpoint: no request timeout. http.TimeoutHandler buffers the entire
+	// response and does not support http.Flusher, which breaks streaming. It also
+	// kills the handler goroutine after the timeout, terminating the long-lived
+	// connection. Connection-level safety is still provided by http.Server timeouts.
 	mux.Handle("GET /v1/leases/{lease_uuid}/events", withTenantRL(handlers.StreamLeaseEvents))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:
-	// securityHeaders → rateLimiter → timeout → maxBody → logging → handler
+	// securityHeaders → rateLimiter → maxBody → logging → mux → [per-route timeout] → handler
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	handler = maxBodySizeMiddleware(maxBodySize)(handler)
-	handler = requestTimeoutMiddleware(requestTimeout)(handler)
 	handler = rateLimiter.Middleware(handler)
 	handler = securityHeadersMiddleware(handler)
 

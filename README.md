@@ -437,7 +437,7 @@ Returns provision diagnostics for a lease, including status, error details, and 
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, or `failed`
+- `status` - Provision status: `provisioning`, `ready`, `failed`, `restarting`, `updating`, or `unknown`
 - `fail_count` - Number of provision attempts that failed
 - `last_error` - Detailed error message (only present on failure)
 

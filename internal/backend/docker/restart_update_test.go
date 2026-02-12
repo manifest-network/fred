@@ -323,6 +323,61 @@ func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 	assert.Contains(t, prov.LastError, "container start failed")
 }
 
+func TestRestart_Failure_SKUProfileLookupFails(t *testing.T) {
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "unknown-sku",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     manifest,
+			ContainerIDs: []string{"old-c1"},
+			FailCount:    0,
+		},
+	}
+
+	mock := &mockDockerClient{}
+
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	err := b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err) // Restart returns nil — failure is async
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for failure callback")
+	}
+
+	// Verify failure callback
+	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
+	assert.Equal(t, "restart failed", callbackPayload.Error)
+
+	// Verify provision stays Ready (not Failed) since old containers are still running.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+	assert.Equal(t, 1, prov.FailCount)
+	assert.Contains(t, prov.LastError, "SKU profile lookup failed")
+}
+
 func TestRestart_MultipleContainers(t *testing.T) {
 	manifest := &DockerManifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{

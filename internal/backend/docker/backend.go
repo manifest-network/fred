@@ -172,21 +172,26 @@ func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID s
 	return s
 }
 
-// persistDiagnostics saves failure diagnostics and container logs to the
-// diagnostics store. It is a best-effort operation: errors are logged but
-// not propagated. Skipped if diagnosticsStore is nil (e.g., in tests).
-func (b *Backend) persistDiagnostics(leaseUUID string, prov *provision, containerIDs []string) {
-	if b.diagnosticsStore == nil {
-		return
-	}
-
-	entry := shared.DiagnosticEntry{
+// diagnosticSnapshot captures provision fields needed for diagnostics persistence.
+// Built under provisionsMu so that persistDiagnostics can run without holding the lock.
+func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
+	return shared.DiagnosticEntry{
 		LeaseUUID:    prov.LeaseUUID,
 		ProviderUUID: prov.ProviderUUID,
 		Tenant:       prov.Tenant,
 		Error:        prov.LastError,
 		FailCount:    prov.FailCount,
 		CreatedAt:    time.Now(),
+	}
+}
+
+// persistDiagnostics saves failure diagnostics and container logs to the
+// diagnostics store. It performs I/O (container log fetching, bbolt write)
+// and must NOT be called while holding provisionsMu.
+// It is a best-effort operation: errors are logged but not propagated.
+func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs []string) {
+	if b.diagnosticsStore == nil {
+		return
 	}
 
 	// Fetch logs from containers that still exist.
@@ -211,7 +216,7 @@ func (b *Backend) persistDiagnostics(leaseUUID string, prov *provision, containe
 
 	if err := b.diagnosticsStore.Store(entry); err != nil {
 		b.logger.Warn("failed to persist failure diagnostics",
-			"lease_uuid", leaseUUID, "error", err)
+			"lease_uuid", entry.LeaseUUID, "error", err)
 	}
 }
 
@@ -909,15 +914,17 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}
 
+			var diagSnap shared.DiagnosticEntry
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[req.LeaseUUID]; ok {
 				prov.Status = backend.ProvisionStatusFailed
 				prov.FailCount++
 				prov.LastError = err.Error()
-				// Persist diagnostics while containers still exist for log access.
-				b.persistDiagnostics(req.LeaseUUID, prov, containerIDs)
+				diagSnap = diagnosticSnapshot(prov)
 			}
 			b.provisionsMu.Unlock()
+			// Persist diagnostics outside lock — fetches container logs (I/O).
+			b.persistDiagnostics(diagSnap, containerIDs)
 
 			// Clean up any containers that were created.
 			// Use a fresh context since the original may be canceled.
@@ -1319,7 +1326,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 	})
 }
 
-// replaceContainersOp describes a blue-green container replacement operation.
+// replaceContainersOp describes a container replacement operation with rollback.
 // Used by both restart and update to share the stop → create → verify lifecycle.
 type replaceContainersOp struct {
 	LeaseUUID       string
@@ -1347,14 +1354,16 @@ type replaceContainersOp struct {
 func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, err error, failStatus backend.ProvisionStatus, logger *slog.Logger) {
 	logger.Error("preflight failed", "error", err)
 
+	var diagSnap shared.DiagnosticEntry
 	b.provisionsMu.Lock()
 	if prov, ok := b.provisions[leaseUUID]; ok {
 		prov.LastError = err.Error()
 		prov.FailCount++
 		prov.Status = failStatus
-		b.persistDiagnostics(leaseUUID, prov, nil)
+		diagSnap = diagnosticSnapshot(prov)
 	}
 	b.provisionsMu.Unlock()
+	b.persistDiagnostics(diagSnap, nil)
 
 	if b.releaseStore != nil {
 		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", err.Error()); relErr != nil {
@@ -1365,8 +1374,9 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, e
 	b.sendCallback(leaseUUID, false, callbackMsg)
 }
 
-// doReplaceContainers performs the blue-green container replacement lifecycle:
-// inspect image → read metadata → setup networking → stop old → create new → verify.
+// doReplaceContainers performs the container replacement lifecycle:
+// inspect image → read metadata → setup networking → stop and rename old →
+// create and start new → verify startup.
 // Old containers are kept stopped for rollback on failure.
 func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersOp) {
 	var err error
@@ -1378,14 +1388,16 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 		if err != nil {
 			op.Logger.Error(op.Operation+" failed", "error", err)
 
-			// Persist diagnostics while failed containers still exist.
+			// Snapshot diagnostics under lock, then persist outside (I/O).
+			var diagSnap shared.DiagnosticEntry
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[op.LeaseUUID]; ok {
 				prov.LastError = err.Error()
 				prov.FailCount++
-				b.persistDiagnostics(op.LeaseUUID, prov, newContainerIDs)
+				diagSnap = diagnosticSnapshot(prov)
 			}
 			b.provisionsMu.Unlock()
+			b.persistDiagnostics(diagSnap, newContainerIDs)
 
 			// Mark release as failed.
 			if b.releaseStore != nil {
@@ -1816,14 +1828,16 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	if len(errs) > 0 {
 		// Partial failure: keep provision visible with only the stuck containers
 		// so the reconciler (or a retry) can see and re-attempt them.
+		var diagSnap shared.DiagnosticEntry
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
 			p.Status = backend.ProvisionStatusFailed
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
-			b.persistDiagnostics(leaseUUID, p, failedIDs)
+			diagSnap = diagnosticSnapshot(p)
 		}
 		b.provisionsMu.Unlock()
+		b.persistDiagnostics(diagSnap, failedIDs)
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
 	}
 
@@ -2176,14 +2190,25 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.provisionsMu.Unlock()
 	}
 
-	// Persist diagnostics for all failed leases (containers are dead but not removed).
+	// Snapshot diagnostics under lock, then persist outside (I/O).
+	type diagItem struct {
+		entry        shared.DiagnosticEntry
+		containerIDs []string
+	}
+	diagItems := make([]diagItem, 0, len(allFailed))
 	b.provisionsMu.RLock()
 	for _, uuid := range allFailed {
 		if prov, ok := b.provisions[uuid]; ok {
-			b.persistDiagnostics(uuid, prov, prov.ContainerIDs)
+			diagItems = append(diagItems, diagItem{
+				entry:        diagnosticSnapshot(prov),
+				containerIDs: append([]string(nil), prov.ContainerIDs...),
+			})
 		}
 	}
 	b.provisionsMu.RUnlock()
+	for _, item := range diagItems {
+		b.persistDiagnostics(item.entry, item.containerIDs)
+	}
 
 	// Send failure callbacks with hardcoded message — never includes logs
 	// or dynamic data. Full diagnostics are in prov.LastError for
@@ -2414,12 +2439,16 @@ func (b *Backend) handleContainerDeath(containerID string) {
 		b.provisionsMu.Unlock()
 	}
 
-	// Persist diagnostics.
+	// Persist diagnostics (snapshot under lock, I/O outside).
+	var diagSnap shared.DiagnosticEntry
+	var diagContainerIDs []string
 	b.provisionsMu.RLock()
 	if p, ok := b.provisions[leaseUUID]; ok {
-		b.persistDiagnostics(leaseUUID, p, p.ContainerIDs)
+		diagSnap = diagnosticSnapshot(p)
+		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
 	}
 	b.provisionsMu.RUnlock()
+	b.persistDiagnostics(diagSnap, diagContainerIDs)
 
 	// Update metrics and send callback.
 	activeProvisions.Dec()

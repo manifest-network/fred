@@ -279,3 +279,117 @@ func TestStreamLeaseEvents_ReceivesEvent(t *testing.T) {
 	assert.Equal(t, leaseUUID, event.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
 }
+
+func TestStreamLeaseEvents_SurvivesBeyondRequestTimeout(t *testing.T) {
+	broker := NewSSEBroker()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       kp.Address,
+				ProviderUuid: providerUUID,
+				State:        billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+
+	h := &Handlers{
+		client:       chainClient,
+		sseBroker:    broker,
+		providerUUID: providerUUID,
+		bech32Prefix: "manifest",
+	}
+
+	// Register SSE WITHOUT timeout middleware — matching production config.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/leases/{lease_uuid}/events", h.StreamLeaseEvents)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	req, err := http.NewRequest("GET", server.URL+"/v1/leases/"+leaseUUID+"/events", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+validToken)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Publish an event after 200ms — well beyond a hypothetical 100ms timeout.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		broker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusReady,
+			Timestamp: time.Now(),
+		})
+	}()
+
+	scanner := bufio.NewScanner(resp.Body)
+	var sseData string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			sseData = strings.TrimPrefix(line, "data: ")
+			break
+		}
+	}
+	require.NotEmpty(t, sseData, "expected SSE event to arrive after delay")
+}
+
+func TestStreamLeaseEvents_TimeoutMiddlewareBreaksSSE(t *testing.T) {
+	// This test documents WHY the SSE endpoint must not use requestTimeoutMiddleware.
+	// http.TimeoutHandler wraps the ResponseWriter with a buffered writer that does
+	// not support http.Flusher, so StreamLeaseEvents returns 500 "streaming unsupported".
+	broker := NewSSEBroker()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       kp.Address,
+				ProviderUuid: providerUUID,
+				State:        billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+
+	h := &Handlers{
+		client:       chainClient,
+		sseBroker:    broker,
+		providerUUID: providerUUID,
+		bech32Prefix: "manifest",
+	}
+
+	// Wrap SSE handler WITH timeout middleware — this should break streaming.
+	withTimeout := requestTimeoutMiddleware(5 * time.Second)
+	mux := http.NewServeMux()
+	mux.Handle("GET /v1/leases/{lease_uuid}/events", withTimeout(http.HandlerFunc(h.StreamLeaseEvents)))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	req, err := http.NewRequest("GET", server.URL+"/v1/leases/"+leaseUUID+"/events", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+validToken)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	// TimeoutHandler's writer does not implement http.Flusher, so the handler
+	// returns 500 "streaming unsupported" instead of establishing the SSE stream.
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"SSE handler should fail when wrapped with requestTimeoutMiddleware because http.TimeoutHandler does not support http.Flusher")
+}
