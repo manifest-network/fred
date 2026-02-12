@@ -87,7 +87,7 @@ type Backend struct {
 	// callbackSender handles callback delivery with retry and HMAC
 	callbackSender *shared.CallbackSender
 
-	// httpClient for sending callbacks (kept for test injection)
+	// httpClient is used by callbackSender for delivery; exposed for test replacement.
 	httpClient *http.Client
 
 	// volumeOwnerCache caches detected volume UID/GID per image ID

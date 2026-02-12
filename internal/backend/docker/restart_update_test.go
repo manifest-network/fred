@@ -1486,3 +1486,85 @@ func TestRestart_RollbackClearsLastError(t *testing.T) {
 	assert.Empty(t, prov.LastError, "LastError should be cleared after successful rollback")
 	assert.Equal(t, 1, prov.FailCount, "FailCount should still reflect the failed attempt")
 }
+
+func TestConcurrentRestartAndUpdate_OnlyOneSucceeds(t *testing.T) {
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     manifest,
+			ContainerIDs: []string{"old-c1"},
+			Quantity:     1,
+		},
+	}
+
+	// Block StopContainer so the first caller holds the async phase long enough
+	// for the second to attempt its call.
+	stopStarted := make(chan struct{}, 2)
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			stopStarted <- struct{}{}
+			// small delay to give the racer a window
+			time.Sleep(50 * time.Millisecond)
+			return nil
+		},
+		RenameContainerFn: func(ctx context.Context, containerID string, newName string) error {
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "new-c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	// Launch Restart and Update concurrently.
+	errs := make(chan error, 2)
+	go func() {
+		errs <- b.Restart(context.Background(), backend.RestartRequest{
+			LeaseUUID: "lease-1",
+		})
+	}()
+	go func() {
+		errs <- b.Update(context.Background(), backend.UpdateRequest{
+			LeaseUUID: "lease-1",
+			Payload:   validManifestJSON("nginx:1.26"),
+		})
+	}()
+
+	err1 := <-errs
+	err2 := <-errs
+
+	// Exactly one should succeed and one should fail with ErrInvalidState.
+	if err1 == nil && err2 == nil {
+		t.Fatal("expected exactly one call to fail with ErrInvalidState, but both succeeded")
+	}
+	if err1 != nil && err2 != nil {
+		t.Fatalf("expected exactly one call to succeed, but both failed: %v; %v", err1, err2)
+	}
+
+	var failedErr error
+	if err1 != nil {
+		failedErr = err1
+	} else {
+		failedErr = err2
+	}
+	assert.ErrorIs(t, failedErr, backend.ErrInvalidState)
+}
