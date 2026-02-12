@@ -140,7 +140,7 @@ type InstanceInfo struct {
 type ProvisionInfo struct {
 	LeaseUUID    string          `json:"lease_uuid"`
 	ProviderUUID string          `json:"provider_uuid"`
-	Status       ProvisionStatus `json:"status"` // "provisioning", "ready", "failed"
+	Status       ProvisionStatus `json:"status"` // see ProvisionStatus* constants
 	CreatedAt    time.Time       `json:"created_at"`
 	FailCount    int             `json:"fail_count"`
 	LastError    string          `json:"last_error,omitempty"`

@@ -200,6 +200,7 @@ List all currently provisioned resources. Used by Fred for reconciliation.
 - `provisioning` - Resource is being created
 - `ready` - Resource is available
 - `failed` - Provisioning failed
+- `unknown` - Status could not be determined
 - `restarting` - Containers are being restarted
 - `updating` - New manifest is being deployed
 
@@ -220,7 +221,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, or `failed`
+- `status` - Provision status: `provisioning`, `ready`, `failed`, `unknown`, `restarting`, or `updating`
 - `fail_count` - Number of provision failures
 - `last_error` - Full diagnostic error message (exit codes, OOM, truncated logs)
 
@@ -273,7 +274,7 @@ Restart containers for a lease without changing the manifest. Stops existing con
 3. Stop and rename existing containers (kept for rollback) in a background goroutine
 4. Recreate containers with the same manifest and configuration
 5. Run startup verification (health checks or startup delay)
-6. On success: remove old containers and POST success callback. On failure: rollback to old containers and POST failure callback
+6. On success: remove old containers and POST success callback. On failure: rollback to old containers, restore `ready` status, and POST failure callback
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned
@@ -308,7 +309,7 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 5. Stop and rename old containers (kept for rollback)
 6. Create and start new containers from the updated manifest
 7. Run startup verification
-8. On success: remove old containers and POST success callback. On failure: rollback to old containers and POST failure callback
+8. On success: remove old containers and POST success callback. On failure: rollback to old containers, mark status as `failed` (the desired update was not achieved even though old containers may be restored), and POST failure callback
 
 **Error Responses:**
 - `400 Bad Request` - Invalid manifest or validation error
@@ -317,7 +318,7 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 
 ### GET /releases/{lease_uuid}
 
-Get the release (deployment) history for a lease. Each provision or update creates a release entry. Restarts reuse the existing manifest and do not create a new release.
+Get the release (deployment) history for a lease. Each provision, update, or restart creates a release entry. Restarts reuse the existing manifest and image but still record a new release entry for operational tracking.
 
 **Response:** `200 OK`
 ```json
