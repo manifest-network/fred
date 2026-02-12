@@ -164,6 +164,21 @@ func (s *ReleaseStore) Latest(leaseUUID string) (*Release, error) {
 	return &releases[len(releases)-1], nil
 }
 
+// LatestActive returns the most recent release with "active" status for a lease.
+// Returns nil, nil when no active release is found.
+func (s *ReleaseStore) LatestActive(leaseUUID string) (*Release, error) {
+	releases, err := s.List(leaseUUID)
+	if err != nil || len(releases) == 0 {
+		return nil, err
+	}
+	for i := len(releases) - 1; i >= 0; i-- {
+		if releases[i].Status == "active" {
+			return &releases[i], nil
+		}
+	}
+	return nil, nil
+}
+
 // UpdateLatestStatus updates the status (and optionally error) of the most recent release.
 func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status, errMsg string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {

@@ -204,6 +204,67 @@ func TestReleaseStore_ActivateLatest(t *testing.T) {
 	})
 }
 
+func TestReleaseStore_LatestActive(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "latest_active.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	t.Run("returns active release skipping failed", func(t *testing.T) {
+		require.NoError(t, store.Append("lease-1", Release{
+			Image:     "postgres:17",
+			Manifest:  []byte(`{"image":"postgres:17"}`),
+			Status:    "active",
+			CreatedAt: time.Now(),
+		}))
+		require.NoError(t, store.Append("lease-1", Release{
+			Image:     "postgres:18",
+			Manifest:  []byte(`{"image":"postgres:18"}`),
+			Status:    "failed",
+			CreatedAt: time.Now(),
+		}))
+
+		rel, err := store.LatestActive("lease-1")
+		require.NoError(t, err)
+		require.NotNil(t, rel)
+		assert.Equal(t, "postgres:17", rel.Image)
+		assert.Equal(t, "active", rel.Status)
+	})
+
+	t.Run("returns nil when no active release", func(t *testing.T) {
+		require.NoError(t, store.Append("lease-2", Release{
+			Image:  "app:1.0",
+			Status: "failed",
+		}))
+
+		rel, err := store.LatestActive("lease-2")
+		require.NoError(t, err)
+		assert.Nil(t, rel)
+	})
+
+	t.Run("returns nil for nonexistent lease", func(t *testing.T) {
+		rel, err := store.LatestActive("nonexistent")
+		require.NoError(t, err)
+		assert.Nil(t, rel)
+	})
+
+	t.Run("returns most recent active when multiple exist", func(t *testing.T) {
+		require.NoError(t, store.Append("lease-3", Release{
+			Image:  "app:1.0",
+			Status: "active",
+		}))
+		require.NoError(t, store.Append("lease-3", Release{
+			Image:  "app:2.0",
+			Status: "active",
+		}))
+
+		rel, err := store.LatestActive("lease-3")
+		require.NoError(t, err)
+		require.NotNil(t, rel)
+		assert.Equal(t, "app:2.0", rel.Image)
+	})
+}
+
 func TestReleaseStore_Persistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "persist_releases.db")
 

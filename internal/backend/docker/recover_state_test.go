@@ -1437,6 +1437,62 @@ func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 		assert.Nil(t, prov.Manifest, "manifest should be nil when no release store is configured")
 	})
 
+	t.Run("manifest restored from active release not failed", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "releases.db")
+		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+		require.NoError(t, err)
+		defer relStore.Close()
+
+		// Simulate: provision with nginx, then failed update to alpine.
+		// The active release is nginx; the latest release is the failed alpine.
+		err = relStore.Append("lease-1", shared.Release{
+			Manifest:  manifestBytes,
+			Image:     "nginx:latest",
+			Status:    "active",
+			CreatedAt: now,
+		})
+		require.NoError(t, err)
+
+		alpineManifest := DockerManifest{Image: "alpine:latest", Command: []string{"sleep", "3600"}}
+		alpineBytes, _ := json.Marshal(alpineManifest)
+		err = relStore.Append("lease-1", shared.Release{
+			Manifest:  alpineBytes,
+			Image:     "alpine:latest",
+			Status:    "failed",
+			CreatedAt: now.Add(time.Second),
+		})
+		require.NoError(t, err)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.releaseStore = relStore
+
+		err = b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		require.NotNil(t, prov.Manifest, "manifest should be restored from active release")
+		assert.Equal(t, "nginx:latest", prov.Manifest.Image,
+			"manifest should come from the active release, not the failed one")
+	})
+
 	t.Run("manifest nil when no release exists for lease", func(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "releases.db")
 		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})

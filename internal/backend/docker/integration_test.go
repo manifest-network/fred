@@ -1958,7 +1958,7 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	// 4. GetReleases → verify history
 	releases, err := b.GetReleases(ctx, leaseUUID)
 	require.NoError(t, err)
-	require.Len(t, releases, 2, "expected 2 releases (provision update + update)")
+	require.Len(t, releases, 3, "expected 3 releases (provision + update + restart)")
 
 	// 5. Verify final state
 	prov := getProvisionInfo(t, b, leaseUUID)
