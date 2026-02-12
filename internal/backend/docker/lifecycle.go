@@ -42,6 +42,7 @@ const (
 	LabelInstanceIndex = "fred.instance_index"
 	LabelFailCount     = "fred.fail_count"
 	LabelCallbackURL   = "fred.callback_url"
+	LabelBackendName   = "fred.backend_name"
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
@@ -81,11 +82,14 @@ type PortBinding struct {
 
 // DockerClient wraps the Docker client for container lifecycle operations.
 type DockerClient struct {
-	client *client.Client
+	client      *client.Client
+	backendName string
 }
 
-// NewDockerClient creates a new Docker client.
-func NewDockerClient(host string) (*DockerClient, error) {
+// NewDockerClient creates a new Docker client. The backendName parameter scopes
+// all list/filter/event operations so that multiple backend instances sharing
+// the same Docker daemon do not interfere with each other.
+func NewDockerClient(host string, backendName string) (*DockerClient, error) {
 	opts := []client.Opt{
 		client.WithAPIVersionNegotiation(),
 	}
@@ -99,7 +103,7 @@ func NewDockerClient(host string) (*DockerClient, error) {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
-	return &DockerClient{client: cli}, nil
+	return &DockerClient{client: cli, backendName: backendName}, nil
 }
 
 // Close closes the Docker client.
@@ -767,6 +771,10 @@ type CreateContainerParams struct {
 	// runs directly as the target user instead of relying on the entrypoint
 	// to switch users (which requires CAP_CHOWN that we drop).
 	User string
+
+	// BackendName identifies the backend instance that created this container,
+	// stored as a label to scope list/filter operations per backend.
+	BackendName string
 }
 
 // portBindRetries is the number of times to retry container creation when
@@ -819,6 +827,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		LabelInstanceIndex: strconv.Itoa(params.InstanceIndex),
 		LabelFailCount:     strconv.Itoa(params.FailCount),
 		LabelCallbackURL:   params.CallbackURL,
+		LabelBackendName:   params.BackendName,
 	}
 
 	// Add user labels (already validated to not conflict with fred.*)
@@ -1151,12 +1160,17 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 }
 
 // ListManagedContainers returns all containers managed by Fred.
+// When backendName is set, only containers belonging to this backend are returned.
 func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
+	f := filters.NewArgs(
+		filters.Arg("label", LabelManaged+"=true"),
+	)
+	if d.backendName != "" {
+		f.Add("label", LabelBackendName+"="+d.backendName)
+	}
 	containers, err := d.client.ContainerList(ctx, container.ListOptions{
-		All: true,
-		Filters: filters.NewArgs(
-			filters.Arg("label", LabelManaged+"=true"),
-		),
+		All:     true,
+		Filters: f,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list containers: %w", err)
@@ -1221,11 +1235,15 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 	name := TenantNetworkName(tenant)
 
 	// Check if network already exists
+	nf := filters.NewArgs(
+		filters.Arg("name", name),
+		filters.Arg("label", LabelManaged+"=true"),
+	)
+	if d.backendName != "" {
+		nf.Add("label", LabelBackendName+"="+d.backendName)
+	}
 	networks, err := d.client.NetworkList(ctx, networktypes.ListOptions{
-		Filters: filters.NewArgs(
-			filters.Arg("name", name),
-			filters.Arg("label", LabelManaged+"=true"),
-		),
+		Filters: nf,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to list networks: %w", err)
@@ -1236,22 +1254,23 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 
 	// Create the network. If a concurrent caller already created it, the
 	// Docker API returns a conflict error. Handle this by re-listing.
+	netLabels := map[string]string{
+		LabelManaged: "true",
+		LabelTenant:  tenant,
+	}
+	if d.backendName != "" {
+		netLabels[LabelBackendName] = d.backendName
+	}
 	resp, err := d.client.NetworkCreate(ctx, name, networktypes.CreateOptions{
 		Driver:   "bridge",
 		Internal: false, // Must be false: Internal:true prevents port publishing (moby#36174)
-		Labels: map[string]string{
-			LabelManaged: "true",
-			LabelTenant:  tenant,
-		},
+		Labels:   netLabels,
 	})
 	if err != nil {
 		if errdefs.IsConflict(err) {
 			// Another goroutine created the network between our list and create.
 			networks, listErr := d.client.NetworkList(ctx, networktypes.ListOptions{
-				Filters: filters.NewArgs(
-					filters.Arg("name", name),
-					filters.Arg("label", LabelManaged+"=true"),
-				),
+				Filters: nf,
 			})
 			if listErr != nil {
 				return "", fmt.Errorf("failed to list networks after conflict: %w", listErr)
@@ -1293,11 +1312,16 @@ func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant st
 }
 
 // ListManagedNetworks returns all networks created by Fred, with full details.
+// When backendName is set, only networks belonging to this backend are returned.
 func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
+	f := filters.NewArgs(
+		filters.Arg("label", LabelManaged+"=true"),
+	)
+	if d.backendName != "" {
+		f.Add("label", LabelBackendName+"="+d.backendName)
+	}
 	summaries, err := d.client.NetworkList(ctx, networktypes.ListOptions{
-		Filters: filters.NewArgs(
-			filters.Arg("label", LabelManaged+"=true"),
-		),
+		Filters: f,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list managed networks: %w", err)
@@ -1350,6 +1374,9 @@ func (d *DockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEve
 		filters.Arg("event", "die"),
 		filters.Arg("label", LabelManaged+"=true"),
 	)
+	if d.backendName != "" {
+		filter.Add("label", LabelBackendName+"="+d.backendName)
+	}
 
 	dockerEvents, dockerErrs := d.client.Events(ctx, events.ListOptions{Filters: filter})
 

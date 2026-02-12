@@ -226,7 +226,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	docker, err := NewDockerClient(cfg.DockerHost)
+	docker, err := NewDockerClient(cfg.DockerHost, cfg.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
@@ -1140,6 +1140,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				ImageVolumes:      imgSetup.Volumes,
 				WritablePathBinds: writablePathBinds,
 				User:              imgSetup.ContainerUser,
+				BackendName:       b.cfg.Name,
 			}, b.cfg.ContainerCreateTimeout)
 			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
 			if createErr != nil {
@@ -1562,6 +1563,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			ImageVolumes:      imgSetup.Volumes,
 			WritablePathBinds: writablePathBinds,
 			User:              imgSetup.ContainerUser,
+			BackendName:       b.cfg.Name,
 		}, b.cfg.ContainerCreateTimeout)
 		if createErr != nil {
 			err = fmt.Errorf("container creation failed (instance %d): %w", i, createErr)

@@ -34,7 +34,7 @@ const testCallbackSecret = "integration-test-secret-at-least-32-chars!"
 func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	t.Helper()
 
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -78,7 +78,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	t.Cleanup(func() {
 		_ = b.Stop()
 		cleanupTestContainers(t, docker, cfg.Name)
-		cleanupTestNetworks(t, docker)
+		cleanupTestNetworks(t, docker, cfg.Name)
 	})
 
 	return b
@@ -90,11 +90,15 @@ func cleanupTestContainers(t *testing.T, docker *DockerClient, backendName strin
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	f := filters.NewArgs(
+		filters.Arg("label", LabelManaged+"=true"),
+	)
+	if backendName != "" {
+		f.Add("label", LabelBackendName+"="+backendName)
+	}
 	containers, err := docker.client.ContainerList(ctx, container.ListOptions{
-		All: true,
-		Filters: filters.NewArgs(
-			filters.Arg("label", LabelManaged+"=true"),
-		),
+		All:     true,
+		Filters: f,
 	})
 	if err != nil {
 		t.Logf("cleanup: failed to list containers: %v", err)
@@ -111,15 +115,19 @@ func cleanupTestContainers(t *testing.T, docker *DockerClient, backendName strin
 }
 
 // cleanupTestNetworks removes all networks managed by Fred.
-func cleanupTestNetworks(t *testing.T, docker *DockerClient) {
+func cleanupTestNetworks(t *testing.T, docker *DockerClient, backendName string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	f := filters.NewArgs(
+		filters.Arg("label", LabelManaged+"=true"),
+	)
+	if backendName != "" {
+		f.Add("label", LabelBackendName+"="+backendName)
+	}
 	networks, err := docker.client.NetworkList(ctx, networktypes.ListOptions{
-		Filters: filters.NewArgs(
-			filters.Arg("label", LabelManaged+"=true"),
-		),
+		Filters: f,
 	})
 	if err != nil {
 		t.Logf("cleanup: failed to list networks: %v", err)
@@ -317,7 +325,7 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	}
 
 	// Verify separate tenant networks were created
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -398,7 +406,7 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	}
 
 	// Inspect container via Docker API
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -488,7 +496,7 @@ func TestIntegration_Docker_DeprovisionIdempotent(t *testing.T) {
 // time to transition to exited. This helper ensures the transition is complete.
 func waitForContainerExited(t *testing.T, containerID string) {
 	t.Helper()
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -507,7 +515,7 @@ func waitForContainerExited(t *testing.T, containerID string) {
 // The container remains visible to Docker (and recoverState) unlike ContainerRemove.
 func killContainer(t *testing.T, containerID string) {
 	t.Helper()
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -538,7 +546,7 @@ func waitForProvisionStatus(t *testing.T, b *Backend, leaseUUID string, expected
 // inspectProvisionContainers lists containers for a lease by label.
 func inspectProvisionContainers(t *testing.T, leaseUUID string) []container.Summary {
 	t.Helper()
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -862,11 +870,11 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	// Track Docker client for cleanup
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)
-		cleanupTestNetworks(t, docker)
+		cleanupTestNetworks(t, docker, cfg.Name)
 		_ = docker.Close()
 	})
 
@@ -951,11 +959,11 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	err = b.Start(ctx)
 	require.NoError(t, err)
 
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)
-		cleanupTestNetworks(t, docker)
+		cleanupTestNetworks(t, docker, cfg.Name)
 		_ = docker.Close()
 	})
 
@@ -1062,7 +1070,7 @@ func TestIntegration_Docker_PortConflict(t *testing.T) {
 // concurrent calls to EnsureTenantNetwork for the same tenant both succeed,
 // even when the second call races with the first's NetworkCreate.
 func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1438,7 +1446,7 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 	}
 
 	// Inspect container networks via Docker API
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
