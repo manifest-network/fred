@@ -81,7 +81,7 @@ test-integration:
 # Run restart, update, and releases integration tests (requires Docker daemon)
 test-integration-restart-update:
 	@echo "Running restart/update/releases integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(RestartLifecycle|UpdateLifecycle|GetReleases_History|UpdateFromFailed|RestartInvalidState_FromFailed|FullLifecycle|MultiContainer(Restart|Update)|UpdateBadImage|SequentialUpdates)" -timeout 10m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(RestartLifecycle|UpdateLifecycle|GetReleases_History|UpdateFromFailed|RestartFromFailed|FullLifecycle|MultiContainer(Restart|Update)|UpdateBadImage|SequentialUpdates)" -timeout 10m
 
 # Run volume integration tests (requires root + Docker + btrfs-progs)
 # Usage: sudo make test-integration-volume

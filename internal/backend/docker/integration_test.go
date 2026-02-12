@@ -1818,7 +1818,7 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestIntegration_Docker_RestartInvalidState_FromFailed(t *testing.T) {
+func TestIntegration_Docker_RestartFromFailed(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -1871,13 +1871,24 @@ func TestIntegration_Docker_RestartInvalidState_FromFailed(t *testing.T) {
 	prov := getProvisionInfo(t, b, leaseUUID)
 	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 
-	// Attempt Restart from Failed state → should return ErrInvalidState
+	// Restart from Failed state → should now succeed (QoL improvement)
 	err = b.Restart(ctx, backend.RestartRequest{
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbackServer.URL,
 	})
-	require.Error(t, err)
-	assert.ErrorIs(t, err, backend.ErrInvalidState, "restart from Failed should return ErrInvalidState")
+	require.NoError(t, err, "restart from Failed should be allowed")
+
+	// Wait for restart callback
+	select {
+	case cb := <-callbackCh:
+		assert.Equal(t, backend.CallbackStatusSuccess, cb.Status, "restart callback should indicate success")
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for restart callback")
+	}
+
+	// Confirm status is Ready after successful restart
+	prov = getProvisionInfo(t, b, leaseUUID)
+	require.Equal(t, backend.ProvisionStatusReady, prov.Status)
 
 	// Cleanup
 	err = b.Deprovision(ctx, leaseUUID)
