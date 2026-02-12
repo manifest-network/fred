@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1265,6 +1266,21 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	sku := prov.SKU
 	b.provisionsMu.Unlock()
 
+	// Record restart release as deploying
+	if b.releaseStore != nil {
+		manifestBytes, marshalErr := json.Marshal(manifest)
+		if marshalErr != nil {
+			logger.Warn("failed to marshal manifest for release", "error", marshalErr)
+		} else if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
+			Manifest:  manifestBytes,
+			Image:     manifest.Image,
+			Status:    "deploying",
+			CreatedAt: time.Now(),
+		}); relErr != nil {
+			logger.Warn("failed to record restart release", "error", relErr)
+		}
+	}
+
 	// Async phase
 	b.wg.Go(func() {
 		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
@@ -1301,6 +1317,13 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 				b.persistDiagnostics(leaseUUID, prov, newContainerIDs)
 			}
 			b.provisionsMu.Unlock()
+
+			// Mark release as failed.
+			if b.releaseStore != nil {
+				if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", err.Error()); relErr != nil {
+					logger.Warn("failed to update release status", "error", relErr)
+				}
+			}
 
 			// Clean up failed new containers.
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1349,6 +1372,14 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 			prov.LastError = ""
 		}
 		b.provisionsMu.Unlock()
+
+		// Mark release as active, previous as superseded.
+		if b.releaseStore != nil {
+			if relErr := b.releaseStore.ActivateLatest(leaseUUID); relErr != nil {
+				logger.Warn("failed to update release status", "error", relErr)
+			}
+		}
+
 		b.sendCallback(leaseUUID, true, "")
 	}()
 
