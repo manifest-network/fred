@@ -1348,3 +1348,128 @@ func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
 	assert.Equal(t, 1, prov.FailCount,
 		"should preserve in-memory FailCount (1), not regress to stale label value (0)")
 }
+
+func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
+	now := time.Now()
+
+	manifest := DockerManifest{
+		Image:   "nginx:latest",
+		Command: []string{"nginx", "-g", "daemon off;"},
+		Env:     map[string]string{"FOO": "bar"},
+		Ports:   map[string]PortConfig{"80/tcp": {HostPort: 0}},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	t.Run("manifest restored on cold start", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "releases.db")
+		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+		require.NoError(t, err)
+		defer relStore.Close()
+
+		// Pre-seed the release store with a manifest for this lease.
+		err = relStore.Append("lease-1", shared.Release{
+			Manifest:  manifestBytes,
+			Image:     manifest.Image,
+			Status:    "active",
+			CreatedAt: now,
+		})
+		require.NoError(t, err)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.releaseStore = relStore
+
+		err = b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+		require.NotNil(t, prov.Manifest, "manifest should be restored from release store")
+		assert.Equal(t, "nginx:latest", prov.Manifest.Image)
+		assert.Equal(t, []string{"nginx", "-g", "daemon off;"}, prov.Manifest.Command)
+		assert.Equal(t, map[string]string{"FOO": "bar"}, prov.Manifest.Env)
+	})
+
+	t.Run("manifest nil when no release store", func(t *testing.T) {
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		// b.releaseStore is nil (default from newBackendForTest)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Nil(t, prov.Manifest, "manifest should be nil when no release store is configured")
+	})
+
+	t.Run("manifest nil when no release exists for lease", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "releases.db")
+		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+		require.NoError(t, err)
+		defer relStore.Close()
+
+		// No releases pre-seeded for lease-1.
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.releaseStore = relStore
+
+		err = b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Nil(t, prov.Manifest, "manifest should be nil when no release exists")
+	})
+}

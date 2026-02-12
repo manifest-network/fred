@@ -2021,6 +2021,21 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				CallbackURL:  c.CallbackURL,
 				ContainerIDs: make([]string, 0),
 			}
+
+			// Restore manifest from the release store so restart/update
+			// work after a cold start (manifest is not stored in labels).
+			if b.releaseStore != nil {
+				if rel, relErr := b.releaseStore.Latest(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
+					var m DockerManifest
+					if jsonErr := json.Unmarshal(rel.Manifest, &m); jsonErr == nil {
+						prov.Manifest = &m
+					} else {
+						b.logger.Warn("failed to unmarshal recovered manifest",
+							"lease_uuid", c.LeaseUUID, "error", jsonErr)
+					}
+				}
+			}
+
 			recovered[c.LeaseUUID] = prov
 		}
 
