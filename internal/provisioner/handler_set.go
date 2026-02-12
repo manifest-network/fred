@@ -447,7 +447,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	return nil
 }
 
-// publishLeaseEvent publishes a LeaseStatusEvent to TopicLeaseEvent for SSE delivery.
+// publishLeaseEvent publishes a LeaseStatusEvent to TopicLeaseEvent for real-time delivery.
 // Best-effort: errors are logged but do not affect the handler's return value.
 func (h *HandlerSet) publishLeaseEvent(leaseUUID string, status backend.ProvisionStatus, errMsg string) {
 	if h.deps.Publisher == nil {

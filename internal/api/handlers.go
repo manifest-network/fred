@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -13,6 +12,8 @@ import (
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
@@ -47,7 +48,8 @@ type Handlers struct {
 	tokenTracker    TokenTrackerInterface
 	statusChecker   StatusChecker
 	placementLookup PlacementLookup
-	sseBroker       *SSEBroker
+	eventBroker     *EventBroker
+	wsUpgrader      websocket.Upgrader
 	providerUUID    string
 	bech32Prefix    string
 	callbackBaseURL string
@@ -58,15 +60,18 @@ type Handlers struct {
 // statusChecker is optional but required for the /status endpoint.
 // placementLookup is optional — used for routing reads to the correct backend.
 // callbackBaseURL is used for restart/update callbacks to the backend.
-// sseBroker is optional — if nil, the SSE endpoint will return 501.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, sseBroker *SSEBroker, providerUUID, bech32Prefix, callbackBaseURL string) *Handlers {
+// eventBroker is optional — if nil, the events endpoint will return 501.
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, eventBroker *EventBroker, providerUUID, bech32Prefix, callbackBaseURL string) *Handlers {
 	return &Handlers{
 		client:          client,
 		backendRouter:   backendRouter,
 		tokenTracker:    tokenTracker,
 		statusChecker:   statusChecker,
 		placementLookup: placementLookup,
-		sseBroker:       sseBroker,
+		eventBroker:     eventBroker,
+		wsUpgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
 		providerUUID:    providerUUID,
 		bech32Prefix:    bech32Prefix,
 		callbackBaseURL: callbackBaseURL,
@@ -984,67 +989,85 @@ var (
 	errInvalidAuthFormat = errors.New("invalid authorization format, expected 'Bearer <token>'")
 )
 
-// StreamLeaseEvents serves an SSE stream of lease status events.
+// StreamLeaseEvents serves a WebSocket stream of lease status events.
 // GET /v1/leases/{lease_uuid}/events
 func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
-	if h.sseBroker == nil {
-		writeError(w, "SSE not enabled", http.StatusNotImplemented)
+	if h.eventBroker == nil {
+		writeError(w, "events not enabled", http.StatusNotImplemented)
 		return
 	}
 
 	leaseUUID := r.PathValue("lease_uuid")
 
-	// Authenticate: no replay check, any lease state.
+	// Authenticate BEFORE upgrading so auth failures return normal HTTP errors.
 	_, statusCode, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
 	if err != nil {
 		writeError(w, err.Error(), statusCode)
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, "streaming unsupported", http.StatusInternalServerError)
+	conn, err := h.wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Error("websocket upgrade failed", "lease_uuid", leaseUUID, "error", err)
+		return // Upgrade writes its own HTTP error response.
+	}
+	defer conn.Close()
+
+	ch := h.eventBroker.Subscribe(leaseUUID)
+	if ch == nil {
+		_ = conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "broker closed"))
 		return
 	}
+	defer h.eventBroker.Unsubscribe(leaseUUID, ch)
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	const (
+		pingInterval = 30 * time.Second
+		writeWait    = 10 * time.Second
+		pongWait     = 40 * time.Second
+	)
 
-	ch := h.sseBroker.Subscribe(leaseUUID)
-	if ch == nil {
-		return // Broker closed; headers already sent so just end the connection.
-	}
-	defer h.sseBroker.Unsubscribe(leaseUUID, ch)
+	// Read pump: detect client disconnect via close frames or pong timeout.
+	closeCh := make(chan struct{})
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	go func() {
+		defer close(closeCh)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
 
-	keepalive := time.NewTicker(30 * time.Second)
-	defer keepalive.Stop()
+	// Write pump: send events + ping frames.
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
 
-	ctx := r.Context()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-closeCh:
 			return
 		case event, ok := <-ch:
 			if !ok {
+				// Broker closed — send clean close frame.
+				_ = conn.WriteControl(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseGoingAway, ""),
+					time.Now().Add(writeWait))
 				return
 			}
-			data, err := json.Marshal(event)
-			if err != nil {
-				slog.Error("failed to marshal SSE event", "lease_uuid", leaseUUID, "error", err)
-				continue
-			}
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteJSON(event); err != nil {
 				return
 			}
-			flusher.Flush()
-		case <-keepalive.C:
-			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
-			flusher.Flush()
 		}
 	}
 }

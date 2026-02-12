@@ -3,7 +3,7 @@ package backend
 import "time"
 
 // LeaseStatusEvent is published when a lease's provisioning status changes.
-// Used for real-time delivery (e.g., SSE) to notify tenants of status transitions.
+// Used for real-time delivery (e.g., WebSocket) to notify tenants of status transitions.
 type LeaseStatusEvent struct {
 	LeaseUUID string          `json:"lease_uuid"`
 	Status    ProvisionStatus `json:"status"`

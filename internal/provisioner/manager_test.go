@@ -2625,9 +2625,9 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 	}
 }
 
-// --- forwardToSSE tests ---
+// --- forwardToEventSink tests ---
 
-// mockLeaseEventSink captures events published to the SSE sink.
+// mockLeaseEventSink captures events published to the event sink.
 type mockLeaseEventSink struct {
 	mu     sync.Mutex
 	events []backend.LeaseStatusEvent
@@ -2639,7 +2639,7 @@ func (s *mockLeaseEventSink) Publish(event backend.LeaseStatusEvent) {
 	s.events = append(s.events, event)
 }
 
-func TestForwardToSSE_ForwardsToSink(t *testing.T) {
+func TestForwardToEventSink_ForwardsToSink(t *testing.T) {
 	sink := &mockLeaseEventSink{}
 	m := &Manager{leaseEventSink: sink}
 
@@ -2653,7 +2653,7 @@ func TestForwardToSSE_ForwardsToSink(t *testing.T) {
 	require.NoError(t, err)
 
 	msg := message.NewMessage(watermill.NewUUID(), data)
-	err = m.forwardToSSE(msg)
+	err = m.forwardToEventSink(msg)
 	assert.NoError(t, err)
 
 	sink.mu.Lock()
@@ -2665,7 +2665,7 @@ func TestForwardToSSE_ForwardsToSink(t *testing.T) {
 	assert.Equal(t, time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC), sink.events[0].Timestamp)
 }
 
-func TestForwardToSSE_IncludesError(t *testing.T) {
+func TestForwardToEventSink_IncludesError(t *testing.T) {
 	sink := &mockLeaseEventSink{}
 	m := &Manager{leaseEventSink: sink}
 
@@ -2679,7 +2679,7 @@ func TestForwardToSSE_IncludesError(t *testing.T) {
 	require.NoError(t, err)
 
 	msg := message.NewMessage(watermill.NewUUID(), data)
-	err = m.forwardToSSE(msg)
+	err = m.forwardToEventSink(msg)
 	assert.NoError(t, err)
 
 	sink.mu.Lock()
@@ -2690,12 +2690,12 @@ func TestForwardToSSE_IncludesError(t *testing.T) {
 	assert.Equal(t, "OOM killed", sink.events[0].Error)
 }
 
-func TestForwardToSSE_MalformedMessage(t *testing.T) {
+func TestForwardToEventSink_MalformedMessage(t *testing.T) {
 	sink := &mockLeaseEventSink{}
 	m := &Manager{leaseEventSink: sink}
 
 	msg := message.NewMessage(watermill.NewUUID(), []byte("not json"))
-	err := m.forwardToSSE(msg)
+	err := m.forwardToEventSink(msg)
 	assert.NoError(t, err, "should return nil for malformed messages (don't retry)")
 
 	sink.mu.Lock()

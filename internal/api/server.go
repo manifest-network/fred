@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"cmp"
 	"context"
 	"crypto/tls"
@@ -87,8 +88,8 @@ type ServerConfig struct {
 
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
-// sseBroker is optional — if nil, the SSE endpoint returns 501.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup, sseBroker *SSEBroker) (*Server, error) {
+// eventBroker is optional — if nil, the events endpoint returns 501.
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup, eventBroker *EventBroker) (*Server, error) {
 	// Create token tracker if path is configured (enables replay protection)
 	var tokenTracker *TokenTracker
 	if cfg.TokenTrackerDBPath != "" {
@@ -111,7 +112,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if tokenTracker != nil {
 		tracker = tokenTracker
 	}
-	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, sseBroker, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.CallbackBaseURL)
+	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, eventBroker, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.CallbackBaseURL)
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
 	var trustedProxies *TrustedProxyConfig
@@ -172,7 +173,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	mux := http.NewServeMux()
 
 	// Per-route timeout wrapper. Applied explicitly to each route so that
-	// streaming endpoints (SSE) can opt out. Routes without withTimeout
+	// streaming endpoints (WebSocket) can opt out. Routes without withTimeout
 	// still have connection-level safety via http.Server.ReadTimeout/WriteTimeout.
 	withTimeout := requestTimeoutMiddleware(requestTimeout)
 
@@ -196,10 +197,8 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withTenantRL(handlers.RestartLease)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTimeout(withTenantRL(handlers.UpdateLease)))
 	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTimeout(withTenantRL(handlers.GetLeaseReleases)))
-	// SSE endpoint: no request timeout. http.TimeoutHandler buffers the entire
-	// response and does not support http.Flusher, which breaks streaming. It also
-	// kills the handler goroutine after the timeout, terminating the long-lived
-	// connection. Connection-level safety is still provided by http.Server timeouts.
+	// WebSocket endpoint: no request timeout. The WebSocket handler manages its own
+	// lifecycle with ping/pong frames and per-write deadlines.
 	mux.Handle("GET /v1/leases/{lease_uuid}/events", withTenantRL(handlers.StreamLeaseEvents))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
@@ -475,18 +474,13 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// Unwrap returns the underlying ResponseWriter so http.ResponseController
-// and interface assertions (e.g., http.Flusher) see through the wrapper.
-func (rw *responseWriter) Unwrap() http.ResponseWriter {
-	return rw.ResponseWriter
-}
-
-// Flush implements http.Flusher by delegating to the underlying writer.
-// Required for SSE streaming through the logging middleware.
-func (rw *responseWriter) Flush() {
-	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+// Hijack implements http.Hijacker by delegating to the underlying writer.
+// Required for WebSocket upgrades through the logging middleware.
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
 	}
+	return nil, nil, errors.New("underlying ResponseWriter does not implement http.Hijacker")
 }
 
 // requestTimeoutMiddleware applies a timeout to request processing.

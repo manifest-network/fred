@@ -6,19 +6,19 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-const sseChannelBuffer = 16
+const eventChannelBuffer = 16
 
-// SSEBroker manages per-lease SSE client subscriptions with non-blocking fan-out.
+// EventBroker manages per-lease event client subscriptions with non-blocking fan-out.
 // Slow clients drop events; they can re-fetch via REST.
-type SSEBroker struct {
+type EventBroker struct {
 	mu      sync.RWMutex
 	clients map[string]map[chan backend.LeaseStatusEvent]struct{} // leaseUUID → set of channels
 	closed  bool
 }
 
-// NewSSEBroker creates a new SSE broker.
-func NewSSEBroker() *SSEBroker {
-	return &SSEBroker{
+// NewEventBroker creates a new event broker.
+func NewEventBroker() *EventBroker {
+	return &EventBroker{
 		clients: make(map[string]map[chan backend.LeaseStatusEvent]struct{}),
 	}
 }
@@ -26,7 +26,7 @@ func NewSSEBroker() *SSEBroker {
 // Subscribe registers a client channel for events on the given lease UUID.
 // The returned channel is buffered; the caller should read from it in a loop.
 // Returns nil if the broker has been closed.
-func (b *SSEBroker) Subscribe(leaseUUID string) <-chan backend.LeaseStatusEvent {
+func (b *EventBroker) Subscribe(leaseUUID string) <-chan backend.LeaseStatusEvent {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -34,7 +34,7 @@ func (b *SSEBroker) Subscribe(leaseUUID string) <-chan backend.LeaseStatusEvent 
 		return nil
 	}
 
-	ch := make(chan backend.LeaseStatusEvent, sseChannelBuffer)
+	ch := make(chan backend.LeaseStatusEvent, eventChannelBuffer)
 	if b.clients[leaseUUID] == nil {
 		b.clients[leaseUUID] = make(map[chan backend.LeaseStatusEvent]struct{})
 	}
@@ -44,7 +44,7 @@ func (b *SSEBroker) Subscribe(leaseUUID string) <-chan backend.LeaseStatusEvent 
 }
 
 // Unsubscribe removes a client channel. The channel is closed after removal.
-func (b *SSEBroker) Unsubscribe(leaseUUID string, ch <-chan backend.LeaseStatusEvent) {
+func (b *EventBroker) Unsubscribe(leaseUUID string, ch <-chan backend.LeaseStatusEvent) {
 	// We need to recover the underlying send channel from the receive-only one.
 	// Since Subscribe created it, we stored the bidirectional channel in the map.
 	// We find and remove the matching channel.
@@ -72,7 +72,7 @@ func (b *SSEBroker) Unsubscribe(leaseUUID string, ch <-chan backend.LeaseStatusE
 
 // Publish sends an event to all clients subscribed to the event's lease UUID.
 // Non-blocking: if a client's channel is full, the event is dropped for that client.
-func (b *SSEBroker) Publish(event backend.LeaseStatusEvent) {
+func (b *EventBroker) Publish(event backend.LeaseStatusEvent) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -92,7 +92,7 @@ func (b *SSEBroker) Publish(event backend.LeaseStatusEvent) {
 
 // Close closes all subscriber channels and prevents new subscriptions.
 // Safe to call multiple times.
-func (b *SSEBroker) Close() {
+func (b *EventBroker) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

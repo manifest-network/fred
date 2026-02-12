@@ -51,11 +51,11 @@ type Manager struct {
 	callbackTimeout      time.Duration
 	timeoutCheckInterval time.Duration
 
-	// leaseEventSink receives lease status events for real-time delivery (e.g., SSE)
+	// leaseEventSink receives lease status events for real-time delivery (e.g., WebSocket)
 	leaseEventSink LeaseEventSink
 }
 
-// LeaseEventSink receives lease status events for real-time delivery (e.g., SSE).
+// LeaseEventSink receives lease status events for real-time delivery (e.g., WebSocket).
 type LeaseEventSink interface {
 	Publish(event backend.LeaseStatusEvent)
 }
@@ -208,13 +208,13 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		handlers.HandlePayloadReceived,
 	)
 
-	// Forward lease events to SSE sink (if configured)
+	// Forward lease events to event sink (if configured)
 	if cfg.LeaseEventSink != nil {
 		wmRouter.AddNoPublisherHandler(
-			"forward_lease_events_to_sse",
+			"forward_lease_events",
 			TopicLeaseEvent,
 			pubSub,
-			m.forwardToSSE,
+			m.forwardToEventSink,
 		)
 	}
 
@@ -238,12 +238,12 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	return m, nil
 }
 
-// forwardToSSE is a Watermill handler that deserializes LeaseStatusEvent messages
-// and forwards them to the SSE sink for real-time client delivery.
-func (m *Manager) forwardToSSE(msg *message.Message) error {
+// forwardToEventSink is a Watermill handler that deserializes LeaseStatusEvent messages
+// and forwards them to the event sink for real-time client delivery.
+func (m *Manager) forwardToEventSink(msg *message.Message) error {
 	var event backend.LeaseStatusEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		slog.Warn("failed to unmarshal lease event for SSE", "error", err)
+		slog.Warn("failed to unmarshal lease event", "error", err)
 		return nil // Don't retry malformed messages
 	}
 

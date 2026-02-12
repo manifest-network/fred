@@ -252,8 +252,8 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Create SSE broker for real-time lease event delivery
-	sseBroker := api.NewSSEBroker()
+	// Create event broker for real-time lease event delivery
+	eventBroker := api.NewEventBroker()
 
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
@@ -261,7 +261,7 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		PayloadStore:    payloadStore,
 		PlacementStore:  placementStore,
-		LeaseEventSink:  sseBroker,
+		LeaseEventSink:  eventBroker,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -298,7 +298,7 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackSecret:       cfg.CallbackSecret,
 		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,
 		CallbackBaseURL:      cfg.CallbackBaseURL,
-	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr, placementStore, sseBroker)
+	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr, placementStore, eventBroker)
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
 	}
@@ -446,6 +446,9 @@ func run(cmd *cobra.Command, args []string) error {
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("failed to shutdown API server gracefully", "error", err)
 	}
+
+	// Close event broker to send clean close frames to all WebSocket clients.
+	eventBroker.Close()
 
 	// Signal all components to stop via context cancellation.
 	// This triggers ctx.Done() in all component loops.
