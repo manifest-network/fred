@@ -25,6 +25,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -145,15 +146,31 @@ func applyEnvOverrides(cfg *docker.Config) {
 	}
 }
 
+// backendService defines the methods that handlers call on the backend.
+// docker.Backend satisfies this interface structurally.
+type backendService interface {
+	Provision(ctx context.Context, req backend.ProvisionRequest) error
+	Deprovision(ctx context.Context, leaseUUID string) error
+	GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
+	GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
+	GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
+	ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error)
+	Restart(ctx context.Context, req backend.RestartRequest) error
+	Update(ctx context.Context, req backend.UpdateRequest) error
+	GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
+	Health(ctx context.Context) error
+	Stats() shared.ResourceStats
+}
+
 // Server handles HTTP requests for the Docker backend.
 type Server struct {
-	backend        *docker.Backend
+	backend        backendService
 	callbackSecret string
 	logger         *slog.Logger
 }
 
 // NewServer creates a new HTTP server for the Docker backend.
-func NewServer(b *docker.Backend, callbackSecret string, logger *slog.Logger) *Server {
+func NewServer(b backendService, callbackSecret string, logger *slog.Logger) *Server {
 	return &Server{
 		backend:        b,
 		callbackSecret: callbackSecret,

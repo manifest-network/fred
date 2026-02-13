@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -724,13 +725,32 @@ func (d *DockerClient) PullImage(ctx context.Context, imageName string, timeout 
 	}
 	defer func() { _ = reader.Close() }()
 
-	// Consume the output to complete the pull
-	_, err = io.Copy(io.Discard, reader)
-	if err != nil {
-		return fmt.Errorf("failed to complete image pull: %w", err)
+	// The Docker daemon streams JSON progress messages. Errors such as
+	// "manifest unknown" are reported inside the stream (as an errorDetail
+	// field) rather than as an HTTP-level error. We must decode each
+	// message and check for embedded errors; discarding with io.Copy
+	// would silently swallow them.
+	decoder := json.NewDecoder(reader)
+	for {
+		var msg jsonPullMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to read image pull output: %w", err)
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("image pull failed: %s", msg.Error)
+		}
 	}
 
 	return nil
+}
+
+// jsonPullMessage is the minimal structure needed to detect errors in the
+// Docker daemon's image-pull JSON stream.
+type jsonPullMessage struct {
+	Error string `json:"error,omitempty"`
 }
 
 // CreateContainerParams holds parameters for creating a container.
