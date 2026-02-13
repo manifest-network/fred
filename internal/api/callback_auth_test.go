@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -489,28 +488,21 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, rr2.Code, "replay attack should be rejected: %s", rr2.Body.String())
 }
 
-// TestHandleProvisionCallback_IdempotencyResponse tests that duplicate callbacks
-// for already-processed leases return a helpful response body.
-func TestHandleProvisionCallback_IdempotencyResponse(t *testing.T) {
+// TestHandleProvisionCallback_AlwaysPublished verifies that all valid callbacks
+// are published to Watermill regardless of in-flight status. Restart/update
+// operations don't register in-flight, so their completion callbacks must not
+// be short-circuited. The Watermill handler (HandleBackendCallback) handles
+// both in-flight and non-in-flight callbacks correctly.
+func TestHandleProvisionCallback_AlwaysPublished(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
-
 	publishedCallback := &mockCallbackPublisher{}
-
-	// Create status checker that says the lease is NOT in-flight (already processed)
-	statusChecker := &mockIdempotencyStatusChecker{
-		isInFlight: map[string]bool{
-			"01234567-89ab-cdef-0123-456789abcdef": false, // Already processed
-			"11111111-1111-1111-1111-111111111111": true,  // Still in-flight
-		},
-	}
 
 	server := &Server{
 		callbackPublisher:     publishedCallback,
 		callbackAuthenticator: auth,
-		statusChecker:         statusChecker,
 	}
 
-	t.Run("already_processed_returns_helpful_body", func(t *testing.T) {
+	t.Run("non_in_flight_callback_is_published", func(t *testing.T) {
 		publishedCallback.reset()
 
 		body := `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`
@@ -523,22 +515,11 @@ func TestHandleProvisionCallback_IdempotencyResponse(t *testing.T) {
 		rr := httptest.NewRecorder()
 		server.handleProvisionCallback(rr, req)
 
-		// Should still return 200 OK for idempotency
 		assert.Equal(t, http.StatusOK, rr.Code)
-
-		// But now with a helpful body
-		var response CallbackResponse
-		err := json.NewDecoder(rr.Body).Decode(&response)
-		require.NoError(t, err, "body: %s", rr.Body.String())
-
-		assert.Equal(t, "already_processed", response.Status)
-		assert.Equal(t, "callback for this lease was already handled", response.Message)
-
-		// Callback should NOT be published for already-processed leases
-		assert.False(t, publishedCallback.called)
+		assert.True(t, publishedCallback.called, "non-in-flight callbacks must be published (restart/update path)")
 	})
 
-	t.Run("in_flight_lease_is_published", func(t *testing.T) {
+	t.Run("in_flight_callback_is_published", func(t *testing.T) {
 		publishedCallback.reset()
 
 		body := `{"lease_uuid":"11111111-1111-1111-1111-111111111111","status":"success"}`
@@ -552,52 +533,8 @@ func TestHandleProvisionCallback_IdempotencyResponse(t *testing.T) {
 		server.handleProvisionCallback(rr, req)
 
 		assert.Equal(t, http.StatusOK, rr.Code)
-
-		// Callback should be published for in-flight leases
 		assert.True(t, publishedCallback.called)
 	})
-
-	t.Run("no_status_checker_publishes_all", func(t *testing.T) {
-		// Server without status checker should publish all callbacks
-		serverNoChecker := &Server{
-			callbackPublisher:     publishedCallback,
-			callbackAuthenticator: auth,
-			statusChecker:         nil,
-		}
-
-		publishedCallback.reset()
-
-		body := `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`
-		signature := auth.ComputeSignature([]byte(body))
-
-		req := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(CallbackSignatureHeader, signature)
-
-		rr := httptest.NewRecorder()
-		serverNoChecker.handleProvisionCallback(rr, req)
-
-		assert.Equal(t, http.StatusOK, rr.Code)
-
-		// Without status checker, callback should be published
-		assert.True(t, publishedCallback.called)
-	})
-}
-
-// mockIdempotencyStatusChecker implements StatusChecker for idempotency testing.
-type mockIdempotencyStatusChecker struct {
-	isInFlight map[string]bool
-}
-
-func (m *mockIdempotencyStatusChecker) HasPayload(leaseUUID string) (bool, error) {
-	return false, nil
-}
-
-func (m *mockIdempotencyStatusChecker) IsInFlight(leaseUUID string) bool {
-	if m.isInFlight == nil {
-		return true // Default to in-flight
-	}
-	return m.isInFlight[leaseUUID]
 }
 
 // TestCallbackAuthenticator_VerifySignature_Standalone tests the VerifySignature method

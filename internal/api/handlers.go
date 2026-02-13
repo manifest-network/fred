@@ -528,6 +528,17 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Publish "restarting" event BEFORE the backend call to guarantee ordering.
+	// The backend may complete and callback before Restart() returns, so
+	// publishing after would risk the client seeing "ready" before "restarting".
+	if h.eventBroker != nil {
+		h.eventBroker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusRestarting,
+			Timestamp: time.Now(),
+		})
+	}
+
 	err = backendClient.Restart(r.Context(), backend.RestartRequest{
 		LeaseUUID:   leaseUUID,
 		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
@@ -591,6 +602,15 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
 		writeError(w, "service unavailable", http.StatusServiceUnavailable)
 		return
+	}
+
+	// Publish "updating" event BEFORE the backend call to guarantee ordering.
+	if h.eventBroker != nil {
+		h.eventBroker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusUpdating,
+			Timestamp: time.Now(),
+		})
 	}
 
 	err = backendClient.Update(r.Context(), backend.UpdateRequest{
@@ -999,6 +1019,16 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 
 	leaseUUID := r.PathValue("lease_uuid")
 
+	// WebSocket API cannot set custom headers, so the client passes the auth
+	// token as a query parameter. Promote it to the Authorization header so the
+	// standard auth pipeline can handle it. This fallback is intentionally
+	// scoped to this handler only.
+	if r.Header.Get("Authorization") == "" {
+		if token := r.URL.Query().Get("token"); token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
+
 	// Authenticate BEFORE upgrading so auth failures return normal HTTP errors.
 	_, statusCode, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
 	if err != nil {
@@ -1072,18 +1102,16 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// extractBearerToken extracts the raw token string from a Bearer authorization header.
-// Returns the token string or an error if the header is missing or malformed.
+// extractBearerToken extracts the raw token string from the Authorization header.
+// Expects "Bearer <token>" format. Returns errMissingAuth if no header is present.
 func extractBearerToken(r *http.Request) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		return "", errMissingAuth
 	}
-
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
 		return "", errInvalidAuthFormat
 	}
-
 	return parts[1], nil
 }

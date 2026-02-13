@@ -218,6 +218,55 @@ func TestStreamLeaseEvents_RequiresAuth(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
+func TestStreamLeaseEvents_QueryParamAuth(t *testing.T) {
+	broker := NewEventBroker()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       kp.Address,
+				ProviderUuid: providerUUID,
+				State:        billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+
+	h := newTestHandlers(broker, chainClient, providerUUID)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/leases/{lease_uuid}/events", h.StreamLeaseEvents)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Dial WITHOUT Authorization header, pass token as query parameter instead.
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") +
+		"/v1/leases/" + leaseUUID + "/events?token=" + validToken
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Verify the connection works by publishing and receiving an event.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		broker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusReady,
+			Timestamp: time.Now(),
+		})
+	}()
+
+	var event backend.LeaseStatusEvent
+	err = conn.ReadJSON(&event)
+	require.NoError(t, err)
+	assert.Equal(t, leaseUUID, event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
+}
+
 func TestStreamLeaseEvents_Returns501WhenBrokerNil(t *testing.T) {
 	h := &Handlers{
 		eventBroker:  nil,
@@ -324,6 +373,7 @@ func TestStreamLeaseEvents_SurvivesBeyondRequestTimeout(t *testing.T) {
 	err := conn.ReadJSON(&event)
 	require.NoError(t, err, "expected event to arrive after delay")
 	assert.Equal(t, leaseUUID, event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
 }
 
 func TestStreamLeaseEvents_WorksThroughLoggingMiddleware(t *testing.T) {
@@ -372,6 +422,7 @@ func TestStreamLeaseEvents_WorksThroughLoggingMiddleware(t *testing.T) {
 	err := conn.ReadJSON(&event)
 	require.NoError(t, err, "expected event through loggingMiddleware")
 	assert.Equal(t, leaseUUID, event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
 }
 
 func TestStreamLeaseEvents_TimeoutMiddlewareBreaksWebSocket(t *testing.T) {
@@ -445,6 +496,8 @@ func TestStreamLeaseEvents_CleanCloseOnBrokerShutdown(t *testing.T) {
 
 	// Give the server goroutine time to subscribe, then close the broker.
 	time.Sleep(100 * time.Millisecond)
+
+	// Close the broker — server should send a CloseGoingAway frame.
 	broker.Close()
 
 	// Expect a CloseGoingAway frame.
@@ -498,4 +551,61 @@ func TestStreamLeaseEvents_ClientDisconnect(t *testing.T) {
 	require.NotPanics(t, func() {
 		broker.Publish(testEvent(leaseUUID, backend.ProvisionStatusReady))
 	})
+}
+
+func TestStreamLeaseEvents_ReceivesRestartAndUpdateEvents(t *testing.T) {
+	broker := NewEventBroker()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       kp.Address,
+				ProviderUuid: providerUUID,
+				State:        billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+
+	h := newTestHandlers(broker, chainClient, providerUUID)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/leases/{lease_uuid}/events", h.StreamLeaseEvents)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
+	require.NotNil(t, conn)
+	defer conn.Close()
+
+	// Publish a sequence: restarting → ready, updating → ready.
+	statuses := []backend.ProvisionStatus{
+		backend.ProvisionStatusRestarting,
+		backend.ProvisionStatusReady,
+		backend.ProvisionStatusUpdating,
+		backend.ProvisionStatusReady,
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		for _, s := range statuses {
+			broker.Publish(backend.LeaseStatusEvent{
+				LeaseUUID: leaseUUID,
+				Status:    s,
+				Timestamp: time.Now(),
+			})
+		}
+	}()
+
+	for _, expected := range statuses {
+		var event backend.LeaseStatusEvent
+		err := conn.ReadJSON(&event)
+		require.NoError(t, err)
+		assert.Equal(t, leaseUUID, event.LeaseUUID)
+		assert.Equal(t, expected, event.Status, "expected status %s", expected)
+	}
 }

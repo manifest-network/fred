@@ -178,17 +178,30 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		return nil
 	}
 
-	// Check if this lease is in-flight (idempotency check)
-	// Ignore callbacks for unknown/already-processed leases to prevent:
-	// - Duplicate on-chain transactions from replay attacks
-	// - Processing misrouted callbacks from other providers
+	// Check if this lease is in-flight (idempotency check).
+	// Non-in-flight callbacks are expected for restart/update operations, which
+	// don't register in the in-flight tracker (the lease is already ACTIVE).
+	// For these, we still publish the status event so WebSocket clients see
+	// the ready/failed transition, but skip chain operations.
 	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
 	if !exists {
-		slog.Warn("ignoring callback for unknown or already-processed lease",
+		switch callback.Status {
+		case backend.CallbackStatusSuccess:
+			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
+		case backend.CallbackStatusFailed:
+			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
+		default:
+			slog.Warn("unexpected callback status for non-in-flight lease",
+				"lease_uuid", callback.LeaseUUID,
+				"status", callback.Status,
+			)
+			return nil
+		}
+		slog.Info("published event for non-in-flight callback (restart/update)",
 			"lease_uuid", callback.LeaseUUID,
 			"status", callback.Status,
 		)
-		return nil // Don't retry - this is not an error
+		return nil
 	}
 
 	slog.Info("processing backend callback",
