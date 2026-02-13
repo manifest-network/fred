@@ -33,6 +33,11 @@ func (m *mockBenchBackend) GetProvision(ctx context.Context, leaseUUID string) (
 func (m *mockBenchBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
 	return nil, ErrNotProvisioned
 }
+func (m *mockBenchBackend) Restart(ctx context.Context, req RestartRequest) error { return nil }
+func (m *mockBenchBackend) Update(ctx context.Context, req UpdateRequest) error   { return nil }
+func (m *mockBenchBackend) GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error) {
+	return nil, ErrNotProvisioned
+}
 
 // BenchmarkRouter_Route benchmarks SKU-based routing decisions.
 func BenchmarkRouter_Route(b *testing.B) {

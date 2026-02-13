@@ -172,6 +172,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /logs/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetLogs)))
 	mux.Handle("GET /provisions/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetProvision)))
 	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
+	mux.Handle("POST /restart", authMw(http.HandlerFunc(s.handleRestart)))
+	mux.Handle("POST /update", authMw(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("GET /releases/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetReleases)))
 
 	// Operational endpoints — no auth required (monitoring, health checks).
 	mux.HandleFunc("GET /health", s.handleHealth)
@@ -223,10 +226,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return 202 Accepted
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(backend.ProvisionResponse{
+	s.writeJSON(w, http.StatusAccepted, backend.ProvisionResponse{
 		ProvisionID: req.LeaseUUID,
 	})
 }
@@ -248,8 +248,7 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	s.writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
@@ -283,8 +282,7 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
+	s.writeJSON(w, http.StatusOK, logs)
 }
 
 // DeprovisionRequest is the request body for /deprovision.
@@ -309,9 +307,112 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(StatusResponse{Status: "ok"})
+	s.writeJSON(w, http.StatusOK, StatusResponse{Status: "ok"})
+}
+
+func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+	var req backend.RestartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.LeaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+	if req.CallbackURL == "" {
+		s.errorResponse(w, http.StatusBadRequest, "callback_url is required")
+		return
+	}
+	if err := validateCallbackURL(req.CallbackURL); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
+		return
+	}
+
+	err := s.backend.Restart(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponse(w, http.StatusConflict, "invalid state for restart")
+			return
+		}
+		s.logger.Error("restart failed", "lease_uuid", req.LeaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "restarting"})
+}
+
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	var req backend.UpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.LeaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+	if req.CallbackURL == "" {
+		s.errorResponse(w, http.StatusBadRequest, "callback_url is required")
+		return
+	}
+	if err := validateCallbackURL(req.CallbackURL); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
+		return
+	}
+	if len(req.Payload) == 0 {
+		s.errorResponse(w, http.StatusBadRequest, "payload is required")
+		return
+	}
+
+	err := s.backend.Update(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponse(w, http.StatusConflict, "invalid state for update")
+			return
+		}
+		if errors.Is(err, backend.ErrValidation) {
+			s.validationErrorResponse(w, err)
+			return
+		}
+		s.logger.Error("update failed", "lease_uuid", req.LeaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "updating"})
+}
+
+func (s *Server) handleGetReleases(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+	if leaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+
+	releases, err := s.backend.GetReleases(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		s.logger.Error("get releases failed", "lease_uuid", leaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, releases)
 }
 
 // StatsResponse is the response body for /stats.
@@ -350,8 +451,7 @@ func (s *Server) handleGetProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	s.writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
@@ -361,8 +461,7 @@ func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
+	s.writeJSON(w, http.StatusOK, backend.ListProvisionsResponse{
 		Provisions: provisions,
 	})
 }
@@ -373,15 +472,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(StatusResponse{Status: "healthy"})
+	s.writeJSON(w, http.StatusOK, StatusResponse{Status: "healthy"})
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.backend.Stats()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(StatsResponse{
+	s.writeJSON(w, http.StatusOK, StatsResponse{
 		TotalCPUCores:     stats.TotalCPU,
 		TotalMemoryMB:     stats.TotalMemoryMB,
 		TotalDiskMB:       stats.TotalDiskMB,
@@ -401,18 +498,28 @@ type ErrorResponse struct {
 	ValidationCode backend.ValidationCode `json:"validation_code,omitempty"`
 }
 
-func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
+func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		s.logger.Error("failed to encode response", "error", err)
+		http.Error(w, `{"error":"internal encoding error"}`, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+	if _, writeErr := w.Write(encoded); writeErr != nil {
+		s.logger.Debug("failed to write response body", "error", writeErr)
+	}
+}
+
+func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
+	s.writeJSON(w, status, ErrorResponse{Error: message})
 }
 
 // validationErrorResponse writes a 400 response with a validation_code field
 // so the HTTPClient can reconstruct the correct sentinel error.
 func (s *Server) validationErrorResponse(w http.ResponseWriter, err error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	json.NewEncoder(w).Encode(ErrorResponse{
+	s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 		Error:          err.Error(),
 		ValidationCode: backend.ClassifyValidationError(err),
 	})

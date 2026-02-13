@@ -230,6 +230,39 @@ func (m *MockBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (
 	return map[string]string{"0": "mock log output\n"}, nil
 }
 
+// Restart is a no-op for mock backend.
+func (m *MockBackend) Restart(ctx context.Context, req RestartRequest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.provisions[req.LeaseUUID]; !exists {
+		return ErrNotProvisioned
+	}
+	return nil
+}
+
+// Update is a no-op for mock backend.
+func (m *MockBackend) Update(ctx context.Context, req UpdateRequest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.provisions[req.LeaseUUID]; !exists {
+		return ErrNotProvisioned
+	}
+	return nil
+}
+
+// GetReleases returns empty releases for mock backend.
+func (m *MockBackend) GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.provisions[leaseUUID]; !exists {
+		return nil, ErrNotProvisioned
+	}
+	return nil, nil
+}
+
 // GetMockProvision returns the internal mock provision (for testing).
 func (m *MockBackend) GetMockProvision(leaseUUID string) (*mockProvision, bool) {
 	m.mu.Lock()

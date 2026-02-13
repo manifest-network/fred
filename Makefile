@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker install clean deps test test-volume test-integration test-integration-volume test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
+.PHONY: all build build-mock build-docker install clean deps test test-volume test-integration test-integration-restart-update test-integration-volume test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -76,13 +76,18 @@ test-volume:
 # Run Docker integration tests (requires Docker daemon)
 test-integration:
 	@echo "Running Docker integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout 5m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout 15m
+
+# Run restart, update, and releases integration tests (requires Docker daemon)
+test-integration-restart-update:
+	@echo "Running restart/update/releases integration tests..."
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(RestartLifecycle|UpdateLifecycle|GetReleases_History|UpdateFromFailed|RestartFromFailed|FullLifecycle|MultiContainer(Restart|Update)|UpdateBadImage|SequentialUpdates)" -timeout 10m
 
 # Run volume integration tests (requires root + Docker + btrfs-progs)
 # Usage: sudo make test-integration-volume
 test-integration-volume:
 	@echo "Running volume integration tests (requires root + Docker + btrfs-progs)..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota)" -timeout 10m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota|RestartPreservesVolumes|UpdatePreservesVolumes)" -timeout 10m
 
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
@@ -155,8 +160,9 @@ help:
 	@echo "  deps             - Download and tidy dependencies"
 	@echo "  test                    - Run tests"
 	@echo "  test-volume             - Run volume unit tests"
-	@echo "  test-integration        - Run Docker integration tests (requires Docker)"
-	@echo "  test-integration-volume - Run volume integration tests (sudo, Docker, btrfs-progs)"
+	@echo "  test-integration               - Run Docker integration tests (requires Docker)"
+	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
+	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, btrfs-progs)"
 	@echo "  test-coverage           - Run tests with coverage report"
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"
 	@echo "  lint             - Run linter"

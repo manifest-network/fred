@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"cmp"
 	"context"
 	"crypto/tls"
@@ -54,7 +55,6 @@ type Server struct {
 	bech32Prefix          string
 	tlsCertFile           string
 	tlsKeyFile            string
-	requestTimeout        time.Duration
 	shutdownTimeout       time.Duration
 	rateLimiter           *RateLimiter
 	tenantRateLimiter     *TenantRateLimiter
@@ -83,11 +83,13 @@ type ServerConfig struct {
 	MaxRequestBodySize   int64
 	CallbackSecret       string // HMAC secret for callback authentication
 	TokenTrackerDBPath   string // Path to token tracker database (enables replay protection)
+	CallbackBaseURL      string // Base URL for backend callbacks (used by restart/update)
 }
 
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup) (*Server, error) {
+// eventBroker is optional — if nil, the events endpoint returns 501.
+func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup, eventBroker *EventBroker) (*Server, error) {
 	// Create token tracker if path is configured (enables replay protection)
 	var tokenTracker *TokenTracker
 	if cfg.TokenTrackerDBPath != "" {
@@ -110,7 +112,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if tokenTracker != nil {
 		tracker = tokenTracker
 	}
-	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, cfg.ProviderUUID, cfg.Bech32Prefix)
+	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, eventBroker, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.CallbackBaseURL)
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
 	var trustedProxies *TrustedProxyConfig
@@ -160,7 +162,6 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		bech32Prefix:          cfg.Bech32Prefix,
 		tlsCertFile:           cfg.TLSCertFile,
 		tlsKeyFile:            cfg.TLSKeyFile,
-		requestTimeout:        requestTimeout,
 		shutdownTimeout:       shutdownTimeout,
 		rateLimiter:           rateLimiter,
 		tenantRateLimiter:     tenantRateLimiter,
@@ -171,10 +172,15 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 
 	mux := http.NewServeMux()
 
+	// Per-route timeout wrapper. Applied explicitly to each route so that
+	// streaming endpoints (WebSocket) can opt out. Routes without withTimeout
+	// still have connection-level safety via http.Server.ReadTimeout/WriteTimeout.
+	withTimeout := requestTimeoutMiddleware(requestTimeout)
+
 	// Unauthenticated routes
-	mux.HandleFunc("GET /health", handlers.HealthCheck)
-	mux.Handle("GET /metrics", promhttp.Handler())
-	mux.HandleFunc("POST /callbacks/provision", s.handleProvisionCallback)
+	mux.Handle("GET /health", withTimeout(http.HandlerFunc(handlers.HealthCheck)))
+	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
+	mux.Handle("POST /callbacks/provision", withTimeout(http.HandlerFunc(s.handleProvisionCallback)))
 
 	// Authenticated routes with optional tenant rate limiting
 	withTenantRL := func(h http.HandlerFunc) http.Handler {
@@ -183,19 +189,24 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 		}
 		return h
 	}
-	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTenantRL(handlers.GetLeaseConnection))
-	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTenantRL(handlers.GetLeaseStatus))
-	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTenantRL(handlers.GetLeaseProvision))
-	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTenantRL(handlers.GetLeaseLogs))
-	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTenantRL(s.handlePayloadUpload))
+	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTimeout(withTenantRL(handlers.GetLeaseConnection)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTimeout(withTenantRL(handlers.GetLeaseStatus)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTimeout(withTenantRL(handlers.GetLeaseProvision)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTimeout(withTenantRL(handlers.GetLeaseLogs)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTimeout(withTenantRL(s.handlePayloadUpload)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withTenantRL(handlers.RestartLease)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTimeout(withTenantRL(handlers.UpdateLease)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTimeout(withTenantRL(handlers.GetLeaseReleases)))
+	// WebSocket endpoint: no request timeout. The WebSocket handler manages its own
+	// lifecycle with ping/pong frames and per-write deadlines.
+	mux.Handle("GET /v1/leases/{lease_uuid}/events", withTenantRL(handlers.StreamLeaseEvents))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:
-	// securityHeaders → rateLimiter → timeout → maxBody → logging → handler
+	// securityHeaders → rateLimiter → maxBody → logging → mux → [per-route timeout] → handler
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	handler = maxBodySizeMiddleware(maxBodySize)(handler)
-	handler = requestTimeoutMiddleware(requestTimeout)(handler)
 	handler = rateLimiter.Middleware(handler)
 	handler = securityHeadersMiddleware(handler)
 
@@ -257,22 +268,12 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Idempotency check: if the lease is no longer in-flight, this is a duplicate callback.
-	// Return 200 OK immediately to prevent duplicate Watermill messages.
-	// This handles the case where a backend retries a callback after we've already processed it.
-	// Since callbacks are HMAC-authenticated, returning status details is safe.
-	if s.statusChecker != nil && !s.statusChecker.IsInFlight(callback.LeaseUUID) {
-		slog.Debug("ignoring duplicate callback for processed lease",
-			"lease_uuid", callback.LeaseUUID,
-			"status", callback.Status,
-		)
-		metrics.DuplicateCallbacksTotal.Inc()
-		writeJSON(w, CallbackResponse{
-			Status:  "already_processed",
-			Message: "callback for this lease was already handled",
-		}, http.StatusOK)
-		return
-	}
+	// Note: we intentionally do NOT short-circuit non-in-flight callbacks here.
+	// Restart/update operations don't register in the in-flight tracker (the lease
+	// is already ACTIVE), so their completion callbacks arrive with IsInFlight==false.
+	// The Watermill handler (HandleBackendCallback) handles both cases correctly:
+	// in-flight callbacks trigger chain acknowledgement, while non-in-flight callbacks
+	// publish the status event for WebSocket clients.
 
 	slog.Info("received provision callback",
 		"lease_uuid", callback.LeaseUUID,
@@ -461,6 +462,15 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack implements http.Hijacker by delegating to the underlying writer.
+// Required for WebSocket upgrades through the logging middleware.
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, errors.New("underlying ResponseWriter does not implement http.Hijacker")
 }
 
 // requestTimeoutMiddleware applies a timeout to request processing.

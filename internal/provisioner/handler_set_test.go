@@ -520,6 +520,68 @@ func TestHandlerSet_HandleBackendCallback_UnknownLease(t *testing.T) {
 	assert.NoError(t, err, "should ignore callback for unknown lease")
 }
 
+// TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent verifies that
+// callbacks for non-in-flight leases (restart/update completions) publish a
+// status event so WebSocket clients see the ready/failed transition.
+func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.T) {
+	pub := newMockPublisher()
+
+	hs := NewHandlerSet(HandlerDeps{
+		Tracker:   NewInFlightTracker(),
+		Publisher: pub,
+	})
+
+	t.Run("success_publishes_ready", func(t *testing.T) {
+		pub.mu.Lock()
+		pub.published = make(map[string][]*message.Message)
+		pub.mu.Unlock()
+
+		msg := newCallbackMsg(t, backend.CallbackPayload{
+			LeaseUUID: "lease-restart",
+			Status:    backend.CallbackStatusSuccess,
+		})
+
+		err := hs.HandleBackendCallback(msg)
+		require.NoError(t, err)
+
+		pub.mu.Lock()
+		msgs := pub.published[TopicLeaseEvent]
+		pub.mu.Unlock()
+		require.Len(t, msgs, 1)
+
+		var event backend.LeaseStatusEvent
+		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+		assert.Equal(t, "lease-restart", event.LeaseUUID)
+		assert.Equal(t, backend.ProvisionStatusReady, event.Status)
+	})
+
+	t.Run("failed_publishes_failed", func(t *testing.T) {
+		pub.mu.Lock()
+		pub.published = make(map[string][]*message.Message)
+		pub.mu.Unlock()
+
+		msg := newCallbackMsg(t, backend.CallbackPayload{
+			LeaseUUID: "lease-update",
+			Status:    backend.CallbackStatusFailed,
+			Error:     "container crashed",
+		})
+
+		err := hs.HandleBackendCallback(msg)
+		require.NoError(t, err)
+
+		pub.mu.Lock()
+		msgs := pub.published[TopicLeaseEvent]
+		pub.mu.Unlock()
+		require.Len(t, msgs, 1)
+
+		var event backend.LeaseStatusEvent
+		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+		assert.Equal(t, "lease-update", event.LeaseUUID)
+		assert.Equal(t, backend.ProvisionStatusFailed, event.Status)
+		assert.Equal(t, "container crashed", event.Error)
+	})
+}
+
 func TestHandlerSet_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
@@ -965,6 +1027,94 @@ func TestHandlerSet_HandleBackendCallback_Success_PreservesPlacement(t *testing.
 	// could crash later, requiring reads/re-provision from the same backend.
 	assert.False(t, f.tracker.IsInFlight("lease-1"))
 	assert.Equal(t, "test-backend", f.ps.Get("lease-1"), "placement should be preserved after success")
+}
+
+// --- publishLeaseEvent tests ---
+
+// mockPublisher implements message.Publisher for testing publishLeaseEvent.
+type mockPublisher struct {
+	mu         sync.Mutex
+	published  map[string][]*message.Message // topic → messages
+	publishErr error
+}
+
+func newMockPublisher() *mockPublisher {
+	return &mockPublisher{published: make(map[string][]*message.Message)}
+}
+
+func (p *mockPublisher) Publish(topic string, messages ...*message.Message) error {
+	if p.publishErr != nil {
+		return p.publishErr
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.published[topic] = append(p.published[topic], messages...)
+	return nil
+}
+
+func (p *mockPublisher) Close() error { return nil }
+
+func TestPublishLeaseEvent_PublishesToTopic(t *testing.T) {
+	pub := newMockPublisher()
+	hs := NewHandlerSet(HandlerDeps{
+		Publisher: pub,
+	})
+
+	hs.publishLeaseEvent("lease-1", backend.ProvisionStatusReady, "")
+
+	pub.mu.Lock()
+	msgs := pub.published[TopicLeaseEvent]
+	pub.mu.Unlock()
+
+	require.Len(t, msgs, 1, "should publish exactly one message")
+
+	var event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	assert.Equal(t, "lease-1", event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
+	assert.Empty(t, event.Error)
+	assert.False(t, event.Timestamp.IsZero(), "timestamp should be set")
+}
+
+func TestPublishLeaseEvent_IncludesError(t *testing.T) {
+	pub := newMockPublisher()
+	hs := NewHandlerSet(HandlerDeps{
+		Publisher: pub,
+	})
+
+	hs.publishLeaseEvent("lease-2", backend.ProvisionStatusFailed, "container crashed")
+
+	pub.mu.Lock()
+	msgs := pub.published[TopicLeaseEvent]
+	pub.mu.Unlock()
+
+	require.Len(t, msgs, 1)
+
+	var event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	assert.Equal(t, "lease-2", event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusFailed, event.Status)
+	assert.Equal(t, "container crashed", event.Error)
+}
+
+func TestPublishLeaseEvent_NilPublisher(t *testing.T) {
+	hs := NewHandlerSet(HandlerDeps{
+		Publisher: nil,
+	})
+
+	// Should not panic
+	hs.publishLeaseEvent("lease-1", backend.ProvisionStatusReady, "")
+}
+
+func TestPublishLeaseEvent_PublishError(t *testing.T) {
+	pub := newMockPublisher()
+	pub.publishErr = errors.New("pubsub down")
+	hs := NewHandlerSet(HandlerDeps{
+		Publisher: pub,
+	})
+
+	// Should not panic — publish errors are logged, not propagated
+	hs.publishLeaseEvent("lease-1", backend.ProvisionStatusReady, "")
 }
 
 // --- Helper ---

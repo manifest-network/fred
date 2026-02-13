@@ -11,6 +11,7 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 - **Periodic Withdrawals**: Configurable scheduled withdrawal of accumulated fees from active leases
 - **Credit Monitoring**: Tracks tenant credit balances and auto-closes leases when credit is depleted
 - **Cross-Provider Credit Detection**: Responds to credit depletion events from other providers
+- **Live Operations**: Restart containers or deploy new manifests (update) on active leases with full release history tracking
 - **Security**: Rate limiting, request size limits, input validation, and optional TLS
 
 ## Architecture Overview
@@ -92,6 +93,23 @@ sequenceDiagram
     F->>F: Verify signature & lease ownership
     F->>B: GET /info/{uuid}
     F-->>T: Connection details
+
+    Note over T,B: Restart (same manifest)
+    T->>F: POST /v1/leases/{uuid}/restart
+    F->>B: POST /restart
+    B->>B: Stop, recreate containers (async)
+    B->>F: POST /callbacks/provision (success)
+
+    Note over T,B: Update (new manifest)
+    T->>F: POST /v1/leases/{uuid}/update
+    F->>B: POST /update
+    B->>B: Pull image, replace containers (async)
+    B->>F: POST /callbacks/provision (success)
+
+    Note over T,B: Release History
+    T->>F: GET /v1/leases/{uuid}/releases
+    F->>B: GET /releases/{uuid}
+    F-->>T: Release history
 
     Note over T,B: Lease Closure
     T->>C: Close Lease (or credit depleted)
@@ -208,6 +226,8 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `placement_store_db_path` | Path to bbolt database for lease→backend placement tracking (required for round-robin) | (optional) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
+> **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
+
 ### Advanced Configuration
 
 These options have sensible defaults but can be tuned for specific environments:
@@ -233,18 +253,7 @@ These options have sensible defaults but can be tuned for specific environments:
 
 ### TLS Configuration
 
-**API Server TLS:**
-```yaml
-tls_cert_file: "/path/to/cert.pem"
-tls_key_file: "/path/to/key.pem"
-```
-
-**gRPC to Chain TLS:**
-```yaml
-grpc_tls_enabled: true
-grpc_tls_ca_file: "/path/to/ca.pem"  # Optional, uses system CAs if empty
-grpc_tls_skip_verify: false          # For testing only
-```
+See [SECURITY.md](SECURITY.md#transport-security) for TLS configuration details (API server HTTPS, gRPC to chain).
 
 ### Environment Variables
 
@@ -270,6 +279,32 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 ```
 
 ## API Endpoints
+
+### Endpoint Reference
+
+#### Tenant API
+
+| Method | Path | Auth | Replay | Lease State | Notes |
+|--------|------|------|--------|-------------|-------|
+| `GET` | `/v1/leases/{uuid}/connection` | ADR-036 | Yes | Active | Returns sensitive connection details |
+| `GET` | `/v1/leases/{uuid}/status` | ADR-036 | No | Any | Idempotent read |
+| `GET` | `/v1/leases/{uuid}/provision` | ADR-036 | No | Any | Idempotent read |
+| `GET` | `/v1/leases/{uuid}/logs` | ADR-036 | No | Any | Idempotent read |
+| `GET` | `/v1/leases/{uuid}/releases` | ADR-036 | No | Any | Idempotent read |
+| `POST` | `/v1/leases/{uuid}/data` | ADR-036 | No | Pending | Has own idempotency (409 on duplicate) |
+| `POST` | `/v1/leases/{uuid}/restart` | ADR-036 | Yes | Active | Mutating — replaying would restart again |
+| `POST` | `/v1/leases/{uuid}/update` | ADR-036 | Yes | Active | Mutating — replaying would redeploy again |
+| `GET` | `/v1/leases/{uuid}/events` | ADR-036 | No | Any | WebSocket stream of lease status events |
+
+#### Operational
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| `GET` | `/health` | None | Chain connectivity, backend health, DB health |
+| `GET` | `/metrics` | None | Prometheus metrics |
+| `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
+
+See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
 
 ### Health Check
 
@@ -297,18 +332,7 @@ GET /v1/leases/{lease_uuid}/connection
 Authorization: Bearer <token>
 ```
 
-Returns connection details for an active lease from the backend. Requires ADR-036 signed authentication token.
-
-**Token Format** (base64-encoded JSON):
-```json
-{
-  "tenant": "manifest1...",
-  "lease_uuid": "...",
-  "timestamp": 1234567890,
-  "pub_key": "<base64-encoded-pubkey>",
-  "signature": "<base64-encoded-signature>"
-}
-```
+Returns connection details for an active lease from the backend. Requires ADR-036 signed bearer token. See [SECURITY.md](SECURITY.md#tenant-authentication-adr-036) for token format and signing details.
 
 **Response (single instance):**
 ```json
@@ -413,7 +437,7 @@ Returns provision diagnostics for a lease, including status, error details, and 
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, or `failed`
+- `status` - Provision status: `provisioning`, `ready`, `failed`, `restarting`, `updating`, or `unknown`
 - `fail_count` - Number of provision attempts that failed
 - `last_error` - Detailed error message (only present on failure)
 
@@ -468,21 +492,7 @@ Content-Type: application/octet-stream
 <raw payload bytes>
 ```
 
-Upload deployment configuration for a lease that was created with a `meta_hash`. The payload is validated against the on-chain hash before provisioning starts.
-
-**Token Format** (base64-encoded JSON):
-```json
-{
-  "tenant": "manifest1...",
-  "lease_uuid": "...",
-  "meta_hash": "abc123...",
-  "timestamp": 1234567890,
-  "pub_key": "<base64-encoded-pubkey>",
-  "signature": "<base64-encoded-signature>"
-}
-```
-
-The signed message format is: `manifest lease data {lease_uuid} {meta_hash_hex} {unix_timestamp}`
+Upload deployment configuration for a lease that was created with a `meta_hash`. The payload is validated against the on-chain hash before provisioning starts. Requires a payload-specific ADR-036 token that includes the `meta_hash` field. See [SECURITY.md](SECURITY.md#tenant-authentication-adr-036) for token details.
 
 **Response Codes:**
 - `202 Accepted` - Payload received, provisioning started
@@ -490,6 +500,137 @@ The signed message format is: `manifest lease data {lease_uuid} {meta_hash_hex} 
 - `401 Unauthorized` - Invalid signature or token
 - `404 Not Found` - Lease not found or not PENDING
 - `409 Conflict` - Payload already received
+
+### Restart Lease
+
+```
+POST /v1/leases/{lease_uuid}/restart
+Authorization: Bearer <token>
+```
+
+Restart containers for a lease without changing the manifest. Containers are stopped, removed, and recreated with the same configuration. Volumes are preserved. Allowed from `ready` or `failed` state.
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "restarting"
+}
+```
+
+**Response Codes:**
+- `202 Accepted` - Restart initiated
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Lease is in a state that cannot be restarted (e.g., already restarting or updating)
+
+### Update Lease
+
+```
+POST /v1/leases/{lease_uuid}/update
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "payload": "<base64-encoded-manifest>"
+}
+```
+
+Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are stopped, new ones are created from the updated manifest, and old containers are cleaned up after verification. On failure, the operation rolls back to the previous containers. Volumes are preserved.
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "updating"
+}
+```
+
+**Response Codes:**
+- `202 Accepted` - Update initiated
+- `400 Bad Request` - Invalid payload or manifest validation error
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Lease is in a state that cannot be updated (e.g., currently restarting)
+
+### Get Release History
+
+```
+GET /v1/leases/{lease_uuid}/releases
+Authorization: Bearer <token>
+```
+
+Returns the release (deployment) history for a lease, showing each version that was deployed.
+
+**Response:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "releases": [
+    {
+      "version": 1,
+      "image": "nginx:1.24",
+      "status": "superseded",
+      "created_at": "2024-01-15T10:30:00Z",
+      "manifest": "<base64-encoded-manifest>"
+    },
+    {
+      "version": 2,
+      "image": "nginx:1.25",
+      "status": "active",
+      "created_at": "2024-01-16T14:00:00Z",
+      "manifest": "<base64-encoded-manifest>"
+    }
+  ]
+}
+```
+
+**Fields:**
+- `version` - Monotonically increasing version number
+- `image` - Container image used in this release
+- `status` - Release status: `deploying`, `active`, `superseded`, or `failed`
+- `created_at` - When this release was created
+- `error` - Error message (only present on failed releases)
+- `manifest` - The manifest payload used for this release
+
+**Response Codes:**
+- `200 OK` - Releases found (may be an empty array)
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Lease not provisioned
+
+### Stream Lease Events (WebSocket)
+
+```
+GET /v1/leases/{lease_uuid}/events
+Authorization: Bearer <token>
+```
+
+Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`).
+
+**Authentication:** Bearer token via the `Authorization` header or the `?token=` query parameter (since the WebSocket API cannot set custom headers during upgrade). Auth is verified before the WebSocket upgrade, so failures return standard HTTP error responses.
+
+**Response:** `101 Switching Protocols` on successful upgrade
+
+```json
+{"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:30:00Z"}
+{"lease_uuid":"...","status":"restarting","timestamp":"2024-01-15T10:31:00Z"}
+{"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:31:30Z"}
+```
+
+**Behavior:**
+- Events are delivered as WebSocket JSON frames
+- The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
+- Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
+- The stream ends when the client disconnects or the server shuts down (clean close frame)
+
+**Response Codes (before upgrade):**
+- `101 Switching Protocols` - WebSocket connection established
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `501 Not Implemented` - Events not enabled on this deployment
 
 ### Provision Callback (Backend -> Fred)
 
@@ -499,20 +640,7 @@ Content-Type: application/json
 X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
 ```
 
-Called by backends to report provisioning status. Requires HMAC-SHA256 authentication with timestamp-based replay protection.
-
-**Authentication:**
-The `X-Fred-Signature` header contains a timestamped HMAC-SHA256 signature. Format: `t=<unix-timestamp>,sha256=<hex>`.
-
-The HMAC is computed over `<timestamp>.<body>` to bind the timestamp to the signature:
-```
-signedPayload = fmt.Sprintf("%d.%s", timestamp, body)
-signature = HMAC-SHA256(signedPayload, callback_secret)
-```
-
-**Replay Protection:**
-- Callbacks older than 5 minutes are rejected
-- Timestamps up to 1 minute in the future are accepted (clock skew tolerance)
+Called by backends to report provisioning status. Requires HMAC-SHA256 authentication via the `X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
 
 **Request:**
 ```json
@@ -546,6 +674,32 @@ for debugging purposes, while maintaining idempotent semantics.
 ## Backend API Specification
 
 Any backend must implement these HTTP endpoints. For a comprehensive implementation guide including SKU handling, callback signing, state management, and reconciliation, see [BACKEND_GUIDE.md](BACKEND_GUIDE.md).
+
+### Endpoint Reference
+
+All endpoints except `/health`, `/stats`, and `/metrics` require HMAC-SHA256 signature authentication via the `X-Fred-Signature` header.
+
+#### Required
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/provision` | HMAC | Create resource (async, callback on completion) |
+| `POST` | `/deprovision` | HMAC | Remove resource (idempotent) |
+| `GET` | `/info/{uuid}` | HMAC | Connection details (host, ports) |
+| `GET` | `/provisions` | HMAC | List all provisions (reconciliation) |
+| `GET` | `/provisions/{uuid}` | HMAC | Provision diagnostics (status, errors) |
+| `GET` | `/logs/{uuid}` | HMAC | Container logs |
+| `GET` | `/health` | None | Health check |
+
+#### Optional
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/restart` | HMAC | Restart containers (async, callback on completion) |
+| `POST` | `/update` | HMAC | Deploy new manifest (async, callback on completion) |
+| `GET` | `/releases/{uuid}` | HMAC | Release history |
+| `GET` | `/stats` | None | Resource capacity and usage |
+| `GET` | `/metrics` | None | Prometheus metrics |
 
 ### POST /provision
 
@@ -671,6 +825,81 @@ List all provisions (for reconciliation).
   ]
 }
 ```
+
+### POST /restart
+
+Restart containers for a lease without changing the manifest (async).
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision"
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "restarting"
+}
+```
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Invalid state for restart (e.g., already restarting or updating)
+
+### POST /update
+
+Deploy a new manifest for a lease, replacing containers (async).
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision",
+  "payload": "<base64-encoded-manifest>",
+  "payload_hash": "sha256-hex-string"
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "updating"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` - Invalid manifest or validation error
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Invalid state for update
+
+### GET /releases/{lease_uuid}
+
+Get release (deployment) history for a lease.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "version": 1,
+    "image": "nginx:1.24",
+    "status": "superseded",
+    "created_at": "2024-01-15T10:30:00Z",
+    "manifest": "<base64-encoded-manifest>"
+  },
+  {
+    "version": 2,
+    "image": "nginx:1.25",
+    "status": "active",
+    "created_at": "2024-01-16T14:00:00Z",
+    "manifest": "<base64-encoded-manifest>"
+  }
+]
+```
+
+**Response:** `404 Not Found` if not provisioned.
 
 ## Running E2E Tests with Mock Backend
 
@@ -901,25 +1130,25 @@ Chain State (leases)     Backend State (provisions)
 | PENDING (no hash) | Not provisioned | Start provisioning |
 | PENDING | Provisioned + ready | Acknowledge lease |
 | ACTIVE | Provisioned + ready | Healthy - no action |
+| ACTIVE | Provisioned + restarting | In-flight restart - no action |
+| ACTIVE | Provisioned + updating | In-flight update - no action |
 | ACTIVE | Provisioned + failed | Anomaly: re-provision (with attempt limit) |
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |
 
-## Security Features
+## Security
 
-- **Rate Limiting**: Per-IP and per-tenant token bucket rate limiting (configurable RPS and burst)
-- **Request Size Limits**: Configurable max request body size (default 1MB)
-- **Input Validation**: UUID format validation on all inputs
-- **Error Sanitization**: Generic error messages to clients, detailed logs server-side
-- **TLS Support**: Optional HTTPS for API and TLS for gRPC
-- **ADR-036 Authentication**: Cryptographic signature verification for tenant access
-- **Token Expiry**: 30-second validity window on authentication tokens
-- **Token Replay Protection**: Used tokens tracked in persistent database to prevent replay attacks. Uses fail-closed semantics: database errors result in 503 Service Unavailable rather than proceeding without protection
-- **Callback Authentication**: HMAC-SHA256 signature verification for backend callbacks
-- **Constant-Time Comparisons**: Hash comparisons use constant-time algorithms to prevent timing attacks
-- **Security Headers**: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Cache-Control headers on all responses
-- **Production Mode**: Optional strict mode that blocks insecure configurations (TLS skip verify, missing replay protection, loopback/link-local/unspecified URLs). SSRF checks validate IP literals and the `localhost` hostname only — private IPs (RFC 1918) are allowed since backends commonly run on private networks. DNS resolution is not performed, so hostnames resolving to blocked addresses are not caught. Use network-level controls for defense in depth.
+- **Tenant Authentication**: ADR-036 secp256k1 signatures with 30-second token expiry and low-S normalization
+- **Replay Protection**: Persistent token tracking (bbolt) with fail-closed semantics on mutating endpoints
+- **Callback Authentication**: HMAC-SHA256 with timestamp-based replay protection (5-minute window)
+- **Rate Limiting**: Dual-layer token bucket — global per-IP (10 RPS) and per-tenant (5 RPS)
+- **Container Hardening**: Drop all capabilities, no-new-privileges, read-only rootfs, PID limits, network isolation
+- **Input Validation**: UUID format checks, URL scheme/host validation, manifest parsing, image allowlisting
+- **Production Mode**: Enforces replay protection, blocks TLS skip-verify, SSRF checks on all URLs
+- **Constant-Time Comparisons**: `hmac.Equal` and `subtle.ConstantTimeCompare` for all secret comparisons
+
+See [SECURITY.md](SECURITY.md) for the full security architecture, authentication flows, replay protection rationale, and known limitations.
 
 ## Performance
 

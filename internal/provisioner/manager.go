@@ -50,6 +50,14 @@ type Manager struct {
 	// Callback timeout handling (stored for external access if needed)
 	callbackTimeout      time.Duration
 	timeoutCheckInterval time.Duration
+
+	// leaseEventSink receives lease status events for real-time delivery (e.g., WebSocket)
+	leaseEventSink LeaseEventSink
+}
+
+// LeaseEventSink receives lease status events for real-time delivery (e.g., WebSocket).
+type LeaseEventSink interface {
+	Publish(event backend.LeaseStatusEvent)
 }
 
 // ManagerConfig configures the provision manager.
@@ -58,6 +66,7 @@ type ManagerConfig struct {
 	CallbackBaseURL      string         // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
 	PayloadStore         *payload.Store // Optional external payload store (if nil, manager won't handle payloads)
 	PlacementStore       PlacementStore // Optional placement store for round-robin routing (nil = disabled)
+	LeaseEventSink       LeaseEventSink // Optional sink for real-time lease events (nil = disabled)
 	CallbackTimeout      time.Duration  // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
 	TimeoutCheckInterval time.Duration  // How often to check for timeouts (default: 1 minute)
 	AckBatchInterval     time.Duration  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
@@ -135,6 +144,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		Tracker:      tracker,
 		Acknowledger: ackBatcher,
 		PayloadStore: cfg.PayloadStore,
+		Publisher:    pubSub,
 	})
 	timeoutChecker := NewTimeoutChecker(TimeoutCheckerConfig{
 		Tracker:       tracker,
@@ -159,6 +169,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		timeoutChecker:       timeoutChecker,
 		callbackTimeout:      callbackTimeout,
 		timeoutCheckInterval: timeoutCheckInterval,
+		leaseEventSink:       cfg.LeaseEventSink,
 	}
 
 	// Register handlers
@@ -197,6 +208,16 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		handlers.HandlePayloadReceived,
 	)
 
+	// Forward lease events to event sink (if configured)
+	if cfg.LeaseEventSink != nil {
+		wmRouter.AddNoPublisherHandler(
+			"forward_lease_events",
+			TopicLeaseEvent,
+			pubSub,
+			m.forwardToEventSink,
+		)
+	}
+
 	// Handle poisoned messages: log and drop them to prevent infinite loops
 	wmRouter.AddNoPublisherHandler(
 		"handle_poison_queue",
@@ -215,6 +236,19 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	)
 
 	return m, nil
+}
+
+// forwardToEventSink is a Watermill handler that deserializes LeaseStatusEvent messages
+// and forwards them to the event sink for real-time client delivery.
+func (m *Manager) forwardToEventSink(msg *message.Message) error {
+	var event backend.LeaseStatusEvent
+	if err := json.Unmarshal(msg.Payload, &event); err != nil {
+		slog.Warn("failed to unmarshal lease event", "error", err)
+		return nil // Don't retry malformed messages
+	}
+
+	m.leaseEventSink.Publish(event)
+	return nil
 }
 
 // Start begins the Watermill router and callback timeout checker.

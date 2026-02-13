@@ -55,6 +55,18 @@ type Backend interface {
 	// Returns ErrNotProvisioned if the lease is not found.
 	GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
 
+	// Restart restarts containers for a lease without changing the manifest.
+	// Returns ErrNotProvisioned if lease not found, ErrInvalidState if not restartable.
+	Restart(ctx context.Context, req RestartRequest) error
+
+	// Update deploys a new manifest for a lease, replacing containers.
+	// Returns ErrNotProvisioned if lease not found, ErrInvalidState if not updatable.
+	Update(ctx context.Context, req UpdateRequest) error
+
+	// GetReleases returns the release history for a lease.
+	// Returns ErrNotProvisioned if lease not found.
+	GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error)
+
 	// Name returns the backend's configured name.
 	Name() string
 }
@@ -128,7 +140,7 @@ type InstanceInfo struct {
 type ProvisionInfo struct {
 	LeaseUUID    string          `json:"lease_uuid"`
 	ProviderUUID string          `json:"provider_uuid"`
-	Status       ProvisionStatus `json:"status"` // "provisioning", "ready", "failed"
+	Status       ProvisionStatus `json:"status"` // see ProvisionStatus* constants
 	CreatedAt    time.Time       `json:"created_at"`
 	FailCount    int             `json:"fail_count"`
 	LastError    string          `json:"last_error,omitempty"`
@@ -147,6 +159,30 @@ type CallbackPayload struct {
 	Error     string         `json:"error,omitempty"`
 }
 
+// RestartRequest contains the data needed to restart a lease's containers.
+type RestartRequest struct {
+	LeaseUUID   string `json:"lease_uuid"`
+	CallbackURL string `json:"callback_url"`
+}
+
+// UpdateRequest contains the data needed to update a lease to a new manifest.
+type UpdateRequest struct {
+	LeaseUUID   string `json:"lease_uuid"`
+	CallbackURL string `json:"callback_url"`
+	Payload     []byte `json:"payload"`
+	PayloadHash string `json:"payload_hash,omitempty"`
+}
+
+// ReleaseInfo describes a single release in the history.
+type ReleaseInfo struct {
+	Version   int       `json:"version"`
+	Image     string    `json:"image"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	Error     string    `json:"error,omitempty"`
+	Manifest  []byte    `json:"manifest"`
+}
+
 // ErrNotProvisioned is returned when a lease is not yet provisioned.
 var ErrNotProvisioned = errors.New("lease not provisioned")
 
@@ -162,6 +198,8 @@ const (
 	ProvisionStatusReady        ProvisionStatus = "ready"
 	ProvisionStatusFailed       ProvisionStatus = "failed"
 	ProvisionStatusUnknown      ProvisionStatus = "unknown"
+	ProvisionStatusRestarting   ProvisionStatus = "restarting"
+	ProvisionStatusUpdating     ProvisionStatus = "updating"
 )
 
 // CallbackStatus represents the status sent in a callback payload.
@@ -220,6 +258,9 @@ func ClassifyValidationError(err error) ValidationCode {
 // ErrInsufficientResources is returned when there are not enough resources
 // to fulfill a provision request.
 var ErrInsufficientResources = errors.New("insufficient resources")
+
+// ErrInvalidState is returned when an operation is not valid for the current lease state.
+var ErrInvalidState = fmt.Errorf("invalid state for operation")
 
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
@@ -647,6 +688,141 @@ func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (_
 		return nil, fmt.Errorf("get logs: unexpected result type %T", result)
 	}
 	return logs, nil
+}
+
+// Restart sends a restart request to the backend.
+func (c *HTTPClient) Restart(ctx context.Context, req RestartRequest) (err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("restart", start, err) }()
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal restart request: %w", err)
+	}
+
+	_, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restart", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("restart request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		switch resp.StatusCode {
+		case http.StatusAccepted:
+			return nil, nil
+		case http.StatusNotFound:
+			return nil, ErrNotProvisioned
+		case http.StatusConflict:
+			return nil, ErrInvalidState
+		default:
+			return nil, fmt.Errorf("restart failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return ErrCircuitOpen
+	}
+	return cbErr
+}
+
+// Update sends an update request to the backend.
+func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("update", start, err) }()
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal update request: %w", err)
+	}
+
+	_, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/update", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("update request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		switch resp.StatusCode {
+		case http.StatusAccepted:
+			return nil, nil
+		case http.StatusBadRequest:
+			return nil, parseValidationError(readErrorBodyBytes(resp))
+		case http.StatusNotFound:
+			return nil, ErrNotProvisioned
+		case http.StatusConflict:
+			return nil, ErrInvalidState
+		default:
+			return nil, fmt.Errorf("update failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return ErrCircuitOpen
+	}
+	return cbErr
+}
+
+// GetReleases retrieves release history for a lease.
+func (c *HTTPClient) GetReleases(ctx context.Context, leaseUUID string) (_ []ReleaseInfo, err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("get_releases", start, err) }()
+
+	url := fmt.Sprintf("%s/releases/%s", c.baseURL, leaseUUID)
+
+	result, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		c.signRequest(httpReq, nil)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("get releases request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotProvisioned
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("get releases failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+
+		var releases []ReleaseInfo
+		if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+			return nil, fmt.Errorf("decode releases response: %w", err)
+		}
+
+		return releases, nil
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return nil, ErrCircuitOpen
+	}
+	if cbErr != nil {
+		return nil, cbErr
+	}
+	releases, ok := result.([]ReleaseInfo)
+	if !ok {
+		return nil, fmt.Errorf("get releases: unexpected result type %T", result)
+	}
+	return releases, nil
 }
 
 // RefreshState is a no-op for remote backends (they refresh server-side).

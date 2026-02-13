@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
@@ -45,23 +48,37 @@ type Handlers struct {
 	tokenTracker    TokenTrackerInterface
 	statusChecker   StatusChecker
 	placementLookup PlacementLookup
+	eventBroker     *EventBroker
+	wsUpgrader      websocket.Upgrader
 	providerUUID    string
 	bech32Prefix    string
+	callbackBaseURL string
 }
 
 // NewHandlers creates a new Handlers instance.
 // tokenTracker is optional but recommended for replay attack protection.
 // statusChecker is optional but required for the /status endpoint.
 // placementLookup is optional — used for routing reads to the correct backend.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, providerUUID, bech32Prefix string) *Handlers {
+// callbackBaseURL is used for restart/update callbacks to the backend.
+// eventBroker is optional — if nil, the events endpoint will return 501.
+func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, eventBroker *EventBroker, providerUUID, bech32Prefix, callbackBaseURL string) *Handlers {
 	return &Handlers{
 		client:          client,
 		backendRouter:   backendRouter,
 		tokenTracker:    tokenTracker,
 		statusChecker:   statusChecker,
 		placementLookup: placementLookup,
+		eventBroker:     eventBroker,
+		wsUpgrader: websocket.Upgrader{
+			// Allow all origins: this API is not browser-facing. Clients are
+			// CLI tools and services that authenticate with cryptographically
+			// signed ADR-036 tokens (no cookies/sessions). Origin checks would
+			// break non-browser clients that don't send Origin headers.
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
 		providerUUID:    providerUUID,
 		bech32Prefix:    bech32Prefix,
+		callbackBaseURL: callbackBaseURL,
 	}
 }
 
@@ -279,6 +296,9 @@ type LeaseStatusResponse struct {
 	MetaHashHex         string `json:"meta_hash_hex,omitempty"` // For debugging - shows the expected payload hash
 	PayloadReceived     bool   `json:"payload_received"`
 	ProvisioningStarted bool   `json:"provisioning_started"`
+	ProvisionStatus     string `json:"provision_status,omitempty"`
+	FailCount           int    `json:"fail_count,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
 }
 
 // GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
@@ -313,6 +333,21 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		response.PayloadReceived = hasPayload
 		response.ProvisioningStarted = h.statusChecker.IsInFlight(leaseUUID)
+	}
+
+	// For active leases, include provision status from the backend
+	if h.backendRouter != nil && auth.Lease.State == billingtypes.LEASE_STATE_ACTIVE {
+		sku := provisioner.ExtractRoutingSKU(auth.Lease)
+		if backendClient := h.resolveBackend(leaseUUID, sku); backendClient != nil {
+			info, err := backendClient.GetProvision(r.Context(), leaseUUID)
+			if err == nil {
+				response.ProvisionStatus = string(info.Status)
+				response.FailCount = info.FailCount
+				response.LastError = info.LastError
+			}
+			// Errors are intentionally ignored — provision status is best-effort.
+			// ErrNotProvisioned during initial setup is expected and safe to skip.
+		}
 	}
 
 	slog.Info("lease status served",
@@ -458,6 +493,214 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 	slog.Info("lease logs served",
 		"lease_uuid", leaseUUID,
 		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
+// LeaseReleasesResponse represents the response for release history.
+type LeaseReleasesResponse struct {
+	LeaseUUID    string               `json:"lease_uuid"`
+	Tenant       string               `json:"tenant"`
+	ProviderUUID string               `json:"provider_uuid"`
+	Releases     []backend.ReleaseInfo `json:"releases"`
+}
+
+// RestartLease handles POST /v1/leases/{lease_uuid}/restart
+func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (requires active lease, checks replay)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.resolveBackend(leaseUUID, sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	err = backendClient.Restart(r.Context(), backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
+	})
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "lease not yet provisioned", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			writeError(w, "invalid state for restart", http.StatusConflict)
+			return
+		}
+		slog.Error("failed to restart lease", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	// Publish "restarting" event after the backend accepts the request.
+	// This is safe: the backend transitions to Restarting synchronously and
+	// spawns the async work in a goroutine, so the completion callback cannot
+	// arrive before Restart() returns.
+	if h.eventBroker != nil {
+		h.eventBroker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusRestarting,
+			Timestamp: time.Now(),
+		})
+	}
+
+	slog.Info("lease restart initiated",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, map[string]string{"status": "restarting"}, http.StatusAccepted)
+}
+
+// UpdateLease handles POST /v1/leases/{lease_uuid}/update
+func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (requires active lease, checks replay)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Read the request body (new manifest payload)
+	var updateReq struct {
+		Payload []byte `json:"payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&updateReq); err != nil {
+		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(updateReq.Payload) == 0 {
+		writeError(w, "payload is required", http.StatusBadRequest)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.resolveBackend(leaseUUID, sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	err = backendClient.Update(r.Context(), backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
+		Payload:     updateReq.Payload,
+	})
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "lease not yet provisioned", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			writeError(w, "invalid state for update", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, backend.ErrValidation) {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		slog.Error("failed to update lease", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	// Publish "updating" event after the backend accepts the request.
+	// This is safe: the backend transitions to Updating synchronously and
+	// spawns the async work in a goroutine, so the completion callback cannot
+	// arrive before Update() returns.
+	if h.eventBroker != nil {
+		h.eventBroker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusUpdating,
+			Timestamp: time.Now(),
+		})
+	}
+
+	slog.Info("lease update initiated",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+		"payload_size", len(updateReq.Payload),
+	)
+
+	writeJSON(w, map[string]string{"status": "updating"}, http.StatusAccepted)
+}
+
+// GetLeaseReleases handles GET /v1/leases/{lease_uuid}/releases
+func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// Authenticate and authorize (any lease state, no replay check for read endpoint)
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	backendClient := h.resolveBackend(leaseUUID, sku)
+	if backendClient == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	releases, err := backendClient.GetReleases(r.Context(), leaseUUID)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			writeError(w, "lease not yet provisioned", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to get releases from backend", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	response := LeaseReleasesResponse{
+		LeaseUUID:    leaseUUID,
+		Tenant:       auth.Token.Tenant,
+		ProviderUUID: h.providerUUID,
+		Releases:     releases,
+	}
+
+	slog.Info("lease releases served",
+		"lease_uuid", leaseUUID,
+		"tenant", auth.Token.Tenant,
+		"release_count", len(releases),
 		"backend", backendClient.Name(),
 	)
 
@@ -774,18 +1017,111 @@ var (
 	errInvalidAuthFormat = errors.New("invalid authorization format, expected 'Bearer <token>'")
 )
 
-// extractBearerToken extracts the raw token string from a Bearer authorization header.
-// Returns the token string or an error if the header is missing or malformed.
+// StreamLeaseEvents serves a WebSocket stream of lease status events.
+// GET /v1/leases/{lease_uuid}/events
+func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
+	if h.eventBroker == nil {
+		writeError(w, "events not enabled", http.StatusNotImplemented)
+		return
+	}
+
+	leaseUUID := r.PathValue("lease_uuid")
+
+	// WebSocket API cannot set custom headers, so the client passes the auth
+	// token as a query parameter. Promote it to the Authorization header so the
+	// standard auth pipeline can handle it. This fallback is intentionally
+	// scoped to this handler only.
+	if r.Header.Get("Authorization") == "" {
+		if token := r.URL.Query().Get("token"); token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
+
+	// Authenticate BEFORE upgrading so auth failures return normal HTTP errors.
+	_, statusCode, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	if err != nil {
+		writeError(w, err.Error(), statusCode)
+		return
+	}
+
+	conn, err := h.wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Error("websocket upgrade failed", "lease_uuid", leaseUUID, "error", err)
+		return // Upgrade writes its own HTTP error response.
+	}
+	defer conn.Close()
+
+	ch := h.eventBroker.Subscribe(leaseUUID)
+	if ch == nil {
+		_ = conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "broker closed"))
+		return
+	}
+	defer h.eventBroker.Unsubscribe(leaseUUID, ch)
+
+	const (
+		pingInterval = 30 * time.Second
+		writeWait    = 10 * time.Second
+		pongWait     = 40 * time.Second
+	)
+
+	// Read pump: detect client disconnect via close frames or pong timeout.
+	closeCh := make(chan struct{})
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	go func() {
+		defer close(closeCh)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Write pump: send events + ping frames.
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-closeCh:
+			return
+		case event, ok := <-ch:
+			if !ok {
+				// Broker closed — send clean close frame.
+				_ = conn.WriteControl(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseGoingAway, ""),
+					time.Now().Add(writeWait))
+				return
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteJSON(event); err != nil {
+				slog.Debug("websocket write failed", "lease_uuid", leaseUUID, "error", err)
+				return
+			}
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				slog.Debug("websocket ping failed", "lease_uuid", leaseUUID, "error", err)
+				return
+			}
+		}
+	}
+}
+
+// extractBearerToken extracts the raw token string from the Authorization header.
+// Expects "Bearer <token>" format. Returns errMissingAuth if no header is present.
 func extractBearerToken(r *http.Request) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		return "", errMissingAuth
 	}
-
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
 		return "", errInvalidAuthFormat
 	}
-
 	return parts[1], nil
 }

@@ -33,6 +33,7 @@ const (
 	TopicLeaseExpired    = "events.lease.expired"
 	TopicBackendCallback = "events.backend.callback"
 	TopicPayloadReceived = "events.payload.received"
+	TopicLeaseEvent      = "events.lease.event"
 )
 
 // CallbackPath is the path suffix for backend provision callbacks.

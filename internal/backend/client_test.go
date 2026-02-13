@@ -720,3 +720,362 @@ func TestHTTPClient_GetInfo_NoHMAC_NoHeader(t *testing.T) {
 
 	assert.Empty(t, capturedSig, "X-Fred-Signature header should be absent when no secret configured")
 }
+
+func TestHTTPClient_Restart(t *testing.T) {
+	var receivedReq RestartRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/restart" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&receivedReq); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-restart",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Restart(context.Background(), RestartRequest{
+		LeaseUUID:   "lease-restart-1",
+		CallbackURL: "http://fred/callback",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "lease-restart-1", receivedReq.LeaseUUID)
+	assert.Equal(t, "http://fred/callback", receivedReq.CallbackURL)
+}
+
+func TestHTTPClient_Restart_NotProvisioned(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-restart-404",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Restart(context.Background(), RestartRequest{LeaseUUID: "nonexistent"})
+	assert.ErrorIs(t, err, ErrNotProvisioned)
+}
+
+func TestHTTPClient_Restart_InvalidState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-restart-409",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Restart(context.Background(), RestartRequest{LeaseUUID: "busy-lease"})
+	assert.ErrorIs(t, err, ErrInvalidState)
+}
+
+func TestHTTPClient_Restart_ServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-restart-500",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Restart(context.Background(), RestartRequest{LeaseUUID: "test"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "500")
+}
+
+func TestHTTPClient_Restart_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-restart"
+
+	var capturedSig string
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-restart",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	err := client.Restart(context.Background(), RestartRequest{
+		LeaseUUID:   "lease-hmac-restart",
+		CallbackURL: "http://fred/callback",
+	})
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
+	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature should verify successfully")
+}
+
+func TestHTTPClient_Update(t *testing.T) {
+	var receivedReq UpdateRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/update" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&receivedReq); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-update",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Update(context.Background(), UpdateRequest{
+		LeaseUUID:   "lease-update-1",
+		CallbackURL: "http://fred/callback",
+		Payload:     []byte("base64-manifest"),
+		PayloadHash: "sha256-hash",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "lease-update-1", receivedReq.LeaseUUID)
+	assert.Equal(t, "sha256-hash", receivedReq.PayloadHash)
+}
+
+func TestHTTPClient_Update_NotProvisioned(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-update-404",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "nonexistent"})
+	assert.ErrorIs(t, err, ErrNotProvisioned)
+}
+
+func TestHTTPClient_Update_InvalidState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-update-409",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "busy-lease"})
+	assert.ErrorIs(t, err, ErrInvalidState)
+}
+
+func TestHTTPClient_Update_ValidationError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":           "validation error: invalid manifest: bad json",
+			"validation_code": "invalid_manifest",
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-update-400",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "test"})
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.ErrorIs(t, err, ErrInvalidManifest)
+}
+
+func TestHTTPClient_Update_ServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-update-500",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "test"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "500")
+}
+
+func TestHTTPClient_Update_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-update"
+
+	var capturedSig string
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-update",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	err := client.Update(context.Background(), UpdateRequest{
+		LeaseUUID:   "lease-hmac-update",
+		CallbackURL: "http://fred/callback",
+		Payload:     []byte("manifest-data"),
+	})
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
+	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature should verify successfully")
+}
+
+func TestHTTPClient_GetReleases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/releases/lease-rel-1" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]ReleaseInfo{
+			{Version: 1, Image: "nginx:1.0", Status: "superseded"},
+			{Version: 2, Image: "nginx:2.0", Status: "active"},
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-releases",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	releases, err := client.GetReleases(context.Background(), "lease-rel-1")
+	require.NoError(t, err)
+	require.Len(t, releases, 2)
+	assert.Equal(t, 1, releases[0].Version)
+	assert.Equal(t, "nginx:1.0", releases[0].Image)
+	assert.Equal(t, "superseded", releases[0].Status)
+	assert.Equal(t, 2, releases[1].Version)
+	assert.Equal(t, "nginx:2.0", releases[1].Image)
+	assert.Equal(t, "active", releases[1].Status)
+}
+
+func TestHTTPClient_GetReleases_NotProvisioned(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-releases-404",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	_, err := client.GetReleases(context.Background(), "nonexistent")
+	assert.ErrorIs(t, err, ErrNotProvisioned)
+}
+
+func TestHTTPClient_GetReleases_ServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-releases-500",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	_, err := client.GetReleases(context.Background(), "test")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "500")
+}
+
+func TestHTTPClient_GetReleases_EmptyList(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]ReleaseInfo{})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-releases-empty",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	releases, err := client.GetReleases(context.Background(), "lease-no-releases")
+	require.NoError(t, err)
+	assert.Empty(t, releases)
+}
+
+func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-releases"
+
+	var capturedSig string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]ReleaseInfo{})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-releases",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	_, err := client.GetReleases(context.Background(), "lease-1")
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present on GET /releases")
+	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
+}

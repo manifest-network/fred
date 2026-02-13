@@ -1405,6 +1405,219 @@ func TestGetLeaseStatus(t *testing.T) {
 		assert.Equal(t, "LEASE_STATE_ACTIVE", response.State)
 	})
 
+	t.Run("active_with_provision_status", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_ACTIVE,
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/provisions/"+leaseUUID && r.Method == "GET" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(backend.ProvisionInfo{
+					LeaseUUID: leaseUUID,
+					Status:    backend.ProvisionStatusReady,
+				})
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var response LeaseStatusResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+		assert.Equal(t, "LEASE_STATE_ACTIVE", response.State)
+		assert.Equal(t, "ready", response.ProvisionStatus)
+	})
+
+	t.Run("active_with_updating_provision", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_ACTIVE,
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/provisions/"+leaseUUID && r.Method == "GET" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(backend.ProvisionInfo{
+					LeaseUUID: leaseUUID,
+					Status:    backend.ProvisionStatusUpdating,
+				})
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var response LeaseStatusResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+		assert.Equal(t, "LEASE_STATE_ACTIVE", response.State)
+		assert.Equal(t, "updating", response.ProvisionStatus)
+	})
+
+	t.Run("active_no_backend_router", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_ACTIVE,
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var response LeaseStatusResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+		assert.Equal(t, "LEASE_STATE_ACTIVE", response.State)
+		assert.Empty(t, response.ProvisionStatus)
+	})
+
+	t.Run("active_backend_error", func(t *testing.T) {
+		chainClient := &mockChainClient{
+			getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+				if uuid == leaseUUID {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						Tenant:       kp.Address,
+						ProviderUuid: providerUUID,
+						State:        billingtypes.LEASE_STATE_ACTIVE,
+					}, nil
+				}
+				return nil, nil
+			},
+		}
+
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseStatus(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var response LeaseStatusResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+		assert.Equal(t, "LEASE_STATE_ACTIVE", response.State)
+		assert.Empty(t, response.ProvisionStatus)
+	})
+
 	t.Run("invalid_uuid_returns_400", func(t *testing.T) {
 		h := &Handlers{
 			client:       nil,
@@ -2613,5 +2826,840 @@ func TestGetLeaseLogs(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, rec.Code)
 		assert.Equal(t, "100", receivedTail)
+	})
+}
+
+// TestRestartLease_BackendIntegration tests the backend integration path
+// in RestartLease using httptest.Server and a real backend.Router.
+func TestRestartLease_BackendIntegration(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	t.Run("router_missing_returns_503", func(t *testing.T) {
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.RestartLease(rec, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "service not configured", errResp.Error)
+	})
+
+	t.Run("not_provisioned_returns_404", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/restart" && r.Method == "POST" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.RestartLease(rec, req)
+
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "lease not yet provisioned", errResp.Error)
+	})
+
+	t.Run("invalid_state_returns_409", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/restart" && r.Method == "POST" {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.RestartLease(rec, req)
+
+		assert.Equal(t, http.StatusConflict, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "invalid state for restart", errResp.Error)
+	})
+
+	t.Run("backend_error_returns_500", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/restart" && r.Method == "POST" {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.RestartLease(rec, req)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "internal server error", errResp.Error)
+	})
+
+	t.Run("happy_path_returns_202", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/restart" && r.Method == "POST" {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.RestartLease(rec, req)
+
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+
+		var response map[string]string
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+		assert.Equal(t, "restarting", response["status"])
+	})
+}
+
+// TestUpdateLease_BackendIntegration tests the backend integration path
+// in UpdateLease using httptest.Server and a real backend.Router.
+func TestUpdateLease_BackendIntegration(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	t.Run("router_missing_returns_503", func(t *testing.T) {
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":"dGVzdA=="}`
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "service not configured", errResp.Error)
+	})
+
+	t.Run("missing_payload_returns_400", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":""}`
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "payload is required", errResp.Error)
+	})
+
+	t.Run("invalid_body_returns_400", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader("not json"))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "invalid request body", errResp.Error)
+	})
+
+	t.Run("not_provisioned_returns_404", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/update" && r.Method == "POST" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":"dGVzdA=="}`
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "lease not yet provisioned", errResp.Error)
+	})
+
+	t.Run("invalid_state_returns_409", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/update" && r.Method == "POST" {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":"dGVzdA=="}`
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusConflict, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "invalid state for update", errResp.Error)
+	})
+
+	t.Run("validation_error_returns_400", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/update" && r.Method == "POST" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid manifest"})
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":"dGVzdA=="}`
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("backend_error_returns_500", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/update" && r.Method == "POST" {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":"dGVzdA=="}`
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "internal server error", errResp.Error)
+	})
+
+	t.Run("happy_path_returns_202", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/update" && r.Method == "POST" {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":"dGVzdA=="}`
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+
+		var response map[string]string
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+		assert.Equal(t, "updating", response["status"])
+	})
+}
+
+// TestGetLeaseReleases_BackendIntegration tests the backend integration path
+// in GetLeaseReleases using httptest.Server and a real backend.Router.
+func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	// GetLeaseReleases uses requireActive=false, so it calls GetLease
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	t.Run("router_missing_returns_503", func(t *testing.T) {
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: nil,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/releases", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseReleases(rec, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "service not configured", errResp.Error)
+	})
+
+	t.Run("not_provisioned_returns_404", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/releases/"+leaseUUID && r.Method == "GET" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/releases", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseReleases(rec, req)
+
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "lease not yet provisioned", errResp.Error)
+	})
+
+	t.Run("backend_error_returns_500", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/releases/"+leaseUUID && r.Method == "GET" {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/releases", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseReleases(rec, req)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "internal server error", errResp.Error)
+	})
+
+	t.Run("happy_path_returns_releases", func(t *testing.T) {
+		now := time.Now().Truncate(time.Second)
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/releases/"+leaseUUID && r.Method == "GET" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]backend.ReleaseInfo{
+					{
+						Version:   1,
+						Image:     "nginx:1.25",
+						Status:    "superseded",
+						CreatedAt: now.Add(-1 * time.Hour),
+					},
+					{
+						Version:   2,
+						Image:     "nginx:1.26",
+						Status:    "active",
+						CreatedAt: now,
+					},
+				})
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/releases", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseReleases(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code, "status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+
+		var response LeaseReleasesResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+		assert.Equal(t, leaseUUID, response.LeaseUUID)
+		assert.Equal(t, kp.Address, response.Tenant)
+		assert.Equal(t, providerUUID, response.ProviderUUID)
+		require.Len(t, response.Releases, 2)
+		assert.Equal(t, 1, response.Releases[0].Version)
+		assert.Equal(t, "nginx:1.25", response.Releases[0].Image)
+		assert.Equal(t, "superseded", response.Releases[0].Status)
+		assert.Equal(t, 2, response.Releases[1].Version)
+		assert.Equal(t, "nginx:1.26", response.Releases[1].Image)
+		assert.Equal(t, "active", response.Releases[1].Status)
+	})
+
+	t.Run("empty_releases_returns_empty_array", func(t *testing.T) {
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/releases/"+leaseUUID && r.Method == "GET" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]backend.ReleaseInfo{})
+				return
+			}
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}))
+		defer backendServer.Close()
+
+		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "test-backend",
+			BaseURL: backendServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: backendClient, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/releases", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseReleases(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var response LeaseReleasesResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+		assert.Empty(t, response.Releases)
 	})
 }

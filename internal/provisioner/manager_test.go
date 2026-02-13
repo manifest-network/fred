@@ -89,6 +89,18 @@ func (m *mockManagerBackend) GetLogs(ctx context.Context, leaseUUID string, tail
 	return nil, backend.ErrNotProvisioned
 }
 
+func (m *mockManagerBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	return nil
+}
+
+func (m *mockManagerBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	return nil
+}
+
+func (m *mockManagerBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+
 func TestNewManager_Validation(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -2611,4 +2623,82 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Error("manager.Start() did not return after cancel")
 	}
+}
+
+// --- forwardToEventSink tests ---
+
+// mockLeaseEventSink captures events published to the event sink.
+type mockLeaseEventSink struct {
+	mu     sync.Mutex
+	events []backend.LeaseStatusEvent
+}
+
+func (s *mockLeaseEventSink) Publish(event backend.LeaseStatusEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
+}
+
+func TestForwardToEventSink_ForwardsToSink(t *testing.T) {
+	sink := &mockLeaseEventSink{}
+	m := &Manager{leaseEventSink: sink}
+
+	event := backend.LeaseStatusEvent{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusReady,
+		Error:     "",
+		Timestamp: time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC),
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := message.NewMessage(watermill.NewUUID(), data)
+	err = m.forwardToEventSink(msg)
+	assert.NoError(t, err)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	require.Len(t, sink.events, 1)
+	assert.Equal(t, "lease-1", sink.events[0].LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, sink.events[0].Status)
+	assert.Empty(t, sink.events[0].Error)
+	assert.Equal(t, time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC), sink.events[0].Timestamp)
+}
+
+func TestForwardToEventSink_IncludesError(t *testing.T) {
+	sink := &mockLeaseEventSink{}
+	m := &Manager{leaseEventSink: sink}
+
+	event := backend.LeaseStatusEvent{
+		LeaseUUID: "lease-2",
+		Status:    backend.ProvisionStatusFailed,
+		Error:     "OOM killed",
+		Timestamp: time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC),
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := message.NewMessage(watermill.NewUUID(), data)
+	err = m.forwardToEventSink(msg)
+	assert.NoError(t, err)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	require.Len(t, sink.events, 1)
+	assert.Equal(t, "lease-2", sink.events[0].LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusFailed, sink.events[0].Status)
+	assert.Equal(t, "OOM killed", sink.events[0].Error)
+}
+
+func TestForwardToEventSink_MalformedMessage(t *testing.T) {
+	sink := &mockLeaseEventSink{}
+	m := &Manager{leaseEventSink: sink}
+
+	msg := message.NewMessage(watermill.NewUUID(), []byte("not json"))
+	err := m.forwardToEventSink(msg)
+	assert.NoError(t, err, "should return nil for malformed messages (don't retry)")
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	assert.Empty(t, sink.events, "no events should reach the sink")
 }

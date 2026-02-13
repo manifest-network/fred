@@ -82,7 +82,7 @@ func execInContainer(t *testing.T, containerID string, cmd []string) string {
 // getContainerID returns the Docker container ID for a lease (exactly one expected).
 func getContainerID(t *testing.T, leaseUUID string) string {
 	t.Helper()
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -103,7 +103,7 @@ func getContainerID(t *testing.T, leaseUUID string) string {
 // containerHasBindMount checks if a container has a bind mount at the given destination.
 func containerHasBindMount(t *testing.T, containerID, dest string) bool {
 	t.Helper()
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -124,7 +124,7 @@ func containerHasBindMount(t *testing.T, containerID, dest string) bool {
 // containerHasTmpfsMount checks if a container has a tmpfs mount at the given destination.
 func containerHasTmpfsMount(t *testing.T, containerID, dest string) bool {
 	t.Helper()
-	docker, err := NewDockerClient("")
+	docker, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -519,11 +519,11 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 		}
 	})
 
-	dockerCli, err := NewDockerClient("")
+	dockerCli, err := NewDockerClient("", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, dockerCli, cfg.Name)
-		cleanupTestNetworks(t, dockerCli)
+		cleanupTestNetworks(t, dockerCli, cfg.Name)
 		_ = dockerCli.Close()
 	})
 

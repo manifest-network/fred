@@ -84,6 +84,7 @@ type Store struct {
 	cancel    context.CancelFunc
 	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
 	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
+	closeErr  error
 }
 
 // StoreConfig configures the payload store.
@@ -374,7 +375,6 @@ func (s *Store) Healthy() error {
 // It waits for all pending writes to complete before closing the database.
 // Close is idempotent and safe to call multiple times.
 func (s *Store) Close() error {
-	var closeErr error
 	s.closeOnce.Do(func() {
 		// Signal shutdown - this will cause writerLoop to exit
 		s.cancel()
@@ -382,9 +382,9 @@ func (s *Store) Close() error {
 		// Wait for all goroutines to finish (writer will flush pending ops)
 		s.wg.Wait()
 
-		closeErr = s.db.Close()
+		s.closeErr = s.db.Close()
 	})
-	return closeErr
+	return s.closeErr
 }
 
 // writerLoop is the dedicated writer goroutine that batches write operations.

@@ -75,6 +75,8 @@ type mockDockerClient struct {
 	InspectImageFn               func(ctx context.Context, imageName string) (*ImageInfo, error)
 	CreateContainerFn            func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainerFn             func(ctx context.Context, containerID string, timeout time.Duration) error
+	StopContainerFn              func(ctx context.Context, containerID string, timeout time.Duration) error
+	RenameContainerFn            func(ctx context.Context, containerID string, newName string) error
 	RemoveContainerFn            func(ctx context.Context, containerID string) error
 	InspectContainerFn           func(ctx context.Context, containerID string) (*ContainerInfo, error)
 	ContainerLogsFn              func(ctx context.Context, containerID string, tail int) (string, error)
@@ -83,6 +85,10 @@ type mockDockerClient struct {
 	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
 	ListManagedNetworksFn        func(ctx context.Context) ([]networktypes.Inspect, error)
 	ResolveImageUserFn           func(ctx context.Context, imageName string, userOverride string) (int, int, error)
+	DetectVolumeOwnerFn          func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
+	DetectWritablePathsFn        func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
+	ExtractImageContentFn        func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error
+	ContainerEventsFn            func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {
@@ -141,6 +147,20 @@ func (m *mockDockerClient) StartContainer(ctx context.Context, containerID strin
 	panic("unexpected call to StartContainer")
 }
 
+func (m *mockDockerClient) StopContainer(ctx context.Context, containerID string, timeout time.Duration) error {
+	if m.StopContainerFn != nil {
+		return m.StopContainerFn(ctx, containerID, timeout)
+	}
+	return nil
+}
+
+func (m *mockDockerClient) RenameContainer(ctx context.Context, containerID string, newName string) error {
+	if m.RenameContainerFn != nil {
+		return m.RenameContainerFn(ctx, containerID, newName)
+	}
+	return nil // default: rename succeeds silently
+}
+
 func (m *mockDockerClient) RemoveContainer(ctx context.Context, containerID string) error {
 	if m.RemoveContainerFn != nil {
 		return m.RemoveContainerFn(ctx, containerID)
@@ -195,6 +215,42 @@ func (m *mockDockerClient) ListManagedNetworks(ctx context.Context) ([]networkty
 		return m.ListManagedNetworksFn(ctx)
 	}
 	panic("unexpected call to ListManagedNetworks")
+}
+
+func (m *mockDockerClient) DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+	if m.DetectVolumeOwnerFn != nil {
+		return m.DetectVolumeOwnerFn(ctx, imageName, volumePaths)
+	}
+	return 0, 0, nil // default: root (auto-detect path entered but produces no override)
+}
+
+func (m *mockDockerClient) DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+	if m.DetectWritablePathsFn != nil {
+		return m.DetectWritablePathsFn(ctx, imageName, uid, candidateParents)
+	}
+	return nil, nil // default: no writable paths detected
+}
+
+func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+	if m.ExtractImageContentFn != nil {
+		return m.ExtractImageContentFn(ctx, imageName, paths, destDir, maxBytes)
+	}
+	return nil // default: extraction succeeds silently
+}
+
+func (m *mockDockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error) {
+	if m.ContainerEventsFn != nil {
+		return m.ContainerEventsFn(ctx)
+	}
+	// Default: return channels that block until context is canceled (no-op).
+	ch := make(chan ContainerEvent)
+	errCh := make(chan error)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+		close(errCh)
+	}()
+	return ch, errCh
 }
 
 // newBackendForTest creates a Backend suitable for unit testing. It wires up a
@@ -1291,4 +1347,185 @@ func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 	assert.Equal(t, 1, prov.FailCount,
 		"should preserve in-memory FailCount (1), not regress to stale label value (0)")
+}
+
+func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
+	now := time.Now()
+
+	manifest := DockerManifest{
+		Image:   "nginx:latest",
+		Command: []string{"nginx", "-g", "daemon off;"},
+		Env:     map[string]string{"FOO": "bar"},
+		Ports:   map[string]PortConfig{"80/tcp": {HostPort: 0}},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	t.Run("manifest restored on cold start", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "releases.db")
+		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+		require.NoError(t, err)
+		defer relStore.Close()
+
+		// Pre-seed the release store with a manifest for this lease.
+		err = relStore.Append("lease-1", shared.Release{
+			Manifest:  manifestBytes,
+			Image:     manifest.Image,
+			Status:    "active",
+			CreatedAt: now,
+		})
+		require.NoError(t, err)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.releaseStore = relStore
+
+		err = b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+		require.NotNil(t, prov.Manifest, "manifest should be restored from release store")
+		assert.Equal(t, "nginx:latest", prov.Manifest.Image)
+		assert.Equal(t, []string{"nginx", "-g", "daemon off;"}, prov.Manifest.Command)
+		assert.Equal(t, map[string]string{"FOO": "bar"}, prov.Manifest.Env)
+	})
+
+	t.Run("manifest nil when no release store", func(t *testing.T) {
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		// b.releaseStore is nil (default from newBackendForTest)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Nil(t, prov.Manifest, "manifest should be nil when no release store is configured")
+	})
+
+	t.Run("manifest restored from active release not failed", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "releases.db")
+		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+		require.NoError(t, err)
+		defer relStore.Close()
+
+		// Simulate: provision with nginx, then failed update to alpine.
+		// The active release is nginx; the latest release is the failed alpine.
+		err = relStore.Append("lease-1", shared.Release{
+			Manifest:  manifestBytes,
+			Image:     "nginx:latest",
+			Status:    "active",
+			CreatedAt: now,
+		})
+		require.NoError(t, err)
+
+		alpineManifest := DockerManifest{Image: "alpine:latest", Command: []string{"sleep", "3600"}}
+		alpineBytes, _ := json.Marshal(alpineManifest)
+		err = relStore.Append("lease-1", shared.Release{
+			Manifest:  alpineBytes,
+			Image:     "alpine:latest",
+			Status:    "failed",
+			CreatedAt: now.Add(time.Second),
+		})
+		require.NoError(t, err)
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.releaseStore = relStore
+
+		err = b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		require.NotNil(t, prov.Manifest, "manifest should be restored from active release")
+		assert.Equal(t, "nginx:latest", prov.Manifest.Image,
+			"manifest should come from the active release, not the failed one")
+	})
+
+	t.Run("manifest nil when no release exists for lease", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "releases.db")
+		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+		require.NoError(t, err)
+		defer relStore.Close()
+
+		// No releases pre-seeded for lease-1.
+
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+		b.releaseStore = relStore
+
+		err = b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Nil(t, prov.Manifest, "manifest should be nil when no release exists")
+	})
 }
