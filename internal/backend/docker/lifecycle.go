@@ -553,6 +553,11 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 			}
 
 		case tar.TypeReg:
+			// Note: OpenFile could follow a symlink created earlier in the archive,
+			// writing outside destDir despite the prefix check. This is not exploitable
+			// here because the tar source is always Docker's CopyFromContainer API,
+			// which walks the filesystem without following symlinks — so a symlink entry
+			// is never followed by regular file entries "inside" it.
 			if totalBytes+hdr.Size > maxBytes {
 				return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d byte limit", maxBytes)
 			}
@@ -1234,7 +1239,9 @@ func TenantNetworkName(tenant string) string {
 func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
 	name := TenantNetworkName(tenant)
 
-	// Check if network already exists
+	// Check if network already exists. The backend_name filter is safe here:
+	// every network Fred creates has this label set (see netLabels below),
+	// so there are no pre-existing networks without it to miss.
 	nf := filters.NewArgs(
 		filters.Arg("name", name),
 		filters.Arg("label", LabelManaged+"=true"),

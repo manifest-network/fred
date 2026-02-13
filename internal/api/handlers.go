@@ -70,6 +70,10 @@ func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker
 		placementLookup: placementLookup,
 		eventBroker:     eventBroker,
 		wsUpgrader: websocket.Upgrader{
+			// Allow all origins: this API is not browser-facing. Clients are
+			// CLI tools and services that authenticate with cryptographically
+			// signed ADR-036 tokens (no cookies/sessions). Origin checks would
+			// break non-browser clients that don't send Origin headers.
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 		providerUUID:    providerUUID,
@@ -294,7 +298,7 @@ type LeaseStatusResponse struct {
 	ProvisioningStarted bool   `json:"provisioning_started"`
 	ProvisionStatus     string `json:"provision_status,omitempty"`
 	FailCount           int    `json:"fail_count,omitempty"`
-	LastError           string `json:"error,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
 }
 
 // GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
