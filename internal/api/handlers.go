@@ -501,9 +501,9 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 
 // LeaseReleasesResponse represents the response for release history.
 type LeaseReleasesResponse struct {
-	LeaseUUID    string               `json:"lease_uuid"`
-	Tenant       string               `json:"tenant"`
-	ProviderUUID string               `json:"provider_uuid"`
+	LeaseUUID    string                `json:"lease_uuid"`
+	Tenant       string                `json:"tenant"`
+	ProviderUUID string                `json:"provider_uuid"`
 	Releases     []backend.ReleaseInfo `json:"releases"`
 }
 
@@ -1049,7 +1049,7 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 		slog.Error("websocket upgrade failed", "lease_uuid", leaseUUID, "error", err)
 		return // Upgrade writes its own HTTP error response.
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	ch := h.eventBroker.Subscribe(leaseUUID)
 	if ch == nil {

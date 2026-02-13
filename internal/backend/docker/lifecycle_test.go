@@ -198,7 +198,7 @@ func TestResolveImageUserNumeric(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(nil, "postgres:16", "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), "postgres:16", "")
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 999, gid)
@@ -211,7 +211,7 @@ func TestResolveImageUserNumericWithGroup(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(nil, "test-image", "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), "test-image", "")
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 100, gid)
@@ -224,7 +224,7 @@ func TestResolveImageUserEmpty(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(nil, "nginx:latest", "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), "nginx:latest", "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, uid)
 	assert.Equal(t, 0, gid)
@@ -239,7 +239,7 @@ func TestResolveImageUserManifestOverride(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(nil, "postgres:16", "postgres")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), "postgres:16", "postgres")
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 999, gid)

@@ -196,9 +196,9 @@ func wsDialWithAuth(t *testing.T, serverURL, leaseUUID, token string) (*websocke
 
 func newTestHandlers(broker *EventBroker, chainClient ChainClient, providerUUID string) *Handlers {
 	return &Handlers{
-		client:      chainClient,
-		eventBroker: broker,
-		wsUpgrader:  websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		client:       chainClient,
+		eventBroker:  broker,
+		wsUpgrader:   websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
 		providerUUID: providerUUID,
 		bech32Prefix: "manifest",
 	}

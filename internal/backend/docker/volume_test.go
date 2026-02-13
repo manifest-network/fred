@@ -145,10 +145,10 @@ func TestCleanupOrphanedVolumes_DestroysOrphans(t *testing.T) {
 	defer stopCancel()
 
 	b := &Backend{
-		cfg:    cfg,
-		pool:   pool,
+		cfg:     cfg,
+		pool:    pool,
 		volumes: vm,
-		logger: slog.Default(),
+		logger:  slog.Default(),
 		provisions: map[string]*provision{
 			"lease-1": {LeaseUUID: "lease-1", Quantity: 1, Status: backend.ProvisionStatusReady},
 			"lease-2": {LeaseUUID: "lease-2", Quantity: 1, Status: backend.ProvisionStatusReady},

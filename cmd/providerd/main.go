@@ -43,7 +43,6 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 	})
 }
 
-
 var version = "dev"
 
 var (
