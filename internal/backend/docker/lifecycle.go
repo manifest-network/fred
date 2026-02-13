@@ -311,7 +311,7 @@ func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName string, 
 		hdr, tarErr := tr.Next()
 		_ = rc.Close()
 		if tarErr != nil {
-			if tarErr == io.EOF {
+			if errors.Is(tarErr, io.EOF) {
 				// Empty tar stream — directory exists but has no entries.
 				return 0, 0, nil
 			}
@@ -521,7 +521,7 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -623,7 +623,7 @@ func readFileFromContainer(ctx context.Context, cli *client.Client, containerID,
 	tr := tar.NewReader(rc)
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("file %s not found in tar stream", path)
 		}
 		if err != nil {

@@ -294,7 +294,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | `POST` | `/v1/leases/{uuid}/data` | ADR-036 | No | Pending | Has own idempotency (409 on duplicate) |
 | `POST` | `/v1/leases/{uuid}/restart` | ADR-036 | Yes | Active | Mutating — replaying would restart again |
 | `POST` | `/v1/leases/{uuid}/update` | ADR-036 | Yes | Active | Mutating — replaying would redeploy again |
-| `GET` | `/v1/leases/{uuid}/events` | ADR-036 | No | Any | SSE stream of lease status events |
+| `GET` | `/v1/leases/{uuid}/events` | ADR-036 | No | Any | WebSocket stream of lease status events |
 
 #### Operational
 
@@ -508,7 +508,7 @@ POST /v1/leases/{lease_uuid}/restart
 Authorization: Bearer <token>
 ```
 
-Restart containers for a lease without changing the manifest. Containers are stopped, removed, and recreated with the same configuration. Volumes are preserved.
+Restart containers for a lease without changing the manifest. Containers are stopped, removed, and recreated with the same configuration. Volumes are preserved. Allowed from `ready` or `failed` state.
 
 **Response:** `202 Accepted`
 ```json
@@ -601,36 +601,36 @@ Returns the release (deployment) history for a lease, showing each version that 
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
 
-### Stream Lease Events (SSE)
+### Stream Lease Events (WebSocket)
 
 ```
 GET /v1/leases/{lease_uuid}/events
 Authorization: Bearer <token>
 ```
 
-Opens a Server-Sent Events stream for real-time lease status updates. Events are pushed when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`).
+Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`).
 
-**Response:** `200 OK` with `Content-Type: text/event-stream`
+**Authentication:** Bearer token via the `Authorization` header or the `?token=` query parameter (since the WebSocket API cannot set custom headers during upgrade). Auth is verified before the WebSocket upgrade, so failures return standard HTTP error responses.
 
-```
-data: {"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:30:00Z"}
+**Response:** `101 Switching Protocols` on successful upgrade
 
-data: {"lease_uuid":"...","status":"restarting","timestamp":"2024-01-15T10:31:00Z"}
-
-data: {"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:31:30Z"}
+```json
+{"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:30:00Z"}
+{"lease_uuid":"...","status":"restarting","timestamp":"2024-01-15T10:31:00Z"}
+{"lease_uuid":"...","status":"ready","timestamp":"2024-01-15T10:31:30Z"}
 ```
 
 **Behavior:**
-- Events are delivered as SSE `data:` lines containing JSON
-- A keepalive comment (`: keepalive`) is sent every 30 seconds
+- Events are delivered as WebSocket JSON frames
+- The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
 - Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
-- The stream ends when the client disconnects
+- The stream ends when the client disconnects or the server shuts down (clean close frame)
 
-**Response Codes:**
-- `200 OK` - Stream opened
+**Response Codes (before upgrade):**
+- `101 Switching Protocols` - WebSocket connection established
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
-- `501 Not Implemented` - SSE not enabled on this deployment
+- `501 Not Implemented` - Events not enabled on this deployment
 
 ### Provision Callback (Backend -> Fred)
 

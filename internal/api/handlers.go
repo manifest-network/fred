@@ -528,17 +528,6 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish "restarting" event BEFORE the backend call to guarantee ordering.
-	// The backend may complete and callback before Restart() returns, so
-	// publishing after would risk the client seeing "ready" before "restarting".
-	if h.eventBroker != nil {
-		h.eventBroker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusRestarting,
-			Timestamp: time.Now(),
-		})
-	}
-
 	err = backendClient.Restart(r.Context(), backend.RestartRequest{
 		LeaseUUID:   leaseUUID,
 		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
@@ -555,6 +544,18 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to restart lease", "error", err, "lease_uuid", leaseUUID)
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
+	}
+
+	// Publish "restarting" event after the backend accepts the request.
+	// This is safe: the backend transitions to Restarting synchronously and
+	// spawns the async work in a goroutine, so the completion callback cannot
+	// arrive before Restart() returns.
+	if h.eventBroker != nil {
+		h.eventBroker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusRestarting,
+			Timestamp: time.Now(),
+		})
 	}
 
 	slog.Info("lease restart initiated",
@@ -604,15 +605,6 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish "updating" event BEFORE the backend call to guarantee ordering.
-	if h.eventBroker != nil {
-		h.eventBroker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusUpdating,
-			Timestamp: time.Now(),
-		})
-	}
-
 	err = backendClient.Update(r.Context(), backend.UpdateRequest{
 		LeaseUUID:   leaseUUID,
 		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
@@ -634,6 +626,18 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to update lease", "error", err, "lease_uuid", leaseUUID)
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
+	}
+
+	// Publish "updating" event after the backend accepts the request.
+	// This is safe: the backend transitions to Updating synchronously and
+	// spawns the async work in a goroutine, so the completion callback cannot
+	// arrive before Update() returns.
+	if h.eventBroker != nil {
+		h.eventBroker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusUpdating,
+			Timestamp: time.Now(),
+		})
 	}
 
 	slog.Info("lease update initiated",
@@ -1091,11 +1095,13 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := conn.WriteJSON(event); err != nil {
+				slog.Debug("websocket write failed", "lease_uuid", leaseUUID, "error", err)
 				return
 			}
 		case <-ticker.C:
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				slog.Debug("websocket ping failed", "lease_uuid", leaseUUID, "error", err)
 				return
 			}
 		}

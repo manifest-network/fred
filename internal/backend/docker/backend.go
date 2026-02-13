@@ -1265,6 +1265,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: no stored manifest for restart", backend.ErrInvalidState)
 	}
+	prevStatus := prov.Status
 	prov.Status = backend.ProvisionStatusRestarting
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
@@ -1274,18 +1275,27 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	sku := prov.SKU
 	b.provisionsMu.Unlock()
 
-	// Record restart release as deploying
+	// Record restart release as deploying. Abort if this fails — without a
+	// release record, ActivateLatest after success is a no-op, and a cold
+	// restart would recover the previous manifest (silently rolling back).
 	if b.releaseStore != nil {
 		manifestBytes, marshalErr := json.Marshal(manifest)
 		if marshalErr != nil {
-			logger.Warn("failed to marshal manifest for release", "error", marshalErr)
-		} else if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
+			b.provisionsMu.Lock()
+			prov.Status = prevStatus
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("failed to marshal manifest for release: %w", marshalErr)
+		}
+		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  manifestBytes,
 			Image:     manifest.Image,
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
-			logger.Warn("failed to record restart release", "error", relErr)
+			b.provisionsMu.Lock()
+			prov.Status = prevStatus
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("failed to record release: %w", relErr)
 		}
 	}
 
@@ -1628,13 +1638,16 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	}
 
 	oldContainerIDs := prov.ContainerIDs
+	prevStatus := prov.Status
 	prov.Status = backend.ProvisionStatusUpdating
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
 	}
 	b.provisionsMu.Unlock()
 
-	// Record release as deploying
+	// Record release as deploying. Abort if this fails — without a
+	// release record, ActivateLatest after success is a no-op, and a cold
+	// restart would recover the previous manifest (silently rolling back).
 	if b.releaseStore != nil {
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  req.Payload,
@@ -1642,7 +1655,10 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
-			logger.Warn("failed to record release", "error", relErr)
+			b.provisionsMu.Lock()
+			prov.Status = prevStatus
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("failed to record release: %w", relErr)
 		}
 	}
 

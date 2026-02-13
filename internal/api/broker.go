@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"sync"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -85,7 +86,10 @@ func (b *EventBroker) Publish(event backend.LeaseStatusEvent) {
 		select {
 		case ch <- event:
 		default:
-			// Client too slow — drop the event. They can re-fetch via REST.
+			slog.Debug("dropped event for slow WebSocket client",
+				"lease_uuid", event.LeaseUUID,
+				"status", event.Status,
+			)
 		}
 	}
 }

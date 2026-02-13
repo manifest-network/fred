@@ -40,6 +40,7 @@ type TokenTracker struct {
 	cancel    context.CancelFunc
 	wg        *sync.WaitGroup // Pointer to avoid copy-by-value issues
 	closeOnce *sync.Once      // Pointer to avoid copy-by-value issues
+	closeErr  error
 }
 
 // TokenTrackerConfig configures the token tracker.
@@ -173,7 +174,6 @@ func (t *TokenTracker) Healthy() error {
 // Close shuts down the token tracker gracefully.
 // Close is idempotent and safe to call multiple times.
 func (t *TokenTracker) Close() error {
-	var closeErr error
 	t.closeOnce.Do(func() {
 		// Signal cleanup goroutine to stop
 		t.cancel()
@@ -182,9 +182,9 @@ func (t *TokenTracker) Close() error {
 		t.wg.Wait()
 
 		// Close the database
-		closeErr = t.db.Close()
+		t.closeErr = t.db.Close()
 	})
-	return closeErr
+	return t.closeErr
 }
 
 // cleanupLoop periodically removes expired tokens.

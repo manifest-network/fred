@@ -269,7 +269,7 @@ Restart containers for a lease without changing the manifest. Stops existing con
 ```
 
 **Behavior:**
-1. Validate the lease exists and is in a restartable state (`ready`)
+1. Validate the lease exists and is in a restartable state (`ready` or `failed`)
 2. Return 202 immediately
 3. Stop and rename existing containers (kept for rollback) in a background goroutine
 4. Recreate containers with the same manifest and configuration

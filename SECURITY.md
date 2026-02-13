@@ -21,7 +21,7 @@ Tenants authenticate to Fred's API using signed bearer tokens. Each token is a b
 }
 ```
 
-**Signed message format:** `manifest lease access {lease_uuid} {unix_timestamp}`
+**Signed message format:** `{tenant}:{lease_uuid}:{unix_timestamp}`
 
 **Payload upload variant:** The `POST /data` endpoint uses a separate token that includes a `meta_hash` field binding the token to a specific payload. Signed message format: `manifest lease data {lease_uuid} {meta_hash_hex} {unix_timestamp}`
 
@@ -100,7 +100,7 @@ Used tokens are tracked in a persistent bbolt database keyed by the normalized s
 | `GET /provision` | No | Idempotent read |
 | `GET /logs` | No | Idempotent read |
 | `GET /releases` | No | Idempotent read |
-| `GET /events` | No | Read-only SSE stream |
+| `GET /events` | No | Read-only WebSocket stream |
 | `POST /data` | No | Has own idempotency guard (409 on duplicate upload) |
 
 **Configuration:** Requires `token_tracker_db_path`. Mandatory when `production_mode: true`.
