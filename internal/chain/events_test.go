@@ -1,10 +1,15 @@
 package chain
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -394,6 +399,110 @@ func TestEventSubscriber_Close(t *testing.T) {
 		// Expected - channel is closed
 	default:
 		t.Error("Close() did not close done channel")
+	}
+}
+
+func TestEventSubscriber_ConnectAndRunSubscriptions(t *testing.T) {
+	// Collect subscription requests sent by connectAndRun
+	type subRequest struct {
+		ID    int
+		Query string
+	}
+
+	subscriptions := make(chan subRequest, 10)
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Logf("upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+
+			var req jsonRPCRequest
+			if err := json.Unmarshal(msg, &req); err != nil {
+				continue
+			}
+
+			if req.Method == "subscribe" {
+				subscriptions <- subRequest{ID: req.ID, Query: req.Params["query"]}
+				// Send subscription confirmation
+				resp := jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}
+				if err := conn.WriteJSON(resp); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/websocket"
+
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
+		URL:          wsURL,
+		ProviderUUID: testProviderUUID,
+		PingInterval: time.Hour, // avoid ping interference
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Run connectAndRun in a goroutine
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sub.connectAndRun(ctx)
+	}()
+
+	// Collect all 4 subscription requests
+	var subs []subRequest
+	timeout := time.After(5 * time.Second)
+	for len(subs) < 4 {
+		select {
+		case s := <-subscriptions:
+			subs = append(subs, s)
+		case <-timeout:
+			t.Fatalf("timed out waiting for subscriptions, got %d of 4", len(subs))
+		}
+	}
+
+	// Cancel context to stop connectAndRun and wait for goroutine to exit
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for connectAndRun to exit")
+	}
+
+	// Verify we got exactly 4 subscriptions
+	require.Len(t, subs, 4)
+
+	// Build a map by ID for easier assertion
+	subByID := make(map[int]string)
+	for _, s := range subs {
+		subByID[s.ID] = s.Query
+	}
+
+	// Verify subscription IDs and queries
+	assert.Contains(t, subByID[subscriptionIDLeaseCreated], "lease_created.provider_uuid='"+testProviderUUID+"'",
+		"lease_created subscription should filter by provider UUID")
+	assert.Contains(t, subByID[subscriptionIDAutoClose], "lease_auto_closed.reason='credit_exhausted'",
+		"auto_close subscription should filter by credit_exhausted reason")
+	assert.Contains(t, subByID[subscriptionIDLeaseClosed], "lease_closed.provider_uuid='"+testProviderUUID+"'",
+		"lease_closed subscription should filter by provider UUID")
+	assert.Contains(t, subByID[subscriptionIDLeaseExpired], "lease_expired.provider_uuid='"+testProviderUUID+"'",
+		"lease_expired subscription should filter by provider UUID")
+
+	// Verify all queries include tm.event='Tx'
+	for id, query := range subByID {
+		assert.Contains(t, query, "tm.event='Tx'", "subscription %d should filter for Tx events", id)
 	}
 }
 

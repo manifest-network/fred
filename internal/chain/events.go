@@ -45,8 +45,10 @@ const (
 
 	// WebSocket JSON-RPC subscription IDs.
 	// These are used to identify different event subscriptions in the CometBFT WebSocket.
-	subscriptionIDProviderLeases = 1 // Provider-specific lease events (created, closed, etc.)
-	subscriptionIDAutoClose      = 2 // Cross-provider lease auto-close events (credit exhaustion)
+	subscriptionIDLeaseCreated = 1 // Lease creation events for this provider
+	subscriptionIDAutoClose    = 2 // Cross-provider lease auto-close events (credit exhaustion)
+	subscriptionIDLeaseClosed  = 3 // Lease closure events for this provider
+	subscriptionIDLeaseExpired = 4 // Lease expiry events for this provider
 )
 
 // LeaseEvent represents a lease-related event from the chain.
@@ -329,12 +331,12 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 		return nil
 	})
 
-	// Subscribe to lease events for this provider
-	query := fmt.Sprintf("tm.event='Tx' AND lease_created.provider_uuid='%s'", s.providerUUID)
-	if err := s.subscribe(conn, query, subscriptionIDProviderLeases); err != nil {
-		return fmt.Errorf("failed to subscribe to provider events: %w", err)
+	// Subscribe to lease_created events for this provider
+	createdQuery := fmt.Sprintf("tm.event='Tx' AND lease_created.provider_uuid='%s'", s.providerUUID)
+	if err := s.subscribe(conn, createdQuery, subscriptionIDLeaseCreated); err != nil {
+		return fmt.Errorf("failed to subscribe to lease created events: %w", err)
 	}
-	slog.Info("subscribed to provider lease events", "provider_uuid", s.providerUUID)
+	slog.Info("subscribed to lease created events", "provider_uuid", s.providerUUID)
 
 	// Subscribe to ALL lease_auto_closed events (any provider) to detect cross-provider credit depletion
 	autoCloseQuery := "tm.event='Tx' AND lease_auto_closed.reason='credit_exhausted'"
@@ -342,6 +344,20 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 		return fmt.Errorf("failed to subscribe to auto-close events: %w", err)
 	}
 	slog.Info("subscribed to lease auto-close events")
+
+	// Subscribe to lease_closed events for this provider
+	closedQuery := fmt.Sprintf("tm.event='Tx' AND lease_closed.provider_uuid='%s'", s.providerUUID)
+	if err := s.subscribe(conn, closedQuery, subscriptionIDLeaseClosed); err != nil {
+		return fmt.Errorf("failed to subscribe to lease closed events: %w", err)
+	}
+	slog.Info("subscribed to lease closed events", "provider_uuid", s.providerUUID)
+
+	// Subscribe to lease_expired events for this provider
+	expiredQuery := fmt.Sprintf("tm.event='Tx' AND lease_expired.provider_uuid='%s'", s.providerUUID)
+	if err := s.subscribe(conn, expiredQuery, subscriptionIDLeaseExpired); err != nil {
+		return fmt.Errorf("failed to subscribe to lease expired events: %w", err)
+	}
+	slog.Info("subscribed to lease expired events", "provider_uuid", s.providerUUID)
 
 	// Start ping ticker to keep connection alive
 	pingTicker := time.NewTicker(s.pingInterval)

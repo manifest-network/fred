@@ -798,11 +798,18 @@ func TestParseManifest_Tmpfs(t *testing.T) {
 		assert.Contains(t, err.Error(), "under sensitive path")
 	})
 
-	t.Run("/run/secrets rejected (subdirectory of managed path)", func(t *testing.T) {
-		data := `{"image": "nginx", "tmpfs": ["/run/secrets"]}`
-		_, err := ParseManifest([]byte(data))
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "under sensitive path")
+	t.Run("/run/mysqld allowed (subdirectory of backend-managed tmpfs)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/run/mysqld"]}`
+		m, err := ParseManifest([]byte(data))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"/run/mysqld"}, m.Tmpfs)
+	})
+
+	t.Run("/tmp/cache allowed (subdirectory of backend-managed tmpfs)", func(t *testing.T) {
+		data := `{"image": "nginx", "tmpfs": ["/tmp/cache"]}`
+		m, err := ParseManifest([]byte(data))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"/tmp/cache"}, m.Tmpfs)
 	})
 }
 

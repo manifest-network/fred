@@ -282,11 +282,21 @@ func validateEnvVars(env map[string]string) error {
 	return nil
 }
 
-// blockedTmpfsPaths are paths that cannot be used as tmpfs mounts because they
-// are managed by the backend (/tmp, /run) or are sensitive kernel filesystems.
+// blockedTmpfsPaths cannot be used as tmpfs mounts. Backend-managed paths
+// (/tmp, /run) are blocked at the root but allow subdirectories (e.g.,
+// /run/mysqld) since those are nested tmpfs within an existing tmpfs.
+// Kernel filesystems block both the root and all subdirectories.
 var blockedTmpfsPaths = map[string]bool{
 	"/tmp":  true,
 	"/run":  true,
+	"/proc": true,
+	"/sys":  true,
+	"/dev":  true,
+}
+
+// sensitiveKernelPaths block all subdirectories — arbitrary tmpfs mounts
+// under these could mask kernel state.
+var sensitiveKernelPaths = map[string]bool{
 	"/proc": true,
 	"/sys":  true,
 	"/dev":  true,
@@ -315,14 +325,17 @@ func validateTmpfsPaths(paths []string) error {
 			return fmt.Errorf("tmpfs: cannot mount root filesystem")
 		}
 
-		// Must not overlap with blocked paths or their subdirectories.
-		// For example, /proc/self and /sys/fs/cgroup must be rejected.
+		// Exact blocked paths (both backend-managed and kernel) are rejected.
 		if blockedTmpfsPaths[cleaned] {
 			return fmt.Errorf("tmpfs: path %q is managed by the backend or is a sensitive path", cleaned)
 		}
-		for blocked := range blockedTmpfsPaths {
-			if strings.HasPrefix(cleaned, blocked+"/") {
-				return fmt.Errorf("tmpfs: path %q is under sensitive path %q", cleaned, blocked)
+		// Sub-paths are only blocked under sensitive kernel filesystems.
+		// Sub-paths under backend-managed tmpfs (/tmp, /run) are allowed
+		// because they create harmless nested tmpfs mounts (e.g.,
+		// /run/mysqld for databases that need a socket directory).
+		for sensitive := range sensitiveKernelPaths {
+			if strings.HasPrefix(cleaned, sensitive+"/") {
+				return fmt.Errorf("tmpfs: path %q is under sensitive path %q", cleaned, sensitive)
 			}
 		}
 

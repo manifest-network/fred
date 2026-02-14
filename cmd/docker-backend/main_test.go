@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -11,7 +13,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -380,6 +385,731 @@ func TestGetReleases_PassesAuth(t *testing.T) {
 	w := httptest.NewRecorder()
 	// Passes auth, panics on nil backend.
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
+}
+
+// --- mockBackend and helpers for handler logic tests ---
+
+type mockBackend struct {
+	ProvisionFunc      func(ctx context.Context, req backend.ProvisionRequest) error
+	DeprovisionFunc    func(ctx context.Context, leaseUUID string) error
+	GetInfoFunc        func(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
+	GetLogsFunc        func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
+	GetProvisionFunc   func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
+	ListProvisionsFunc func(ctx context.Context) ([]backend.ProvisionInfo, error)
+	RestartFunc        func(ctx context.Context, req backend.RestartRequest) error
+	UpdateFunc         func(ctx context.Context, req backend.UpdateRequest) error
+	GetReleasesFunc    func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
+	HealthFunc         func(ctx context.Context) error
+	StatsFunc          func() shared.ResourceStats
+}
+
+func (m *mockBackend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
+	if m.ProvisionFunc == nil {
+		panic("mockBackend.Provision called but not configured")
+	}
+	return m.ProvisionFunc(ctx, req)
+}
+
+func (m *mockBackend) Deprovision(ctx context.Context, leaseUUID string) error {
+	if m.DeprovisionFunc == nil {
+		panic("mockBackend.Deprovision called but not configured")
+	}
+	return m.DeprovisionFunc(ctx, leaseUUID)
+}
+
+func (m *mockBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
+	if m.GetInfoFunc == nil {
+		panic("mockBackend.GetInfo called but not configured")
+	}
+	return m.GetInfoFunc(ctx, leaseUUID)
+}
+
+func (m *mockBackend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	if m.GetLogsFunc == nil {
+		panic("mockBackend.GetLogs called but not configured")
+	}
+	return m.GetLogsFunc(ctx, leaseUUID, tail)
+}
+
+func (m *mockBackend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+	if m.GetProvisionFunc == nil {
+		panic("mockBackend.GetProvision called but not configured")
+	}
+	return m.GetProvisionFunc(ctx, leaseUUID)
+}
+
+func (m *mockBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
+	if m.ListProvisionsFunc == nil {
+		panic("mockBackend.ListProvisions called but not configured")
+	}
+	return m.ListProvisionsFunc(ctx)
+}
+
+func (m *mockBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
+	if m.RestartFunc == nil {
+		panic("mockBackend.Restart called but not configured")
+	}
+	return m.RestartFunc(ctx, req)
+}
+
+func (m *mockBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	if m.UpdateFunc == nil {
+		panic("mockBackend.Update called but not configured")
+	}
+	return m.UpdateFunc(ctx, req)
+}
+
+func (m *mockBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	if m.GetReleasesFunc == nil {
+		panic("mockBackend.GetReleases called but not configured")
+	}
+	return m.GetReleasesFunc(ctx, leaseUUID)
+}
+
+func (m *mockBackend) Health(ctx context.Context) error {
+	if m.HealthFunc == nil {
+		panic("mockBackend.Health called but not configured")
+	}
+	return m.HealthFunc(ctx)
+}
+
+func (m *mockBackend) Stats() shared.ResourceStats {
+	if m.StatsFunc == nil {
+		panic("mockBackend.Stats called but not configured")
+	}
+	return m.StatsFunc()
+}
+
+// newMockHandler creates a Handler backed by the given mockBackend.
+func newMockHandler(mb *mockBackend) http.Handler {
+	s := NewServer(mb, testSecret, slog.Default())
+	return s.Handler()
+}
+
+// signedPostRequest creates a POST request with a valid HMAC signature.
+func signedPostRequest(path, body string) *http.Request {
+	b := []byte(body)
+	req := httptest.NewRequest("POST", path, bytes.NewReader(b))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, b))
+	return req
+}
+
+// signedGetRequest creates a GET request with a valid HMAC signature.
+func signedGetRequest(path string) *http.Request {
+	req := httptest.NewRequest("GET", path, nil)
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+	return req
+}
+
+// --- Handler logic tests (using mockBackend) ---
+
+func TestHandleProvision(t *testing.T) {
+	validBody := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb","items":[{"sku":"docker-micro","quantity":1}]}`
+
+	t.Run("success returns 202", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(_ context.Context, req backend.ProvisionRequest) error {
+				assert.Equal(t, "lease-1", req.LeaseUUID)
+				return nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusAccepted, w.Code)
+		var resp backend.ProvisionResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "lease-1", resp.ProvisionID)
+	})
+
+	t.Run("ErrAlreadyProvisioned returns 409", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
+				return fmt.Errorf("wrap: %w", backend.ErrAlreadyProvisioned)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "already provisioned")
+	})
+
+	t.Run("ErrUnknownSKU returns 400 with validation_code", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
+				return fmt.Errorf("bad sku: %w", backend.ErrUnknownSKU)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		var errResp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+		assert.Equal(t, backend.ValidationCodeUnknownSKU, errResp.ValidationCode)
+	})
+
+	t.Run("ErrInvalidManifest returns 400 with validation_code", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
+				return fmt.Errorf("bad manifest: %w", backend.ErrInvalidManifest)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		var errResp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+		assert.Equal(t, backend.ValidationCodeInvalidManifest, errResp.ValidationCode)
+	})
+
+	t.Run("ErrImageNotAllowed returns 400 with validation_code", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
+				return fmt.Errorf("blocked: %w", backend.ErrImageNotAllowed)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		var errResp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+		assert.Equal(t, backend.ValidationCodeImageNotAllowed, errResp.ValidationCode)
+	})
+
+	t.Run("ErrInsufficientResources returns 503", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
+				return fmt.Errorf("no capacity: %w", backend.ErrInsufficientResources)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
+				return fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleDeprovision(t *testing.T) {
+	validBody := `{"lease_uuid":"lease-1"}`
+
+	t.Run("success returns 200", func(t *testing.T) {
+		mb := &mockBackend{
+			DeprovisionFunc: func(_ context.Context, leaseUUID string) error {
+				assert.Equal(t, "lease-1", leaseUUID)
+				return nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/deprovision", validBody))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var resp StatusResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "ok", resp.Status)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			DeprovisionFunc: func(context.Context, string) error {
+				return fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/deprovision", validBody))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleGetInfo(t *testing.T) {
+	t.Run("success returns 200 with LeaseInfo", func(t *testing.T) {
+		info := &backend.LeaseInfo{"host": "example.com", "port": float64(8080)}
+		mb := &mockBackend{
+			GetInfoFunc: func(_ context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
+				assert.Equal(t, "lease-1", leaseUUID)
+				return info, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/info/lease-1"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got backend.LeaseInfo
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Equal(t, "example.com", got["host"])
+	})
+
+	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {
+		mb := &mockBackend{
+			GetInfoFunc: func(context.Context, string) (*backend.LeaseInfo, error) {
+				return nil, backend.ErrNotProvisioned
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/info/lease-1"))
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+		assert.Contains(t, w.Body.String(), "not provisioned")
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			GetInfoFunc: func(context.Context, string) (*backend.LeaseInfo, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/info/lease-1"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleGetLogs(t *testing.T) {
+	t.Run("success with default tail returns 200", func(t *testing.T) {
+		mb := &mockBackend{
+			GetLogsFunc: func(_ context.Context, leaseUUID string, tail int) (map[string]string, error) {
+				assert.Equal(t, "lease-1", leaseUUID)
+				assert.Equal(t, 100, tail) // default
+				return map[string]string{"container-1": "log output"}, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/logs/lease-1"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got map[string]string
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Equal(t, "log output", got["container-1"])
+	})
+
+	t.Run("success with custom tail", func(t *testing.T) {
+		mb := &mockBackend{
+			GetLogsFunc: func(_ context.Context, _ string, tail int) (map[string]string, error) {
+				assert.Equal(t, 50, tail)
+				return map[string]string{"c": "ok"}, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/logs/lease-1?tail=50"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {
+		mb := &mockBackend{
+			GetLogsFunc: func(context.Context, string, int) (map[string]string, error) {
+				return nil, backend.ErrNotProvisioned
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/logs/lease-1"))
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			GetLogsFunc: func(context.Context, string, int) (map[string]string, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/logs/lease-1"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleGetProvision(t *testing.T) {
+	t.Run("success returns 200 with ProvisionInfo", func(t *testing.T) {
+		info := &backend.ProvisionInfo{
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusReady,
+		}
+		mb := &mockBackend{
+			GetProvisionFunc: func(_ context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
+				assert.Equal(t, "lease-1", leaseUUID)
+				return info, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions/lease-1"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got backend.ProvisionInfo
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Equal(t, backend.ProvisionStatusReady, got.Status)
+	})
+
+	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {
+		mb := &mockBackend{
+			GetProvisionFunc: func(context.Context, string) (*backend.ProvisionInfo, error) {
+				return nil, backend.ErrNotProvisioned
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions/lease-1"))
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			GetProvisionFunc: func(context.Context, string) (*backend.ProvisionInfo, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions/lease-1"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleListProvisions(t *testing.T) {
+	t.Run("success with items returns 200", func(t *testing.T) {
+		items := []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+			{LeaseUUID: "lease-2", Status: backend.ProvisionStatusProvisioning},
+		}
+		mb := &mockBackend{
+			ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) {
+				return items, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got backend.ListProvisionsResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Len(t, got.Provisions, 2)
+	})
+
+	t.Run("success empty returns 200", func(t *testing.T) {
+		mb := &mockBackend{
+			ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) {
+				return nil, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got backend.ListProvisionsResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Empty(t, got.Provisions)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleRestart(t *testing.T) {
+	validBody := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`
+
+	t.Run("success returns 202", func(t *testing.T) {
+		mb := &mockBackend{
+			RestartFunc: func(_ context.Context, req backend.RestartRequest) error {
+				assert.Equal(t, "lease-1", req.LeaseUUID)
+				return nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
+
+		assert.Equal(t, http.StatusAccepted, w.Code)
+		var resp StatusResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "restarting", resp.Status)
+	})
+
+	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {
+		mb := &mockBackend{
+			RestartFunc: func(context.Context, backend.RestartRequest) error {
+				return backend.ErrNotProvisioned
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	t.Run("ErrInvalidState returns 409", func(t *testing.T) {
+		mb := &mockBackend{
+			RestartFunc: func(context.Context, backend.RestartRequest) error {
+				return backend.ErrInvalidState
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "invalid state for restart")
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			RestartFunc: func(context.Context, backend.RestartRequest) error {
+				return fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleUpdate(t *testing.T) {
+	validBody := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+
+	t.Run("success returns 202", func(t *testing.T) {
+		mb := &mockBackend{
+			UpdateFunc: func(_ context.Context, req backend.UpdateRequest) error {
+				assert.Equal(t, "lease-1", req.LeaseUUID)
+				return nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+
+		assert.Equal(t, http.StatusAccepted, w.Code)
+		var resp StatusResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "updating", resp.Status)
+	})
+
+	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {
+		mb := &mockBackend{
+			UpdateFunc: func(context.Context, backend.UpdateRequest) error {
+				return backend.ErrNotProvisioned
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	t.Run("ErrInvalidState returns 409", func(t *testing.T) {
+		mb := &mockBackend{
+			UpdateFunc: func(context.Context, backend.UpdateRequest) error {
+				return backend.ErrInvalidState
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "invalid state for update")
+	})
+
+	t.Run("ErrUnknownSKU returns 400 with validation_code", func(t *testing.T) {
+		mb := &mockBackend{
+			UpdateFunc: func(context.Context, backend.UpdateRequest) error {
+				return fmt.Errorf("bad: %w", backend.ErrUnknownSKU)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		var errResp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+		assert.Equal(t, backend.ValidationCodeUnknownSKU, errResp.ValidationCode)
+	})
+
+	t.Run("ErrInvalidManifest returns 400 with validation_code", func(t *testing.T) {
+		mb := &mockBackend{
+			UpdateFunc: func(context.Context, backend.UpdateRequest) error {
+				return fmt.Errorf("bad: %w", backend.ErrInvalidManifest)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		var errResp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+		assert.Equal(t, backend.ValidationCodeInvalidManifest, errResp.ValidationCode)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			UpdateFunc: func(context.Context, backend.UpdateRequest) error {
+				return fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleGetReleases(t *testing.T) {
+	t.Run("success with releases returns 200", func(t *testing.T) {
+		releases := []backend.ReleaseInfo{
+			{Version: 1, Image: "nginx:1.0", Status: "ready"},
+			{Version: 2, Image: "nginx:2.0", Status: "ready"},
+		}
+		mb := &mockBackend{
+			GetReleasesFunc: func(_ context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+				assert.Equal(t, "lease-1", leaseUUID)
+				return releases, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/releases/lease-1"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got []backend.ReleaseInfo
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Len(t, got, 2)
+		assert.Equal(t, "nginx:2.0", got[1].Image)
+	})
+
+	t.Run("success empty returns 200", func(t *testing.T) {
+		mb := &mockBackend{
+			GetReleasesFunc: func(context.Context, string) ([]backend.ReleaseInfo, error) {
+				return []backend.ReleaseInfo{}, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/releases/lease-1"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got []backend.ReleaseInfo
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Empty(t, got)
+	})
+
+	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {
+		mb := &mockBackend{
+			GetReleasesFunc: func(context.Context, string) ([]backend.ReleaseInfo, error) {
+				return nil, backend.ErrNotProvisioned
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/releases/lease-1"))
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			GetReleasesFunc: func(context.Context, string) ([]backend.ReleaseInfo, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/releases/lease-1"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleHealth(t *testing.T) {
+	t.Run("healthy returns 200", func(t *testing.T) {
+		mb := &mockBackend{
+			HealthFunc: func(context.Context) error { return nil },
+		}
+		handler := newMockHandler(mb)
+
+		// No auth required for /health
+		req := httptest.NewRequest("GET", "/health", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var resp StatusResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "healthy", resp.Status)
+	})
+
+	t.Run("unhealthy returns 503", func(t *testing.T) {
+		mb := &mockBackend{
+			HealthFunc: func(context.Context) error { return fmt.Errorf("docker down") },
+		}
+		handler := newMockHandler(mb)
+
+		req := httptest.NewRequest("GET", "/health", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		assert.Contains(t, w.Body.String(), "docker down")
+	})
+}
+
+func TestHandleStats(t *testing.T) {
+	t.Run("returns computed stats", func(t *testing.T) {
+		mb := &mockBackend{
+			StatsFunc: func() shared.ResourceStats {
+				return shared.ResourceStats{
+					TotalCPU:          8.0,
+					TotalMemoryMB:     16384,
+					TotalDiskMB:       102400,
+					AllocatedCPU:      3.0,
+					AllocatedMemoryMB: 4096,
+					AllocatedDiskMB:   20480,
+					AllocationCount:   2,
+				}
+			},
+		}
+		handler := newMockHandler(mb)
+
+		// No auth required for /stats
+		req := httptest.NewRequest("GET", "/stats", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got StatsResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+
+		assert.InDelta(t, 8.0, got.TotalCPUCores, 0.001)
+		assert.Equal(t, int64(16384), got.TotalMemoryMB)
+		assert.Equal(t, int64(102400), got.TotalDiskMB)
+		assert.InDelta(t, 3.0, got.AllocatedCPUCores, 0.001)
+		assert.Equal(t, int64(4096), got.AllocatedMemoryMB)
+		assert.Equal(t, int64(20480), got.AllocatedDiskMB)
+
+		// Verify Available* fields are computed (Total - Allocated)
+		assert.InDelta(t, 5.0, got.AvailableCPUCores, 0.001)
+		assert.Equal(t, int64(12288), got.AvailableMemoryMB)
+		assert.Equal(t, int64(81920), got.AvailableDiskMB)
+
+		assert.Equal(t, 2, got.ActiveContainers)
+	})
 }
 
 func TestValidateCallbackURL(t *testing.T) {
