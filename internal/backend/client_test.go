@@ -1079,3 +1079,62 @@ func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
 	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
 }
+
+func TestIsStack(t *testing.T) {
+	t.Run("empty items", func(t *testing.T) {
+		assert.False(t, IsStack(nil))
+		assert.False(t, IsStack([]LeaseItem{}))
+	})
+
+	t.Run("all with ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		}
+		assert.True(t, IsStack(items))
+	})
+
+	t.Run("none with ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1},
+			{SKU: "docker-small", Quantity: 2},
+		}
+		assert.False(t, IsStack(items))
+	})
+
+	t.Run("single item with ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		}
+		assert.True(t, IsStack(items))
+	})
+
+	t.Run("single item without ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1},
+		}
+		assert.False(t, IsStack(items))
+	})
+
+	t.Run("mixed: first has, second doesn't", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1},
+		}
+		assert.PanicsWithValue(t,
+			`mixed ServiceName in lease items: items[0].ServiceName="web" but found ""`,
+			func() { IsStack(items) },
+		)
+	})
+
+	t.Run("mixed: first doesn't, second has", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		}
+		assert.PanicsWithValue(t,
+			`mixed ServiceName in lease items: items[0].ServiceName="" but found "db"`,
+			func() { IsStack(items) },
+		)
+	})
+}
