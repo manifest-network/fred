@@ -397,34 +397,38 @@ Returns connection details for a running lease. Only available when the provisio
 
 **Response (`200`, stack):**
 
-For stack provisions, instances are grouped by service name under a `"services"` map:
+For stack provisions, instances are grouped by service name under a `"services"` map. Each service value is an object with an `"instances"` key:
 
 ```json
 {
   "host": "192.168.1.100",
   "services": {
-    "web": [
-      {
-        "instance_index": 0,
-        "container_id": "abcdefghijkl",
-        "image": "ghcr.io/myorg/webapp:v2.1.0",
-        "status": "running",
-        "ports": {
-          "8080/tcp": { "host_ip": "0.0.0.0", "host_port": "32768" }
+    "web": {
+      "instances": [
+        {
+          "instance_index": 0,
+          "container_id": "abcdefghijkl",
+          "image": "ghcr.io/myorg/webapp:v2.1.0",
+          "status": "running",
+          "ports": {
+            "8080/tcp": { "host_ip": "0.0.0.0", "host_port": "32768" }
+          }
         }
-      }
-    ],
-    "db": [
-      {
-        "instance_index": 0,
-        "container_id": "mnopqrstuvwx",
-        "image": "postgres:16",
-        "status": "running",
-        "ports": {
-          "5432/tcp": { "host_ip": "0.0.0.0", "host_port": "32769" }
+      ]
+    },
+    "db": {
+      "instances": [
+        {
+          "instance_index": 0,
+          "container_id": "mnopqrstuvwx",
+          "image": "postgres:16",
+          "status": "running",
+          "ports": {
+            "5432/tcp": { "host_ip": "0.0.0.0", "host_port": "32769" }
+          }
         }
-      }
-    ]
+      ]
+    }
   }
 }
 ```
