@@ -56,6 +56,53 @@ func TestStackManifest_ServiceNameValidation(t *testing.T) {
 	}
 }
 
+func TestStackManifest_Validate_EmptyServices(t *testing.T) {
+	sm := StackManifest{Services: map[string]*DockerManifest{}}
+	err := sm.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least one service")
+}
+
+func TestStackManifest_Validate_NilServices(t *testing.T) {
+	sm := StackManifest{Services: nil}
+	err := sm.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least one service")
+}
+
+func TestStackManifest_Validate_NilServiceManifest(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": nil,
+		},
+	}
+	err := sm.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil manifest")
+}
+
+func TestStackManifest_Validate_EmptyServiceName(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*DockerManifest{
+			"": {Image: "nginx"},
+		},
+	}
+	err := sm.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty")
+}
+
+func TestStackManifest_Validate_InvalidServiceManifest(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: ""}, // image is required
+		},
+	}
+	err := sm.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "web")
+}
+
 func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 	t.Run("duplicate service names in items", func(t *testing.T) {
 		stack := &StackManifest{
