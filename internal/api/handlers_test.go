@@ -877,6 +877,83 @@ func TestExtractConnectionDetails(t *testing.T) {
 	}
 }
 
+func TestExtractConnectionDetails_Services(t *testing.T) {
+	t.Run("stack with two services", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"services": map[string]any{
+				"web": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "abc123",
+							"image":          "nginx:latest",
+							"status":         "running",
+							"ports": map[string]any{
+								"80/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "8080"},
+							},
+						},
+					},
+				},
+				"db": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "def456",
+							"image":          "postgres:16",
+							"status":         "running",
+						},
+					},
+				},
+			},
+		}
+
+		result := extractConnectionDetails(input)
+		assert.Equal(t, "docker-host.example.com", result.Host)
+		assert.Nil(t, result.Instances, "stack response should not have flat instances")
+		require.Len(t, result.Services, 2)
+
+		// web service
+		webSvc := result.Services["web"]
+		require.Len(t, webSvc.Instances, 1)
+		assert.Equal(t, 0, webSvc.Instances[0].InstanceIndex)
+		assert.Equal(t, "abc123", webSvc.Instances[0].ContainerID)
+		assert.Equal(t, "nginx:latest", webSvc.Instances[0].Image)
+		assert.Equal(t, "running", webSvc.Instances[0].Status)
+		require.Len(t, webSvc.Instances[0].Ports, 1)
+		assert.Equal(t, PortMapping{HostIP: "0.0.0.0", HostPort: 8080}, webSvc.Instances[0].Ports["80/tcp"])
+
+		// db service
+		dbSvc := result.Services["db"]
+		require.Len(t, dbSvc.Instances, 1)
+		assert.Equal(t, "postgres:16", dbSvc.Instances[0].Image)
+	})
+
+	t.Run("services field not in metadata", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"services": map[string]any{
+				"web": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "abc",
+						},
+					},
+				},
+			},
+			"region": "us-east-1",
+		}
+
+		result := extractConnectionDetails(input)
+		assert.Len(t, result.Services, 1)
+		assert.Equal(t, "us-east-1", result.Metadata["region"])
+		// "services" should NOT appear in metadata.
+		_, inMeta := result.Metadata["services"]
+		assert.False(t, inMeta)
+	})
+}
+
 // TestGetLeaseConnection_TokenReplayProtection tests the token replay protection.
 func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
