@@ -1082,8 +1082,13 @@ func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
 
 func TestIsStack(t *testing.T) {
 	t.Run("empty items", func(t *testing.T) {
-		assert.False(t, IsStack(nil))
-		assert.False(t, IsStack([]LeaseItem{}))
+		result, err := IsStack(nil)
+		require.NoError(t, err)
+		assert.False(t, result)
+
+		result, err = IsStack([]LeaseItem{})
+		require.NoError(t, err)
+		assert.False(t, result)
 	})
 
 	t.Run("all with ServiceName", func(t *testing.T) {
@@ -1091,7 +1096,9 @@ func TestIsStack(t *testing.T) {
 			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
 		}
-		assert.True(t, IsStack(items))
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.True(t, result)
 	})
 
 	t.Run("none with ServiceName", func(t *testing.T) {
@@ -1099,21 +1106,27 @@ func TestIsStack(t *testing.T) {
 			{SKU: "docker-small", Quantity: 1},
 			{SKU: "docker-small", Quantity: 2},
 		}
-		assert.False(t, IsStack(items))
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.False(t, result)
 	})
 
 	t.Run("single item with ServiceName", func(t *testing.T) {
 		items := []LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
 		}
-		assert.True(t, IsStack(items))
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.True(t, result)
 	})
 
 	t.Run("single item without ServiceName", func(t *testing.T) {
 		items := []LeaseItem{
 			{SKU: "docker-small", Quantity: 1},
 		}
-		assert.False(t, IsStack(items))
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.False(t, result)
 	})
 
 	t.Run("mixed: first has, second doesn't", func(t *testing.T) {
@@ -1121,10 +1134,9 @@ func TestIsStack(t *testing.T) {
 			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-small", Quantity: 1},
 		}
-		assert.PanicsWithValue(t,
-			`mixed ServiceName in lease items: items[0].ServiceName="web" but found ""`,
-			func() { IsStack(items) },
-		)
+		_, err := IsStack(items)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mixed")
 	})
 
 	t.Run("mixed: first doesn't, second has", func(t *testing.T) {
@@ -1132,9 +1144,8 @@ func TestIsStack(t *testing.T) {
 			{SKU: "docker-small", Quantity: 1},
 			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
 		}
-		assert.PanicsWithValue(t,
-			`mixed ServiceName in lease items: items[0].ServiceName="" but found "db"`,
-			func() { IsStack(items) },
-		)
+		_, err := IsStack(items)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mixed")
 	})
 }

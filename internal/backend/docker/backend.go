@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -249,13 +248,7 @@ func containerLogKeys(prov *provision) map[string]string {
 	if prov == nil || !prov.IsStack() {
 		return nil
 	}
-	keys := make(map[string]string)
-	for svcName, cids := range prov.ServiceContainers {
-		for i, cid := range cids {
-			keys[cid] = fmt.Sprintf("%s/%d", svcName, i)
-		}
-	}
-	return keys
+	return stackContainerLogKeys(prov.ServiceContainers)
 }
 
 // stackContainerLogKeys builds a containerID → display key mapping from a
@@ -588,7 +581,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	}
 
 	// Parse payload — auto-detects single manifest vs stack manifest.
-	isStack := backend.IsStack(req.Items)
+	isStack, err := backend.IsStack(req.Items)
+	if err != nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
 	manifest, stackManifest, parseErr := ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.removeProvision(req.LeaseUUID)
@@ -830,7 +827,7 @@ func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manife
 	for v := range imageInfo.Volumes {
 		volumes = append(volumes, v)
 	}
-	sort.Strings(volumes)
+	slices.Sort(volumes)
 
 	result := &imageSetup{Volumes: volumes}
 
@@ -936,6 +933,30 @@ func (b *Backend) setupVolumeBinds(ctx context.Context, leaseUUID string, instan
 		if volumeUID != 0 || volumeGID != 0 {
 			if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
 				return nil, fmt.Errorf("volume subdir chown failed (instance %d): %w", instanceIndex, chownErr)
+			}
+		}
+		binds[subdir] = volPath
+	}
+	return binds, nil
+}
+
+// buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
+// under hostPath and returns bind mount mappings. Returns an error if any
+// VOLUME path cannot be sanitized (unsupported path format).
+func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
+	binds := make(map[string]string, len(imageVolumes))
+	for _, volPath := range imageVolumes {
+		sanitized := sanitizeVolumePath(volPath)
+		if sanitized == "" {
+			return nil, fmt.Errorf("image declares unsupported VOLUME path %q", volPath)
+		}
+		subdir := filepath.Join(hostPath, sanitized)
+		if err := os.MkdirAll(subdir, 0o700); err != nil {
+			return nil, fmt.Errorf("volume subdir %q: %w", subdir, err)
+		}
+		if uid != 0 || gid != 0 {
+			if err := os.Chown(subdir, uid, gid); err != nil {
+				return nil, fmt.Errorf("chown volume subdir %q: %w", subdir, err)
 			}
 		}
 		binds[subdir] = volPath
@@ -1201,30 +1222,12 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 					// Set up VOLUME path subdirs (if stateful)
 					if needsStatefulVolume {
-						volumeBinds = make(map[string]string, len(imgSetup.Volumes))
-						for _, volPath := range imgSetup.Volumes {
-							sanitized := sanitizeVolumePath(volPath)
-							if sanitized == "" {
-								err = fmt.Errorf("image declares unsupported VOLUME path %q that cannot be quota-enforced (instance %d, sku %s)", volPath, instanceIndex, item.SKU)
-								callbackErr = "image has unsupported VOLUME path"
-								return
-							}
-							subdir := filepath.Join(hostPath, sanitized)
-							if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
-								instanceLogger.Error("failed to create volume subdir", "path", subdir, "error", mkErr)
-								err = fmt.Errorf("volume subdir creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, mkErr)
-								callbackErr = "volume creation failed"
-								return
-							}
-							if imgSetup.VolumeUID != 0 || imgSetup.VolumeGID != 0 {
-								if chownErr := os.Chown(subdir, imgSetup.VolumeUID, imgSetup.VolumeGID); chownErr != nil {
-									instanceLogger.Error("failed to chown volume subdir", "path", subdir, "uid", imgSetup.VolumeUID, "gid", imgSetup.VolumeGID, "error", chownErr)
-									err = fmt.Errorf("volume subdir chown failed (instance %d, sku %s): %w", instanceIndex, item.SKU, chownErr)
-									callbackErr = "volume creation failed"
-									return
-								}
-							}
-							volumeBinds[subdir] = volPath
+						var buildErr error
+						volumeBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+						if buildErr != nil {
+							err = fmt.Errorf("volume setup failed (instance %d, sku %s): %w", instanceIndex, item.SKU, buildErr)
+							callbackErr = "volume creation failed"
+							return
 						}
 					}
 
@@ -1466,28 +1469,12 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 						createdVolumeIDs = append(createdVolumeIDs, volumeID)
 					}
 					if needsStatefulVolume {
-						volumeBinds = make(map[string]string, len(imgSetup.Volumes))
-						for _, volPath := range imgSetup.Volumes {
-							sanitized := sanitizeVolumePath(volPath)
-							if sanitized == "" {
-								err = fmt.Errorf("image declares unsupported VOLUME path %q (service %s, instance %d)", volPath, svcName, i)
-								callbackErr = "image has unsupported VOLUME path"
-								return
-							}
-							subdir := filepath.Join(hostPath, sanitized)
-							if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
-								err = fmt.Errorf("volume subdir creation failed (service %s, instance %d): %w", svcName, i, mkErr)
-								callbackErr = "volume creation failed"
-								return
-							}
-							if imgSetup.VolumeUID != 0 || imgSetup.VolumeGID != 0 {
-								if chownErr := os.Chown(subdir, imgSetup.VolumeUID, imgSetup.VolumeGID); chownErr != nil {
-									err = fmt.Errorf("volume subdir chown failed (service %s, instance %d): %w", svcName, i, chownErr)
-									callbackErr = "volume creation failed"
-									return
-								}
-							}
-							volumeBinds[subdir] = volPath
+						var buildErr error
+						volumeBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+						if buildErr != nil {
+							err = fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
+							callbackErr = "volume creation failed"
+							return
 						}
 					}
 					if needsWritableVolume {
@@ -1957,28 +1944,12 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 					op.Logger.Warn("writable path content seeding unavailable on "+op.Operation, "service", svcName, "error", volErr)
 				} else {
 					if needsStatefulVolume {
-						volumeBinds = make(map[string]string, len(imgSetup.Volumes))
-						for _, volPath := range imgSetup.Volumes {
-							sanitized := sanitizeVolumePath(volPath)
-							if sanitized == "" {
-								err = fmt.Errorf("image declares unsupported VOLUME path %q (service %s, instance %d)", volPath, svcName, i)
-								callbackErr = "image has unsupported VOLUME path"
-								return
-							}
-							subdir := filepath.Join(hostPath, sanitized)
-							if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
-								err = fmt.Errorf("volume subdir creation failed (service %s, instance %d): %w", svcName, i, mkErr)
-								callbackErr = op.Operation + " failed"
-								return
-							}
-							if imgSetup.VolumeUID != 0 || imgSetup.VolumeGID != 0 {
-								if chownErr := os.Chown(subdir, imgSetup.VolumeUID, imgSetup.VolumeGID); chownErr != nil {
-									err = fmt.Errorf("volume subdir chown failed (service %s, instance %d): %w", svcName, i, chownErr)
-									callbackErr = op.Operation + " failed"
-									return
-								}
-							}
-							volumeBinds[subdir] = volPath
+						var buildErr error
+						volumeBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+						if buildErr != nil {
+							err = fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
+							callbackErr = op.Operation + " failed"
+							return
 						}
 					}
 					if needsWritableVolume {
