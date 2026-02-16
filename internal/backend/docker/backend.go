@@ -258,6 +258,22 @@ func containerLogKeys(prov *provision) map[string]string {
 	return keys
 }
 
+// stackContainerLogKeys builds a containerID → display key mapping from a
+// service containers map. Used by stack error paths that have a local
+// serviceContainers map but no provision pointer.
+func stackContainerLogKeys(serviceContainers map[string][]string) map[string]string {
+	if len(serviceContainers) == 0 {
+		return nil
+	}
+	keys := make(map[string]string)
+	for svcName, cids := range serviceContainers {
+		for i, cid := range cids {
+			keys[cid] = fmt.Sprintf("%s/%d", svcName, i)
+		}
+	}
+	return keys
+}
+
 // New creates a new Docker backend.
 func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	if err := cfg.Validate(); err != nil {
@@ -500,6 +516,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	var prevFailCount int
 	var oldContainerIDs []string
 	var oldQuantity int
+	var oldItems []backend.LeaseItem // non-nil for stacks, needed for service-aware release
 	b.provisionsMu.Lock()
 	if existing, exists := b.provisions[req.LeaseUUID]; exists {
 		if existing.Status != backend.ProvisionStatusFailed {
@@ -510,6 +527,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		prevFailCount = existing.FailCount
 		oldContainerIDs = existing.ContainerIDs
 		oldQuantity = existing.Quantity
+		oldItems = existing.Items
 		delete(b.provisions, req.LeaseUUID)
 	}
 	b.provisions[req.LeaseUUID] = &provision{
@@ -527,8 +545,18 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 
 	// Clean up old failed provision resources outside the lock.
 	if oldQuantity > 0 {
-		for i := 0; i < oldQuantity; i++ {
-			b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
+		if len(oldItems) > 0 {
+			// Stack: release service-aware allocation IDs.
+			for _, item := range oldItems {
+				for i := 0; i < item.Quantity; i++ {
+					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
+				}
+			}
+		} else {
+			// Legacy: release index-based allocation IDs.
+			for i := 0; i < oldQuantity; i++ {
+				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
+			}
 		}
 		// Remove old containers but keep volumes — stateful data persists
 		// across re-provisions. Volumes are reused via idempotent Create in
@@ -1297,7 +1325,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 				diagSnap = diagnosticSnapshot(prov)
 			}
 			b.provisionsMu.Unlock()
-			b.persistDiagnostics(diagSnap, containerIDs)
+			b.persistDiagnostics(diagSnap, containerIDs, stackContainerLogKeys(serviceContainers))
 
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
@@ -1512,27 +1540,13 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		}
 	}
 
-	// Build a synthetic manifest for startup verification (uses the first service's health check config).
-	// For stacks, verify all containers regardless of which service they belong to.
-	// We use a representative manifest that has a health check if any service has one.
-	var verifyManifest *DockerManifest
-	for _, svc := range stack.Services {
-		if svc.HasActiveHealthCheck() {
-			verifyManifest = svc
-			break
+	// Verify startup per-service so each service uses its own health check config.
+	for svcName, svcCIDs := range serviceContainers {
+		svc := stack.Services[svcName]
+		if err = b.verifyStartup(ctx, svc, svcCIDs, logger.With("service", svcName)); err != nil {
+			callbackErr = startupErrorToCallbackMsg(err)
+			return
 		}
-	}
-	if verifyManifest == nil {
-		// Pick any service manifest for the basic startup check.
-		for _, svc := range stack.Services {
-			verifyManifest = svc
-			break
-		}
-	}
-
-	if err = b.verifyStartup(ctx, verifyManifest, containerIDs, logger); err != nil {
-		callbackErr = startupErrorToCallbackMsg(err)
-		return
 	}
 
 	logger.Info("all stack containers provisioned and verified", "count", len(containerIDs), "services", len(stack.Services))
@@ -1784,7 +1798,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 				diagSnap = diagnosticSnapshot(prov)
 			}
 			b.provisionsMu.Unlock()
-			b.persistDiagnostics(diagSnap, newContainerIDs)
+			b.persistDiagnostics(diagSnap, newContainerIDs, stackContainerLogKeys(newServiceContainers))
 
 			if b.releaseStore != nil {
 				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", err.Error()); relErr != nil {
@@ -1920,25 +1934,56 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 		imgSetup := imageSetups[svcName]
 
 		for i := 0; i < item.Quantity; i++ {
-			volumeBinds, volErr := b.setupVolumeBinds(ctx, op.LeaseUUID, i, profile.DiskMB, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
-			if volErr != nil {
-				err = volErr
-				callbackErr = op.Operation + " failed"
-				return
-			}
-
+			// Inline volume setup with service-aware volume ID
+			// (cannot use setupVolumeBinds which uses legacy fred-{uuid}-{i} format).
+			var volumeBinds map[string]string
 			var writablePathBinds map[string]string
-			if len(imgSetup.WritablePaths) > 0 {
+			needsStatefulVolume := profile.DiskMB > 0 && len(imgSetup.Volumes) > 0
+			needsWritableVolume := len(imgSetup.WritablePaths) > 0
+
+			if needsStatefulVolume || needsWritableVolume {
 				volumeID := fmt.Sprintf("fred-%s-%s-%d", op.LeaseUUID, svcName, i)
 				sizeMB := profile.DiskMB
 				if sizeMB <= 0 {
 					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
 				}
-				hostPath, _, wpVolErr := b.volumes.Create(ctx, volumeID, sizeMB)
-				if wpVolErr == nil {
-					writablePathBinds = b.setupWritablePathBinds(ctx, svc.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
+				hostPath, _, volErr := b.volumes.Create(ctx, volumeID, sizeMB)
+				if volErr != nil {
+					if needsStatefulVolume {
+						err = fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
+						callbackErr = op.Operation + " failed"
+						return
+					}
+					op.Logger.Warn("writable path content seeding unavailable on "+op.Operation, "service", svcName, "error", volErr)
 				} else {
-					op.Logger.Warn("writable path content seeding unavailable on "+op.Operation, "service", svcName, "error", wpVolErr)
+					if needsStatefulVolume {
+						volumeBinds = make(map[string]string, len(imgSetup.Volumes))
+						for _, volPath := range imgSetup.Volumes {
+							sanitized := sanitizeVolumePath(volPath)
+							if sanitized == "" {
+								err = fmt.Errorf("image declares unsupported VOLUME path %q (service %s, instance %d)", volPath, svcName, i)
+								callbackErr = "image has unsupported VOLUME path"
+								return
+							}
+							subdir := filepath.Join(hostPath, sanitized)
+							if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
+								err = fmt.Errorf("volume subdir creation failed (service %s, instance %d): %w", svcName, i, mkErr)
+								callbackErr = op.Operation + " failed"
+								return
+							}
+							if imgSetup.VolumeUID != 0 || imgSetup.VolumeGID != 0 {
+								if chownErr := os.Chown(subdir, imgSetup.VolumeUID, imgSetup.VolumeGID); chownErr != nil {
+									err = fmt.Errorf("volume subdir chown failed (service %s, instance %d): %w", svcName, i, chownErr)
+									callbackErr = op.Operation + " failed"
+									return
+								}
+							}
+							volumeBinds[subdir] = volPath
+						}
+					}
+					if needsWritableVolume {
+						writablePathBinds = b.setupWritablePathBinds(ctx, svc.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
+					}
 				}
 			}
 
@@ -1980,24 +2025,13 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 		}
 	}
 
-	// Startup verification using a representative manifest.
-	var verifyManifest *DockerManifest
-	for _, svc := range op.Stack.Services {
-		if svc.HasActiveHealthCheck() {
-			verifyManifest = svc
-			break
+	// Verify startup per-service so each service uses its own health check config.
+	for svcName, svcCIDs := range newServiceContainers {
+		svc := op.Stack.Services[svcName]
+		if err = b.verifyStartup(ctx, svc, svcCIDs, op.Logger.With("service", svcName)); err != nil {
+			callbackErr = startupErrorToCallbackMsg(err)
+			return
 		}
-	}
-	if verifyManifest == nil {
-		for _, svc := range op.Stack.Services {
-			verifyManifest = svc
-			break
-		}
-	}
-
-	if err = b.verifyStartup(ctx, verifyManifest, newContainerIDs, op.Logger); err != nil {
-		callbackErr = startupErrorToCallbackMsg(err)
-		return
 	}
 
 	op.Logger.Info(op.Operation+" completed (stack)", "containers", len(newContainerIDs))
@@ -2025,7 +2059,10 @@ func (b *Backend) rollbackStackContainers(leaseUUID string, serviceContainers ma
 
 			canonicalName := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, svcName, i)
 			if renameErr := b.docker.RenameContainer(ctx, cid, canonicalName); renameErr != nil {
-				logger.Error("rollback: failed to rename container", "service", svcName, "container_id", shortID(cid), "error", renameErr)
+				// Skip start — running under the -prev name would lack the
+				// service network alias, breaking inter-service DNS.
+				logger.Error("rollback: failed to rename container, skipping start", "service", svcName, "container_id", shortID(cid), "error", renameErr)
+				continue
 			}
 			if startErr := b.docker.StartContainer(ctx, cid, 30*time.Second); startErr != nil {
 				logger.Error("rollback: failed to restart container", "service", svcName, "container_id", shortID(cid), "error", startErr)

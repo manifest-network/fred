@@ -4,12 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
+
+// serviceNameRe restricts service names to DNS-label-safe characters.
+// This prevents path traversal, invalid Docker container names, and
+// other injection via service names interpolated into container names,
+// volume IDs, filesystem paths, and network aliases.
+var serviceNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 // maxTmpfsMounts is the maximum number of additional tmpfs mounts a tenant can request.
 // Combined with the automatic /tmp and /run mounts (2), and the default 64MB per mount,
@@ -367,6 +374,12 @@ func (s *StackManifest) Validate() error {
 		if name == "" {
 			return fmt.Errorf("service name cannot be empty")
 		}
+		if len(name) > 63 {
+			return fmt.Errorf("service name %q exceeds 63 characters", name)
+		}
+		if !serviceNameRe.MatchString(name) {
+			return fmt.Errorf("service name %q must match [a-z0-9]([a-z0-9-]*[a-z0-9])?", name)
+		}
 		if svc == nil {
 			return fmt.Errorf("service %q has nil manifest", name)
 		}
@@ -421,6 +434,9 @@ func ValidateStackAgainstItems(stack *StackManifest, items []backend.LeaseItem) 
 
 	itemNames := make(map[string]bool, len(items))
 	for _, item := range items {
+		if itemNames[item.ServiceName] {
+			return fmt.Errorf("duplicate lease item service name %q", item.ServiceName)
+		}
 		itemNames[item.ServiceName] = true
 	}
 
