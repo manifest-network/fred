@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // maxTmpfsMounts is the maximum number of additional tmpfs mounts a tenant can request.
@@ -344,6 +346,96 @@ func validateTmpfsPaths(paths []string) error {
 			return fmt.Errorf("tmpfs: duplicate path: %q", cleaned)
 		}
 		seen[cleaned] = true
+	}
+
+	return nil
+}
+
+// StackManifest represents a multi-service deployment where each service
+// has its own DockerManifest. The services map is keyed by service name
+// (matching LeaseItem.ServiceName from the chain).
+type StackManifest struct {
+	Services map[string]*DockerManifest `json:"services"`
+}
+
+// Validate checks that the stack manifest is valid.
+func (s *StackManifest) Validate() error {
+	if len(s.Services) == 0 {
+		return fmt.Errorf("stack manifest must have at least one service")
+	}
+	for name, svc := range s.Services {
+		if name == "" {
+			return fmt.Errorf("service name cannot be empty")
+		}
+		if svc == nil {
+			return fmt.Errorf("service %q has nil manifest", name)
+		}
+		if err := svc.Validate(); err != nil {
+			return fmt.Errorf("service %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// ParsePayload auto-detects whether data is a single DockerManifest or a
+// StackManifest (contains a "services" key). Returns exactly one non-nil result.
+func ParsePayload(data []byte) (*DockerManifest, *StackManifest, error) {
+	if len(data) == 0 {
+		return nil, nil, fmt.Errorf("payload is empty")
+	}
+
+	// Probe for the "services" key to detect stack format.
+	var probe struct {
+		Services json.RawMessage `json:"services"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, nil, fmt.Errorf("invalid payload JSON: %w", err)
+	}
+
+	if probe.Services != nil {
+		var stack StackManifest
+		if err := json.Unmarshal(data, &stack); err != nil {
+			return nil, nil, fmt.Errorf("invalid stack manifest JSON: %w", err)
+		}
+		if err := stack.Validate(); err != nil {
+			return nil, nil, err
+		}
+		return nil, &stack, nil
+	}
+
+	manifest, err := ParseManifest(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifest, nil, nil
+}
+
+// ValidateStackAgainstItems ensures a 1:1 mapping between manifest service
+// names and lease item service names. Every lease item must have a matching
+// service in the manifest, and vice versa.
+func ValidateStackAgainstItems(stack *StackManifest, items []backend.LeaseItem) error {
+	manifestNames := make(map[string]bool, len(stack.Services))
+	for name := range stack.Services {
+		manifestNames[name] = true
+	}
+
+	itemNames := make(map[string]bool, len(items))
+	for _, item := range items {
+		itemNames[item.ServiceName] = true
+	}
+
+	// Check for services in manifest but not in lease items.
+	for name := range manifestNames {
+		if !itemNames[name] {
+			return fmt.Errorf("manifest service %q has no matching lease item", name)
+		}
+	}
+
+	// Check for lease items not in manifest.
+	for name := range itemNames {
+		if !manifestNames[name] {
+			return fmt.Errorf("lease item service %q has no matching manifest service", name)
+		}
 	}
 
 	return nil

@@ -73,8 +73,19 @@ type Backend interface {
 
 // LeaseItem represents a single SKU with its quantity in a lease.
 type LeaseItem struct {
-	SKU      string `json:"sku"`
-	Quantity int    `json:"quantity"`
+	SKU         string `json:"sku"`
+	Quantity    int    `json:"quantity"`
+	ServiceName string `json:"service_name,omitempty"`
+}
+
+// IsStack returns true when the lease items represent a stack (multi-service deployment).
+// A stack lease has ServiceName set on every item. Legacy leases have no ServiceName
+// on any item. The modes are all-or-nothing (enforced on-chain).
+func IsStack(items []LeaseItem) bool {
+	if len(items) == 0 {
+		return false
+	}
+	return items[0].ServiceName != ""
 }
 
 // ProvisionRequest contains the data needed to provision a resource.

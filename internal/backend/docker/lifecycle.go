@@ -44,6 +44,7 @@ const (
 	LabelFailCount     = "fred.fail_count"
 	LabelCallbackURL   = "fred.callback_url"
 	LabelBackendName   = "fred.backend_name"
+	LabelServiceName   = "fred.service_name"
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
@@ -63,6 +64,7 @@ type ContainerInfo struct {
 	Tenant        string
 	ProviderUUID  string
 	SKU           string
+	ServiceName   string // Stack service name (empty for legacy single-container leases)
 	InstanceIndex int
 	FailCount     int
 	CallbackURL   string
@@ -772,6 +774,7 @@ type CreateContainerParams struct {
 	Tenant        string
 	ProviderUUID  string
 	SKU           string
+	ServiceName   string // Stack service name (empty for legacy)
 	Manifest      *DockerManifest
 	Profile       SKUProfile
 	InstanceIndex int // For multi-unit leases (0-based index)
@@ -866,6 +869,9 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		LabelFailCount:     strconv.Itoa(params.FailCount),
 		LabelCallbackURL:   params.CallbackURL,
 		LabelBackendName:   params.BackendName,
+	}
+	if params.ServiceName != "" {
+		labels[LabelServiceName] = params.ServiceName
 	}
 
 	// Add user labels (already validated to not conflict with fred.*)
@@ -997,12 +1003,29 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		}
 	}
 
-	// Generate container name from lease UUID and instance index
-	containerName := fmt.Sprintf("fred-%s-%d", params.LeaseUUID, params.InstanceIndex)
+	// Generate container name: stack uses service name, legacy uses instance index only.
+	var containerName string
+	if params.ServiceName != "" {
+		containerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, params.ServiceName, params.InstanceIndex)
+	} else {
+		containerName = fmt.Sprintf("fred-%s-%d", params.LeaseUUID, params.InstanceIndex)
+	}
 
 	networkConfig := params.NetworkConfig
 	if networkConfig == nil {
 		networkConfig = &networktypes.NetworkingConfig{}
+	}
+
+	// For stack services, add the service name as a Docker network alias
+	// so other services in the stack can resolve it by name (e.g., "redis").
+	if params.ServiceName != "" {
+		for netName, epCfg := range networkConfig.EndpointsConfig {
+			if epCfg == nil {
+				epCfg = &networktypes.EndpointSettings{}
+				networkConfig.EndpointsConfig[netName] = epCfg
+			}
+			epCfg.Aliases = append(epCfg.Aliases, params.ServiceName)
+		}
 	}
 
 	// Attempt creation with retry for ephemeral port conflicts.
@@ -1172,6 +1195,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		Tenant:        resp.Config.Labels[LabelTenant],
 		ProviderUUID:  resp.Config.Labels[LabelProviderUUID],
 		SKU:           resp.Config.Labels[LabelSKU],
+		ServiceName:   resp.Config.Labels[LabelServiceName],
 		CallbackURL:   resp.Config.Labels[LabelCallbackURL],
 		Image:         resp.Config.Image,
 		Status:        resp.State.Status,
@@ -1234,6 +1258,7 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			Tenant:        c.Labels[LabelTenant],
 			ProviderUUID:  c.Labels[LabelProviderUUID],
 			SKU:           c.Labels[LabelSKU],
+			ServiceName:   c.Labels[LabelServiceName],
 			CallbackURL:   c.Labels[LabelCallbackURL],
 			Image:         c.Image,
 			Status:        c.State,
