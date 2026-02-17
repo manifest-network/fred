@@ -334,6 +334,50 @@ func TestStackManifest_DependsOn_HealthyWithoutHealthCheck(t *testing.T) {
 	assert.Contains(t, err.Error(), "health_check")
 }
 
+func TestStackManifest_DependsOn_HealthyWithNoneHealthCheck(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image: "nginx",
+				DependsOn: map[string]DependsOnCondition{
+					"db": {Condition: "service_healthy"},
+				},
+			},
+			"db": {
+				Image: "postgres",
+				HealthCheck: &HealthCheckConfig{
+					Test: []string{"NONE"}, // disabled health check
+				},
+			},
+		},
+	}
+	err := sm.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "health_check")
+}
+
+func TestStackManifest_DependsOn_MultipleDependencies(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image: "nginx",
+				DependsOn: map[string]DependsOnCondition{
+					"db":    {Condition: "service_healthy"},
+					"cache": {Condition: "service_started"},
+				},
+			},
+			"db": {
+				Image: "postgres",
+				HealthCheck: &HealthCheckConfig{
+					Test: []string{"CMD", "pg_isready"},
+				},
+			},
+			"cache": {Image: "redis"},
+		},
+	}
+	assert.NoError(t, sm.Validate())
+}
+
 func TestStackManifest_DependsOn_CycleDirectAB(t *testing.T) {
 	sm := StackManifest{
 		Services: map[string]*DockerManifest{
