@@ -55,8 +55,7 @@ func TestBuildComposeProject_BasicMapping(t *testing.T) {
 		},
 	}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	assert.Equal(t, "fred-lease-1", project.Name)
 	require.Contains(t, project.Services, "web")
@@ -82,8 +81,7 @@ func TestBuildComposeProject_ResourceLimits(t *testing.T) {
 	params := baseProjectParams()
 	params.Profiles["docker-small"] = SKUProfile{CPUCores: 2.0, MemoryMB: 1024}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.NotNil(t, svc.Deploy)
@@ -108,8 +106,7 @@ func TestBuildComposeProject_Labels(t *testing.T) {
 		"app.version": "1.0",
 	}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Equal(t, "true", svc.Labels[LabelManaged])
@@ -136,8 +133,7 @@ func TestBuildComposeProject_HealthCheck(t *testing.T) {
 		StartPeriod: Duration(30 * time.Second),
 	}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.NotNil(t, svc.HealthCheck)
@@ -151,8 +147,7 @@ func TestBuildComposeProject_HealthCheck(t *testing.T) {
 func TestBuildComposeProject_NoHealthCheck(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Nil(t, svc.HealthCheck)
@@ -161,8 +156,7 @@ func TestBuildComposeProject_NoHealthCheck(t *testing.T) {
 func TestBuildComposeProject_CapDropAll(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Contains(t, svc.CapDrop, "ALL")
@@ -171,8 +165,7 @@ func TestBuildComposeProject_CapDropAll(t *testing.T) {
 func TestBuildComposeProject_SecurityOpt(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Contains(t, svc.SecurityOpt, "no-new-privileges:true")
@@ -181,8 +174,7 @@ func TestBuildComposeProject_SecurityOpt(t *testing.T) {
 func TestBuildComposeProject_ReadOnlyRootfs(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.True(t, svc.ReadOnly)
@@ -191,8 +183,7 @@ func TestBuildComposeProject_ReadOnlyRootfs(t *testing.T) {
 func TestBuildComposeProject_RestartPolicyDisabled(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	// Service-level restart.
@@ -206,8 +197,7 @@ func TestBuildComposeProject_RestartPolicyDisabled(t *testing.T) {
 func TestBuildComposeProject_PullPolicyNever(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Equal(t, "never", svc.PullPolicy)
@@ -225,8 +215,7 @@ func TestBuildComposeProject_StatefulVolumeBinds(t *testing.T) {
 		},
 	}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	var bindVols []string
@@ -250,8 +239,7 @@ func TestBuildComposeProject_WritablePathBinds(t *testing.T) {
 		},
 	}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	var found bool
@@ -271,8 +259,7 @@ func TestBuildComposeProject_EphemeralVolumeOverride(t *testing.T) {
 	}
 	// No VolBinds → should get tmpfs overrides.
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	var tmpfsTargets []string
@@ -289,8 +276,7 @@ func TestBuildComposeProject_TmpfsSizeLimits(t *testing.T) {
 	params := baseProjectParams()
 	params.Cfg.ContainerTmpfsSizeMB = 128
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	expectedSize := int64(128 * 1024 * 1024)
@@ -305,8 +291,7 @@ func TestBuildComposeProject_TmpfsSizeLimits(t *testing.T) {
 func TestBuildComposeProject_NoAnonymousVolumes(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	// No Docker-managed volumes should be in the project.
 	assert.Empty(t, project.Volumes)
@@ -326,8 +311,7 @@ func TestBuildComposeProject_QuantityFanOut(t *testing.T) {
 	}
 	params.ImageSetups["web"] = &imageSetup{}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	assert.Contains(t, project.Services, "web-0")
 	assert.Contains(t, project.Services, "web-1")
@@ -342,8 +326,7 @@ func TestBuildComposeProject_FanOutDNSAlias(t *testing.T) {
 	}
 	params.ImageSetups["web"] = &imageSetup{}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	for _, svcName := range []string{"web-0", "web-1"} {
 		svc := project.Services[svcName]
@@ -360,8 +343,7 @@ func TestBuildComposeProject_ContainerNaming(t *testing.T) {
 	}
 	params.ImageSetups["web"] = &imageSetup{}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	assert.Equal(t, "fred-lease-1-web-0", project.Services["web-0"].ContainerName)
 	assert.Equal(t, "fred-lease-1-web-1", project.Services["web-1"].ContainerName)
@@ -371,8 +353,7 @@ func TestBuildComposeProject_ExternalNetwork(t *testing.T) {
 	params := baseProjectParams()
 	params.NetworkName = "fred-tenant-abc123"
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	require.Contains(t, project.Networks, "default")
 	net := project.Networks["default"]
@@ -383,8 +364,7 @@ func TestBuildComposeProject_ExternalNetwork(t *testing.T) {
 func TestBuildComposeProject_NoExtraNetworks(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	// Only "default" network should be present.
 	assert.Len(t, project.Networks, 1)
@@ -395,8 +375,7 @@ func TestBuildComposeProject_NoNetworkWhenIsolationDisabled(t *testing.T) {
 	params := baseProjectParams()
 	params.NetworkName = ""
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	assert.Empty(t, project.Networks)
 }
@@ -418,8 +397,7 @@ func TestBuildComposeProject_MultiService(t *testing.T) {
 		"db":  {},
 	}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	assert.Len(t, project.Services, 2)
 	assert.Contains(t, project.Services, "web")
@@ -434,8 +412,7 @@ func TestBuildComposeProject_UserFromImageSetup(t *testing.T) {
 		ContainerUser: "999:999",
 	}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Equal(t, "999:999", svc.User)
@@ -445,8 +422,7 @@ func TestBuildComposeProject_TmpfsMounts(t *testing.T) {
 	params := baseProjectParams()
 	params.Stack.Services["web"].Tmpfs = []string{"/var/cache/nginx", "/var/log/nginx"}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	var tmpfsTargets []string
@@ -482,8 +458,7 @@ func TestBuildComposeProject_DependsOn_Simple(t *testing.T) {
 	}
 	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.Contains(t, svc.DependsOn, "db")
@@ -520,8 +495,7 @@ func TestBuildComposeProject_DependsOn_FanOutDep(t *testing.T) {
 	}
 	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.Len(t, svc.DependsOn, 2)
@@ -551,8 +525,7 @@ func TestBuildComposeProject_DependsOn_BothFanOut(t *testing.T) {
 	}
 	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	for _, name := range []string{"web-0", "web-1"} {
 		svc := project.Services[name]
@@ -569,8 +542,7 @@ func TestBuildComposeProject_StopGracePeriod_Set(t *testing.T) {
 	d := Duration(30 * time.Second)
 	params.Stack.Services["web"].StopGracePeriod = &d
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.NotNil(t, svc.StopGracePeriod)
@@ -580,8 +552,7 @@ func TestBuildComposeProject_StopGracePeriod_Set(t *testing.T) {
 func TestBuildComposeProject_StopGracePeriod_NotSet(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Nil(t, svc.StopGracePeriod)
@@ -594,8 +565,7 @@ func TestBuildComposeProject_Init_True(t *testing.T) {
 	trueVal := true
 	params.Stack.Services["web"].Init = &trueVal
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.NotNil(t, svc.Init)
@@ -607,8 +577,7 @@ func TestBuildComposeProject_Init_False(t *testing.T) {
 	falseVal := false
 	params.Stack.Services["web"].Init = &falseVal
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.NotNil(t, svc.Init)
@@ -618,8 +587,7 @@ func TestBuildComposeProject_Init_False(t *testing.T) {
 func TestBuildComposeProject_Init_NotSet(t *testing.T) {
 	params := baseProjectParams()
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	assert.Nil(t, svc.Init)
@@ -631,8 +599,7 @@ func TestBuildComposeProject_Expose(t *testing.T) {
 	params := baseProjectParams()
 	params.Stack.Services["web"].Expose = []string{"3000", "8080"}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	svc := project.Services["web"]
 	require.Len(t, svc.Expose, 2)
@@ -645,8 +612,7 @@ func TestBuildComposeProject_Expose(t *testing.T) {
 func TestBuildComposeProject_ServiceConfigName(t *testing.T) {
 	t.Run("single instance", func(t *testing.T) {
 		params := baseProjectParams()
-		project, err := buildComposeProject(params)
-		require.NoError(t, err)
+		project := buildComposeProject(params)
 
 		svc := project.Services["web"]
 		assert.Equal(t, "web", svc.Name)
@@ -659,8 +625,7 @@ func TestBuildComposeProject_ServiceConfigName(t *testing.T) {
 		}
 		params.ImageSetups["web"] = &imageSetup{}
 
-		project, err := buildComposeProject(params)
-		require.NoError(t, err)
+		project := buildComposeProject(params)
 
 		assert.Equal(t, "web-0", project.Services["web-0"].Name)
 		assert.Equal(t, "web-1", project.Services["web-1"].Name)
@@ -688,8 +653,7 @@ func TestBuildComposeProject_DependsOn_ComposeGraphResolvable(t *testing.T) {
 	}
 	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
 
-	project, err := buildComposeProject(params)
-	require.NoError(t, err)
+	project := buildComposeProject(params)
 
 	// Verify ServiceConfig.Name is set for all services — this is what
 	// Compose's dependency graph uses as vertex keys.
@@ -701,8 +665,7 @@ func TestBuildComposeProject_DependsOn_ComposeGraphResolvable(t *testing.T) {
 func TestBuildComposeProject_CustomLabels(t *testing.T) {
 	t.Run("single instance", func(t *testing.T) {
 		params := baseProjectParams()
-		project, err := buildComposeProject(params)
-		require.NoError(t, err)
+		project := buildComposeProject(params)
 
 		svc := project.Services["web"]
 		assert.Equal(t, composeProjectName("lease-1"), svc.CustomLabels["com.docker.compose.project"])
@@ -716,8 +679,7 @@ func TestBuildComposeProject_CustomLabels(t *testing.T) {
 		params.Items = []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 2, ServiceName: "web"},
 		}
-		project, err := buildComposeProject(params)
-		require.NoError(t, err)
+		project := buildComposeProject(params)
 
 		expectedProject := composeProjectName("lease-1")
 		for _, name := range []string{"web-0", "web-1"} {

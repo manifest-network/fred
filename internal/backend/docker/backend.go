@@ -123,9 +123,9 @@ type provision struct {
 	CallbackURL  string // URL to notify on provision completion
 
 	// Stack fields (set when IsStack() returns true)
-	StackManifest     *StackManifest          // Per-service manifests for stack deployments
-	ServiceContainers map[string][]string     // service name → container IDs
-	Items             []backend.LeaseItem     // Original lease items (preserved for stack operations)
+	StackManifest     *StackManifest      // Per-service manifests for stack deployments
+	ServiceContainers map[string][]string // service name → container IDs
+	Items             []backend.LeaseItem // Original lease items (preserved for stack operations)
 }
 
 // IsStack returns true when this provision represents a stack deployment.
@@ -1519,7 +1519,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 	}
 
 	// Build Compose project and bring it up.
-	project, buildErr := buildComposeProject(composeProjectParams{
+	project := buildComposeProject(composeProjectParams{
 		LeaseUUID:    req.LeaseUUID,
 		Tenant:       req.Tenant,
 		ProviderUUID: req.ProviderUUID,
@@ -1534,11 +1534,6 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		VolBinds:     volBinds,
 		Cfg:          &b.cfg,
 	})
-	if buildErr != nil {
-		err = fmt.Errorf("build compose project: %w", buildErr)
-		callbackErr = "container creation failed"
-		return
-	}
 
 	logger.Info("compose up", "project", projectName, "services", len(project.Services))
 	if upErr := b.compose.Up(ctx, project, composeUpOpts{}); upErr != nil {
@@ -1954,7 +1949,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 
 	// Build Compose project and bring it up.
 	// ForceRecreate is used for restarts (config unchanged but containers need replacing).
-	project, buildErr := buildComposeProject(composeProjectParams{
+	project := buildComposeProject(composeProjectParams{
 		LeaseUUID:    op.LeaseUUID,
 		Tenant:       tenant,
 		ProviderUUID: providerUUID,
@@ -1969,11 +1964,6 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 		VolBinds:     volBinds,
 		Cfg:          &b.cfg,
 	})
-	if buildErr != nil {
-		err = fmt.Errorf("build compose project: %w", buildErr)
-		callbackErr = op.Operation + " failed"
-		return
-	}
 
 	op.Logger.Info("compose up for "+op.Operation, "project", projectName, "services", len(project.Services))
 	forceRecreate := op.Operation == "restart"
@@ -2058,7 +2048,7 @@ func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
 	}
 
 	// Build project from previous manifest.
-	project, buildErr := buildComposeProject(composeProjectParams{
+	project := buildComposeProject(composeProjectParams{
 		LeaseUUID:    op.LeaseUUID,
 		Tenant:       tenant,
 		ProviderUUID: providerUUID,
@@ -2073,10 +2063,6 @@ func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
 		VolBinds:     volBinds,
 		Cfg:          &b.cfg,
 	})
-	if buildErr != nil {
-		op.Logger.Error("rollback: failed to build compose project", "error", buildErr)
-		return false
-	}
 
 	// Compose Up with ForceRecreate to restore previous containers.
 	if upErr := b.compose.Up(rollbackCtx, project, composeUpOpts{ForceRecreate: true}); upErr != nil {
@@ -2994,12 +2980,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
 					// Use ParsePayload to auto-detect single vs stack manifest.
 					legacyM, stackM, payloadErr := ParsePayload(rel.Manifest)
-					if payloadErr != nil {
+					switch {
+					case payloadErr != nil:
 						b.logger.Warn("failed to parse recovered manifest",
 							"lease_uuid", c.LeaseUUID, "error", payloadErr)
-					} else if stackM != nil {
+					case stackM != nil:
 						prov.StackManifest = stackM
-					} else if legacyM != nil {
+					case legacyM != nil:
 						prov.Manifest = legacyM
 					}
 				}

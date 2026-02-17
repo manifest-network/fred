@@ -182,12 +182,12 @@ type ConnectionResponse struct {
 // For multi-instance leases, the Instances array contains per-instance details.
 // For stack (multi-service) leases, the Services map contains per-service details.
 type ConnectionDetails struct {
-	Host      string                                `json:"host"`
-	Ports     map[string]PortMapping                `json:"ports,omitempty"`
-	Instances []InstanceInfo                        `json:"instances,omitempty"`
-	Services  map[string]ServiceConnectionDetails   `json:"services,omitempty"`
-	Protocol  string                                `json:"protocol,omitempty"`
-	Metadata  map[string]string                     `json:"metadata,omitempty"`
+	Host      string                              `json:"host"`
+	Ports     map[string]PortMapping              `json:"ports,omitempty"`
+	Instances []InstanceInfo                      `json:"instances,omitempty"`
+	Services  map[string]ServiceConnectionDetails `json:"services,omitempty"`
+	Protocol  string                              `json:"protocol,omitempty"`
+	Metadata  map[string]string                   `json:"metadata,omitempty"`
 }
 
 // ServiceConnectionDetails contains connection details for a single service in a stack.

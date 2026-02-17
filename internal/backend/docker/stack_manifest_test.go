@@ -35,13 +35,13 @@ func TestStackManifest_ServiceNameValidation(t *testing.T) {
 		name   string
 		errMsg string
 	}{
-		{"Web", "must match"},            // uppercase
-		{"my_db", "must match"},          // underscore
-		{"-web", "must match"},           // leading dash
-		{"web-", "must match"},           // trailing dash
-		{"my.svc", "must match"},         // dot
+		{"Web", "must match"},                              // uppercase
+		{"my_db", "must match"},                            // underscore
+		{"-web", "must match"},                             // leading dash
+		{"web-", "must match"},                             // trailing dash
+		{"my.svc", "must match"},                           // dot
 		{strings.Repeat("a", 64), "exceeds 63 characters"}, // too long
-		{"web@1", "must match"},          // special char
+		{"web@1", "must match"},                            // special char
 	}
 	for _, tc := range invalid {
 		t.Run("invalid/"+tc.name, func(t *testing.T) {

@@ -25,7 +25,7 @@ type composeProjectParams struct {
 	Items        []backend.LeaseItem
 	Profiles     map[string]SKUProfile
 	ImageSetups  map[string]*imageSetup
-	NetworkName  string                            // pre-created tenant network name (empty if isolation disabled)
+	NetworkName  string                             // pre-created tenant network name (empty if isolation disabled)
 	VolBinds     map[string]map[int]serviceVolBinds // svc → instance → binds
 	Cfg          *Config
 }
@@ -38,7 +38,7 @@ type serviceVolBinds struct {
 
 // buildComposeProject generates a compose-go Project from the parameters.
 // The project is fully in-memory — no YAML files or project directories.
-func buildComposeProject(params composeProjectParams) (*composetypes.Project, error) {
+func buildComposeProject(params composeProjectParams) *composetypes.Project {
 	projectName := composeProjectName(params.LeaseUUID)
 	services := make(composetypes.Services)
 
@@ -54,7 +54,7 @@ func buildComposeProject(params composeProjectParams) (*composetypes.Project, er
 				composeSvcName = fmt.Sprintf("%s-%d", svcName, i)
 			}
 
-			svcConfig, err := buildComposeServiceConfig(composeServiceParams{
+			svcConfig := buildComposeServiceConfig(composeServiceParams{
 				LeaseUUID:    params.LeaseUUID,
 				Tenant:       params.Tenant,
 				ProviderUUID: params.ProviderUUID,
@@ -70,9 +70,6 @@ func buildComposeProject(params composeProjectParams) (*composetypes.Project, er
 				NetworkName:  params.NetworkName,
 				Cfg:          params.Cfg,
 			})
-			if err != nil {
-				return nil, fmt.Errorf("service %s instance %d: %w", svcName, i, err)
-			}
 
 			// Apply volume binds if present.
 			if params.VolBinds != nil {
@@ -155,7 +152,7 @@ func buildComposeProject(params composeProjectParams) (*composetypes.Project, er
 		}
 	}
 
-	return project, nil
+	return project
 }
 
 // applyDependsOn maps manifest-level depends_on to Compose DependsOnConfig.
@@ -231,15 +228,15 @@ type composeServiceParams struct {
 	Cfg          *Config
 }
 
-func buildComposeServiceConfig(p composeServiceParams) (composetypes.ServiceConfig, error) {
+func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfig {
 	svc := composetypes.ServiceConfig{
-		Image:      p.Manifest.Image,
-		PullPolicy: composetypes.PullPolicyNever,
-		CapDrop:    []string{"ALL"},
+		Image:       p.Manifest.Image,
+		PullPolicy:  composetypes.PullPolicyNever,
+		CapDrop:     []string{"ALL"},
 		SecurityOpt: []string{"no-new-privileges:true"},
-		ReadOnly:   p.Cfg.IsReadonlyRootfs(),
-		PidsLimit:  *p.Cfg.GetPidsLimit(),
-		Restart:    composetypes.RestartPolicyNo,
+		ReadOnly:    p.Cfg.IsReadonlyRootfs(),
+		PidsLimit:   *p.Cfg.GetPidsLimit(),
+		Restart:     composetypes.RestartPolicyNo,
 	}
 
 	// Deploy: resource limits and restart policy.
@@ -397,7 +394,7 @@ func buildComposeServiceConfig(p composeServiceParams) (composetypes.ServiceConf
 	}
 	svc.Labels = labels
 
-	return svc, nil
+	return svc
 }
 
 // applyVolumeBinds adds bind mount volumes to a service config.

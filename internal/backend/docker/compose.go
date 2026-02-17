@@ -89,8 +89,8 @@ func (s *composeService) Up(ctx context.Context, project *composetypes.Project, 
 	}
 	return s.backend.Up(ctx, project, composeapi.UpOptions{
 		Create: composeapi.CreateOptions{
-			Recreate:     recreate,
-			QuietPull:    true,
+			Recreate:      recreate,
+			QuietPull:     true,
 			RemoveOrphans: true,
 		},
 		Start: composeapi.StartOptions{},
