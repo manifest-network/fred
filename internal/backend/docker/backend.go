@@ -2903,7 +2903,7 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 }
 
 // ListProvisions returns all currently provisioned resources.
-func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
+func (b *Backend) ListProvisions(_ context.Context) ([]backend.ProvisionInfo, error) {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
 
