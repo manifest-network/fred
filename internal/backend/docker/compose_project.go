@@ -121,6 +121,9 @@ func buildComposeProject(params composeProjectParams) (*composetypes.Project, er
 		}
 	}
 
+	// Apply depends_on after all services are built.
+	applyDependsOn(services, params.Stack, params.Items)
+
 	project := &composetypes.Project{
 		Name:     projectName,
 		Services: services,
@@ -137,6 +140,61 @@ func buildComposeProject(params composeProjectParams) (*composetypes.Project, er
 	}
 
 	return project, nil
+}
+
+// applyDependsOn maps manifest-level depends_on to Compose DependsOnConfig.
+// It handles fan-out expansion: if service "web" depends on "db" and "db"
+// has quantity 2, then each "web" instance depends on both "db-0" and "db-1".
+func applyDependsOn(services composetypes.Services, stack *StackManifest, items []backend.LeaseItem) {
+	// Build a map of service name → quantity for fan-out.
+	qty := make(map[string]int, len(items))
+	for _, item := range items {
+		qty[item.ServiceName] = item.Quantity
+	}
+
+	for _, item := range items {
+		svcName := item.ServiceName
+		manifest := stack.Services[svcName]
+		if len(manifest.DependsOn) == 0 {
+			continue
+		}
+
+		// Build the Compose DependsOnConfig for this service.
+		depConfig := make(composetypes.DependsOnConfig)
+		for depName, cond := range manifest.DependsOn {
+			depQty := qty[depName]
+			if depQty <= 1 {
+				// Simple: depends on the single instance (no suffix).
+				depConfig[depName] = composetypes.ServiceDependency{
+					Condition: cond.Condition,
+					Required:  true,
+				}
+			} else {
+				// Fan-out: depends on all instances of the dependency.
+				for i := 0; i < depQty; i++ {
+					composeName := fmt.Sprintf("%s-%d", depName, i)
+					depConfig[composeName] = composetypes.ServiceDependency{
+						Condition: cond.Condition,
+						Required:  true,
+					}
+				}
+			}
+		}
+
+		// Apply to all instances of the source service.
+		if item.Quantity <= 1 {
+			svc := services[svcName]
+			svc.DependsOn = depConfig
+			services[svcName] = svc
+		} else {
+			for i := 0; i < item.Quantity; i++ {
+				composeName := fmt.Sprintf("%s-%d", svcName, i)
+				svc := services[composeName]
+				svc.DependsOn = depConfig
+				services[composeName] = svc
+			}
+		}
+	}
 }
 
 // composeServiceParams holds inputs for building a single Compose service config.
@@ -253,6 +311,23 @@ func buildComposeServiceConfig(p composeServiceParams) (composetypes.ServiceConf
 			d := composetypes.Duration(hc.StartPeriod.Duration())
 			svc.HealthCheck.StartPeriod = &d
 		}
+	}
+
+	// Stop grace period.
+	if p.Manifest.StopGracePeriod != nil {
+		d := composetypes.Duration(p.Manifest.StopGracePeriod.Duration())
+		svc.StopGracePeriod = &d
+	}
+
+	// Init process (tini).
+	if p.Manifest.Init != nil {
+		val := *p.Manifest.Init
+		svc.Init = &val
+	}
+
+	// Expose (documentary ports, no host binding).
+	if len(p.Manifest.Expose) > 0 {
+		svc.Expose = composetypes.StringOrNumberList(p.Manifest.Expose)
 	}
 
 	// User.

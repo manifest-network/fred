@@ -198,6 +198,7 @@ When lease items carry `service_name` fields (and the payload is a [stack manife
      - Resource allocation ID: `{leaseUUID}-{serviceName}-{instanceIndex}`
      - Volume ID: `fred-{leaseUUID}-{serviceName}-{instanceIndex}`
    - A Compose project is built in-memory from the stack manifest via `buildComposeProject`
+   - Service startup ordering is controlled by `depends_on` declarations in the manifest (supports `service_started` and `service_healthy` conditions with cycle detection)
    - `compose.Up` atomically creates, starts, and network-attaches all service containers
    - `compose.PS` discovers the resulting container IDs per service
    - Startup verification runs per-service, each using its own health check config

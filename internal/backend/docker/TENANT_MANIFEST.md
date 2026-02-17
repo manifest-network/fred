@@ -31,7 +31,13 @@ The manifest is a JSON document submitted by tenants as the lease payload. It de
     "start_period": "10s"
   },
   "tmpfs": ["/var/cache/nginx", "/var/log/nginx"],
-  "user": "nginx"
+  "user": "nginx",
+  "stop_grace_period": "10s",
+  "init": true,
+  "expose": ["3000", "9090"],
+  "depends_on": {
+    "db": { "condition": "service_healthy" }
+  }
 }
 ```
 
@@ -48,6 +54,10 @@ The manifest is a JSON document submitted by tenants as the lease payload. It de
 | `health_check` | object | no | Container health check configuration (see below). |
 | `tmpfs` | string[] | no | Additional writable tmpfs mount paths (see below). |
 | `user` | string | no | Override container runtime user (see below). |
+| `stop_grace_period` | duration | no | Time after SIGTERM before SIGKILL (1s–120s, see below). |
+| `init` | bool | no | Run an init process (tini) as PID 1 (see below). |
+| `expose` | string[] | no | Document inter-service ports without host binding (see below). |
+| `depends_on` | object | no | Service startup dependencies — **stack-only** (see below). |
 
 ## Ports
 
@@ -166,6 +176,85 @@ When `user` is set, the backend:
 
 If neither the manifest nor the Dockerfile's `USER` directive specifies a user, the container runs as root (UID 0).
 
+## Stop Grace Period
+
+The `stop_grace_period` field specifies how long to wait after sending SIGTERM before sending SIGKILL when stopping the container. This gives the application time to shut down gracefully (flush buffers, close connections, etc.).
+
+```json
+{
+  "stop_grace_period": "30s"
+}
+```
+
+**Constraints:**
+
+- Minimum: `1s`
+- Maximum: `120s`
+- Accepts Go duration strings (`"10s"`, `"1m30s"`)
+
+If not set, Docker's default (10s) is used.
+
+## Init Process
+
+The `init` field runs an init process (tini) as PID 1 inside the container. This is useful for:
+
+- **Zombie reaping**: Prevents zombie processes from accumulating when the main process spawns children that exit.
+- **Signal forwarding**: Ensures SIGTERM is properly forwarded to the main process.
+
+```json
+{
+  "init": true
+}
+```
+
+Set to `true` to enable, `false` to explicitly disable. If not set, Docker's default behavior applies.
+
+## Expose
+
+The `expose` field documents inter-service ports without creating host port bindings. This is purely documentary — it does not affect networking or security. Unlike `ports`, exposed ports are only accessible to other services on the same network (when network isolation is enabled).
+
+```json
+{
+  "expose": ["3000", "9090"]
+}
+```
+
+**Constraints:**
+
+- Values must be valid port numbers (1–65535) as strings
+- No duplicate ports
+
+**`expose` vs `ports`**: Use `ports` when external access is needed (creates host bindings). Use `expose` to document ports that other services in the stack connect to internally.
+
+## Depends On (Stack Only)
+
+The `depends_on` field declares startup dependencies between services in a stack manifest. It controls the order in which Docker Compose starts services. This field is **only allowed in stack manifests** — single-container manifests reject it.
+
+```json
+{
+  "depends_on": {
+    "db": { "condition": "service_healthy" },
+    "cache": { "condition": "service_started" }
+  }
+}
+```
+
+Keys are service names that this service depends on. Each value specifies a condition:
+
+| Condition | Description |
+|---|---|
+| `service_started` | Wait until the dependency has started |
+| `service_healthy` | Wait until the dependency reports healthy (requires the dependency to have a `health_check`) |
+
+**Validation rules:**
+
+- Referenced services must exist in the stack
+- A service cannot depend on itself
+- `service_healthy` requires the referenced service to have an active `health_check`
+- Circular dependencies are rejected (cycle detection with max depth 10)
+
+**Fan-out behavior:** When a dependency has `quantity > 1`, the depending service waits for all instances. For example, if `web` depends on `db` and `db` has quantity 2, then `web` depends on both `db-0` and `db-1`.
+
 ## Image Registry Allowlist
 
 The container image must be from an operator-approved registry. The registry is extracted from the image reference using Docker's standard normalization:
@@ -269,6 +358,9 @@ A stack manifest deploys multiple services as a single lease. Instead of a flat 
       "image": "ghcr.io/myorg/webapp:v2.1.0",
       "ports": { "8080/tcp": {} },
       "env": { "DATABASE_URL": "postgres://db:5432/myapp" },
+      "depends_on": {
+        "db": { "condition": "service_healthy" }
+      },
       "health_check": {
         "test": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
         "interval": "15s",

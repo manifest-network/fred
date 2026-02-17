@@ -460,3 +460,182 @@ func TestBuildComposeProject_TmpfsMounts(t *testing.T) {
 	assert.Contains(t, tmpfsTargets, "/var/cache/nginx")
 	assert.Contains(t, tmpfsTargets, "/var/log/nginx")
 }
+
+// --- depends_on compose mapping tests ---
+
+func TestBuildComposeProject_DependsOn_Simple(t *testing.T) {
+	params := baseProjectParams()
+	params.Stack = &StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image: "nginx",
+				DependsOn: map[string]DependsOnCondition{
+					"db": {Condition: "service_started"},
+				},
+			},
+			"db": {Image: "postgres"},
+		},
+	}
+	params.Items = []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+	}
+	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	require.Contains(t, svc.DependsOn, "db")
+	assert.Equal(t, "service_started", svc.DependsOn["db"].Condition)
+	assert.True(t, svc.DependsOn["db"].Required)
+
+	// db should have no depends_on.
+	dbSvc := project.Services["db"]
+	assert.Empty(t, dbSvc.DependsOn)
+}
+
+func TestBuildComposeProject_DependsOn_FanOutDep(t *testing.T) {
+	// web (qty 1) depends on db (qty 2) → web depends on db-0 and db-1.
+	params := baseProjectParams()
+	params.Stack = &StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image: "nginx",
+				DependsOn: map[string]DependsOnCondition{
+					"db": {Condition: "service_healthy"},
+				},
+			},
+			"db": {
+				Image: "postgres",
+				HealthCheck: &HealthCheckConfig{
+					Test: []string{"CMD", "pg_isready"},
+				},
+			},
+		},
+	}
+	params.Items = []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 2, ServiceName: "db"},
+	}
+	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	require.Len(t, svc.DependsOn, 2)
+	require.Contains(t, svc.DependsOn, "db-0")
+	require.Contains(t, svc.DependsOn, "db-1")
+	assert.Equal(t, "service_healthy", svc.DependsOn["db-0"].Condition)
+	assert.Equal(t, "service_healthy", svc.DependsOn["db-1"].Condition)
+}
+
+func TestBuildComposeProject_DependsOn_BothFanOut(t *testing.T) {
+	// web (qty 2) depends on db (qty 2) → web-0 and web-1 both depend on db-0 and db-1.
+	params := baseProjectParams()
+	params.Stack = &StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image: "nginx",
+				DependsOn: map[string]DependsOnCondition{
+					"db": {Condition: "service_started"},
+				},
+			},
+			"db": {Image: "postgres"},
+		},
+	}
+	params.Items = []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 2, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 2, ServiceName: "db"},
+	}
+	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	for _, name := range []string{"web-0", "web-1"} {
+		svc := project.Services[name]
+		require.Len(t, svc.DependsOn, 2, "service %s should depend on 2 instances", name)
+		assert.Contains(t, svc.DependsOn, "db-0")
+		assert.Contains(t, svc.DependsOn, "db-1")
+	}
+}
+
+// --- stop_grace_period compose mapping tests ---
+
+func TestBuildComposeProject_StopGracePeriod_Set(t *testing.T) {
+	params := baseProjectParams()
+	d := Duration(30 * time.Second)
+	params.Stack.Services["web"].StopGracePeriod = &d
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	require.NotNil(t, svc.StopGracePeriod)
+	assert.Equal(t, 30*time.Second, time.Duration(*svc.StopGracePeriod))
+}
+
+func TestBuildComposeProject_StopGracePeriod_NotSet(t *testing.T) {
+	params := baseProjectParams()
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	assert.Nil(t, svc.StopGracePeriod)
+}
+
+// --- init compose mapping tests ---
+
+func TestBuildComposeProject_Init_True(t *testing.T) {
+	params := baseProjectParams()
+	trueVal := true
+	params.Stack.Services["web"].Init = &trueVal
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	require.NotNil(t, svc.Init)
+	assert.True(t, *svc.Init)
+}
+
+func TestBuildComposeProject_Init_False(t *testing.T) {
+	params := baseProjectParams()
+	falseVal := false
+	params.Stack.Services["web"].Init = &falseVal
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	require.NotNil(t, svc.Init)
+	assert.False(t, *svc.Init)
+}
+
+func TestBuildComposeProject_Init_NotSet(t *testing.T) {
+	params := baseProjectParams()
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	assert.Nil(t, svc.Init)
+}
+
+// --- expose compose mapping tests ---
+
+func TestBuildComposeProject_Expose(t *testing.T) {
+	params := baseProjectParams()
+	params.Stack.Services["web"].Expose = []string{"3000", "8080"}
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	svc := project.Services["web"]
+	require.Len(t, svc.Expose, 2)
+	assert.Contains(t, []string(svc.Expose), "3000")
+	assert.Contains(t, []string(svc.Expose), "8080")
+}
