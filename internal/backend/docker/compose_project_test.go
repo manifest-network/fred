@@ -697,3 +697,34 @@ func TestBuildComposeProject_DependsOn_ComposeGraphResolvable(t *testing.T) {
 		assert.Equal(t, mapKey, svc.Name, "ServiceConfig.Name must match the Services map key")
 	}
 }
+
+func TestBuildComposeProject_CustomLabels(t *testing.T) {
+	t.Run("single instance", func(t *testing.T) {
+		params := baseProjectParams()
+		project, err := buildComposeProject(params)
+		require.NoError(t, err)
+
+		svc := project.Services["web"]
+		assert.Equal(t, composeProjectName("lease-1"), svc.CustomLabels["com.docker.compose.project"])
+		assert.Equal(t, "web", svc.CustomLabels["com.docker.compose.service"])
+		assert.Equal(t, "False", svc.CustomLabels["com.docker.compose.oneoff"])
+		assert.Contains(t, svc.CustomLabels, "com.docker.compose.version")
+	})
+
+	t.Run("fan-out instances", func(t *testing.T) {
+		params := baseProjectParams()
+		params.Items = []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 2, ServiceName: "web"},
+		}
+		project, err := buildComposeProject(params)
+		require.NoError(t, err)
+
+		expectedProject := composeProjectName("lease-1")
+		for _, name := range []string{"web-0", "web-1"} {
+			svc := project.Services[name]
+			assert.Equal(t, expectedProject, svc.CustomLabels["com.docker.compose.project"])
+			assert.Equal(t, name, svc.CustomLabels["com.docker.compose.service"])
+			assert.Equal(t, "False", svc.CustomLabels["com.docker.compose.oneoff"])
+		}
+	})
+}

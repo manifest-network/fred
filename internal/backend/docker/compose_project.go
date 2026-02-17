@@ -8,6 +8,7 @@ import (
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	composeapi "github.com/docker/compose/v2/pkg/api"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
@@ -108,6 +109,17 @@ func buildComposeProject(params composeProjectParams) (*composetypes.Project, er
 			// Set service name — required by Compose's dependency graph resolver
 			// which keys vertices by ServiceConfig.Name, not the Services map key.
 			svcConfig.Name = composeSvcName
+
+			// Set CustomLabels — required by Compose's internal container
+			// tracking. The CLI layer normally populates these, but since we
+			// build projects in-memory we must set them ourselves. Without
+			// these labels, start() cannot find containers after create().
+			svcConfig.CustomLabels = composetypes.Labels{
+				composeapi.ProjectLabel: composeProjectName(params.LeaseUUID),
+				composeapi.ServiceLabel: composeSvcName,
+				composeapi.VersionLabel: composeapi.ComposeVersion,
+				composeapi.OneoffLabel:  "False",
+			}
 
 			// Set container name.
 			svcConfig.ContainerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, svcName, i)
