@@ -105,6 +105,10 @@ func buildComposeProject(params composeProjectParams) (*composetypes.Project, er
 				}
 			}
 
+			// Set service name — required by Compose's dependency graph resolver
+			// which keys vertices by ServiceConfig.Name, not the Services map key.
+			svcConfig.Name = composeSvcName
+
 			// Set container name.
 			svcConfig.ContainerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, svcName, i)
 

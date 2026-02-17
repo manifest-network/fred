@@ -639,3 +639,61 @@ func TestBuildComposeProject_Expose(t *testing.T) {
 	assert.Contains(t, []string(svc.Expose), "3000")
 	assert.Contains(t, []string(svc.Expose), "8080")
 }
+
+// --- ServiceConfig.Name tests ---
+
+func TestBuildComposeProject_ServiceConfigName(t *testing.T) {
+	t.Run("single instance", func(t *testing.T) {
+		params := baseProjectParams()
+		project, err := buildComposeProject(params)
+		require.NoError(t, err)
+
+		svc := project.Services["web"]
+		assert.Equal(t, "web", svc.Name)
+	})
+
+	t.Run("fan-out instances", func(t *testing.T) {
+		params := baseProjectParams()
+		params.Items = []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 2, ServiceName: "web"},
+		}
+		params.ImageSetups["web"] = &imageSetup{}
+
+		project, err := buildComposeProject(params)
+		require.NoError(t, err)
+
+		assert.Equal(t, "web-0", project.Services["web-0"].Name)
+		assert.Equal(t, "web-1", project.Services["web-1"].Name)
+	})
+}
+
+func TestBuildComposeProject_DependsOn_ComposeGraphResolvable(t *testing.T) {
+	// Regression test: Compose's NewGraph keys vertices by ServiceConfig.Name.
+	// If Name is empty, depends_on resolution fails with "could not find: not found".
+	params := baseProjectParams()
+	params.Stack = &StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image: "nginx",
+				DependsOn: map[string]DependsOnCondition{
+					"db": {Condition: "service_started"},
+				},
+			},
+			"db": {Image: "postgres"},
+		},
+	}
+	params.Items = []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+	}
+	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
+
+	project, err := buildComposeProject(params)
+	require.NoError(t, err)
+
+	// Verify ServiceConfig.Name is set for all services — this is what
+	// Compose's dependency graph uses as vertex keys.
+	for mapKey, svc := range project.Services {
+		assert.Equal(t, mapKey, svc.Name, "ServiceConfig.Name must match the Services map key")
+	}
+}
