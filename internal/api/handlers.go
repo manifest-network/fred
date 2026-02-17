@@ -180,12 +180,19 @@ type ConnectionResponse struct {
 
 // ConnectionDetails contains the connection information for a lease.
 // For multi-instance leases, the Instances array contains per-instance details.
+// For stack (multi-service) leases, the Services map contains per-service details.
 type ConnectionDetails struct {
-	Host      string                 `json:"host"`
-	Ports     map[string]PortMapping `json:"ports,omitempty"`
-	Instances []InstanceInfo         `json:"instances,omitempty"`
-	Protocol  string                 `json:"protocol,omitempty"`
-	Metadata  map[string]string      `json:"metadata,omitempty"`
+	Host      string                                `json:"host"`
+	Ports     map[string]PortMapping                `json:"ports,omitempty"`
+	Instances []InstanceInfo                        `json:"instances,omitempty"`
+	Services  map[string]ServiceConnectionDetails   `json:"services,omitempty"`
+	Protocol  string                                `json:"protocol,omitempty"`
+	Metadata  map[string]string                     `json:"metadata,omitempty"`
+}
+
+// ServiceConnectionDetails contains connection details for a single service in a stack.
+type ServiceConnectionDetails struct {
+	Instances []InstanceInfo `json:"instances"`
 }
 
 // InstanceInfo contains connection details for a single instance in a multi-instance lease.
@@ -907,6 +914,7 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 		"host":      true,
 		"ports":     true,
 		"instances": true,
+		"services":  true,
 		"protocol":  true,
 		"metadata":  true,
 	}
@@ -982,6 +990,47 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 
 				details.Instances = append(details.Instances, instance)
 			}
+		}
+	}
+
+	// Extract services map (for stack leases)
+	if services, ok := info["services"].(map[string]any); ok {
+		details.Services = make(map[string]ServiceConnectionDetails, len(services))
+		for svcName, svcDataAny := range services {
+			svcData, ok := svcDataAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			var svcDetails ServiceConnectionDetails
+			if svcInstances, ok := svcData["instances"].([]any); ok {
+				for _, instAny := range svcInstances {
+					if inst, ok := instAny.(map[string]any); ok {
+						instance := InstanceInfo{}
+						if idx, ok := inst["instance_index"].(float64); ok {
+							instance.InstanceIndex = int(idx)
+						}
+						if cid, ok := inst["container_id"].(string); ok {
+							instance.ContainerID = cid
+						}
+						if img, ok := inst["image"].(string); ok {
+							instance.Image = img
+						}
+						if status, ok := inst["status"].(string); ok {
+							instance.Status = status
+						}
+						if ports, ok := inst["ports"].(map[string]any); ok {
+							instance.Ports = make(map[string]PortMapping)
+							for containerPort, bindingAny := range ports {
+								if binding, ok := bindingAny.(map[string]any); ok {
+									instance.Ports[containerPort] = extractPortMapping(binding)
+								}
+							}
+						}
+						svcDetails.Instances = append(svcDetails.Instances, instance)
+					}
+				}
+			}
+			details.Services[svcName] = svcDetails
 		}
 	}
 

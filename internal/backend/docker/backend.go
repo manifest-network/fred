@@ -12,7 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +61,7 @@ type ContainerEvent struct {
 type Backend struct {
 	cfg     Config
 	docker  dockerClient
+	compose composeExecutor
 	pool    *shared.ResourcePool
 	volumes volumeManager
 	logger  *slog.Logger
@@ -113,13 +114,23 @@ type provision struct {
 	SKU          string
 	ContainerIDs []string // Multiple containers for multi-unit leases
 	Image        string
-	Manifest     *DockerManifest // Stored for restart/update operations
+	Manifest     *DockerManifest // Stored for restart/update operations (legacy)
 	Status       backend.ProvisionStatus
 	Quantity     int // Expected number of containers
 	CreatedAt    time.Time
 	FailCount    int    // Number of times provisioning has failed for this lease
 	LastError    string // Last error message, queryable after failure
 	CallbackURL  string // URL to notify on provision completion
+
+	// Stack fields (set when IsStack() returns true)
+	StackManifest     *StackManifest          // Per-service manifests for stack deployments
+	ServiceContainers map[string][]string     // service name → container IDs
+	Items             []backend.LeaseItem     // Original lease items (preserved for stack operations)
+}
+
+// IsStack returns true when this provision represents a stack deployment.
+func (p *provision) IsStack() bool {
+	return p.StackManifest != nil
 }
 
 // shortID truncates a container/network ID to 12 characters for logging.
@@ -189,9 +200,16 @@ func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
 // diagnostics store. It performs I/O (container log fetching, bbolt write)
 // and must NOT be called while holding provisionsMu.
 // It is a best-effort operation: errors are logged but not propagated.
-func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs []string) {
+// An optional containerKeys map overrides the default index-based log keys
+// (e.g., "web/0" for stack services).
+func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs []string, containerKeys ...map[string]string) {
 	if b.diagnosticsStore == nil {
 		return
+	}
+
+	var keys map[string]string
+	if len(containerKeys) > 0 {
+		keys = containerKeys[0]
 	}
 
 	// Fetch logs from containers that still exist.
@@ -207,7 +225,13 @@ func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs 
 					"container_id", shortID(cid), "error", err)
 				continue
 			}
-			logs[fmt.Sprintf("%d", i)] = logOutput
+			key := fmt.Sprintf("%d", i)
+			if keys != nil {
+				if k, ok := keys[cid]; ok {
+					key = k
+				}
+			}
+			logs[key] = logOutput
 		}
 		if len(logs) > 0 {
 			entry.Logs = logs
@@ -218,6 +242,31 @@ func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs 
 		b.logger.Warn("failed to persist failure diagnostics",
 			"lease_uuid", entry.LeaseUUID, "error", err)
 	}
+}
+
+// containerLogKeys builds a containerID → display key mapping for stack provisions.
+// Returns nil for non-stack provisions.
+func containerLogKeys(prov *provision) map[string]string {
+	if prov == nil || !prov.IsStack() {
+		return nil
+	}
+	return stackContainerLogKeys(prov.ServiceContainers)
+}
+
+// stackContainerLogKeys builds a containerID → display key mapping from a
+// service containers map. Used by stack error paths that have a local
+// serviceContainers map but no provision pointer.
+func stackContainerLogKeys(serviceContainers map[string][]string) map[string]string {
+	if len(serviceContainers) == 0 {
+		return nil
+	}
+	keys := make(map[string]string)
+	for svcName, cids := range serviceContainers {
+		for i, cid := range cids {
+			keys[cid] = fmt.Sprintf("%s/%d", svcName, i)
+		}
+	}
+	return keys
 }
 
 // New creates a new Docker backend.
@@ -289,9 +338,18 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to create volume manager: %w", err)
 	}
 
+	composeSvc, err := newComposeService(cfg.DockerHost)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("init compose service: %w", err)
+	}
+
 	b := &Backend{
 		cfg:              cfg,
 		docker:           docker,
+		compose:          composeSvc,
 		pool:             pool,
 		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
@@ -462,6 +520,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	var prevFailCount int
 	var oldContainerIDs []string
 	var oldQuantity int
+	var oldItems []backend.LeaseItem // non-nil for stacks, needed for service-aware release
 	b.provisionsMu.Lock()
 	if existing, exists := b.provisions[req.LeaseUUID]; exists {
 		if existing.Status != backend.ProvisionStatusFailed {
@@ -472,6 +531,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		prevFailCount = existing.FailCount
 		oldContainerIDs = existing.ContainerIDs
 		oldQuantity = existing.Quantity
+		oldItems = existing.Items
 		delete(b.provisions, req.LeaseUUID)
 	}
 	b.provisions[req.LeaseUUID] = &provision{
@@ -489,8 +549,18 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 
 	// Clean up old failed provision resources outside the lock.
 	if oldQuantity > 0 {
-		for i := 0; i < oldQuantity; i++ {
-			b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
+		if len(oldItems) > 0 {
+			// Stack: release service-aware allocation IDs.
+			for _, item := range oldItems {
+				for i := 0; i < item.Quantity; i++ {
+					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
+				}
+			}
+		} else {
+			// Legacy: release index-based allocation IDs.
+			for i := 0; i < oldQuantity; i++ {
+				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
+			}
 		}
 		// Remove old containers but keep volumes — stateful data persists
 		// across re-provisions. Volumes are reused via idempotent Create in
@@ -521,44 +591,92 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		profiles[item.SKU] = profile
 	}
 
-	// Parse manifest
-	manifest, err := ParseManifest(req.Payload)
+	// Parse payload — auto-detects single manifest vs stack manifest.
+	isStack, err := backend.IsStack(req.Items)
 	if err != nil {
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
-	}
-
-	// Validate image against registry allowlist
-	if err := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); err != nil {
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
+	manifest, stackManifest, parseErr := ParsePayload(req.Payload)
+	if parseErr != nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
+	}
 
-	// Try to allocate resources for all instances
-	// Track allocations so we can roll back on failure
-	var allocatedIDs []string
-	instanceIdx := 0
-	for _, item := range req.Items {
-		for i := 0; i < item.Quantity; i++ {
-			instanceID := fmt.Sprintf("%s-%d", req.LeaseUUID, instanceIdx)
-			if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
-				// Release any previously allocated resources
-				for _, id := range allocatedIDs {
-					b.pool.Release(id)
-				}
+	// Validate payload type matches lease items.
+	if isStack && stackManifest == nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: lease items have service names but payload is not a stack manifest", backend.ErrInvalidManifest)
+	}
+	if !isStack && stackManifest != nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: payload is a stack manifest but lease items have no service names", backend.ErrInvalidManifest)
+	}
+
+	// Validate images against registry allowlist.
+	if isStack {
+		if err := ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
+			b.removeProvision(req.LeaseUUID)
+			return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+		}
+		for svcName, svc := range stackManifest.Services {
+			if err := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); err != nil {
 				b.removeProvision(req.LeaseUUID)
-				return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
+				return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, err)
 			}
-			allocatedIDs = append(allocatedIDs, instanceID)
-			instanceIdx++
+		}
+	} else {
+		if err := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); err != nil {
+			b.removeProvision(req.LeaseUUID)
+			return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 		}
 	}
 
-	// Update the reservation with full details now that validation passed
+	// Try to allocate resources for all instances.
+	// Stack uses service-aware allocation IDs: {leaseUUID}-{serviceName}-{instanceIndex}
+	var allocatedIDs []string
+	if isStack {
+		for _, item := range req.Items {
+			for i := 0; i < item.Quantity; i++ {
+				instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
+				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
+					for _, id := range allocatedIDs {
+						b.pool.Release(id)
+					}
+					b.removeProvision(req.LeaseUUID)
+					return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
+				}
+				allocatedIDs = append(allocatedIDs, instanceID)
+			}
+		}
+	} else {
+		instanceIdx := 0
+		for _, item := range req.Items {
+			for i := 0; i < item.Quantity; i++ {
+				instanceID := fmt.Sprintf("%s-%d", req.LeaseUUID, instanceIdx)
+				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
+					for _, id := range allocatedIDs {
+						b.pool.Release(id)
+					}
+					b.removeProvision(req.LeaseUUID)
+					return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
+				}
+				allocatedIDs = append(allocatedIDs, instanceID)
+				instanceIdx++
+			}
+		}
+	}
+
+	// Update the reservation with full details now that validation passed.
 	b.provisionsMu.Lock()
 	if prov, ok := b.provisions[req.LeaseUUID]; ok {
 		prov.SKU = req.RoutingSKU()
-		prov.Image = manifest.Image
+		if isStack {
+			prov.StackManifest = stackManifest
+			prov.Items = req.Items
+		} else {
+			prov.Image = manifest.Image
+		}
 	}
 	b.provisionsMu.Unlock()
 
@@ -574,7 +692,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		stop := context.AfterFunc(b.stopCtx, cancel)
 		defer stop()
 
-		b.doProvision(ctx, req, manifest, profiles, logger)
+		if isStack {
+			b.doProvisionStack(ctx, req, stackManifest, profiles, logger)
+		} else {
+			b.doProvision(ctx, req, manifest, profiles, logger)
+		}
 	})
 
 	return nil
@@ -712,7 +834,7 @@ func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manife
 	for v := range imageInfo.Volumes {
 		volumes = append(volumes, v)
 	}
-	sort.Strings(volumes)
+	slices.Sort(volumes)
 
 	result := &imageSetup{Volumes: volumes}
 
@@ -825,6 +947,30 @@ func (b *Backend) setupVolumeBinds(ctx context.Context, leaseUUID string, instan
 	return binds, nil
 }
 
+// buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
+// under hostPath and returns bind mount mappings. Returns an error if any
+// VOLUME path cannot be sanitized (unsupported path format).
+func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
+	binds := make(map[string]string, len(imageVolumes))
+	for _, volPath := range imageVolumes {
+		sanitized := sanitizeVolumePath(volPath)
+		if sanitized == "" {
+			return nil, fmt.Errorf("image declares unsupported VOLUME path %q", volPath)
+		}
+		subdir := filepath.Join(hostPath, sanitized)
+		if err := os.MkdirAll(subdir, 0o700); err != nil {
+			return nil, fmt.Errorf("volume subdir %q: %w", subdir, err)
+		}
+		if uid != 0 || gid != 0 {
+			if err := os.Chown(subdir, uid, gid); err != nil {
+				return nil, fmt.Errorf("chown volume subdir %q: %w", subdir, err)
+			}
+		}
+		binds[subdir] = volPath
+	}
+	return binds, nil
+}
+
 // setupWritablePathBinds extracts image content for writable paths into
 // a managed volume subdirectory and returns a bind map for container creation.
 // Extraction failures are logged but don't fail the overall operation;
@@ -861,6 +1007,68 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 	}
 
 	return binds
+}
+
+// setupStackVolBinds creates volume bind mounts for all services/instances of a stack.
+// It returns the volume binds map, a list of newly created volume IDs, and any fatal error.
+// Non-fatal failures (writable-path-only volume creation) are logged as warnings.
+func (b *Backend) setupStackVolBinds(
+	ctx context.Context,
+	leaseUUID string,
+	items []backend.LeaseItem,
+	profiles map[string]SKUProfile,
+	imageSetups map[string]*imageSetup,
+	services map[string]*DockerManifest,
+	logger *slog.Logger,
+) (map[string]map[int]serviceVolBinds, []string, error) {
+	volBinds := make(map[string]map[int]serviceVolBinds)
+	var createdVolumeIDs []string
+
+	for _, item := range items {
+		svcName := item.ServiceName
+		profile := profiles[item.SKU]
+		imgSetup := imageSetups[svcName]
+
+		for i := 0; i < item.Quantity; i++ {
+			needsStatefulVolume := profile.DiskMB > 0 && len(imgSetup.Volumes) > 0
+			needsWritableVolume := len(imgSetup.WritablePaths) > 0
+
+			if needsStatefulVolume || needsWritableVolume {
+				volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, svcName, i)
+				sizeMB := profile.DiskMB
+				if sizeMB <= 0 {
+					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
+				}
+				hostPath, volCreated, volErr := b.volumes.Create(ctx, volumeID, sizeMB)
+				if volErr != nil {
+					if needsStatefulVolume {
+						return nil, createdVolumeIDs, fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
+					}
+					logger.Warn("writable path content seeding unavailable (volume creation failed)", "service", svcName, "error", volErr)
+					continue
+				}
+				if volCreated {
+					createdVolumeIDs = append(createdVolumeIDs, volumeID)
+				}
+				binds := serviceVolBinds{}
+				if needsStatefulVolume {
+					var buildErr error
+					binds.StatefulBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+					if buildErr != nil {
+						return nil, createdVolumeIDs, fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
+					}
+				}
+				if needsWritableVolume {
+					binds.WritableBinds = b.setupWritablePathBinds(ctx, services[svcName].Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
+				}
+				if volBinds[svcName] == nil {
+					volBinds[svcName] = make(map[int]serviceVolBinds)
+				}
+				volBinds[svcName][i] = binds
+			}
+		}
+	}
+	return volBinds, createdVolumeIDs, nil
 }
 
 // verifyStartup checks that containers started successfully.
@@ -1083,30 +1291,12 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 					// Set up VOLUME path subdirs (if stateful)
 					if needsStatefulVolume {
-						volumeBinds = make(map[string]string, len(imgSetup.Volumes))
-						for _, volPath := range imgSetup.Volumes {
-							sanitized := sanitizeVolumePath(volPath)
-							if sanitized == "" {
-								err = fmt.Errorf("image declares unsupported VOLUME path %q that cannot be quota-enforced (instance %d, sku %s)", volPath, instanceIndex, item.SKU)
-								callbackErr = "image has unsupported VOLUME path"
-								return
-							}
-							subdir := filepath.Join(hostPath, sanitized)
-							if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
-								instanceLogger.Error("failed to create volume subdir", "path", subdir, "error", mkErr)
-								err = fmt.Errorf("volume subdir creation failed (instance %d, sku %s): %w", instanceIndex, item.SKU, mkErr)
-								callbackErr = "volume creation failed"
-								return
-							}
-							if imgSetup.VolumeUID != 0 || imgSetup.VolumeGID != 0 {
-								if chownErr := os.Chown(subdir, imgSetup.VolumeUID, imgSetup.VolumeGID); chownErr != nil {
-									instanceLogger.Error("failed to chown volume subdir", "path", subdir, "uid", imgSetup.VolumeUID, "gid", imgSetup.VolumeGID, "error", chownErr)
-									err = fmt.Errorf("volume subdir chown failed (instance %d, sku %s): %w", instanceIndex, item.SKU, chownErr)
-									callbackErr = "volume creation failed"
-									return
-								}
-							}
-							volumeBinds[subdir] = volPath
+						var buildErr error
+						volumeBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+						if buildErr != nil {
+							err = fmt.Errorf("volume setup failed (instance %d, sku %s): %w", instanceIndex, item.SKU, buildErr)
+							callbackErr = "volume creation failed"
+							return
 						}
 					}
 
@@ -1172,6 +1362,245 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 
 	logger.Info("all containers provisioned and verified", "count", len(containerIDs))
+}
+
+// doProvisionStack performs container creation for a stack (multi-service) lease
+// using Docker Compose. Compose handles container creation, start ordering, and
+// network attachment atomically via a single Up call.
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+	var containerIDs []string
+	var createdVolumeIDs []string
+	var err error
+	var callbackErr string
+	provisionStart := time.Now()
+	serviceContainers := make(map[string][]string)
+	projectName := composeProjectName(req.LeaseUUID)
+
+	defer func() {
+		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
+		if err != nil {
+			logger.Error("stack provision failed", "lease_uuid", req.LeaseUUID, "error", err)
+			provisionsTotal.WithLabelValues("failure").Inc()
+
+			// Release all service-aware allocation IDs.
+			for _, item := range req.Items {
+				for i := 0; i < item.Quantity; i++ {
+					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
+				}
+			}
+
+			var diagSnap shared.DiagnosticEntry
+			b.provisionsMu.Lock()
+			if prov, ok := b.provisions[req.LeaseUUID]; ok {
+				prov.Status = backend.ProvisionStatusFailed
+				prov.FailCount++
+				prov.LastError = err.Error()
+				diagSnap = diagnosticSnapshot(prov)
+			}
+			b.provisionsMu.Unlock()
+			b.persistDiagnostics(diagSnap, containerIDs, stackContainerLogKeys(serviceContainers))
+
+			// Clean up via Compose Down (removes all project containers).
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			if downErr := b.compose.Down(cleanupCtx, projectName, 10*time.Second); downErr != nil {
+				logger.Warn("compose down failed during cleanup, falling back to individual removal", "error", downErr)
+				for _, cid := range containerIDs {
+					if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
+						logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
+					}
+				}
+			}
+			for _, volumeID := range createdVolumeIDs {
+				if volErr := b.volumes.Destroy(cleanupCtx, volumeID); volErr != nil {
+					logger.Warn("failed to cleanup volume after error", "volume_id", volumeID, "error", volErr)
+				}
+			}
+			b.sendCallback(req.LeaseUUID, false, callbackErr)
+			return
+		}
+
+		provisionsTotal.WithLabelValues("success").Inc()
+		activeProvisions.Inc()
+		b.provisionsMu.Lock()
+		if prov, ok := b.provisions[req.LeaseUUID]; ok {
+			prov.ContainerIDs = containerIDs
+			prov.ServiceContainers = serviceContainers
+			prov.Status = backend.ProvisionStatusReady
+			prov.LastError = ""
+		}
+		b.provisionsMu.Unlock()
+
+		if b.releaseStore != nil {
+			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
+				Manifest:  req.Payload,
+				Image:     "stack",
+				Status:    "active",
+				CreatedAt: time.Now(),
+			}); relErr != nil {
+				b.logger.Warn("failed to record initial release", "lease", req.LeaseUUID, "error", relErr)
+			}
+		}
+
+		if b.diagnosticsStore != nil {
+			if delErr := b.diagnosticsStore.Delete(req.LeaseUUID); delErr != nil {
+				b.logger.Warn("failed to remove stale diagnostic entry", "lease", req.LeaseUUID, "error", delErr)
+			}
+		}
+
+		updateResourceMetrics(b.pool.Stats())
+		b.sendCallback(req.LeaseUUID, true, "")
+	}()
+
+	if ctx.Err() != nil {
+		logger.Warn("provisioning canceled before start", "error", ctx.Err())
+		err = fmt.Errorf("provisioning canceled: %w", ctx.Err())
+		callbackErr = "provisioning canceled"
+		return
+	}
+
+	// Pull each unique image (deduplicated across services).
+	pulledImages := make(map[string]bool)
+	for svcName, svc := range stack.Services {
+		if pulledImages[svc.Image] {
+			continue
+		}
+		logger.Info("pulling image", "service", svcName, "image", svc.Image)
+		pullStart := time.Now()
+		if err = b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); err != nil {
+			logger.Error("failed to pull image", "service", svcName, "error", err)
+			err = fmt.Errorf("image pull failed for service %s: %w", svcName, err)
+			callbackErr = "image pull failed"
+			return
+		}
+		imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())
+		pulledImages[svc.Image] = true
+	}
+
+	// Per-service image setup (inspect, user resolution, writable paths).
+	imageSetups := make(map[string]*imageSetup)
+	for svcName, svc := range stack.Services {
+		imgSetup, setupErr := b.inspectImageForSetup(ctx, svc.Image, svc.User)
+		if setupErr != nil {
+			logger.Error("image setup failed", "service", svcName, "error", setupErr)
+			err = setupErr
+			callbackErr = "image inspect failed"
+			return
+		}
+		imageSetups[svcName] = imgSetup
+	}
+
+	// Resolve tenant network name (not Docker network ID — Compose needs the name).
+	var networkName string
+	if b.cfg.IsNetworkIsolation() {
+		_, netErr := b.docker.EnsureTenantNetwork(ctx, req.Tenant)
+		if netErr != nil {
+			logger.Error("failed to create tenant network", "error", netErr)
+			err = netErr
+			callbackErr = "tenant network setup failed"
+			return
+		}
+		networkName = TenantNetworkName(req.Tenant)
+	}
+
+	// Pre-create volumes and build volume binds per service/instance.
+	b.provisionsMu.RLock()
+	failCount := 0
+	if prov, ok := b.provisions[req.LeaseUUID]; ok {
+		failCount = prov.FailCount
+	}
+	b.provisionsMu.RUnlock()
+
+	var volBinds map[string]map[int]serviceVolBinds
+	volBinds, createdVolumeIDs, err = b.setupStackVolBinds(ctx, req.LeaseUUID, req.Items, profiles, imageSetups, stack.Services, logger)
+	if err != nil {
+		callbackErr = "volume creation failed"
+		return
+	}
+
+	// Build Compose project and bring it up.
+	project, buildErr := buildComposeProject(composeProjectParams{
+		LeaseUUID:    req.LeaseUUID,
+		Tenant:       req.Tenant,
+		ProviderUUID: req.ProviderUUID,
+		CallbackURL:  req.CallbackURL,
+		BackendName:  b.cfg.Name,
+		FailCount:    failCount,
+		Stack:        stack,
+		Items:        req.Items,
+		Profiles:     profiles,
+		ImageSetups:  imageSetups,
+		NetworkName:  networkName,
+		VolBinds:     volBinds,
+		Cfg:          &b.cfg,
+	})
+	if buildErr != nil {
+		err = fmt.Errorf("build compose project: %w", buildErr)
+		callbackErr = "container creation failed"
+		return
+	}
+
+	logger.Info("compose up", "project", projectName, "services", len(project.Services))
+	if upErr := b.compose.Up(ctx, project, composeUpOpts{}); upErr != nil {
+		err = fmt.Errorf("compose up failed: %w", upErr)
+		callbackErr = "container creation failed"
+		return
+	}
+
+	// Discover container IDs via Compose PS.
+	containers, psErr := b.compose.PS(ctx, projectName)
+	if psErr != nil {
+		err = fmt.Errorf("compose ps failed: %w", psErr)
+		callbackErr = "container creation failed"
+		return
+	}
+
+	containerIDs, serviceContainers = mapComposeContainers(containers, req.Items)
+
+	// Verify startup per-service so each service uses its own health check config.
+	for svcName, svcCIDs := range serviceContainers {
+		svc := stack.Services[svcName]
+		if err = b.verifyStartup(ctx, svc, svcCIDs, logger.With("service", svcName)); err != nil {
+			callbackErr = startupErrorToCallbackMsg(err)
+			return
+		}
+	}
+
+	logger.Info("all stack containers provisioned and verified", "count", len(containerIDs), "services", len(stack.Services))
+}
+
+// mapComposeContainers maps Compose PS output to containerIDs and serviceContainers.
+// For fanned-out services (web-0, web-1), it strips the instance suffix to recover
+// the original service name.
+func mapComposeContainers(containers []composeContainerSummary, items []backend.LeaseItem) ([]string, map[string][]string) {
+	// Build a set of base service names for fan-out detection.
+	svcQuantities := make(map[string]int, len(items))
+	for _, item := range items {
+		svcQuantities[item.ServiceName] = item.Quantity
+	}
+
+	var containerIDs []string
+	serviceContainers := make(map[string][]string)
+
+	for _, c := range containers {
+		containerIDs = append(containerIDs, c.ID)
+		// Recover original service name from Compose service name.
+		// Fan-out: "web-0" → "web", single: "web" → "web".
+		// We verify the suffix is a valid integer to avoid prefix collisions
+		// (e.g., "web-extra" must not match "web" with qty>1).
+		baseName := c.Service
+		for svcName, qty := range svcQuantities {
+			if qty > 1 && strings.HasPrefix(c.Service, svcName+"-") {
+				suffix := strings.TrimPrefix(c.Service, svcName+"-")
+				if _, parseErr := strconv.Atoi(suffix); parseErr == nil {
+					baseName = svcName
+					break
+				}
+			}
+		}
+		serviceContainers[baseName] = append(serviceContainers[baseName], c.ID)
+	}
+	return containerIDs, serviceContainers
 }
 
 // healthPollInterval is the interval between health check polls during startup verification.
@@ -1261,17 +1690,21 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, prov.Status)
 	}
-	if prov.Manifest == nil {
+	if prov.Manifest == nil && prov.StackManifest == nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: no stored manifest for restart", backend.ErrInvalidState)
 	}
+	isStack := prov.IsStack()
 	prevStatus := prov.Status
 	prov.Status = backend.ProvisionStatusRestarting
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
 	}
 	manifest := prov.Manifest
+	stackManifest := prov.StackManifest
 	containerIDs := prov.ContainerIDs
+	serviceContainers := prov.ServiceContainers
+	items := prov.Items
 	sku := prov.SKU
 	b.provisionsMu.Unlock()
 
@@ -1279,7 +1712,16 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	// release record, ActivateLatest after success is a no-op, and a cold
 	// restart would recover the previous manifest (silently rolling back).
 	if b.releaseStore != nil {
-		manifestBytes, marshalErr := json.Marshal(manifest)
+		var manifestBytes []byte
+		var marshalErr error
+		var releaseImage string
+		if isStack {
+			manifestBytes, marshalErr = json.Marshal(stackManifest)
+			releaseImage = "stack"
+		} else {
+			manifestBytes, marshalErr = json.Marshal(manifest)
+			releaseImage = manifest.Image
+		}
 		if marshalErr != nil {
 			b.provisionsMu.Lock()
 			prov.Status = prevStatus
@@ -1288,7 +1730,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		}
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  manifestBytes,
-			Image:     manifest.Image,
+			Image:     releaseImage,
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
@@ -1308,7 +1750,11 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		stop := context.AfterFunc(b.stopCtx, cancel)
 		defer stop()
 
-		b.doRestart(ctx, req.LeaseUUID, manifest, containerIDs, sku, logger)
+		if isStack {
+			b.doRestartStack(ctx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, logger)
+		} else {
+			b.doRestart(ctx, req.LeaseUUID, manifest, containerIDs, sku, logger)
+		}
 	})
 
 	return nil
@@ -1334,6 +1780,326 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 		Operation:       "restart",
 		Logger:          logger,
 	})
+}
+
+// doRestartStack performs an async stack restart: stops all service containers
+// and recreates them from the stored StackManifest.
+func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, logger *slog.Logger) {
+	profiles := make(map[string]SKUProfile, len(items))
+	for _, item := range items {
+		if _, ok := profiles[item.SKU]; ok {
+			continue
+		}
+		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
+		if profErr != nil {
+			b.recordPreflightFailure(leaseUUID, "restart failed",
+				fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr),
+				backend.ProvisionStatusReady, logger)
+			return
+		}
+		profiles[item.SKU] = profile
+	}
+
+	b.doReplaceStackContainers(ctx, replaceStackContainersOp{
+		LeaseUUID:         leaseUUID,
+		Stack:             stack,
+		Items:             items,
+		Profiles:          profiles,
+		OldContainerIDs:   oldContainerIDs,
+		ServiceContainers: serviceContainers,
+		Operation:         "restart",
+		Logger:            logger,
+	})
+}
+
+// replaceStackContainersOp describes a stack container replacement operation.
+type replaceStackContainersOp struct {
+	LeaseUUID         string
+	Stack             *StackManifest
+	Items             []backend.LeaseItem
+	Profiles          map[string]SKUProfile
+	OldContainerIDs   []string
+	ServiceContainers map[string][]string // old service → container IDs mapping
+	Operation         string              // "restart" or "update"
+	Logger            *slog.Logger
+
+	// OnSuccess is called under provisionsMu lock after successful replacement.
+	OnSuccess func(prov *provision)
+}
+
+// doReplaceStackContainers performs the stack container replacement lifecycle
+// using Docker Compose. Compose handles stopping old containers and starting
+// new ones via a single Up call, with rollback via Up with the previous manifest.
+func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackContainersOp) {
+	var err error
+	var callbackErr string
+	var newContainerIDs []string
+	var imageSetups map[string]*imageSetup
+	newServiceContainers := make(map[string][]string)
+	projectName := composeProjectName(op.LeaseUUID)
+
+	defer func() {
+		if err != nil {
+			op.Logger.Error(op.Operation+" failed (stack)", "error", err)
+
+			var diagSnap shared.DiagnosticEntry
+			b.provisionsMu.Lock()
+			if prov, ok := b.provisions[op.LeaseUUID]; ok {
+				prov.LastError = err.Error()
+				prov.FailCount++
+				diagSnap = diagnosticSnapshot(prov)
+			}
+			b.provisionsMu.Unlock()
+			b.persistDiagnostics(diagSnap, newContainerIDs, stackContainerLogKeys(newServiceContainers))
+
+			if b.releaseStore != nil {
+				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", err.Error()); relErr != nil {
+					op.Logger.Warn("failed to update release status", "error", relErr)
+				}
+			}
+
+			// Rollback: rebuild the Project from the previous StackManifest and
+			// Compose Up to restore the old containers.
+			restored := b.rollbackStackViaCompose(op)
+			b.provisionsMu.Lock()
+			if prov, ok := b.provisions[op.LeaseUUID]; ok {
+				if restored {
+					prov.Status = backend.ProvisionStatusReady
+					if op.Operation == "restart" {
+						prov.LastError = ""
+					}
+					op.Logger.Info("rolled back to previous containers via compose (stack)")
+				} else {
+					prov.Status = backend.ProvisionStatusFailed
+				}
+			}
+			b.provisionsMu.Unlock()
+
+			if restored {
+				callbackErr += "; rolled back to previous version"
+			} else {
+				callbackErr += "; rollback failed"
+			}
+
+			b.sendCallback(op.LeaseUUID, false, callbackErr)
+			return
+		}
+
+		// Success: update provision (Compose already replaced old containers).
+		b.provisionsMu.Lock()
+		if prov, ok := b.provisions[op.LeaseUUID]; ok {
+			prov.ContainerIDs = newContainerIDs
+			prov.ServiceContainers = newServiceContainers
+			prov.Status = backend.ProvisionStatusReady
+			prov.LastError = ""
+			if op.OnSuccess != nil {
+				op.OnSuccess(prov)
+			}
+		}
+		b.provisionsMu.Unlock()
+
+		if b.releaseStore != nil {
+			if relErr := b.releaseStore.ActivateLatest(op.LeaseUUID); relErr != nil {
+				op.Logger.Warn("failed to update release status", "error", relErr)
+			}
+		}
+
+		b.sendCallback(op.LeaseUUID, true, "")
+	}()
+
+	// Per-service image setup.
+	imageSetups = make(map[string]*imageSetup)
+	for svcName, svc := range op.Stack.Services {
+		imgSetup, setupErr := b.inspectImageForSetup(ctx, svc.Image, svc.User)
+		if setupErr != nil {
+			err = setupErr
+			callbackErr = op.Operation + " failed"
+			return
+		}
+		imageSetups[svcName] = imgSetup
+	}
+
+	// Read provision metadata.
+	b.provisionsMu.RLock()
+	failCount := 0
+	tenant := ""
+	providerUUID := ""
+	callbackURL := ""
+	if prov, ok := b.provisions[op.LeaseUUID]; ok {
+		failCount = prov.FailCount
+		tenant = prov.Tenant
+		providerUUID = prov.ProviderUUID
+		callbackURL = prov.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
+
+	// Resolve tenant network name.
+	var networkName string
+	if b.cfg.IsNetworkIsolation() {
+		if _, netErr := b.docker.EnsureTenantNetwork(ctx, tenant); netErr != nil {
+			err = netErr
+			callbackErr = op.Operation + " failed"
+			return
+		}
+		networkName = TenantNetworkName(tenant)
+	}
+
+	// Ensure volumes exist for all services/instances.
+	volBinds, _, volErr := b.setupStackVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
+	if volErr != nil {
+		err = volErr
+		callbackErr = op.Operation + " failed"
+		return
+	}
+
+	// Build Compose project and bring it up.
+	// ForceRecreate is used for restarts (config unchanged but containers need replacing).
+	project, buildErr := buildComposeProject(composeProjectParams{
+		LeaseUUID:    op.LeaseUUID,
+		Tenant:       tenant,
+		ProviderUUID: providerUUID,
+		CallbackURL:  callbackURL,
+		BackendName:  b.cfg.Name,
+		FailCount:    failCount,
+		Stack:        op.Stack,
+		Items:        op.Items,
+		Profiles:     op.Profiles,
+		ImageSetups:  imageSetups,
+		NetworkName:  networkName,
+		VolBinds:     volBinds,
+		Cfg:          &b.cfg,
+	})
+	if buildErr != nil {
+		err = fmt.Errorf("build compose project: %w", buildErr)
+		callbackErr = op.Operation + " failed"
+		return
+	}
+
+	op.Logger.Info("compose up for "+op.Operation, "project", projectName, "services", len(project.Services))
+	forceRecreate := op.Operation == "restart"
+	if upErr := b.compose.Up(ctx, project, composeUpOpts{ForceRecreate: forceRecreate}); upErr != nil {
+		err = fmt.Errorf("compose up failed: %w", upErr)
+		callbackErr = op.Operation + " failed"
+		return
+	}
+
+	// Discover new container IDs via Compose PS.
+	containers, psErr := b.compose.PS(ctx, projectName)
+	if psErr != nil {
+		err = fmt.Errorf("compose ps failed: %w", psErr)
+		callbackErr = op.Operation + " failed"
+		return
+	}
+
+	newContainerIDs, newServiceContainers = mapComposeContainers(containers, op.Items)
+
+	// Verify startup per-service so each service uses its own health check config.
+	for svcName, svcCIDs := range newServiceContainers {
+		svc := op.Stack.Services[svcName]
+		if err = b.verifyStartup(ctx, svc, svcCIDs, op.Logger.With("service", svcName)); err != nil {
+			callbackErr = startupErrorToCallbackMsg(err)
+			return
+		}
+	}
+
+	op.Logger.Info(op.Operation+" completed (stack)", "containers", len(newContainerIDs))
+}
+
+// rollbackStackViaCompose restores the previous stack state by rebuilding a
+// Compose project from the previous StackManifest (still in the provision,
+// since OnSuccess hasn't run) and calling Compose Up. Returns true on success.
+func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// Read previous manifest from provision (OnSuccess hasn't run, so
+	// prov.StackManifest is still the old manifest).
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions[op.LeaseUUID]
+	if !ok {
+		b.provisionsMu.RUnlock()
+		op.Logger.Error("rollback: provision not found")
+		return false
+	}
+	prevStack := prov.StackManifest
+	tenant := prov.Tenant
+	providerUUID := prov.ProviderUUID
+	callbackURL := prov.CallbackURL
+	failCount := prov.FailCount
+	b.provisionsMu.RUnlock()
+
+	if prevStack == nil {
+		op.Logger.Error("rollback: no previous stack manifest available")
+		return false
+	}
+
+	// Inspect images for the previous manifest.
+	prevImageSetups := make(map[string]*imageSetup)
+	for svcName, svc := range prevStack.Services {
+		imgSetup, setupErr := b.inspectImageForSetup(rollbackCtx, svc.Image, svc.User)
+		if setupErr != nil {
+			op.Logger.Error("rollback: image inspection failed", "service", svcName, "error", setupErr)
+			return false
+		}
+		prevImageSetups[svcName] = imgSetup
+	}
+
+	// Resolve network name.
+	var networkName string
+	if b.cfg.IsNetworkIsolation() {
+		networkName = TenantNetworkName(tenant)
+	}
+
+	// Re-use existing volumes (already created during original provision).
+	volBinds, _, volErr := b.setupStackVolBinds(rollbackCtx, op.LeaseUUID, op.Items, op.Profiles, prevImageSetups, prevStack.Services, op.Logger)
+	if volErr != nil {
+		op.Logger.Error("rollback: volume setup failed", "error", volErr)
+		return false
+	}
+
+	// Build project from previous manifest.
+	project, buildErr := buildComposeProject(composeProjectParams{
+		LeaseUUID:    op.LeaseUUID,
+		Tenant:       tenant,
+		ProviderUUID: providerUUID,
+		CallbackURL:  callbackURL,
+		BackendName:  b.cfg.Name,
+		FailCount:    failCount,
+		Stack:        prevStack,
+		Items:        op.Items,
+		Profiles:     op.Profiles,
+		ImageSetups:  prevImageSetups,
+		NetworkName:  networkName,
+		VolBinds:     volBinds,
+		Cfg:          &b.cfg,
+	})
+	if buildErr != nil {
+		op.Logger.Error("rollback: failed to build compose project", "error", buildErr)
+		return false
+	}
+
+	// Compose Up with ForceRecreate to restore previous containers.
+	if upErr := b.compose.Up(rollbackCtx, project, composeUpOpts{ForceRecreate: true}); upErr != nil {
+		op.Logger.Error("rollback: compose up failed", "error", upErr)
+		return false
+	}
+
+	// Discover restored container IDs and update provision.
+	containers, psErr := b.compose.PS(rollbackCtx, composeProjectName(op.LeaseUUID))
+	if psErr != nil {
+		op.Logger.Error("rollback: compose ps failed", "error", psErr)
+		return false
+	}
+
+	containerIDs, serviceContainers := mapComposeContainers(containers, op.Items)
+	b.provisionsMu.Lock()
+	if p, ok := b.provisions[op.LeaseUUID]; ok {
+		p.ContainerIDs = containerIDs
+		p.ServiceContainers = serviceContainers
+	}
+	b.provisionsMu.Unlock()
+
+	return true
 }
 
 // replaceContainersOp describes a container replacement operation with rollback.
@@ -1617,20 +2383,98 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, prov.Status)
 	}
 
-	// Parse and validate new manifest
-	manifest, parseErr := ParseManifest(req.Payload)
+	isStack := prov.IsStack()
+
+	// Parse new payload (auto-detects single vs stack).
+	manifest, stackManifest, parseErr := ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
 	}
 
-	// Validate image against allowlist
+	// Ensure payload type matches existing provision type.
+	if isStack && stackManifest == nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: stack lease requires a stack manifest (with services key)", backend.ErrInvalidManifest)
+	}
+	if !isStack && stackManifest != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: non-stack lease cannot be updated with a stack manifest", backend.ErrInvalidManifest)
+	}
+
+	if isStack {
+		// Validate stack against stored items.
+		if valErr := ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("%w: %w", backend.ErrValidation, valErr)
+		}
+		// Validate all images.
+		for svcName, svc := range stackManifest.Services {
+			if imgErr := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); imgErr != nil {
+				b.provisionsMu.Unlock()
+				return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, imgErr)
+			}
+		}
+		// Validate all SKU profiles.
+		profiles := make(map[string]SKUProfile, len(prov.Items))
+		for _, item := range prov.Items {
+			if _, ok := profiles[item.SKU]; ok {
+				continue
+			}
+			profile, profErr := b.cfg.GetSKUProfile(item.SKU)
+			if profErr != nil {
+				b.provisionsMu.Unlock()
+				return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
+			}
+			profiles[item.SKU] = profile
+		}
+
+		oldContainerIDs := prov.ContainerIDs
+		serviceContainers := prov.ServiceContainers
+		items := prov.Items
+		prevStatus := prov.Status
+		prov.Status = backend.ProvisionStatusUpdating
+		if req.CallbackURL != "" {
+			prov.CallbackURL = req.CallbackURL
+		}
+		b.provisionsMu.Unlock()
+
+		// Record release.
+		releaseImage := "stack"
+		if b.releaseStore != nil {
+			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
+				Manifest:  req.Payload,
+				Image:     releaseImage,
+				Status:    "deploying",
+				CreatedAt: time.Now(),
+			}); relErr != nil {
+				b.provisionsMu.Lock()
+				prov.Status = prevStatus
+				b.provisionsMu.Unlock()
+				return fmt.Errorf("failed to record release: %w", relErr)
+			}
+		}
+
+		// Async phase
+		b.wg.Go(func() {
+			provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+			defer cancel()
+
+			stop := context.AfterFunc(b.stopCtx, cancel)
+			defer stop()
+
+			b.doUpdateStack(ctx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, logger)
+		})
+		return nil
+	}
+
+	// Legacy single-manifest path.
 	if imgErr := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); imgErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrValidation, imgErr)
 	}
 
-	// Validate SKU profile
 	profile, profErr := b.cfg.GetSKUProfile(prov.SKU)
 	if profErr != nil {
 		b.provisionsMu.Unlock()
@@ -1645,9 +2489,6 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	}
 	b.provisionsMu.Unlock()
 
-	// Record release as deploying. Abort if this fails — without a
-	// release record, ActivateLatest after success is a no-op, and a cold
-	// restart would recover the previous manifest (silently rolling back).
 	if b.releaseStore != nil {
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  req.Payload,
@@ -1662,7 +2503,6 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		}
 	}
 
-	// Async phase
 	b.wg.Go(func() {
 		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
 		ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
@@ -1714,6 +2554,39 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 	})
 }
 
+// doUpdateStack performs the actual stack container update asynchronously.
+func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, logger *slog.Logger) {
+	// Pull each unique image (deduplicated).
+	pulledImages := make(map[string]bool)
+	for svcName, svc := range stack.Services {
+		if pulledImages[svc.Image] {
+			continue
+		}
+		logger.Info("pulling image for update", "service", svcName, "image", svc.Image)
+		if pullErr := b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); pullErr != nil {
+			b.recordPreflightFailure(leaseUUID, "image pull failed",
+				fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr),
+				backend.ProvisionStatusFailed, logger)
+			return
+		}
+		pulledImages[svc.Image] = true
+	}
+
+	b.doReplaceStackContainers(ctx, replaceStackContainersOp{
+		LeaseUUID:         leaseUUID,
+		Stack:             stack,
+		Items:             items,
+		Profiles:          profiles,
+		OldContainerIDs:   oldContainerIDs,
+		ServiceContainers: serviceContainers,
+		Operation:         "update",
+		Logger:            logger,
+		OnSuccess: func(prov *provision) {
+			prov.StackManifest = stack
+		},
+	})
+}
+
 // GetReleases returns the release history for a lease.
 func (b *Backend) GetReleases(_ context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
 	b.provisionsMu.RLock()
@@ -1749,6 +2622,7 @@ func (b *Backend) GetReleases(_ context.Context, leaseUUID string) ([]backend.Re
 
 // GetInfo returns lease information including connection details.
 // For multi-unit leases, returns an "instances" array with each container's info.
+// For stack leases, returns a "services" map grouping instances by service name.
 func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
@@ -1762,7 +2636,43 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 		return nil, backend.ErrNotProvisioned
 	}
 
-	// Get container details from Docker for all instances
+	// Stack response: group instances by service name.
+	if prov.IsStack() {
+		services := make(map[string]any)
+		for svcName, containerIDs := range prov.ServiceContainers {
+			var instances []map[string]any
+			for _, containerID := range containerIDs {
+				info, err := b.docker.InspectContainer(ctx, containerID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to inspect container: %w", err)
+				}
+				ports := make(map[string]map[string]string)
+				for portSpec, binding := range info.Ports {
+					ports[portSpec] = map[string]string{
+						"host_ip":   binding.HostIP,
+						"host_port": binding.HostPort,
+					}
+				}
+				instances = append(instances, map[string]any{
+					"instance_index": info.InstanceIndex,
+					"container_id":   shortID(info.ContainerID),
+					"image":          info.Image,
+					"status":         info.Status,
+					"ports":          ports,
+				})
+			}
+			services[svcName] = map[string]any{
+				"instances": instances,
+			}
+		}
+		leaseInfo := backend.LeaseInfo{
+			"host":     b.cfg.HostAddress,
+			"services": services,
+		}
+		return &leaseInfo, nil
+	}
+
+	// Legacy response: flat instances array.
 	var instances []map[string]any
 	for _, containerID := range prov.ContainerIDs {
 		info, err := b.docker.InspectContainer(ctx, containerID)
@@ -1770,7 +2680,6 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 			return nil, fmt.Errorf("failed to inspect container: %w", err)
 		}
 
-		// Build port mapping for this instance
 		ports := make(map[string]map[string]string)
 		for portSpec, binding := range info.Ports {
 			ports[portSpec] = map[string]string{
@@ -1823,25 +2732,51 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	prov.Status = backend.ProvisionStatusFailed
 	b.provisionsMu.Unlock()
 
-	// Remove all containers, collecting successes and failures.
-	// RemoveContainer is idempotent (already-removed containers return nil),
-	// so non-nil errors indicate actual failures (I/O, permissions, etc.).
+	// Remove all containers.
+	// For stacks, use Compose Down for atomic cleanup; fall back to individual
+	// removal if Compose fails. For single-container leases, use RemoveContainer.
 	var errs []error
 	var failedIDs []string
-	for _, containerID := range prov.ContainerIDs {
-		if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-			logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
-			errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
-			failedIDs = append(failedIDs, containerID)
+	if prov.IsStack() {
+		stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
+		if downErr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); downErr != nil {
+			logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
+			for _, containerID := range prov.ContainerIDs {
+				if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
+					logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
+					errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+					failedIDs = append(failedIDs, containerID)
+				} else {
+					logger.Info("container removed", "container_id", shortID(containerID))
+				}
+			}
 		} else {
-			logger.Info("container removed", "container_id", shortID(containerID))
+			logger.Info("compose down completed", "project", composeProjectName(leaseUUID))
+		}
+	} else {
+		for _, containerID := range prov.ContainerIDs {
+			if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
+				logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
+				errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+				failedIDs = append(failedIDs, containerID)
+			} else {
+				logger.Info("container removed", "container_id", shortID(containerID))
+			}
 		}
 	}
 
 	// Release resource pool allocations regardless of outcome — the lease
 	// is being abandoned and these resources should be freed.
-	for i := 0; i < prov.Quantity; i++ {
-		b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
+	if prov.IsStack() {
+		for _, item := range prov.Items {
+			for i := 0; i < item.Quantity; i++ {
+				b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
+			}
+		}
+	} else {
+		for i := 0; i < prov.Quantity; i++ {
+			b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
+		}
 	}
 
 	if len(errs) > 0 {
@@ -1862,11 +2797,23 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 
 	// Destroy managed volumes for all instances.
 	var volumeErrs []error
-	for i := 0; i < prov.Quantity; i++ {
-		volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
-		if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
-			logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
-			volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
+	if prov.IsStack() {
+		for _, item := range prov.Items {
+			for i := 0; i < item.Quantity; i++ {
+				volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)
+				if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
+					logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
+					volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
+				}
+			}
+		}
+	} else {
+		for i := 0; i < prov.Quantity; i++ {
+			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
+			if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
+				logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
+				volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
+			}
 		}
 	}
 
@@ -1956,7 +2903,7 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 }
 
 // ListProvisions returns all currently provisioned resources.
-func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
+func (b *Backend) ListProvisions(_ context.Context) ([]backend.ProvisionInfo, error) {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
 
@@ -2045,12 +2992,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// release (e.g., a failed update to a newer image).
 			if b.releaseStore != nil {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
-					var m DockerManifest
-					if jsonErr := json.Unmarshal(rel.Manifest, &m); jsonErr == nil {
-						prov.Manifest = &m
-					} else {
-						b.logger.Warn("failed to unmarshal recovered manifest",
-							"lease_uuid", c.LeaseUUID, "error", jsonErr)
+					// Use ParsePayload to auto-detect single vs stack manifest.
+					legacyM, stackM, payloadErr := ParsePayload(rel.Manifest)
+					if payloadErr != nil {
+						b.logger.Warn("failed to parse recovered manifest",
+							"lease_uuid", c.LeaseUUID, "error", payloadErr)
+					} else if stackM != nil {
+						prov.StackManifest = stackM
+					} else if legacyM != nil {
+						prov.Manifest = legacyM
 					}
 				}
 			}
@@ -2061,6 +3011,33 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// Add container ID to the provision
 		prov.ContainerIDs = append(prov.ContainerIDs, c.ContainerID)
 		prov.Quantity = len(prov.ContainerIDs)
+
+		// Build ServiceContainers map and Items for stack containers.
+		if c.ServiceName != "" {
+			if prov.ServiceContainers == nil {
+				prov.ServiceContainers = make(map[string][]string)
+			}
+			prov.ServiceContainers[c.ServiceName] = append(prov.ServiceContainers[c.ServiceName], c.ContainerID)
+
+			// Rebuild Items from container labels (SKU + ServiceName per container).
+			// Use a dedup map keyed by service name since multiple containers
+			// belong to the same item.
+			found := false
+			for idx := range prov.Items {
+				if prov.Items[idx].ServiceName == c.ServiceName {
+					prov.Items[idx].Quantity = len(prov.ServiceContainers[c.ServiceName])
+					found = true
+					break
+				}
+			}
+			if !found {
+				prov.Items = append(prov.Items, backend.LeaseItem{
+					SKU:         c.SKU,
+					Quantity:    1,
+					ServiceName: c.ServiceName,
+				})
+			}
+		}
 
 		// Use the highest FailCount across containers. Labels are normally
 		// identical, but can diverge after a partial re-provision.
@@ -2075,7 +3052,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 
 		// Use instance-specific allocation ID, grouped by lease for filtering.
-		instanceID := fmt.Sprintf("%s-%d", c.LeaseUUID, c.InstanceIndex)
+		// Stack uses service-aware IDs: {leaseUUID}-{serviceName}-{instanceIndex}
+		var instanceID string
+		if c.ServiceName != "" {
+			instanceID = fmt.Sprintf("%s-%s-%d", c.LeaseUUID, c.ServiceName, c.InstanceIndex)
+		} else {
+			instanceID = fmt.Sprintf("%s-%d", c.LeaseUUID, c.InstanceIndex)
+		}
 		allocsByLease[c.LeaseUUID] = append(allocsByLease[c.LeaseUUID], shared.ResourceAllocation{
 			LeaseUUID: instanceID,
 			Tenant:    c.Tenant,
@@ -2230,6 +3213,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	type diagItem struct {
 		entry        shared.DiagnosticEntry
 		containerIDs []string
+		keys         map[string]string
 	}
 	diagItems := make([]diagItem, 0, len(allFailed))
 	b.provisionsMu.RLock()
@@ -2238,12 +3222,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			diagItems = append(diagItems, diagItem{
 				entry:        diagnosticSnapshot(prov),
 				containerIDs: append([]string(nil), prov.ContainerIDs...),
+				keys:         containerLogKeys(prov),
 			})
 		}
 	}
 	b.provisionsMu.RUnlock()
 	for _, item := range diagItems {
-		b.persistDiagnostics(item.entry, item.containerIDs)
+		b.persistDiagnostics(item.entry, item.containerIDs, item.keys)
 	}
 
 	// Send failure callbacks with hardcoded message — never includes logs
@@ -2295,8 +3280,16 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	expected := make(map[string]bool)
 	b.provisionsMu.RLock()
 	for leaseUUID, prov := range b.provisions {
-		for i := 0; i < prov.Quantity; i++ {
-			expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
+		if prov.IsStack() {
+			for _, item := range prov.Items {
+				for i := 0; i < item.Quantity; i++ {
+					expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
+				}
+			}
+		} else {
+			for i := 0; i < prov.Quantity; i++ {
+				expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
+			}
 		}
 	}
 	b.provisionsMu.RUnlock()
@@ -2478,23 +3471,29 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	// Persist diagnostics (snapshot under lock, I/O outside).
 	var diagSnap shared.DiagnosticEntry
 	var diagContainerIDs []string
+	var diagKeys map[string]string
 	b.provisionsMu.RLock()
 	if p, ok := b.provisions[leaseUUID]; ok {
 		diagSnap = diagnosticSnapshot(p)
 		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
+		diagKeys = containerLogKeys(p)
 	}
 	b.provisionsMu.RUnlock()
-	b.persistDiagnostics(diagSnap, diagContainerIDs)
+	b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
 
 	// Update metrics and send callback.
 	activeProvisions.Dec()
 	b.sendCallback(leaseUUID, false, errMsgContainerExited)
 
-	b.logger.Warn("container death detected via events API",
+	logAttrs := []any{
 		"lease_uuid", leaseUUID,
 		"container_id", shortID(containerID),
 		"fail_count", currentProv.FailCount,
-	)
+	}
+	if info.ServiceName != "" {
+		logAttrs = append(logAttrs, "service_name", info.ServiceName)
+	}
+	b.logger.Warn("container death detected via events API", logAttrs...)
 }
 
 // findLeaseByContainerID returns the lease UUID, provision, and true if a
@@ -2526,6 +3525,31 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	b.provisionsMu.RUnlock()
 
 	if exists {
+		// Stack logs: key by "serviceName/instanceIndex" (e.g., "web/0", "db/0").
+		if prov.IsStack() {
+			result := make(map[string]string, len(prov.ContainerIDs))
+			for svcName, containerIDs := range prov.ServiceContainers {
+				for i, containerID := range containerIDs {
+					key := fmt.Sprintf("%s/%d", svcName, i)
+					logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
+					if err != nil {
+						b.logger.Warn("failed to retrieve container logs",
+							"lease_uuid", leaseUUID,
+							"service", svcName,
+							"instance", i,
+							"container_id", shortID(containerID),
+							"error", err,
+						)
+						result[key] = fmt.Sprintf("<error: %s>", err)
+						continue
+					}
+					result[key] = logs
+				}
+			}
+			return result, nil
+		}
+
+		// Legacy logs: key by instance index ("0", "1", ...).
 		result := make(map[string]string, len(prov.ContainerIDs))
 		for i, containerID := range prov.ContainerIDs {
 			logs, err := b.docker.ContainerLogs(ctx, containerID, tail)

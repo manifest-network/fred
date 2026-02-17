@@ -73,8 +73,27 @@ type Backend interface {
 
 // LeaseItem represents a single SKU with its quantity in a lease.
 type LeaseItem struct {
-	SKU      string `json:"sku"`
-	Quantity int    `json:"quantity"`
+	SKU         string `json:"sku"`
+	Quantity    int    `json:"quantity"`
+	ServiceName string `json:"service_name,omitempty"`
+}
+
+// IsStack returns true when the lease items represent a stack (multi-service deployment).
+// A stack lease has ServiceName set on every item. Legacy leases have no ServiceName
+// on any item. The modes are all-or-nothing (enforced on-chain).
+// Returns an error if items contain a mix of set and unset ServiceName values,
+// which indicates a chain enforcement bug or corrupted request.
+func IsStack(items []LeaseItem) (bool, error) {
+	if len(items) == 0 {
+		return false, nil
+	}
+	isStack := items[0].ServiceName != ""
+	for _, item := range items[1:] {
+		if (item.ServiceName != "") != isStack {
+			return false, fmt.Errorf("mixed ServiceName in lease items: items[0].ServiceName=%q but found %q", items[0].ServiceName, item.ServiceName)
+		}
+	}
+	return isStack, nil
 }
 
 // ProvisionRequest contains the data needed to provision a resource.
@@ -260,7 +279,7 @@ func ClassifyValidationError(err error) ValidationCode {
 var ErrInsufficientResources = errors.New("insufficient resources")
 
 // ErrInvalidState is returned when an operation is not valid for the current lease state.
-var ErrInvalidState = fmt.Errorf("invalid state for operation")
+var ErrInvalidState = errors.New("invalid state for operation")
 
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")

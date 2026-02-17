@@ -4,10 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
+
+// serviceNameRe restricts service names to DNS-label-safe characters.
+// This prevents path traversal, invalid Docker container names, and
+// other injection via service names interpolated into container names,
+// volume IDs, filesystem paths, and network aliases.
+var serviceNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 // maxTmpfsMounts is the maximum number of additional tmpfs mounts a tenant can request.
 // Combined with the automatic /tmp and /run mounts (2), and the default 64MB per mount,
@@ -55,6 +64,27 @@ type DockerManifest struct {
 	// "username", or "username:group". When set, volumes are pre-chowned to
 	// the resolved UID/GID and container.Config.User is set accordingly.
 	User string `json:"user,omitempty"`
+
+	// DependsOn declares startup dependencies on other services (stack-only).
+	// Keys are service names; values specify the condition to wait for.
+	DependsOn map[string]DependsOnCondition `json:"depends_on,omitempty"`
+
+	// StopGracePeriod is the time to wait after SIGTERM before sending SIGKILL.
+	// Bounded to 1s–120s.
+	StopGracePeriod *Duration `json:"stop_grace_period,omitempty"`
+
+	// Init runs an init process (tini) as PID 1 inside the container for
+	// proper zombie reaping and signal forwarding.
+	Init *bool `json:"init,omitempty"`
+
+	// Expose documents inter-service ports without creating host bindings.
+	// Values are port numbers as strings (e.g., "3000", "8080").
+	Expose []string `json:"expose,omitempty"`
+}
+
+// DependsOnCondition specifies the condition a dependency must meet.
+type DependsOnCondition struct {
+	Condition string `json:"condition"`
 }
 
 // PortConfig specifies port mapping configuration.
@@ -117,13 +147,17 @@ func (d Duration) Duration() time.Duration {
 }
 
 // ParseManifest parses and validates a DockerManifest from JSON.
+// Unknown fields are rejected to catch accidental misuse (e.g., passing
+// a stack manifest where a single-container manifest is expected).
 func ParseManifest(data []byte) (*DockerManifest, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("manifest is empty")
 	}
 
 	var m DockerManifest
-	if err := json.Unmarshal(data, &m); err != nil {
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("invalid manifest JSON: %w", err)
 	}
 
@@ -134,10 +168,29 @@ func ParseManifest(data []byte) (*DockerManifest, error) {
 	return &m, nil
 }
 
-// Validate checks that the manifest is valid.
+// Validate checks that the manifest is valid for single-container use.
+// It rejects stack-only fields like depends_on.
 func (m *DockerManifest) Validate() error {
+	return m.validate(false)
+}
+
+// ValidateInStack checks that the manifest is valid for use within a stack.
+// It allows stack-only fields like depends_on (cross-service validation is
+// done separately by StackManifest.Validate).
+func (m *DockerManifest) ValidateInStack() error {
+	return m.validate(true)
+}
+
+// validate is the shared validation logic. When inStack is false, stack-only
+// fields (depends_on) are rejected.
+func (m *DockerManifest) validate(inStack bool) error {
 	if m.Image == "" {
 		return fmt.Errorf("image is required")
+	}
+
+	// depends_on is stack-only.
+	if !inStack && len(m.DependsOn) > 0 {
+		return fmt.Errorf("depends_on is only allowed in stack manifests")
 	}
 
 	// Validate port specifications
@@ -179,6 +232,22 @@ func (m *DockerManifest) Validate() error {
 		if err := validateUserSpec(m.User); err != nil {
 			return err
 		}
+	}
+
+	// Validate stop_grace_period bounds (1s–120s).
+	if m.StopGracePeriod != nil {
+		d := m.StopGracePeriod.Duration()
+		if d < time.Second {
+			return fmt.Errorf("stop_grace_period must be at least 1s, got %s", d)
+		}
+		if d > 120*time.Second {
+			return fmt.Errorf("stop_grace_period must be at most 120s, got %s", d)
+		}
+	}
+
+	// Validate expose ports.
+	if err := validateExposePorts(m.Expose); err != nil {
+		return err
 	}
 
 	return nil
@@ -344,6 +413,222 @@ func validateTmpfsPaths(paths []string) error {
 			return fmt.Errorf("tmpfs: duplicate path: %q", cleaned)
 		}
 		seen[cleaned] = true
+	}
+
+	return nil
+}
+
+// validateExposePorts checks that expose port values are valid port numbers
+// with no duplicates.
+func validateExposePorts(ports []string) error {
+	seen := make(map[string]bool, len(ports))
+	for _, p := range ports {
+		port, err := strconv.Atoi(p)
+		if err != nil {
+			return fmt.Errorf("expose: %q is not a valid port number", p)
+		}
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("expose: port %d must be between 1 and 65535", port)
+		}
+		if seen[p] {
+			return fmt.Errorf("expose: duplicate port %q", p)
+		}
+		seen[p] = true
+	}
+	return nil
+}
+
+// StackManifest represents a multi-service deployment where each service
+// has its own DockerManifest. The services map is keyed by service name
+// (matching LeaseItem.ServiceName from the chain).
+type StackManifest struct {
+	Services map[string]*DockerManifest `json:"services"`
+}
+
+// Validate checks that the stack manifest is valid.
+func (s *StackManifest) Validate() error {
+	if len(s.Services) == 0 {
+		return fmt.Errorf("stack manifest must have at least one service")
+	}
+	for name, svc := range s.Services {
+		if name == "" {
+			return fmt.Errorf("service name cannot be empty")
+		}
+		if len(name) > 63 {
+			return fmt.Errorf("service name %q exceeds 63 characters", name)
+		}
+		if !serviceNameRe.MatchString(name) {
+			return fmt.Errorf("service name %q must match [a-z0-9]([a-z0-9-]*[a-z0-9])?", name)
+		}
+		if svc == nil {
+			return fmt.Errorf("service %q has nil manifest", name)
+		}
+		if err := svc.ValidateInStack(); err != nil {
+			return fmt.Errorf("service %q: %w", name, err)
+		}
+	}
+
+	// Cross-service depends_on validation.
+	if err := s.validateDependsOn(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// dependsOnMaxDepth is the maximum dependency chain depth for cycle detection.
+const dependsOnMaxDepth = 10
+
+// validateDependsOn checks cross-service dependency constraints:
+// - Referenced services must exist in the stack.
+// - No self-dependencies.
+// - Only "service_started" and "service_healthy" conditions allowed.
+// - "service_healthy" requires the referenced service to have an active health check.
+// - No cycles (DFS with max depth 10).
+func (s *StackManifest) validateDependsOn() error {
+	for name, svc := range s.Services {
+		for dep, cond := range svc.DependsOn {
+			// Self-dependency.
+			if dep == name {
+				return fmt.Errorf("service %q: depends_on cannot reference itself", name)
+			}
+
+			// Referenced service must exist.
+			depSvc, ok := s.Services[dep]
+			if !ok {
+				return fmt.Errorf("service %q: depends_on references unknown service %q", name, dep)
+			}
+
+			// Validate condition.
+			switch cond.Condition {
+			case "service_started":
+				// Always valid.
+			case "service_healthy":
+				if !depSvc.HasActiveHealthCheck() {
+					return fmt.Errorf("service %q: depends_on %q with condition %q requires %q to have a health_check",
+						name, dep, cond.Condition, dep)
+				}
+			case "":
+				return fmt.Errorf("service %q: depends_on %q has empty condition", name, dep)
+			default:
+				return fmt.Errorf("service %q: depends_on %q has invalid condition %q (must be service_started or service_healthy)",
+					name, dep, cond.Condition)
+			}
+		}
+	}
+
+	// Cycle detection via DFS.
+	return s.detectDependsOnCycles()
+}
+
+// detectDependsOnCycles performs DFS-based cycle detection across the
+// depends_on graph. Returns an error if any cycle is found or if the
+// dependency chain exceeds dependsOnMaxDepth.
+func (s *StackManifest) detectDependsOnCycles() error {
+	const (
+		white = 0 // unvisited
+		gray  = 1 // in current path
+		black = 2 // fully explored
+	)
+
+	color := make(map[string]int, len(s.Services))
+
+	var dfs func(name string, depth int) error
+	dfs = func(name string, depth int) error {
+		if depth > dependsOnMaxDepth {
+			return fmt.Errorf("depends_on: dependency chain exceeds maximum depth of %d", dependsOnMaxDepth)
+		}
+		color[name] = gray
+		svc := s.Services[name]
+		if svc == nil {
+			return nil
+		}
+		for dep := range svc.DependsOn {
+			switch color[dep] {
+			case gray:
+				return fmt.Errorf("depends_on: cycle detected involving service %q", dep)
+			case white:
+				if err := dfs(dep, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		color[name] = black
+		return nil
+	}
+
+	for name := range s.Services {
+		if color[name] == white {
+			if err := dfs(name, 0); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ParsePayload auto-detects whether data is a single DockerManifest or a
+// StackManifest (contains a "services" key). Returns exactly one non-nil result.
+func ParsePayload(data []byte) (*DockerManifest, *StackManifest, error) {
+	if len(data) == 0 {
+		return nil, nil, fmt.Errorf("payload is empty")
+	}
+
+	// Probe for the "services" key to detect stack format.
+	var probe struct {
+		Services json.RawMessage `json:"services"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, nil, fmt.Errorf("invalid payload JSON: %w", err)
+	}
+
+	if probe.Services != nil {
+		var stack StackManifest
+		if err := json.Unmarshal(data, &stack); err != nil {
+			return nil, nil, fmt.Errorf("invalid stack manifest JSON: %w", err)
+		}
+		if err := stack.Validate(); err != nil {
+			return nil, nil, err
+		}
+		return nil, &stack, nil
+	}
+
+	manifest, err := ParseManifest(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifest, nil, nil
+}
+
+// ValidateStackAgainstItems ensures a 1:1 mapping between manifest service
+// names and lease item service names. Every lease item must have a matching
+// service in the manifest, and vice versa.
+func ValidateStackAgainstItems(stack *StackManifest, items []backend.LeaseItem) error {
+	manifestNames := make(map[string]bool, len(stack.Services))
+	for name := range stack.Services {
+		manifestNames[name] = true
+	}
+
+	itemNames := make(map[string]bool, len(items))
+	for _, item := range items {
+		if itemNames[item.ServiceName] {
+			return fmt.Errorf("duplicate lease item service name %q", item.ServiceName)
+		}
+		itemNames[item.ServiceName] = true
+	}
+
+	// Check for services in manifest but not in lease items.
+	for name := range manifestNames {
+		if !itemNames[name] {
+			return fmt.Errorf("manifest service %q has no matching lease item", name)
+		}
+	}
+
+	// Check for lease items not in manifest.
+	for name := range itemNames {
+		if !manifestNames[name] {
+			return fmt.Errorf("lease item service %q has no matching manifest service", name)
+		}
 	}
 
 	return nil

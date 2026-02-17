@@ -1079,3 +1079,73 @@ func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
 	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
 }
+
+func TestIsStack(t *testing.T) {
+	t.Run("empty items", func(t *testing.T) {
+		result, err := IsStack(nil)
+		require.NoError(t, err)
+		assert.False(t, result)
+
+		result, err = IsStack([]LeaseItem{})
+		require.NoError(t, err)
+		assert.False(t, result)
+	})
+
+	t.Run("all with ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		}
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.True(t, result)
+	})
+
+	t.Run("none with ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1},
+			{SKU: "docker-small", Quantity: 2},
+		}
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.False(t, result)
+	})
+
+	t.Run("single item with ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		}
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.True(t, result)
+	})
+
+	t.Run("single item without ServiceName", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1},
+		}
+		result, err := IsStack(items)
+		require.NoError(t, err)
+		assert.False(t, result)
+	})
+
+	t.Run("mixed: first has, second doesn't", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1},
+		}
+		_, err := IsStack(items)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mixed")
+	})
+
+	t.Run("mixed: first doesn't, second has", func(t *testing.T) {
+		items := []LeaseItem{
+			{SKU: "docker-small", Quantity: 1},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		}
+		_, err := IsStack(items)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mixed")
+	})
+}

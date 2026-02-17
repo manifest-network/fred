@@ -57,6 +57,82 @@ func TestSanitizeVolumePath(t *testing.T) {
 	}
 }
 
+func TestBuildStatefulVolumeBinds(t *testing.T) {
+	t.Run("empty volumes returns empty map", func(t *testing.T) {
+		dir := t.TempDir()
+		binds, err := buildStatefulVolumeBinds(dir, nil, 0, 0)
+		require.NoError(t, err)
+		assert.Empty(t, binds)
+	})
+
+	t.Run("single volume path", func(t *testing.T) {
+		dir := t.TempDir()
+		binds, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		require.NoError(t, err)
+		require.Len(t, binds, 1)
+		expected := filepath.Join(dir, "data")
+		assert.Equal(t, "/data", binds[expected])
+		assert.DirExists(t, expected)
+	})
+
+	t.Run("multiple volume paths", func(t *testing.T) {
+		dir := t.TempDir()
+		binds, err := buildStatefulVolumeBinds(dir, []string{"/data", "/var/lib/postgresql/data"}, 0, 0)
+		require.NoError(t, err)
+		assert.Len(t, binds, 2)
+		assert.Equal(t, "/data", binds[filepath.Join(dir, "data")])
+		assert.Equal(t, "/var/lib/postgresql/data", binds[filepath.Join(dir, "var/lib/postgresql/data")])
+		assert.DirExists(t, filepath.Join(dir, "data"))
+		assert.DirExists(t, filepath.Join(dir, "var/lib/postgresql/data"))
+	})
+
+	t.Run("unsupported volume path returns error", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := buildStatefulVolumeBinds(dir, []string{".."}, 0, 0)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported VOLUME path")
+		assert.Contains(t, err.Error(), "..")
+	})
+
+	t.Run("unsupported path among valid paths returns error and stops", func(t *testing.T) {
+		dir := t.TempDir()
+		// "/" sanitizes to "" which is unsupported
+		_, err := buildStatefulVolumeBinds(dir, []string{"/data", "/"}, 0, 0)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported VOLUME path")
+	})
+
+	t.Run("uid gid zero skips chown", func(t *testing.T) {
+		dir := t.TempDir()
+		binds, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		require.NoError(t, err)
+		assert.Len(t, binds, 1)
+		// Just verify it succeeds without chown — no permission error
+	})
+
+	t.Run("mkdir on read-only parent fails", func(t *testing.T) {
+		dir := t.TempDir()
+		roDir := filepath.Join(dir, "readonly")
+		require.NoError(t, os.MkdirAll(roDir, 0o700))
+		require.NoError(t, os.Chmod(roDir, 0o500))
+		t.Cleanup(func() { os.Chmod(roDir, 0o700) })
+
+		_, err := buildStatefulVolumeBinds(roDir, []string{"/data"}, 0, 0)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "volume subdir")
+	})
+
+	t.Run("subdirectory permissions are 0700", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		require.NoError(t, err)
+
+		info, err := os.Stat(filepath.Join(dir, "data"))
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+	})
+}
+
 func TestNoopVolumeManager(t *testing.T) {
 	vm := &noopVolumeManager{}
 

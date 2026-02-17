@@ -183,6 +183,30 @@ Multi-unit leases create multiple containers from the same manifest. Multi-SKU l
 
 The entire async operation is bounded by `ProvisionTimeout` and is canceled on backend shutdown.
 
+### Stack Provisioning
+
+When lease items carry `service_name` fields (and the payload is a [stack manifest](TENANT_MANIFEST.md#stack-manifests)), the backend provisions a multi-service stack:
+
+1. **Synchronous validation** — same as single-container, plus:
+   - Detects stack vs single mode via `IsStack(items)`
+   - Validates 1:1 mapping between manifest service names and lease item service names
+   - Validates each per-service manifest independently
+
+2. **Asynchronous provisioning** — Docker Compose-based deployment:
+   - Each service's image is pulled and inspected independently (pre-flight, before Compose)
+   - Volumes are pre-created for stateful services (`disk_mb > 0` with image `VOLUME`s)
+     - Resource allocation ID: `{leaseUUID}-{serviceName}-{instanceIndex}`
+     - Volume ID: `fred-{leaseUUID}-{serviceName}-{instanceIndex}`
+   - A Compose project is built in-memory from the stack manifest via `buildComposeProject`
+   - Service startup ordering is controlled by `depends_on` declarations in the manifest (supports `service_started` and `service_healthy` conditions with cycle detection)
+   - `compose.Up` atomically creates, starts, and network-attaches all service containers
+   - `compose.PS` discovers the resulting container IDs per service
+   - Startup verification runs per-service, each using its own health check config
+   - Restart/update uses `compose.Up` with the updated project; on failure, the previous manifest is rebuilt and rolled back via another `compose.Up`
+   - Deprovision uses `compose.Down` for atomic cleanup, with fallback to individual container removal
+
+3. **Callback** — single callback for the entire stack (success only when all services are healthy/running).
+
 ## Container Hardening
 
 Every container is created with the following security measures:
@@ -292,7 +316,7 @@ All authenticated endpoints require an `X-Fred-Signature` HMAC-SHA256 header (se
 
 Starts async container provisioning. Pre-flight validation (SKU, manifest, image allowlist, resources) is synchronous; the actual container lifecycle runs in a background goroutine with results delivered via callback.
 
-**Request:**
+**Request (single-container):**
 
 ```json
 {
@@ -304,6 +328,22 @@ Starts async container provisioning. Pre-flight validation (SKU, manifest, image
   ],
   "callback_url": "https://fred-host/api/v1/backend/callback",
   "payload": "<base64-encoded manifest JSON>"
+}
+```
+
+**Request (stack):**
+
+```json
+{
+  "lease_uuid": "abc-123",
+  "tenant": "manifest1...",
+  "provider_uuid": "prov-1",
+  "items": [
+    { "sku": "docker-small", "quantity": 1, "service_name": "web" },
+    { "sku": "docker-medium", "quantity": 1, "service_name": "db" }
+  ],
+  "callback_url": "https://fred-host/api/v1/backend/callback",
+  "payload": "<base64-encoded stack manifest JSON>"
 }
 ```
 
@@ -341,7 +381,7 @@ Removes all containers and managed volumes for a lease and releases resources. I
 
 Returns connection details for a running lease. Only available when the provision status is `ready` — returns `404` otherwise.
 
-**Response (`200`):**
+**Response (`200`, single-container):**
 
 ```json
 {
@@ -360,18 +400,65 @@ Returns connection details for a running lease. Only available when the provisio
 }
 ```
 
+**Response (`200`, stack):**
+
+For stack provisions, instances are grouped by service name under a `"services"` map. Each service value is an object with an `"instances"` key:
+
+```json
+{
+  "host": "192.168.1.100",
+  "services": {
+    "web": {
+      "instances": [
+        {
+          "instance_index": 0,
+          "container_id": "abcdefghijkl",
+          "image": "ghcr.io/myorg/webapp:v2.1.0",
+          "status": "running",
+          "ports": {
+            "8080/tcp": { "host_ip": "0.0.0.0", "host_port": "32768" }
+          }
+        }
+      ]
+    },
+    "db": {
+      "instances": [
+        {
+          "instance_index": 0,
+          "container_id": "mnopqrstuvwx",
+          "image": "postgres:16",
+          "status": "running",
+          "ports": {
+            "5432/tcp": { "host_ip": "0.0.0.0", "host_port": "32769" }
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
 ### `GET /logs/{lease_uuid}` (authenticated)
 
-Returns container stdout/stderr keyed by instance index. Works for any provision status (provisioning, ready, or failed).
+Returns container stdout/stderr. For single-container provisions, logs are keyed by instance index. For stack provisions, logs use `"serviceName/instanceIndex"` keys (e.g., `"web/0"`, `"db/0"`). Works for any provision status (provisioning, ready, or failed).
 
 **Query parameters:** `tail` — number of lines (default 100, max 10000).
 
-**Response (`200`):**
+**Response (`200`, single-container):**
 
 ```json
 {
   "0": "2025-01-15T10:00:00Z Starting server...\n...",
   "1": "2025-01-15T10:00:00Z Worker ready\n..."
+}
+```
+
+**Response (`200`, stack):**
+
+```json
+{
+  "web/0": "2025-01-15T10:00:00Z Listening on :8080\n...",
+  "db/0": "2025-01-15T10:00:00Z database system is ready to accept connections\n..."
 }
 ```
 
@@ -467,7 +554,7 @@ Prometheus metrics in exposition format. Served by `promhttp.Handler()`.
 
 The resource pool tracks CPU, memory, and disk allocations.
 
-- **Allocation IDs** are per-instance: `<lease-uuid>-<instance-index>` (e.g., `abc123-0`, `abc123-1`).
+- **Allocation IDs** are per-instance: `<lease-uuid>-<instance-index>` for single-container leases (e.g., `abc123-0`, `abc123-1`), or `<lease-uuid>-<service-name>-<instance-index>` for stack leases (e.g., `abc123-web-0`, `abc123-db-0`).
 - **TryAllocate** atomically checks capacity and reserves resources for a SKU. On insufficient resources, returns an error and the caller rolls back any partial allocations.
 - **Release** is idempotent -- releasing a non-existent allocation is a no-op.
 - **Stats** returns total, allocated, and available CPU/memory/disk.
@@ -509,6 +596,7 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.instance_index` | integer string | 0-based index within a multi-unit lease |
 | `fred.fail_count` | integer string | Number of provision failures for this lease at creation time |
 | `fred.callback_url` | URL string | Callback URL for provision results; persisted so failure callbacks survive backend restarts |
+| `fred.service_name` | service name string | Service name within a stack (stack provisions only) |
 
 User-provided labels in the manifest are also applied, but may not use the `fred.*` prefix.
 

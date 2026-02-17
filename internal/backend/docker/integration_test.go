@@ -10,8 +10,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"path/filepath"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -2474,4 +2474,703 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	// Cleanup
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
+}
+
+// --- Stack integration tests ---
+
+func TestIntegration_Stack_ProvisionLifecycle(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-lifecycle-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// GetInfo should return stack-structured response
+	info, err := b.GetInfo(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.Equal(t, "127.0.0.1", (*info)["host"])
+
+	services, ok := (*info)["services"].(map[string]any)
+	require.True(t, ok, "expected services map in stack GetInfo response")
+	require.Contains(t, services, "web")
+	require.Contains(t, services, "db")
+
+	for _, svcName := range []string{"web", "db"} {
+		svc, ok := services[svcName].(map[string]any)
+		require.True(t, ok, "expected map for service %s", svcName)
+		instances, ok := svc["instances"].([]map[string]any)
+		require.True(t, ok, "expected instances array for service %s", svcName)
+		require.Len(t, instances, 1, "expected 1 instance for service %s", svcName)
+		assert.Equal(t, "running", instances[0]["status"])
+	}
+
+	// GetLogs should return service-keyed logs
+	logs, err := b.GetLogs(ctx, leaseUUID, 10)
+	require.NoError(t, err)
+	assert.Contains(t, logs, "web/0")
+	assert.Contains(t, logs, "db/0")
+
+	// ListProvisions should show status Ready
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	// Deprovision
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+
+	// GetInfo should return ErrNotProvisioned after deprovision
+	_, err = b.GetInfo(ctx, leaseUUID)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+func TestIntegration_Stack_HealthCheck(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-health-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db": {
+				Image:   "busybox:latest",
+				Command: []string{"sleep", "3600"},
+				HealthCheck: &HealthCheckConfig{
+					Test:     []string{"CMD", "true"},
+					Interval: Duration(1 * time.Second),
+					Timeout:  Duration(1 * time.Second),
+					Retries:  3,
+				},
+			},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Verify both services are running
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	containers := inspectProvisionContainers(t, leaseUUID)
+	assert.Len(t, containers, 2, "expected 2 containers for stack")
+
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.ProvisionTimeout = 15 * time.Second
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-health-fail-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db": {
+				Image:   "busybox:latest",
+				Command: []string{"sleep", "3600"},
+				HealthCheck: &HealthCheckConfig{
+					Test:     []string{"CMD", "false"},
+					Interval: Duration(1 * time.Second),
+					Timeout:  Duration(1 * time.Second),
+					Retries:  1,
+				},
+			},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 30*time.Second)
+	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+}
+
+func TestIntegration_Stack_DependsOn(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-depends-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image:   "busybox:latest",
+				Command: []string{"sleep", "3600"},
+				DependsOn: map[string]DependsOnCondition{
+					"db": {Condition: "service_started"},
+				},
+			},
+			"db": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Verify both services are running
+	containers := inspectProvisionContainers(t, leaseUUID)
+	assert.Len(t, containers, 2, "expected 2 containers (web + db)")
+
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Stack_DependsOnHealthy(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-depends-healthy-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image:   "busybox:latest",
+				Command: []string{"sleep", "3600"},
+				DependsOn: map[string]DependsOnCondition{
+					"db": {Condition: "service_healthy"},
+				},
+			},
+			"db": {
+				Image:   "busybox:latest",
+				Command: []string{"sleep", "3600"},
+				HealthCheck: &HealthCheckConfig{
+					Test:     []string{"CMD", "true"},
+					Interval: Duration(1 * time.Second),
+					Timeout:  Duration(1 * time.Second),
+					Retries:  3,
+				},
+			},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	containers := inspectProvisionContainers(t, leaseUUID)
+	assert.Len(t, containers, 2, "expected 2 containers (web + db)")
+
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(true)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-net-%d", time.Now().UnixNano())
+	tenant := fmt.Sprintf("stack-tenant-%d", time.Now().UnixNano())
+
+	// web resolves db by DNS name — if resolution works, the services share a network.
+	// Use nslookup instead of ping because cap_drop: ALL removes NET_RAW.
+	// Retry loop handles the race where db hasn't registered in Docker DNS yet.
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {
+				Image:   "busybox:latest",
+				Command: []string{"sh", "-c", "for i in 1 2 3 4 5; do nslookup db && break; sleep 1; done; sleep 3600"},
+			},
+			"db": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       tenant,
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Verify both containers are running (nslookup succeeded, so DNS worked)
+	containers := inspectProvisionContainers(t, leaseUUID)
+	assert.Len(t, containers, 2, "expected 2 containers")
+
+	// Verify tenant network was created
+	docker, err := NewDockerClient("", "")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+
+	netName := TenantNetworkName(tenant)
+	networks, err := docker.ListManagedNetworks(ctx)
+	require.NoError(t, err)
+
+	found := false
+	for _, n := range networks {
+		if n.Name == netName {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "tenant network %s should exist", netName)
+
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Stack_Restart(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-restart-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Record container IDs before restart
+	containersBefore := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersBefore, 2)
+	idsBefore := make(map[string]bool)
+	for _, c := range containersBefore {
+		idsBefore[c.ID] = true
+	}
+
+	// Restart
+	err = b.Restart(ctx, backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err)
+
+	cb = waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Verify new container IDs
+	containersAfter := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containersAfter, 2)
+	for _, c := range containersAfter {
+		assert.False(t, idsBefore[c.ID], "container %s should be new after restart", c.ID[:12])
+	}
+
+	// Verify status is Ready
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Stack_Update(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-update-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Update both services to alpine
+	updatedStack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	updatedPayload, err := json.Marshal(updatedStack)
+	require.NoError(t, err)
+
+	err = b.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+		Payload:     updatedPayload,
+	})
+	require.NoError(t, err)
+
+	cb = waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Verify containers are running alpine
+	containers := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containers, 2)
+	for _, c := range containers {
+		assert.Contains(t, c.Image, "alpine", "container should be running alpine after update, got %s", c.Image)
+	}
+
+	// Verify status is Ready
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Stack_Deprovision(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-deprov-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Verify containers exist before deprovision
+	containers := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containers, 2, "expected 2 containers before deprovision")
+
+	// Deprovision
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+
+	// Verify all containers removed
+	containers = inspectProvisionContainers(t, leaseUUID)
+	assert.Empty(t, containers, "expected all containers removed after deprovision")
+}
+
+func TestIntegration_Stack_MultiQuantity(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-multi-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// GetInfo should show 2 instances for web, 1 for db
+	info, err := b.GetInfo(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+
+	services, ok := (*info)["services"].(map[string]any)
+	require.True(t, ok, "expected services map")
+
+	webSvc, ok := services["web"].(map[string]any)
+	require.True(t, ok, "expected web service map")
+	webInstances, ok := webSvc["instances"].([]map[string]any)
+	require.True(t, ok, "expected web instances array")
+	assert.Len(t, webInstances, 2, "expected 2 web instances")
+
+	dbSvc, ok := services["db"].(map[string]any)
+	require.True(t, ok, "expected db service map")
+	dbInstances, ok := dbSvc["instances"].([]map[string]any)
+	require.True(t, ok, "expected db instances array")
+	assert.Len(t, dbInstances, 1, "expected 1 db instance")
+
+	// Verify 3 total containers
+	containers := inspectProvisionContainers(t, leaseUUID)
+	assert.Len(t, containers, 3, "expected 3 total containers (2 web + 1 db)")
+
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+}
+
+func TestIntegration_Stack_FullLifecycle(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("stack-full-%d", time.Now().UnixNano())
+
+	stack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	// Step 1: Provision
+	err = b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	})
+	require.NoError(t, err)
+
+	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	prov := getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	// Step 2: Restart
+	err = b.Restart(ctx, backend.RestartRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err)
+
+	cb = waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	prov = getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	// Step 3: Update to alpine
+	updatedStack := StackManifest{
+		Services: map[string]*DockerManifest{
+			"web": {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
+		},
+	}
+	updatedPayload, err := json.Marshal(updatedStack)
+	require.NoError(t, err)
+
+	err = b.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackServer.URL,
+		Payload:     updatedPayload,
+	})
+	require.NoError(t, err)
+
+	cb = waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute)
+	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	prov = getProvisionInfo(t, b, leaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+
+	// Verify alpine images
+	containers := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, containers, 2)
+	for _, c := range containers {
+		assert.Contains(t, c.Image, "alpine", "expected alpine image after update, got %s", c.Image)
+	}
+
+	// Step 4: Deprovision
+	err = b.Deprovision(ctx, leaseUUID)
+	require.NoError(t, err)
+
+	_, err = b.GetInfo(ctx, leaseUUID)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+
+	containers = inspectProvisionContainers(t, leaseUUID)
+	assert.Empty(t, containers, "expected no containers after deprovision")
 }
