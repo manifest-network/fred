@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -104,47 +105,6 @@ func TestStackContainerLogKeys(t *testing.T) {
 	})
 }
 
-// --- Finding 9: rollbackStackContainers skips start after rename failure ---
-
-func TestRollbackStackContainers_SkipsStartAfterRenameFail(t *testing.T) {
-	var mu sync.Mutex
-	startedContainers := map[string]bool{}
-
-	mock := &mockDockerClient{
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
-		},
-		RenameContainerFn: func(ctx context.Context, containerID string, newName string) error {
-			if containerID == "db-c1" {
-				return fmt.Errorf("rename conflict")
-			}
-			return nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			mu.Lock()
-			startedContainers[containerID] = true
-			mu.Unlock()
-			return nil
-		},
-	}
-
-	b := newBackendForTest(mock, nil)
-
-	serviceContainers := map[string][]string{
-		"web": {"web-c1"},
-		"db":  {"db-c1"},
-	}
-
-	allRestored := b.rollbackStackContainers("lease-1", serviceContainers, b.logger)
-
-	assert.False(t, allRestored, "should return false when rename fails for a container")
-
-	mu.Lock()
-	defer mu.Unlock()
-	assert.True(t, startedContainers["web-c1"], "web container should be started after successful rename")
-	assert.False(t, startedContainers["db-c1"], "db container should NOT be started after rename failure")
-}
-
 // --- Finding 1: volume IDs are service-aware ---
 
 func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
@@ -162,7 +122,6 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 		},
 	}
 
-	containerN := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
@@ -170,21 +129,17 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			mu.Lock()
-			containerN++
-			id := fmt.Sprintf("container-%d", containerN)
-			mu.Unlock()
-			return id, nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
+	}
+
+	composeMock := &mockComposeExecutor{
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "web-c1", Service: "web", State: "running"},
+				{ID: "db-c1", Service: "db", State: "running"},
+			}, nil
 		},
 	}
 
@@ -209,6 +164,7 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.volumes = vm
 	// Add a disk-enabled SKU profile.
 	b.cfg.SKUProfiles["docker-small-disk"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}
@@ -229,7 +185,7 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, status)
 
 	mu.Lock()
-	sort.Strings(volumeIDs)
+	slices.Sort(volumeIDs)
 	mu.Unlock()
 	assert.Equal(t, []string{"fred-lease-1-db-0", "fred-lease-1-web-0"}, volumeIDs)
 
@@ -260,42 +216,26 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 		},
 	})
 
-	// Track which container IDs correspond to which service.
-	var mu sync.Mutex
-	containerToService := map[string]string{}
-	containerN := 0
-
-	inspectCount := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			mu.Lock()
-			containerN++
-			id := fmt.Sprintf("c-%s-%d", params.ServiceName, containerN)
-			containerToService[id] = params.ServiceName
-			mu.Unlock()
-			return id, nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			mu.Lock()
-			svc := containerToService[containerID]
-			inspectCount++
-			mu.Unlock()
-
 			info := &ContainerInfo{ContainerID: containerID, Status: "running"}
-			if svc == "web" {
+			if containerID == "web-c1" {
 				// Health check container: report healthy so waitForHealthy succeeds.
 				info.Health = HealthStatusHealthy
 			}
 			return info, nil
 		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
+	}
+
+	composeMock := &mockComposeExecutor{
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "web-c1", Service: "web", State: "running"},
+				{ID: "db-c1", Service: "db", State: "running"},
+			}, nil
 		},
 	}
 
@@ -318,6 +258,7 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	req := newStackProvisionRequest("lease-1", "tenant-a", items, payload)
@@ -344,7 +285,6 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 
 func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 	removedContainers := map[string]bool{}
-	containerN := 0
 	var mu sync.Mutex
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
@@ -356,18 +296,17 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			mu.Lock()
-			containerN++
-			id := fmt.Sprintf("new-%d", containerN)
-			mu.Unlock()
-			return id, nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	composeMock := &mockComposeExecutor{
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "new-web-c1", Service: "web", State: "running"},
+				{ID: "new-db-c1", Service: "db", State: "running"},
+			}, nil
 		},
 	}
 
@@ -396,6 +335,7 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 			},
 		},
 	})
+	b.compose = composeMock
 
 	// Pre-allocate old stack resources with service-aware IDs.
 	_ = b.pool.TryAllocate("lease-1-web-0", "docker-small", "tenant-a")
@@ -487,35 +427,26 @@ func TestStackRestart_Success(t *testing.T) {
 	}
 
 	var mu sync.Mutex
-	stoppedIDs := []string{}
-	removedIDs := []string{}
-	containerN := 0
+	var upForceRecreate bool
 
 	mock := &mockDockerClient{
-		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			mu.Lock()
-			stoppedIDs = append(stoppedIDs, containerID)
-			mu.Unlock()
-			return nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			mu.Lock()
-			removedIDs = append(removedIDs, containerID)
-			mu.Unlock()
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			mu.Lock()
-			containerN++
-			id := fmt.Sprintf("new-%s-%d", params.ServiceName, containerN)
-			mu.Unlock()
-			return id, nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			mu.Lock()
+			upForceRecreate = opts.ForceRecreate
+			mu.Unlock()
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "new-web-c1", Service: "web", State: "running"},
+				{ID: "new-db-c1", Service: "db", State: "running"},
+			}, nil
 		},
 	}
 
@@ -533,6 +464,7 @@ func TestStackRestart_Success(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
 	b.httpClient = callbackServer.Client()
 	rebuildCallbackSender(b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -549,11 +481,9 @@ func TestStackRestart_Success(t *testing.T) {
 		t.Fatal("timeout waiting for callback")
 	}
 
-	// Verify old containers were stopped.
+	// Verify Compose Up was called with ForceRecreate for restart.
 	mu.Lock()
-	assert.ElementsMatch(t, []string{"old-web", "old-db"}, stoppedIDs)
-	// Verify old containers were removed after successful replacement.
-	assert.ElementsMatch(t, []string{"old-web", "old-db"}, removedIDs)
+	assert.True(t, upForceRecreate, "restart should use ForceRecreate")
 	mu.Unlock()
 
 	// Verify callback indicates success.
@@ -603,32 +533,39 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 		},
 	}
 
-	createCount := 0
 	mock := &mockDockerClient{
-		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			createCount++
-			if createCount > 1 {
-				return "", fmt.Errorf("disk full")
-			}
-			return "new-web", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			// Rollback inspects old containers; they are "exited" (were stopped).
-			return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
 	}
 
+	var mu sync.Mutex
+	upCallCount := 0
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			mu.Lock()
+			upCallCount++
+			call := upCallCount
+			mu.Unlock()
+			if call == 1 {
+				// First Up (restart) fails.
+				return fmt.Errorf("compose up failed")
+			}
+			// Second Up (rollback) succeeds.
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "restored-web", Service: "web", State: "running"},
+				{ID: "restored-db", Service: "db", State: "running"},
+			}, nil
+		},
+	}
+
+	var callbackPayload backend.CallbackPayload
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -639,6 +576,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
 	b.httpClient = callbackServer.Client()
 	rebuildCallbackSender(b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -655,12 +593,20 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 		t.Fatal("timeout waiting for callback")
 	}
 
-	// After rollback, provision should be back to Ready (old containers restored).
+	// Even though rollback succeeded, the operation failed — callback should report failure.
+	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
+
+	// After rollback via Compose, provision should be back to Ready.
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	status := prov.Status
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
+
+	// Verify Up was called twice (restart + rollback).
+	mu.Lock()
+	assert.Equal(t, 2, upCallCount, "should call Up twice: restart + rollback")
+	mu.Unlock()
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -697,30 +643,21 @@ func TestStackUpdate_Success(t *testing.T) {
 		},
 	}
 
-	var mu sync.Mutex
-	containerN := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
 		},
-		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			mu.Lock()
-			containerN++
-			id := fmt.Sprintf("new-%s-%d", params.ServiceName, containerN)
-			mu.Unlock()
-			return id, nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	composeMock := &mockComposeExecutor{
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "new-web-c1", Service: "web", State: "running"},
+				{ID: "new-db-c1", Service: "db", State: "running"},
+			}, nil
 		},
 	}
 
@@ -738,6 +675,7 @@ func TestStackUpdate_Success(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
 	b.httpClient = callbackServer.Client()
 	rebuildCallbackSender(b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -962,17 +900,20 @@ func TestGetLogs_Stack_MultiInstance(t *testing.T) {
 // --- Stack Deprovision tests ---
 
 func TestDeprovision_Stack(t *testing.T) {
-	var removedIDs []string
+	var downCalled bool
 	var destroyedVols []string
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removedIDs = append(removedIDs, containerID)
-			return nil
-		},
-	}
+	mock := &mockDockerClient{}
 	vm := &mockVolumeManager{
 		DestroyFn: func(ctx context.Context, id string) error {
 			destroyedVols = append(destroyedVols, id)
+			return nil
+		},
+	}
+
+	composeMock := &mockComposeExecutor{
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			downCalled = true
+			assert.Equal(t, "fred-lease-1", projectName)
 			return nil
 		},
 	}
@@ -1002,6 +943,7 @@ func TestDeprovision_Stack(t *testing.T) {
 			Items: items,
 		},
 	})
+	b.compose = composeMock
 	b.volumes = vm
 	// Pre-allocate with service-aware IDs.
 	_ = b.pool.TryAllocate("lease-1-web-0", "docker-small", "tenant-a")
@@ -1010,12 +952,173 @@ func TestDeprovision_Stack(t *testing.T) {
 	err := b.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 
-	// All containers removed.
-	assert.ElementsMatch(t, []string{"web-c1", "db-c1"}, removedIDs)
+	// Compose Down was called instead of individual RemoveContainer.
+	assert.True(t, downCalled, "compose down should be called for stack deprovision")
 
 	// Service-aware volumes destroyed.
-	sort.Strings(destroyedVols)
+	slices.Sort(destroyedVols)
 	assert.Equal(t, []string{"fred-lease-1-db-0", "fred-lease-1-web-0"}, destroyedVols)
+
+	// Provision removed.
+	b.provisionsMu.RLock()
+	_, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, exists)
+
+	// Resources freed.
+	stats := b.pool.Stats()
+	assert.Equal(t, 0, stats.AllocationCount)
+}
+
+// --- Compose failure tests ---
+
+func TestStackProvision_ComposeUpFailure(t *testing.T) {
+	var downCalled bool
+	var mu sync.Mutex
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+	}
+
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return fmt.Errorf("compose up failed: out of memory")
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			mu.Lock()
+			downCalled = true
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	items := []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+	}
+	payload := validStackManifestJSON(map[string]string{
+		"web": "nginx:latest",
+		"db":  "postgres:16",
+	})
+
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	req := newStackProvisionRequest("lease-1", "tenant-a", items, payload)
+	req.CallbackURL = callbackServer.URL
+
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+
+	// Callback should indicate failure.
+	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
+
+	// Compose Down should be called for cleanup.
+	mu.Lock()
+	assert.True(t, downCalled, "compose down should be called on up failure")
+	mu.Unlock()
+
+	// Provision status should be failed.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	b.provisionsMu.RUnlock()
+
+	// Resources should be released.
+	stats := b.pool.Stats()
+	assert.Equal(t, 0, stats.AllocationCount)
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestDeprovision_Stack_DownFallback(t *testing.T) {
+	var mu sync.Mutex
+	removedContainers := map[string]bool{}
+
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			mu.Lock()
+			removedContainers[containerID] = true
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	composeMock := &mockComposeExecutor{
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return fmt.Errorf("compose down failed")
+		},
+	}
+
+	vm := &mockVolumeManager{
+		DestroyFn: func(ctx context.Context, id string) error {
+			return nil
+		},
+	}
+
+	items := []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			StackManifest: &StackManifest{
+				Services: map[string]*DockerManifest{
+					"web": {Image: "nginx"},
+					"db":  {Image: "postgres"},
+				},
+			},
+			ContainerIDs: []string{"web-c1", "db-c1"},
+			ServiceContainers: map[string][]string{
+				"web": {"web-c1"},
+				"db":  {"db-c1"},
+			},
+			Items: items,
+		},
+	})
+	b.compose = composeMock
+	b.volumes = vm
+	_ = b.pool.TryAllocate("lease-1-web-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-db-0", "docker-small", "tenant-a")
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.NoError(t, err)
+
+	// Both containers should be removed individually as fallback.
+	mu.Lock()
+	assert.True(t, removedContainers["web-c1"], "web container should be removed individually")
+	assert.True(t, removedContainers["db-c1"], "db container should be removed individually")
+	mu.Unlock()
 
 	// Provision removed.
 	b.provisionsMu.RLock()

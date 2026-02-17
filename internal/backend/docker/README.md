@@ -192,13 +192,17 @@ When lease items carry `service_name` fields (and the payload is a [stack manife
    - Validates 1:1 mapping between manifest service names and lease item service names
    - Validates each per-service manifest independently
 
-2. **Asynchronous provisioning** — per-service image pull and inspect:
-   - Each service's image is pulled and inspected independently
-   - For each service, for each instance (based on `quantity`):
+2. **Asynchronous provisioning** — Docker Compose-based deployment:
+   - Each service's image is pulled and inspected independently (pre-flight, before Compose)
+   - Volumes are pre-created for stateful services (`disk_mb > 0` with image `VOLUME`s)
      - Resource allocation ID: `{leaseUUID}-{serviceName}-{instanceIndex}`
      - Volume ID: `fred-{leaseUUID}-{serviceName}-{instanceIndex}`
-     - Container created with the service name as a network alias (enabling inter-service DNS)
-   - Startup verification runs per-service (health check polling for all containers across all services)
+   - A Compose project is built in-memory from the stack manifest via `buildComposeProject`
+   - `compose.Up` atomically creates, starts, and network-attaches all service containers
+   - `compose.PS` discovers the resulting container IDs per service
+   - Startup verification runs per-service, each using its own health check config
+   - Restart/update uses `compose.Up` with the updated project; on failure, the previous manifest is rebuilt and rolled back via another `compose.Up`
+   - Deprovision uses `compose.Down` for atomic cleanup, with fallback to individual container removal
 
 3. **Callback** — single callback for the entire stack (success only when all services are healthy/running).
 

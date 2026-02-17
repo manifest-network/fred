@@ -279,6 +279,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	b := &Backend{
 		cfg:        cfg,
 		docker:     mock,
+		compose:    &mockComposeExecutor{},
 		pool:       pool,
 		volumes:    &noopVolumeManager{},
 		logger:     slog.Default(),

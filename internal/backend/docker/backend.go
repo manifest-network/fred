@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,7 @@ type ContainerEvent struct {
 type Backend struct {
 	cfg     Config
 	docker  dockerClient
+	compose composeExecutor
 	pool    *shared.ResourcePool
 	volumes volumeManager
 	logger  *slog.Logger
@@ -336,9 +338,18 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to create volume manager: %w", err)
 	}
 
+	composeSvc, err := newComposeService(cfg.DockerHost)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("init compose service: %w", err)
+	}
+
 	b := &Backend{
 		cfg:              cfg,
 		docker:           docker,
+		compose:          composeSvc,
 		pool:             pool,
 		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
@@ -697,10 +708,6 @@ func prevContainerName(leaseUUID string, instanceIndex int) string {
 	return fmt.Sprintf("fred-%s-%d-prev", leaseUUID, instanceIndex)
 }
 
-func prevStackContainerName(leaseUUID, serviceName string, instanceIndex int) string {
-	return fmt.Sprintf("fred-%s-%s-%d-prev", leaseUUID, serviceName, instanceIndex)
-}
-
 // rollbackContainers renames old containers back to their canonical names and
 // restarts them. Handles partial-stop scenarios where some containers may still
 // be running (e.g., stop failed mid-loop for multi-container leases).
@@ -1002,6 +1009,68 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 	return binds
 }
 
+// setupStackVolBinds creates volume bind mounts for all services/instances of a stack.
+// It returns the volume binds map, a list of newly created volume IDs, and any fatal error.
+// Non-fatal failures (writable-path-only volume creation) are logged as warnings.
+func (b *Backend) setupStackVolBinds(
+	ctx context.Context,
+	leaseUUID string,
+	items []backend.LeaseItem,
+	profiles map[string]SKUProfile,
+	imageSetups map[string]*imageSetup,
+	services map[string]*DockerManifest,
+	logger *slog.Logger,
+) (map[string]map[int]serviceVolBinds, []string, error) {
+	volBinds := make(map[string]map[int]serviceVolBinds)
+	var createdVolumeIDs []string
+
+	for _, item := range items {
+		svcName := item.ServiceName
+		profile := profiles[item.SKU]
+		imgSetup := imageSetups[svcName]
+
+		for i := 0; i < item.Quantity; i++ {
+			needsStatefulVolume := profile.DiskMB > 0 && len(imgSetup.Volumes) > 0
+			needsWritableVolume := len(imgSetup.WritablePaths) > 0
+
+			if needsStatefulVolume || needsWritableVolume {
+				volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, svcName, i)
+				sizeMB := profile.DiskMB
+				if sizeMB <= 0 {
+					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
+				}
+				hostPath, volCreated, volErr := b.volumes.Create(ctx, volumeID, sizeMB)
+				if volErr != nil {
+					if needsStatefulVolume {
+						return nil, createdVolumeIDs, fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
+					}
+					logger.Warn("writable path content seeding unavailable (volume creation failed)", "service", svcName, "error", volErr)
+					continue
+				}
+				if volCreated {
+					createdVolumeIDs = append(createdVolumeIDs, volumeID)
+				}
+				binds := serviceVolBinds{}
+				if needsStatefulVolume {
+					var buildErr error
+					binds.StatefulBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+					if buildErr != nil {
+						return nil, createdVolumeIDs, fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
+					}
+				}
+				if needsWritableVolume {
+					binds.WritableBinds = b.setupWritablePathBinds(ctx, services[svcName].Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
+				}
+				if volBinds[svcName] == nil {
+					volBinds[svcName] = make(map[int]serviceVolBinds)
+				}
+				volBinds[svcName][i] = binds
+			}
+		}
+	}
+	return volBinds, createdVolumeIDs, nil
+}
+
 // verifyStartup checks that containers started successfully.
 // Uses health-check-aware polling when the manifest declares an active health check,
 // otherwise falls back to a fixed-wait + inspect check.
@@ -1295,16 +1364,17 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	logger.Info("all containers provisioned and verified", "count", len(containerIDs))
 }
 
-// doProvisionStack performs container creation for a stack (multi-service) lease.
-// Each service in the stack gets its own image, config, and container(s).
+// doProvisionStack performs container creation for a stack (multi-service) lease
+// using Docker Compose. Compose handles container creation, start ordering, and
+// network attachment atomically via a single Up call.
 func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
-	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
 	var callbackErr string
 	provisionStart := time.Now()
 	serviceContainers := make(map[string][]string)
+	projectName := composeProjectName(req.LeaseUUID)
 
 	defer func() {
 		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
@@ -1330,11 +1400,15 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 			b.provisionsMu.Unlock()
 			b.persistDiagnostics(diagSnap, containerIDs, stackContainerLogKeys(serviceContainers))
 
+			// Clean up via Compose Down (removes all project containers).
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
-			for _, cid := range containerIDs {
-				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-					logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
+			if downErr := b.compose.Down(cleanupCtx, projectName, 10*time.Second); downErr != nil {
+				logger.Warn("compose down failed during cleanup, falling back to individual removal", "error", downErr)
+				for _, cid := range containerIDs {
+					if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
+						logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
+					}
 				}
 			}
 			for _, volumeID := range createdVolumeIDs {
@@ -1416,17 +1490,20 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		imageSetups[svcName] = imgSetup
 	}
 
-	// Set up per-tenant network isolation.
-	networkConfig, netErr := b.ensureNetworkConfig(ctx, req.Tenant)
-	if netErr != nil {
-		logger.Error("failed to create tenant network", "error", netErr)
-		err = netErr
-		callbackErr = "tenant network setup failed"
-		return
+	// Resolve tenant network name (not Docker network ID — Compose needs the name).
+	var networkName string
+	if b.cfg.IsNetworkIsolation() {
+		_, netErr := b.docker.EnsureTenantNetwork(ctx, req.Tenant)
+		if netErr != nil {
+			logger.Error("failed to create tenant network", "error", netErr)
+			err = netErr
+			callbackErr = "tenant network setup failed"
+			return
+		}
+		networkName = TenantNetworkName(req.Tenant)
 	}
 
-	// Create and start containers for each service/item.
-	containerIDs = make([]string, 0, totalQuantity)
+	// Pre-create volumes and build volume binds per service/instance.
 	b.provisionsMu.RLock()
 	failCount := 0
 	if prov, ok := b.provisions[req.LeaseUUID]; ok {
@@ -1434,98 +1511,51 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 	}
 	b.provisionsMu.RUnlock()
 
-	for _, item := range req.Items {
-		svcName := item.ServiceName
-		svc := stack.Services[svcName]
-		profile := profiles[item.SKU]
-		imgSetup := imageSetups[svcName]
-
-		for i := 0; i < item.Quantity; i++ {
-			instanceLogger := logger.With("service", svcName, "instance", i, "sku", item.SKU)
-			instanceLogger.Info("creating container")
-
-			var volumeBinds map[string]string
-			var writablePathBinds map[string]string
-			needsStatefulVolume := profile.DiskMB > 0 && len(imgSetup.Volumes) > 0
-			needsWritableVolume := len(imgSetup.WritablePaths) > 0
-
-			if needsStatefulVolume || needsWritableVolume {
-				volumeID := fmt.Sprintf("fred-%s-%s-%d", req.LeaseUUID, svcName, i)
-				sizeMB := profile.DiskMB
-				if sizeMB <= 0 {
-					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
-				}
-				hostPath, volCreated, volErr := b.volumes.Create(ctx, volumeID, sizeMB)
-				if volErr != nil {
-					if needsStatefulVolume {
-						instanceLogger.Error("failed to create volume", "error", volErr)
-						err = fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
-						callbackErr = "volume creation failed"
-						return
-					}
-					instanceLogger.Warn("writable path content seeding unavailable (volume creation failed)", "error", volErr)
-				} else {
-					if volCreated {
-						createdVolumeIDs = append(createdVolumeIDs, volumeID)
-					}
-					if needsStatefulVolume {
-						var buildErr error
-						volumeBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
-						if buildErr != nil {
-							err = fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
-							callbackErr = "volume creation failed"
-							return
-						}
-					}
-					if needsWritableVolume {
-						writablePathBinds = b.setupWritablePathBinds(ctx, svc.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
-					}
-				}
-			}
-
-			createStart := time.Now()
-			containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
-				LeaseUUID:         req.LeaseUUID,
-				Tenant:            req.Tenant,
-				ProviderUUID:      req.ProviderUUID,
-				SKU:               item.SKU,
-				ServiceName:       svcName,
-				Manifest:          svc,
-				Profile:           profile,
-				InstanceIndex:     i,
-				FailCount:         failCount,
-				CallbackURL:       req.CallbackURL,
-				HostBindIP:        b.cfg.GetHostBindIP(),
-				ReadonlyRootfs:    b.cfg.IsReadonlyRootfs(),
-				PidsLimit:         b.cfg.GetPidsLimit(),
-				TmpfsSizeMB:       b.cfg.GetTmpfsSizeMB(),
-				NetworkConfig:     networkConfig,
-				VolumeBinds:       volumeBinds,
-				ImageVolumes:      imgSetup.Volumes,
-				WritablePathBinds: writablePathBinds,
-				User:              imgSetup.ContainerUser,
-				BackendName:       b.cfg.Name,
-			}, b.cfg.ContainerCreateTimeout)
-			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
-			if createErr != nil {
-				instanceLogger.Error("failed to create container", "error", createErr)
-				err = fmt.Errorf("container creation failed (service %s, instance %d): %w", svcName, i, createErr)
-				callbackErr = "container creation failed"
-				return
-			}
-			containerIDs = append(containerIDs, containerID)
-			serviceContainers[svcName] = append(serviceContainers[svcName], containerID)
-
-			instanceLogger.Info("starting container", "container_id", shortID(containerID))
-			if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
-				instanceLogger.Error("failed to start container", "error", startErr)
-				err = fmt.Errorf("container start failed (service %s, instance %d): %w", svcName, i, startErr)
-				callbackErr = "container start failed"
-				return
-			}
-			instanceLogger.Info("container provisioned successfully", "container_id", shortID(containerID))
-		}
+	var volBinds map[string]map[int]serviceVolBinds
+	volBinds, createdVolumeIDs, err = b.setupStackVolBinds(ctx, req.LeaseUUID, req.Items, profiles, imageSetups, stack.Services, logger)
+	if err != nil {
+		callbackErr = "volume creation failed"
+		return
 	}
+
+	// Build Compose project and bring it up.
+	project, buildErr := buildComposeProject(composeProjectParams{
+		LeaseUUID:    req.LeaseUUID,
+		Tenant:       req.Tenant,
+		ProviderUUID: req.ProviderUUID,
+		CallbackURL:  req.CallbackURL,
+		BackendName:  b.cfg.Name,
+		FailCount:    failCount,
+		Stack:        stack,
+		Items:        req.Items,
+		Profiles:     profiles,
+		ImageSetups:  imageSetups,
+		NetworkName:  networkName,
+		VolBinds:     volBinds,
+		Cfg:          &b.cfg,
+	})
+	if buildErr != nil {
+		err = fmt.Errorf("build compose project: %w", buildErr)
+		callbackErr = "container creation failed"
+		return
+	}
+
+	logger.Info("compose up", "project", projectName, "services", len(project.Services))
+	if upErr := b.compose.Up(ctx, project, composeUpOpts{}); upErr != nil {
+		err = fmt.Errorf("compose up failed: %w", upErr)
+		callbackErr = "container creation failed"
+		return
+	}
+
+	// Discover container IDs via Compose PS.
+	containers, psErr := b.compose.PS(ctx, projectName)
+	if psErr != nil {
+		err = fmt.Errorf("compose ps failed: %w", psErr)
+		callbackErr = "container creation failed"
+		return
+	}
+
+	containerIDs, serviceContainers = mapComposeContainers(containers, req.Items)
 
 	// Verify startup per-service so each service uses its own health check config.
 	for svcName, svcCIDs := range serviceContainers {
@@ -1537,6 +1567,40 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 	}
 
 	logger.Info("all stack containers provisioned and verified", "count", len(containerIDs), "services", len(stack.Services))
+}
+
+// mapComposeContainers maps Compose PS output to containerIDs and serviceContainers.
+// For fanned-out services (web-0, web-1), it strips the instance suffix to recover
+// the original service name.
+func mapComposeContainers(containers []composeContainerSummary, items []backend.LeaseItem) ([]string, map[string][]string) {
+	// Build a set of base service names for fan-out detection.
+	svcQuantities := make(map[string]int, len(items))
+	for _, item := range items {
+		svcQuantities[item.ServiceName] = item.Quantity
+	}
+
+	var containerIDs []string
+	serviceContainers := make(map[string][]string)
+
+	for _, c := range containers {
+		containerIDs = append(containerIDs, c.ID)
+		// Recover original service name from Compose service name.
+		// Fan-out: "web-0" → "web", single: "web" → "web".
+		// We verify the suffix is a valid integer to avoid prefix collisions
+		// (e.g., "web-extra" must not match "web" with qty>1).
+		baseName := c.Service
+		for svcName, qty := range svcQuantities {
+			if qty > 1 && strings.HasPrefix(c.Service, svcName+"-") {
+				suffix := strings.TrimPrefix(c.Service, svcName+"-")
+				if _, parseErr := strconv.Atoi(suffix); parseErr == nil {
+					baseName = svcName
+					break
+				}
+			}
+		}
+		serviceContainers[baseName] = append(serviceContainers[baseName], c.ID)
+	}
+	return containerIDs, serviceContainers
 }
 
 // healthPollInterval is the interval between health check polls during startup verification.
@@ -1763,15 +1827,16 @@ type replaceStackContainersOp struct {
 	OnSuccess func(prov *provision)
 }
 
-// doReplaceStackContainers performs the stack container replacement lifecycle:
-// inspect images → read metadata → setup networking → stop and rename old →
-// create and start new per-service → verify startup.
+// doReplaceStackContainers performs the stack container replacement lifecycle
+// using Docker Compose. Compose handles stopping old containers and starting
+// new ones via a single Up call, with rollback via Up with the previous manifest.
 func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackContainersOp) {
 	var err error
 	var callbackErr string
 	var newContainerIDs []string
-	var oldStopped bool
+	var imageSetups map[string]*imageSetup
 	newServiceContainers := make(map[string][]string)
+	projectName := composeProjectName(op.LeaseUUID)
 
 	defer func() {
 		if err != nil {
@@ -1793,36 +1858,26 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 				}
 			}
 
-			// Clean up failed new containers.
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cleanupCancel()
-			for _, cid := range newContainerIDs {
-				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-					op.Logger.Warn("failed to cleanup container after "+op.Operation+" error", "container_id", shortID(cid), "error", rmErr)
-				}
-			}
-
-			// Rollback: restart old containers to restore service.
-			restored := !oldStopped || b.rollbackStackContainers(op.LeaseUUID, op.ServiceContainers, op.Logger)
+			// Rollback: rebuild the Project from the previous StackManifest and
+			// Compose Up to restore the old containers.
+			restored := b.rollbackStackViaCompose(op)
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[op.LeaseUUID]; ok {
 				if restored {
 					prov.Status = backend.ProvisionStatusReady
-					if oldStopped && op.Operation == "restart" {
+					if op.Operation == "restart" {
 						prov.LastError = ""
 					}
+					op.Logger.Info("rolled back to previous containers via compose (stack)")
 				} else {
 					prov.Status = backend.ProvisionStatusFailed
-				}
-				if restored {
-					op.Logger.Info("rolled back to previous containers (stack)", "containers", len(op.OldContainerIDs))
 				}
 			}
 			b.provisionsMu.Unlock()
 
 			if restored {
 				callbackErr += "; rolled back to previous version"
-			} else if oldStopped {
+			} else {
 				callbackErr += "; rollback failed"
 			}
 
@@ -1830,15 +1885,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 			return
 		}
 
-		// Success: remove old containers and update provision.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		for _, cid := range op.OldContainerIDs {
-			if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-				op.Logger.Warn("failed to remove old container after "+op.Operation, "container_id", shortID(cid), "error", rmErr)
-			}
-		}
-
+		// Success: update provision (Compose already replaced old containers).
 		b.provisionsMu.Lock()
 		if prov, ok := b.provisions[op.LeaseUUID]; ok {
 			prov.ContainerIDs = newContainerIDs
@@ -1861,7 +1908,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	}()
 
 	// Per-service image setup.
-	imageSetups := make(map[string]*imageSetup)
+	imageSetups = make(map[string]*imageSetup)
 	for svcName, svc := range op.Stack.Services {
 		imgSetup, setupErr := b.inspectImageForSetup(ctx, svc.Image, svc.User)
 		if setupErr != nil {
@@ -1886,115 +1933,65 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	}
 	b.provisionsMu.RUnlock()
 
-	// Set up networking.
-	networkConfig, netErr := b.ensureNetworkConfig(ctx, tenant)
-	if netErr != nil {
-		err = netErr
+	// Resolve tenant network name.
+	var networkName string
+	if b.cfg.IsNetworkIsolation() {
+		if _, netErr := b.docker.EnsureTenantNetwork(ctx, tenant); netErr != nil {
+			err = netErr
+			callbackErr = op.Operation + " failed"
+			return
+		}
+		networkName = TenantNetworkName(tenant)
+	}
+
+	// Ensure volumes exist for all services/instances.
+	volBinds, _, volErr := b.setupStackVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
+	if volErr != nil {
+		err = volErr
 		callbackErr = op.Operation + " failed"
 		return
 	}
 
-	// Stop and rename old containers per service to free canonical names.
-	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	for svcName, cids := range op.ServiceContainers {
-		for i, cid := range cids {
-			op.Logger.Info("stopping container for "+op.Operation, "service", svcName, "container_id", shortID(cid))
-			if stopErr := b.docker.StopContainer(ctx, cid, stopTimeout); stopErr != nil {
-				err = fmt.Errorf("failed to stop container %s (service %s): %w", shortID(cid), svcName, stopErr)
-				callbackErr = op.Operation + " failed"
-				return
-			}
-			oldStopped = true
-			if renameErr := b.docker.RenameContainer(ctx, cid, prevStackContainerName(op.LeaseUUID, svcName, i)); renameErr != nil {
-				err = fmt.Errorf("failed to rename old container %s (service %s): %w", shortID(cid), svcName, renameErr)
-				callbackErr = op.Operation + " failed"
-				return
-			}
-		}
+	// Build Compose project and bring it up.
+	// ForceRecreate is used for restarts (config unchanged but containers need replacing).
+	project, buildErr := buildComposeProject(composeProjectParams{
+		LeaseUUID:    op.LeaseUUID,
+		Tenant:       tenant,
+		ProviderUUID: providerUUID,
+		CallbackURL:  callbackURL,
+		BackendName:  b.cfg.Name,
+		FailCount:    failCount,
+		Stack:        op.Stack,
+		Items:        op.Items,
+		Profiles:     op.Profiles,
+		ImageSetups:  imageSetups,
+		NetworkName:  networkName,
+		VolBinds:     volBinds,
+		Cfg:          &b.cfg,
+	})
+	if buildErr != nil {
+		err = fmt.Errorf("build compose project: %w", buildErr)
+		callbackErr = op.Operation + " failed"
+		return
 	}
 
-	// Create and start new containers per service.
-	for _, item := range op.Items {
-		svcName := item.ServiceName
-		svc := op.Stack.Services[svcName]
-		profile := op.Profiles[item.SKU]
-		imgSetup := imageSetups[svcName]
-
-		for i := 0; i < item.Quantity; i++ {
-			// Inline volume setup with service-aware volume ID
-			// (cannot use setupVolumeBinds which uses legacy fred-{uuid}-{i} format).
-			var volumeBinds map[string]string
-			var writablePathBinds map[string]string
-			needsStatefulVolume := profile.DiskMB > 0 && len(imgSetup.Volumes) > 0
-			needsWritableVolume := len(imgSetup.WritablePaths) > 0
-
-			if needsStatefulVolume || needsWritableVolume {
-				volumeID := fmt.Sprintf("fred-%s-%s-%d", op.LeaseUUID, svcName, i)
-				sizeMB := profile.DiskMB
-				if sizeMB <= 0 {
-					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
-				}
-				hostPath, _, volErr := b.volumes.Create(ctx, volumeID, sizeMB)
-				if volErr != nil {
-					if needsStatefulVolume {
-						err = fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
-						callbackErr = op.Operation + " failed"
-						return
-					}
-					op.Logger.Warn("writable path content seeding unavailable on "+op.Operation, "service", svcName, "error", volErr)
-				} else {
-					if needsStatefulVolume {
-						var buildErr error
-						volumeBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
-						if buildErr != nil {
-							err = fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
-							callbackErr = op.Operation + " failed"
-							return
-						}
-					}
-					if needsWritableVolume {
-						writablePathBinds = b.setupWritablePathBinds(ctx, svc.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
-					}
-				}
-			}
-
-			containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
-				LeaseUUID:         op.LeaseUUID,
-				Tenant:            tenant,
-				ProviderUUID:      providerUUID,
-				SKU:               item.SKU,
-				ServiceName:       svcName,
-				Manifest:          svc,
-				Profile:           profile,
-				InstanceIndex:     i,
-				FailCount:         failCount,
-				CallbackURL:       callbackURL,
-				HostBindIP:        b.cfg.GetHostBindIP(),
-				ReadonlyRootfs:    b.cfg.IsReadonlyRootfs(),
-				PidsLimit:         b.cfg.GetPidsLimit(),
-				TmpfsSizeMB:       b.cfg.GetTmpfsSizeMB(),
-				NetworkConfig:     networkConfig,
-				VolumeBinds:       volumeBinds,
-				ImageVolumes:      imgSetup.Volumes,
-				WritablePathBinds: writablePathBinds,
-				User:              imgSetup.ContainerUser,
-				BackendName:       b.cfg.Name,
-			}, b.cfg.ContainerCreateTimeout)
-			if createErr != nil {
-				err = fmt.Errorf("container creation failed (service %s, instance %d): %w", svcName, i, createErr)
-				callbackErr = op.Operation + " failed"
-				return
-			}
-			newContainerIDs = append(newContainerIDs, containerID)
-			newServiceContainers[svcName] = append(newServiceContainers[svcName], containerID)
-
-			if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
-				err = fmt.Errorf("container start failed (service %s, instance %d): %w", svcName, i, startErr)
-				callbackErr = op.Operation + " failed"
-				return
-			}
-		}
+	op.Logger.Info("compose up for "+op.Operation, "project", projectName, "services", len(project.Services))
+	forceRecreate := op.Operation == "restart"
+	if upErr := b.compose.Up(ctx, project, composeUpOpts{ForceRecreate: forceRecreate}); upErr != nil {
+		err = fmt.Errorf("compose up failed: %w", upErr)
+		callbackErr = op.Operation + " failed"
+		return
 	}
+
+	// Discover new container IDs via Compose PS.
+	containers, psErr := b.compose.PS(ctx, projectName)
+	if psErr != nil {
+		err = fmt.Errorf("compose ps failed: %w", psErr)
+		callbackErr = op.Operation + " failed"
+		return
+	}
+
+	newContainerIDs, newServiceContainers = mapComposeContainers(containers, op.Items)
 
 	// Verify startup per-service so each service uses its own health check config.
 	for svcName, svcCIDs := range newServiceContainers {
@@ -2008,41 +2005,101 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	op.Logger.Info(op.Operation+" completed (stack)", "containers", len(newContainerIDs))
 }
 
-// rollbackStackContainers restores old stack containers after a failed replacement.
-func (b *Backend) rollbackStackContainers(leaseUUID string, serviceContainers map[string][]string, logger *slog.Logger) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// rollbackStackViaCompose restores the previous stack state by rebuilding a
+// Compose project from the previous StackManifest (still in the provision,
+// since OnSuccess hasn't run) and calling Compose Up. Returns true on success.
+func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	total := 0
-	restored := 0
-	for svcName, cids := range serviceContainers {
-		for i, cid := range cids {
-			total++
-			info, inspectErr := b.docker.InspectContainer(ctx, cid)
-			if inspectErr != nil {
-				logger.Error("rollback: failed to inspect container", "service", svcName, "container_id", shortID(cid), "error", inspectErr)
-				continue
-			}
-			if info.Status == "running" {
-				restored++
-				continue
-			}
-
-			canonicalName := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, svcName, i)
-			if renameErr := b.docker.RenameContainer(ctx, cid, canonicalName); renameErr != nil {
-				// Skip start — running under the -prev name would lack the
-				// service network alias, breaking inter-service DNS.
-				logger.Error("rollback: failed to rename container, skipping start", "service", svcName, "container_id", shortID(cid), "error", renameErr)
-				continue
-			}
-			if startErr := b.docker.StartContainer(ctx, cid, 30*time.Second); startErr != nil {
-				logger.Error("rollback: failed to restart container", "service", svcName, "container_id", shortID(cid), "error", startErr)
-			} else {
-				restored++
-			}
-		}
+	// Read previous manifest from provision (OnSuccess hasn't run, so
+	// prov.StackManifest is still the old manifest).
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions[op.LeaseUUID]
+	if !ok {
+		b.provisionsMu.RUnlock()
+		op.Logger.Error("rollback: provision not found")
+		return false
 	}
-	return restored == total
+	prevStack := prov.StackManifest
+	tenant := prov.Tenant
+	providerUUID := prov.ProviderUUID
+	callbackURL := prov.CallbackURL
+	failCount := prov.FailCount
+	b.provisionsMu.RUnlock()
+
+	if prevStack == nil {
+		op.Logger.Error("rollback: no previous stack manifest available")
+		return false
+	}
+
+	// Inspect images for the previous manifest.
+	prevImageSetups := make(map[string]*imageSetup)
+	for svcName, svc := range prevStack.Services {
+		imgSetup, setupErr := b.inspectImageForSetup(rollbackCtx, svc.Image, svc.User)
+		if setupErr != nil {
+			op.Logger.Error("rollback: image inspection failed", "service", svcName, "error", setupErr)
+			return false
+		}
+		prevImageSetups[svcName] = imgSetup
+	}
+
+	// Resolve network name.
+	var networkName string
+	if b.cfg.IsNetworkIsolation() {
+		networkName = TenantNetworkName(tenant)
+	}
+
+	// Re-use existing volumes (already created during original provision).
+	volBinds, _, volErr := b.setupStackVolBinds(rollbackCtx, op.LeaseUUID, op.Items, op.Profiles, prevImageSetups, prevStack.Services, op.Logger)
+	if volErr != nil {
+		op.Logger.Error("rollback: volume setup failed", "error", volErr)
+		return false
+	}
+
+	// Build project from previous manifest.
+	project, buildErr := buildComposeProject(composeProjectParams{
+		LeaseUUID:    op.LeaseUUID,
+		Tenant:       tenant,
+		ProviderUUID: providerUUID,
+		CallbackURL:  callbackURL,
+		BackendName:  b.cfg.Name,
+		FailCount:    failCount,
+		Stack:        prevStack,
+		Items:        op.Items,
+		Profiles:     op.Profiles,
+		ImageSetups:  prevImageSetups,
+		NetworkName:  networkName,
+		VolBinds:     volBinds,
+		Cfg:          &b.cfg,
+	})
+	if buildErr != nil {
+		op.Logger.Error("rollback: failed to build compose project", "error", buildErr)
+		return false
+	}
+
+	// Compose Up with ForceRecreate to restore previous containers.
+	if upErr := b.compose.Up(rollbackCtx, project, composeUpOpts{ForceRecreate: true}); upErr != nil {
+		op.Logger.Error("rollback: compose up failed", "error", upErr)
+		return false
+	}
+
+	// Discover restored container IDs and update provision.
+	containers, psErr := b.compose.PS(rollbackCtx, composeProjectName(op.LeaseUUID))
+	if psErr != nil {
+		op.Logger.Error("rollback: compose ps failed", "error", psErr)
+		return false
+	}
+
+	containerIDs, serviceContainers := mapComposeContainers(containers, op.Items)
+	b.provisionsMu.Lock()
+	if p, ok := b.provisions[op.LeaseUUID]; ok {
+		p.ContainerIDs = containerIDs
+		p.ServiceContainers = serviceContainers
+	}
+	b.provisionsMu.Unlock()
+
+	return true
 }
 
 // replaceContainersOp describes a container replacement operation with rollback.
@@ -2675,18 +2732,36 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	prov.Status = backend.ProvisionStatusFailed
 	b.provisionsMu.Unlock()
 
-	// Remove all containers, collecting successes and failures.
-	// RemoveContainer is idempotent (already-removed containers return nil),
-	// so non-nil errors indicate actual failures (I/O, permissions, etc.).
+	// Remove all containers.
+	// For stacks, use Compose Down for atomic cleanup; fall back to individual
+	// removal if Compose fails. For single-container leases, use RemoveContainer.
 	var errs []error
 	var failedIDs []string
-	for _, containerID := range prov.ContainerIDs {
-		if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-			logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
-			errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
-			failedIDs = append(failedIDs, containerID)
+	if prov.IsStack() {
+		stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
+		if downErr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); downErr != nil {
+			logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
+			for _, containerID := range prov.ContainerIDs {
+				if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
+					logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
+					errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+					failedIDs = append(failedIDs, containerID)
+				} else {
+					logger.Info("container removed", "container_id", shortID(containerID))
+				}
+			}
 		} else {
-			logger.Info("container removed", "container_id", shortID(containerID))
+			logger.Info("compose down completed", "project", composeProjectName(leaseUUID))
+		}
+	} else {
+		for _, containerID := range prov.ContainerIDs {
+			if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
+				logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
+				errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+				failedIDs = append(failedIDs, containerID)
+			} else {
+				logger.Info("container removed", "container_id", shortID(containerID))
+			}
 		}
 	}
 
