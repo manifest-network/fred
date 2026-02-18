@@ -93,7 +93,7 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                      Watermill Router                                │   │
 │  │                                                                     │   │
-│  │  Middleware: [Retry, Recoverer]                                      │   │
+│  │  Middleware: [PoisonQueue, Retry, Recoverer]                           │   │
 │  │                                                                     │   │
 │  │  Topics → Handlers (HandlerSet):                                    │   │
 │  │  ─────────────────────────────────────────────────────────────      │   │
@@ -194,12 +194,14 @@ Key interfaces defined where they're consumed:
    c. Call backend POST /provision with callback URL
    d. Track as in-flight, record placement (lease→backend)
 6. Backend provisions resource asynchronously
-7. Backend calls POST /callbacks/provision
-8. handleBackendCallback:
-   a. Verify HMAC signature
-   b. Pop from in-flight tracking
-   c. If success: acknowledge lease on chain
-   d. If failed: reject lease on chain
+7. Backend calls POST /callbacks/provision (API server):
+   a. Verify HMAC signature (CallbackAuthenticator)
+   b. Parse and validate callback payload
+   c. Publish to Watermill topic (events.backend.callback)
+8. handleBackendCallback (Watermill handler):
+   a. If success: acknowledge lease on chain
+   b. If failed: reject lease on chain
+   c. Remove from in-flight tracking after chain ack succeeds
 ```
 
 ### Lease Creation (With Payload)
