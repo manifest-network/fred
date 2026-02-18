@@ -13,26 +13,27 @@ import (
 
 func TestParseLogLevel(t *testing.T) {
 	tests := []struct {
+		name      string
 		input     string
 		wantLevel slog.Level
 		wantErr   bool
 		errSubstr string
 	}{
-		{input: "debug", wantLevel: slog.LevelDebug},
-		{input: "info", wantLevel: slog.LevelInfo},
-		{input: "warn", wantLevel: slog.LevelWarn},
-		{input: "error", wantLevel: slog.LevelError},
-		{input: "DEBUG", wantLevel: slog.LevelDebug},
-		{input: "Info", wantLevel: slog.LevelInfo},
-		{input: "WARN", wantLevel: slog.LevelWarn},
-		{input: "Error", wantLevel: slog.LevelError},
-		{input: "", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
-		{input: "trace", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
-		{input: "fatal", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
+		{name: "debug", input: "debug", wantLevel: slog.LevelDebug},
+		{name: "info", input: "info", wantLevel: slog.LevelInfo},
+		{name: "warn", input: "warn", wantLevel: slog.LevelWarn},
+		{name: "error", input: "error", wantLevel: slog.LevelError},
+		{name: "DEBUG", input: "DEBUG", wantLevel: slog.LevelDebug},
+		{name: "Info", input: "Info", wantLevel: slog.LevelInfo},
+		{name: "WARN", input: "WARN", wantLevel: slog.LevelWarn},
+		{name: "Error", input: "Error", wantLevel: slog.LevelError},
+		{name: "empty", input: "", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
+		{name: "trace", input: "trace", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
+		{name: "fatal", input: "fatal", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			level, err := ParseLogLevel(tt.input)
 			assert.Equal(t, tt.wantLevel, level)
 			if tt.wantErr {
