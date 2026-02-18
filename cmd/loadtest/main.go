@@ -325,7 +325,11 @@ func (lt *LoadTester) doPayloadRequest(results *Results) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		results.Record(latency, resp.StatusCode, fmt.Errorf("read body: %w", err), int64(lt.payloadSize), int64(len(body)))
+		return
+	}
 	results.Record(latency, resp.StatusCode, nil, int64(lt.payloadSize), int64(len(body)))
 }
 
@@ -387,7 +391,11 @@ func (lt *LoadTester) doConnectionRequest(results *Results) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		results.Record(latency, resp.StatusCode, fmt.Errorf("read body: %w", err), 0, int64(len(body)))
+		return
+	}
 	results.Record(latency, resp.StatusCode, nil, 0, int64(len(body)))
 }
 
@@ -465,7 +473,11 @@ func (lt *LoadTester) doCallbackRequest(results *Results) {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		results.Record(latency, resp.StatusCode, fmt.Errorf("read body: %w", err), int64(len(body)), int64(len(respBody)))
+		return
+	}
 	results.Record(latency, resp.StatusCode, nil, int64(len(body)), int64(len(respBody)))
 }
 
