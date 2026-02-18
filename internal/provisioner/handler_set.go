@@ -48,7 +48,8 @@ func (h *HandlerSet) rejectOnValidationError(ctx context.Context, lease *billing
 		"tenant", lease.Tenant,
 		"error", err,
 	)
-	_, _, rejectErr := h.deps.ChainClient.RejectLeases(ctx, []string{lease.Uuid}, validationErrorToRejectReason(err))
+	reason := validationErrorToRejectReason(err)
+	_, _, rejectErr := h.deps.ChainClient.RejectLeases(ctx, []string{lease.Uuid}, reason)
 	if rejectErr != nil {
 		slog.Error("failed to reject lease after validation error",
 			"lease_uuid", lease.Uuid,
@@ -56,6 +57,7 @@ func (h *HandlerSet) rejectOnValidationError(ctx context.Context, lease *billing
 		)
 		return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
 	}
+	h.publishLeaseEvent(lease.Uuid, backend.ProvisionStatusFailed, reason)
 	return nil
 }
 
