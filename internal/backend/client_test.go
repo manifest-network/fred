@@ -1,11 +1,13 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -1078,6 +1080,201 @@ func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present on GET /releases")
 	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
+}
+
+func TestDecodeJSONLimited(t *testing.T) {
+	t.Run("within limit", func(t *testing.T) {
+		body := io.NopCloser(bytes.NewReader([]byte(`{"host":"example.com"}`)))
+		var info LeaseInfo
+		err := decodeJSONLimited(body, 1024, &info)
+		require.NoError(t, err)
+		assert.Equal(t, "example.com", info["host"])
+	})
+
+	t.Run("exactly at limit", func(t *testing.T) {
+		payload := `{"k":"` + strings.Repeat("x", 90) + `"}`
+		body := io.NopCloser(bytes.NewReader([]byte(payload)))
+		var info LeaseInfo
+		err := decodeJSONLimited(body, int64(len(payload)), &info)
+		require.NoError(t, err)
+	})
+
+	t.Run("exceeds limit by one byte", func(t *testing.T) {
+		payload := `{"k":"` + strings.Repeat("x", 90) + `"}`
+		body := io.NopCloser(bytes.NewReader([]byte(payload)))
+		var info LeaseInfo
+		err := decodeJSONLimited(body, int64(len(payload))-1, &info)
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+	})
+
+	t.Run("invalid JSON within limit", func(t *testing.T) {
+		body := io.NopCloser(bytes.NewReader([]byte(`not json`)))
+		var info LeaseInfo
+		err := decodeJSONLimited(body, 1024, &info)
+		assert.Error(t, err)
+		assert.NotErrorIs(t, err, ErrResponseTooLarge)
+	})
+}
+
+func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
+	// oversizedHandler returns an HTTP handler that writes exactly size bytes
+	// of valid JSON for the given endpoint type.
+	oversizedJSON := func(size int) []byte {
+		// Build a JSON object with a padding field large enough to exceed the limit.
+		// {"pad":"xxxx..."} — overhead is ~10 bytes for framing.
+		padLen := size - 10
+		if padLen < 0 {
+			padLen = 0
+		}
+		return []byte(`{"pad":"` + strings.Repeat("x", padLen) + `"}`)
+	}
+
+	t.Run("GetInfo rejects oversized response", func(t *testing.T) {
+		const limit int64 = 512
+		body := oversizedJSON(int(limit) + 100)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(body)
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:         "test-size-info",
+			BaseURL:      server.URL,
+			Timeout:      5 * time.Second,
+			MaxInfoBytes: limit,
+		})
+
+		_, err := client.GetInfo(context.Background(), "lease-1")
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+	})
+
+	t.Run("GetProvision rejects oversized response", func(t *testing.T) {
+		const limit int64 = 512
+		body, _ := json.Marshal(ProvisionInfo{LeaseUUID: strings.Repeat("x", int(limit))})
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(body)
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:              "test-size-provision",
+			BaseURL:           server.URL,
+			Timeout:           5 * time.Second,
+			MaxProvisionBytes: limit,
+		})
+
+		_, err := client.GetProvision(context.Background(), "lease-1")
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+	})
+
+	t.Run("ListProvisions rejects oversized response", func(t *testing.T) {
+		const limit int64 = 256
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(oversizedJSON(int(limit) + 100))
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:               "test-size-provisions",
+			BaseURL:            server.URL,
+			Timeout:            5 * time.Second,
+			MaxProvisionsBytes: limit,
+		})
+
+		_, err := client.ListProvisions(context.Background())
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+	})
+
+	t.Run("GetLogs rejects oversized response", func(t *testing.T) {
+		const limit int64 = 256
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(oversizedJSON(int(limit) + 100))
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:         "test-size-logs",
+			BaseURL:      server.URL,
+			Timeout:      5 * time.Second,
+			MaxLogsBytes: limit,
+		})
+
+		_, err := client.GetLogs(context.Background(), "lease-1", 100)
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+	})
+
+	t.Run("GetReleases rejects oversized response", func(t *testing.T) {
+		const limit int64 = 256
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(oversizedJSON(int(limit) + 100))
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:             "test-size-releases",
+			BaseURL:          server.URL,
+			Timeout:          5 * time.Second,
+			MaxReleasesBytes: limit,
+		})
+
+		_, err := client.GetReleases(context.Background(), "lease-1")
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+	})
+
+	t.Run("within-limit responses still succeed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(LeaseInfo{"host": "ok.example.com"})
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:         "test-size-ok",
+			BaseURL:      server.URL,
+			Timeout:      5 * time.Second,
+			MaxInfoBytes: 4096,
+		})
+
+		info, err := client.GetInfo(context.Background(), "lease-1")
+		require.NoError(t, err)
+		assert.Equal(t, "ok.example.com", (*info)["host"])
+	})
+}
+
+func TestPositiveOr(t *testing.T) {
+	assert.Equal(t, int64(100), positiveOr(100, 999), "positive value should be used")
+	assert.Equal(t, int64(999), positiveOr(0, 999), "zero should fall back to default")
+	assert.Equal(t, int64(999), positiveOr(-1, 999), "negative should fall back to default")
+	assert.Equal(t, int64(999), positiveOr(-999, 999), "large negative should fall back to default")
+	assert.Equal(t, int64(1), positiveOr(1, 999), "boundary: 1 is positive")
+}
+
+func TestNewHTTPClient_NegativeLimitsNormalized(t *testing.T) {
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:               "test-negative-limits",
+		BaseURL:            "http://example.com",
+		MaxInfoBytes:       -1,
+		MaxProvisionBytes:  -100,
+		MaxProvisionsBytes: 0,
+		MaxLogsBytes:       -999,
+		MaxReleasesBytes:   -1,
+	})
+
+	assert.Equal(t, DefaultMaxInfoBytes, client.maxInfoBytes)
+	assert.Equal(t, DefaultMaxProvisionBytes, client.maxProvisionBytes)
+	assert.Equal(t, DefaultMaxProvisionsBytes, client.maxProvisionsBytes)
+	assert.Equal(t, DefaultMaxLogsBytes, client.maxLogsBytes)
+	assert.Equal(t, DefaultMaxReleasesBytes, client.maxReleasesBytes)
 }
 
 func TestIsStack(t *testing.T) {

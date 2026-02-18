@@ -281,6 +281,9 @@ var ErrInsufficientResources = errors.New("insufficient resources")
 // ErrInvalidState is returned when an operation is not valid for the current lease state.
 var ErrInvalidState = errors.New("invalid state for operation")
 
+// ErrResponseTooLarge is returned when a backend response body exceeds the configured size limit.
+var ErrResponseTooLarge = errors.New("response body too large")
+
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
@@ -297,7 +300,23 @@ type HTTPClient struct {
 	secret     string
 	httpClient *http.Client
 	cb         *gobreaker.CircuitBreaker
+
+	// Response body size limits
+	maxInfoBytes       int64
+	maxProvisionBytes  int64
+	maxProvisionsBytes int64
+	maxLogsBytes       int64
+	maxReleasesBytes   int64
 }
+
+// Default response body size limits (defense-in-depth against buggy/misrouted backends).
+const (
+	DefaultMaxInfoBytes       int64 = 1 << 20  // 1 MiB — single lease info
+	DefaultMaxProvisionBytes  int64 = 1 << 20  // 1 MiB — single provision record
+	DefaultMaxProvisionsBytes int64 = 8 << 20  // 8 MiB — list of all provisions
+	DefaultMaxLogsBytes       int64 = 16 << 20 // 16 MiB — container logs can be large
+	DefaultMaxReleasesBytes   int64 = 8 << 20  // 8 MiB — release history with manifests
+)
 
 // HTTPClientConfig configures an HTTP backend client.
 type HTTPClientConfig struct {
@@ -313,6 +332,24 @@ type HTTPClientConfig struct {
 	CBInterval      time.Duration // Interval to clear counts in closed state (default: 0, never clear)
 	CBTimeout       time.Duration // Time to wait before transitioning from open to half-open (default: 60s)
 	CBFailureThresh uint32        // Number of failures to trip the breaker (default: 5)
+
+	// Response body size limits (0 = use default). Defense-in-depth caps to prevent
+	// a buggy or misrouted backend from pressuring memory with unbounded responses.
+	MaxInfoBytes       int64 // GetInfo response limit (default: 1 MiB)
+	MaxProvisionBytes  int64 // GetProvision response limit (default: 1 MiB)
+	MaxProvisionsBytes int64 // ListProvisions response limit (default: 8 MiB)
+	MaxLogsBytes       int64 // GetLogs response limit (default: 16 MiB)
+	MaxReleasesBytes   int64 // GetReleases response limit (default: 8 MiB)
+}
+
+// positiveOr returns v if v > 0, otherwise returns fallback.
+// Used to normalize response size limits so that zero and negative
+// config values are treated as "use default".
+func positiveOr(v, fallback int64) int64 {
+	if v > 0 {
+		return v
+	}
+	return fallback
 }
 
 // NewHTTPClient creates a new HTTP backend client.
@@ -366,7 +403,12 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			Timeout:   timeout,
 			Transport: transport,
 		},
-		cb: cb,
+		cb:                 cb,
+		maxInfoBytes:       positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
+		maxProvisionBytes:  positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
+		maxProvisionsBytes: positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
+		maxLogsBytes:       positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
+		maxReleasesBytes:   positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
 	}
 }
 
@@ -402,6 +444,26 @@ func readErrorBodyBytes(resp *http.Response) []byte {
 // readErrorBody reads the response body as a string (convenience wrapper).
 func readErrorBody(resp *http.Response) string {
 	return string(readErrorBodyBytes(resp))
+}
+
+// decodeJSONLimited reads at most limit bytes from r, then JSON-unmarshals into dst.
+// Returns ErrResponseTooLarge if the body exceeds limit. Remaining bytes are drained
+// to allow connection reuse.
+func decodeJSONLimited(r io.ReadCloser, limit int64, dst any) error {
+	lr := io.LimitReader(r, limit+1)
+	body, err := io.ReadAll(lr)
+	// Drain any remaining bytes so the underlying connection can be reused.
+	_, _ = io.Copy(io.Discard, r)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
+	}
+	if int64(len(body)) > limit {
+		return fmt.Errorf("%w: %d bytes exceeds %d byte limit", ErrResponseTooLarge, len(body), limit)
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
 }
 
 // parseValidationError parses a 400 response body and returns an error
@@ -509,7 +571,7 @@ func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInf
 		}
 
 		var info LeaseInfo
-		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		if err := decodeJSONLimited(resp.Body, c.maxInfoBytes, &info); err != nil {
 			return nil, fmt.Errorf("decode info response: %w", err)
 		}
 
@@ -588,14 +650,14 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
-		var result struct {
+		var provResult struct {
 			Provisions []ProvisionInfo `json:"provisions"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if err := decodeJSONLimited(resp.Body, c.maxProvisionsBytes, &provResult); err != nil {
 			return nil, fmt.Errorf("decode provisions response: %w", err)
 		}
 
-		return result.Provisions, nil
+		return provResult.Provisions, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
@@ -640,7 +702,7 @@ func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (_ *Pro
 		}
 
 		var info ProvisionInfo
-		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		if err := decodeJSONLimited(resp.Body, c.maxProvisionBytes, &info); err != nil {
 			return nil, fmt.Errorf("decode provision response: %w", err)
 		}
 
@@ -689,7 +751,7 @@ func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (_
 		}
 
 		var logs map[string]string
-		if err := json.NewDecoder(resp.Body).Decode(&logs); err != nil {
+		if err := decodeJSONLimited(resp.Body, c.maxLogsBytes, &logs); err != nil {
 			return nil, fmt.Errorf("decode logs response: %w", err)
 		}
 
@@ -824,7 +886,7 @@ func (c *HTTPClient) GetReleases(ctx context.Context, leaseUUID string) (_ []Rel
 		}
 
 		var releases []ReleaseInfo
-		if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		if err := decodeJSONLimited(resp.Body, c.maxReleasesBytes, &releases); err != nil {
 			return nil, fmt.Errorf("decode releases response: %w", err)
 		}
 
