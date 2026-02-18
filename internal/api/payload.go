@@ -54,21 +54,24 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Extract and validate bearer token (PayloadAuthToken)
-	token, err := h.extractPayloadToken(r)
-	if err != nil {
-		slog.Warn("invalid authorization", "error", err)
-		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
-		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
-		return
-	}
-
-	// Validate the token
-	if err := token.Validate(h.bech32Prefix); err != nil {
-		slog.Warn("token validation failed", "error", err)
-		metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
-		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
-		return
+	// Use pre-validated token from middleware context if available (avoids redundant
+	// ECDSA verification). Falls back to self-validate when rate limiting is disabled.
+	token := PayloadAuthTokenFromContext(r.Context())
+	if token == nil {
+		var err error
+		token, err = h.extractPayloadToken(r)
+		if err != nil {
+			slog.Warn("invalid authorization", "error", err)
+			metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+			writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
+			return
+		}
+		if err := token.Validate(h.bech32Prefix); err != nil {
+			slog.Warn("token validation failed", "error", err)
+			metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+			writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
+			return
+		}
 	}
 
 	// Verify the token's lease UUID matches the request

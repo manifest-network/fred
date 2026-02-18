@@ -183,7 +183,7 @@ Separate token bucket per tenant, applied after token extraction.
 | Max tracked tenants | 10,000 (LRU eviction) |
 | TTL per entry | 5 minutes |
 
-**Design note:** Tenant identity is extracted from the token without full signature verification to avoid expensive crypto on every request. An attacker could craft tokens with fake tenant fields to distribute across rate-limit buckets. This is acceptable because the IP-level limit still applies, and handler-level authentication rejects forged tokens.
+**Design note:** Tokens are cryptographically validated (signature + timestamp + address) in the rate-limit middleware **before** consuming from the tenant's bucket. This prevents attackers from burning a victim's quota with forged tokens. The validated token is stored in request context so downstream handlers skip redundant ECDSA verification.
 
 ### Response Headers
 
@@ -271,4 +271,4 @@ The daemon refuses to start if any check fails.
 
 2. **Release history includes raw manifests.** The `GET /releases` response includes the full manifest payload. If tenants put secrets in environment variables, those persist in the release store and are returned on read. This is tenant-visible-to-tenant-only (properly authenticated), but tenants should be aware that manifest contents are stored.
 
-3. **Per-tenant rate limiting can be bypassed with forged tenant fields.** Since tenant extraction skips signature verification for performance, an attacker could distribute requests across rate-limit buckets. IP-level rate limiting and handler-level authentication still apply.
+3. **Per-tenant rate limiting adds ECDSA cost to every request.** Tokens are fully validated (secp256k1 signature verification) before bucket consumption, which adds CPU overhead per request. This is the correct trade-off: the previous design (skipping verification) allowed attackers to burn a victim's quota with forged tokens.

@@ -12,6 +12,8 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/time/rate"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // TrustedProxyConfig holds parsed trusted proxy CIDR ranges.
@@ -203,21 +205,26 @@ func extractDirectIP(remoteAddr string) string {
 
 // TenantRateLimiter implements per-tenant rate limiting using a token bucket algorithm.
 // This is used for authenticated endpoints where the tenant identity is known.
+// Tokens are cryptographically validated before consuming from the bucket to prevent
+// attackers from burning a victim's quota with forged tokens.
 type TenantRateLimiter struct {
-	tenants *lru.LRU[string, *rate.Limiter]
-	rate    rate.Limit // requests per second
-	burst   int        // max burst size
+	tenants      *lru.LRU[string, *rate.Limiter]
+	rate         rate.Limit // requests per second
+	burst        int        // max burst size
+	bech32Prefix string
 }
 
 // NewTenantRateLimiter creates a new per-tenant rate limiter.
 // rps is requests per second, burst is the maximum burst size per tenant.
-func NewTenantRateLimiter(rps float64, burst int) *TenantRateLimiter {
+// bech32Prefix is used for cryptographic token validation before bucket consumption.
+func NewTenantRateLimiter(rps float64, burst int, bech32Prefix string) *TenantRateLimiter {
 	cache := lru.NewLRU[string, *rate.Limiter](maxTenants, nil, tenantTTL)
 
 	return &TenantRateLimiter{
-		tenants: cache,
-		rate:    rate.Limit(rps),
-		burst:   burst,
+		tenants:      cache,
+		rate:         rate.Limit(rps),
+		burst:        burst,
+		bech32Prefix: bech32Prefix,
 	}
 }
 
@@ -244,33 +251,53 @@ func (tl *TenantRateLimiter) retryAfterSeconds() string {
 	return calcRetryAfterSeconds(tl.rate)
 }
 
-// TenantKey is the context key type for storing tenant info.
-type tenantKey struct{}
+// authTokenKey is the context key for storing a validated *AuthToken.
+type authTokenKey struct{}
 
-// ContextWithTenant returns a new context with the tenant value set.
-func ContextWithTenant(ctx context.Context, tenant string) context.Context {
-	return context.WithValue(ctx, tenantKey{}, tenant)
+// payloadAuthTokenKey is the context key for storing a validated *PayloadAuthToken.
+type payloadAuthTokenKey struct{}
+
+// AuthTokenFromContext retrieves the pre-validated AuthToken from request context.
+// Returns nil if no token was stored (e.g. rate limiting disabled).
+func AuthTokenFromContext(ctx context.Context) *AuthToken {
+	token, _ := ctx.Value(authTokenKey{}).(*AuthToken)
+	return token
 }
 
-// TenantRateLimitMiddleware returns middleware that applies per-tenant rate limiting.
-// It extracts the tenant from the Authorization header and applies the limit.
-// If tenant cannot be extracted, the request proceeds without tenant-based limiting.
-func (tl *TenantRateLimiter) Middleware() func(http.Handler) http.Handler {
+// PayloadAuthTokenFromContext retrieves the pre-validated PayloadAuthToken from request context.
+// Returns nil if no token was stored (e.g. rate limiting disabled).
+func PayloadAuthTokenFromContext(ctx context.Context) *PayloadAuthToken {
+	token, _ := ctx.Value(payloadAuthTokenKey{}).(*PayloadAuthToken)
+	return token
+}
+
+// AuthMiddleware returns middleware that validates AuthTokens and applies per-tenant
+// rate limiting. Tokens are cryptographically validated BEFORE consuming from the
+// bucket, preventing attackers from burning a victim's quota with forged tokens.
+// The validated token is stored in request context so handlers skip re-validation.
+func (tl *TenantRateLimiter) AuthMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Try to extract tenant from bearer token
-			tenant := extractTenantFromAuth(r)
-			if tenant == "" {
-				// No tenant info available - proceed without tenant rate limiting
-				// (IP-based rate limiting still applies)
-				next.ServeHTTP(w, r)
+			tokenStr, err := extractBearerToken(r)
+			if err != nil {
+				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 				return
 			}
 
-			// Apply tenant rate limit
-			if !tl.Allow(tenant) {
+			token, err := ParseAuthToken(tokenStr)
+			if err != nil {
+				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
+				return
+			}
+
+			if err := token.Validate(tl.bech32Prefix); err != nil {
+				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
+				return
+			}
+
+			if !tl.Allow(token.Tenant) {
 				slog.Warn("tenant rate limit exceeded",
-					"tenant", tenant,
+					"tenant", token.Tenant,
 					"path", r.URL.Path,
 				)
 				w.Header().Set("Retry-After", tl.retryAfterSeconds())
@@ -278,38 +305,52 @@ func (tl *TenantRateLimiter) Middleware() func(http.Handler) http.Handler {
 				return
 			}
 
-			// Store tenant in context for downstream handlers
-			ctx := ContextWithTenant(r.Context(), tenant)
+			ctx := context.WithValue(r.Context(), authTokenKey{}, token)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-// extractTenantFromAuth attempts to extract the tenant address from the Authorization header.
-// Returns empty string if extraction fails (request proceeds without tenant rate limiting).
-//
-// This intentionally skips full signature verification (secp256k1 + ADR-036) because:
-//  1. The downstream handler performs full authentication — this is only for rate-limit bucketing
-//  2. Avoiding redundant crypto verification saves significant CPU per request
-//  3. A spoofed tenant in an unsigned token only affects rate-limit bucketing;
-//     the request will still be rejected by the handler's real authentication
-//
-// Security note: without signature verification, an attacker can forge tokens with
-// arbitrary tenant addresses to distribute requests across rate-limit buckets. This
-// is acceptable because IP-based rate limiting still applies, and the handler's full
-// authentication will reject any forged token before data is returned.
-func extractTenantFromAuth(r *http.Request) string {
-	tokenStr, err := extractBearerToken(r)
-	if err != nil {
-		slog.Debug("tenant extraction: no bearer token", "error", err)
-		return ""
-	}
+// PayloadAuthMiddleware returns middleware that validates PayloadAuthTokens and applies
+// per-tenant rate limiting. Same validate-before-consume pattern as AuthMiddleware.
+// Increments PayloadUploadsTotal{invalid_auth} on rejection so the metric fires
+// regardless of whether rate limiting is enabled (the handler fallback path also
+// increments on its own rejections).
+func (tl *TenantRateLimiter) PayloadAuthMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tokenStr, err := extractBearerToken(r)
+			if err != nil {
+				metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
+				return
+			}
 
-	token, err := ParseAuthToken(tokenStr)
-	if err != nil {
-		slog.Debug("tenant extraction: token parse failed", "error", err)
-		return ""
-	}
+			token, err := ParsePayloadAuthToken(tokenStr)
+			if err != nil {
+				metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
+				return
+			}
 
-	return token.Tenant
+			if err := token.Validate(tl.bech32Prefix); err != nil {
+				metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
+				return
+			}
+
+			if !tl.Allow(token.Tenant) {
+				slog.Warn("tenant rate limit exceeded",
+					"tenant", token.Tenant,
+					"path", r.URL.Path,
+				)
+				w.Header().Set("Retry-After", tl.retryAfterSeconds())
+				writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), payloadAuthTokenKey{}, token)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }

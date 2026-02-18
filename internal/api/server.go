@@ -125,7 +125,7 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	// Create per-tenant rate limiter if configured
 	var tenantRateLimiter *TenantRateLimiter
 	if cfg.TenantRateLimitRPS > 0 {
-		tenantRateLimiter = NewTenantRateLimiter(cfg.TenantRateLimitRPS, cfg.TenantRateLimitBurst)
+		tenantRateLimiter = NewTenantRateLimiter(cfg.TenantRateLimitRPS, cfg.TenantRateLimitBurst, cfg.Bech32Prefix)
 		slog.Info("per-tenant rate limiting enabled",
 			"rps", cfg.TenantRateLimitRPS,
 			"burst", cfg.TenantRateLimitBurst,
@@ -182,24 +182,46 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
 	mux.Handle("POST /callbacks/provision", withTimeout(http.HandlerFunc(s.handleProvisionCallback)))
 
-	// Authenticated routes with optional tenant rate limiting
-	withTenantRL := func(h http.HandlerFunc) http.Handler {
+	// Authenticated routes with optional tenant rate limiting.
+	// AuthMiddleware validates AuthTokens; PayloadAuthMiddleware validates PayloadAuthTokens.
+	// Both validate tokens cryptographically BEFORE consuming from the rate-limit bucket.
+	withAuthRL := func(h http.HandlerFunc) http.Handler {
 		if tenantRateLimiter != nil {
-			return tenantRateLimiter.Middleware()(h)
+			return tenantRateLimiter.AuthMiddleware()(h)
 		}
 		return h
 	}
-	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTimeout(withTenantRL(handlers.GetLeaseConnection)))
-	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTimeout(withTenantRL(handlers.GetLeaseStatus)))
-	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTimeout(withTenantRL(handlers.GetLeaseProvision)))
-	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTimeout(withTenantRL(handlers.GetLeaseLogs)))
-	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTimeout(withTenantRL(s.handlePayloadUpload)))
-	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withTenantRL(handlers.RestartLease)))
-	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTimeout(withTenantRL(handlers.UpdateLease)))
-	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTimeout(withTenantRL(handlers.GetLeaseReleases)))
+	withPayloadRL := func(h http.HandlerFunc) http.Handler {
+		if tenantRateLimiter != nil {
+			return tenantRateLimiter.PayloadAuthMiddleware()(h)
+		}
+		return h
+	}
+	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTimeout(withAuthRL(handlers.GetLeaseConnection)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTimeout(withAuthRL(handlers.GetLeaseStatus)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTimeout(withAuthRL(handlers.GetLeaseProvision)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTimeout(withAuthRL(handlers.GetLeaseLogs)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTimeout(withPayloadRL(s.handlePayloadUpload)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withAuthRL(handlers.RestartLease)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTimeout(withAuthRL(handlers.UpdateLease)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTimeout(withAuthRL(handlers.GetLeaseReleases)))
+
+	// WebSocket token promoter: WebSocket clients cannot set custom headers, so
+	// the auth token is passed as a query parameter. This middleware promotes it
+	// to the Authorization header BEFORE AuthMiddleware runs.
+	wsTokenPromoter := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "" {
+				if token := r.URL.Query().Get("token"); token != "" {
+					r.Header.Set("Authorization", "Bearer "+token)
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 	// WebSocket endpoint: no request timeout. The WebSocket handler manages its own
 	// lifecycle with ping/pong frames and per-write deadlines.
-	mux.Handle("GET /v1/leases/{lease_uuid}/events", withTenantRL(handlers.StreamLeaseEvents))
+	mux.Handle("GET /v1/leases/{lease_uuid}/events", wsTokenPromoter(withAuthRL(handlers.StreamLeaseEvents)))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:

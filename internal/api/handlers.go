@@ -105,15 +105,18 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 		return nil, http.StatusBadRequest, errors.New(errMsgInvalidLeaseUUID)
 	}
 
-	// Extract and validate bearer token
-	token, err := h.extractToken(r)
-	if err != nil {
-		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
-	}
-
-	// Validate the token
-	if err := token.Validate(h.bech32Prefix); err != nil {
-		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
+	// Use pre-validated token from middleware context if available (avoids redundant
+	// ECDSA verification). Falls back to self-validate when rate limiting is disabled.
+	token := AuthTokenFromContext(r.Context())
+	if token == nil {
+		var err error
+		token, err = h.extractToken(r)
+		if err != nil {
+			return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
+		}
+		if err := token.Validate(h.bech32Prefix); err != nil {
+			return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
+		}
 	}
 
 	// Check for token replay attack (if tracker is configured and checkReplay is true)

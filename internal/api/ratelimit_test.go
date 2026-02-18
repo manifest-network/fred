@@ -310,7 +310,7 @@ func TestRateLimiter_GetVisitorReturnsExisting(t *testing.T) {
 // TenantRateLimiter tests
 
 func TestTenantRateLimiter_AllowsWithinLimit(t *testing.T) {
-	tl := NewTenantRateLimiter(10, 10) // 10 requests per second, burst of 10
+	tl := NewTenantRateLimiter(10, 10, "manifest") // 10 requests per second, burst of 10
 
 	tenant := "manifest1abc123"
 	for i := range 10 {
@@ -319,7 +319,7 @@ func TestTenantRateLimiter_AllowsWithinLimit(t *testing.T) {
 }
 
 func TestTenantRateLimiter_BlocksOverLimit(t *testing.T) {
-	tl := NewTenantRateLimiter(1, 1) // 1 request per second, burst of 1
+	tl := NewTenantRateLimiter(1, 1, "manifest") // 1 request per second, burst of 1
 
 	tenant := "manifest1xyz789"
 
@@ -331,7 +331,7 @@ func TestTenantRateLimiter_BlocksOverLimit(t *testing.T) {
 }
 
 func TestTenantRateLimiter_PerTenantIsolation(t *testing.T) {
-	tl := NewTenantRateLimiter(1, 1)
+	tl := NewTenantRateLimiter(1, 1, "manifest")
 
 	tenant1 := "manifest1tenant1"
 	tenant2 := "manifest1tenant2"
@@ -344,7 +344,7 @@ func TestTenantRateLimiter_PerTenantIsolation(t *testing.T) {
 }
 
 func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
-	tl := NewTenantRateLimiter(10, 10)
+	tl := NewTenantRateLimiter(10, 10, "manifest")
 
 	tenant := "manifest1test"
 
@@ -357,21 +357,15 @@ func TestTenantRateLimiter_GetLimiterReturnsExisting(t *testing.T) {
 	assert.Equal(t, limiter1, limiter2, "getLimiter should return the same limiter for the same tenant")
 }
 
-func TestTenantRateLimiter_Middleware(t *testing.T) {
-	tl := NewTenantRateLimiter(1, 1) // 1 request per second, burst of 1
-
-	// Create a handler that verifies tenant was set in context
-	var capturedTenant string
+func TestTenantRateLimiter_AuthMiddleware(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if tenant, ok := r.Context().Value(tenantKey{}).(string); ok {
-			capturedTenant = tenant
-		}
 		w.WriteHeader(http.StatusOK)
 	})
 
-	middleware := tl.Middleware()(handler)
-
 	t.Run("rate_limits_per_tenant", func(t *testing.T) {
+		tl := NewTenantRateLimiter(1, 1, "manifest") // 1 request per second, burst of 1
+		middleware := tl.AuthMiddleware()(handler)
+
 		// Create a valid auth token for testing
 		kp := testutil.NewTestKeyPair("test-tenant")
 		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
@@ -399,9 +393,8 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 	})
 
 	t.Run("different_tenants_independent", func(t *testing.T) {
-		// Use fresh rate limiter
-		tl2 := NewTenantRateLimiter(1, 1)
-		middleware2 := tl2.Middleware()(handler)
+		tl := NewTenantRateLimiter(1, 1, "manifest")
+		middleware := tl.AuthMiddleware()(handler)
 
 		// Create tokens for two different tenants
 		kp1 := testutil.NewTestKeyPair("tenant-1")
@@ -413,7 +406,7 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 		req1 := httptest.NewRequest("GET", "/test", nil)
 		req1.Header.Set("Authorization", "Bearer "+token1)
 		rec1 := httptest.NewRecorder()
-		middleware2.ServeHTTP(rec1, req1)
+		middleware.ServeHTTP(rec1, req1)
 
 		assert.Equal(t, http.StatusOK, rec1.Code)
 
@@ -421,22 +414,20 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 		req2 := httptest.NewRequest("GET", "/test", nil)
 		req2.Header.Set("Authorization", "Bearer "+token2)
 		rec2 := httptest.NewRecorder()
-		middleware2.ServeHTTP(rec2, req2)
+		middleware.ServeHTTP(rec2, req2)
 
 		assert.Equal(t, http.StatusOK, rec2.Code, "should have separate limit")
 	})
 
-	t.Run("sets_tenant_in_context", func(t *testing.T) {
-		tl3 := NewTenantRateLimiter(10, 10)
-		capturedTenant = "" // Reset
+	t.Run("sets_token_in_context", func(t *testing.T) {
+		tl := NewTenantRateLimiter(10, 10, "manifest")
 
+		var capturedToken *AuthToken
 		contextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if tenant, ok := r.Context().Value(tenantKey{}).(string); ok {
-				capturedTenant = tenant
-			}
+			capturedToken = AuthTokenFromContext(r.Context())
 			w.WriteHeader(http.StatusOK)
 		})
-		middleware3 := tl3.Middleware()(contextHandler)
+		middleware := tl.AuthMiddleware()(contextHandler)
 
 		kp := testutil.NewTestKeyPair("context-test")
 		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
@@ -444,102 +435,167 @@ func TestTenantRateLimiter_Middleware(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
-		middleware3.ServeHTTP(rec, req)
+		middleware.ServeHTTP(rec, req)
 
-		assert.Equal(t, kp.Address, capturedTenant)
+		require.NotNil(t, capturedToken, "AuthToken should be in context")
+		assert.Equal(t, kp.Address, capturedToken.Tenant)
+		assert.Equal(t, testutil.ValidUUID1, capturedToken.LeaseUUID)
 	})
 
-	t.Run("no_auth_header_proceeds_without_tenant_limiting", func(t *testing.T) {
-		tl4 := NewTenantRateLimiter(1, 1)
-		middleware4 := tl4.Middleware()(handler)
+	t.Run("no_auth_header_returns_401", func(t *testing.T) {
+		tl := NewTenantRateLimiter(1, 1, "manifest")
+		middleware := tl.AuthMiddleware()(handler)
 
-		// Request without auth header should proceed (IP limiting still applies separately)
 		req := httptest.NewRequest("GET", "/test", nil)
 		rec := httptest.NewRecorder()
-		middleware4.ServeHTTP(rec, req)
+		middleware.ServeHTTP(rec, req)
 
-		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	})
 
-	t.Run("invalid_token_proceeds_without_tenant_limiting", func(t *testing.T) {
-		tl5 := NewTenantRateLimiter(1, 1)
-		middleware5 := tl5.Middleware()(handler)
+	t.Run("invalid_token_returns_401", func(t *testing.T) {
+		tl := NewTenantRateLimiter(1, 1, "manifest")
+		middleware := tl.AuthMiddleware()(handler)
 
-		// Request with invalid token should proceed (tenant extraction fails gracefully)
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer invalid-token-data")
 		rec := httptest.NewRecorder()
-		middleware5.ServeHTTP(rec, req)
+		middleware.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("expired_token_returns_401_without_consuming_bucket", func(t *testing.T) {
+		tl := NewTenantRateLimiter(1, 1, "manifest")
+		middleware := tl.AuthMiddleware()(handler)
+
+		kp := testutil.NewTestKeyPair("expired-test")
+		token := testutil.CreateExpiredToken(kp, testutil.ValidUUID1)
+
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		middleware.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+
+		// Bucket should NOT have been consumed — a valid token should still pass
+		validToken := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
+		req2 := httptest.NewRequest("GET", "/test", nil)
+		req2.Header.Set("Authorization", "Bearer "+validToken)
+		rec2 := httptest.NewRecorder()
+		middleware.ServeHTTP(rec2, req2)
+
+		assert.Equal(t, http.StatusOK, rec2.Code, "bucket should not have been consumed by expired token")
+	})
+}
+
+func TestTenantRateLimiter_PayloadAuthMiddleware(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	t.Run("valid_payload_token_passes", func(t *testing.T) {
+		tl := NewTenantRateLimiter(10, 10, "manifest")
+		middleware := tl.PayloadAuthMiddleware()(handler)
+
+		kp := testutil.NewTestKeyPair("payload-test")
+		metaHash := testutil.ComputePayloadHash([]byte("test-payload"))
+		token := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
+
+		req := httptest.NewRequest("POST", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		middleware.ServeHTTP(rec, req)
 
 		assert.Equal(t, http.StatusOK, rec.Code)
 	})
+
+	t.Run("sets_payload_token_in_context", func(t *testing.T) {
+		tl := NewTenantRateLimiter(10, 10, "manifest")
+
+		var capturedToken *PayloadAuthToken
+		contextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedToken = PayloadAuthTokenFromContext(r.Context())
+			w.WriteHeader(http.StatusOK)
+		})
+		middleware := tl.PayloadAuthMiddleware()(contextHandler)
+
+		kp := testutil.NewTestKeyPair("payload-ctx")
+		metaHash := testutil.ComputePayloadHash([]byte("test-payload"))
+		token := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
+
+		req := httptest.NewRequest("POST", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		middleware.ServeHTTP(rec, req)
+
+		require.NotNil(t, capturedToken, "PayloadAuthToken should be in context")
+		assert.Equal(t, kp.Address, capturedToken.Tenant)
+		assert.Equal(t, testutil.ValidUUID1, capturedToken.LeaseUUID)
+		assert.Equal(t, metaHash, capturedToken.MetaHash)
+	})
+
+	t.Run("invalid_payload_token_returns_401", func(t *testing.T) {
+		tl := NewTenantRateLimiter(1, 1, "manifest")
+		middleware := tl.PayloadAuthMiddleware()(handler)
+
+		req := httptest.NewRequest("POST", "/test", nil)
+		req.Header.Set("Authorization", "Bearer invalid-token")
+		rec := httptest.NewRecorder()
+		middleware.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("missing_auth_returns_401", func(t *testing.T) {
+		tl := NewTenantRateLimiter(1, 1, "manifest")
+		middleware := tl.PayloadAuthMiddleware()(handler)
+
+		req := httptest.NewRequest("POST", "/test", nil)
+		rec := httptest.NewRecorder()
+		middleware.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
 }
 
-func TestContextWithTenant(t *testing.T) {
-	ctx := context.Background()
-	tenant := "manifest1test123"
+func TestAuthTokenFromContext(t *testing.T) {
+	t.Run("returns_nil_when_absent", func(t *testing.T) {
+		ctx := context.Background()
+		assert.Nil(t, AuthTokenFromContext(ctx))
+	})
 
-	newCtx := ContextWithTenant(ctx, tenant)
-
-	// Verify tenant can be retrieved
-	got, ok := newCtx.Value(tenantKey{}).(string)
-	require.True(t, ok, "tenant not found in context")
-	assert.Equal(t, tenant, got)
+	t.Run("returns_token_when_present", func(t *testing.T) {
+		token := &AuthToken{
+			Tenant:    "manifest1test",
+			LeaseUUID: testutil.ValidUUID1,
+		}
+		ctx := context.WithValue(context.Background(), authTokenKey{}, token)
+		got := AuthTokenFromContext(ctx)
+		require.NotNil(t, got)
+		assert.Equal(t, token.Tenant, got.Tenant)
+		assert.Equal(t, token.LeaseUUID, got.LeaseUUID)
+	})
 }
 
-func TestExtractTenantFromAuth(t *testing.T) {
-	t.Run("valid_token_returns_tenant", func(t *testing.T) {
-		kp := testutil.NewTestKeyPair("extract-test")
-		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
-
-		req := httptest.NewRequest("GET", "/test", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		tenant := extractTenantFromAuth(req)
-		assert.Equal(t, kp.Address, tenant)
+func TestPayloadAuthTokenFromContext(t *testing.T) {
+	t.Run("returns_nil_when_absent", func(t *testing.T) {
+		ctx := context.Background()
+		assert.Nil(t, PayloadAuthTokenFromContext(ctx))
 	})
 
-	t.Run("missing_auth_returns_empty", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/test", nil)
-
-		tenant := extractTenantFromAuth(req)
-		assert.Equal(t, "", tenant)
-	})
-
-	t.Run("invalid_token_returns_empty", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/test", nil)
-		req.Header.Set("Authorization", "Bearer not-valid-base64-json")
-
-		tenant := extractTenantFromAuth(req)
-		assert.Equal(t, "", tenant)
-	})
-
-	t.Run("any_parseable_token_extracts_tenant", func(t *testing.T) {
-		kp := testutil.NewTestKeyPair("prefix-test")
-		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now())
-
-		req := httptest.NewRequest("GET", "/test", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		// extractTenantFromAuth skips crypto validation and returns the
-		// self-reported tenant for rate-limit bucketing only.
-		// The handler's real authentication validates the signature.
-		tenant := extractTenantFromAuth(req)
-		assert.Equal(t, kp.Address, tenant)
-	})
-
-	t.Run("expired_token_still_extracts_tenant", func(t *testing.T) {
-		kp := testutil.NewTestKeyPair("expired-test")
-		// Create token with old timestamp
-		token := testutil.CreateTestToken(kp, testutil.ValidUUID1, time.Now().Add(-1*time.Hour))
-
-		req := httptest.NewRequest("GET", "/test", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		// Expired tokens still return a tenant for rate-limit bucketing.
-		// The handler's real authentication will reject expired tokens.
-		tenant := extractTenantFromAuth(req)
-		assert.Equal(t, kp.Address, tenant)
+	t.Run("returns_token_when_present", func(t *testing.T) {
+		token := &PayloadAuthToken{
+			Tenant:    "manifest1test",
+			LeaseUUID: testutil.ValidUUID1,
+			MetaHash:  "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+		}
+		ctx := context.WithValue(context.Background(), payloadAuthTokenKey{}, token)
+		got := PayloadAuthTokenFromContext(ctx)
+		require.NotNil(t, got)
+		assert.Equal(t, token.Tenant, got.Tenant)
+		assert.Equal(t, token.MetaHash, got.MetaHash)
 	})
 }
 
@@ -574,7 +630,7 @@ func TestCalcRetryAfterSeconds(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 
 			// Also test TenantRateLimiter
-			tl := NewTenantRateLimiter(tt.rate, 1)
+			tl := NewTenantRateLimiter(tt.rate, 1, "manifest")
 			got = tl.retryAfterSeconds()
 			assert.Equal(t, tt.want, got)
 		})
