@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,41 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestParseLogLevel(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantLevel slog.Level
+		wantErr   bool
+		errSubstr string
+	}{
+		{name: "debug", input: "debug", wantLevel: slog.LevelDebug},
+		{name: "info", input: "info", wantLevel: slog.LevelInfo},
+		{name: "warn", input: "warn", wantLevel: slog.LevelWarn},
+		{name: "error", input: "error", wantLevel: slog.LevelError},
+		{name: "DEBUG", input: "DEBUG", wantLevel: slog.LevelDebug},
+		{name: "Info", input: "Info", wantLevel: slog.LevelInfo},
+		{name: "WARN", input: "WARN", wantLevel: slog.LevelWarn},
+		{name: "Error", input: "Error", wantLevel: slog.LevelError},
+		{name: "empty", input: "", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
+		{name: "trace", input: "trace", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
+		{name: "fatal", input: "fatal", wantLevel: slog.LevelInfo, wantErr: true, errSubstr: "unknown log level"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			level, err := ParseLogLevel(tt.input)
+			assert.Equal(t, tt.wantLevel, level)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errSubstr)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
 
 func TestIsValidUUID_Valid(t *testing.T) {
 	validUUIDs := []string{
