@@ -19,16 +19,16 @@ func TestRouter_Route(t *testing.T) {
 		Backends: []BackendEntry{
 			{
 				Backend:   k8sBackend,
-				Match:     MatchCriteria{SKUPrefix: "k8s-"},
+				Match:     MatchCriteria{SKUs: []string{"k8s-small", "k8s-large"}},
 				IsDefault: true,
 			},
 			{
 				Backend: gpuBackend,
-				Match:   MatchCriteria{SKUPrefix: "gpu-"},
+				Match:   MatchCriteria{SKUs: []string{"gpu-a100", "gpu-h100-4x"}},
 			},
 			{
 				Backend: vmBackend,
-				Match:   MatchCriteria{SKUPrefix: "vm-"},
+				Match:   MatchCriteria{SKUs: []string{"vm-ubuntu", "vm-windows-server"}},
 			},
 		},
 	})
@@ -118,8 +118,8 @@ func TestRouter_ImplicitDefault(t *testing.T) {
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
-			{Backend: backend1, Match: MatchCriteria{SKUPrefix: "a-"}},
-			{Backend: backend2, Match: MatchCriteria{SKUPrefix: "b-"}},
+			{Backend: backend1, Match: MatchCriteria{SKUs: []string{"a-1"}}},
+			{Backend: backend2, Match: MatchCriteria{SKUs: []string{"b-1"}}},
 		},
 	})
 	require.NoError(t, err)
@@ -214,21 +214,21 @@ func TestRouter_RouteAll(t *testing.T) {
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: backendB, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: backendC, Match: MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: backendB, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: backendC, Match: MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 	require.NoError(t, err)
 
-	// Two backends match gpu-
+	// Two backends match gpu-a100
 	matches := router.RouteAll("gpu-a100")
 	assert.Len(t, matches, 2)
 	names := []string{matches[0].Name(), matches[1].Name()}
 	assert.Contains(t, names, "backend-a")
 	assert.Contains(t, names, "backend-b")
 
-	// One backend matches k8s-
+	// One backend matches k8s-small
 	matches = router.RouteAll("k8s-small")
 	assert.Len(t, matches, 1)
 	assert.Equal(t, "backend-c", matches[0].Name())
@@ -243,14 +243,14 @@ func TestRouter_RouteAll_Deduplicates(t *testing.T) {
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}, IsDefault: true},
-			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-a100"}},
+			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}, IsDefault: true},
+			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
 		},
 	})
 	require.NoError(t, err)
 
-	// Same backend registered twice for matching prefixes — should deduplicate
-	matches := router.RouteAll("gpu-a100-4x")
+	// Same backend registered twice for matching SKU — should deduplicate
+	matches := router.RouteAll("gpu-a100")
 	assert.Len(t, matches, 1)
 	assert.Equal(t, "shared", matches[0].Name())
 }
@@ -262,9 +262,9 @@ func TestRouter_RouteRoundRobin_Distribution(t *testing.T) {
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: backendB, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: backendC, Match: MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: backendB, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: backendC, Match: MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 	require.NoError(t, err)
@@ -285,7 +285,7 @@ func TestRouter_RouteRoundRobin_SingleMatch(t *testing.T) {
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}, IsDefault: true},
+			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}, IsDefault: true},
 		},
 	})
 	require.NoError(t, err)
@@ -303,7 +303,7 @@ func TestRouter_RouteRoundRobin_NoMatch_FallsBackToDefault(t *testing.T) {
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
+			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
 			{Backend: defaultBackend, IsDefault: true},
 		},
 	})
@@ -323,9 +323,9 @@ func TestRouter_RouteRoundRobin_InterleavedSKUs(t *testing.T) {
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
-			{Backend: gpuA, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: gpuB, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: k8s, Match: MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: gpuA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: gpuB, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: k8s, Match: MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 	require.NoError(t, err)
@@ -348,6 +348,43 @@ func TestRouter_RouteRoundRobin_InterleavedSKUs(t *testing.T) {
 	assert.Greater(t, gpuCounts["gpu-a"], 0)
 	assert.Greater(t, gpuCounts["gpu-b"], 0)
 	assert.Equal(t, 100, gpuCounts["gpu-a"]+gpuCounts["gpu-b"])
+}
+
+func TestRouter_RouteRoundRobin_ExactSKUs(t *testing.T) {
+	// Simulates production: 3 backends with the same exact SKU UUIDs.
+	// All backends match every SKU UUID, so round-robin distributes evenly.
+	skus := []string{
+		"a1b2c3d4-e5f6-7890-abcd-1234567890ab",
+		"b2c3d4e5-f6a7-8901-bcde-2345678901bc",
+	}
+
+	backendA := NewMockBackend(MockBackendConfig{Name: "docker-1"})
+	backendB := NewMockBackend(MockBackendConfig{Name: "docker-2"})
+	backendC := NewMockBackend(MockBackendConfig{Name: "docker-3"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: backendA, Match: MatchCriteria{SKUs: skus}, IsDefault: true},
+			{Backend: backendB, Match: MatchCriteria{SKUs: skus}},
+			{Backend: backendC, Match: MatchCriteria{SKUs: skus}},
+		},
+	})
+	require.NoError(t, err)
+
+	// Round-robin across all 3 backends for a known SKU UUID
+	counts := map[string]int{}
+	for i := 0; i < 300; i++ {
+		b := router.RouteRoundRobin("a1b2c3d4-e5f6-7890-abcd-1234567890ab")
+		counts[b.Name()]++
+	}
+
+	assert.Equal(t, 100, counts["docker-1"])
+	assert.Equal(t, 100, counts["docker-2"])
+	assert.Equal(t, 100, counts["docker-3"])
+
+	// Unknown SKU falls back to default
+	b := router.RouteRoundRobin("unknown-uuid")
+	assert.Equal(t, "docker-1", b.Name())
 }
 
 // unhealthyMockBackend is a mock backend that returns an error on Health check.

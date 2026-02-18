@@ -41,21 +41,6 @@ func (m *mockBenchBackend) GetReleases(ctx context.Context, leaseUUID string) ([
 
 // BenchmarkRouter_Route benchmarks SKU-based routing decisions.
 func BenchmarkRouter_Route(b *testing.B) {
-	// Create router with multiple backends
-	backends := []BackendEntry{
-		{Backend: &mockBenchBackend{name: "kubernetes"}, Match: MatchCriteria{SKUPrefix: "k8s-"}},
-		{Backend: &mockBenchBackend{name: "gpu"}, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-		{Backend: &mockBenchBackend{name: "vm"}, Match: MatchCriteria{SKUPrefix: "vm-"}},
-		{Backend: &mockBenchBackend{name: "storage"}, Match: MatchCriteria{SKUPrefix: "storage-"}},
-		{Backend: &mockBenchBackend{name: "default"}, IsDefault: true},
-	}
-
-	router, err := NewRouter(RouterConfig{Backends: backends})
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	// SKUs to test routing
 	skus := []string{
 		"k8s-small",
 		"k8s-large",
@@ -65,6 +50,20 @@ func BenchmarkRouter_Route(b *testing.B) {
 		"vm-premium",
 		"storage-ssd",
 		"unknown-sku", // Falls back to default
+	}
+
+	// Create router with multiple backends using exact SKU lists
+	backends := []BackendEntry{
+		{Backend: &mockBenchBackend{name: "kubernetes"}, Match: MatchCriteria{SKUs: []string{"k8s-small", "k8s-large"}}},
+		{Backend: &mockBenchBackend{name: "gpu"}, Match: MatchCriteria{SKUs: []string{"gpu-a100", "gpu-h100"}}},
+		{Backend: &mockBenchBackend{name: "vm"}, Match: MatchCriteria{SKUs: []string{"vm-basic", "vm-premium"}}},
+		{Backend: &mockBenchBackend{name: "storage"}, Match: MatchCriteria{SKUs: []string{"storage-ssd"}}},
+		{Backend: &mockBenchBackend{name: "default"}, IsDefault: true},
+	}
+
+	router, err := NewRouter(RouterConfig{Backends: backends})
+	if err != nil {
+		b.Fatal(err)
 	}
 
 	b.ResetTimer()
@@ -82,9 +81,11 @@ func BenchmarkRouter_Route(b *testing.B) {
 
 // BenchmarkRouter_Route_Parallel benchmarks concurrent routing.
 func BenchmarkRouter_Route_Parallel(b *testing.B) {
+	skus := []string{"gpu-a100", "k8s-small", "unknown"}
+
 	backends := []BackendEntry{
-		{Backend: &mockBenchBackend{name: "gpu"}, Match: MatchCriteria{SKUPrefix: "gpu-"}},
-		{Backend: &mockBenchBackend{name: "k8s"}, Match: MatchCriteria{SKUPrefix: "k8s-"}},
+		{Backend: &mockBenchBackend{name: "gpu"}, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
+		{Backend: &mockBenchBackend{name: "k8s"}, Match: MatchCriteria{SKUs: []string{"k8s-small"}}},
 		{Backend: &mockBenchBackend{name: "default"}, IsDefault: true},
 	}
 
@@ -92,8 +93,6 @@ func BenchmarkRouter_Route_Parallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-
-	skus := []string{"gpu-a100", "k8s-small", "unknown"}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -113,9 +112,6 @@ func BenchmarkRouter_GetBackendByName(b *testing.B) {
 		backends[i] = BackendEntry{
 			Backend:   &mockBenchBackend{name: name},
 			IsDefault: name == "default",
-		}
-		if name != "default" {
-			backends[i].Match = MatchCriteria{SKUPrefix: name + "-"}
 		}
 	}
 

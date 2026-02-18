@@ -301,7 +301,7 @@ The startup order is critical to avoid race conditions:
 
 ### Router Design
 
-The backend router matches leases to backends by SKU prefix. When multiple backends share the same prefix, `RouteRoundRobin` distributes new provisions across them using an atomic counter. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
+The backend router matches leases to backends by exact SKU UUID. When multiple backends share the same SKU list, `RouteRoundRobin` distributes new provisions across them using an atomic counter. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
 
 ```go
 type Router struct {
@@ -321,7 +321,7 @@ func (r *Router) RouteRoundRobin(sku string) Backend // round-robin across match
 - `RouteRoundRobin` — distributes across all matching backends (used for new provisions)
 - **Placement lookup** — maps `lease_uuid → backend_name` for read-path routing (connection, logs, diagnostics)
 
-When a single backend matches a SKU prefix, all three strategies behave identically.
+When a single backend matches a SKU, all three strategies behave identically.
 
 ### Circuit Breaker
 
@@ -352,7 +352,7 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
 - Read on every tenant API call (connection, logs, diagnostics) to route to the correct backend
 - Deleted on deprovision or lease closure
 - Rebuilt on startup: the reconciler calls `SetBatch` with placements from all backends' `ListProvisions`
-- Optional — only needed when multiple backends share a SKU prefix
+- Optional — only needed when multiple backends share the same SKU list
 
 ### Payload Store
 

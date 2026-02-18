@@ -115,7 +115,7 @@ type BackendConfig struct {
 	Name      string        `mapstructure:"name"`
 	URL       string        `mapstructure:"url"`
 	Timeout   time.Duration `mapstructure:"timeout"`
-	SKUPrefix string        `mapstructure:"sku_prefix"`
+	SKUs      []string      `mapstructure:"skus"`
 	IsDefault bool          `mapstructure:"default"`
 }
 
@@ -191,6 +191,21 @@ func Load(configPath string) (*Config, error) {
 		v.SetConfigFile(configPath)
 		if err := v.ReadInConfig(); err != nil {
 			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+	}
+
+	// Detect removed config keys that viper silently ignores.
+	// Old configs with sku_prefix would leave backends[i].skus empty,
+	// causing silent misrouting to the default backend.
+	if backends := v.Get("backends"); backends != nil {
+		if backendSlice, ok := backends.([]any); ok {
+			for i, entry := range backendSlice {
+				if m, ok := entry.(map[string]any); ok {
+					if _, has := m["sku_prefix"]; has {
+						return nil, fmt.Errorf("backends[%d]: sku_prefix is no longer supported (on-chain SKUs are always UUIDs); replace sku_prefix with skus: [list of exact SKU UUIDs]", i)
+					}
+				}
+			}
 		}
 	}
 

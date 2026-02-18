@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync/atomic"
 )
 
@@ -22,8 +21,7 @@ type backendEntry struct {
 
 // MatchCriteria defines how to match a lease to a backend.
 type MatchCriteria struct {
-	SKUPrefix string   // Match if SKU starts with this prefix (e.g., "gpu-", "k8s-")
-	SKUs      []string // Match if SKU is in this exact list
+	SKUs []string // Match if SKU is in this exact list
 }
 
 // RouterConfig configures the backend router.
@@ -123,19 +121,14 @@ func (r *Router) RouteRoundRobin(sku string) Backend {
 }
 
 // matches checks if a SKU matches the given criteria.
+// Empty criteria (no SKU list) matches nothing;
+// use IsDefault to designate a fallback backend.
 func (r *Router) matches(sku string, match MatchCriteria) bool {
-	// Check SKU prefix first
-	if match.SKUPrefix != "" && strings.HasPrefix(sku, match.SKUPrefix) {
-		return true
-	}
-
-	// Check exact SKU list
 	for _, s := range match.SKUs {
 		if sku == s {
 			return true
 		}
 	}
-
 	return false
 }
 
@@ -145,7 +138,7 @@ func (r *Router) Default() Backend {
 }
 
 // Backends returns all unique backends for operations like reconciliation and health checks.
-// The same backend may be registered multiple times with different SKU prefixes, but
+// The same backend may be registered multiple times with different SKU lists, but
 // this method returns each backend only once (deduplicated by name).
 func (r *Router) Backends() []Backend {
 	seen := make(map[string]bool)

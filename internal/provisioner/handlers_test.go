@@ -159,8 +159,8 @@ func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
-			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 
@@ -211,8 +211,8 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
-			{Backend: backend1, Match: backend.MatchCriteria{SKUPrefix: "a-"}},
-			{Backend: backend2, Match: backend.MatchCriteria{SKUPrefix: "b-"}, IsDefault: true},
+			{Backend: backend1, Match: backend.MatchCriteria{SKUs: []string{"a-1"}}},
+			{Backend: backend2, Match: backend.MatchCriteria{SKUs: []string{"b-1"}}, IsDefault: true},
 		},
 	})
 
@@ -257,8 +257,8 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
-			{Backend: backend1, Match: backend.MatchCriteria{SKUPrefix: "a-"}},
-			{Backend: backend2, Match: backend.MatchCriteria{SKUPrefix: "b-"}, IsDefault: true},
+			{Backend: backend1, Match: backend.MatchCriteria{SKUs: []string{"a-1"}}},
+			{Backend: backend2, Match: backend.MatchCriteria{SKUs: []string{"b-1"}}, IsDefault: true},
 		},
 	})
 

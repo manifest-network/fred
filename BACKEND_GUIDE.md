@@ -41,37 +41,33 @@ This guide explains how to implement a backend for Fred. A backend is an HTTP se
 
 ## Two Levels of SKU Handling
 
-### Level 1: Fred Routes by SKU Prefix
+### Level 1: Fred Routes by SKU UUID
 
-Fred's router matches SKU prefixes to backends. This is configured in Fred's `config.yaml`:
+Fred's router matches exact SKU UUIDs to backends. On-chain SKUs are always UUIDv7. This is configured in Fred's `config.yaml`:
 
 ```yaml
 backends:
-  - name: docker
-    url: "http://docker-backend:9001"
-    sku_prefix: "docker-"      # Matches: docker-nginx, docker-redis, docker-*
+  - name: docker-1
+    url: "http://docker-backend-1:9001"
+    skus:
+      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+      - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
     default: true
 
-  - name: kubernetes
-    url: "http://k8s-backend:9000"
-    sku_prefix: "k8s-"         # Matches: k8s-small, k8s-large, k8s-*
-
-  - name: gpu-1
-    url: "http://gpu-backend-1:9000"
-    sku_prefix: "gpu-"         # Matches: gpu-a100, gpu-h100, gpu-*
-
-  # Round-robin: same sku_prefix as gpu-1, provisions distributed 50/50
-  - name: gpu-2
-    url: "http://gpu-backend-2:9000"
-    sku_prefix: "gpu-"
+  # Round-robin: same skus as docker-1, provisions distributed 50/50
+  - name: docker-2
+    url: "http://docker-backend-2:9001"
+    skus:
+      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+      - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
 # Required for round-robin — tracks which backend serves each lease
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
-Fred does NOT interpret the full SKU - it only uses the prefix to decide which backend receives the request.
+Fred does NOT interpret the SKU — it only uses exact UUID matching to decide which backend receives the request.
 
-**Round-robin:** Multiple backends can share the same `sku_prefix`. When this happens, Fred distributes new provisions across them using round-robin and records a placement (lease→backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. This requires `placement_store_db_path` to be configured.
+**Round-robin:** Multiple backends can share the same `skus` list. When this happens, Fred distributes new provisions across them using round-robin and records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. This requires `placement_store_db_path` to be configured.
 
 ### Level 2: Backend Interprets Full SKU
 

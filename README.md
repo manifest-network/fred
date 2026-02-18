@@ -5,7 +5,7 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 ## Features
 
 - **Lease Lifecycle Management**: Watches chain events and orchestrates provisioning through backends
-- **Multi-Backend Support**: Route leases to different backends based on SKU prefix, with round-robin distribution across backends sharing the same prefix
+- **Multi-Backend Support**: Route leases to different backends based on exact SKU UUID list, with round-robin distribution across backends sharing the same match criteria
 - **Event-Driven Architecture**: Uses Watermill for internal event routing with retries and middleware
 - **Tenant Authentication API**: HTTP/HTTPS API with ADR-036 signature verification for tenant access
 - **Periodic Withdrawals**: Configurable scheduled withdrawal of accumulated fees from active leases
@@ -55,9 +55,9 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
               +---------------------+---------------------+
               v                     v                     v
       +---------------+     +---------------+     +---------------+
-      |  Kubernetes   |     |     GPU       |     |      VM       |
+      |   Docker-1    |     |   Docker-2    |     |   Docker-3    |
       |   Backend     |     |   Backend     |     |   Backend     |
-      | (sku: k8s-*)  |     | (sku: gpu-*)  |     | (sku: vm-*)   |
+      | (skus: [uuid])|     | (skus: [uuid])|     | (skus: [uuid])|
       +---------------+     +---------------+     +---------------+
 ```
 
@@ -152,7 +152,7 @@ All required fields are validated at startup. The daemon will fail to start with
 | `provider_address` | Provider management address |
 | `keyring_dir` | Directory containing keyring |
 | `key_name` | Key name for signing transactions |
-| `backends` | At least one backend must be configured (multiple backends may share a `sku_prefix` for round-robin) |
+| `backends` | At least one backend must be configured (multiple backends may share `skus` for round-robin) |
 | `callback_base_url` | URL where backends send callbacks (must be absolute http/https URL) |
 | `callback_secret` | Shared secret for HMAC callback authentication (minimum 32 characters) |
 
@@ -160,31 +160,29 @@ All required fields are validated at startup. The daemon will fail to start with
 
 Backends are services that handle the actual resource provisioning. Each backend URL must be an absolute URL with `http://` or `https://` scheme.
 
+Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, provisions are distributed across them using round-robin.
+
 ```yaml
 backends:
-  - name: kubernetes
-    url: "http://k8s-backend:9000"
-    timeout: 30s
-    sku_prefix: "k8s-"
-    default: true  # Fallback for unmatched SKUs
+  # Give every backend the same skus list so they all match,
+  # then round-robin distributes evenly across them.
+  - name: docker-1
+    url: "http://10.0.0.1:9000"
+    skus:
+      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+      - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
+    default: true
 
-  - name: gpu
-    url: "http://gpu-backend:9000"
-    timeout: 60s
-    sku_prefix: "gpu-"
-
-  # Round-robin: multiple backends can share the same sku_prefix.
-  # New provisions are distributed across them; reads are routed
-  # to the correct backend via the placement store.
-  # - name: gpu-2
-  #   url: "http://gpu-backend-2:9000"
-  #   timeout: 60s
-  #   sku_prefix: "gpu-"
+  - name: docker-2
+    url: "http://10.0.0.2:9000"
+    skus:
+      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+      - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
 callback_base_url: "http://fred.provider.example.com:8080"
 callback_secret: "your-32-character-or-longer-secret-here"
 
-# Required for round-robin setups (multiple backends per SKU prefix).
+# Required for round-robin setups (multiple backends sharing match criteria).
 # Records which backend serves each lease so reads hit the right machine.
 # placement_store_db_path: "/var/lib/fred/placements.db"
 ```

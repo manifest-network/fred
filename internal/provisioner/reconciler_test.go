@@ -584,7 +584,7 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
 			{Backend: backend1, IsDefault: true},
-			{Backend: backend2, Match: backend.MatchCriteria{SKUPrefix: "b2-"}},
+			{Backend: backend2, Match: backend.MatchCriteria{SKUs: []string{"b2-sku"}}},
 		},
 	})
 
@@ -1205,8 +1205,8 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
-			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100-4x"}}},
+			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 
@@ -1498,9 +1498,9 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
-			{Backend: backend1, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: backend2, Match: backend.MatchCriteria{SKUPrefix: "vm-"}},
-			{Backend: backend3, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: backend1, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: backend2, Match: backend.MatchCriteria{SKUs: []string{"vm-basic"}}},
+			{Backend: backend3, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 
@@ -2243,7 +2243,7 @@ func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
 			{Backend: b1, IsDefault: true},
-			{Backend: b2, Match: backend.MatchCriteria{SKUPrefix: "b2-"}},
+			{Backend: b2, Match: backend.MatchCriteria{SKUs: []string{"b2-sku"}}},
 		},
 	})
 

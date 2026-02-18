@@ -1129,6 +1129,75 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 	}
 }
 
+func TestLoad_BackendSKUs(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1abc"
+key_name: "provider"
+keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+backends:
+  - name: "docker-1"
+    url: "http://10.0.0.1:9000"
+    skus:
+      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+      - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
+    default: true
+  - name: "docker-2"
+    url: "http://10.0.0.2:9000"
+    skus:
+      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+  - name: "docker-3"
+    url: "http://10.0.0.3:9000"
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Backends, 3)
+
+	// Backend with skus
+	assert.Equal(t, []string{
+		"a1b2c3d4-e5f6-7890-abcd-1234567890ab",
+		"b2c3d4e5-f6a7-8901-bcde-2345678901bc",
+	}, cfg.Backends[0].SKUs)
+	assert.True(t, cfg.Backends[0].IsDefault)
+
+	// Backend with single SKU
+	assert.Equal(t, []string{"a1b2c3d4-e5f6-7890-abcd-1234567890ab"}, cfg.Backends[1].SKUs)
+
+	// Backend with no SKUs — should be nil
+	assert.Nil(t, cfg.Backends[2].SKUs)
+}
+
+func TestLoad_RejectsSKUPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1abc"
+key_name: "provider"
+keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+backends:
+  - name: "gpu"
+    url: "http://10.0.0.1:9000"
+    sku_prefix: "gpu-"
+    default: true
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+
+	_, err := Load(configPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sku_prefix is no longer supported")
+	assert.Contains(t, err.Error(), "backends[0]")
+}
+
 func TestLoad_ConfigFile(t *testing.T) {
 	// Create a temp config file
 	tmpDir := t.TempDir()
