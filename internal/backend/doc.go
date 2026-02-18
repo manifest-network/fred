@@ -3,7 +3,7 @@
 //
 // Fred supports multiple backends, each responsible for provisioning a specific
 // type of resource (e.g., Kubernetes deployments, GPU allocations, VMs). The
-// Router directs leases to the appropriate backend based on SKU prefix matching.
+// Router directs leases to the appropriate backend based on exact SKU UUID matching.
 //
 // # Backend Interface
 //
@@ -28,13 +28,12 @@
 //
 // # Router
 //
-// The Router matches leases to backends using SKU prefix:
+// The Router matches leases to backends using exact SKU UUIDs:
 //
 //	backends:
-//	  - name: kubernetes
-//	    sku_prefix: "k8s-"     # Matches k8s-small, k8s-large, etc.
-//	  - name: gpu
-//	    sku_prefix: "gpu-"     # Matches gpu-a100, gpu-h100, etc.
+//	  - name: docker-1
+//	    skus:
+//	      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
 //	  - name: default
 //	    default: true          # Fallback for unmatched SKUs
 //

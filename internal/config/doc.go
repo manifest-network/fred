@@ -37,10 +37,11 @@
 // Multiple backends can be configured with SKU-based routing:
 //
 //	backends:
-//	  - name: kubernetes
-//	    url: "http://k8s-backend:9000"
+//	  - name: docker-1
+//	    url: "http://docker-backend:9000"
 //	    timeout: 30s
-//	    sku_prefix: "k8s-"
+//	    skus:
+//	      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
 //	    default: true
 //
 // At least one backend with default: true should be configured as a fallback.

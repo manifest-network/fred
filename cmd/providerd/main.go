@@ -179,7 +179,7 @@ func run(cmd *cobra.Command, args []string) error {
 		backendEntries = append(backendEntries, backend.BackendEntry{
 			Backend: client,
 			Match: backend.MatchCriteria{
-				SKUPrefix: bcfg.SKUPrefix,
+				SKUs: bcfg.SKUs,
 			},
 			IsDefault: bcfg.IsDefault,
 		})
@@ -187,7 +187,7 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Info("configured backend",
 			"name", bcfg.Name,
 			"url", bcfg.URL,
-			"sku_prefix", bcfg.SKUPrefix,
+			"skus", bcfg.SKUs,
 			"default", bcfg.IsDefault,
 		)
 	}
@@ -233,18 +233,16 @@ func run(cmd *cobra.Command, args []string) error {
 	// Round-robin will still distribute provisions, but read operations (connection,
 	// logs, provision diagnostics) may route to the wrong backend.
 	if placementStore == nil {
-		prefixCount := make(map[string]int)
+		matchCount := make(map[string]int)
 		for _, bcfg := range cfg.Backends {
-			prefixCount[bcfg.SKUPrefix]++
+			for _, sku := range bcfg.SKUs {
+				matchCount["sku:"+sku]++
+			}
 		}
-		for prefix, count := range prefixCount {
+		for key, count := range matchCount {
 			if count > 1 {
-				label := prefix
-				if label == "" {
-					label = "(default)"
-				}
-				slog.Warn("multiple backends share the same SKU prefix without a placement store; read operations may route incorrectly",
-					"sku_prefix", label,
+				slog.Warn("multiple backends share the same SKU match criteria without a placement store; read operations may route incorrectly",
+					"match_key", key,
 					"backend_count", count,
 				)
 			}

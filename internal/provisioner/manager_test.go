@@ -989,8 +989,8 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
-			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100-4x"}}},
+			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 
@@ -1851,8 +1851,8 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
-			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUPrefix: "gpu-"}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUPrefix: "k8s-"}, IsDefault: true},
+			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100"}}},
+			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
 		},
 	})
 
