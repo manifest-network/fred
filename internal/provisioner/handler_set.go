@@ -234,6 +234,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 				h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
 				recordDuration()
 				metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
+				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
 				slog.Info("lease already acknowledged, skipping",
 					"lease_uuid", callback.LeaseUUID,
 					"tenant", provision.Tenant,
@@ -459,6 +460,8 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		}
 		return err
 	}
+
+	h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusProvisioning, "")
 	return nil
 }
 

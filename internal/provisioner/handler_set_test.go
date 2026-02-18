@@ -404,6 +404,40 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError(t *testing.T)
 	assert.False(t, tracker.IsInFlight("lease-1"))
 }
 
+func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError_PublishesReadyEvent(t *testing.T) {
+	pub := newMockPublisher()
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			return false, "", billingtypes.ErrLeaseNotPending
+		},
+	}
+	mb := &mockManagerBackend{name: "test-backend"}
+	mockChain := &chain.MockClient{}
+
+	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs.deps.Publisher = pub
+	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusSuccess,
+	})
+
+	err := hs.HandleBackendCallback(msg)
+	assert.NoError(t, err)
+
+	pub.mu.Lock()
+	msgs := pub.published[TopicLeaseEvent]
+	pub.mu.Unlock()
+	require.Len(t, msgs, 1, "should publish ready event even on terminal ack error")
+
+	var event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	assert.Equal(t, "lease-1", event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
+	assert.Empty(t, event.Error)
+}
+
 func TestHandlerSet_HandleBackendCallback_Success_TransientAckError(t *testing.T) {
 	ack := &mockAcknowledger{
 		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
@@ -695,6 +729,55 @@ func TestHandlerSet_HandlePayloadReceived_Success(t *testing.T) {
 
 	assert.Equal(t, payloadData, req.Payload)
 	assert.True(t, tracker.IsInFlight("lease-1"))
+}
+
+func TestHandlerSet_HandlePayloadReceived_Success_PublishesProvisioningEvent(t *testing.T) {
+	pub := newMockPublisher()
+	mb := &mockManagerBackend{name: "test-backend"}
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:     leaseUUID,
+				Tenant:   "tenant-a",
+				State:    billingtypes.LEASE_STATE_PENDING,
+				MetaHash: []byte{0x01},
+				Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}, nil
+		},
+	}
+
+	tempDir := t.TempDir()
+	ps, err := payload.NewStore(payload.StoreConfig{
+		DBPath: filepath.Join(tempDir, "payloads.db"),
+	})
+	require.NoError(t, err)
+	defer ps.Close()
+
+	payloadData := []byte(`{"image":"nginx:latest"}`)
+	ps.Store("lease-1", payloadData)
+
+	hs, _ := newTestHandlerSet(mockChain, mb, nil, ps)
+	hs.deps.Publisher = pub
+
+	msg := newPayloadEventMsg(t, payload.Event{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-a",
+		MetaHashHex: hashPayload(payloadData),
+	})
+
+	err = hs.HandlePayloadReceived(msg)
+	assert.NoError(t, err)
+
+	pub.mu.Lock()
+	msgs := pub.published[TopicLeaseEvent]
+	pub.mu.Unlock()
+	require.Len(t, msgs, 1, "should publish provisioning event")
+
+	var event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	assert.Equal(t, "lease-1", event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusProvisioning, event.Status)
+	assert.Empty(t, event.Error)
 }
 
 func TestHandlerSet_HandlePayloadReceived_NilPayloadStore(t *testing.T) {
