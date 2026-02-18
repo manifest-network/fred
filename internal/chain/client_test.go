@@ -447,10 +447,23 @@ func TestClient_GetLease(t *testing.T) {
 		assert.Equal(t, "lease-123", lease.Uuid)
 	})
 
-	t.Run("gRPC error", func(t *testing.T) {
+	t.Run("not found returns nil nil", func(t *testing.T) {
 		bq := &mockBillingQuery{
 			LeaseFn: func(context.Context, *billingtypes.QueryLeaseRequest, ...grpc.CallOption) (*billingtypes.QueryLeaseResponse, error) {
 				return nil, status.Error(codes.NotFound, "not found")
+			},
+		}
+		c := newMockClient(func(c *Client) { c.billingQuery = bq })
+
+		lease, err := c.GetLease(context.Background(), "nope")
+		assert.NoError(t, err)
+		assert.Nil(t, lease)
+	})
+
+	t.Run("gRPC error", func(t *testing.T) {
+		bq := &mockBillingQuery{
+			LeaseFn: func(context.Context, *billingtypes.QueryLeaseRequest, ...grpc.CallOption) (*billingtypes.QueryLeaseResponse, error) {
+				return nil, status.Error(codes.Internal, "server error")
 			},
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
@@ -476,6 +489,19 @@ func TestClient_GetActiveLease(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, lease)
 		assert.Equal(t, billingtypes.LEASE_STATE_ACTIVE, lease.State)
+	})
+
+	t.Run("not found returns nil", func(t *testing.T) {
+		bq := &mockBillingQuery{
+			LeaseFn: func(context.Context, *billingtypes.QueryLeaseRequest, ...grpc.CallOption) (*billingtypes.QueryLeaseResponse, error) {
+				return nil, status.Error(codes.NotFound, "not found")
+			},
+		}
+		c := newMockClient(func(c *Client) { c.billingQuery = bq })
+
+		lease, err := c.GetActiveLease(context.Background(), "missing")
+		assert.NoError(t, err)
+		assert.Nil(t, lease)
 	})
 
 	t.Run("non-active returns nil", func(t *testing.T) {

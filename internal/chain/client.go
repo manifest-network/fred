@@ -225,6 +225,9 @@ func (c *Client) GetLease(ctx context.Context, leaseUUID string) (*billingtypes.
 	})
 	recordQueryMetrics("get_lease", start)
 	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("failed to query lease: %w", err)
 	}
 
@@ -238,7 +241,7 @@ func (c *Client) GetActiveLease(ctx context.Context, leaseUUID string) (*billing
 		return nil, err
 	}
 
-	if lease.State != billingtypes.LEASE_STATE_ACTIVE {
+	if lease == nil || lease.State != billingtypes.LEASE_STATE_ACTIVE {
 		return nil, nil
 	}
 

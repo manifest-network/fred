@@ -6,31 +6,14 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// describeNames collects fqName strings from a prometheus.Collector via Describe().
-func describeNames(c prometheus.Collector) []string {
-	ch := make(chan *prometheus.Desc, 10)
-	go func() {
-		c.Describe(ch)
-		close(ch)
-	}()
-	var names []string
-	for d := range ch {
-		// Desc.String() returns: "Desc{fqName: \"...\", help: ...}"
-		s := d.String()
-		if idx := strings.Index(s, "fqName: \""); idx >= 0 {
-			s = s[idx+len("fqName: \""):]
-			if end := strings.Index(s, "\""); end >= 0 {
-				names = append(names, s[:end])
-			}
-		}
-	}
-	return names
-}
-
 func TestMetricsRegistered(t *testing.T) {
-	// Collect all metric collectors and verify their fqNames start with "fred_".
+	// Register all collectors in a fresh registry and Gather() to verify
+	// names without relying on debug string formats.
+	reg := prometheus.NewPedanticRegistry()
+
 	collectors := []prometheus.Collector{
 		InFlightProvisions,
 		ProvisioningTotal,
@@ -58,18 +41,39 @@ func TestMetricsRegistered(t *testing.T) {
 		MalformedMessagesTotal,
 	}
 
-	var allNames []string
 	for _, c := range collectors {
-		names := describeNames(c)
-		assert.NotEmpty(t, names, "collector should describe at least one metric")
-		for _, n := range names {
-			assert.True(t, strings.HasPrefix(n, "fred_"), "metric %q should start with fred_", n)
-		}
-		allNames = append(allNames, names...)
+		require.NoError(t, reg.Register(c))
 	}
 
-	// We expect at least 24 distinct metric names (one per collector).
-	assert.GreaterOrEqual(t, len(allNames), 24, "should have at least 24 metric names")
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	names := make(map[string]bool, len(families))
+	for _, f := range families {
+		names[f.GetName()] = true
+	}
+
+	// Every gathered metric name must start with "fred_".
+	for name := range names {
+		assert.True(t, strings.HasPrefix(name, "fred_"), "metric %q should start with fred_", name)
+	}
+
+	// Non-vec metrics (Gauge, Counter, Histogram) appear immediately in Gather;
+	// Vec metrics only appear after WithLabelValues, so we check those separately
+	// in TestCounterVecLabels. Here we verify the non-vec subset.
+	for _, expected := range []string{
+		"fred_provisioner_in_flight_provisions",
+		"fred_provisioner_callback_timeouts_total",
+		"fred_reconciler_duration_seconds",
+		"fred_reconciler_conflicts_total",
+		"fred_payload_stored_count",
+		"fred_payload_size_bytes",
+		"fred_payload_leases_awaiting_total",
+		"fred_api_duplicate_callbacks_total",
+		"fred_watermill_poisoned_messages_total",
+	} {
+		assert.True(t, names[expected], "metric %q should be gathered", expected)
+	}
 }
 
 func TestCounterVecLabels(t *testing.T) {
@@ -124,12 +128,10 @@ func TestCounterVecLabels(t *testing.T) {
 func TestOutcomeConstants(t *testing.T) {
 	outcomes := []string{OutcomeSuccess, OutcomePartial, OutcomeError, OutcomeFailed}
 
-	// All must be non-empty.
 	for _, o := range outcomes {
 		assert.NotEmpty(t, o)
 	}
 
-	// All must be distinct.
 	seen := make(map[string]bool)
 	for _, o := range outcomes {
 		assert.False(t, seen[o], "duplicate outcome constant: %s", o)
