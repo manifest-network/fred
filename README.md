@@ -1073,7 +1073,7 @@ internal/
 │   ├── inflight.go     # In-flight tracking implementation
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
-│   ├── payload.go      # Temporary payload storage (bbolt)
+│   ├── payload/        # Temporary payload storage (bbolt)
 │   ├── placement/      # Lease→backend placement store (bbolt)
 │   ├── bridge.go       # Chain events -> Watermill
 │   └── interfaces.go   # BackendRouter, LeaseRejecter, PlacementStore interfaces

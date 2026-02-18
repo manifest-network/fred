@@ -229,7 +229,7 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("placement store disabled (no placement_store_db_path configured)")
 	}
 
-	// Warn if multiple backends share the same SKU prefix without a placement store.
+	// Warn if multiple backends share the same SKU without a placement store.
 	// Round-robin will still distribute provisions, but read operations (connection,
 	// logs, provision diagnostics) may route to the wrong backend.
 	if placementStore == nil {

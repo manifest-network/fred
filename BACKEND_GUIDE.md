@@ -14,10 +14,10 @@ This guide explains how to implement a backend for Fred. A backend is an HTTP se
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │                      Router                              │   │
 │  │                                                         │   │
-│  │   "docker-nginx" starts with "docker-" ?                │   │
+│  │   SKU == "a1b2c3d4-...-1234567890ab" ?                   │   │
 │  │         YES → use Docker Backend                        │   │
 │  │                                                         │   │
-│  │   "gpu-a100" starts with "gpu-" ?                       │   │
+│  │   SKU == "c3d4e5f6-...-4567890123de" ?                  │   │
 │  │         YES → use GPU Backend                           │   │
 │  │                                                         │   │
 │  │   No match? → use Default Backend                       │   │

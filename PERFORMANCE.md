@@ -155,7 +155,7 @@ go test -bench=BenchmarkWatermill ./internal/provisioner/
 
 ```bash
 # Benchmark payload storage (bbolt)
-go test -bench=. ./internal/provisioner/ -run=^$ -bench=PayloadStore
+go test -bench=. ./internal/provisioner/payload/ -run=^$ -bench=PayloadStore
 ```
 
 ## Benchmark Files
@@ -164,7 +164,7 @@ go test -bench=. ./internal/provisioner/ -run=^$ -bench=PayloadStore
 |------|-------------|
 | `internal/provisioner/manager_bench_test.go` | Watermill and Manager benchmarks |
 | `internal/provisioner/manager_stress_test.go` | Stress tests (10K-1M events) |
-| `internal/provisioner/payload_bench_test.go` | PayloadStore benchmarks |
+| `internal/provisioner/payload/store_bench_test.go` | PayloadStore benchmarks |
 | `internal/api/token_tracker_bench_test.go` | Token tracker benchmarks |
 | `internal/backend/router_bench_test.go` | Backend router benchmarks |
 
