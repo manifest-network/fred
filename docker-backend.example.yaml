@@ -111,11 +111,11 @@ allowed_registries:
 
 # HMAC secret for signing callbacks to Fred (minimum 32 characters)
 # Generate with: openssl rand -hex 32
-callback_secret: "change-me-to-a-secure-32-char-secret!"
+# callback_secret: ""
 
 # Skip TLS certificate verification for callbacks (development only!)
 # WARNING: Never enable in production - vulnerable to MITM attacks
-callback_insecure_skip_verify: true
+# callback_insecure_skip_verify: false
 
 # Path to bbolt database for persisting pending callbacks.
 # Callbacks are stored before delivery to survive restarts.
@@ -164,7 +164,8 @@ releases_max_age: 2160h
 # External host address for port mappings.
 # This is the address tenants will use to connect to containers.
 # Must be a valid hostname or IP address (not a URL).
-host_address: "0.0.0.0"
+# IMPORTANT: Replace with your server's public IP or hostname.
+host_address: ""
 
 # IP address to bind container ports to. Use "127.0.0.1" to restrict
 # to localhost only. Default: "0.0.0.0" (all interfaces).

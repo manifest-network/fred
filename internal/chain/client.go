@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
@@ -83,7 +84,16 @@ type ClientConfig struct {
 
 // NewClient creates a new chain client connected to the given gRPC endpoint.
 func NewClient(cfg ClientConfig, signer *Signer) (*Client, error) {
-	var dialOpts []grpc.DialOption
+	dialOpts := []grpc.DialOption{
+		// Keepalive must respect the server's enforcement policy.
+		// Cosmos SDK / gRPC defaults: MinTime=5m, PermitWithoutStream=false.
+		// Pinging more aggressively triggers GOAWAY ENHANCE_YOUR_CALM.
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                5 * time.Minute,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	}
 
 	if cfg.TLSEnabled {
 		tlsConfig, err := buildTLSConfig(cfg.TLSCAFile, cfg.TLSSkipVerify)

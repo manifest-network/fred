@@ -44,6 +44,10 @@
 //	GET  /v1/leases/{uuid}/status         - Get provisioning status (authenticated)
 //	GET  /v1/leases/{uuid}/provision      - Get provision diagnostics (authenticated)
 //	GET  /v1/leases/{uuid}/logs           - Get container logs (authenticated)
+//	GET  /v1/leases/{uuid}/releases       - Get release history (authenticated)
+//	GET  /v1/leases/{uuid}/events         - Stream lease events via WebSocket (authenticated)
 //	POST /v1/leases/{uuid}/data           - Upload deployment payload (authenticated)
+//	POST /v1/leases/{uuid}/restart        - Restart a provisioned lease (authenticated)
+//	POST /v1/leases/{uuid}/update         - Update a provisioned lease (authenticated)
 //	POST /callbacks/provision             - Backend provisioning callback (HMAC auth)
 package api

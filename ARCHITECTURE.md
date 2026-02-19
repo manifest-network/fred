@@ -176,6 +176,7 @@ Key interfaces defined where they're consumed:
 | `PlacementStore` | `provisioner/interfaces.go` | Orchestrator, Reconciler |
 | `PlacementLookup` | `api/handlers.go` | API read handlers |
 | `LeaseRejecter` | `provisioner/interfaces.go` | TimeoutChecker |
+| `Acknowledger` | `provisioner/ack_batcher.go` | HandlerSet (lease acknowledgement) |
 | `CallbackPublisher` | `api/server.go` | API callback handler |
 | `StatusChecker` | `api/server.go` | API status handler |
 
@@ -338,10 +339,14 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
 - Network errors (connection refused, timeout)
 - HTTP 5xx errors (server errors)
 
-**What does NOT count as a failure:**
-- HTTP 404 from `GetInfo`, `GetProvision`, or `GetLogs` (`ErrNotProvisioned`) - this is a valid "lease not found" response
+**What does NOT count as a failure (exempted via `IsSuccessful`):**
+- `ErrNotProvisioned` (HTTP 404) — valid "lease not found" from read endpoints
+- `ErrValidation` (HTTP 400) — permanent client error, won't succeed on retry
+- `ErrAlreadyProvisioned` (HTTP 409 from Provision) — idempotent duplicate
+- `ErrInvalidState` (HTTP 409 from Restart/Update) — wrong lease state for operation
+- `ErrInsufficientResources` (HTTP 503 from Provision) — backend at capacity, not unhealthy
 
-This ensures that tenant requests for unprovisioned leases don't accidentally trip the circuit breaker and block backend operations.
+This ensures that expected business conditions don't trip the circuit breaker and block backend operations.
 
 ## Data Flow
 
