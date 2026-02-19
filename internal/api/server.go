@@ -206,22 +206,11 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTimeout(withAuthRL(handlers.UpdateLease)))
 	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTimeout(withAuthRL(handlers.GetLeaseReleases)))
 
-	// WebSocket token promoter: WebSocket clients cannot set custom headers, so
-	// the auth token is passed as a query parameter. This middleware promotes it
-	// to the Authorization header BEFORE AuthMiddleware runs.
-	wsTokenPromoter := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Authorization") == "" {
-				if token := r.URL.Query().Get("token"); token != "" {
-					r.Header.Set("Authorization", "Bearer "+token)
-				}
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
 	// WebSocket endpoint: no request timeout. The WebSocket handler manages its own
 	// lifecycle with ping/pong frames and per-write deadlines.
-	mux.Handle("GET /v1/leases/{lease_uuid}/events", wsTokenPromoter(withAuthRL(handlers.StreamLeaseEvents)))
+	// WSTokenPromoter promotes the "token" query param to the Authorization header
+	// and strips it from the URL (WebSocket clients cannot set custom headers).
+	mux.Handle("GET /v1/leases/{lease_uuid}/events", WSTokenPromoter(withAuthRL(handlers.StreamLeaseEvents)))
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:
@@ -512,6 +501,23 @@ func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Han
 			th.ServeHTTP(w, r)
 		})
 	}
+}
+
+// WSTokenPromoter is middleware that promotes a WebSocket "token" query
+// parameter to the Authorization header and strips it from the URL so it
+// does not leak into proxy access logs.
+func WSTokenPromoter(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			if token := r.URL.Query().Get("token"); token != "" {
+				r.Header.Set("Authorization", "Bearer "+token)
+				q := r.URL.Query()
+				q.Del("token")
+				r.URL.RawQuery = q.Encode()
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // securityHeadersMiddleware adds security headers to all responses.

@@ -239,7 +239,7 @@ func TestStreamLeaseEvents_QueryParamAuth(t *testing.T) {
 	h := newTestHandlers(broker, chainClient, providerUUID)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/leases/{lease_uuid}/events", h.StreamLeaseEvents)
+	mux.Handle("GET /v1/leases/{lease_uuid}/events", WSTokenPromoter(http.HandlerFunc(h.StreamLeaseEvents)))
 	server := httptest.NewServer(mux)
 	defer server.Close()
 

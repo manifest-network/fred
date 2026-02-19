@@ -638,9 +638,15 @@ func readFileFromContainer(ctx context.Context, cli *client.Client, containerID,
 			return nil, fmt.Errorf("reading tar: %w", err)
 		}
 		if hdr.Typeflag == tar.TypeReg {
-			data, err := io.ReadAll(tr)
+			// Limit reads to 1 MiB to prevent a malicious image from
+			// causing OOM via an oversized /etc/passwd or /etc/group.
+			const maxFileSize = 1 << 20
+			data, err := io.ReadAll(io.LimitReader(tr, maxFileSize+1))
 			if err != nil {
 				return nil, fmt.Errorf("reading %s: %w", path, err)
+			}
+			if len(data) > maxFileSize {
+				return nil, fmt.Errorf("file %s exceeds %d byte limit", path, maxFileSize)
 			}
 			return data, nil
 		}

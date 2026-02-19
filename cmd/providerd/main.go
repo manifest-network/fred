@@ -365,7 +365,10 @@ func run(cmd *cobra.Command, args []string) error {
 	// Perform startup operations sequentially to avoid same-block transaction conflicts
 	// WithdrawOnce waits for block inclusion before returning, ensuring the next tx is in a different block
 	slog.Info("performing initial withdrawal")
-	withdrawScheduler.WithdrawOnce(ctx)
+	if err := withdrawScheduler.WithdrawOnce(ctx); err != nil {
+		slog.Error("initial withdrawal failed", "error", err)
+		// Continue — periodic scheduler will retry
+	}
 
 	// Run startup reconciliation to recover from any crash
 	// This compares chain state vs backend state and fixes inconsistencies

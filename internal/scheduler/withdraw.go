@@ -3,6 +3,7 @@ package scheduler
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -109,9 +110,12 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 // WithdrawOnce performs a single withdrawal and credit check cycle.
 // This should be called at startup before Start() to ensure the transaction
 // completes before other startup transactions (like lease acknowledgment).
-func (s *WithdrawScheduler) WithdrawOnce(ctx context.Context) {
-	s.withdraw(ctx)
+func (s *WithdrawScheduler) WithdrawOnce(ctx context.Context) error {
+	if err := s.withdraw(ctx); err != nil {
+		return err
+	}
 	s.checkCreditsAndClose(ctx)
+	return nil
 }
 
 // TriggerWithdraw triggers an immediate withdrawal cycle.
@@ -258,7 +262,9 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 // and schedules the next check based on estimated depletion times.
 func (s *WithdrawScheduler) withdrawAndCheckCredits(ctx context.Context) {
 	// First, perform the withdrawal
-	s.withdraw(ctx)
+	if err := s.withdraw(ctx); err != nil {
+		slog.Error("withdrawal failed", "error", err)
+	}
 
 	// Then check credits and auto-close depleted leases
 	nextCheck := s.checkCreditsAndClose(ctx)
@@ -272,7 +278,7 @@ func (s *WithdrawScheduler) withdrawAndCheckCredits(ctx context.Context) {
 }
 
 // withdraw performs a withdrawal, handling pagination if there are more leases.
-func (s *WithdrawScheduler) withdraw(ctx context.Context) {
+func (s *WithdrawScheduler) withdraw(ctx context.Context) error {
 	slog.Info("checking withdrawable amounts", "provider_uuid", s.providerUUID)
 
 	// Check if there's anything to withdraw before executing transaction (with retry)
@@ -287,11 +293,7 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) {
 		}
 
 		if attempt == maxRetries {
-			slog.Error("failed to check withdrawable amounts after retries",
-				"error", err,
-				"attempts", attempt,
-			)
-			return
+			return fmt.Errorf("check withdrawable amounts after %d retries: %w", attempt, err)
 		}
 
 		slog.Warn("transient error checking withdrawable amounts, retrying",
@@ -302,7 +304,7 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-time.After(backoff):
 		}
 
@@ -315,21 +317,21 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) {
 
 	if withdrawable.IsZero() {
 		slog.Info("no funds to withdraw, skipping transaction", "provider_uuid", s.providerUUID)
-		return
+		return nil
 	}
 
 	slog.Info("withdrawable amounts available", "amounts", withdrawable)
 
 	txHash, err := s.client.WithdrawByProvider(ctx, s.providerUUID)
 	if err != nil {
-		slog.Error("withdrawal failed", "error", err)
-		return
+		return fmt.Errorf("withdrawal failed: %w", err)
 	}
 
 	slog.Info("withdrawal complete",
 		"provider_uuid", s.providerUUID,
 		"tx_hash", txHash,
 	)
+	return nil
 }
 
 // checkCreditsAndClose checks tenant credit balances and closes leases for
@@ -360,21 +362,33 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 		tenantLeases[lease.Tenant] = append(tenantLeases[lease.Tenant], lease.Uuid)
 	}
 
-	// Process tenants under lock, collect results
+	// Fetch credit balances WITHOUT holding the lock (network I/O)
+	type creditResult struct {
+		balances sdktypes.Coins
+		err      error
+	}
+	results := make(map[string]creditResult, len(tenantLeases))
+	for tenant := range tenantLeases {
+		if ctx.Err() != nil {
+			break
+		}
+		_, balances, err := s.client.GetCreditAccount(ctx, tenant)
+		results[tenant] = creditResult{balances, err}
+	}
+
+	// Apply results under lock
 	var earliestDepletion time.Time
 	var leasesToClose []string
 
 	s.mu.Lock()
 
-	// Check each tenant's credit balance
 	for tenant, leaseUUIDs := range tenantLeases {
-		// Check for context cancellation between iterations
-		if ctx.Err() != nil {
-			break
+		result, checked := results[tenant]
+		if !checked {
+			continue // skipped due to context cancellation
 		}
 
-		_, balances, err := s.client.GetCreditAccount(ctx, tenant)
-		if err != nil {
+		if result.err != nil {
 			// Track consecutive errors - if we consistently can't check, schedule earlier retry
 			state, exists := s.tenants[tenant]
 			if !exists {
@@ -385,7 +399,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 
 			slog.Warn("failed to get credit account",
 				"tenant", tenant,
-				"error", err,
+				"error", result.err,
 				"consecutive_errors", state.consecutiveErrs,
 				"lease_count", len(leaseUUIDs),
 			)
@@ -407,7 +421,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 		}
 
 		// Check if balance is zero (depleted)
-		if balances.IsZero() {
+		if result.balances.IsZero() {
 			slog.Warn("credit exhausted, closing leases",
 				"tenant", tenant,
 				"lease_count", len(leaseUUIDs),
@@ -422,7 +436,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 		if !exists {
 			// First time seeing this tenant, just record state
 			s.tenants[tenant] = &tenantState{
-				lastBalance:   balances,
+				lastBalance:   result.balances,
 				lastCheckTime: now,
 			}
 			continue
@@ -431,7 +445,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 		// Calculate burn rate from balance change
 		elapsed := now.Sub(state.lastCheckTime)
 		if elapsed > 0 {
-			depletionTime := s.estimateDepletionTime(state.lastBalance, balances, elapsed, now)
+			depletionTime := s.estimateDepletionTime(state.lastBalance, result.balances, elapsed, now)
 
 			if !depletionTime.IsZero() && (earliestDepletion.IsZero() || depletionTime.Before(earliestDepletion)) {
 				earliestDepletion = depletionTime
@@ -439,7 +453,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 		}
 
 		// Update tenant state
-		state.lastBalance = balances
+		state.lastBalance = result.balances
 		state.lastCheckTime = now
 	}
 

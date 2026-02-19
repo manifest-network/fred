@@ -1079,15 +1079,7 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 
 	leaseUUID := r.PathValue("lease_uuid")
 
-	// WebSocket API cannot set custom headers, so the client passes the auth
-	// token as a query parameter. Promote it to the Authorization header so the
-	// standard auth pipeline can handle it. This fallback is intentionally
-	// scoped to this handler only.
-	if r.Header.Get("Authorization") == "" {
-		if token := r.URL.Query().Get("token"); token != "" {
-			r.Header.Set("Authorization", "Bearer "+token)
-		}
-	}
+	// Token promotion and stripping is handled by wsTokenPromoter middleware.
 
 	// Authenticate BEFORE upgrading so auth failures return normal HTTP errors.
 	_, statusCode, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
