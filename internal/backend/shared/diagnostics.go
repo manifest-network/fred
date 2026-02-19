@@ -1,17 +1,11 @@
 package shared
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"log/slog"
-	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
-
-	"github.com/manifest-network/fred/internal/util"
 )
 
 var diagnosticsBucketName = []byte("failure_diagnostics")
@@ -30,13 +24,7 @@ type DiagnosticEntry struct {
 // DiagnosticsStore persists failure diagnostics in bbolt so they survive
 // container removal and backend restarts.
 type DiagnosticsStore struct {
-	db     *bolt.DB
-	maxAge time.Duration
-
-	cancel    context.CancelFunc
-	wg        *sync.WaitGroup
-	closeOnce *sync.Once
-	closeErr  error // captured by first Close() call
+	*boltStore
 }
 
 // DiagnosticsStoreConfig configures the diagnostics store.
@@ -50,77 +38,23 @@ type DiagnosticsStoreConfig struct {
 // If MaxAge > 0, a background cleanup loop removes expired entries periodically
 // and an initial cleanup runs immediately to clear stale entries from previous runs.
 func NewDiagnosticsStore(cfg DiagnosticsStoreConfig) (*DiagnosticsStore, error) {
-	if cfg.DBPath == "" {
-		return nil, fmt.Errorf("diagnostics db path is required")
-	}
-
-	db, err := bolt.Open(cfg.DBPath, 0600, &bolt.Options{
-		Timeout: 5 * time.Second,
+	base, err := openBoltStore(boltStoreConfig{
+		DBPath:     cfg.DBPath,
+		BucketName: diagnosticsBucketName,
+		MaxAge:     cfg.MaxAge,
+		Label:      "diagnostics",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to open diagnostics db: %w", err)
+		return nil, err
 	}
 
-	// Create bucket if it doesn't exist
-	err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(diagnosticsBucketName)
-		return err
-	})
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to create diagnostics bucket: %w", err)
-	}
+	s := &DiagnosticsStore{boltStore: base}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &DiagnosticsStore{
-		db:        db,
-		maxAge:    cfg.MaxAge,
-		cancel:    cancel,
-		wg:        &sync.WaitGroup{},
-		closeOnce: &sync.Once{},
-	}
-
-	// Start background cleanup if expiry is enabled
 	if cfg.MaxAge > 0 {
-		// Run initial cleanup to remove stale entries from previous run
-		if removed, cleanupErr := s.RemoveOlderThan(cfg.MaxAge); cleanupErr != nil {
-			slog.Warn("initial diagnostics cleanup failed", "error", cleanupErr)
-		} else if removed > 0 {
-			slog.Info("removed expired diagnostics on startup", "count", removed, "max_age", cfg.MaxAge)
-		}
-
-		interval := cfg.CleanupInterval
-		if interval <= 0 {
-			interval = cfg.MaxAge
-		}
-		s.wg.Go(func() {
-			util.StartCleanupLoop(ctx, interval, s.cleanup, "diagnostics")
-		})
+		base.startCleanup("diagnostics", cfg.CleanupInterval, s.RemoveOlderThan)
 	}
 
 	return s, nil
-}
-
-// cleanup removes expired diagnostic entries. Used by the background cleanup loop.
-func (s *DiagnosticsStore) cleanup() error {
-	removed, err := s.RemoveOlderThan(s.maxAge)
-	if err != nil {
-		return err
-	}
-	if removed > 0 {
-		slog.Debug("cleaned up expired diagnostics", "count", removed)
-	}
-	return nil
-}
-
-// Healthy checks if the bbolt database is accessible and the diagnostics bucket exists.
-func (s *DiagnosticsStore) Healthy() error {
-	return s.db.View(func(tx *bolt.Tx) error {
-		if tx.Bucket(diagnosticsBucketName) == nil {
-			return errors.New("diagnostics bucket missing")
-		}
-		return nil
-	})
 }
 
 // Store persists a diagnostic entry, upserting by LeaseUUID.
@@ -197,16 +131,4 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	})
 
 	return removed, err
-}
-
-// Close shuts down the diagnostics store gracefully.
-// Close is idempotent: the first call closes the database and captures
-// any error; subsequent calls return the same error.
-func (s *DiagnosticsStore) Close() error {
-	s.closeOnce.Do(func() {
-		s.cancel()
-		s.wg.Wait()
-		s.closeErr = s.db.Close()
-	})
-	return s.closeErr
 }
