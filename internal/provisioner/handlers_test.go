@@ -329,6 +329,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
+	rejected := false
 	mockChain := &chain.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
@@ -338,6 +339,12 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 				MetaHash: []byte{0x01, 0x02, 0x03},
 				Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
 			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			rejected = true
+			assert.Equal(t, []string{"lease-1"}, leaseUUIDs)
+			assert.Equal(t, "payload corrupted", reason)
+			return 1, []string{"tx-rej"}, nil
 		},
 	}
 
@@ -367,12 +374,13 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	})
 
 	err = manager.handlePayloadReceived(msg)
-	assert.Error(t, err, "handlePayloadReceived() should return error for hash mismatch")
+	assert.NoError(t, err, "should return nil after rejecting the lease")
+	assert.True(t, rejected, "lease should be rejected on-chain")
 
-	// Payload should be deleted on hash mismatch
+	// Payload should be deleted after successful rejection
 	hasP2, errP2 := payloadStore.Has("lease-1")
 	require.NoError(t, errP2)
-	assert.False(t, hasP2, "payload should be deleted on hash mismatch")
+	assert.False(t, hasP2, "payload should be deleted after rejection")
 
 	// Lease should not be in-flight
 	assert.False(t, manager.IsInFlight("lease-1"), "lease should not be in-flight after hash mismatch")

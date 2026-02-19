@@ -24,10 +24,11 @@ func truncateRejectReason(reason string) string {
 // These hardcoded strings prevent dynamic data (SKU names, image registries,
 // file paths, JSON bodies) from leaking on-chain.
 const (
-	rejectReasonInvalidSKU      = "invalid SKU"
-	rejectReasonInvalidManifest = "invalid manifest"
-	rejectReasonImageNotAllowed = "image not allowed"
-	rejectReasonValidationError = "validation error"
+	rejectReasonInvalidSKU       = "invalid SKU"
+	rejectReasonInvalidManifest  = "invalid manifest"
+	rejectReasonImageNotAllowed  = "image not allowed"
+	rejectReasonValidationError  = "validation error"
+	rejectReasonPayloadCorrupted = "payload corrupted"
 )
 
 // validationErrorToRejectReason maps a validation error to a hardcoded

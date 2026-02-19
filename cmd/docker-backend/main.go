@@ -86,20 +86,23 @@ func main() {
 	}
 
 	// Start HTTP server
+	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("starting HTTP server", "addr", cfg.ListenAddr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("HTTP server error", "error", err)
-			os.Exit(1)
+			serverErr <- err
 		}
 	}()
 
-	// Wait for shutdown signal
+	// Wait for shutdown signal or server error
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-
-	logger.Info("shutting down...")
+	select {
+	case <-sigCh:
+		logger.Info("shutting down...")
+	case err := <-serverErr:
+		logger.Error("HTTP server error, shutting down", "error", err)
+	}
 
 	// Graceful shutdown
 	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)

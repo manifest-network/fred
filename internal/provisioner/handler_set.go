@@ -439,12 +439,24 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		// Re-verify payload hash before provisioning to catch any corruption.
 		// The payload was validated on upload, but disk corruption could occur.
 		if err := payload.VerifyHashHex(payloadData, event.MetaHashHex); err != nil {
-			h.deps.PayloadStore.Delete(event.LeaseUUID)
-			slog.Error("payload hash mismatch - possible corruption",
+			slog.Error("payload hash mismatch - possible corruption, rejecting lease",
 				"lease_uuid", event.LeaseUUID,
 				"error", err,
 			)
-			return err
+			// Reject the lease on-chain: the payload is irrecoverably corrupted
+			// and cannot be provisioned. If rejection fails, we return the error
+			// so Watermill retries — the payload is still in the store, so the
+			// hash mismatch will fire again and re-attempt rejection.
+			_, _, rejectErr := h.deps.ChainClient.RejectLeases(
+				msg.Context(), []string{event.LeaseUUID}, rejectReasonPayloadCorrupted,
+			)
+			if rejectErr != nil {
+				return fmt.Errorf("failed to reject lease %s after payload corruption: %w",
+					event.LeaseUUID, rejectErr)
+			}
+			h.deps.PayloadStore.Delete(event.LeaseUUID)
+			h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusFailed, rejectReasonPayloadCorrupted)
+			return nil
 		}
 	}
 

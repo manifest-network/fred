@@ -155,6 +155,7 @@ func main() {
 	}
 
 	// Start server
+	serverErr := make(chan error, 1)
 	go func() {
 		slog.Info("starting mock backend server",
 			"addr", addr,
@@ -162,17 +163,19 @@ func main() {
 			"delay", delay,
 		)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server error", "error", err)
-			os.Exit(1)
+			serverErr <- err
 		}
 	}()
 
-	// Wait for shutdown signal
+	// Wait for shutdown signal or server error
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	slog.Info("shutting down...")
+	select {
+	case <-sigChan:
+		slog.Info("shutting down...")
+	case err := <-serverErr:
+		slog.Error("server error, shutting down", "error", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

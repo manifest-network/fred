@@ -882,6 +882,7 @@ func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
 }
 
 func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
+	rejected := false
 	mockChain := &chain.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
@@ -891,6 +892,12 @@ func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 				MetaHash: []byte{0x01},
 				Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			rejected = true
+			assert.Equal(t, []string{"lease-1"}, leaseUUIDs)
+			assert.Equal(t, "payload corrupted", reason)
+			return 1, []string{"tx-rej"}, nil
 		},
 	}
 
@@ -910,10 +917,11 @@ func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 	})
 
 	err = hs.HandlePayloadReceived(msg)
-	assert.Error(t, err, "should return error for hash mismatch")
+	assert.NoError(t, err, "should return nil after rejecting the lease")
+	assert.True(t, rejected, "lease should be rejected on-chain")
 	hasPayloadHash, errHash := ps.Has("lease-1")
 	require.NoError(t, errHash)
-	assert.False(t, hasPayloadHash, "payload should be deleted on hash mismatch")
+	assert.False(t, hasPayloadHash, "payload should be deleted after successful rejection")
 }
 
 func TestHandlerSet_HandlePayloadReceived_ValidationError_PublishesFailedEvent(t *testing.T) {

@@ -380,10 +380,20 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			return counts.ConsecutiveFailures >= cbFailureThresh
 		},
 		IsSuccessful: func(err error) bool {
-			// ErrNotProvisioned (404 from GetInfo) is a valid response, not a backend failure.
-			// ErrValidation (400 from Provision) is a permanent client error, not transient.
-			// Neither should count toward the circuit breaker failure threshold.
-			return err == nil || errors.Is(err, ErrNotProvisioned) || errors.Is(err, ErrValidation)
+			// These errors represent client-side or capacity conditions, not backend
+			// health failures. They should NOT count toward the circuit breaker
+			// failure threshold:
+			//   - ErrNotProvisioned: 404 from GetInfo/GetProvision/GetLogs (valid "not found")
+			//   - ErrValidation: 400 from Provision/Update (permanent client error)
+			//   - ErrInsufficientResources: 503 from Provision (backend at capacity, not unhealthy)
+			//   - ErrAlreadyProvisioned: 409 from Provision (idempotent duplicate)
+			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
+			return err == nil ||
+				errors.Is(err, ErrNotProvisioned) ||
+				errors.Is(err, ErrValidation) ||
+				errors.Is(err, ErrInsufficientResources) ||
+				errors.Is(err, ErrAlreadyProvisioned) ||
+				errors.Is(err, ErrInvalidState)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -525,12 +535,21 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusAccepted {
-			// 400 Bad Request indicates a validation error that won't succeed on retry.
-			// Parse the structured response to recover sub-category sentinels.
-			if resp.StatusCode == http.StatusBadRequest {
+			// Map well-known status codes to sentinel errors so the circuit
+			// breaker and callers can distinguish them from backend failures.
+			switch resp.StatusCode {
+			case http.StatusBadRequest:
+				// 400: validation error — permanent, won't succeed on retry.
 				return nil, parseValidationError(readErrorBodyBytes(resp))
+			case http.StatusConflict:
+				// 409: lease already provisioned — idempotent duplicate.
+				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
+			case http.StatusServiceUnavailable:
+				// 503: backend at capacity — not a health failure.
+				return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
+			default:
+				return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 			}
-			return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
 		return nil, nil
