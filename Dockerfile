@@ -13,8 +13,8 @@ ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/providerd ./cmd/providerd \
  && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/docker-backend ./cmd/docker-backend
 
-# Pre-create /data owned by nonroot (65534) for the docker-backend stage.
-RUN mkdir -p /out/data && chown 65534:65534 /out/data
+# Pre-create /data owned by nonroot (65532) for the docker-backend stage.
+RUN mkdir -p /out/data && chown 65532:65532 /out/data
 
 # ---- providerd runtime ----
 # Config must be mounted at runtime:
@@ -41,7 +41,7 @@ COPY --from=builder /out/docker-backend /docker-backend
 
 # /data holds persistent state (callbacks.db, diagnostics.db, releases.db).
 # Declare as a volume so data survives container restarts.
-COPY --from=builder --chown=65534:65534 /out/data /data
+COPY --from=builder --chown=65532:65532 /out/data /data
 WORKDIR /data
 VOLUME /data
 USER nonroot:nonroot
