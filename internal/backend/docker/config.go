@@ -11,6 +11,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/config"
 )
 
 // Type aliases for readability within the docker package.
@@ -53,7 +54,7 @@ type Config struct {
 	AllowedRegistries []string `yaml:"allowed_registries"`
 
 	// CallbackSecret is the HMAC secret for signing callbacks.
-	CallbackSecret string `yaml:"callback_secret"`
+	CallbackSecret config.Secret `yaml:"callback_secret"`
 
 	// HostAddress is the external address for port mappings.
 	HostAddress string `yaml:"host_address"`

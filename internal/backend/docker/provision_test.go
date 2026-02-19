@@ -74,7 +74,7 @@ func rebuildCallbackSender(b *Backend) {
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:      b.callbackStore,
 		HTTPClient: b.httpClient,
-		Secret:     b.cfg.CallbackSecret,
+		Secret:     string(b.cfg.CallbackSecret),
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
 		Backoff:    &zeroBackoff,
@@ -1669,7 +1669,7 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:      b.callbackStore,
 		HTTPClient: b.httpClient,
-		Secret:     b.cfg.CallbackSecret,
+		Secret:     string(b.cfg.CallbackSecret),
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
 		Backoff:    &longBackoff,
