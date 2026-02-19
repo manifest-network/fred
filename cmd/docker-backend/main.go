@@ -40,6 +40,7 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
+	logger.Info("starting docker-backend", "version", version)
 
 	// Load configuration
 	cfg, err := loadConfig(*configPath)
