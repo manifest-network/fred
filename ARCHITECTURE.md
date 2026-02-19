@@ -200,9 +200,10 @@ Key interfaces defined where they're consumed:
    b. Parse and validate callback payload
    c. Publish to Watermill topic (events.backend.callback)
 8. handleBackendCallback (Watermill handler):
-   a. If success: acknowledge lease on chain
-   b. If failed: reject lease on chain
-   c. Remove from in-flight tracking after chain ack succeeds
+   a. Peek in-flight tracker for lease (non-destructive)
+   b. If success: acknowledge lease on chain via AckBatcher
+   c. If failed + PENDING: reject lease on chain, then untrack
+   d. If failed + ACTIVE: untrack and defer to reconciler (retry/reject by FailCount)
 ```
 
 ### Lease Creation (With Payload)

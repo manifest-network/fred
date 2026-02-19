@@ -7,7 +7,7 @@
 //
 // # Backend Interface
 //
-// Any backend must implement the Backend interface, which defines eight operations:
+// Any backend must implement the Backend interface, which defines twelve operations:
 //
 //   - Provision: Start async provisioning, backend calls callback URL when done
 //   - GetInfo: Retrieve connection details for a provisioned resource
@@ -15,6 +15,10 @@
 //   - GetLogs: Retrieve container logs for a provision
 //   - Deprovision: Clean up resources (must be idempotent)
 //   - ListProvisions: Return all provisioned resources (for reconciliation)
+//   - RefreshState: Synchronize in-memory state with actual resources
+//   - Restart: Restart containers without changing the manifest
+//   - Update: Deploy a new manifest, replacing containers
+//   - GetReleases: Return the release (deployment) history for a lease
 //   - Health: Report whether the backend can accept requests
 //   - Name: Return the backend's configured name
 //
