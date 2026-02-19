@@ -31,4 +31,4 @@ mock-backend
 docker-backend
 providerd
 scripts/
-REVIEW*.md
+*.md
