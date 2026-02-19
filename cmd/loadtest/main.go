@@ -85,6 +85,12 @@ func main() {
 		}
 	}
 
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		slog.Error("failed to generate key pair", "error", err)
+		os.Exit(1)
+	}
+
 	lt := &LoadTester{
 		target:       *target,
 		duration:     *duration,
@@ -92,6 +98,8 @@ func main() {
 		payloadSize:  *payloadSize,
 		rampUp:       *rampUp,
 		callbackAuth: callbackAuth,
+		pub:          pub,
+		priv:         priv,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -131,6 +139,11 @@ type LoadTester struct {
 	rampUp       time.Duration
 	callbackAuth *api.CallbackAuthenticator
 	client       *http.Client
+
+	// Pre-generated key pair reused across all requests to avoid the cost
+	// of ed25519.GenerateKey on every iteration.
+	pub  ed25519.PublicKey
+	priv ed25519.PrivateKey
 }
 
 // Results holds load test results.
@@ -283,7 +296,7 @@ func (lt *LoadTester) RunPayloadTest() *Results {
 				case <-ctx.Done():
 					return
 				default:
-					lt.doPayloadRequest(results)
+					lt.doPayloadRequest(ctx, results)
 				}
 			}
 		}(i)
@@ -294,7 +307,7 @@ func (lt *LoadTester) RunPayloadTest() *Results {
 	return results
 }
 
-func (lt *LoadTester) doPayloadRequest(results *Results) {
+func (lt *LoadTester) doPayloadRequest(ctx context.Context, results *Results) {
 	// Generate test data
 	leaseUUID := uuid.New().String()
 	payload := make([]byte, lt.payloadSize)
@@ -306,7 +319,7 @@ func (lt *LoadTester) doPayloadRequest(results *Results) {
 	token := lt.generateAuthToken(leaseUUID, hashStr)
 
 	url := fmt.Sprintf("%s/v1/leases/%s/data", lt.target, leaseUUID)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		results.Record(0, 0, err, 0, 0)
 		return
@@ -357,7 +370,7 @@ func (lt *LoadTester) RunConnectionTest() *Results {
 				case <-ctx.Done():
 					return
 				default:
-					lt.doConnectionRequest(results)
+					lt.doConnectionRequest(ctx, results)
 				}
 			}
 		}(i)
@@ -368,12 +381,12 @@ func (lt *LoadTester) RunConnectionTest() *Results {
 	return results
 }
 
-func (lt *LoadTester) doConnectionRequest(results *Results) {
+func (lt *LoadTester) doConnectionRequest(ctx context.Context, results *Results) {
 	leaseUUID := uuid.New().String()
 	token := lt.generateAuthToken(leaseUUID, "")
 
 	url := fmt.Sprintf("%s/v1/leases/%s/connection", lt.target, leaseUUID)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		results.Record(0, 0, err, 0, 0)
 		return
@@ -423,7 +436,7 @@ func (lt *LoadTester) RunCallbackTest() *Results {
 				case <-ctx.Done():
 					return
 				default:
-					lt.doCallbackRequest(results)
+					lt.doCallbackRequest(ctx, results)
 				}
 			}
 		}(i)
@@ -434,7 +447,7 @@ func (lt *LoadTester) RunCallbackTest() *Results {
 	return results
 }
 
-func (lt *LoadTester) doCallbackRequest(results *Results) {
+func (lt *LoadTester) doCallbackRequest(ctx context.Context, results *Results) {
 	leaseUUID := uuid.New().String()
 
 	// Create callback payload
@@ -454,7 +467,7 @@ func (lt *LoadTester) doCallbackRequest(results *Results) {
 	signature := lt.signCallback(body)
 
 	url := fmt.Sprintf("%s/callbacks/provision", lt.target)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		results.Record(0, 0, err, 0, 0)
 		return
@@ -509,14 +522,14 @@ func (lt *LoadTester) RunMixedTest() *Results {
 					op := opCounter.Add(1)
 					switch op % 10 {
 					case 0, 1, 2, 3: // 40% payload uploads
-						lt.doPayloadRequest(results)
+						lt.doPayloadRequest(ctx, results)
 					case 4, 5, 6, 7, 8: // 50% connection checks
-						lt.doConnectionRequest(results)
+						lt.doConnectionRequest(ctx, results)
 					case 9: // 10% callbacks (if secret provided)
 						if lt.callbackAuth != nil {
-							lt.doCallbackRequest(results)
+							lt.doCallbackRequest(ctx, results)
 						} else {
-							lt.doConnectionRequest(results)
+							lt.doConnectionRequest(ctx, results)
 						}
 					}
 				}
@@ -529,27 +542,22 @@ func (lt *LoadTester) RunMixedTest() *Results {
 	return results
 }
 
-// generateAuthToken creates a test auth token.
-// Note: This generates tokens that fred will reject (invalid signature).
-// For realistic testing, you need to use real keys and proper ADR-036 signing.
+// generateAuthToken creates a test auth token using the pre-generated key pair.
+// Note: These tokens will be rejected by fred (invalid on-chain identity).
+// For realistic testing, you need real keys and proper ADR-036 signing.
 func (lt *LoadTester) generateAuthToken(leaseUUID, metaHash string) string {
-	// Generate a random key pair for testing
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-
-	// Create token payload
 	timestamp := time.Now().Unix()
 	tenant := "manifest1loadtest" + leaseUUID[:8]
 
-	// Create signed message (ADR-036 format)
 	msg := fmt.Sprintf("manifest lease data %s %s %d", leaseUUID, metaHash, timestamp)
-	signature := ed25519.Sign(priv, []byte(msg))
+	signature := ed25519.Sign(lt.priv, []byte(msg))
 
 	token := map[string]interface{}{
 		"tenant":     tenant,
 		"lease_uuid": leaseUUID,
 		"meta_hash":  metaHash,
 		"timestamp":  timestamp,
-		"pub_key":    base64.StdEncoding.EncodeToString(pub),
+		"pub_key":    base64.StdEncoding.EncodeToString(lt.pub),
 		"signature":  base64.StdEncoding.EncodeToString(signature),
 	}
 

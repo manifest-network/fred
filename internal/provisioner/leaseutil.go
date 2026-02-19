@@ -2,22 +2,30 @@ package provisioner
 
 import (
 	"errors"
+	"unicode/utf8"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-// maxRejectReasonLen is the maximum length for on-chain lease rejection reasons.
-// The billing module enforces a 256-character limit.
+// maxRejectReasonLen is the maximum byte length for on-chain lease rejection
+// reasons. The billing module enforces len(reason) <= 256 in ValidateBasic.
 const maxRejectReasonLen = 256
 
-// truncateRejectReason truncates a rejection reason to fit the on-chain limit.
+// truncateRejectReason truncates a rejection reason to fit the on-chain byte
+// limit while avoiding splitting multi-byte UTF-8 runes.
 func truncateRejectReason(reason string) string {
-	if len(reason) > maxRejectReasonLen {
-		return reason[:maxRejectReasonLen-3] + "..."
+	if len(reason) <= maxRejectReasonLen {
+		return reason
 	}
-	return reason
+	// Leave room for the "..." suffix.
+	limit := maxRejectReasonLen - 3
+	// Back up to a rune boundary so we don't split a multi-byte sequence.
+	for limit > 0 && !utf8.RuneStart(reason[limit]) {
+		limit--
+	}
+	return reason[:limit] + "..."
 }
 
 // Deterministic rejection reasons for on-chain lease rejection.

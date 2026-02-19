@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
@@ -999,16 +1000,22 @@ func TestTruncateRejectReason(t *testing.T) {
 	}{
 		{"short string unchanged", "short error", "short error"},
 		{"empty string unchanged", "", ""},
-		{"exactly 256 chars unchanged", strings.Repeat("a", 256), strings.Repeat("a", 256)},
-		{"257 chars truncated", strings.Repeat("a", 257), strings.Repeat("a", 253) + "..."},
-		{"500 chars truncated", strings.Repeat("b", 500), strings.Repeat("b", 253) + "..."},
+		{"exactly 256 bytes unchanged", strings.Repeat("a", 256), strings.Repeat("a", 256)},
+		{"257 bytes truncated", strings.Repeat("a", 257), strings.Repeat("a", 253) + "..."},
+		{"500 bytes truncated", strings.Repeat("b", 500), strings.Repeat("b", 253) + "..."},
+		// "é" is 2 bytes (0xC3 0xA9). 128 runes = 256 bytes fits exactly.
+		{"multibyte exactly at limit", strings.Repeat("\u00e9", 128), strings.Repeat("\u00e9", 128)},
+		// 129 "é" = 258 bytes > 256. Truncated: must back up to rune boundary.
+		// 253 bytes / 2 = 126 full runes (252 bytes) + "..." (3 bytes) = 255 bytes.
+		{"multibyte over limit", strings.Repeat("\u00e9", 129), strings.Repeat("\u00e9", 126) + "..."},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := truncateRejectReason(tt.input)
 			assert.Equal(t, tt.expect, result)
-			assert.LessOrEqual(t, len(result), maxRejectReasonLen)
+			assert.LessOrEqual(t, len(result), maxRejectReasonLen, "must fit on-chain byte limit")
+			assert.True(t, utf8.ValidString(result), "result should be valid UTF-8")
 		})
 	}
 }

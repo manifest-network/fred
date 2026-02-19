@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -35,12 +37,11 @@ func main() {
 	configPath := flag.String("config", "docker-backend.yaml", "Path to configuration file")
 	flag.Parse()
 
-	// Setup logger
+	// Bootstrap logger for startup messages (before config is loaded).
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
-	logger.Info("starting docker-backend", "version", version)
 
 	// Load configuration
 	cfg, err := loadConfig(*configPath)
@@ -51,6 +52,18 @@ func main() {
 
 	// Apply environment variable overrides
 	applyEnvOverrides(&cfg)
+
+	// Re-configure logger with the configured log level.
+	logLevel, err := config.ParseLogLevel(cmp.Or(cfg.LogLevel, "info"))
+	if err != nil {
+		logger.Error("invalid log_level in config", "error", err)
+		os.Exit(1)
+	}
+	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
+	slog.SetDefault(logger)
+	logger.Info("starting docker-backend", "version", version, "log_level", cfg.LogLevel)
 
 	// Log SKU mappings for visibility
 	for uuid, profile := range cfg.SKUMapping {
@@ -578,13 +591,10 @@ func validateCallbackURL(rawURL string) error {
 	// Check if hostname is an IP address
 	ip := net.ParseIP(hostname)
 	if ip != nil {
-		// Block link-local addresses (including cloud metadata endpoints 169.254.x.x)
+		// Block link-local addresses (169.254.0.0/16, fe80::/10) which
+		// include cloud metadata endpoints like 169.254.169.254.
 		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return fmt.Errorf("link-local addresses are not allowed")
-		}
-		// Explicit check for AWS/cloud metadata endpoint
-		if ip.To4() != nil && ip.To4()[0] == 169 && ip.To4()[1] == 254 {
-			return fmt.Errorf("metadata service addresses are not allowed")
 		}
 	}
 
