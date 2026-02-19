@@ -122,7 +122,7 @@ sequenceDiagram
 
 ```bash
 # Build all binaries (providerd, mock-backend, docker-backend)
-make build
+make all
 
 # Build only providerd
 go build -o build/providerd ./cmd/providerd
@@ -657,17 +657,8 @@ Status must be either `"success"` or `"failed"`.
 
 **Idempotency:**
 If a callback is received for a lease that has already been processed (no longer in-flight),
-the server returns `200 OK` with a body indicating the duplicate status:
-
-```json
-{
-  "status": "already_processed",
-  "message": "callback for this lease was already handled"
-}
-```
-
-This allows backends to distinguish between successful processing and duplicate callbacks
-for debugging purposes, while maintaining idempotent semantics.
+the server still returns `200 OK` as a no-op. Response bodies are not guaranteed for this
+path, so callers should treat the HTTP status code as the source of truth.
 
 ## Backend API Specification
 
@@ -1016,13 +1007,15 @@ version: '3.8'
 
 services:
   mock-backend:
-    build:
-      context: .
-      dockerfile: Dockerfile.mock
+    # Build once on the host first: make build-mock
+    image: alpine:3.21
+    command: ["/app/mock-backend"]
     environment:
       - MOCK_BACKEND_ADDR=:9000
       - MOCK_BACKEND_DELAY=1s
       - MOCK_BACKEND_CALLBACK_SECRET=shared-secret-at-least-32-characters
+    volumes:
+      - "./build/mock-backend:/app/mock-backend:ro"
     ports:
       - "9000:9000"
 
@@ -1030,6 +1023,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: providerd
     environment:
       - PROVIDER_PROVIDER_UUID=01234567-89ab-cdef-0123-456789abcdef
       - PROVIDER_API_LISTEN_ADDR=:8080

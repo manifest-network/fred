@@ -108,20 +108,20 @@ type Backend struct {
 // provision tracks provisioned containers for a lease.
 // A single lease may have multiple containers based on quantity.
 type provision struct {
-	LeaseUUID    string
-	Tenant       string
-	ProviderUUID string
-	SKU          string
-	ContainerIDs []string // Multiple containers for multi-unit leases
-	Image        string
-	Manifest     *DockerManifest // Stored for restart/update operations (legacy)
-	Status       backend.ProvisionStatus
-	Quantity     int // Expected number of containers
-	CreatedAt    time.Time
-	FailCount              int    // Number of times provisioning has failed for this lease
-	VolumeCleanupAttempts  int    // Number of failed volume cleanup attempts during deprovision
-	LastError              string // Last error message, queryable after failure
-	CallbackURL  string // URL to notify on provision completion
+	LeaseUUID             string
+	Tenant                string
+	ProviderUUID          string
+	SKU                   string
+	ContainerIDs          []string // Multiple containers for multi-unit leases
+	Image                 string
+	Manifest              *DockerManifest // Stored for restart/update operations (legacy)
+	Status                backend.ProvisionStatus
+	Quantity              int // Expected number of containers
+	CreatedAt             time.Time
+	FailCount             int    // Number of times provisioning has failed for this lease
+	VolumeCleanupAttempts int    // Number of failed volume cleanup attempts during deprovision
+	LastError             string // Last error message, queryable after failure
+	CallbackURL           string // URL to notify on provision completion
 
 	// Stack fields (set when IsStack() returns true)
 	StackManifest     *StackManifest      // Per-service manifests for stack deployments

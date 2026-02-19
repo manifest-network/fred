@@ -354,11 +354,13 @@ Simple health check endpoint.
 
 Return 200 if your backend can accept requests. Fred uses this for health monitoring.
 
-### POST /refresh-state (Optional)
+### RefreshState (Backend interface method, optional for in-process backends)
 
-Synchronize in-memory provision state with the underlying infrastructure. Fred's HTTP client does **not** call this endpoint — it is a no-op for HTTP backends because the backend server is expected to maintain its own state. This endpoint exists in the `Backend` interface (`RefreshState`) for in-process backends (like the Docker backend) that need to re-read container/VM state before the reconciler calls `ListProvisions`.
+`RefreshState` exists on Fred's `Backend` interface, but it is **not** a required HTTP route for HTTP backends. Fred's HTTP client uses a no-op implementation for remote backends because those servers are expected to maintain their own state.
 
-If your backend maintains an in-memory cache of provisions, you may choose to expose this endpoint so an external trigger can force a state refresh. Otherwise, you can safely ignore it.
+In-process backends (such as the Docker backend) should implement `RefreshState` to sync in-memory state from the underlying infrastructure before reconciliation calls `ListProvisions`.
+
+If your HTTP backend keeps an internal cache and you want an external trigger, you may optionally expose your own `/refresh-state` route. Fred itself does not call that route.
 
 ### GET /stats (Optional)
 
@@ -380,7 +382,7 @@ Return resource capacity and usage statistics. Useful for UI display and monitor
 }
 ```
 
-This endpoint is optional but recommended for production backends.
+This endpoint is optional but recommended for production backends. The Docker backend implements it; the mock backend intentionally omits it to stay minimal.
 
 ## Callback Protocol
 

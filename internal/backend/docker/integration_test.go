@@ -213,7 +213,7 @@ func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	leaseUUID := fmt.Sprintf("lifecycle-%d", time.Now().UnixNano())
 
 	manifest := DockerManifest{
-		Image: "busybox:latest",
+		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
 	payload, err := json.Marshal(manifest)
@@ -1311,8 +1311,8 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 	// Create a backend with very limited resources (only enough for 1 micro container)
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
-		cfg.TotalCPUCores = 0.25  // exactly 1 docker-micro (0.25 cores)
-		cfg.TotalMemoryMB = 256   // exactly 1 docker-micro (256 MB)
+		cfg.TotalCPUCores = 0.25 // exactly 1 docker-micro (0.25 cores)
+		cfg.TotalMemoryMB = 256  // exactly 1 docker-micro (256 MB)
 	})
 
 	ctx := context.Background()
