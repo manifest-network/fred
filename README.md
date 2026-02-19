@@ -310,7 +310,9 @@ See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
 GET /health
 ```
 
-Returns server health status including chain connectivity.
+Returns server health status. Checks chain connectivity, all registered backends,
+token tracker (bbolt), and placement store (bbolt). Returns `200 OK` when all
+checks pass or `503 Service Unavailable` when any check fails.
 
 **Response:**
 ```json
@@ -318,7 +320,10 @@ Returns server health status including chain connectivity.
   "status": "healthy",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "checks": {
-    "chain": {"status": "healthy"}
+    "chain": {"status": "healthy"},
+    "backend:docker-1": {"status": "healthy"},
+    "token_tracker": {"status": "healthy"},
+    "placement_store": {"status": "healthy"}
   }
 }
 ```
@@ -400,18 +405,27 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "state": "PENDING",
   "requires_payload": true,
+  "meta_hash_hex": "a1b2c3...",
   "payload_received": false,
   "provisioning_started": false
 }
 ```
 
 **Fields:**
+- `tenant` - Tenant address from the authenticated token
+- `provider_uuid` - Provider UUID
 - `state` - Chain lease state (PENDING, ACTIVE, CLOSED, EXPIRED)
 - `requires_payload` - True if lease has meta_hash (expects payload upload)
+- `meta_hash_hex` - Expected payload hash in hex (omitted if no meta_hash)
 - `payload_received` - True if payload has been uploaded
 - `provisioning_started` - True if provisioning is in progress
+- `provision_status` - Backend provision status (omitted if not provisioned)
+- `fail_count` - Number of provisioning failures (omitted if zero)
+- `last_error` - Most recent provisioning error (omitted if none)
 
 ### Get Provision Diagnostics
 
