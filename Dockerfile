@@ -31,7 +31,7 @@ ENTRYPOINT ["/providerd"]
 # Config must be mounted at runtime. The Docker socket must also be accessible.
 # Persist /data to retain callbacks.db, diagnostics.db, and releases.db:
 #   docker run -v db-data:/data \
-#     -v ./docker-backend.yaml:/docker-backend.yaml \
+#     -v ./docker-backend.yaml:/data/docker-backend.yaml \
 #     -v /var/run/docker.sock:/var/run/docker.sock \
 #     --group-add <docker-gid> \
 #     fred-docker-backend
