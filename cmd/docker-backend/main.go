@@ -29,6 +29,8 @@ import (
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "docker-backend.yaml", "Path to configuration file")
 	flag.Parse()
@@ -38,6 +40,7 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
+	logger.Info("starting docker-backend", "version", version)
 
 	// Load configuration
 	cfg, err := loadConfig(*configPath)
