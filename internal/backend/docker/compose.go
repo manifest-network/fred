@@ -12,6 +12,7 @@ import (
 	composeapi "github.com/docker/compose/v2/pkg/api"
 	"github.com/docker/compose/v2/pkg/compose"
 	"github.com/docker/docker/client"
+	"github.com/sirupsen/logrus"
 )
 
 // composeExecutor wraps Docker Compose operations for stack deployments.
@@ -55,6 +56,12 @@ type composeService struct {
 // newComposeService creates a composeService that uses the Docker daemon at
 // the given host for Compose operations.
 func newComposeService(dockerHost string) (*composeService, error) {
+	// Silence the Compose library's logrus logger. Compose emits noisy
+	// warnings (e.g., "No resource found to remove") via its own global
+	// logrus instance. Operational information is already logged by the
+	// backend's structured logger.
+	logrus.SetOutput(io.Discard)
+
 	dockerCli, err := command.NewDockerCli(
 		command.WithCombinedStreams(io.Discard),
 	)
