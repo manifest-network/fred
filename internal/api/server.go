@@ -508,13 +508,13 @@ func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Han
 // does not leak into proxy access logs.
 func WSTokenPromoter(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "" {
-			if token := r.URL.Query().Get("token"); token != "" {
+		if token := r.URL.Query().Get("token"); token != "" {
+			if r.Header.Get("Authorization") == "" {
 				r.Header.Set("Authorization", "Bearer "+token)
-				q := r.URL.Query()
-				q.Del("token")
-				r.URL.RawQuery = q.Encode()
 			}
+			q := r.URL.Query()
+			q.Del("token")
+			r.URL.RawQuery = q.Encode()
 		}
 		next.ServeHTTP(w, r)
 	})
