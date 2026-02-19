@@ -1,17 +1,12 @@
 package shared
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
-
-	"github.com/manifest-network/fred/internal/util"
 )
 
 var callbackBucketName = []byte("pending_callbacks")
@@ -27,13 +22,7 @@ type CallbackEntry struct {
 
 // CallbackStore persists pending callbacks in bbolt so they survive restarts.
 type CallbackStore struct {
-	db     *bolt.DB
-	maxAge time.Duration
-
-	cancel    context.CancelFunc
-	wg        *sync.WaitGroup
-	closeOnce *sync.Once
-	closeErr  error // captured by first Close() call
+	*boltStore
 }
 
 // CallbackStoreConfig configures the callback store.
@@ -47,77 +36,23 @@ type CallbackStoreConfig struct {
 // If MaxAge > 0, a background cleanup loop removes expired entries periodically
 // and an initial cleanup runs immediately to clear stale entries from previous runs.
 func NewCallbackStore(cfg CallbackStoreConfig) (*CallbackStore, error) {
-	if cfg.DBPath == "" {
-		return nil, fmt.Errorf("callback db path is required")
-	}
-
-	db, err := bolt.Open(cfg.DBPath, 0600, &bolt.Options{
-		Timeout: 5 * time.Second,
+	base, err := openBoltStore(boltStoreConfig{
+		DBPath:     cfg.DBPath,
+		BucketName: callbackBucketName,
+		MaxAge:     cfg.MaxAge,
+		Label:      "callback",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to open callback db: %w", err)
+		return nil, err
 	}
 
-	// Create bucket if it doesn't exist
-	err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(callbackBucketName)
-		return err
-	})
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to create callback bucket: %w", err)
-	}
+	s := &CallbackStore{boltStore: base}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &CallbackStore{
-		db:        db,
-		maxAge:    cfg.MaxAge,
-		cancel:    cancel,
-		wg:        &sync.WaitGroup{},
-		closeOnce: &sync.Once{},
-	}
-
-	// Start background cleanup if expiry is enabled
 	if cfg.MaxAge > 0 {
-		// Run initial cleanup to remove stale entries from previous run
-		if removed, cleanupErr := s.RemoveOlderThan(cfg.MaxAge); cleanupErr != nil {
-			slog.Warn("initial callback cleanup failed", "error", cleanupErr)
-		} else if removed > 0 {
-			slog.Info("removed expired callbacks on startup", "count", removed, "max_age", cfg.MaxAge)
-		}
-
-		interval := cfg.CleanupInterval
-		if interval <= 0 {
-			interval = cfg.MaxAge
-		}
-		s.wg.Go(func() {
-			util.StartCleanupLoop(ctx, interval, s.cleanup, "callback")
-		})
+		base.startCleanup("callback", cfg.CleanupInterval, s.RemoveOlderThan)
 	}
 
 	return s, nil
-}
-
-// cleanup removes expired callback entries. Used by the background cleanup loop.
-func (s *CallbackStore) cleanup() error {
-	removed, err := s.RemoveOlderThan(s.maxAge)
-	if err != nil {
-		return err
-	}
-	if removed > 0 {
-		slog.Debug("cleaned up expired callbacks", "count", removed)
-	}
-	return nil
-}
-
-// Healthy checks if the bbolt database is accessible and the callback bucket exists.
-func (s *CallbackStore) Healthy() error {
-	return s.db.View(func(tx *bolt.Tx) error {
-		if tx.Bucket(callbackBucketName) == nil {
-			return errors.New("callback bucket missing")
-		}
-		return nil
-	})
 }
 
 // Store persists a callback entry before attempting delivery.
@@ -192,16 +127,4 @@ func (s *CallbackStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	})
 
 	return removed, err
-}
-
-// Close shuts down the callback store gracefully.
-// Close is idempotent: the first call closes the database and captures
-// any error; subsequent calls return the same error.
-func (s *CallbackStore) Close() error {
-	s.closeOnce.Do(func() {
-		s.cancel()
-		s.wg.Wait()
-		s.closeErr = s.db.Close()
-	})
-	return s.closeErr
 }

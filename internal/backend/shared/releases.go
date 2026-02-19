@@ -1,17 +1,12 @@
 package shared
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
-
-	"github.com/manifest-network/fred/internal/util"
 )
 
 var releasesBucketName = []byte("releases")
@@ -28,13 +23,7 @@ type Release struct {
 
 // ReleaseStore persists release history in bbolt so it survives backend restarts.
 type ReleaseStore struct {
-	db     *bolt.DB
-	maxAge time.Duration
-
-	cancel    context.CancelFunc
-	wg        *sync.WaitGroup
-	closeOnce *sync.Once
-	closeErr  error
+	*boltStore
 }
 
 // ReleaseStoreConfig configures the release store.
@@ -46,73 +35,23 @@ type ReleaseStoreConfig struct {
 
 // NewReleaseStore opens or creates a bbolt database for release persistence.
 func NewReleaseStore(cfg ReleaseStoreConfig) (*ReleaseStore, error) {
-	if cfg.DBPath == "" {
-		return nil, fmt.Errorf("releases db path is required")
-	}
-
-	db, err := bolt.Open(cfg.DBPath, 0600, &bolt.Options{
-		Timeout: 5 * time.Second,
+	base, err := openBoltStore(boltStoreConfig{
+		DBPath:     cfg.DBPath,
+		BucketName: releasesBucketName,
+		MaxAge:     cfg.MaxAge,
+		Label:      "releases",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to open releases db: %w", err)
+		return nil, err
 	}
 
-	err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(releasesBucketName)
-		return err
-	})
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to create releases bucket: %w", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &ReleaseStore{
-		db:        db,
-		maxAge:    cfg.MaxAge,
-		cancel:    cancel,
-		wg:        &sync.WaitGroup{},
-		closeOnce: &sync.Once{},
-	}
+	s := &ReleaseStore{boltStore: base}
 
 	if cfg.MaxAge > 0 {
-		if removed, cleanupErr := s.RemoveOlderThan(cfg.MaxAge); cleanupErr != nil {
-			slog.Warn("initial releases cleanup failed", "error", cleanupErr)
-		} else if removed > 0 {
-			slog.Info("removed expired releases on startup", "count", removed, "max_age", cfg.MaxAge)
-		}
-
-		interval := cfg.CleanupInterval
-		if interval <= 0 {
-			interval = cfg.MaxAge
-		}
-		s.wg.Go(func() {
-			util.StartCleanupLoop(ctx, interval, s.cleanup, "releases")
-		})
+		base.startCleanup("releases", cfg.CleanupInterval, s.RemoveOlderThan)
 	}
 
 	return s, nil
-}
-
-func (s *ReleaseStore) cleanup() error {
-	removed, err := s.RemoveOlderThan(s.maxAge)
-	if err != nil {
-		return err
-	}
-	if removed > 0 {
-		slog.Debug("cleaned up expired releases", "count", removed)
-	}
-	return nil
-}
-
-// Healthy checks if the bbolt database is accessible.
-func (s *ReleaseStore) Healthy() error {
-	return s.db.View(func(tx *bolt.Tx) error {
-		if tx.Bucket(releasesBucketName) == nil {
-			return errors.New("releases bucket missing")
-		}
-		return nil
-	})
 }
 
 // Append adds a new release for a lease, auto-assigning Version.
@@ -290,14 +229,4 @@ func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	})
 
 	return removed, err
-}
-
-// Close shuts down the release store gracefully.
-func (s *ReleaseStore) Close() error {
-	s.closeOnce.Do(func() {
-		s.cancel()
-		s.wg.Wait()
-		s.closeErr = s.db.Close()
-	})
-	return s.closeErr
 }
