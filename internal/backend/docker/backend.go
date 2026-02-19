@@ -118,8 +118,9 @@ type provision struct {
 	Status       backend.ProvisionStatus
 	Quantity     int // Expected number of containers
 	CreatedAt    time.Time
-	FailCount    int    // Number of times provisioning has failed for this lease
-	LastError    string // Last error message, queryable after failure
+	FailCount              int    // Number of times provisioning has failed for this lease
+	VolumeCleanupAttempts  int    // Number of failed volume cleanup attempts during deprovision
+	LastError              string // Last error message, queryable after failure
 	CallbackURL  string // URL to notify on provision completion
 
 	// Stack fields (set when IsStack() returns true)
@@ -150,6 +151,13 @@ const (
 	// an infinite retry loop. Truncating here keeps full diagnostics in
 	// LastError (for ListProvisions) while ensuring callbacks succeed.
 	callbackMaxErrorLen = 256
+
+	// maxVolumeCleanupAttempts is the maximum number of times Deprovision will
+	// retry volume destruction before giving up and removing the provision from
+	// the map. This prevents infinite retries when volumes cannot be removed
+	// (e.g., permission denied on files created by the container process).
+	// Stuck volumes require manual cleanup.
+	maxVolumeCleanupAttempts = 3
 
 	// errMsgContainerExited is the base error message for containers that
 	// exit unexpectedly, used by recoverState and failure callbacks.
@@ -2804,11 +2812,42 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	if len(volumeErrs) > 0 {
-		// Volume cleanup failed — keep provision visible for retry.
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
-			p.Status = backend.ProvisionStatusFailed
+			p.VolumeCleanupAttempts++
 			p.ContainerIDs = nil // containers are gone
+
+			if p.VolumeCleanupAttempts >= maxVolumeCleanupAttempts {
+				// Too many failed attempts — give up and remove the provision.
+				// The leaked volumes require manual cleanup by the operator.
+				tenant := p.Tenant
+				delete(b.provisions, leaseUUID)
+				b.provisionsMu.Unlock()
+
+				// Perform the same cleanup as the normal success path.
+				if b.releaseStore != nil {
+					if err := b.releaseStore.Delete(leaseUUID); err != nil {
+						logger.Warn("failed to delete release history", "error", err)
+					}
+				}
+				if b.cfg.IsNetworkIsolation() {
+					if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+						logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
+					}
+				}
+				deprovisionsTotal.Inc()
+				activeProvisions.Dec()
+				updateResourceMetrics(b.pool.Stats())
+
+				logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
+					"attempts", p.VolumeCleanupAttempts,
+					"errors", errors.Join(volumeErrs...),
+				)
+				return nil
+			}
+
+			// Under the limit — keep provision visible for retry.
+			p.Status = backend.ProvisionStatusFailed
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
 		}
 		b.provisionsMu.Unlock()

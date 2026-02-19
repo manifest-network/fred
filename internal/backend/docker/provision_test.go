@@ -1293,6 +1293,42 @@ func TestDeprovision_VolumeDestroyFailure(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 	assert.Nil(t, prov.ContainerIDs, "containers should be nil since they were removed")
 	assert.Contains(t, prov.LastError, "volume cleanup failed")
+	assert.Equal(t, 1, prov.VolumeCleanupAttempts)
+}
+
+func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
+	vm := &mockVolumeManager{
+		DestroyFn: func(ctx context.Context, id string) error {
+			return fmt.Errorf("permission denied")
+		},
+	}
+
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:             "lease-1",
+			Tenant:                "tenant-a",
+			Status:                backend.ProvisionStatusFailed,
+			Quantity:              1,
+			ContainerIDs:          nil, // containers already removed
+			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
+		},
+	})
+	b.volumes = vm
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.NoError(t, err, "should return nil when giving up")
+
+	// Provision should be removed from the map
+	b.provisionsMu.RLock()
+	_, exists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, exists, "provision should be removed after max volume cleanup attempts")
 }
 
 // --- GetInfo tests ---
