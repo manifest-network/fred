@@ -111,6 +111,15 @@ func TestComputeSubdomain(t *testing.T) {
 		assert.LessOrEqual(t, len(subB), 63)
 		assert.NotEqual(t, subA, subB, "truncated names with different suffixes must produce different subdomains")
 	})
+
+	t.Run("cross-pattern collision: svc=web idx=0 vs svc=web-0 idx=0", func(t *testing.T) {
+		// "web" with quantity=2, instanceIndex=0 → "web-0-{hash}"
+		// "web-0" with quantity=1 → "web-0-{hash}"
+		// These must differ because the hash incorporates serviceName + instanceIndex.
+		subA := ComputeSubdomain(leaseUUID, "web", 0, 2)
+		subB := ComputeSubdomain(leaseUUID, "web-0", 0, 1)
+		assert.NotEqual(t, subA, subB, "cross-pattern names must not collide")
+	})
 }
 
 func TestComputeFQDN(t *testing.T) {

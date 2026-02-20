@@ -28,6 +28,10 @@ const maxDNSLabel = 63
 // service metadata. The result is guaranteed to be at most 63 characters
 // (the DNS label limit); long service names are truncated to fit.
 //
+// The hash suffix is derived from all discriminating fields (leaseUUID,
+// serviceName, instanceIndex) to prevent cross-pattern collisions — e.g.,
+// service "web" instance 0 vs. service "web-0" instance 0.
+//
 // Matrix:
 //
 //	serviceName == "" && quantity <= 1 → {hash7}
@@ -35,7 +39,9 @@ const maxDNSLabel = 63
 //	serviceName != "" && quantity <= 1 → {svc}-{hash7}
 //	serviceName != "" && quantity > 1  → {svc}-{idx}-{hash7}
 func ComputeSubdomain(leaseUUID, serviceName string, instanceIndex, quantity int) string {
-	h := sha256.Sum256([]byte(leaseUUID))
+	// Hash all discriminating fields so identical prefixes from different
+	// naming patterns (e.g., "web" idx=0 vs "web-0" idx=0) get different suffixes.
+	h := sha256.Sum256([]byte(leaseUUID + "/" + serviceName + "/" + strconv.Itoa(instanceIndex)))
 	hash7 := hex.EncodeToString(h[:])[:7]
 
 	idx := strconv.Itoa(instanceIndex)
