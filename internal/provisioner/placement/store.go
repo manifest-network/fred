@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -149,11 +151,7 @@ func (s *Store) Count() int {
 func (s *Store) List() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	uuids := make([]string, 0, len(s.cache))
-	for k := range s.cache {
-		uuids = append(uuids, k)
-	}
-	return uuids
+	return slices.Collect(maps.Keys(s.cache))
 }
 
 // Healthy checks that the bbolt database and bucket are accessible.

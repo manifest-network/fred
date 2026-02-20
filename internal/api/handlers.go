@@ -55,20 +55,28 @@ type Handlers struct {
 	callbackBaseURL string
 }
 
+// HandlersConfig configures a Handlers instance.
+type HandlersConfig struct {
+	Client          ChainClient
+	BackendRouter   *backend.Router
+	TokenTracker    TokenTrackerInterface    // optional but recommended for replay attack protection
+	StatusChecker   StatusChecker            // optional but required for the /status endpoint
+	PlacementLookup PlacementLookup          // optional — used for routing reads to the correct backend
+	EventBroker     *EventBroker             // optional — if nil, the events endpoint will return 501
+	ProviderUUID    string
+	Bech32Prefix    string
+	CallbackBaseURL string // used for restart/update callbacks to the backend
+}
+
 // NewHandlers creates a new Handlers instance.
-// tokenTracker is optional but recommended for replay attack protection.
-// statusChecker is optional but required for the /status endpoint.
-// placementLookup is optional — used for routing reads to the correct backend.
-// callbackBaseURL is used for restart/update callbacks to the backend.
-// eventBroker is optional — if nil, the events endpoint will return 501.
-func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker TokenTrackerInterface, statusChecker StatusChecker, placementLookup PlacementLookup, eventBroker *EventBroker, providerUUID, bech32Prefix, callbackBaseURL string) *Handlers {
+func NewHandlers(cfg HandlersConfig) *Handlers {
 	return &Handlers{
-		client:          client,
-		backendRouter:   backendRouter,
-		tokenTracker:    tokenTracker,
-		statusChecker:   statusChecker,
-		placementLookup: placementLookup,
-		eventBroker:     eventBroker,
+		client:          cfg.Client,
+		backendRouter:   cfg.BackendRouter,
+		tokenTracker:    cfg.TokenTracker,
+		statusChecker:   cfg.StatusChecker,
+		placementLookup: cfg.PlacementLookup,
+		eventBroker:     cfg.EventBroker,
 		wsUpgrader: websocket.Upgrader{
 			// Allow all origins: this API is not browser-facing. Clients are
 			// CLI tools and services that authenticate with cryptographically
@@ -76,9 +84,9 @@ func NewHandlers(client ChainClient, backendRouter *backend.Router, tokenTracker
 			// break non-browser clients that don't send Origin headers.
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		providerUUID:    providerUUID,
-		bech32Prefix:    bech32Prefix,
-		callbackBaseURL: callbackBaseURL,
+		providerUUID:    cfg.ProviderUUID,
+		bech32Prefix:    cfg.Bech32Prefix,
+		callbackBaseURL: cfg.CallbackBaseURL,
 	}
 }
 

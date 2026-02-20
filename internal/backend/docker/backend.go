@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -560,13 +561,13 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		if len(oldItems) > 0 {
 			// Stack: release service-aware allocation IDs.
 			for _, item := range oldItems {
-				for i := 0; i < item.Quantity; i++ {
+				for i := range item.Quantity {
 					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
 				}
 			}
 		} else {
 			// Legacy: release index-based allocation IDs.
-			for i := 0; i < oldQuantity; i++ {
+			for i := range oldQuantity {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}
 		}
@@ -645,7 +646,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	var allocatedIDs []string
 	if isStack {
 		for _, item := range req.Items {
-			for i := 0; i < item.Quantity; i++ {
+			for i := range item.Quantity {
 				instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
 				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
 					for _, id := range allocatedIDs {
@@ -660,7 +661,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	} else {
 		instanceIdx := 0
 		for _, item := range req.Items {
-			for i := 0; i < item.Quantity; i++ {
+			for range item.Quantity {
 				instanceID := fmt.Sprintf("%s-%d", req.LeaseUUID, instanceIdx)
 				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
 					for _, id := range allocatedIDs {
@@ -838,11 +839,7 @@ func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manife
 		return nil, fmt.Errorf("image inspect failed: %w", err)
 	}
 
-	var volumes []string
-	for v := range imageInfo.Volumes {
-		volumes = append(volumes, v)
-	}
-	slices.Sort(volumes)
+	volumes := slices.Sorted(maps.Keys(imageInfo.Volumes))
 
 	result := &imageSetup{Volumes: volumes}
 
@@ -1037,7 +1034,7 @@ func (b *Backend) setupStackVolBinds(
 		profile := profiles[item.SKU]
 		imgSetup := imageSetups[svcName]
 
-		for i := 0; i < item.Quantity; i++ {
+		for i := range item.Quantity {
 			needsStatefulVolume := profile.DiskMB > 0 && len(imgSetup.Volumes) > 0
 			needsWritableVolume := len(imgSetup.WritablePaths) > 0
 
@@ -1126,7 +1123,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			logger.Error("provision failed", "lease_uuid", req.LeaseUUID, "error", err)
 			provisionsTotal.WithLabelValues("failure").Inc()
 			// Clean up on failure - release all allocated resources
-			for i := 0; i < totalQuantity; i++ {
+			for i := range totalQuantity {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}
 
@@ -1253,7 +1250,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	for _, item := range req.Items {
 		profile := profiles[item.SKU]
 
-		for i := 0; i < item.Quantity; i++ {
+		for range item.Quantity {
 			instanceLogger := logger.With("instance", instanceIndex, "sku", item.SKU)
 
 			// Create container with instance index for unique naming
@@ -1392,7 +1389,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 
 			// Release all service-aware allocation IDs.
 			for _, item := range req.Items {
-				for i := 0; i < item.Quantity; i++ {
+				for i := range item.Quantity {
 					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
 				}
 			}
@@ -2763,12 +2760,12 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	// is being abandoned and these resources should be freed.
 	if prov.IsStack() {
 		for _, item := range prov.Items {
-			for i := 0; i < item.Quantity; i++ {
+			for i := range item.Quantity {
 				b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
 			}
 		}
 	} else {
-		for i := 0; i < prov.Quantity; i++ {
+		for i := range prov.Quantity {
 			b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
 		}
 	}
@@ -2793,7 +2790,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	var volumeErrs []error
 	if prov.IsStack() {
 		for _, item := range prov.Items {
-			for i := 0; i < item.Quantity; i++ {
+			for i := range item.Quantity {
 				volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)
 				if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
 					logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
@@ -2802,7 +2799,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			}
 		}
 	} else {
-		for i := 0; i < prov.Quantity; i++ {
+		for i := range prov.Quantity {
 			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
 			if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
 				logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
@@ -3308,12 +3305,12 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	for leaseUUID, prov := range b.provisions {
 		if prov.IsStack() {
 			for _, item := range prov.Items {
-				for i := 0; i < item.Quantity; i++ {
+				for i := range item.Quantity {
 					expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
 				}
 			}
 		} else {
-			for i := 0; i < prov.Quantity; i++ {
+			for i := range prov.Quantity {
 				expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
 			}
 		}

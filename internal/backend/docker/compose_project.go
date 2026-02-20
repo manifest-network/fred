@@ -2,6 +2,7 @@ package docker
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -48,7 +49,7 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 		profile := params.Profiles[item.SKU]
 		imgSetup := params.ImageSetups[svcName]
 
-		for i := 0; i < item.Quantity; i++ {
+		for i := range item.Quantity {
 			composeSvcName := svcName
 			if item.Quantity > 1 {
 				composeSvcName = fmt.Sprintf("%s-%d", svcName, i)
@@ -184,7 +185,7 @@ func applyDependsOn(services composetypes.Services, stack *StackManifest, items 
 				}
 			} else {
 				// Fan-out: depends on all instances of the dependency.
-				for i := 0; i < depQty; i++ {
+				for i := range depQty {
 					composeName := fmt.Sprintf("%s-%d", depName, i)
 					depConfig[composeName] = composetypes.ServiceDependency{
 						Condition: cond.Condition,
@@ -200,7 +201,7 @@ func applyDependsOn(services composetypes.Services, stack *StackManifest, items 
 			svc.DependsOn = depConfig
 			services[svcName] = svc
 		} else {
-			for i := 0; i < item.Quantity; i++ {
+			for i := range item.Quantity {
 				composeName := fmt.Sprintf("%s-%d", svcName, i)
 				svc := services[composeName]
 				svc.DependsOn = depConfig
@@ -277,11 +278,7 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 	if len(p.Manifest.Ports) > 0 {
 		ports := make([]composetypes.ServicePortConfig, 0, len(p.Manifest.Ports))
 		// Sort port specs for deterministic output.
-		portSpecs := make([]string, 0, len(p.Manifest.Ports))
-		for spec := range p.Manifest.Ports {
-			portSpecs = append(portSpecs, spec)
-		}
-		slices.Sort(portSpecs)
+		portSpecs := slices.Sorted(maps.Keys(p.Manifest.Ports))
 
 		for _, spec := range portSpecs {
 			cfg := p.Manifest.Ports[spec]

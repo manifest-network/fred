@@ -101,7 +101,7 @@ func BenchmarkStore_Read(b *testing.B) {
 	payload := make([]byte, 1024)
 	rand.Read(payload)
 	lastKey := ""
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		lastKey = fmt.Sprintf("lease-%d", i)
 		store.Store(lastKey, payload)
 	}
@@ -136,7 +136,7 @@ func BenchmarkStore_Read_Parallel(b *testing.B) {
 	payload := make([]byte, 1024)
 	rand.Read(payload)
 	lastKey := ""
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		lastKey = fmt.Sprintf("lease-%d", i)
 		store.Store(lastKey, payload)
 	}
@@ -250,7 +250,7 @@ func BenchmarkStore_MixedWorkload(b *testing.B) {
 	payload := make([]byte, 1024)
 	rand.Read(payload)
 	lastKey := ""
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		lastKey = fmt.Sprintf("lease-%d", i)
 		store.Store(lastKey, payload)
 	}
@@ -304,14 +304,14 @@ func TestStore_StressTest(t *testing.T) {
 	var writeOps, readOps, deleteOps atomic.Int64
 	start := time.Now()
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
 			payload := make([]byte, 1024)
 			rand.Read(payload)
 
-			for i := 0; i < opsPerRoutine; i++ {
+			for i := range opsPerRoutine {
 				leaseUUID := fmt.Sprintf("lease-%d-%d", gid, i%50) // Reuse some UUIDs
 
 				switch i % 10 {
@@ -369,14 +369,14 @@ func TestStore_HighConcurrencyWrites(t *testing.T) {
 	var successCount, failCount atomic.Int64
 	start := time.Now()
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
 			payload := make([]byte, 2048) // 2KB payloads
 			rand.Read(payload)
 
-			for i := 0; i < writesPerRoutine; i++ {
+			for i := range writesPerRoutine {
 				leaseUUID := fmt.Sprintf("lease-%d-%d", gid, i)
 				if store.Store(leaseUUID, payload) {
 					successCount.Add(1)
@@ -399,7 +399,7 @@ func TestStore_HighConcurrencyWrites(t *testing.T) {
 	t.Logf("  Failed (duplicates): %d", failCount.Load())
 
 	// Verify data integrity - sample check
-	for g := 0; g < 10; g++ {
+	for g := range 10 {
 		leaseUUID := fmt.Sprintf("lease-%d-0", g)
 		got, err := store.Get(leaseUUID)
 		assert.NoError(t, err, "Get error for lease %s", leaseUUID)

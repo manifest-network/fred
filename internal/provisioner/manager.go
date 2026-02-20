@@ -20,6 +20,9 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
+// poisonTopic is the Watermill dead-letter topic for messages that exhaust retries.
+const poisonTopic = "events.poison"
+
 // Compile-time check that Manager implements ReconcilerTracker.
 var _ ReconcilerTracker = (*Manager)(nil)
 
@@ -108,7 +111,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	// This prevents infinite retry loops: after Retry exhausts its attempts,
 	// PoisonQueue intercepts the error, publishes the message to a dead-letter
 	// topic, and returns nil — acknowledging the message and breaking the loop.
-	poisonQueue, err := middleware.PoisonQueue(pubSub, "events.poison")
+	poisonQueue, err := middleware.PoisonQueue(pubSub, poisonTopic)
 	if err != nil {
 		return nil, fmt.Errorf("create poison queue middleware: %w", err)
 	}
@@ -221,7 +224,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	// Handle poisoned messages: log and drop them to prevent infinite loops
 	wmRouter.AddNoPublisherHandler(
 		"handle_poison_queue",
-		"events.poison",
+		poisonTopic,
 		pubSub,
 		func(msg *message.Message) error {
 			slog.Error("message moved to poison queue after all retries exhausted",

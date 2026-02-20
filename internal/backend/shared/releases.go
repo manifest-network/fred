@@ -164,7 +164,7 @@ func (s *ReleaseStore) ActivateLatest(leaseUUID string) error {
 			return nil
 		}
 
-		for i := 0; i < len(releases)-1; i++ {
+		for i := range len(releases)-1 {
 			if releases[i].Status == "active" {
 				releases[i].Status = "superseded"
 			}

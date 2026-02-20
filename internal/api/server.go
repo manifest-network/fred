@@ -112,7 +112,17 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if tokenTracker != nil {
 		tracker = tokenTracker
 	}
-	handlers := NewHandlers(client, backendRouter, tracker, statusChecker, placementLookup, eventBroker, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.CallbackBaseURL)
+	handlers := NewHandlers(HandlersConfig{
+		Client:          client,
+		BackendRouter:   backendRouter,
+		TokenTracker:    tracker,
+		StatusChecker:   statusChecker,
+		PlacementLookup: placementLookup,
+		EventBroker:     eventBroker,
+		ProviderUUID:    cfg.ProviderUUID,
+		Bech32Prefix:    cfg.Bech32Prefix,
+		CallbackBaseURL: cfg.CallbackBaseURL,
+	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
 	var trustedProxies *TrustedProxyConfig

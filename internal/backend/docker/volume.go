@@ -2,7 +2,9 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -120,7 +122,7 @@ const volumePrefix = "fred-"
 func listVolumeIDs(dataPath string) ([]string, error) {
 	entries, err := os.ReadDir(dataPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read volume data directory %s: %w", dataPath, err)

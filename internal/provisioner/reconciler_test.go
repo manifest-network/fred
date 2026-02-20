@@ -893,7 +893,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 
 	// Half the goroutines simulate manager's TryTrackInFlight + Provision
 	// Half simulate reconciler's startProvisioning (which also uses TryTrackInFlight)
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		go func(workerID int) {
 			defer wg.Done()
 			<-start
@@ -1920,7 +1920,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	start := make(chan struct{})
 	completed := make(chan struct{}, numGoroutines)
 
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		go func() {
 			defer wg.Done()
 			<-start

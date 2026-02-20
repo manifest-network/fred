@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync/atomic"
 )
 
@@ -124,12 +125,7 @@ func (r *Router) RouteRoundRobin(sku string) Backend {
 // Empty criteria (no SKU list) matches nothing;
 // use IsDefault to designate a fallback backend.
 func (r *Router) matches(sku string, match MatchCriteria) bool {
-	for _, s := range match.SKUs {
-		if sku == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(match.SKUs, sku)
 }
 
 // Default returns the default backend.
