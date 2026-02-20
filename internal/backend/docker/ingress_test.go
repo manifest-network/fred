@@ -2,6 +2,7 @@ package docker
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -73,6 +74,34 @@ func TestComputeSubdomain(t *testing.T) {
 		for _, c := range sub {
 			assert.Contains(t, "0123456789abcdef", string(c))
 		}
+	})
+
+	t.Run("long service name truncated to DNS limit", func(t *testing.T) {
+		longName := "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0" // 63 chars
+		sub := ComputeSubdomain(leaseUUID, longName, 0, 1)
+		assert.LessOrEqual(t, len(sub), 63, "subdomain must not exceed DNS label limit")
+		assert.Contains(t, sub, "-") // still has hash separator
+	})
+
+	t.Run("long service name multi-instance truncated to DNS limit", func(t *testing.T) {
+		longName := "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0"
+		sub := ComputeSubdomain(leaseUUID, longName, 99, 100)
+		assert.LessOrEqual(t, len(sub), 63, "subdomain must not exceed DNS label limit")
+		assert.Contains(t, sub, "99-") // instance index present
+	})
+
+	t.Run("trailing hyphen trimmed after truncation", func(t *testing.T) {
+		// Craft a name where truncation lands exactly on a hyphen.
+		// maxLen for svc with quantity=1 is 63 - 7 - 1 = 55 chars.
+		// Put a hyphen at position 55 so truncation cuts right there.
+		name := strings.Repeat("a", 54) + "-" + strings.Repeat("b", 8) // 63 chars total
+		sub := ComputeSubdomain(leaseUUID, name, 0, 1)
+		assert.LessOrEqual(t, len(sub), 63)
+		// Extract the service portion (everything before the last "-{hash7}").
+		// The hash is 7 hex chars, so the service part ends at len-8.
+		svcPart := sub[:len(sub)-8]
+		assert.False(t, strings.HasSuffix(svcPart, "-"),
+			"service portion %q should not end with a hyphen", svcPart)
 	})
 }
 

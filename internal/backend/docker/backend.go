@@ -42,6 +42,7 @@ type dockerClient interface {
 	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
 	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
+	NetworkExists(ctx context.Context, networkName string) (bool, error)
 	ConnectToNetwork(ctx context.Context, containerID, networkName string) error
 	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
 	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
@@ -398,6 +399,17 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Validate volume manager (filesystem support, permissions)
 	if err := b.volumes.Validate(); err != nil {
 		return fmt.Errorf("volume manager validation failed: %w", err)
+	}
+
+	// Verify ingress network exists on the daemon before accepting provisions.
+	if b.cfg.Ingress.Enabled {
+		exists, err := b.docker.NetworkExists(ctx, b.cfg.Ingress.Network)
+		if err != nil {
+			return fmt.Errorf("ingress network check failed: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf("ingress network %q does not exist; create it before starting the backend", b.cfg.Ingress.Network)
+		}
 	}
 
 	// Check daemon capabilities for hardening configuration

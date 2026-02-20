@@ -158,7 +158,7 @@ type Config struct {
 	// Ingress configures optional reverse proxy integration.
 	// When enabled, containers with routable TCP ports get proxy labels
 	// and are connected to the proxy network for HTTPS auto-discovery.
-	Ingress IngressConfig `yaml:"traefik"`
+	Ingress IngressConfig `yaml:"ingress"`
 }
 
 func ptrBool(b bool) *bool    { return &b }

@@ -1378,6 +1378,18 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 	return resp.ID, nil
 }
 
+// NetworkExists returns true if the named Docker network exists.
+func (d *DockerClient) NetworkExists(ctx context.Context, networkName string) (bool, error) {
+	_, err := d.client.NetworkInspect(ctx, networkName, networktypes.InspectOptions{})
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to inspect network %q: %w", networkName, err)
+	}
+	return true, nil
+}
+
 // ConnectToNetwork attaches a running container to an additional Docker network.
 // Docker only supports one endpoint in EndpointsConfig at creation time, so
 // secondary networks (like the ingress network) must be connected post-creation.

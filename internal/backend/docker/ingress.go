@@ -21,8 +21,12 @@ type IngressConfig struct {
 	Entrypoint     string `yaml:"entrypoint"`
 }
 
+// maxDNSLabel is the maximum length of a single DNS label (RFC 1035).
+const maxDNSLabel = 63
+
 // ComputeSubdomain derives a unique, human-friendly subdomain from lease and
-// service metadata.
+// service metadata. The result is guaranteed to be at most 63 characters
+// (the DNS label limit); long service names are truncated to fit.
 //
 // Matrix:
 //
@@ -42,10 +46,22 @@ func ComputeSubdomain(leaseUUID, serviceName string, instanceIndex, quantity int
 	case serviceName == "" && quantity > 1:
 		return idx + "-" + hash7
 	case serviceName != "" && quantity <= 1:
-		return serviceName + "-" + hash7
+		svc := truncateLabel(serviceName, maxDNSLabel-len(hash7)-1) // "{svc}-{hash7}"
+		return svc + "-" + hash7
 	default:
-		return serviceName + "-" + idx + "-" + hash7
+		svc := truncateLabel(serviceName, maxDNSLabel-len(idx)-len(hash7)-2) // "{svc}-{idx}-{hash7}"
+		return svc + "-" + idx + "-" + hash7
 	}
+}
+
+// truncateLabel truncates s to maxLen, trimming any trailing hyphen
+// left by the cut to keep the result a valid DNS label.
+func truncateLabel(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	s = s[:maxLen]
+	return strings.TrimRight(s, "-")
 }
 
 // ComputeFQDN returns subdomain + "." + wildcardDomain.

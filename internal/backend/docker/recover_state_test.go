@@ -82,6 +82,7 @@ type mockDockerClient struct {
 	ContainerLogsFn              func(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainersFn      func(ctx context.Context) ([]ContainerInfo, error)
 	EnsureTenantNetworkFn        func(ctx context.Context, tenant string) (string, error)
+	NetworkExistsFn              func(ctx context.Context, networkName string) (bool, error)
 	ConnectToNetworkFn           func(ctx context.Context, containerID, networkName string) error
 	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
 	ListManagedNetworksFn        func(ctx context.Context) ([]networktypes.Inspect, error)
@@ -195,6 +196,13 @@ func (m *mockDockerClient) EnsureTenantNetwork(ctx context.Context, tenant strin
 		return m.EnsureTenantNetworkFn(ctx, tenant)
 	}
 	panic("unexpected call to EnsureTenantNetwork")
+}
+
+func (m *mockDockerClient) NetworkExists(ctx context.Context, networkName string) (bool, error) {
+	if m.NetworkExistsFn != nil {
+		return m.NetworkExistsFn(ctx, networkName)
+	}
+	return true, nil // default: network exists
 }
 
 func (m *mockDockerClient) ConnectToNetwork(ctx context.Context, containerID, networkName string) error {
