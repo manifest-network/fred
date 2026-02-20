@@ -54,14 +54,18 @@ func ComputeSubdomain(leaseUUID, serviceName string, instanceIndex, quantity int
 	}
 }
 
-// truncateLabel truncates s to maxLen, trimming any trailing hyphen
-// left by the cut to keep the result a valid DNS label.
+// truncateLabel truncates s to maxLen. When truncation occurs, the last 8
+// characters are replaced with a hash of the full string to prevent collisions
+// between names that share a common prefix (8 hex chars = 32 bits).
 func truncateLabel(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	s = s[:maxLen]
-	return strings.TrimRight(s, "-")
+	// 8-char hash suffix + separator = 9 chars reserved for disambiguation.
+	h := sha256.Sum256([]byte(s))
+	suffix := hex.EncodeToString(h[:])[:8]
+	prefix := strings.TrimRight(s[:maxLen-len(suffix)-1], "-")
+	return prefix + "-" + suffix
 }
 
 // ComputeFQDN returns subdomain + "." + wildcardDomain.

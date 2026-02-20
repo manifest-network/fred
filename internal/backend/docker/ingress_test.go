@@ -92,16 +92,24 @@ func TestComputeSubdomain(t *testing.T) {
 
 	t.Run("trailing hyphen trimmed after truncation", func(t *testing.T) {
 		// Craft a name where truncation lands exactly on a hyphen.
-		// maxLen for svc with quantity=1 is 63 - 7 - 1 = 55 chars.
-		// Put a hyphen at position 55 so truncation cuts right there.
 		name := strings.Repeat("a", 54) + "-" + strings.Repeat("b", 8) // 63 chars total
 		sub := ComputeSubdomain(leaseUUID, name, 0, 1)
 		assert.LessOrEqual(t, len(sub), 63)
-		// Extract the service portion (everything before the last "-{hash7}").
-		// The hash is 7 hex chars, so the service part ends at len-8.
-		svcPart := sub[:len(sub)-8]
-		assert.False(t, strings.HasSuffix(svcPart, "-"),
-			"service portion %q should not end with a hyphen", svcPart)
+		// No label in the subdomain should end with a hyphen.
+		for _, part := range strings.Split(sub, "-") {
+			assert.NotEmpty(t, part, "subdomain should not contain empty parts from double hyphens")
+		}
+	})
+
+	t.Run("different long names with shared prefix do not collide", func(t *testing.T) {
+		prefix := strings.Repeat("a", 50)
+		nameA := prefix + "-alpha-version"  // 63 chars+
+		nameB := prefix + "-bravo-version"  // 63 chars+
+		subA := ComputeSubdomain(leaseUUID, nameA, 0, 1)
+		subB := ComputeSubdomain(leaseUUID, nameB, 0, 1)
+		assert.LessOrEqual(t, len(subA), 63)
+		assert.LessOrEqual(t, len(subB), 63)
+		assert.NotEqual(t, subA, subB, "truncated names with different suffixes must produce different subdomains")
 	})
 }
 
