@@ -202,14 +202,17 @@ func (m *mockDockerClient) NetworkExists(ctx context.Context, networkName string
 	if m.NetworkExistsFn != nil {
 		return m.NetworkExistsFn(ctx, networkName)
 	}
-	return true, nil // default: network exists
+	// Permissive default: most tests don't involve ingress and shouldn't
+	// need to explicitly mock network existence.
+	return true, nil
 }
 
 func (m *mockDockerClient) ConnectToNetwork(ctx context.Context, containerID, networkName string) error {
 	if m.ConnectToNetworkFn != nil {
 		return m.ConnectToNetworkFn(ctx, containerID, networkName)
 	}
-	return nil // default: connect succeeds silently
+	// Permissive default: most tests don't involve ingress networking.
+	return nil
 }
 
 func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error {

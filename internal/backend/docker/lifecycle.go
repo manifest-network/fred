@@ -1394,7 +1394,10 @@ func (d *DockerClient) NetworkExists(ctx context.Context, networkName string) (b
 // Docker only supports one endpoint in EndpointsConfig at creation time, so
 // secondary networks (like the ingress network) must be connected post-creation.
 func (d *DockerClient) ConnectToNetwork(ctx context.Context, containerID, networkName string) error {
-	return d.client.NetworkConnect(ctx, networkName, containerID, nil)
+	if err := d.client.NetworkConnect(ctx, networkName, containerID, nil); err != nil {
+		return fmt.Errorf("failed to connect container %s to network %s: %w", containerID, networkName, err)
+	}
+	return nil
 }
 
 // RemoveTenantNetworkIfEmpty removes the tenant's network if no containers are connected.
