@@ -82,6 +82,8 @@ type mockDockerClient struct {
 	ContainerLogsFn              func(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainersFn      func(ctx context.Context) ([]ContainerInfo, error)
 	EnsureTenantNetworkFn        func(ctx context.Context, tenant string) (string, error)
+	NetworkExistsFn              func(ctx context.Context, networkName string) (bool, error)
+	ConnectToNetworkFn           func(ctx context.Context, containerID, networkName string) error
 	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
 	ListManagedNetworksFn        func(ctx context.Context) ([]networktypes.Inspect, error)
 	ResolveImageUserFn           func(ctx context.Context, imageName string, userOverride string) (int, int, error)
@@ -194,6 +196,23 @@ func (m *mockDockerClient) EnsureTenantNetwork(ctx context.Context, tenant strin
 		return m.EnsureTenantNetworkFn(ctx, tenant)
 	}
 	panic("unexpected call to EnsureTenantNetwork")
+}
+
+func (m *mockDockerClient) NetworkExists(ctx context.Context, networkName string) (bool, error) {
+	if m.NetworkExistsFn != nil {
+		return m.NetworkExistsFn(ctx, networkName)
+	}
+	// Permissive default: most tests don't involve ingress and shouldn't
+	// need to explicitly mock network existence.
+	return true, nil
+}
+
+func (m *mockDockerClient) ConnectToNetwork(ctx context.Context, containerID, networkName string) error {
+	if m.ConnectToNetworkFn != nil {
+		return m.ConnectToNetworkFn(ctx, containerID, networkName)
+	}
+	// Permissive default: most tests don't involve ingress networking.
+	return nil
 }
 
 func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error {
