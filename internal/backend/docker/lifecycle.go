@@ -1390,7 +1390,7 @@ func (d *DockerClient) NetworkExists(ctx context.Context, networkName string) (b
 	return true, nil
 }
 
-// ConnectToNetwork attaches a running container to an additional Docker network.
+// ConnectToNetwork attaches a container to an additional Docker network.
 // Docker only supports one endpoint in EndpointsConfig at creation time, so
 // secondary networks (like the ingress network) must be connected post-creation.
 func (d *DockerClient) ConnectToNetwork(ctx context.Context, containerID, networkName string) error {

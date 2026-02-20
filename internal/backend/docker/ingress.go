@@ -125,7 +125,8 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 // Traefik-specific function; everything else is proxy-agnostic.
 func TraefikLabels(cfg IngressConfig, routerName, fqdn string, containerPort int) map[string]string {
 	return map[string]string{
-		"traefik.enable": "true",
+		"traefik.enable":        "true",
+		"traefik.docker.network": cfg.Network,
 		fmt.Sprintf("traefik.http.routers.%s.rule", routerName):                      fmt.Sprintf("Host(`%s`)", fqdn),
 		fmt.Sprintf("traefik.http.routers.%s.entrypoints", routerName):               cfg.Entrypoint,
 		fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", routerName):          cfg.CertResolver,

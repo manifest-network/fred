@@ -225,8 +225,9 @@ func TestTraefikLabels(t *testing.T) {
 
 	labels := TraefikLabels(cfg, "fred-web-abc1234", "web-abc1234.barney8.manifest0.net", 80)
 
-	require.Len(t, labels, 5)
+	require.Len(t, labels, 6)
 	assert.Equal(t, "true", labels["traefik.enable"])
+	assert.Equal(t, "traefik", labels["traefik.docker.network"])
 	assert.Equal(t, "Host(`web-abc1234.barney8.manifest0.net`)", labels["traefik.http.routers.fred-web-abc1234.rule"])
 	assert.Equal(t, "websecure", labels["traefik.http.routers.fred-web-abc1234.entrypoints"])
 	assert.Equal(t, "letsencrypt", labels["traefik.http.routers.fred-web-abc1234.tls.certresolver"])

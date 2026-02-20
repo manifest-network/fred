@@ -710,7 +710,7 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 		project := buildComposeProject(params)
 
-		// Project should have both "default" and "traefik" networks.
+		// Project should have both "default" and "ingress" networks.
 		require.Contains(t, project.Networks, "default")
 		require.Contains(t, project.Networks, "ingress")
 		assert.Equal(t, "traefik-net", project.Networks["ingress"].Name)
@@ -723,6 +723,7 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 		// Traefik labels should be present.
 		assert.Equal(t, "true", svc.Labels["traefik.enable"])
+		assert.Equal(t, "traefik-net", svc.Labels["traefik.docker.network"])
 		assert.NotEmpty(t, svc.Labels[LabelFQDN])
 		assert.Contains(t, svc.Labels[LabelFQDN], "barney8.manifest0.net")
 	})
