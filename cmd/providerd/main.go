@@ -173,7 +173,7 @@ func run(cmd *cobra.Command, args []string) error {
 			Name:    bcfg.Name,
 			BaseURL: bcfg.URL,
 			Timeout: bcfg.Timeout,
-			Secret:  cfg.CallbackSecret,
+			Secret:  string(cfg.CallbackSecret),
 		})
 
 		backendEntries = append(backendEntries, backend.BackendEntry{
@@ -292,7 +292,7 @@ func run(cmd *cobra.Command, args []string) error {
 		IdleTimeout:          cfg.HTTPIdleTimeout,
 		ShutdownTimeout:      cfg.ShutdownTimeout,
 		MaxRequestBodySize:   cfg.MaxRequestBodySize,
-		CallbackSecret:       cfg.CallbackSecret,
+		CallbackSecret:       string(cfg.CallbackSecret),
 		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,
 		CallbackBaseURL:      cfg.CallbackBaseURL,
 	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr, placementStore, eventBroker)

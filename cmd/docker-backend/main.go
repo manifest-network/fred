@@ -87,7 +87,7 @@ func main() {
 	cancel()
 
 	// Create server
-	server := NewServer(b, cfg.CallbackSecret, logger)
+	server := NewServer(b, string(cfg.CallbackSecret), logger)
 
 	// Setup HTTP server
 	httpServer := &http.Server{
@@ -155,7 +155,7 @@ func applyEnvOverrides(cfg *docker.Config) {
 		cfg.ListenAddr = addr
 	}
 	if secret := os.Getenv("DOCKER_BACKEND_CALLBACK_SECRET"); secret != "" {
-		cfg.CallbackSecret = secret
+		cfg.CallbackSecret = config.Secret(secret)
 	}
 	if host := os.Getenv("DOCKER_BACKEND_HOST_ADDRESS"); host != "" {
 		cfg.HostAddress = host

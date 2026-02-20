@@ -373,7 +373,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:      cbStore,
 		HTTPClient: httpClient,
-		Secret:     cfg.CallbackSecret,
+		Secret:     string(cfg.CallbackSecret),
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
 		OnDelivery: func(outcome string) {

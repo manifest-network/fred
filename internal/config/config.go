@@ -86,7 +86,7 @@ type Config struct {
 	// Backend configuration
 	Backends        []BackendConfig `mapstructure:"backends"`
 	CallbackBaseURL string          `mapstructure:"callback_base_url"`
-	CallbackSecret  string          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
+	CallbackSecret  Secret          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
 
 	// Reconciliation configuration
 	ReconciliationInterval time.Duration `mapstructure:"reconciliation_interval"`
