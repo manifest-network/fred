@@ -59,10 +59,10 @@ type Handlers struct {
 type HandlersConfig struct {
 	Client          ChainClient
 	BackendRouter   *backend.Router
-	TokenTracker    TokenTrackerInterface    // optional but recommended for replay attack protection
-	StatusChecker   StatusChecker            // optional but required for the /status endpoint
-	PlacementLookup PlacementLookup          // optional — used for routing reads to the correct backend
-	EventBroker     *EventBroker             // optional — if nil, the events endpoint will return 501
+	TokenTracker    TokenTrackerInterface // optional but recommended for replay attack protection
+	StatusChecker   StatusChecker         // optional but required for the /status endpoint
+	PlacementLookup PlacementLookup       // optional — used for routing reads to the correct backend
+	EventBroker     *EventBroker          // optional — if nil, the events endpoint will return 501
 	ProviderUUID    string
 	Bech32Prefix    string
 	CallbackBaseURL string // used for restart/update callbacks to the backend
