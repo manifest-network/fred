@@ -45,6 +45,7 @@ const (
 	LabelCallbackURL   = "fred.callback_url"
 	LabelBackendName   = "fred.backend_name"
 	LabelServiceName   = "fred.service_name"
+	LabelFQDN          = "fred.fqdn"
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
@@ -75,6 +76,7 @@ type ContainerInfo struct {
 	OOMKilled     bool         // True if container was killed by the OOM killer
 	CreatedAt     time.Time
 	Ports         map[string]PortBinding
+	FQDN          string
 }
 
 // PortBinding represents a port mapping.
@@ -822,6 +824,11 @@ type CreateContainerParams struct {
 	// BackendName identifies the backend instance that created this container,
 	// stored as a label to scope list/filter operations per backend.
 	BackendName string
+
+	// Ingress holds the reverse proxy configuration.
+	// When Enabled, proxy labels are injected into the container.
+	Ingress  IngressConfig
+	Quantity int // Total quantity for this service (used in subdomain computation)
 }
 
 // portBindRetries is the number of times to retry container creation when
@@ -883,6 +890,19 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 	// Add user labels (already validated to not conflict with fred.*)
 	for k, v := range params.Manifest.Labels {
 		labels[k] = v
+	}
+
+	// Inject ingress labels for auto-discovery routing.
+	if params.Ingress.Enabled {
+		if port, ok := SelectIngressPort(params.Manifest.Ports); ok {
+			subdomain := ComputeSubdomain(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
+			fqdn := ComputeFQDN(subdomain, params.Ingress.WildcardDomain)
+			routerName := RouterName(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
+			for k, v := range TraefikLabels(params.Ingress, routerName, fqdn, port) {
+				labels[k] = v
+			}
+			labels[LabelFQDN] = fqdn
+		}
 	}
 
 	// Build environment variables
@@ -1212,6 +1232,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		FailCount:     meta.FailCount,
 		CreatedAt:     meta.CreatedAt,
 		Ports:         make(map[string]PortBinding),
+		FQDN:          resp.Config.Labels[LabelFQDN],
 	}
 
 	// Extract port bindings
@@ -1272,6 +1293,7 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			FailCount:     meta.FailCount,
 			CreatedAt:     meta.CreatedAt,
 			Ports:         make(map[string]PortBinding),
+			FQDN:          c.Labels[LabelFQDN],
 		}
 
 		// Extract port bindings from container ports
@@ -1354,6 +1376,13 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 		return "", fmt.Errorf("failed to create tenant network: %w", err)
 	}
 	return resp.ID, nil
+}
+
+// ConnectToNetwork attaches a running container to an additional Docker network.
+// Docker only supports one endpoint in EndpointsConfig at creation time, so
+// secondary networks (like the ingress network) must be connected post-creation.
+func (d *DockerClient) ConnectToNetwork(ctx context.Context, containerID, networkName string) error {
+	return d.client.NetworkConnect(ctx, networkName, containerID, nil)
 }
 
 // RemoveTenantNetworkIfEmpty removes the tenant's network if no containers are connected.

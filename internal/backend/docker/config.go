@@ -154,6 +154,11 @@ type Config struct {
 	// Entries older than this are removed by the release store's background cleanup.
 	// Defaults to 90 days.
 	ReleasesMaxAge time.Duration `yaml:"releases_max_age"`
+
+	// Ingress configures optional reverse proxy integration.
+	// When enabled, containers with routable TCP ports get proxy labels
+	// and are connected to the proxy network for HTTPS auto-discovery.
+	Ingress IngressConfig `yaml:"traefik"`
 }
 
 func ptrBool(b bool) *bool    { return &b }
@@ -415,6 +420,10 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("volume_filesystem must be btrfs, xfs, or zfs (got %q)", c.VolumeFilesystem)
 		}
+	}
+
+	if err := c.Ingress.Validate(); err != nil {
+		return err
 	}
 
 	if c.TenantQuota != nil {
