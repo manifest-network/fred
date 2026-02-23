@@ -153,6 +153,11 @@ Get connection details for a provisioned resource.
 
 The response format is flexible - return whatever fields are relevant to your resource type. Fred passes this directly to tenants. The `ports` field maps container ports (e.g., `80/tcp`) to host bindings.
 
+**Known fields** that Fred extracts into the structured `ConnectionResponse`:
+- `host`, `fqdn`, `ports`, `instances`, `services`, `protocol`, `metadata`
+
+When ingress is enabled, instances may include an `fqdn` field. If no top-level `fqdn` is present in the response, Fred propagates the first instance's `fqdn` to `connection.fqdn` automatically. The same propagation applies per-service in stack leases.
+
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned or not ready yet
 
