@@ -271,7 +271,7 @@ func TestRouter_RouteRoundRobin_Distribution(t *testing.T) {
 
 	// Round-robin across two GPU backends
 	counts := map[string]int{}
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		b := router.RouteRoundRobin("gpu-a100")
 		counts[b.Name()]++
 	}
@@ -291,7 +291,7 @@ func TestRouter_RouteRoundRobin_SingleMatch(t *testing.T) {
 	require.NoError(t, err)
 
 	// Single match always returns the same backend
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		b := router.RouteRoundRobin("gpu-a100")
 		assert.Equal(t, "solo", b.Name())
 	}
@@ -310,7 +310,7 @@ func TestRouter_RouteRoundRobin_NoMatch_FallsBackToDefault(t *testing.T) {
 	require.NoError(t, err)
 
 	// Repeated calls with unmatched SKU always return default (no divide-by-zero)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		b := router.RouteRoundRobin("unknown-sku")
 		assert.Equal(t, "default", b.Name())
 	}
@@ -334,7 +334,7 @@ func TestRouter_RouteRoundRobin_InterleavedSKUs(t *testing.T) {
 	// for different SKUs advances the counter for all groups, so the
 	// per-group distribution is not perfectly even.
 	gpuCounts := map[string]int{}
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		b := router.RouteRoundRobin("gpu-a100")
 		gpuCounts[b.Name()]++
 
@@ -373,7 +373,7 @@ func TestRouter_RouteRoundRobin_ExactSKUs(t *testing.T) {
 
 	// Round-robin across all 3 backends for a known SKU UUID
 	counts := map[string]int{}
-	for i := 0; i < 300; i++ {
+	for range 300 {
 		b := router.RouteRoundRobin("a1b2c3d4-e5f6-7890-abcd-1234567890ab")
 		counts[b.Name()]++
 	}

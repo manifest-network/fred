@@ -283,7 +283,7 @@ func (lt *LoadTester) RunPayloadTest() *Results {
 	// Ramp up workers gradually
 	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
 
-	for i := 0; i < lt.concurrency; i++ {
+	for i := range lt.concurrency {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
@@ -359,7 +359,7 @@ func (lt *LoadTester) RunConnectionTest() *Results {
 
 	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
 
-	for i := 0; i < lt.concurrency; i++ {
+	for i := range lt.concurrency {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
@@ -425,7 +425,7 @@ func (lt *LoadTester) RunCallbackTest() *Results {
 
 	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
 
-	for i := 0; i < lt.concurrency; i++ {
+	for i := range lt.concurrency {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
@@ -508,7 +508,7 @@ func (lt *LoadTester) RunMixedTest() *Results {
 
 	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
 
-	for i := 0; i < lt.concurrency; i++ {
+	for i := range lt.concurrency {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()

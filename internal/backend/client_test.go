@@ -307,7 +307,7 @@ func TestHTTPClient_CircuitBreaker(t *testing.T) {
 	})
 
 	// First 3 calls should go through to server (and fail)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
 		assert.Error(t, err)
 		assert.NotErrorIs(t, err, ErrCircuitOpen)
@@ -355,7 +355,7 @@ func TestHTTPClient_CircuitBreaker_Recovery(t *testing.T) {
 	})
 
 	// Fail twice to trip the breaker
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_ = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
 	}
 
@@ -374,7 +374,7 @@ func TestHTTPClient_CircuitBreaker_Recovery(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify circuit is closed by making more calls
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		err = client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
 		assert.NoError(t, err)
 	}

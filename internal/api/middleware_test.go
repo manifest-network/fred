@@ -279,7 +279,7 @@ func TestRequestTimeoutMiddleware_ConcurrentRequests(t *testing.T) {
 	const numRequests = 50
 	done := make(chan struct{}, numRequests)
 
-	for i := 0; i < numRequests; i++ {
+	for range numRequests {
 		go func() {
 			req := httptest.NewRequest("GET", "/concurrent", nil)
 			rec := httptest.NewRecorder()
@@ -289,7 +289,7 @@ func TestRequestTimeoutMiddleware_ConcurrentRequests(t *testing.T) {
 	}
 
 	// Wait for all requests to complete
-	for i := 0; i < numRequests; i++ {
+	for i := range numRequests {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):

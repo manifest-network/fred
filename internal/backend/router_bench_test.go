@@ -314,13 +314,13 @@ func TestHTTPClient_HighThroughput(t *testing.T) {
 	var errors atomic.Int64
 	start := time.Now()
 
-	for g := 0; g < numGoroutines; g++ {
+	for range numGoroutines {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			ctx := context.Background()
 
-			for i := 0; i < reqsPerRoutine; i++ {
+			for range reqsPerRoutine {
 				req := ProvisionRequest{
 					LeaseUUID:    "test-lease",
 					Tenant:       "manifest1test",

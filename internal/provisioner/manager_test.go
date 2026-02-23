@@ -273,7 +273,7 @@ func TestManager_TryTrackInFlight_RaceCondition(t *testing.T) {
 	// Use a channel to synchronize goroutine start (maximize contention)
 	start := make(chan struct{})
 
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		go func(workerID int) {
 			defer wg.Done()
 

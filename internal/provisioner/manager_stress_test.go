@@ -134,11 +134,11 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 	eventsPerGoroutine := numEvents / numGoroutines
 
 	// Publish events from multiple goroutines
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
-			for i := 0; i < eventsPerGoroutine; i++ {
+			for i := range eventsPerGoroutine {
 				event := chain.LeaseEvent{
 					Type:         chain.LeaseCreated,
 					LeaseUUID:    fmt.Sprintf("lease-%d-%d", gid, i),
@@ -271,7 +271,7 @@ func TestManager_SustainedLoad(t *testing.T) {
 	start := time.Now()
 
 	// Start workers
-	for w := 0; w < numWorkers; w++ {
+	for w := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
@@ -405,7 +405,7 @@ func TestManager_WithBackendLatency(t *testing.T) {
 			const numEvents = 1000
 			start := time.Now()
 
-			for i := 0; i < numEvents; i++ {
+			for i := range numEvents {
 				event := chain.LeaseEvent{
 					Type:         chain.LeaseCreated,
 					LeaseUUID:    fmt.Sprintf("latency-lease-%d", i),
@@ -550,7 +550,7 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 	var memBefore runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
 
-	for w := 0; w < numWorkers; w++ {
+	for w := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()

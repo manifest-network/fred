@@ -1162,7 +1162,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 
 		// Both requests should succeed without tracker
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
 			req.Header.Set("Authorization", "Bearer "+validToken)
 			req.SetPathValue("lease_uuid", leaseUUID)

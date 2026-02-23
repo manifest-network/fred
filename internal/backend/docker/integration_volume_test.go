@@ -5,7 +5,9 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -236,7 +238,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	assert.Error(t, err, "btrfs subvolume should be destroyed after deprovision")
 
 	_, statErr := os.Stat(subvolPath)
-	assert.True(t, os.IsNotExist(statErr), "volume directory should be gone after deprovision")
+	assert.True(t, errors.Is(statErr, fs.ErrNotExist), "volume directory should be gone after deprovision")
 }
 
 func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
@@ -478,9 +480,9 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = os.Stat(subvol0)
-	assert.True(t, os.IsNotExist(err), "subvolume 0 should be destroyed after deprovision, got err: %v", err)
+	assert.True(t, errors.Is(err, fs.ErrNotExist), "subvolume 0 should be destroyed after deprovision, got err: %v", err)
 	_, err = os.Stat(subvol1)
-	assert.True(t, os.IsNotExist(err), "subvolume 1 should be destroyed after deprovision, got err: %v", err)
+	assert.True(t, errors.Is(err, fs.ErrNotExist), "subvolume 1 should be destroyed after deprovision, got err: %v", err)
 }
 
 // TestIntegration_Docker_OrphanedVolumeCleanup verifies that orphaned volumes
@@ -587,7 +589,7 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 
 	// Orphaned volume should have been destroyed during startup
 	_, statErr := os.Stat(subvolPath)
-	assert.True(t, os.IsNotExist(statErr),
+	assert.True(t, errors.Is(statErr, fs.ErrNotExist),
 		"orphaned volume should be destroyed after backend restart, got err: %v", statErr)
 }
 

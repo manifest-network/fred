@@ -2,7 +2,9 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -45,7 +47,7 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		z.logger.Debug("reusing existing zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
 		return mountpoint, false, nil
 	}
-	if !os.IsNotExist(statErr) {
+	if !errors.Is(statErr, fs.ErrNotExist) {
 		return "", false, fmt.Errorf("stat mountpoint %s: %w", mountpoint, statErr)
 	}
 

@@ -86,7 +86,7 @@ func TestEventBroker_SlowClientDropsEvents(t *testing.T) {
 	ch := broker.Subscribe("lease-1")
 
 	// Fill the buffer (eventChannelBuffer = 16).
-	for i := 0; i < eventChannelBuffer+5; i++ {
+	for range eventChannelBuffer + 5 {
 		broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
 	}
 

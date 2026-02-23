@@ -422,30 +422,7 @@ func (c *Client) isRetryableTxError(err error) bool {
 	// Extract the gRPC status from the error (works with wrapped errors)
 	st, ok := status.FromError(err)
 	if ok {
-		switch st.Code() {
-		case codes.Unavailable:
-			// Server temporarily unavailable (connection refused, reset, etc.)
-			return true
-		case codes.DeadlineExceeded:
-			// Request timed out
-			return true
-		case codes.ResourceExhausted:
-			// Rate limited or resource exhausted - may recover
-			return true
-		case codes.Aborted:
-			// Operation was aborted (e.g., concurrency conflict) - may succeed on retry
-			return true
-		case codes.Internal:
-			// Internal server error - transient issues may resolve
-			return true
-		case codes.Unknown:
-			// Unknown error - could be transient network issue
-			return true
-		default:
-			// Other codes (InvalidArgument, NotFound, PermissionDenied, etc.)
-			// are not retryable as they indicate client errors or permanent failures
-			return false
-		}
+		return c.isRetryableGRPCCode(st.Code())
 	}
 
 	// If we can't extract a gRPC status, check the error chain for wrapped gRPC errors

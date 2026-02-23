@@ -2,8 +2,10 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc32"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -48,7 +50,7 @@ func (x *xfsVolumeManager) assignProjectID(volumeID string) (uint32, error) {
 	// Probe until we find a free slot. Project ID 0 is reserved by XFS,
 	// so skip it. Cap iterations to prevent an infinite loop if the
 	// ID space is exhausted.
-	for range math.MaxUint32 {
+	for range int64(math.MaxUint32) {
 		if candidate == 0 {
 			candidate++
 		}
@@ -141,7 +143,7 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		x.logger.Debug("reusing existing xfs quota directory", "path", dirPath, "project_id", projID, "quota_mb", sizeMB)
 		return dirPath, false, nil
 	}
-	if !os.IsNotExist(statErr) {
+	if !errors.Is(statErr, fs.ErrNotExist) {
 		return "", false, fmt.Errorf("stat volume dir %s: %w", dirPath, statErr)
 	}
 
@@ -196,7 +198,7 @@ func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	x.removeProjectID(id)
 
 	// Remove the directory (quota is implicitly freed).
-	if err := os.RemoveAll(dirPath); err != nil && !os.IsNotExist(err) {
+	if err := os.RemoveAll(dirPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove directory %s: %w", dirPath, err)
 	}
 

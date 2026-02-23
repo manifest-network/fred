@@ -94,7 +94,7 @@ func TestAckBatcher_BatchesMultipleRequests(t *testing.T) {
 
 	// Send multiple requests concurrently
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -162,7 +162,7 @@ func TestAckBatcher_FallsBackToIndividualOnBatchFailure(t *testing.T) {
 	results := make([]bool, 3)
 	errs := make([]error, 3)
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -214,7 +214,7 @@ func TestAckBatcher_FlushesOnBatchSizeReached(t *testing.T) {
 
 	// Send exactly batch size requests
 	var wg sync.WaitGroup
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -318,7 +318,7 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 	results := make([]bool, 3)
 	errs := make([]error, 3)
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

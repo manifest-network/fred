@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -137,7 +138,7 @@ func loadConfig(path string) (docker.Config, error) {
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return cfg, fmt.Errorf("config file not found: %s", path)
 		}
 		return cfg, fmt.Errorf("failed to read config: %w", err)
@@ -538,7 +539,9 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 	encoded, err := json.Marshal(data)
 	if err != nil {
 		s.logger.Error("failed to encode response", "error", err)
-		http.Error(w, `{"error":"internal encoding error"}`, http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"internal encoding error"}`))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -559,6 +562,15 @@ func (s *Server) validationErrorResponse(w http.ResponseWriter, err error) {
 		Error:          err.Error(),
 		ValidationCode: backend.ClassifyValidationError(err),
 	})
+}
+
+// jsonError writes a JSON error response with the correct Content-Type.
+// Used by standalone middleware that doesn't have access to Server methods.
+func jsonError(w http.ResponseWriter, status int, message string) {
+	encoded, _ := json.Marshal(ErrorResponse{Error: message})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(encoded)
 }
 
 const maxRequestBodySize = 1 << 20 // 1 MiB
@@ -611,14 +623,14 @@ func hmacAuthMiddleware(secret string, logger *slog.Logger) func(http.Handler) h
 			sig := r.Header.Get(hmacauth.SignatureHeader)
 			if sig == "" {
 				logger.Warn("missing signature header", "remote", r.RemoteAddr, "path", r.URL.Path)
-				http.Error(w, `{"error":"missing signature"}`, http.StatusUnauthorized)
+				jsonError(w, http.StatusUnauthorized, "missing signature")
 				return
 			}
 
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				logger.Warn("failed to read request body", "error", err)
-				http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+				jsonError(w, http.StatusRequestEntityTooLarge, "request body too large")
 				return
 			}
 
@@ -628,7 +640,7 @@ func hmacAuthMiddleware(secret string, logger *slog.Logger) func(http.Handler) h
 					"remote", r.RemoteAddr,
 					"path", r.URL.Path,
 				)
-				http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+				jsonError(w, http.StatusUnauthorized, "invalid signature")
 				return
 			}
 

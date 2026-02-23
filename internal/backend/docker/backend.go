@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -573,13 +574,13 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		if len(oldItems) > 0 {
 			// Stack: release service-aware allocation IDs.
 			for _, item := range oldItems {
-				for i := 0; i < item.Quantity; i++ {
+				for i := range item.Quantity {
 					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
 				}
 			}
 		} else {
 			// Legacy: release index-based allocation IDs.
-			for i := 0; i < oldQuantity; i++ {
+			for i := range oldQuantity {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}
 		}
@@ -658,7 +659,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	var allocatedIDs []string
 	if isStack {
 		for _, item := range req.Items {
-			for i := 0; i < item.Quantity; i++ {
+			for i := range item.Quantity {
 				instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
 				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
 					for _, id := range allocatedIDs {
@@ -673,7 +674,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	} else {
 		instanceIdx := 0
 		for _, item := range req.Items {
-			for i := 0; i < item.Quantity; i++ {
+			for range item.Quantity {
 				instanceID := fmt.Sprintf("%s-%d", req.LeaseUUID, instanceIdx)
 				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
 					for _, id := range allocatedIDs {
@@ -851,11 +852,7 @@ func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manife
 		return nil, fmt.Errorf("image inspect failed: %w", err)
 	}
 
-	var volumes []string
-	for v := range imageInfo.Volumes {
-		volumes = append(volumes, v)
-	}
-	slices.Sort(volumes)
+	volumes := slices.Sorted(maps.Keys(imageInfo.Volumes))
 
 	result := &imageSetup{Volumes: volumes}
 
@@ -1050,7 +1047,7 @@ func (b *Backend) setupStackVolBinds(
 		profile := profiles[item.SKU]
 		imgSetup := imageSetups[svcName]
 
-		for i := 0; i < item.Quantity; i++ {
+		for i := range item.Quantity {
 			needsStatefulVolume := profile.DiskMB > 0 && len(imgSetup.Volumes) > 0
 			needsWritableVolume := len(imgSetup.WritablePaths) > 0
 
@@ -1139,7 +1136,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			logger.Error("provision failed", "lease_uuid", req.LeaseUUID, "error", err)
 			provisionsTotal.WithLabelValues("failure").Inc()
 			// Clean up on failure - release all allocated resources
-			for i := 0; i < totalQuantity; i++ {
+			for i := range totalQuantity {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}
 
@@ -1266,7 +1263,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	for _, item := range req.Items {
 		profile := profiles[item.SKU]
 
-		for i := 0; i < item.Quantity; i++ {
+		for range item.Quantity {
 			instanceLogger := logger.With("instance", instanceIndex, "sku", item.SKU)
 
 			// Create container with instance index for unique naming
@@ -1420,7 +1417,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 
 			// Release all service-aware allocation IDs.
 			for _, item := range req.Items {
-				for i := 0; i < item.Quantity; i++ {
+				for i := range item.Quantity {
 					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
 				}
 			}
@@ -1719,8 +1716,9 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		return backend.ErrNotProvisioned
 	}
 	if prov.Status != backend.ProvisionStatusReady && prov.Status != backend.ProvisionStatusFailed {
+		status := prov.Status
 		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, prov.Status)
+		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, status)
 	}
 	if prov.Manifest == nil && prov.StackManifest == nil {
 		b.provisionsMu.Unlock()
@@ -1734,9 +1732,12 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	}
 	manifest := prov.Manifest
 	stackManifest := prov.StackManifest
-	containerIDs := prov.ContainerIDs
-	serviceContainers := prov.ServiceContainers
-	items := prov.Items
+	containerIDs := append([]string(nil), prov.ContainerIDs...)
+	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+	for k, v := range prov.ServiceContainers {
+		serviceContainers[k] = append([]string(nil), v...)
+	}
+	items := append([]backend.LeaseItem(nil), prov.Items...)
 	sku := prov.SKU
 	b.provisionsMu.Unlock()
 
@@ -2418,8 +2419,9 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return backend.ErrNotProvisioned
 	}
 	if prov.Status != backend.ProvisionStatusReady && prov.Status != backend.ProvisionStatusFailed {
+		status := prov.Status
 		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, prov.Status)
+		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, status)
 	}
 
 	isStack := prov.IsStack()
@@ -2468,9 +2470,12 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			profiles[item.SKU] = profile
 		}
 
-		oldContainerIDs := prov.ContainerIDs
-		serviceContainers := prov.ServiceContainers
-		items := prov.Items
+		oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
+		serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+		for k, v := range prov.ServiceContainers {
+			serviceContainers[k] = append([]string(nil), v...)
+		}
+		items := append([]backend.LeaseItem(nil), prov.Items...)
 		prevStatus := prov.Status
 		prov.Status = backend.ProvisionStatusUpdating
 		if req.CallbackURL != "" {
@@ -2520,7 +2525,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
 	}
 
-	oldContainerIDs := prov.ContainerIDs
+	oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
 	prevStatus := prov.Status
 	prov.Status = backend.ProvisionStatusUpdating
 	if req.CallbackURL != "" {
@@ -2665,22 +2670,32 @@ func (b *Backend) GetReleases(_ context.Context, leaseUUID string) ([]backend.Re
 func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
-	b.provisionsMu.RUnlock()
-
 	if !exists {
+		b.provisionsMu.RUnlock()
 		return nil, backend.ErrNotProvisioned
 	}
+	status := prov.Status
+	isStack := prov.IsStack()
+	containerIDs := append([]string(nil), prov.ContainerIDs...)
+	var serviceContainers map[string][]string
+	if isStack {
+		serviceContainers = make(map[string][]string, len(prov.ServiceContainers))
+		for k, v := range prov.ServiceContainers {
+			serviceContainers[k] = append([]string(nil), v...)
+		}
+	}
+	b.provisionsMu.RUnlock()
 
-	if prov.Status != backend.ProvisionStatusReady {
+	if status != backend.ProvisionStatusReady {
 		return nil, backend.ErrNotProvisioned
 	}
 
 	// Stack response: group instances by service name.
-	if prov.IsStack() {
+	if isStack {
 		services := make(map[string]any)
-		for svcName, containerIDs := range prov.ServiceContainers {
+		for svcName, svcContainerIDs := range serviceContainers {
 			var instances []map[string]any
-			for _, containerID := range containerIDs {
+			for _, containerID := range svcContainerIDs {
 				info, err := b.docker.InspectContainer(ctx, containerID)
 				if err != nil {
 					return nil, fmt.Errorf("failed to inspect container: %w", err)
@@ -2717,7 +2732,7 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 
 	// Legacy response: flat instances array.
 	var instances []map[string]any
-	for _, containerID := range prov.ContainerIDs {
+	for _, containerID := range containerIDs {
 		info, err := b.docker.InspectContainer(ctx, containerID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to inspect container: %w", err)
@@ -2777,6 +2792,11 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	// from racing with removal. Die events emitted during RemoveContainer will
 	// see a non-Ready status and be skipped.
 	prov.Status = backend.ProvisionStatusFailed
+	isStack := prov.IsStack()
+	containerIDs := append([]string(nil), prov.ContainerIDs...)
+	items := append([]backend.LeaseItem(nil), prov.Items...)
+	quantity := prov.Quantity
+	tenant := prov.Tenant
 	b.provisionsMu.Unlock()
 
 	// Remove all containers.
@@ -2784,11 +2804,11 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	// removal if Compose fails. For single-container leases, use RemoveContainer.
 	var errs []error
 	var failedIDs []string
-	if prov.IsStack() {
+	if isStack {
 		stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 		if downErr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); downErr != nil {
 			logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
-			for _, containerID := range prov.ContainerIDs {
+			for _, containerID := range containerIDs {
 				if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
 					logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
 					errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
@@ -2801,7 +2821,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			logger.Info("compose down completed", "project", composeProjectName(leaseUUID))
 		}
 	} else {
-		for _, containerID := range prov.ContainerIDs {
+		for _, containerID := range containerIDs {
 			if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
 				logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
 				errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
@@ -2814,14 +2834,14 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 
 	// Release resource pool allocations regardless of outcome — the lease
 	// is being abandoned and these resources should be freed.
-	if prov.IsStack() {
-		for _, item := range prov.Items {
-			for i := 0; i < item.Quantity; i++ {
+	if isStack {
+		for _, item := range items {
+			for i := range item.Quantity {
 				b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
 			}
 		}
 	} else {
-		for i := 0; i < prov.Quantity; i++ {
+		for i := range quantity {
 			b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
 		}
 	}
@@ -2844,9 +2864,9 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 
 	// Destroy managed volumes for all instances.
 	var volumeErrs []error
-	if prov.IsStack() {
-		for _, item := range prov.Items {
-			for i := 0; i < item.Quantity; i++ {
+	if isStack {
+		for _, item := range items {
+			for i := range item.Quantity {
 				volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)
 				if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
 					logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
@@ -2855,7 +2875,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			}
 		}
 	} else {
-		for i := 0; i < prov.Quantity; i++ {
+		for i := range quantity {
 			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
 			if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
 				logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
@@ -2921,15 +2941,15 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 
 	// Clean up tenant network if isolation is enabled
 	if b.cfg.IsNetworkIsolation() {
-		if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, prov.Tenant); err != nil {
-			logger.Warn("failed to remove tenant network", "tenant", prov.Tenant, "error", err)
+		if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+			logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
 		}
 	}
 
 	deprovisionsTotal.Inc()
 	activeProvisions.Dec()
 	updateResourceMetrics(b.pool.Stats())
-	logger.Info("deprovisioned", "containers_removed", len(prov.ContainerIDs))
+	logger.Info("deprovisioned", "containers_removed", len(containerIDs))
 	return nil
 }
 
@@ -2944,10 +2964,9 @@ func (b *Backend) RefreshState(ctx context.Context) error {
 func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
 	b.provisionsMu.RLock()
 	prov, ok := b.provisions[leaseUUID]
-	b.provisionsMu.RUnlock()
-
+	var info *backend.ProvisionInfo
 	if ok {
-		return &backend.ProvisionInfo{
+		info = &backend.ProvisionInfo{
 			LeaseUUID:    prov.LeaseUUID,
 			ProviderUUID: prov.ProviderUUID,
 			Status:       prov.Status,
@@ -2955,7 +2974,12 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 			BackendName:  b.cfg.Name,
 			FailCount:    prov.FailCount,
 			LastError:    prov.LastError,
-		}, nil
+		}
+	}
+	b.provisionsMu.RUnlock()
+
+	if info != nil {
+		return info, nil
 	}
 
 	// Fall back to persisted diagnostics.
@@ -3237,17 +3261,28 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		allocations = append(allocations, allocs...)
 	}
 	b.pool.Reset(allocations)
+
+	// Snapshot aggregate stats from the recovered map before releasing the lock.
+	// After unlock, `recovered` aliases `b.provisions` and concurrent goroutines
+	// may modify both the map and the pointed-to provision structs.
+	var readyCount float64
+	totalContainers := 0
+	leaseCount := len(recovered)
+	activeTenants := make(map[string]bool, len(recovered))
+	for _, p := range recovered {
+		if p.Status == backend.ProvisionStatusReady {
+			readyCount++
+		}
+		totalContainers += len(p.ContainerIDs)
+		if p.Tenant != "" {
+			activeTenants[p.Tenant] = true
+		}
+	}
 	b.provisionsMu.Unlock()
 
 	// Reset the active provisions gauge from the recovered map. Without this,
 	// the gauge drifts (and can go negative) because Inc/Dec are only called
 	// during normal Provision/Deprovision, but recoverState replaces the map.
-	var readyCount float64
-	for _, p := range recovered {
-		if p.Status == backend.ProvisionStatusReady {
-			readyCount++
-		}
-	}
 	activeProvisions.Set(readyCount)
 	updateResourceMetrics(b.pool.Stats())
 
@@ -3261,7 +3296,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			b.provisionsMu.RUnlock()
 			continue
 		}
-		containerIDs := prov.ContainerIDs
+		containerIDs := append([]string(nil), prov.ContainerIDs...)
 		b.provisionsMu.RUnlock()
 
 		for _, cid := range containerIDs {
@@ -3317,14 +3352,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.sendCallback(uuid, false, errMsgContainerExited)
 	}
 
-	totalContainers := 0
-	for _, p := range recovered {
-		totalContainers += len(p.ContainerIDs)
-	}
-
 	stats := b.pool.Stats()
 	logAttrs := []any{
-		"leases", len(recovered),
+		"leases", leaseCount,
 		"containers", totalContainers,
 		"cpu_allocated", stats.AllocatedCPU,
 		"memory_allocated_mb", stats.AllocatedMemoryMB,
@@ -3336,7 +3366,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	// Clean up orphaned tenant networks if network isolation is enabled
 	if b.cfg.IsNetworkIsolation() {
-		b.cleanupOrphanedNetworks(ctx, recovered)
+		b.cleanupOrphanedNetworks(ctx, activeTenants)
 	}
 
 	return nil
@@ -3361,12 +3391,12 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	for leaseUUID, prov := range b.provisions {
 		if prov.IsStack() {
 			for _, item := range prov.Items {
-				for i := 0; i < item.Quantity; i++ {
+				for i := range item.Quantity {
 					expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
 				}
 			}
 		} else {
-			for i := 0; i < prov.Quantity; i++ {
+			for i := range prov.Quantity {
 				expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
 			}
 		}
@@ -3393,17 +3423,11 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 }
 
 // cleanupOrphanedNetworks removes managed networks whose tenant has no active provisions.
-func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, provisions map[string]*provision) {
+func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map[string]bool) {
 	networks, err := b.docker.ListManagedNetworks(ctx)
 	if err != nil {
 		b.logger.Warn("failed to list managed networks for cleanup", "error", err)
 		return
-	}
-
-	// Build set of active tenants
-	activeTenants := make(map[string]bool)
-	for _, p := range provisions {
-		activeTenants[p.Tenant] = true
 	}
 
 	for _, n := range networks {
@@ -3489,7 +3513,7 @@ func (b *Backend) containerEventLoop() {
 // Failed and sends a callback — the same transition that recoverState
 // performs, but for a single container in real time.
 func (b *Backend) handleContainerDeath(containerID string) {
-	leaseUUID, _, found := b.findLeaseByContainerID(containerID)
+	leaseUUID, found := b.findLeaseByContainerID(containerID)
 	if !found {
 		return
 	}
@@ -3534,6 +3558,7 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	}
 	currentProv.Status = backend.ProvisionStatusFailed
 	currentProv.FailCount++
+	failCount := currentProv.FailCount
 	currentProv.LastError = errMsgContainerExited
 	b.provisionsMu.Unlock()
 
@@ -3567,7 +3592,7 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	logAttrs := []any{
 		"lease_uuid", leaseUUID,
 		"container_id", shortID(containerID),
-		"fail_count", currentProv.FailCount,
+		"fail_count", failCount,
 	}
 	if info.ServiceName != "" {
 		logAttrs = append(logAttrs, "service_name", info.ServiceName)
@@ -3575,21 +3600,21 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	b.logger.Warn("container death detected via events API", logAttrs...)
 }
 
-// findLeaseByContainerID returns the lease UUID, provision, and true if a
-// provision containing the given container ID is found. Returns ("", nil, false)
-// otherwise. Called under no lock; acquires read lock internally.
-func (b *Backend) findLeaseByContainerID(containerID string) (string, *provision, bool) {
+// findLeaseByContainerID returns the lease UUID and true if a provision
+// containing the given container ID is found. Returns ("", false) otherwise.
+// Called under no lock; acquires read lock internally.
+func (b *Backend) findLeaseByContainerID(containerID string) (string, bool) {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
 
 	for uuid, prov := range b.provisions {
 		for _, cid := range prov.ContainerIDs {
 			if cid == containerID {
-				return uuid, prov, true
+				return uuid, true
 			}
 		}
 	}
-	return "", nil, false
+	return "", false
 }
 
 // GetLogs returns the last N lines of stdout/stderr for each container in
@@ -3601,14 +3626,23 @@ func (b *Backend) findLeaseByContainerID(containerID string) (string, *provision
 func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
-	b.provisionsMu.RUnlock()
-
 	if exists {
+		isStack := prov.IsStack()
+		containerIDs := append([]string(nil), prov.ContainerIDs...)
+		var serviceContainers map[string][]string
+		if isStack {
+			serviceContainers = make(map[string][]string, len(prov.ServiceContainers))
+			for k, v := range prov.ServiceContainers {
+				serviceContainers[k] = append([]string(nil), v...)
+			}
+		}
+		b.provisionsMu.RUnlock()
+
 		// Stack logs: key by "serviceName/instanceIndex" (e.g., "web/0", "db/0").
-		if prov.IsStack() {
-			result := make(map[string]string, len(prov.ContainerIDs))
-			for svcName, containerIDs := range prov.ServiceContainers {
-				for i, containerID := range containerIDs {
+		if isStack {
+			result := make(map[string]string, len(containerIDs))
+			for svcName, svcContainerIDs := range serviceContainers {
+				for i, containerID := range svcContainerIDs {
 					key := fmt.Sprintf("%s/%d", svcName, i)
 					logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
 					if err != nil {
@@ -3629,8 +3663,8 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 		}
 
 		// Legacy logs: key by instance index ("0", "1", ...).
-		result := make(map[string]string, len(prov.ContainerIDs))
-		for i, containerID := range prov.ContainerIDs {
+		result := make(map[string]string, len(containerIDs))
+		for i, containerID := range containerIDs {
 			logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
 			if err != nil {
 				b.logger.Warn("failed to retrieve container logs",
@@ -3646,6 +3680,7 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 		}
 		return result, nil
 	}
+	b.provisionsMu.RUnlock()
 
 	// Fall back to persisted diagnostics.
 	if b.diagnosticsStore != nil {

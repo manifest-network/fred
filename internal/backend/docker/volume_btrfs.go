@@ -2,7 +2,9 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -30,7 +32,7 @@ func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64
 		b.logger.Debug("reusing existing btrfs subvolume", "path", subvolPath, "quota_mb", sizeMB)
 		return subvolPath, false, nil
 	}
-	if !os.IsNotExist(statErr) {
+	if !errors.Is(statErr, fs.ErrNotExist) {
 		return "", false, fmt.Errorf("stat subvolume %s: %w", subvolPath, statErr)
 	}
 

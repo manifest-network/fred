@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -31,7 +33,7 @@ func TestNewTokenTracker(t *testing.T) {
 
 		// Check file exists
 		_, err = os.Stat(dbPath)
-		assert.False(t, os.IsNotExist(err), "database file was not created")
+		assert.False(t, errors.Is(err, fs.ErrNotExist), "database file was not created")
 	})
 
 	t.Run("uses_default_max_age", func(t *testing.T) {

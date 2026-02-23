@@ -78,7 +78,7 @@ func BenchmarkTokenTracker_ReplayDetection(b *testing.B) {
 	// Pre-populate with tokens
 	const numTokens = 1000
 	tokens := make([]string, numTokens)
-	for i := 0; i < numTokens; i++ {
+	for i := range numTokens {
 		tokens[i] = fmt.Sprintf("preload-token-%d", i)
 		if err := tracker.TryUse(tokens[i]); err != nil {
 			b.Fatal(err)
@@ -114,7 +114,7 @@ func BenchmarkTokenTracker_MixedWorkload(b *testing.B) {
 	// Pre-populate with some tokens (simulating replay attempts)
 	const numExistingTokens = 100
 	existingTokens := make([]string, numExistingTokens)
-	for i := 0; i < numExistingTokens; i++ {
+	for i := range numExistingTokens {
 		existingTokens[i] = fmt.Sprintf("existing-token-%d", i)
 		tracker.TryUse(existingTokens[i])
 	}
@@ -170,12 +170,12 @@ func TestTokenTracker_StressTest(t *testing.T) {
 		sharedTokens[i] = fmt.Sprintf("shared-token-%d", i)
 	}
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
 
-			for i := 0; i < opsPerRoutine; i++ {
+			for i := range opsPerRoutine {
 				var token string
 				if i%20 == 0 {
 					// 5% use shared tokens (high contention)
@@ -247,12 +247,12 @@ func TestTokenTracker_HighContention(t *testing.T) {
 	var firstUse, replayDetected, errors atomic.Int64
 	start := time.Now()
 
-	for g := 0; g < numGoroutines; g++ {
+	for range numGoroutines {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			for i := 0; i < opsPerRoutine; i++ {
+			for i := range opsPerRoutine {
 				token := sharedTokens[i%numSharedTokens]
 				err := tracker.TryUse(token)
 				switch err {

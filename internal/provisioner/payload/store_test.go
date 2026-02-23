@@ -176,13 +176,13 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		go func(id int) {
 			defer wg.Done()
 			uuid := testutil.ValidUUID1
 			payload := []byte("payload")
 
-			for j := 0; j < numOperations; j++ {
+			for j := range numOperations {
 				switch j % 5 {
 				case 0:
 					store.Store(uuid, payload)
@@ -349,7 +349,7 @@ func TestStore_FlushOnClose(t *testing.T) {
 	require.NoError(t, err, "NewStore() error")
 
 	// Store multiple items
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		key := string(rune('a' + i))
 		store.Store(key, []byte("data"))
 	}
@@ -384,7 +384,7 @@ func TestStore_BatchingConcurrentWrites(t *testing.T) {
 	wg.Add(numWrites)
 
 	// Concurrent writes with unique keys
-	for i := 0; i < numWrites; i++ {
+	for i := range numWrites {
 		go func(id int) {
 			defer wg.Done()
 			// Generate unique key using format: "batch-NNN"
@@ -412,7 +412,7 @@ func TestStore_BatchingMixedOperations(t *testing.T) {
 	defer store.Close()
 
 	// Store multiple items
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		key := string(rune('a' + i))
 		store.Store(key, []byte("initial"))
 	}
@@ -431,7 +431,7 @@ func TestStore_BatchingMixedOperations(t *testing.T) {
 	}
 
 	// 10 pops
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		go func(id int) {
 			defer wg.Done()
 			key := string(rune('a' + id))
@@ -721,7 +721,7 @@ func TestStore_CloseDrainsPendingWrites(t *testing.T) {
 	wg.Add(numWriters)
 
 	// Start writers that will queue up operations
-	for i := 0; i < numWriters; i++ {
+	for i := range numWriters {
 		go func(id int) {
 			defer wg.Done()
 			leaseUUID := strings.Repeat("a", 8) + "-" + string(rune('0'+id%10))

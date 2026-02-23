@@ -218,15 +218,14 @@ func TestFindLeaseByContainerID(t *testing.T) {
 		},
 	})
 
-	uuid, prov, found := b.findLeaseByContainerID("c2")
+	uuid, found := b.findLeaseByContainerID("c2")
 	assert.True(t, found)
 	assert.Equal(t, "lease-1", uuid)
-	assert.Equal(t, "lease-1", prov.LeaseUUID)
 
-	uuid, _, found = b.findLeaseByContainerID("c3")
+	uuid, found = b.findLeaseByContainerID("c3")
 	assert.True(t, found)
 	assert.Equal(t, "lease-2", uuid)
 
-	_, _, found = b.findLeaseByContainerID("nonexistent")
+	_, found = b.findLeaseByContainerID("nonexistent")
 	assert.False(t, found)
 }

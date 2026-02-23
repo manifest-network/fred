@@ -223,13 +223,13 @@ func TestManager_HighThroughput(t *testing.T) {
 	var wg sync.WaitGroup
 	start := time.Now()
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
 			eventsPerGoroutine := numEvents / numGoroutines
 
-			for i := 0; i < eventsPerGoroutine; i++ {
+			for i := range eventsPerGoroutine {
 				event := chain.LeaseEvent{
 					Type:         chain.LeaseCreated,
 					LeaseUUID:    fmt.Sprintf("lease-%d-%d", gid, i),
@@ -318,8 +318,8 @@ func TestManager_BurstTraffic(t *testing.T) {
 	totalEvents := numBursts * eventsPerBurst
 	start := time.Now()
 
-	for burst := 0; burst < numBursts; burst++ {
-		for i := 0; i < eventsPerBurst; i++ {
+	for burst := range numBursts {
+		for i := range eventsPerBurst {
 			event := chain.LeaseEvent{
 				Type:         chain.LeaseCreated,
 				LeaseUUID:    fmt.Sprintf("lease-burst%d-%d", burst, i),
