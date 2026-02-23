@@ -915,6 +915,61 @@ func extractPortMapping(binding map[string]any) PortMapping {
 	}
 }
 
+// parseInstanceInfo extracts an InstanceInfo from an untyped instance map.
+// Handles two port-binding representations:
+//   - map[string]map[string]string: the typed Go format used when LeaseInfo is
+//     constructed in-process (e.g., in tests or future in-process backends)
+//   - map[string]any: the JSON-unmarshaled format produced when data has been
+//     round-tripped through JSON (the normal production path via HTTP)
+func parseInstanceInfo(inst map[string]any) InstanceInfo {
+	instance := InstanceInfo{}
+
+	if idx, ok := inst["instance_index"].(float64); ok {
+		instance.InstanceIndex = int(idx)
+	} else if idx, ok := inst["instance_index"].(int); ok {
+		instance.InstanceIndex = idx
+	}
+	if cid, ok := inst["container_id"].(string); ok {
+		instance.ContainerID = cid
+	}
+	if img, ok := inst["image"].(string); ok {
+		instance.Image = img
+	}
+	if status, ok := inst["status"].(string); ok {
+		instance.Status = status
+	}
+	if fqdn, ok := inst["fqdn"].(string); ok {
+		instance.FQDN = fqdn
+	}
+
+	// Handle typed format from Docker backend
+	if ports, ok := inst["ports"].(map[string]map[string]string); ok {
+		instance.Ports = make(map[string]PortMapping, len(ports))
+		for containerPort, binding := range ports {
+			var hostPort int
+			if hp, ok := binding["host_port"]; ok {
+				if parsed, err := strconv.Atoi(hp); err == nil {
+					hostPort = parsed
+				}
+			}
+			instance.Ports[containerPort] = PortMapping{
+				HostIP:   binding["host_ip"],
+				HostPort: hostPort,
+			}
+		}
+	} else if ports, ok := inst["ports"].(map[string]any); ok {
+		// Handle JSON-unmarshaled format
+		instance.Ports = make(map[string]PortMapping, len(ports))
+		for containerPort, bindingAny := range ports {
+			if binding, ok := bindingAny.(map[string]any); ok {
+				instance.Ports[containerPort] = extractPortMapping(binding)
+			}
+		}
+	}
+
+	return instance
+}
+
 // extractConnectionDetails extracts ConnectionDetails from a backend LeaseInfo map.
 // Known fields (host, port, ports, protocol, metadata) are mapped to struct fields.
 // Unknown top-level string fields are placed in Metadata.
@@ -974,44 +1029,7 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 	if instances, ok := info["instances"].([]any); ok {
 		for _, instAny := range instances {
 			if inst, ok := instAny.(map[string]any); ok {
-				instance := InstanceInfo{}
-
-				// Extract instance index
-				if idx, ok := inst["instance_index"].(float64); ok {
-					instance.InstanceIndex = int(idx)
-				}
-
-				// Extract container ID
-				if cid, ok := inst["container_id"].(string); ok {
-					instance.ContainerID = cid
-				}
-
-				// Extract image
-				if img, ok := inst["image"].(string); ok {
-					instance.Image = img
-				}
-
-				// Extract status
-				if status, ok := inst["status"].(string); ok {
-					instance.Status = status
-				}
-
-				// Extract FQDN
-				if fqdn, ok := inst["fqdn"].(string); ok {
-					instance.FQDN = fqdn
-				}
-
-				// Extract per-instance ports
-				if ports, ok := inst["ports"].(map[string]any); ok {
-					instance.Ports = make(map[string]PortMapping)
-					for containerPort, bindingAny := range ports {
-						if binding, ok := bindingAny.(map[string]any); ok {
-							instance.Ports[containerPort] = extractPortMapping(binding)
-						}
-					}
-				}
-
-				details.Instances = append(details.Instances, instance)
+				details.Instances = append(details.Instances, parseInstanceInfo(inst))
 			}
 		}
 	}
@@ -1030,39 +1048,18 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 				continue
 			}
 			var svcDetails ServiceConnectionDetails
+			if fqdn, ok := svcData["fqdn"].(string); ok {
+				svcDetails.FQDN = fqdn
+			}
 			if svcInstances, ok := svcData["instances"].([]any); ok {
 				for _, instAny := range svcInstances {
 					if inst, ok := instAny.(map[string]any); ok {
-						instance := InstanceInfo{}
-						if idx, ok := inst["instance_index"].(float64); ok {
-							instance.InstanceIndex = int(idx)
-						}
-						if cid, ok := inst["container_id"].(string); ok {
-							instance.ContainerID = cid
-						}
-						if img, ok := inst["image"].(string); ok {
-							instance.Image = img
-						}
-						if status, ok := inst["status"].(string); ok {
-							instance.Status = status
-						}
-						if fqdn, ok := inst["fqdn"].(string); ok {
-							instance.FQDN = fqdn
-						}
-						if ports, ok := inst["ports"].(map[string]any); ok {
-							instance.Ports = make(map[string]PortMapping)
-							for containerPort, bindingAny := range ports {
-								if binding, ok := bindingAny.(map[string]any); ok {
-									instance.Ports[containerPort] = extractPortMapping(binding)
-								}
-							}
-						}
-						svcDetails.Instances = append(svcDetails.Instances, instance)
+						svcDetails.Instances = append(svcDetails.Instances, parseInstanceInfo(inst))
 					}
 				}
 			}
 			// Propagate FQDN from the first instance to the service level
-			if len(svcDetails.Instances) > 0 {
+			if svcDetails.FQDN == "" && len(svcDetails.Instances) > 0 {
 				svcDetails.FQDN = svcDetails.Instances[0].FQDN
 			}
 			details.Services[svcName] = svcDetails

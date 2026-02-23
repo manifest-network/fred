@@ -823,6 +823,30 @@ func TestExtractConnectionDetails(t *testing.T) {
 			},
 		},
 		{
+			name: "instance with typed port map from docker backend",
+			input: backend.LeaseInfo{
+				"host": "docker-host.example.com",
+				"instances": []any{
+					map[string]any{
+						"instance_index": 0,
+						"container_id":   "abc123",
+						"ports": map[string]map[string]string{
+							"80/tcp": {"host_ip": "0.0.0.0", "host_port": "8080"},
+						},
+					},
+				},
+			},
+			expectedHost: "docker-host.example.com",
+			expectedMeta: map[string]string{},
+			expectedInstances: []InstanceInfo{
+				{
+					InstanceIndex: 0,
+					ContainerID:   "abc123",
+					Ports:         map[string]PortMapping{"80/tcp": {HostIP: "0.0.0.0", HostPort: 8080}},
+				},
+			},
+		},
+		{
 			name: "instances field is not included in metadata",
 			input: backend.LeaseInfo{
 				"host": "docker-host.example.com",
@@ -868,6 +892,7 @@ func TestExtractConnectionDetails(t *testing.T) {
 				assert.Equal(t, expected.ContainerID, actual.ContainerID)
 				assert.Equal(t, expected.Image, actual.Image)
 				assert.Equal(t, expected.Status, actual.Status)
+				assert.Equal(t, expected.FQDN, actual.FQDN)
 				assert.Len(t, actual.Ports, len(expected.Ports))
 				for k, v := range expected.Ports {
 					assert.Equal(t, v, actual.Ports[k])
@@ -927,6 +952,32 @@ func TestExtractConnectionDetails_Services(t *testing.T) {
 		dbSvc := result.Services["db"]
 		require.Len(t, dbSvc.Instances, 1)
 		assert.Equal(t, "postgres:16", dbSvc.Instances[0].Image)
+	})
+
+	t.Run("service instance ports with typed map from docker backend", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"services": map[string]any{
+				"web": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": 2,
+							"container_id":   "abc123",
+							"ports": map[string]map[string]string{
+								"80/tcp": {"host_ip": "0.0.0.0", "host_port": "8080"},
+							},
+						},
+					},
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		require.Len(t, result.Services, 1)
+		webSvc := result.Services["web"]
+		require.Len(t, webSvc.Instances, 1)
+		assert.Equal(t, 2, webSvc.Instances[0].InstanceIndex)
+		require.Len(t, webSvc.Instances[0].Ports, 1)
+		assert.Equal(t, PortMapping{HostIP: "0.0.0.0", HostPort: 8080}, webSvc.Instances[0].Ports["80/tcp"])
 	})
 
 	t.Run("services field not in metadata", func(t *testing.T) {
@@ -1099,6 +1150,28 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 		require.Len(t, webSvc.Instances, 2)
 		assert.Equal(t, "web-0-abc.example.com", webSvc.Instances[0].FQDN)
 		assert.Equal(t, "web-1-def.example.com", webSvc.Instances[1].FQDN)
+	})
+
+	t.Run("explicit service fqdn takes precedence over instance fqdn", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"services": map[string]any{
+				"web": map[string]any{
+					"fqdn": "explicit-web.example.com",
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "abc123",
+							"fqdn":           "instance-web.example.com",
+						},
+					},
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		require.Len(t, result.Services, 1)
+		assert.Equal(t, "explicit-web.example.com", result.Services["web"].FQDN)
+		assert.Equal(t, "instance-web.example.com", result.Services["web"].Instances[0].FQDN)
 	})
 
 	t.Run("service without fqdn in instances", func(t *testing.T) {
