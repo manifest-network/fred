@@ -113,12 +113,13 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 			return 80, true
 		}
 
-		if !found {
+		switch {
+		case !found:
 			bestPort = port
 			found = true
-		} else if port == 8080 && bestPort != 80 {
+		case port == 8080 && bestPort != 80:
 			bestPort = 8080
-		} else if bestPort != 80 && bestPort != 8080 && port < bestPort {
+		case bestPort != 80 && bestPort != 8080 && port < bestPort:
 			bestPort = port
 		}
 	}
@@ -131,7 +132,7 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 // Traefik-specific function; everything else is proxy-agnostic.
 func TraefikLabels(cfg IngressConfig, routerName, fqdn string, containerPort int) map[string]string {
 	return map[string]string{
-		"traefik.enable":        "true",
+		"traefik.enable":         "true",
 		"traefik.docker.network": cfg.Network,
 		fmt.Sprintf("traefik.http.routers.%s.rule", routerName):                      fmt.Sprintf("Host(`%s`)", fqdn),
 		fmt.Sprintf("traefik.http.routers.%s.entrypoints", routerName):               cfg.Entrypoint,

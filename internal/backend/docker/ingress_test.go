@@ -103,8 +103,8 @@ func TestComputeSubdomain(t *testing.T) {
 
 	t.Run("different long names with shared prefix do not collide", func(t *testing.T) {
 		prefix := strings.Repeat("a", 50)
-		nameA := prefix + "-alpha-version"  // 63 chars+
-		nameB := prefix + "-bravo-version"  // 63 chars+
+		nameA := prefix + "-alpha-version" // 63 chars+
+		nameB := prefix + "-bravo-version" // 63 chars+
 		subA := ComputeSubdomain(leaseUUID, nameA, 0, 1)
 		subB := ComputeSubdomain(leaseUUID, nameB, 0, 1)
 		assert.LessOrEqual(t, len(subA), 63)
