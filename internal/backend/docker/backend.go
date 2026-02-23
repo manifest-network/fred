@@ -1732,9 +1732,12 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	}
 	manifest := prov.Manifest
 	stackManifest := prov.StackManifest
-	containerIDs := prov.ContainerIDs
-	serviceContainers := prov.ServiceContainers
-	items := prov.Items
+	containerIDs := append([]string(nil), prov.ContainerIDs...)
+	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+	for k, v := range prov.ServiceContainers {
+		serviceContainers[k] = append([]string(nil), v...)
+	}
+	items := append([]backend.LeaseItem(nil), prov.Items...)
 	sku := prov.SKU
 	b.provisionsMu.Unlock()
 
@@ -2467,9 +2470,12 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			profiles[item.SKU] = profile
 		}
 
-		oldContainerIDs := prov.ContainerIDs
-		serviceContainers := prov.ServiceContainers
-		items := prov.Items
+		oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
+		serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+		for k, v := range prov.ServiceContainers {
+			serviceContainers[k] = append([]string(nil), v...)
+		}
+		items := append([]backend.LeaseItem(nil), prov.Items...)
 		prevStatus := prov.Status
 		prov.Status = backend.ProvisionStatusUpdating
 		if req.CallbackURL != "" {
@@ -2519,7 +2525,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
 	}
 
-	oldContainerIDs := prov.ContainerIDs
+	oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
 	prevStatus := prov.Status
 	prov.Status = backend.ProvisionStatusUpdating
 	if req.CallbackURL != "" {
@@ -2788,7 +2794,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	prov.Status = backend.ProvisionStatusFailed
 	isStack := prov.IsStack()
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
-	items := prov.Items
+	items := append([]backend.LeaseItem(nil), prov.Items...)
 	quantity := prov.Quantity
 	tenant := prov.Tenant
 	b.provisionsMu.Unlock()
@@ -3507,7 +3513,7 @@ func (b *Backend) containerEventLoop() {
 // Failed and sends a callback — the same transition that recoverState
 // performs, but for a single container in real time.
 func (b *Backend) handleContainerDeath(containerID string) {
-	leaseUUID, _, found := b.findLeaseByContainerID(containerID)
+	leaseUUID, found := b.findLeaseByContainerID(containerID)
 	if !found {
 		return
 	}
@@ -3594,21 +3600,21 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	b.logger.Warn("container death detected via events API", logAttrs...)
 }
 
-// findLeaseByContainerID returns the lease UUID, provision, and true if a
-// provision containing the given container ID is found. Returns ("", nil, false)
-// otherwise. Called under no lock; acquires read lock internally.
-func (b *Backend) findLeaseByContainerID(containerID string) (string, *provision, bool) {
+// findLeaseByContainerID returns the lease UUID and true if a provision
+// containing the given container ID is found. Returns ("", false) otherwise.
+// Called under no lock; acquires read lock internally.
+func (b *Backend) findLeaseByContainerID(containerID string) (string, bool) {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
 
 	for uuid, prov := range b.provisions {
 		for _, cid := range prov.ContainerIDs {
 			if cid == containerID {
-				return uuid, prov, true
+				return uuid, true
 			}
 		}
 	}
-	return "", nil, false
+	return "", false
 }
 
 // GetLogs returns the last N lines of stdout/stderr for each container in
