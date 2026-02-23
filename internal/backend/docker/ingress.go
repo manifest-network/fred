@@ -11,6 +11,7 @@ import (
 // IngressConfig holds configuration for reverse proxy integration.
 // When Enabled, containers with routable TCP ports get proxy labels
 // pointing Traefik at the per-tenant network for auto-discovery.
+// Requires network_isolation to be enabled (validated at config load time).
 // Currently generates Traefik-specific labels; the config layer is
 // proxy-agnostic so a future backend swap only changes label generation.
 type IngressConfig struct {

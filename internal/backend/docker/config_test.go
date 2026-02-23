@@ -524,6 +524,38 @@ func TestConfig_Validate_TenantQuota(t *testing.T) {
 	})
 }
 
+func TestConfig_Validate_IngressRequiresNetworkIsolation(t *testing.T) {
+	ingress := IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "example.com",
+		CertResolver:   "letsencrypt",
+		Entrypoint:     "websecure",
+	}
+
+	t.Run("ingress with network_isolation disabled", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.Ingress = ingress
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "ingress requires network_isolation to be enabled")
+	})
+
+	t.Run("ingress with network_isolation enabled", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.NetworkIsolation = ptrBool(true)
+		cfg.Ingress = ingress
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("ingress with network_isolation default", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.NetworkIsolation = nil // defaults to true
+		cfg.Ingress = ingress
+		require.NoError(t, cfg.Validate())
+	})
+}
+
 func TestConfig_DefaultConfig_Validates(t *testing.T) {
 	cfg := DefaultConfig()
 	// DefaultConfig is missing required secrets/addresses — set them

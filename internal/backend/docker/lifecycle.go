@@ -827,8 +827,11 @@ type CreateContainerParams struct {
 
 	// Ingress holds the reverse proxy configuration.
 	// When Enabled, proxy labels are injected into the container.
-	Ingress  IngressConfig
-	Quantity int // Total quantity for this service (used in subdomain computation)
+	// NetworkName must be non-empty when Ingress is enabled (enforced by
+	// Config.Validate requiring network_isolation).
+	Ingress     IngressConfig
+	NetworkName string // Per-tenant network name for traefik.docker.network label
+	Quantity    int    // Total quantity for this service (used in subdomain computation)
 }
 
 // portBindRetries is the number of times to retry container creation when
@@ -898,8 +901,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 			subdomain := ComputeSubdomain(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
 			fqdn := ComputeFQDN(subdomain, params.Ingress.WildcardDomain)
 			routerName := RouterName(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
-			networkName := TenantNetworkName(params.Tenant)
-			for k, v := range TraefikLabels(params.Ingress, networkName, routerName, fqdn, port) {
+			for k, v := range TraefikLabels(params.Ingress, params.NetworkName, routerName, fqdn, port) {
 				labels[k] = v
 			}
 			labels[LabelFQDN] = fqdn
@@ -1377,28 +1379,6 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 		return "", fmt.Errorf("failed to create tenant network: %w", err)
 	}
 	return resp.ID, nil
-}
-
-// NetworkExists returns true if the named Docker network exists.
-func (d *DockerClient) NetworkExists(ctx context.Context, networkName string) (bool, error) {
-	_, err := d.client.NetworkInspect(ctx, networkName, networktypes.InspectOptions{})
-	if err != nil {
-		if client.IsErrNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("failed to inspect network %q: %w", networkName, err)
-	}
-	return true, nil
-}
-
-// ConnectToNetwork attaches a container to an additional Docker network.
-// Docker only supports one endpoint in EndpointsConfig at creation time, so
-// secondary networks (like the ingress network) must be connected post-creation.
-func (d *DockerClient) ConnectToNetwork(ctx context.Context, containerID, networkName string) error {
-	if err := d.client.NetworkConnect(ctx, networkName, containerID, nil); err != nil {
-		return fmt.Errorf("failed to connect container %s to network %s: %w", containerID, networkName, err)
-	}
-	return nil
 }
 
 // RemoveTenantNetworkIfEmpty removes the tenant's network if no containers are connected.

@@ -249,6 +249,8 @@ reconcile_interval: 5m
 # TCP ports automatically get Traefik discovery labels. Traefik routes to
 # containers via the per-tenant network (traefik.docker.network), so no shared
 # ingress network is needed. Requires network_isolation: true (the default).
+# Note: Traefik must run with host networking (or equivalent access) to reach
+# containers on per-tenant bridge networks.
 #
 # ingress:
 #   enabled: true

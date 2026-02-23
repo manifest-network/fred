@@ -43,8 +43,6 @@ type dockerClient interface {
 	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
 	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
-	NetworkExists(ctx context.Context, networkName string) (bool, error)
-	ConnectToNetwork(ctx context.Context, containerID, networkName string) error
 	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
 	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 	DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (uid, gid int, err error)
@@ -1339,6 +1337,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				User:              imgSetup.ContainerUser,
 				BackendName:       b.cfg.Name,
 				Ingress:           b.cfg.Ingress,
+				NetworkName:       TenantNetworkName(req.Tenant),
 				Quantity:          item.Quantity,
 			}, b.cfg.ContainerCreateTimeout)
 			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
@@ -2345,6 +2344,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			User:              imgSetup.ContainerUser,
 			BackendName:       b.cfg.Name,
 			Ingress:           b.cfg.Ingress,
+			NetworkName:       TenantNetworkName(tenant),
 			Quantity:          op.Quantity,
 		}, b.cfg.ContainerCreateTimeout)
 		if createErr != nil {
