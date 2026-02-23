@@ -402,17 +402,6 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("volume manager validation failed: %w", err)
 	}
 
-	// Verify ingress network exists on the daemon before accepting provisions.
-	if b.cfg.Ingress.Enabled {
-		exists, err := b.docker.NetworkExists(ctx, b.cfg.Ingress.Network)
-		if err != nil {
-			return fmt.Errorf("ingress network check failed: %w", err)
-		}
-		if !exists {
-			return fmt.Errorf("ingress network %q does not exist; create it before starting the backend", b.cfg.Ingress.Network)
-		}
-	}
-
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(ctx)
 
@@ -1360,19 +1349,6 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				return
 			}
 			containerIDs = append(containerIDs, containerID)
-
-			// Connect to ingress network (must be done post-creation; Docker
-			// only supports one EndpointsConfig at creation time).
-			if b.cfg.Ingress.Enabled {
-				if _, ok := SelectIngressPort(manifest.Ports); ok {
-					if netErr := b.docker.ConnectToNetwork(ctx, containerID, b.cfg.Ingress.Network); netErr != nil {
-						instanceLogger.Error("failed to connect to ingress network", "error", netErr)
-						err = fmt.Errorf("ingress network connect failed (instance %d, sku %s): %w", instanceIndex, item.SKU, netErr)
-						callbackErr = "ingress network connect failed"
-						return
-					}
-				}
-			}
 
 			// Start container
 			instanceLogger.Info("starting container", "container_id", shortID(containerID))
@@ -2377,18 +2353,6 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			return
 		}
 		newContainerIDs = append(newContainerIDs, containerID)
-
-		// Connect to ingress network post-creation.
-		if b.cfg.Ingress.Enabled {
-			if _, ok := SelectIngressPort(op.Manifest.Ports); ok {
-				if netErr := b.docker.ConnectToNetwork(ctx, containerID, b.cfg.Ingress.Network); netErr != nil {
-					op.Logger.Error("failed to connect to ingress network", "error", netErr)
-					err = fmt.Errorf("ingress network connect failed (instance %d): %w", i, netErr)
-					callbackErr = op.Operation + " failed"
-					return
-				}
-			}
-		}
 
 		if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
 			err = fmt.Errorf("container start failed (instance %d): %w", i, startErr)

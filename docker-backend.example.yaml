@@ -241,3 +241,17 @@ startup_verify_duration: 5s
 # How often to reconcile in-memory state with Docker. Detects crashed
 # containers and sends failure callbacks. Default: 5m.
 reconcile_interval: 5m
+
+# =============================================================================
+# INGRESS (optional)
+# =============================================================================
+# Reverse proxy integration via Traefik. When enabled, containers with routable
+# TCP ports automatically get Traefik discovery labels. Traefik routes to
+# containers via the per-tenant network (traefik.docker.network), so no shared
+# ingress network is needed. Requires network_isolation: true (the default).
+#
+# ingress:
+#   enabled: true
+#   wildcard_domain: "example.com"    # *.example.com DNS must point to this host
+#   cert_resolver: "letsencrypt"      # Traefik ACME cert resolver name
+#   entrypoint: "websecure"           # Traefik entrypoint for HTTPS

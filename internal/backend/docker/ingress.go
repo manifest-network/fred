@@ -9,14 +9,13 @@ import (
 )
 
 // IngressConfig holds configuration for reverse proxy integration.
-// When Enabled, containers with routable TCP ports get proxy labels and
-// are connected to the proxy network for auto-discovery.
+// When Enabled, containers with routable TCP ports get proxy labels
+// pointing Traefik at the per-tenant network for auto-discovery.
 // Currently generates Traefik-specific labels; the config layer is
 // proxy-agnostic so a future backend swap only changes label generation.
 type IngressConfig struct {
 	Enabled        bool   `yaml:"enabled"`
 	WildcardDomain string `yaml:"wildcard_domain"`
-	Network        string `yaml:"network"`
 	CertResolver   string `yaml:"cert_resolver"`
 	Entrypoint     string `yaml:"entrypoint"`
 }
@@ -128,12 +127,14 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 }
 
 // TraefikLabels generates the Docker labels that Traefik uses for
-// auto-discovery and routing configuration. This is the only
+// auto-discovery and routing configuration. networkName is the
+// per-tenant Docker network that Traefik should use to reach the
+// container (set via traefik.docker.network). This is the only
 // Traefik-specific function; everything else is proxy-agnostic.
-func TraefikLabels(cfg IngressConfig, routerName, fqdn string, containerPort int) map[string]string {
+func TraefikLabels(cfg IngressConfig, networkName, routerName, fqdn string, containerPort int) map[string]string {
 	return map[string]string{
 		"traefik.enable":         "true",
-		"traefik.docker.network": cfg.Network,
+		"traefik.docker.network": networkName,
 		fmt.Sprintf("traefik.http.routers.%s.rule", routerName):                      fmt.Sprintf("Host(`%s`)", fqdn),
 		fmt.Sprintf("traefik.http.routers.%s.entrypoints", routerName):               cfg.Entrypoint,
 		fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", routerName):          cfg.CertResolver,
@@ -154,9 +155,6 @@ func (ic *IngressConfig) Validate() error {
 	}
 	if strings.HasSuffix(ic.WildcardDomain, ".") {
 		return fmt.Errorf("ingress.wildcard_domain must not end with '.'")
-	}
-	if ic.Network == "" {
-		return fmt.Errorf("ingress.network is required when ingress is enabled")
 	}
 	if ic.CertResolver == "" {
 		return fmt.Errorf("ingress.cert_resolver is required when ingress is enabled")

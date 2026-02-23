@@ -898,7 +898,8 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 			subdomain := ComputeSubdomain(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
 			fqdn := ComputeFQDN(subdomain, params.Ingress.WildcardDomain)
 			routerName := RouterName(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
-			for k, v := range TraefikLabels(params.Ingress, routerName, fqdn, port) {
+			networkName := TenantNetworkName(params.Tenant)
+			for k, v := range TraefikLabels(params.Ingress, networkName, routerName, fqdn, port) {
 				labels[k] = v
 			}
 			labels[LabelFQDN] = fqdn
