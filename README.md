@@ -345,6 +345,7 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   "provider_uuid": "...",
   "connection": {
     "host": "compute-alpha.example.com",
+    "fqdn": "a1b2c3d.example.com",
     "ports": {
       "8080/tcp": {"host_ip": "0.0.0.0", "host_port": 32768},
       "443/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}
@@ -366,12 +367,14 @@ Returns connection details for an active lease from the backend. Requires ADR-03
   "provider_uuid": "...",
   "connection": {
     "host": "compute-alpha.example.com",
+    "fqdn": "0-a1b2c3d.example.com",
     "instances": [
       {
         "instance_index": 0,
         "container_id": "abc123",
         "image": "nginx:latest",
         "status": "running",
+        "fqdn": "0-a1b2c3d.example.com",
         "ports": {"80/tcp": {"host_ip": "0.0.0.0", "host_port": 32768}}
       },
       {
@@ -379,6 +382,7 @@ Returns connection details for an active lease from the backend. Requires ADR-03
         "container_id": "def456",
         "image": "redis:alpine",
         "status": "running",
+        "fqdn": "1-e5f6789.example.com",
         "ports": {"6379/tcp": {"host_ip": "0.0.0.0", "host_port": 32769}}
       }
     ],
@@ -388,8 +392,10 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 ```
 
 **Fields:**
+- `fqdn` - Fully qualified domain name for ingress routing (omitted when ingress is not enabled). At the top level (`connection.fqdn`), this is set directly from the backend or propagated from the first instance's FQDN when no top-level value is provided. Each instance and service may also have its own `fqdn`. A top-level or service-level explicit FQDN takes precedence over instance propagation.
 - `ports` - Map of container port to host binding (e.g., "8080/tcp" → host_port 32768)
-- `instances` - Array of per-instance details for multi-container leases (each with its own ports)
+- `instances` - Array of per-instance details for multi-container leases (each with its own ports and optional `fqdn`)
+- `services` - Map of service name to connection details for stack (multi-service) leases. Each service contains its own `instances` array and optional `fqdn` (propagated from its first instance when not set explicitly).
 - `metadata` - Additional backend-specific data
 
 ### Get Lease Status
@@ -756,7 +762,10 @@ Get lease information for a provisioned resource.
 
 **Known Fields** (extracted by fred into structured response):
 - `host` - Hostname or IP for connecting to the resource
+- `fqdn` - Fully qualified domain name for ingress routing (omitted when not set)
 - `ports` - Map of container ports to host bindings
+- `instances` - Array of per-instance details (each may include its own `fqdn`)
+- `services` - Map of service name to per-service details (each may include its own `fqdn`)
 - `protocol` - Connection protocol (e.g., "https", "ssh")
 - `metadata` - Additional key-value metadata
 
