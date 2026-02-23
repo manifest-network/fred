@@ -194,6 +194,7 @@ type ConnectionResponse struct {
 // For stack (multi-service) leases, the Services map contains per-service details.
 type ConnectionDetails struct {
 	Host      string                              `json:"host"`
+	FQDN      string                              `json:"fqdn,omitempty"`
 	Ports     map[string]PortMapping              `json:"ports,omitempty"`
 	Instances []InstanceInfo                      `json:"instances,omitempty"`
 	Services  map[string]ServiceConnectionDetails `json:"services,omitempty"`
@@ -203,6 +204,7 @@ type ConnectionDetails struct {
 
 // ServiceConnectionDetails contains connection details for a single service in a stack.
 type ServiceConnectionDetails struct {
+	FQDN      string         `json:"fqdn,omitempty"`
 	Instances []InstanceInfo `json:"instances"`
 }
 
@@ -212,6 +214,7 @@ type InstanceInfo struct {
 	ContainerID   string                 `json:"container_id,omitempty"`
 	Image         string                 `json:"image,omitempty"`
 	Status        string                 `json:"status,omitempty"`
+	FQDN          string                 `json:"fqdn,omitempty"`
 	Ports         map[string]PortMapping `json:"ports,omitempty"`
 }
 
@@ -923,6 +926,7 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 	// Known fields that map to struct fields
 	knownFields := map[string]bool{
 		"host":      true,
+		"fqdn":      true,
 		"ports":     true,
 		"instances": true,
 		"services":  true,
@@ -933,6 +937,9 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 	// Extract known fields
 	if host, ok := info["host"].(string); ok {
 		details.Host = host
+	}
+	if fqdn, ok := info["fqdn"].(string); ok {
+		details.FQDN = fqdn
 	}
 	if protocol, ok := info["protocol"].(string); ok {
 		details.Protocol = protocol
@@ -989,6 +996,11 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 					instance.Status = status
 				}
 
+				// Extract FQDN
+				if fqdn, ok := inst["fqdn"].(string); ok {
+					instance.FQDN = fqdn
+				}
+
 				// Extract per-instance ports
 				if ports, ok := inst["ports"].(map[string]any); ok {
 					instance.Ports = make(map[string]PortMapping)
@@ -1002,6 +1014,11 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 				details.Instances = append(details.Instances, instance)
 			}
 		}
+	}
+
+	// Propagate FQDN from the first instance to the top level (single-container leases)
+	if details.FQDN == "" && len(details.Instances) > 0 {
+		details.FQDN = details.Instances[0].FQDN
 	}
 
 	// Extract services map (for stack leases)
@@ -1029,6 +1046,9 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 						if status, ok := inst["status"].(string); ok {
 							instance.Status = status
 						}
+						if fqdn, ok := inst["fqdn"].(string); ok {
+							instance.FQDN = fqdn
+						}
 						if ports, ok := inst["ports"].(map[string]any); ok {
 							instance.Ports = make(map[string]PortMapping)
 							for containerPort, bindingAny := range ports {
@@ -1040,6 +1060,10 @@ func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 						svcDetails.Instances = append(svcDetails.Instances, instance)
 					}
 				}
+			}
+			// Propagate FQDN from the first instance to the service level
+			if len(svcDetails.Instances) > 0 {
+				svcDetails.FQDN = svcDetails.Instances[0].FQDN
 			}
 			details.Services[svcName] = svcDetails
 		}

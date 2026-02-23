@@ -954,6 +954,174 @@ func TestExtractConnectionDetails_Services(t *testing.T) {
 	})
 }
 
+func TestExtractConnectionDetails_FQDN(t *testing.T) {
+	t.Run("direct fqdn in lease info", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"fqdn": "myapp.example.com",
+		}
+		result := extractConnectionDetails(input)
+		assert.Equal(t, "myapp.example.com", result.FQDN)
+		_, inMeta := result.Metadata["fqdn"]
+		assert.False(t, inMeta, "fqdn should not appear in metadata")
+	})
+
+	t.Run("fqdn propagated from first instance", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"instances": []any{
+				map[string]any{
+					"instance_index": float64(0),
+					"container_id":   "abc123",
+					"fqdn":           "inst.example.com",
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		assert.Equal(t, "inst.example.com", result.FQDN)
+		require.Len(t, result.Instances, 1)
+		assert.Equal(t, "inst.example.com", result.Instances[0].FQDN)
+	})
+
+	t.Run("direct fqdn takes precedence over instance fqdn", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"fqdn": "top-level.example.com",
+			"instances": []any{
+				map[string]any{
+					"instance_index": float64(0),
+					"container_id":   "abc123",
+					"fqdn":           "instance-level.example.com",
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		assert.Equal(t, "top-level.example.com", result.FQDN)
+		require.Len(t, result.Instances, 1)
+		assert.Equal(t, "instance-level.example.com", result.Instances[0].FQDN)
+	})
+
+	t.Run("multi-instance each with unique fqdn", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"instances": []any{
+				map[string]any{
+					"instance_index": float64(0),
+					"container_id":   "container0",
+					"fqdn":           "0-abc1234.example.com",
+				},
+				map[string]any{
+					"instance_index": float64(1),
+					"container_id":   "container1",
+					"fqdn":           "1-def5678.example.com",
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		assert.Equal(t, "0-abc1234.example.com", result.FQDN, "top-level propagated from first instance")
+		require.Len(t, result.Instances, 2)
+		assert.Equal(t, "0-abc1234.example.com", result.Instances[0].FQDN)
+		assert.Equal(t, "1-def5678.example.com", result.Instances[1].FQDN)
+	})
+
+	t.Run("no fqdn anywhere", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"instances": []any{
+				map[string]any{
+					"instance_index": float64(0),
+					"container_id":   "abc123",
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		assert.Empty(t, result.FQDN)
+		require.Len(t, result.Instances, 1)
+		assert.Empty(t, result.Instances[0].FQDN)
+	})
+
+	t.Run("service-level fqdn propagated from first instance", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"services": map[string]any{
+				"web": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "abc123",
+							"fqdn":           "web.example.com",
+						},
+					},
+				},
+				"db": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "def456",
+							"fqdn":           "db.example.com",
+						},
+					},
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		require.Len(t, result.Services, 2)
+		assert.Equal(t, "web.example.com", result.Services["web"].FQDN)
+		assert.Equal(t, "db.example.com", result.Services["db"].FQDN)
+		assert.Equal(t, "web.example.com", result.Services["web"].Instances[0].FQDN)
+		assert.Equal(t, "db.example.com", result.Services["db"].Instances[0].FQDN)
+	})
+
+	t.Run("service with multi-instance unique fqdns", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"services": map[string]any{
+				"web": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "web0",
+							"fqdn":           "web-0-abc.example.com",
+						},
+						map[string]any{
+							"instance_index": float64(1),
+							"container_id":   "web1",
+							"fqdn":           "web-1-def.example.com",
+						},
+					},
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		require.Len(t, result.Services, 1)
+		webSvc := result.Services["web"]
+		assert.Equal(t, "web-0-abc.example.com", webSvc.FQDN, "service-level propagated from first instance")
+		require.Len(t, webSvc.Instances, 2)
+		assert.Equal(t, "web-0-abc.example.com", webSvc.Instances[0].FQDN)
+		assert.Equal(t, "web-1-def.example.com", webSvc.Instances[1].FQDN)
+	})
+
+	t.Run("service without fqdn in instances", func(t *testing.T) {
+		input := backend.LeaseInfo{
+			"host": "docker-host.example.com",
+			"services": map[string]any{
+				"web": map[string]any{
+					"instances": []any{
+						map[string]any{
+							"instance_index": float64(0),
+							"container_id":   "abc123",
+						},
+					},
+				},
+			},
+		}
+		result := extractConnectionDetails(input)
+		require.Len(t, result.Services, 1)
+		assert.Empty(t, result.Services["web"].FQDN)
+		assert.Empty(t, result.Services["web"].Instances[0].FQDN)
+	})
+}
+
 // TestGetLeaseConnection_TokenReplayProtection tests the token replay protection.
 func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
