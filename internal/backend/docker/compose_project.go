@@ -29,6 +29,7 @@ type composeProjectParams struct {
 	NetworkName  string                             // pre-created tenant network name (empty if isolation disabled)
 	VolBinds     map[string]map[int]serviceVolBinds // svc → instance → binds
 	Cfg          *Config
+	Ingress      IngressConfig
 }
 
 // serviceVolBinds holds volume binds for a single service instance.
@@ -70,6 +71,8 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				ImgSetup:     imgSetup,
 				NetworkName:  params.NetworkName,
 				Cfg:          params.Cfg,
+				Ingress:      params.Ingress,
+				Quantity:     item.Quantity,
 			})
 
 			// Apply volume binds if present.
@@ -131,6 +134,22 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				}
 			}
 
+			// Connect routable services to the ingress network.
+			// When a service explicitly declares networks, Compose no longer
+			// auto-assigns the default bridge. Ensure "default" is present so
+			// the service can still communicate with non-routable services.
+			if params.Ingress.Enabled {
+				if _, ok := SelectIngressPort(svc.Ports); ok {
+					if svcConfig.Networks == nil {
+						svcConfig.Networks = map[string]*composetypes.ServiceNetworkConfig{}
+					}
+					if svcConfig.Networks["default"] == nil {
+						svcConfig.Networks["default"] = &composetypes.ServiceNetworkConfig{}
+					}
+					svcConfig.Networks["ingress"] = &composetypes.ServiceNetworkConfig{}
+				}
+			}
+
 			services[composeSvcName] = svcConfig
 		}
 	}
@@ -150,6 +169,17 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				Name:     params.NetworkName,
 				External: true,
 			},
+		}
+	}
+
+	// Add ingress network as a second external network.
+	if params.Ingress.Enabled {
+		if project.Networks == nil {
+			project.Networks = composetypes.Networks{}
+		}
+		project.Networks["ingress"] = composetypes.NetworkConfig{
+			Name:     params.Ingress.Network,
+			External: true,
 		}
 	}
 
@@ -227,6 +257,8 @@ type composeServiceParams struct {
 	ImgSetup     *imageSetup
 	NetworkName  string
 	Cfg          *Config
+	Ingress      IngressConfig
+	Quantity     int
 }
 
 func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfig {
@@ -389,6 +421,20 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 	for k, v := range p.Manifest.Labels {
 		labels[k] = v
 	}
+
+	// Inject ingress labels for auto-discovery routing.
+	if p.Ingress.Enabled {
+		if port, ok := SelectIngressPort(p.Manifest.Ports); ok {
+			subdomain := ComputeSubdomain(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
+			fqdn := ComputeFQDN(subdomain, p.Ingress.WildcardDomain)
+			routerName := RouterName(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
+			for k, v := range TraefikLabels(p.Ingress, routerName, fqdn, port) {
+				labels[k] = v
+			}
+			labels[LabelFQDN] = fqdn
+		}
+	}
+
 	svc.Labels = labels
 
 	return svc
