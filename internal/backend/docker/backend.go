@@ -3255,17 +3255,28 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		allocations = append(allocations, allocs...)
 	}
 	b.pool.Reset(allocations)
+
+	// Snapshot aggregate stats from the recovered map before releasing the lock.
+	// After unlock, `recovered` aliases `b.provisions` and concurrent goroutines
+	// may modify both the map and the pointed-to provision structs.
+	var readyCount float64
+	totalContainers := 0
+	leaseCount := len(recovered)
+	activeTenants := make(map[string]bool, len(recovered))
+	for _, p := range recovered {
+		if p.Status == backend.ProvisionStatusReady {
+			readyCount++
+		}
+		totalContainers += len(p.ContainerIDs)
+		if p.Tenant != "" {
+			activeTenants[p.Tenant] = true
+		}
+	}
 	b.provisionsMu.Unlock()
 
 	// Reset the active provisions gauge from the recovered map. Without this,
 	// the gauge drifts (and can go negative) because Inc/Dec are only called
 	// during normal Provision/Deprovision, but recoverState replaces the map.
-	var readyCount float64
-	for _, p := range recovered {
-		if p.Status == backend.ProvisionStatusReady {
-			readyCount++
-		}
-	}
 	activeProvisions.Set(readyCount)
 	updateResourceMetrics(b.pool.Stats())
 
@@ -3279,7 +3290,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			b.provisionsMu.RUnlock()
 			continue
 		}
-		containerIDs := prov.ContainerIDs
+		containerIDs := append([]string(nil), prov.ContainerIDs...)
 		b.provisionsMu.RUnlock()
 
 		for _, cid := range containerIDs {
@@ -3335,14 +3346,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.sendCallback(uuid, false, errMsgContainerExited)
 	}
 
-	totalContainers := 0
-	for _, p := range recovered {
-		totalContainers += len(p.ContainerIDs)
-	}
-
 	stats := b.pool.Stats()
 	logAttrs := []any{
-		"leases", len(recovered),
+		"leases", leaseCount,
 		"containers", totalContainers,
 		"cpu_allocated", stats.AllocatedCPU,
 		"memory_allocated_mb", stats.AllocatedMemoryMB,
@@ -3354,7 +3360,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	// Clean up orphaned tenant networks if network isolation is enabled
 	if b.cfg.IsNetworkIsolation() {
-		b.cleanupOrphanedNetworks(ctx, recovered)
+		b.cleanupOrphanedNetworks(ctx, activeTenants)
 	}
 
 	return nil
@@ -3411,17 +3417,11 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 }
 
 // cleanupOrphanedNetworks removes managed networks whose tenant has no active provisions.
-func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, provisions map[string]*provision) {
+func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map[string]bool) {
 	networks, err := b.docker.ListManagedNetworks(ctx)
 	if err != nil {
 		b.logger.Warn("failed to list managed networks for cleanup", "error", err)
 		return
-	}
-
-	// Build set of active tenants
-	activeTenants := make(map[string]bool)
-	for _, p := range provisions {
-		activeTenants[p.Tenant] = true
 	}
 
 	for _, n := range networks {
