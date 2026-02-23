@@ -134,22 +134,6 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				}
 			}
 
-			// Connect routable services to the ingress network.
-			// When a service explicitly declares networks, Compose no longer
-			// auto-assigns the default bridge. Ensure "default" is present so
-			// the service can still communicate with non-routable services.
-			if params.Ingress.Enabled {
-				if _, ok := SelectIngressPort(svc.Ports); ok {
-					if svcConfig.Networks == nil {
-						svcConfig.Networks = map[string]*composetypes.ServiceNetworkConfig{}
-					}
-					if svcConfig.Networks["default"] == nil {
-						svcConfig.Networks["default"] = &composetypes.ServiceNetworkConfig{}
-					}
-					svcConfig.Networks["ingress"] = &composetypes.ServiceNetworkConfig{}
-				}
-			}
-
 			services[composeSvcName] = svcConfig
 		}
 	}
@@ -169,17 +153,6 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				Name:     params.NetworkName,
 				External: true,
 			},
-		}
-	}
-
-	// Add ingress network as a second external network.
-	if params.Ingress.Enabled {
-		if project.Networks == nil {
-			project.Networks = composetypes.Networks{}
-		}
-		project.Networks["ingress"] = composetypes.NetworkConfig{
-			Name:     params.Ingress.Network,
-			External: true,
 		}
 	}
 
@@ -428,7 +401,7 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 			subdomain := ComputeSubdomain(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
 			fqdn := ComputeFQDN(subdomain, p.Ingress.WildcardDomain)
 			routerName := RouterName(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
-			for k, v := range TraefikLabels(p.Ingress, routerName, fqdn, port) {
+			for k, v := range TraefikLabels(p.Ingress, p.NetworkName, routerName, fqdn, port) {
 				labels[k] = v
 			}
 			labels[LabelFQDN] = fqdn

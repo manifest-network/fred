@@ -227,16 +227,16 @@ func TestTraefikLabels(t *testing.T) {
 	cfg := IngressConfig{
 		Enabled:        true,
 		WildcardDomain: "barney8.manifest0.net",
-		Network:        "traefik",
 		CertResolver:   "letsencrypt",
 		Entrypoint:     "websecure",
 	}
 
-	labels := TraefikLabels(cfg, "fred-web-abc1234", "web-abc1234.barney8.manifest0.net", 80)
+	tenantNetwork := "fred-tenant-abc123"
+	labels := TraefikLabels(cfg, tenantNetwork, "fred-web-abc1234", "web-abc1234.barney8.manifest0.net", 80)
 
 	require.Len(t, labels, 6)
 	assert.Equal(t, "true", labels["traefik.enable"])
-	assert.Equal(t, "traefik", labels["traefik.docker.network"])
+	assert.Equal(t, tenantNetwork, labels["traefik.docker.network"])
 	assert.Equal(t, "Host(`web-abc1234.barney8.manifest0.net`)", labels["traefik.http.routers.fred-web-abc1234.rule"])
 	assert.Equal(t, "websecure", labels["traefik.http.routers.fred-web-abc1234.entrypoints"])
 	assert.Equal(t, "letsencrypt", labels["traefik.http.routers.fred-web-abc1234.tls.certresolver"])
@@ -258,7 +258,6 @@ func TestIngressConfig_Validate(t *testing.T) {
 			cfg: IngressConfig{
 				Enabled:        true,
 				WildcardDomain: "barney8.manifest0.net",
-				Network:        "traefik",
 				CertResolver:   "letsencrypt",
 				Entrypoint:     "websecure",
 			},
@@ -267,7 +266,6 @@ func TestIngressConfig_Validate(t *testing.T) {
 			name: "missing wildcard_domain",
 			cfg: IngressConfig{
 				Enabled:      true,
-				Network:      "traefik",
 				CertResolver: "letsencrypt",
 				Entrypoint:   "websecure",
 			},
@@ -278,7 +276,6 @@ func TestIngressConfig_Validate(t *testing.T) {
 			cfg: IngressConfig{
 				Enabled:        true,
 				WildcardDomain: ".barney8.manifest0.net",
-				Network:        "traefik",
 				CertResolver:   "letsencrypt",
 				Entrypoint:     "websecure",
 			},
@@ -289,28 +286,16 @@ func TestIngressConfig_Validate(t *testing.T) {
 			cfg: IngressConfig{
 				Enabled:        true,
 				WildcardDomain: "barney8.manifest0.net.",
-				Network:        "traefik",
 				CertResolver:   "letsencrypt",
 				Entrypoint:     "websecure",
 			},
 			wantErr: "must not end with '.'",
 		},
 		{
-			name: "missing network",
-			cfg: IngressConfig{
-				Enabled:        true,
-				WildcardDomain: "barney8.manifest0.net",
-				CertResolver:   "letsencrypt",
-				Entrypoint:     "websecure",
-			},
-			wantErr: "network is required",
-		},
-		{
 			name: "missing cert_resolver",
 			cfg: IngressConfig{
 				Enabled:        true,
 				WildcardDomain: "barney8.manifest0.net",
-				Network:        "traefik",
 				Entrypoint:     "websecure",
 			},
 			wantErr: "cert_resolver is required",
@@ -320,7 +305,6 @@ func TestIngressConfig_Validate(t *testing.T) {
 			cfg: IngressConfig{
 				Enabled:        true,
 				WildcardDomain: "barney8.manifest0.net",
-				Network:        "traefik",
 				CertResolver:   "letsencrypt",
 			},
 			wantErr: "entrypoint is required",

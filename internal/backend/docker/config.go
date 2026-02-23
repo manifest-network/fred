@@ -157,7 +157,8 @@ type Config struct {
 
 	// Ingress configures optional reverse proxy integration.
 	// When enabled, containers with routable TCP ports get proxy labels
-	// and are connected to the proxy network for HTTPS auto-discovery.
+	// pointing Traefik at the per-tenant network for HTTPS auto-discovery.
+	// Requires network_isolation to be enabled.
 	Ingress IngressConfig `yaml:"ingress"`
 }
 
@@ -424,6 +425,10 @@ func (c *Config) Validate() error {
 
 	if err := c.Ingress.Validate(); err != nil {
 		return err
+	}
+
+	if c.Ingress.Enabled && !c.IsNetworkIsolation() {
+		return fmt.Errorf("ingress requires network_isolation to be enabled")
 	}
 
 	if c.TenantQuota != nil {

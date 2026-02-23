@@ -695,12 +695,11 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 	ingress := IngressConfig{
 		Enabled:        true,
 		WildcardDomain: "barney8.manifest0.net",
-		Network:        "traefik-net",
 		CertResolver:   "letsencrypt",
 		Entrypoint:     "websecure",
 	}
 
-	t.Run("routable service gets ingress network and labels", func(t *testing.T) {
+	t.Run("routable service gets traefik labels with tenant network", func(t *testing.T) {
 		params := baseProjectParams()
 		params.Stack.Services["web"] = &DockerManifest{
 			Image: "nginx:latest",
@@ -710,25 +709,23 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 		project := buildComposeProject(params)
 
-		// Project should have both "default" and "ingress" networks.
+		// Project should only have the "default" (tenant) network — no shared ingress network.
 		require.Contains(t, project.Networks, "default")
-		require.Contains(t, project.Networks, "ingress")
-		assert.Equal(t, "traefik-net", project.Networks["ingress"].Name)
-		assert.True(t, bool(project.Networks["ingress"].External))
+		assert.NotContains(t, project.Networks, "ingress")
 
-		// Service should be connected to both networks.
+		// Service should only be on the default network.
 		svc := project.Services["web"]
 		require.NotNil(t, svc.Networks["default"])
-		require.NotNil(t, svc.Networks["ingress"])
+		assert.Nil(t, svc.Networks["ingress"])
 
-		// Traefik labels should be present.
+		// Traefik labels should point to the tenant network.
 		assert.Equal(t, "true", svc.Labels["traefik.enable"])
-		assert.Equal(t, "traefik-net", svc.Labels["traefik.docker.network"])
+		assert.Equal(t, params.NetworkName, svc.Labels["traefik.docker.network"])
 		assert.NotEmpty(t, svc.Labels[LabelFQDN])
 		assert.Contains(t, svc.Labels[LabelFQDN], "barney8.manifest0.net")
 	})
 
-	t.Run("non-routable service does not get ingress network", func(t *testing.T) {
+	t.Run("non-routable service does not get traefik labels", func(t *testing.T) {
 		params := baseProjectParams()
 		params.Stack = &StackManifest{
 			Services: map[string]*DockerManifest{
@@ -745,38 +742,16 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 		project := buildComposeProject(params)
 
-		// web should have ingress network.
+		// web should have traefik labels.
 		webSvc := project.Services["web"]
-		require.NotNil(t, webSvc.Networks["ingress"])
 		assert.Equal(t, "true", webSvc.Labels["traefik.enable"])
 
-		// redis should NOT have ingress network or labels.
+		// redis should NOT have traefik labels.
 		redisSvc := project.Services["redis"]
-		if redisSvc.Networks != nil {
-			assert.Nil(t, redisSvc.Networks["ingress"])
-		}
 		assert.Empty(t, redisSvc.Labels["traefik.enable"])
 	})
 
-	t.Run("isolation disabled with ingress still has default network for routable services", func(t *testing.T) {
-		params := baseProjectParams()
-		params.NetworkName = "" // isolation disabled
-		params.Stack.Services["web"] = &DockerManifest{
-			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
-		}
-		params.Ingress = ingress
-
-		project := buildComposeProject(params)
-
-		svc := project.Services["web"]
-		require.NotNil(t, svc.Networks)
-		// Should have both default and traefik to maintain inter-service connectivity.
-		require.NotNil(t, svc.Networks["default"])
-		require.NotNil(t, svc.Networks["ingress"])
-	})
-
-	t.Run("disabled ingress produces no extra networks or labels", func(t *testing.T) {
+	t.Run("disabled ingress produces no traefik labels", func(t *testing.T) {
 		params := baseProjectParams()
 		params.Stack.Services["web"] = &DockerManifest{
 			Image: "nginx:latest",
