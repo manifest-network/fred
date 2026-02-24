@@ -3,14 +3,17 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
@@ -594,4 +597,31 @@ func (e *errorPlacementStore) SetBatch(placements map[string]string) error {
 		return e.setErr
 	}
 	return e.mockPlacementStore.SetBatch(placements)
+}
+
+func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testing.T) {
+	mb := &mockManagerBackend{
+		name:         "test-backend",
+		provisionErr: fmt.Errorf("no capacity: %w", backend.ErrInsufficientResources),
+	}
+	router := &mockBackendRouter{
+		routeFn: func(sku string) backend.Backend { return mb },
+	}
+	tracker := NewInFlightTracker()
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
+
+	before := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("test-backend"))
+
+	lease := &billingtypes.Lease{
+		Uuid:   "lease-capacity",
+		Tenant: "tenant-a",
+		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInsufficientResources)
+
+	after := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("test-backend"))
+	assert.Equal(t, 1.0, after-before, "BackendInsufficientResourcesTotal should increment by 1")
 }

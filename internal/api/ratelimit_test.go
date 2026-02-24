@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -635,4 +637,101 @@ func TestCalcRetryAfterSeconds(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestRateLimiter_Middleware_IncrementsRateLimitRejectionsTotal(t *testing.T) {
+	before := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("global"))
+
+	rl := NewRateLimiter(1, 1, nil) // 1 rps, burst 1
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	middleware := rl.Middleware(handler)
+
+	// First request passes
+	req1 := httptest.NewRequest("GET", "/test", nil)
+	req1.RemoteAddr = "10.0.0.1:12345"
+	rec1 := httptest.NewRecorder()
+	middleware.ServeHTTP(rec1, req1)
+	assert.Equal(t, http.StatusOK, rec1.Code)
+
+	// Second request should be rate limited
+	req2 := httptest.NewRequest("GET", "/test", nil)
+	req2.RemoteAddr = "10.0.0.1:12345"
+	rec2 := httptest.NewRecorder()
+	middleware.ServeHTTP(rec2, req2)
+	assert.Equal(t, http.StatusTooManyRequests, rec2.Code)
+
+	after := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("global"))
+	assert.Equal(t, 1.0, after-before, "global rate limit rejection metric should increment by 1")
+}
+
+func TestTenantRateLimiter_AuthMiddleware_IncrementsRateLimitRejectionsTotal(t *testing.T) {
+	before := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+
+	kp := testutil.NewTestKeyPair("rl-tenant-test")
+	tl := NewTenantRateLimiter(1, 1, "manifest") // 1 rps, burst 1
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	middleware := tl.AuthMiddleware()(handler)
+
+	leaseUUID := testutil.ValidUUID1
+	token := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	// First request passes
+	req1 := httptest.NewRequest("GET", "/test", nil)
+	req1.Header.Set("Authorization", "Bearer "+token)
+	rec1 := httptest.NewRecorder()
+	middleware.ServeHTTP(rec1, req1)
+	assert.Equal(t, http.StatusOK, rec1.Code)
+
+	// Second request hits rate limit (use a fresh token so it passes auth)
+	token2 := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	req2 := httptest.NewRequest("GET", "/test", nil)
+	req2.Header.Set("Authorization", "Bearer "+token2)
+	rec2 := httptest.NewRecorder()
+	middleware.ServeHTTP(rec2, req2)
+	assert.Equal(t, http.StatusTooManyRequests, rec2.Code)
+
+	after := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+	assert.Equal(t, 1.0, after-before, "tenant rate limit rejection metric should increment by 1")
+}
+
+func TestTenantRateLimiter_PayloadAuthMiddleware_IncrementsRateLimitRejectionsTotal(t *testing.T) {
+	before := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+
+	kp := testutil.NewTestKeyPair("rl-payload-test")
+	tl := NewTenantRateLimiter(1, 1, "manifest") // 1 rps, burst 1
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	middleware := tl.PayloadAuthMiddleware()(handler)
+
+	metaHash := testutil.ComputePayloadHash([]byte("test-payload"))
+	token1 := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
+
+	// First request passes
+	req1 := httptest.NewRequest("POST", "/test", nil)
+	req1.Header.Set("Authorization", "Bearer "+token1)
+	rec1 := httptest.NewRecorder()
+	middleware.ServeHTTP(rec1, req1)
+	assert.Equal(t, http.StatusOK, rec1.Code)
+
+	// Second request hits rate limit
+	token2 := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
+	req2 := httptest.NewRequest("POST", "/test", nil)
+	req2.Header.Set("Authorization", "Bearer "+token2)
+	rec2 := httptest.NewRecorder()
+	middleware.ServeHTTP(rec2, req2)
+	assert.Equal(t, http.StatusTooManyRequests, rec2.Code)
+
+	after := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+	assert.Equal(t, 1.0, after-before, "tenant rate limit rejection metric should increment by 1 on payload auth")
 }

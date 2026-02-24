@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"slices"
 	"sync/atomic"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // Router routes requests to backends based on SKU matching.
@@ -177,6 +179,9 @@ func (r *Router) HealthCheck(ctx context.Context) ([]BackendHealth, bool) {
 			health.Healthy = false
 			health.Error = err.Error()
 			allHealthy = false
+			metrics.BackendHealthy.WithLabelValues(b.Name()).Set(0)
+		} else {
+			metrics.BackendHealthy.WithLabelValues(b.Name()).Set(1)
 		}
 
 		results = append(results, health)

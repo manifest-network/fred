@@ -5,8 +5,11 @@ import (
 	"errors"
 	"testing"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 func TestRouter_Route(t *testing.T) {
@@ -509,4 +512,37 @@ func TestRouter_HealthCheck_ContextCancellation(t *testing.T) {
 	assert.True(t, allHealthy)
 
 	require.Len(t, results, 1)
+}
+
+func TestRouter_HealthCheck_SetsBackendHealthyGauge(t *testing.T) {
+	healthy := NewMockBackend(MockBackendConfig{Name: "healthy-be"})
+	unhealthy := &unhealthyBackend{MockBackend: *NewMockBackend(MockBackendConfig{Name: "sick-be"})}
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: healthy, IsDefault: true},
+			{Backend: unhealthy},
+		},
+	})
+	require.NoError(t, err)
+
+	router.HealthCheck(context.Background())
+
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("healthy-be")),
+		"healthy backend gauge should be 1")
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("sick-be")),
+		"unhealthy backend gauge should be 0")
+}
+
+// unhealthyBackend wraps MockBackend but returns an error from Health().
+type unhealthyBackend struct {
+	MockBackend
+}
+
+func (u *unhealthyBackend) Health(ctx context.Context) error {
+	return errors.New("backend down")
+}
+
+func (u *unhealthyBackend) Name() string {
+	return u.name
 }

@@ -112,16 +112,23 @@ func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Rout
 	if tokenTracker != nil {
 		tracker = tokenTracker
 	}
+	// Type-assert statusChecker to InFlightReporter (provisioner.Manager implements both)
+	var inFlightReporter InFlightReporter
+	if sc, ok := statusChecker.(InFlightReporter); ok {
+		inFlightReporter = sc
+	}
+
 	handlers := NewHandlers(HandlersConfig{
-		Client:          client,
-		BackendRouter:   backendRouter,
-		TokenTracker:    tracker,
-		StatusChecker:   statusChecker,
-		PlacementLookup: placementLookup,
-		EventBroker:     eventBroker,
-		ProviderUUID:    cfg.ProviderUUID,
-		Bech32Prefix:    cfg.Bech32Prefix,
-		CallbackBaseURL: cfg.CallbackBaseURL,
+		Client:           client,
+		BackendRouter:    backendRouter,
+		TokenTracker:     tracker,
+		StatusChecker:    statusChecker,
+		PlacementLookup:  placementLookup,
+		EventBroker:      eventBroker,
+		InFlightReporter: inFlightReporter,
+		ProviderUUID:     cfg.ProviderUUID,
+		Bech32Prefix:     cfg.Bech32Prefix,
+		CallbackBaseURL:  cfg.CallbackBaseURL,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling

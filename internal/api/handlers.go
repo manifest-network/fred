@@ -41,42 +41,50 @@ type PlacementLookup interface {
 	Healthy() error
 }
 
+// InFlightReporter provides the current number of in-flight provisions.
+type InFlightReporter interface {
+	InFlightCount() int
+}
+
 // Handlers contains HTTP request handlers.
 type Handlers struct {
-	client          ChainClient
-	backendRouter   *backend.Router
-	tokenTracker    TokenTrackerInterface
-	statusChecker   StatusChecker
-	placementLookup PlacementLookup
-	eventBroker     *EventBroker
-	wsUpgrader      websocket.Upgrader
-	providerUUID    string
-	bech32Prefix    string
-	callbackBaseURL string
+	client           ChainClient
+	backendRouter    *backend.Router
+	tokenTracker     TokenTrackerInterface
+	statusChecker    StatusChecker
+	placementLookup  PlacementLookup
+	eventBroker      *EventBroker
+	inFlightReporter InFlightReporter
+	wsUpgrader       websocket.Upgrader
+	providerUUID     string
+	bech32Prefix     string
+	callbackBaseURL  string
 }
 
 // HandlersConfig configures a Handlers instance.
 type HandlersConfig struct {
-	Client          ChainClient
-	BackendRouter   *backend.Router
-	TokenTracker    TokenTrackerInterface // optional but recommended for replay attack protection
-	StatusChecker   StatusChecker         // optional but required for the /status endpoint
-	PlacementLookup PlacementLookup       // optional — used for routing reads to the correct backend
-	EventBroker     *EventBroker          // optional — if nil, the events endpoint will return 501
-	ProviderUUID    string
-	Bech32Prefix    string
-	CallbackBaseURL string // used for restart/update callbacks to the backend
+	Client           ChainClient
+	BackendRouter    *backend.Router
+	TokenTracker     TokenTrackerInterface // optional but recommended for replay attack protection
+	StatusChecker    StatusChecker         // optional but required for the /status endpoint
+	PlacementLookup  PlacementLookup       // optional — used for routing reads to the correct backend
+	EventBroker      *EventBroker          // optional — if nil, the events endpoint will return 501
+	InFlightReporter InFlightReporter      // optional — if set, /health includes in-flight stats
+	ProviderUUID     string
+	Bech32Prefix     string
+	CallbackBaseURL  string // used for restart/update callbacks to the backend
 }
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(cfg HandlersConfig) *Handlers {
 	return &Handlers{
-		client:          cfg.Client,
-		backendRouter:   cfg.BackendRouter,
-		tokenTracker:    cfg.TokenTracker,
-		statusChecker:   cfg.StatusChecker,
-		placementLookup: cfg.PlacementLookup,
-		eventBroker:     cfg.EventBroker,
+		client:           cfg.Client,
+		backendRouter:    cfg.BackendRouter,
+		tokenTracker:     cfg.TokenTracker,
+		statusChecker:    cfg.StatusChecker,
+		placementLookup:  cfg.PlacementLookup,
+		eventBroker:      cfg.EventBroker,
+		inFlightReporter: cfg.InFlightReporter,
 		wsUpgrader: websocket.Upgrader{
 			// Allow all origins: this API is not browser-facing. Clients are
 			// CLI tools and services that authenticate with cryptographically
@@ -728,11 +736,17 @@ func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, http.StatusOK)
 }
 
+// HealthStats contains operational statistics for the health response.
+type HealthStats struct {
+	InFlightProvisions int `json:"in_flight_provisions"`
+}
+
 // HealthResponse represents the health check response.
 type HealthResponse struct {
 	Status       string                  `json:"status"`
 	ProviderUUID string                  `json:"provider_uuid"`
 	Checks       map[string]*CheckResult `json:"checks"`
+	Stats        *HealthStats            `json:"stats,omitempty"`
 }
 
 // CheckResult represents the result of a single health check.
@@ -827,6 +841,12 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		Status:       status,
 		ProviderUUID: h.providerUUID,
 		Checks:       checks,
+	}
+
+	if h.inFlightReporter != nil {
+		response.Stats = &HealthStats{
+			InFlightProvisions: h.inFlightReporter.InFlightCount(),
+		}
 	}
 
 	writeJSON(w, response, httpStatus)

@@ -308,6 +308,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomePartial).Inc()
 	} else {
 		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
+		metrics.ReconcilerLastSuccessTimestamp.SetToCurrentTime()
 	}
 
 	// 5. Clean up orphaned payloads (payloads for leases that are no longer pending)
@@ -413,6 +414,9 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 
 	err := backendClient.Provision(ctx, req)
 	if err != nil {
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
+		}
 		// Clean up in-flight on error.
 		// Keep payload in store so next reconciliation can retry with it.
 		if r.tracker != nil {

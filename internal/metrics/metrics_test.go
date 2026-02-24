@@ -29,7 +29,11 @@ func TestMetricsRegistered(t *testing.T) {
 		LeasesAwaitingPayloadTotal,
 		BackendRequestDuration,
 		BackendRequestsTotal,
+		BackendInsufficientResourcesTotal,
+		BackendHealthy,
 		BackendCircuitBreakerState,
+		RateLimitRejectionsTotal,
+		ReconcilerLastSuccessTimestamp,
 		APIRequestDuration,
 		APIRequestsTotal,
 		DuplicateCallbacksTotal,
@@ -71,6 +75,7 @@ func TestMetricsRegistered(t *testing.T) {
 		"fred_payload_leases_awaiting_total",
 		"fred_api_duplicate_callbacks_total",
 		"fred_watermill_poisoned_messages_total",
+		"fred_reconciler_last_success_timestamp_seconds",
 	} {
 		assert.True(t, names[expected], "metric %q should be gathered", expected)
 	}
@@ -122,6 +127,15 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		MalformedMessagesTotal.WithLabelValues("provision")
+	})
+	assert.NotPanics(t, func() {
+		RateLimitRejectionsTotal.WithLabelValues("global")
+	})
+	assert.NotPanics(t, func() {
+		BackendInsufficientResourcesTotal.WithLabelValues("docker")
+	})
+	assert.NotPanics(t, func() {
+		BackendHealthy.WithLabelValues("docker")
 	})
 }
 

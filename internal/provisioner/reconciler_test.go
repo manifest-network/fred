@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -16,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
@@ -2825,4 +2827,111 @@ func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Empty(t, rejectedLeases, "should not reject — HasPayload error is transient")
+}
+
+func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, nil, nil)
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
+
+	err = reconciler.ReconcileAll(context.Background())
+	require.NoError(t, err)
+
+	after := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
+	assert.Greater(t, after, before, "ReconcilerLastSuccessTimestamp should be updated after reconciliation")
+	assert.Greater(t, after, float64(0), "ReconcilerLastSuccessTimestamp should be a positive unix timestamp")
+}
+
+func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-cap", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+					Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}}},
+			}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "cap-backend",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: fmt.Errorf("no room: %w", backend.ErrInsufficientResources),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	tracker := newMockInFlightTracker(nil)
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, tracker, nil)
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("cap-backend"))
+
+	_ = reconciler.ReconcileAll(context.Background())
+
+	after := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("cap-backend"))
+	assert.Equal(t, 1.0, after-before, "BackendInsufficientResourcesTotal should increment by 1 for reconciler path")
+}
+
+func TestReconciler_ReconcileAll_PartialFailureDoesNotUpdateTimestamp(t *testing.T) {
+	// When a lease errors during provisioning the outcome is "partial",
+	// and ReconcilerLastSuccessTimestamp must NOT be updated.
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-fail", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+					Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}}},
+			}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:         "test",
+		provisions:   []backend.ProvisionInfo{},
+		provisionErr: errors.New("backend exploded"),
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	tracker := newMockInFlightTracker(nil)
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, router, tracker, nil)
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
+
+	_ = reconciler.ReconcileAll(context.Background())
+
+	after := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
+	assert.Equal(t, before, after, "ReconcilerLastSuccessTimestamp should NOT be updated on partial failure")
 }

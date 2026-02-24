@@ -3981,3 +3981,56 @@ func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
 		assert.Empty(t, response.Releases)
 	})
 }
+
+// --- Health endpoint stats tests ---
+
+// mockInFlightReporter implements InFlightReporter for testing.
+type mockInFlightReporter struct {
+	count int
+}
+
+func (m *mockInFlightReporter) InFlightCount() int { return m.count }
+
+func TestHealthCheck_WithInFlightReporter(t *testing.T) {
+	reporter := &mockInFlightReporter{count: 42}
+	h := &Handlers{
+		providerUUID:     testutil.ValidUUID1,
+		bech32Prefix:     "manifest",
+		inFlightReporter: reporter,
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, "healthy", response.Status)
+	require.NotNil(t, response.Stats, "stats should be present when reporter is configured")
+	assert.Equal(t, 42, response.Stats.InFlightProvisions)
+}
+
+func TestHealthCheck_WithoutInFlightReporter(t *testing.T) {
+	h := &Handlers{
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+		// inFlightReporter is nil
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, "healthy", response.Status)
+	assert.Nil(t, response.Stats, "stats should be absent without reporter")
+}
