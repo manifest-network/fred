@@ -1532,8 +1532,9 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 
 // mockStatusChecker implements StatusChecker for testing.
 type mockStatusChecker struct {
-	hasPayload map[string]bool
-	isInFlight map[string]bool
+	hasPayload    map[string]bool
+	isInFlight    map[string]bool
+	inFlightCount int
 }
 
 func (m *mockStatusChecker) HasPayload(leaseUUID string) (bool, error) {
@@ -1548,6 +1549,10 @@ func (m *mockStatusChecker) IsInFlight(leaseUUID string) bool {
 		return false
 	}
 	return m.isInFlight[leaseUUID]
+}
+
+func (m *mockStatusChecker) InFlightCount() int {
+	return m.inFlightCount
 }
 
 // TestGetLeaseStatus tests the GetLeaseStatus endpoint.
@@ -3984,19 +3989,12 @@ func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
 
 // --- Health endpoint stats tests ---
 
-// mockInFlightReporter implements InFlightReporter for testing.
-type mockInFlightReporter struct {
-	count int
-}
-
-func (m *mockInFlightReporter) InFlightCount() int { return m.count }
-
-func TestHealthCheck_WithInFlightReporter(t *testing.T) {
-	reporter := &mockInFlightReporter{count: 42}
+func TestHealthCheck_WithStatusChecker(t *testing.T) {
+	sc := &mockStatusChecker{inFlightCount: 42}
 	h := &Handlers{
-		providerUUID:     testutil.ValidUUID1,
-		bech32Prefix:     "manifest",
-		inFlightReporter: reporter,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+		statusChecker: sc,
 	}
 
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -4010,15 +4008,15 @@ func TestHealthCheck_WithInFlightReporter(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
 	assert.Equal(t, "healthy", response.Status)
-	require.NotNil(t, response.Stats, "stats should be present when reporter is configured")
+	require.NotNil(t, response.Stats, "stats should be present when statusChecker is configured")
 	assert.Equal(t, 42, response.Stats.InFlightProvisions)
 }
 
-func TestHealthCheck_WithoutInFlightReporter(t *testing.T) {
+func TestHealthCheck_WithoutStatusChecker(t *testing.T) {
 	h := &Handlers{
 		providerUUID: testutil.ValidUUID1,
 		bech32Prefix: "manifest",
-		// inFlightReporter is nil
+		// statusChecker is nil
 	}
 
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -4032,5 +4030,5 @@ func TestHealthCheck_WithoutInFlightReporter(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
 	assert.Equal(t, "healthy", response.Status)
-	assert.Nil(t, response.Stats, "stats should be absent without reporter")
+	assert.Nil(t, response.Stats, "stats should be absent without statusChecker")
 }

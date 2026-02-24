@@ -41,50 +41,42 @@ type PlacementLookup interface {
 	Healthy() error
 }
 
-// InFlightReporter provides the current number of in-flight provisions.
-type InFlightReporter interface {
-	InFlightCount() int
-}
-
 // Handlers contains HTTP request handlers.
 type Handlers struct {
-	client           ChainClient
-	backendRouter    *backend.Router
-	tokenTracker     TokenTrackerInterface
-	statusChecker    StatusChecker
-	placementLookup  PlacementLookup
-	eventBroker      *EventBroker
-	inFlightReporter InFlightReporter
-	wsUpgrader       websocket.Upgrader
-	providerUUID     string
-	bech32Prefix     string
-	callbackBaseURL  string
+	client          ChainClient
+	backendRouter   *backend.Router
+	tokenTracker    TokenTrackerInterface
+	statusChecker   StatusChecker
+	placementLookup PlacementLookup
+	eventBroker     *EventBroker
+	wsUpgrader      websocket.Upgrader
+	providerUUID    string
+	bech32Prefix    string
+	callbackBaseURL string
 }
 
 // HandlersConfig configures a Handlers instance.
 type HandlersConfig struct {
-	Client           ChainClient
-	BackendRouter    *backend.Router
-	TokenTracker     TokenTrackerInterface // optional but recommended for replay attack protection
-	StatusChecker    StatusChecker         // optional but required for the /status endpoint
-	PlacementLookup  PlacementLookup       // optional — used for routing reads to the correct backend
-	EventBroker      *EventBroker          // optional — if nil, the events endpoint will return 501
-	InFlightReporter InFlightReporter      // optional — if set, /health includes in-flight stats
-	ProviderUUID     string
-	Bech32Prefix     string
-	CallbackBaseURL  string // used for restart/update callbacks to the backend
+	Client          ChainClient
+	BackendRouter   *backend.Router
+	TokenTracker    TokenTrackerInterface // optional but recommended for replay attack protection
+	StatusChecker   StatusChecker         // optional but required for the /status endpoint
+	PlacementLookup PlacementLookup       // optional — used for routing reads to the correct backend
+	EventBroker     *EventBroker          // optional — if nil, the events endpoint will return 501
+	ProviderUUID    string
+	Bech32Prefix    string
+	CallbackBaseURL string // used for restart/update callbacks to the backend
 }
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(cfg HandlersConfig) *Handlers {
 	return &Handlers{
-		client:           cfg.Client,
-		backendRouter:    cfg.BackendRouter,
-		tokenTracker:     cfg.TokenTracker,
-		statusChecker:    cfg.StatusChecker,
-		placementLookup:  cfg.PlacementLookup,
-		eventBroker:      cfg.EventBroker,
-		inFlightReporter: cfg.InFlightReporter,
+		client:          cfg.Client,
+		backendRouter:   cfg.BackendRouter,
+		tokenTracker:    cfg.TokenTracker,
+		statusChecker:   cfg.StatusChecker,
+		placementLookup: cfg.PlacementLookup,
+		eventBroker:     cfg.EventBroker,
 		wsUpgrader: websocket.Upgrader{
 			// Allow all origins: this API is not browser-facing. Clients are
 			// CLI tools and services that authenticate with cryptographically
@@ -843,9 +835,9 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		Checks:       checks,
 	}
 
-	if h.inFlightReporter != nil {
+	if h.statusChecker != nil {
 		response.Stats = &HealthStats{
-			InFlightProvisions: h.inFlightReporter.InFlightCount(),
+			InFlightProvisions: h.statusChecker.InFlightCount(),
 		}
 	}
 
