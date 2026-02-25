@@ -516,7 +516,7 @@ func TestRouter_HealthCheck_ContextCancellation(t *testing.T) {
 
 func TestRouter_HealthCheck_SetsBackendHealthyGauge(t *testing.T) {
 	healthy := NewMockBackend(MockBackendConfig{Name: "healthy-be"})
-	unhealthy := &unhealthyBackend{MockBackend: *NewMockBackend(MockBackendConfig{Name: "sick-be"})}
+	unhealthy := &unhealthyBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "sick-be"})}
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
@@ -536,7 +536,7 @@ func TestRouter_HealthCheck_SetsBackendHealthyGauge(t *testing.T) {
 
 // unhealthyBackend wraps MockBackend but returns an error from Health().
 type unhealthyBackend struct {
-	MockBackend
+	*MockBackend
 }
 
 func (u *unhealthyBackend) Health(ctx context.Context) error {
