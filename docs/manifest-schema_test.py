@@ -528,6 +528,157 @@ def main():
     expect_invalid("not a manifest (null)", None)
 
     # ---------------------------------------------------------------
+    # Schema drift regression tests
+    # These cover the five categories of drift between JSON Schema
+    # and Go runtime validation identified during review.
+    # ---------------------------------------------------------------
+
+    # (a) health_check.test — CMD/CMD-SHELL require ≥2 items, NONE exactly 1
+    expect_invalid("health_check CMD without args", {
+        "image": "nginx",
+        "health_check": {"test": ["CMD"]}
+    })
+
+    expect_invalid("health_check CMD-SHELL without args", {
+        "image": "nginx",
+        "health_check": {"test": ["CMD-SHELL"]}
+    })
+
+    expect_invalid("health_check NONE with extra args", {
+        "image": "nginx",
+        "health_check": {"test": ["NONE", "extra"]}
+    })
+
+    expect_invalid("health_check unknown test type", {
+        "image": "nginx",
+        "health_check": {"test": ["EXEC", "true"]}
+    })
+
+    expect_valid("health_check CMD with multiple args", {
+        "image": "nginx",
+        "health_check": {"test": ["CMD", "curl", "-f", "http://localhost/"]}
+    })
+
+    expect_valid("health_check CMD-SHELL with one arg", {
+        "image": "nginx",
+        "health_check": {"test": ["CMD-SHELL", "curl -f http://localhost/ || exit 1"]}
+    })
+
+    # (b) stop_grace_period — integer nanosecond bounds (1s–120s)
+    expect_invalid("stop_grace_period integer below 1s", {
+        "image": "nginx",
+        "stop_grace_period": 999999999
+    })
+
+    expect_invalid("stop_grace_period integer above 120s", {
+        "image": "nginx",
+        "stop_grace_period": 120000000001
+    })
+
+    expect_valid("stop_grace_period integer exactly 1s", {
+        "image": "nginx",
+        "stop_grace_period": 1000000000
+    })
+
+    expect_valid("stop_grace_period integer exactly 120s", {
+        "image": "nginx",
+        "stop_grace_period": 120000000000
+    })
+
+    expect_valid("stop_grace_period string 10s", {
+        "image": "nginx",
+        "stop_grace_period": "10s"
+    })
+
+    expect_valid("stop_grace_period string compound 1m30s", {
+        "image": "nginx",
+        "stop_grace_period": "1m30s"
+    })
+
+    # (c) tmpfs — blocked paths enforced
+    expect_invalid("tmpfs root path /", {
+        "image": "nginx",
+        "tmpfs": ["/"]
+    })
+
+    expect_invalid("tmpfs /tmp (auto-mounted)", {
+        "image": "nginx",
+        "tmpfs": ["/tmp"]
+    })
+
+    expect_invalid("tmpfs /run (auto-mounted)", {
+        "image": "nginx",
+        "tmpfs": ["/run"]
+    })
+
+    expect_invalid("tmpfs /proc sub-path", {
+        "image": "nginx",
+        "tmpfs": ["/proc/self"]
+    })
+
+    expect_invalid("tmpfs /sys sub-path", {
+        "image": "nginx",
+        "tmpfs": ["/sys/fs"]
+    })
+
+    expect_invalid("tmpfs /dev sub-path", {
+        "image": "nginx",
+        "tmpfs": ["/dev/shm"]
+    })
+
+    expect_invalid("tmpfs /proc exact", {
+        "image": "nginx",
+        "tmpfs": ["/proc"]
+    })
+
+    expect_invalid("tmpfs /sys exact", {
+        "image": "nginx",
+        "tmpfs": ["/sys"]
+    })
+
+    expect_invalid("tmpfs /dev exact", {
+        "image": "nginx",
+        "tmpfs": ["/dev"]
+    })
+
+    expect_valid("tmpfs /var/log (allowed path)", {
+        "image": "nginx",
+        "tmpfs": ["/var/log"]
+    })
+
+    expect_valid("tmpfs /tmp-data (not /tmp exact)", {
+        "image": "nginx",
+        "tmpfs": ["/tmp-data"]
+    })
+
+    expect_valid("tmpfs /run/mysqld (sub-path of /run allowed)", {
+        "image": "nginx",
+        "tmpfs": ["/run/mysqld"]
+    })
+
+    # (d) Uppercase protocols accepted (Go normalizes to lowercase)
+    expect_valid("port uppercase TCP", {
+        "image": "nginx",
+        "ports": {"80/TCP": {}}
+    })
+
+    expect_valid("port uppercase UDP", {
+        "image": "nginx",
+        "ports": {"53/UDP": {}}
+    })
+
+    expect_valid("port mixed case Tcp", {
+        "image": "nginx",
+        "ports": {"80/Tcp": {}}
+    })
+
+    # (e) Empty depends_on allowed in single-service manifest
+    expect_valid("single-service with empty depends_on", {
+        "image": "nginx",
+        "depends_on": {}
+    })
+
+    # ---------------------------------------------------------------
     # Summary
     # ---------------------------------------------------------------
     total = passed + failed
