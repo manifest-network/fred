@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manifest-network/fred/docs/manifest-schema.json",
   "title": "Fred Deployment Manifest",
-  "description": "Schema for Fred deployment manifests. Supports two formats: a single-service DockerManifest or a multi-service StackManifest. The payload submitted to POST /v1/leases/{uuid}/data or POST /v1/leases/{uuid}/update must conform to exactly one of these formats.",
+  "description": "Schema for Fred deployment manifests. Supports two formats: a single-service DockerManifest or a multi-service StackManifest. For POST /v1/leases/{uuid}/data the raw HTTP body is the manifest JSON. For POST /v1/leases/{uuid}/update the manifest is base64-encoded inside a JSON wrapper ({\"payload\": \"<base64>\"}); this schema describes the decoded manifest, not the wrapper.",
   "oneOf": [
     {
       "$ref": "#/$defs/DockerManifestSingle",
@@ -43,10 +43,10 @@
             "minLength": 1,
             "not": {
               "anyOf": [
-                { "pattern": "^(?i)PATH$" },
-                { "pattern": "^(?i)LD_" },
-                { "pattern": "^(?i)FRED_" },
-                { "pattern": "^(?i)DOCKER_" }
+                { "pattern": "^[Pp][Aa][Tt][Hh]$" },
+                { "pattern": "^[Ll][Dd]_" },
+                { "pattern": "^[Ff][Rr][Ee][Dd]_" },
+                { "pattern": "^[Dd][Oo][Cc][Kk][Ee][Rr]_" }
               ]
             },
             "pattern": "^[^=\\x00]+$",
