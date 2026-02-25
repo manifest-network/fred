@@ -36,7 +36,7 @@ func TestMetricsRegistered(t *testing.T) {
 		ReconcilerLastSuccessTimestamp,
 		APIRequestDuration,
 		APIRequestsTotal,
-		DuplicateCallbacksTotal,
+		NonInFlightCallbacksTotal,
 		ChainTxTotal,
 		ChainQueryDuration,
 		WatermillMessagesTotal,
@@ -73,7 +73,7 @@ func TestMetricsRegistered(t *testing.T) {
 		"fred_payload_stored_count",
 		"fred_payload_size_bytes",
 		"fred_payload_leases_awaiting_total",
-		"fred_api_duplicate_callbacks_total",
+		"fred_api_non_in_flight_callbacks_total",
 		"fred_watermill_poisoned_messages_total",
 		"fred_reconciler_last_success_timestamp_seconds",
 	} {

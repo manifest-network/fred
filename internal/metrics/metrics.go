@@ -264,11 +264,12 @@ var (
 		Help:      "Total number of provisions that timed out waiting for backend callback",
 	})
 
-	// DuplicateCallbacksTotal tracks callbacks received for leases not in the in-flight tracker.
-	DuplicateCallbacksTotal = promauto.NewCounter(prometheus.CounterOpts{
+	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker.
+	// This includes expected restart/update completions as well as duplicate deliveries.
+	NonInFlightCallbacksTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
-		Name:      "duplicate_callbacks_total",
+		Name:      "non_in_flight_callbacks_total",
 		Help:      "Callbacks received for leases not in the in-flight tracker (restart/update completions or duplicate delivery)",
 	})
 )

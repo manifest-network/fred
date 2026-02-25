@@ -1333,8 +1333,8 @@ func TestPublishLeaseEvent_PublishError(t *testing.T) {
 
 // --- Metric tests ---
 
-func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsDuplicateCallbacks(t *testing.T) {
-	before := promtestutil.ToFloat64(metrics.DuplicateCallbacksTotal)
+func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallbacks(t *testing.T) {
+	before := promtestutil.ToFloat64(metrics.NonInFlightCallbacksTotal)
 
 	hs := NewHandlerSet(HandlerDeps{
 		Tracker: NewInFlightTracker(),
@@ -1348,8 +1348,8 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsDuplicateCallbac
 	err := hs.HandleBackendCallback(msg)
 	assert.NoError(t, err)
 
-	after := promtestutil.ToFloat64(metrics.DuplicateCallbacksTotal)
-	assert.Equal(t, 1.0, after-before, "DuplicateCallbacksTotal should increment by 1")
+	after := promtestutil.ToFloat64(metrics.NonInFlightCallbacksTotal)
+	assert.Equal(t, 1.0, after-before, "NonInFlightCallbacksTotal should increment by 1")
 }
 
 // --- Helper ---
