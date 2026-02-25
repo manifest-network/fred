@@ -593,9 +593,79 @@ def main():
         "stop_grace_period": "10s"
     })
 
+    expect_valid("stop_grace_period string 1s (minimum)", {
+        "image": "nginx",
+        "stop_grace_period": "1s"
+    })
+
+    expect_valid("stop_grace_period string 120s (maximum)", {
+        "image": "nginx",
+        "stop_grace_period": "120s"
+    })
+
     expect_valid("stop_grace_period string compound 1m30s", {
         "image": "nginx",
         "stop_grace_period": "1m30s"
+    })
+
+    expect_valid("stop_grace_period string 1m", {
+        "image": "nginx",
+        "stop_grace_period": "1m"
+    })
+
+    expect_valid("stop_grace_period string 2m (120s)", {
+        "image": "nginx",
+        "stop_grace_period": "2m"
+    })
+
+    expect_valid("stop_grace_period string 1000ms (1s)", {
+        "image": "nginx",
+        "stop_grace_period": "1000ms"
+    })
+
+    expect_valid("stop_grace_period string 120000ms (120s)", {
+        "image": "nginx",
+        "stop_grace_period": "120000ms"
+    })
+
+    expect_valid("stop_grace_period string fractional 1.5s", {
+        "image": "nginx",
+        "stop_grace_period": "1.5s"
+    })
+
+    expect_invalid("stop_grace_period string 500ms (< 1s)", {
+        "image": "nginx",
+        "stop_grace_period": "500ms"
+    })
+
+    expect_invalid("stop_grace_period string 121s (> 120s)", {
+        "image": "nginx",
+        "stop_grace_period": "121s"
+    })
+
+    expect_invalid("stop_grace_period string 0s", {
+        "image": "nginx",
+        "stop_grace_period": "0s"
+    })
+
+    expect_invalid("stop_grace_period string 3m (180s)", {
+        "image": "nginx",
+        "stop_grace_period": "3m"
+    })
+
+    expect_invalid("stop_grace_period string 1h (3600s)", {
+        "image": "nginx",
+        "stop_grace_period": "1h"
+    })
+
+    expect_invalid("stop_grace_period string 999ms (< 1s)", {
+        "image": "nginx",
+        "stop_grace_period": "999ms"
+    })
+
+    expect_invalid("stop_grace_period string 120001ms (> 120s)", {
+        "image": "nginx",
+        "stop_grace_period": "120001ms"
     })
 
     # (c) tmpfs — blocked paths enforced

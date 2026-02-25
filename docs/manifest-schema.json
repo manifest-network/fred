@@ -264,12 +264,32 @@
       "description": "A time duration. Accepts Go duration strings (\"30s\", \"1m\") or integer nanoseconds."
     },
     "StopGracePeriod": {
-      "description": "Duration bounded to 1s–120s. For integer nanoseconds the range is enforced exactly. For duration strings, only simple single-unit forms can be range-checked; compound forms (e.g., \"1m30s\") are validated at runtime.",
+      "description": "Duration bounded to 1s–120s. Integer nanoseconds are range-checked exactly. For strings, integer seconds (1s–120s), milliseconds (1000ms–120000ms), and minutes (1m–2m) are enforced by the schema. Fractional and compound forms (e.g., \"1.5s\", \"1m30s\") pass the schema and are range-validated at runtime.",
       "oneOf": [
         {
           "type": "string",
-          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
-          "description": "Go duration string. Must evaluate to 1s–120s at runtime."
+          "pattern": "^([1-9]|[1-9][0-9]|1[01][0-9]|120)s$",
+          "description": "Integer seconds, 1s–120s."
+        },
+        {
+          "type": "string",
+          "pattern": "^([1-9][0-9]{3,4}|1[01][0-9]{4}|120000)ms$",
+          "description": "Integer milliseconds, 1000ms–120000ms."
+        },
+        {
+          "type": "string",
+          "pattern": "^[12]m$",
+          "description": "Integer minutes, 1m (60s) or 2m (120s)."
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+(ns|us|µs|ms|s|m|h)$",
+          "description": "Fractional single-unit duration. Range validated at runtime."
+        },
+        {
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)){2,}$",
+          "description": "Compound duration (e.g., \"1m30s\"). Range validated at runtime."
         },
         {
           "type": "integer",
