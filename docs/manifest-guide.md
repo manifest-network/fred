@@ -137,7 +137,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 ### Image
 
 - **Required.** Cannot be empty.
-- Must pass the operator's allowed-registries check (if configured). The registry is extracted using Docker's standard normalization:
+- Must be from a registry in the operator's `allowed_registries` list. The registry is extracted using Docker's standard normalization:
 
 | Image | Resolved Registry |
 |---|---|
@@ -306,7 +306,7 @@ Overrides the container's runtime user. Useful for images like `postgres` whose 
 - User part (before `:`) cannot be empty.
 - If `:` is present, the group part (after `:`) cannot be empty.
 
-**Backend behavior:** When `user` is set, the backend resolves the specification to a numeric UID/GID by inspecting the image's `/etc/passwd`, pre-chowns volume subdirectories to the resolved UID:GID, and sets the container to run as that user from start. If neither the manifest nor the Dockerfile's `USER` directive specifies a user, the container runs as root (UID 0).
+**Backend behavior:** When `user` is set, the backend resolves the specification to a numeric UID/GID by inspecting the image's `/etc/passwd`, pre-chowns volume subdirectories to the resolved UID:GID, and sets the container to run as that user from start. When `user` is not set but the image declares `VOLUME` paths, the backend auto-detects the volume directory ownership from the image and runs as the detected UID:GID (this handles images like `postgres` and `mongo` that pre-chown their data directories during build). If no user can be determined from any source, the container runs as root (UID 0).
 
 ```json
 // Valid
@@ -551,7 +551,7 @@ Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automa
 
 ### PostgreSQL (User Override + Stateful)
 
-Requires a stateful SKU with `disk_mb > 0`. The `user` field ensures the container runs as `postgres` from the start, bypassing the default entrypoint's `chown` calls that would fail without `CAP_CHOWN`.
+Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume ownership for `postgres` images, but setting `user` explicitly is recommended for clarity and to ensure correct behavior across image versions.
 
 ```json
 {
