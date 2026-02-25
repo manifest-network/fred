@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manifest-network/fred/docs/manifest-schema.json",
+  "title": "Fred Deployment Manifest",
+  "description": "Schema for Fred deployment manifests. Supports two formats: a single-service DockerManifest or a multi-service StackManifest. The payload submitted to POST /v1/leases/{uuid}/data or POST /v1/leases/{uuid}/update must conform to exactly one of these formats.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/DockerManifestSingle",
+      "description": "Single-service manifest. The depends_on field is forbidden."
+    },
+    {
+      "$ref": "#/$defs/StackManifest",
+      "description": "Multi-service stack manifest with a top-level services map."
+    }
+  ],
+  "$defs": {
+    "DockerManifestBase": {
+      "type": "object",
+      "description": "Base container specification shared by single-service and stack contexts. Resource limits are determined by the lease SKU, not the manifest.",
+      "required": ["image"],
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Container image to run (e.g., \"nginx:latest\", \"ghcr.io/org/app:v1.2\"). Required."
+        },
+        "ports": {
+          "type": "object",
+          "description": "Port mappings. Keys are \"port/protocol\" strings; values configure optional host port binding.",
+          "propertyNames": {
+            "$ref": "#/$defs/PortSpec"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/PortConfig"
+          }
+        },
+        "env": {
+          "type": "object",
+          "description": "Environment variables passed to the container. Certain names and prefixes are blocked for security.",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "not": {
+              "anyOf": [
+                { "pattern": "^(?i)PATH$" },
+                { "pattern": "^(?i)LD_" },
+                { "pattern": "^(?i)FRED_" },
+                { "pattern": "^(?i)DOCKER_" }
+              ]
+            },
+            "pattern": "^[^=\\x00]+$",
+            "description": "Variable name. Cannot be empty, contain '=' or NUL. Blocked: PATH, LD_*, FRED_*, DOCKER_* (case-insensitive)."
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Overrides the container entrypoint."
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Arguments passed to the command."
+        },
+        "labels": {
+          "type": "object",
+          "description": "Custom labels added to the container. Keys must not start with \"fred.\" (reserved namespace).",
+          "propertyNames": {
+            "type": "string",
+            "not": { "pattern": "^fred\\." }
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "health_check": {
+          "$ref": "#/$defs/HealthCheckConfig"
+        },
+        "tmpfs": {
+          "type": "array",
+          "description": "Additional writable tmpfs mount paths for containers with read-only root filesystems. /tmp and /run are always mounted automatically.",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/",
+            "description": "Absolute path. Must not be /, /tmp, /run, /proc, /sys, /dev, or any sub-path of /proc, /sys, /dev."
+          }
+        },
+        "user": {
+          "type": "string",
+          "description": "Container runtime user. Formats: \"uid\", \"uid:gid\", \"username\", \"username:group\". No whitespace; both user and group parts must be non-empty.",
+          "pattern": "^[^\\s:]+(:([^\\s:]+))?$"
+        },
+        "depends_on": {
+          "type": "object",
+          "description": "Startup dependencies on other services. Only allowed inside a StackManifest; rejected for single-service manifests.",
+          "additionalProperties": {
+            "$ref": "#/$defs/DependsOnCondition"
+          }
+        },
+        "stop_grace_period": {
+          "$ref": "#/$defs/Duration",
+          "description": "Time to wait after SIGTERM before SIGKILL. Must be between 1s and 120s inclusive."
+        },
+        "init": {
+          "type": "boolean",
+          "description": "Run an init process (tini) as PID 1 for zombie reaping and signal forwarding."
+        },
+        "expose": {
+          "type": "array",
+          "description": "Inter-service ports documented without creating host bindings. Port numbers as strings, 1-65535, no duplicates.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$",
+            "description": "Port number as a string (1-65535)."
+          }
+        }
+      }
+    },
+    "DockerManifestSingle": {
+      "description": "Single-service manifest. Identical to DockerManifestBase but depends_on is forbidden.",
+      "$ref": "#/$defs/DockerManifestBase",
+      "not": {
+        "required": ["depends_on"]
+      }
+    },
+    "DockerManifestInStack": {
+      "description": "Service manifest within a stack. depends_on is allowed.",
+      "$ref": "#/$defs/DockerManifestBase"
+    },
+    "StackManifest": {
+      "type": "object",
+      "description": "Multi-service deployment. Each service has its own DockerManifest. Service names must match chain lease items 1:1.",
+      "required": ["services"],
+      "additionalProperties": false,
+      "properties": {
+        "services": {
+          "type": "object",
+          "description": "Map of service name to DockerManifest. At least one service required.",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/ServiceName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/DockerManifestInStack"
+          }
+        }
+      }
+    },
+    "PortSpec": {
+      "type": "string",
+      "pattern": "^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])/(tcp|udp)$",
+      "description": "Port specification in \"port/protocol\" format. Port: 1-65535. Protocol: tcp or udp (lowercase). The Go runtime normalizes protocol case, but the canonical form is lowercase."
+    },
+    "PortConfig": {
+      "type": "object",
+      "description": "Port mapping configuration.",
+      "additionalProperties": false,
+      "properties": {
+        "host_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 0,
+          "description": "Fixed host port. 0 or omitted means Docker assigns a random available port."
+        }
+      }
+    },
+    "HealthCheckConfig": {
+      "type": "object",
+      "description": "Container health check configuration.",
+      "required": ["test"],
+      "additionalProperties": false,
+      "properties": {
+        "test": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Health check command. First element must be CMD, CMD-SHELL, or NONE. CMD and CMD-SHELL require at least one additional argument."
+        },
+        "interval": {
+          "$ref": "#/$defs/Duration",
+          "description": "Time between health checks."
+        },
+        "timeout": {
+          "$ref": "#/$defs/Duration",
+          "description": "Timeout for each health check execution."
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of consecutive failures before marking unhealthy."
+        },
+        "start_period": {
+          "$ref": "#/$defs/Duration",
+          "description": "Initial grace period during which health check failures are not counted."
+        }
+      }
+    },
+    "DependsOnCondition": {
+      "type": "object",
+      "description": "Condition a dependency must meet before this service starts.",
+      "required": ["condition"],
+      "additionalProperties": false,
+      "properties": {
+        "condition": {
+          "type": "string",
+          "enum": ["service_started", "service_healthy"],
+          "description": "service_started: dependency container has started. service_healthy: dependency must have an active health check and be healthy."
+        }
+      }
+    },
+    "Duration": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "description": "Go duration string (e.g., \"30s\", \"1m30s\", \"500ms\")."
+        },
+        {
+          "type": "integer",
+          "description": "Duration in nanoseconds."
+        }
+      ],
+      "description": "A time duration. Accepts Go duration strings (\"30s\", \"1m\") or integer nanoseconds."
+    },
+    "ServiceName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+      "minLength": 1,
+      "maxLength": 63,
+      "description": "RFC 1123 DNS label: lowercase alphanumeric and hyphens, 1-63 characters, must start and end with alphanumeric."
+    }
+  }
+}
