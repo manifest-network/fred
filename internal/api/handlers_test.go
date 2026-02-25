@@ -1532,8 +1532,9 @@ func TestGetLeaseConnection_ChainErrors(t *testing.T) {
 
 // mockStatusChecker implements StatusChecker for testing.
 type mockStatusChecker struct {
-	hasPayload map[string]bool
-	isInFlight map[string]bool
+	hasPayload    map[string]bool
+	isInFlight    map[string]bool
+	inFlightCount int
 }
 
 func (m *mockStatusChecker) HasPayload(leaseUUID string) (bool, error) {
@@ -1548,6 +1549,10 @@ func (m *mockStatusChecker) IsInFlight(leaseUUID string) bool {
 		return false
 	}
 	return m.isInFlight[leaseUUID]
+}
+
+func (m *mockStatusChecker) InFlightCount() int {
+	return m.inFlightCount
 }
 
 // TestGetLeaseStatus tests the GetLeaseStatus endpoint.
@@ -3980,4 +3985,50 @@ func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
 
 		assert.Empty(t, response.Releases)
 	})
+}
+
+// --- Health endpoint stats tests ---
+
+func TestHealthCheck_WithStatusChecker(t *testing.T) {
+	sc := &mockStatusChecker{inFlightCount: 42}
+	h := &Handlers{
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+		statusChecker: sc,
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, "healthy", response.Status)
+	require.NotNil(t, response.Stats, "stats should be present when statusChecker is configured")
+	assert.Equal(t, 42, response.Stats.InFlightProvisions)
+}
+
+func TestHealthCheck_WithoutStatusChecker(t *testing.T) {
+	h := &Handlers{
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+		// statusChecker is nil
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, "healthy", response.Status)
+	assert.Nil(t, response.Stats, "stats should be absent without statusChecker")
 }

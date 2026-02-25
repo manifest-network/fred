@@ -57,6 +57,14 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 10), // 0.5s to ~8min
 	})
 
+	// ReconcilerLastSuccessTimestamp records the unix timestamp of the last successful reconciliation.
+	ReconcilerLastSuccessTimestamp = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "last_success_timestamp_seconds",
+		Help:      "Unix timestamp of the last successful reconciliation run",
+	})
+
 	// ReconciliationActions tracks actions taken during reconciliation.
 	ReconciliationActions = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
@@ -121,6 +129,22 @@ var (
 		Help:      "Total number of backend requests",
 	}, []string{"backend", "operation", "status"})
 
+	// BackendInsufficientResourcesTotal tracks backend capacity rejections.
+	BackendInsufficientResourcesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "insufficient_resources_total",
+		Help:      "Total number of provisions rejected due to insufficient backend resources",
+	}, []string{"backend"})
+
+	// BackendHealthy tracks backend health status (1 = healthy, 0 = unhealthy).
+	BackendHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "healthy",
+		Help:      "Backend health status (1 = healthy, 0 = unhealthy)",
+	}, []string{"backend"})
+
 	// BackendCircuitBreakerState tracks circuit breaker state (0=closed, 1=half-open, 2=open).
 	BackendCircuitBreakerState = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
@@ -128,6 +152,17 @@ var (
 		Name:      "circuit_breaker_state",
 		Help:      "Circuit breaker state (0=closed, 1=half-open, 2=open)",
 	}, []string{"backend"})
+)
+
+// Rate limit metrics
+var (
+	// RateLimitRejectionsTotal tracks requests rejected by rate limiting.
+	RateLimitRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "rate_limit_rejections_total",
+		Help:      "Total number of requests rejected by rate limiting",
+	}, []string{"limiter"}) // limiter: global, tenant
 )
 
 // API metrics
@@ -229,12 +264,13 @@ var (
 		Help:      "Total number of provisions that timed out waiting for backend callback",
 	})
 
-	// DuplicateCallbacksTotal tracks duplicate callbacks that were ignored (idempotency).
-	DuplicateCallbacksTotal = promauto.NewCounter(prometheus.CounterOpts{
+	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker.
+	// This includes expected restart/update completions as well as duplicate deliveries.
+	NonInFlightCallbacksTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
-		Name:      "duplicate_callbacks_total",
-		Help:      "Total number of duplicate callbacks ignored due to idempotency check",
+		Name:      "non_in_flight_callbacks_total",
+		Help:      "Callbacks received for leases not in the in-flight tracker (restart/update completions or duplicate delivery)",
 	})
 )
 

@@ -728,11 +728,17 @@ func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, http.StatusOK)
 }
 
+// HealthStats contains operational statistics for the health response.
+type HealthStats struct {
+	InFlightProvisions int `json:"in_flight_provisions"`
+}
+
 // HealthResponse represents the health check response.
 type HealthResponse struct {
 	Status       string                  `json:"status"`
 	ProviderUUID string                  `json:"provider_uuid"`
 	Checks       map[string]*CheckResult `json:"checks"`
+	Stats        *HealthStats            `json:"stats,omitempty"`
 }
 
 // CheckResult represents the result of a single health check.
@@ -827,6 +833,12 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		Status:       status,
 		ProviderUUID: h.providerUUID,
 		Checks:       checks,
+	}
+
+	if h.statusChecker != nil {
+		response.Stats = &HealthStats{
+			InFlightProvisions: h.statusChecker.InFlightCount(),
+		}
 	}
 
 	writeJSON(w, response, httpStatus)

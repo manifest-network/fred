@@ -149,6 +149,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		limiter := rl.getVisitor(ip)
 		if !limiter.Allow() {
 			slog.Warn("rate limit exceeded", "ip", ip, "path", r.URL.Path)
+			metrics.RateLimitRejectionsTotal.WithLabelValues("global").Inc()
 			w.Header().Set("Retry-After", rl.retryAfterSeconds())
 			writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -300,6 +301,7 @@ func (tl *TenantRateLimiter) AuthMiddleware() func(http.Handler) http.Handler {
 					"tenant", token.Tenant,
 					"path", r.URL.Path,
 				)
+				metrics.RateLimitRejectionsTotal.WithLabelValues("tenant").Inc()
 				w.Header().Set("Retry-After", tl.retryAfterSeconds())
 				writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -344,6 +346,7 @@ func (tl *TenantRateLimiter) PayloadAuthMiddleware() func(http.Handler) http.Han
 					"tenant", token.Tenant,
 					"path", r.URL.Path,
 				)
+				metrics.RateLimitRejectionsTotal.WithLabelValues("tenant").Inc()
 				w.Header().Set("Retry-After", tl.retryAfterSeconds())
 				writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return

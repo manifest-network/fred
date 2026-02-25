@@ -13,6 +13,7 @@ import (
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,6 +21,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
@@ -1327,6 +1329,27 @@ func TestPublishLeaseEvent_PublishError(t *testing.T) {
 
 	// Should not panic — publish errors are logged, not propagated
 	hs.publishLeaseEvent("lease-1", backend.ProvisionStatusReady, "")
+}
+
+// --- Metric tests ---
+
+func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallbacks(t *testing.T) {
+	before := promtestutil.ToFloat64(metrics.NonInFlightCallbacksTotal)
+
+	hs := NewHandlerSet(HandlerDeps{
+		Tracker: NewInFlightTracker(),
+	})
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-not-in-flight",
+		Status:    backend.CallbackStatusSuccess,
+	})
+
+	err := hs.HandleBackendCallback(msg)
+	assert.NoError(t, err)
+
+	after := promtestutil.ToFloat64(metrics.NonInFlightCallbacksTotal)
+	assert.Equal(t, 1.0, after-before, "NonInFlightCallbacksTotal should increment by 1")
 }
 
 // --- Helper ---

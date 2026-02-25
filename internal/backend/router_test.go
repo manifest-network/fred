@@ -5,8 +5,11 @@ import (
 	"errors"
 	"testing"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 func TestRouter_Route(t *testing.T) {
@@ -509,4 +512,81 @@ func TestRouter_HealthCheck_ContextCancellation(t *testing.T) {
 	assert.True(t, allHealthy)
 
 	require.Len(t, results, 1)
+}
+
+func TestRouter_HealthCheck_SetsBackendHealthyGauge(t *testing.T) {
+	healthy := NewMockBackend(MockBackendConfig{Name: "healthy-be"})
+	unhealthy := &unhealthyBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "sick-be"})}
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: healthy, IsDefault: true},
+			{Backend: unhealthy},
+		},
+	})
+	require.NoError(t, err)
+
+	router.HealthCheck(context.Background())
+
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("healthy-be")),
+		"healthy backend gauge should be 1")
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("sick-be")),
+		"unhealthy backend gauge should be 0")
+}
+
+func TestRouter_HealthCheck_SkipsGaugeOnContextCancellation(t *testing.T) {
+	be := &contextAwareBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "ctx-be"})}
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: be, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// Set the gauge to 1 (healthy) first.
+	metrics.BackendHealthy.WithLabelValues("ctx-be").Set(1)
+
+	// Call HealthCheck with a cancelled context; the backend returns ctx.Err().
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results, allHealthy := router.HealthCheck(ctx)
+
+	assert.False(t, allHealthy)
+	require.Len(t, results, 1)
+	assert.False(t, results[0].Healthy)
+
+	// Gauge must remain at 1 — context cancellation should not flip it to 0.
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("ctx-be")),
+		"gauge should not change on context cancellation")
+}
+
+// unhealthyBackend wraps MockBackend but returns an error from Health().
+type unhealthyBackend struct {
+	*MockBackend
+}
+
+func (u *unhealthyBackend) Health(ctx context.Context) error {
+	return errors.New("backend down")
+}
+
+func (u *unhealthyBackend) Name() string {
+	return u.name
+}
+
+// contextAwareBackend wraps MockBackend but returns ctx.Err() when the context is done.
+type contextAwareBackend struct {
+	*MockBackend
+}
+
+func (c *contextAwareBackend) Health(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *contextAwareBackend) Name() string {
+	return c.name
 }

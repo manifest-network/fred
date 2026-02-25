@@ -42,6 +42,7 @@ type CallbackPublisher interface {
 type StatusChecker interface {
 	HasPayload(leaseUUID string) (bool, error)
 	IsInFlight(leaseUUID string) bool
+	InFlightCount() int
 }
 
 // Server is the HTTP API server.

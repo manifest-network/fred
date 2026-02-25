@@ -187,6 +187,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	// the ready/failed transition, but skip chain operations.
 	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
 	if !exists {
+		metrics.NonInFlightCallbacksTotal.Inc()
 		switch callback.Status {
 		case backend.CallbackStatusSuccess:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")

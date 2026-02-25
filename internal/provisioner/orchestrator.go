@@ -2,12 +2,14 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // ProvisionOpts contains optional parameters for provisioning.
@@ -86,6 +88,9 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 
 	// Start provisioning (async - backend will call back)
 	if err := backendClient.Provision(ctx, req); err != nil {
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
+		}
 		// Clean up in-flight tracking on failure
 		o.tracker.UntrackInFlight(lease.Uuid)
 
