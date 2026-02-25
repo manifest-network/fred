@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Validates docs/manifest-schema.json against positive and negative test cases.
 
-Mirrors the Go validation logic in internal/backend/docker/manifest.go.
+Uses the JSON Schema definition to approximate the Go validation logic
+in internal/backend/docker/manifest.go, but does not cover every backend rule.
+
+Requires the 'jsonschema' package (install with: pip install jsonschema).
 Run: python3 docs/manifest-schema_test.py
 """
 
