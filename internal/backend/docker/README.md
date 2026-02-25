@@ -155,7 +155,7 @@ When provisioning `redis:latest` on this SKU:
 
 ## Tenant Manifest Reference
 
-See [TENANT_MANIFEST.md](TENANT_MANIFEST.md) for the full tenant-facing manifest specification (image, ports, env, health check, tmpfs).
+See [Manifest Guide](../../../docs/manifest-guide.md) for the full tenant-facing manifest specification (image, ports, env, health check, tmpfs). A formal [JSON Schema](../../../docs/manifest-schema.json) is also available.
 
 ## Provisioning Lifecycle
 
@@ -185,7 +185,7 @@ The entire async operation is bounded by `ProvisionTimeout` and is canceled on b
 
 ### Stack Provisioning
 
-When lease items carry `service_name` fields (and the payload is a [stack manifest](TENANT_MANIFEST.md#stack-manifests)), the backend provisions a multi-service stack:
+When lease items carry `service_name` fields (and the payload is a [stack manifest](../../../docs/manifest-guide.md#stack-manifest)), the backend provisions a multi-service stack:
 
 1. **Synchronous validation** — same as single-container, plus:
    - Detects stack vs single mode via `IsStack(items)`
