@@ -179,7 +179,11 @@ func (r *Router) HealthCheck(ctx context.Context) ([]BackendHealth, bool) {
 			health.Healthy = false
 			health.Error = err.Error()
 			allHealthy = false
-			metrics.BackendHealthy.WithLabelValues(b.Name()).Set(0)
+			// Only update the metric for genuine backend failures.
+			// Context cancellation reflects the request lifecycle, not backend health.
+			if ctx.Err() == nil {
+				metrics.BackendHealthy.WithLabelValues(b.Name()).Set(0)
+			}
 		} else {
 			metrics.BackendHealthy.WithLabelValues(b.Name()).Set(1)
 		}
