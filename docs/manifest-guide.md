@@ -137,7 +137,15 @@ A JSON object with a top-level `services` key containing a map of service names 
 ### Image
 
 - **Required.** Cannot be empty.
-- Must pass the operator's allowed-registries check (if configured).
+- Must pass the operator's allowed-registries check (if configured). The registry is extracted using Docker's standard normalization:
+
+| Image | Resolved Registry |
+|---|---|
+| `nginx` | `docker.io` |
+| `nginx:latest` | `docker.io` |
+| `myorg/myapp:v1` | `docker.io` |
+| `ghcr.io/org/app:v1` | `ghcr.io` |
+| `registry.example.com:5000/img` | `registry.example.com:5000` |
 
 ### Ports
 
@@ -155,7 +163,7 @@ Port map keys must be in `"port/protocol"` format:
 
 > **Note:** The Go runtime normalizes protocol case (e.g., `"80/TCP"` is accepted), but the canonical form is lowercase. Always use lowercase `tcp` or `udp` in manifests.
 
-Host port (`host_port`) must be 0–65535. A value of 0 (or omitted) means Docker auto-assigns.
+Host port (`host_port`) must be 0–65535. A value of 0 (or omitted) means Docker auto-assigns. Use `GET /info/{lease_uuid}` after provisioning to discover assigned host ports.
 
 ### Environment Variables
 
@@ -208,6 +216,8 @@ Rules:
 - `CMD` and `CMD-SHELL` require at least one argument after the type prefix.
 - `retries` must be ≥ 0.
 - Duration fields (`interval`, `timeout`, `start_period`) accept Go duration strings (`"30s"`, `"1m30s"`, `"500ms"`) or integer nanoseconds.
+- When a health check is present, the backend waits for all containers to report `healthy` before sending a success callback.
+- A health check defined in the Dockerfile but **not** in the manifest does not trigger health-aware startup verification — the manifest is the contract.
 
 ```json
 // CMD — exec form
@@ -282,12 +292,21 @@ Each tmpfs mount uses the operator-configured size limit (default 64MB). Combine
 
 Overrides the container's runtime user. Useful for images like `postgres` whose entrypoint tries to chown directories (requires running as the target user directly since `CAP_CHOWN` is dropped).
 
-**Formats:** `"uid"`, `"uid:gid"`, `"username"`, `"username:group"`
+**Formats** (same as Docker's `USER` directive):
+
+| Format | Example | Description |
+|---|---|---|
+| `uid` | `"999"` | Numeric user ID |
+| `uid:gid` | `"999:999"` | Numeric user and group IDs |
+| `username` | `"postgres"` | Username resolved from the image's `/etc/passwd` |
+| `username:group` | `"postgres:postgres"` | User and group resolved from the image |
 
 **Rules:**
 - No whitespace allowed.
 - User part (before `:`) cannot be empty.
 - If `:` is present, the group part (after `:`) cannot be empty.
+
+**Backend behavior:** When `user` is set, the backend resolves the specification to a numeric UID/GID by inspecting the image's `/etc/passwd`, pre-chowns volume subdirectories to the resolved UID:GID, and sets the container to run as that user from start. If neither the manifest nor the Dockerfile's `USER` directive specifies a user, the container runs as root (UID 0).
 
 ```json
 // Valid
@@ -310,6 +329,8 @@ Time to wait after sending SIGTERM before sending SIGKILL on container stop.
 - Maximum: **120s**
 - Accepts Go duration strings or integer nanoseconds.
 
+If not set, Docker's default (10s) is used.
+
 ```json
 { "stop_grace_period": "10s" }
 { "stop_grace_period": "2m" }
@@ -319,9 +340,13 @@ Time to wait after sending SIGTERM before sending SIGKILL on container stop.
 { "stop_grace_period": "121s" }
 ```
 
+### Init
+
+Runs an init process (tini) as PID 1 inside the container for zombie reaping and signal forwarding. Set to `true` to enable, `false` to explicitly disable. If not set, Docker's default behavior applies.
+
 ### Expose
 
-Documents inter-service ports without creating host bindings. Useful in stacks for indicating which ports other services should connect to.
+Documents inter-service ports without creating host bindings. Unlike `ports`, exposed ports are only accessible to other services on the same network (when network isolation is enabled). Use `ports` when external access is needed; use `expose` to document internal service ports.
 
 - Values are port number strings, range 1–65535.
 - No duplicates.
@@ -389,6 +414,12 @@ Declares startup ordering between services in a stack.
   - `"service_started"` — wait for the dependency container to start.
   - `"service_healthy"` — wait for the dependency to pass its health check. **Requires** the referenced service to have an active `health_check` (not `NONE`).
 - The dependency graph must be acyclic (no circular dependencies).
+
+**Fan-out behavior:** When a dependency has `quantity > 1`, the depending service waits for all instances. For example, if `web` depends on `db` and `db` has quantity 2, then `web` depends on both `db-0` and `db-1`.
+
+### Inter-Service DNS
+
+When network isolation is enabled, all services in a stack share the same tenant network. Each service's containers are created with the service name as a network alias, allowing services to reach each other by name (e.g., the `web` service can connect to `db:5432`).
 
 ### Cycle Detection
 
@@ -464,6 +495,121 @@ Duration fields accept two formats:
 2. **Integer nanoseconds** — e.g., `30000000000` for 30 seconds
 
 Go duration strings support these units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`.
+
+## Examples
+
+### Minimal
+
+```json
+{
+  "image": "nginx:latest"
+}
+```
+
+### Web Application
+
+```json
+{
+  "image": "ghcr.io/myorg/webapp:v2.1.0",
+  "ports": {
+    "8080/tcp": {}
+  },
+  "env": {
+    "APP_ENV": "production",
+    "LOG_LEVEL": "info"
+  },
+  "health_check": {
+    "test": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+    "interval": "15s",
+    "timeout": "3s",
+    "retries": 3,
+    "start_period": "30s"
+  },
+  "tmpfs": ["/var/cache/app"]
+}
+```
+
+### Redis (Stateful)
+
+Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts and re-provisions but is destroyed on deprovision.
+
+```json
+{
+  "image": "redis:7",
+  "ports": {
+    "6379/tcp": {}
+  },
+  "health_check": {
+    "test": ["CMD", "redis-cli", "ping"],
+    "interval": "10s",
+    "timeout": "3s",
+    "retries": 3,
+    "start_period": "5s"
+  }
+}
+```
+
+### PostgreSQL (User Override + Stateful)
+
+Requires a stateful SKU with `disk_mb > 0`. The `user` field ensures the container runs as `postgres` from the start, bypassing the default entrypoint's `chown` calls that would fail without `CAP_CHOWN`.
+
+```json
+{
+  "image": "postgres:16",
+  "ports": {
+    "5432/tcp": {}
+  },
+  "env": {
+    "POSTGRES_PASSWORD": "changeme",
+    "POSTGRES_DB": "myapp"
+  },
+  "user": "postgres",
+  "health_check": {
+    "test": ["CMD-SHELL", "pg_isready -U postgres"],
+    "interval": "10s",
+    "timeout": "5s",
+    "retries": 5,
+    "start_period": "30s"
+  }
+}
+```
+
+### Stack (Web + Database)
+
+```json
+{
+  "services": {
+    "web": {
+      "image": "ghcr.io/myorg/webapp:v2.1.0",
+      "ports": { "8080/tcp": {} },
+      "env": { "DATABASE_URL": "postgres://db:5432/myapp" },
+      "depends_on": {
+        "db": { "condition": "service_healthy" }
+      },
+      "health_check": {
+        "test": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+        "interval": "15s",
+        "timeout": "3s",
+        "retries": 3,
+        "start_period": "30s"
+      }
+    },
+    "db": {
+      "image": "postgres:16",
+      "ports": { "5432/tcp": {} },
+      "env": { "POSTGRES_PASSWORD": "changeme", "POSTGRES_DB": "myapp" },
+      "user": "postgres",
+      "health_check": {
+        "test": ["CMD-SHELL", "pg_isready -U postgres"],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 5,
+        "start_period": "30s"
+      }
+    }
+  }
+}
+```
 
 ## Common Mistakes
 
