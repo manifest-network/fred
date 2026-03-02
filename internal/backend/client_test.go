@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1344,5 +1346,73 @@ func TestIsStack(t *testing.T) {
 		_, err := IsStack(items)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "mixed")
+	})
+}
+
+func TestRecordMetrics_NilCollectors(t *testing.T) {
+	t.Run("both nil — no panic", func(t *testing.T) {
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: "http://localhost"})
+		assert.NotPanics(t, func() {
+			client.recordMetrics("provision", time.Now(), nil)
+			client.recordMetrics("deprovision", time.Now(), assert.AnError)
+		})
+	})
+
+	t.Run("only RequestDuration set — no panic", func(t *testing.T) {
+		hist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "test_duration_partial",
+			Help: "test",
+		}, []string{"backend", "operation", "status"})
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:            "test",
+			BaseURL:         "http://localhost",
+			RequestDuration: hist,
+		})
+		assert.NotPanics(t, func() {
+			client.recordMetrics("provision", time.Now(), nil)
+		})
+		// Histogram was observed (1 sample); use testutil.CollectAndCount to verify.
+		assert.Equal(t, 1, promtestutil.CollectAndCount(hist))
+	})
+
+	t.Run("only RequestsTotal set", func(t *testing.T) {
+		counter := prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "test_requests_partial",
+			Help: "test",
+		}, []string{"backend", "operation", "status"})
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:          "test",
+			BaseURL:       "http://localhost",
+			RequestsTotal: counter,
+		})
+		assert.NotPanics(t, func() {
+			client.recordMetrics("provision", time.Now(), nil)
+		})
+		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "provision", "success")))
+	})
+
+	t.Run("both set — records to both", func(t *testing.T) {
+		hist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "test_duration_both",
+			Help: "test",
+		}, []string{"backend", "operation", "status"})
+		counter := prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "test_requests_both",
+			Help: "test",
+		}, []string{"backend", "operation", "status"})
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:            "test",
+			BaseURL:         "http://localhost",
+			RequestDuration: hist,
+			RequestsTotal:   counter,
+		})
+		client.recordMetrics("get_info", time.Now(), nil)
+		client.recordMetrics("get_info", time.Now(), assert.AnError)
+
+		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "get_info", "success")))
+		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "get_info", "error")))
 	})
 }

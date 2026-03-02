@@ -111,6 +111,15 @@ var (
 		Name:      "reconciliation_total",
 		Help:      "Total number of reconciliation runs by outcome",
 	}, []string{"outcome"})
+
+	// reconcilerLastSuccessTimestamp records the unix timestamp of the last
+	// successful reconciliation run for this docker backend.
+	reconcilerLastSuccessTimestamp = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "reconciliation_last_success_timestamp_seconds",
+		Help:      "Unix timestamp of the last successful reconciliation run",
+	})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.

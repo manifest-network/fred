@@ -3423,6 +3423,7 @@ func (b *Backend) reconcileLoop() {
 				reconciliationTotal.WithLabelValues("error").Inc()
 			} else {
 				reconciliationTotal.WithLabelValues("success").Inc()
+				reconcilerLastSuccessTimestamp.SetToCurrentTime()
 			}
 			cancel()
 		}

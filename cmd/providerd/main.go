@@ -18,6 +18,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -170,10 +171,13 @@ func run(cmd *cobra.Command, args []string) error {
 	var backendEntries []backend.BackendEntry
 	for _, bcfg := range cfg.Backends {
 		client := backend.NewHTTPClient(backend.HTTPClientConfig{
-			Name:    bcfg.Name,
-			BaseURL: bcfg.URL,
-			Timeout: bcfg.Timeout,
-			Secret:  string(cfg.CallbackSecret),
+			Name:                bcfg.Name,
+			BaseURL:             bcfg.URL,
+			Timeout:             bcfg.Timeout,
+			Secret:              string(cfg.CallbackSecret),
+			RequestDuration:     metrics.BackendRequestDuration,
+			RequestsTotal:       metrics.BackendRequestsTotal,
+			CircuitBreakerState: metrics.BackendCircuitBreakerState,
 		})
 
 		backendEntries = append(backendEntries, backend.BackendEntry{
@@ -194,7 +198,8 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Create backend router
 	backendRouter, err := backend.NewRouter(backend.RouterConfig{
-		Backends: backendEntries,
+		Backends:       backendEntries,
+		BackendHealthy: metrics.BackendHealthy,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create backend router: %w", err)

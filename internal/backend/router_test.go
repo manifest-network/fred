@@ -523,6 +523,7 @@ func TestRouter_HealthCheck_SetsBackendHealthyGauge(t *testing.T) {
 			{Backend: healthy, IsDefault: true},
 			{Backend: unhealthy},
 		},
+		BackendHealthy: metrics.BackendHealthy,
 	})
 	require.NoError(t, err)
 
@@ -541,6 +542,7 @@ func TestRouter_HealthCheck_SkipsGaugeOnContextCancellation(t *testing.T) {
 		Backends: []BackendEntry{
 			{Backend: be, IsDefault: true},
 		},
+		BackendHealthy: metrics.BackendHealthy,
 	})
 	require.NoError(t, err)
 
