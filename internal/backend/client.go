@@ -309,9 +309,8 @@ type HTTPClient struct {
 	maxReleasesBytes   int64
 
 	// Optional Prometheus metrics (nil = skip recording)
-	requestDuration     *prometheus.HistogramVec
-	requestsTotal       *prometheus.CounterVec
-	circuitBreakerState *prometheus.GaugeVec
+	requestDuration *prometheus.HistogramVec
+	requestsTotal   *prometheus.CounterVec
 }
 
 // Default response body size limits (defense-in-depth against buggy/misrouted backends).
@@ -433,9 +432,8 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		maxProvisionsBytes:  positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
 		maxLogsBytes:        positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
 		maxReleasesBytes:    positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
-		requestDuration:     cfg.RequestDuration,
-		requestsTotal:       cfg.RequestsTotal,
-		circuitBreakerState: cfg.CircuitBreakerState,
+		requestDuration: cfg.RequestDuration,
+		requestsTotal:   cfg.RequestsTotal,
 	}
 }
 
@@ -447,7 +445,7 @@ func (c *HTTPClient) Name() string {
 // recordMetrics records request duration and count for a backend operation.
 // No-op when metrics are not configured.
 func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error) {
-	if c.requestDuration == nil {
+	if c.requestDuration == nil && c.requestsTotal == nil {
 		return
 	}
 	duration := time.Since(start).Seconds()
@@ -455,8 +453,12 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	if err != nil {
 		status = "error"
 	}
-	c.requestDuration.WithLabelValues(c.name, operation, status).Observe(duration)
-	c.requestsTotal.WithLabelValues(c.name, operation, status).Inc()
+	if c.requestDuration != nil {
+		c.requestDuration.WithLabelValues(c.name, operation, status).Observe(duration)
+	}
+	if c.requestsTotal != nil {
+		c.requestsTotal.WithLabelValues(c.name, operation, status).Inc()
+	}
 }
 
 // readErrorBodyBytes reads up to 4 KiB from an HTTP response body for
