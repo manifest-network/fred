@@ -6,7 +6,7 @@ import (
 	"slices"
 	"sync/atomic"
 
-	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Router routes requests to backends based on SKU matching.
@@ -15,6 +15,9 @@ type Router struct {
 	backendsByName map[string]Backend // O(1) lookup by name
 	defaultBackend Backend
 	counter        atomic.Uint64 // round-robin counter for RouteRoundRobin
+
+	// Optional Prometheus gauge for backend health (nil = skip recording)
+	backendHealthy *prometheus.GaugeVec
 }
 
 type backendEntry struct {
@@ -30,6 +33,11 @@ type MatchCriteria struct {
 // RouterConfig configures the backend router.
 type RouterConfig struct {
 	Backends []BackendEntry
+
+	// Optional Prometheus gauge for backend health status. When nil, HealthCheck
+	// skips metric recording. This prevents binaries that don't use these metrics
+	// from registering phantom fred-level gauges via transitive imports.
+	BackendHealthy *prometheus.GaugeVec // labels: backend
 }
 
 // BackendEntry pairs a backend with its matching criteria.
@@ -47,6 +55,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 
 	r := &Router{
 		backendsByName: make(map[string]Backend),
+		backendHealthy: cfg.BackendHealthy,
 	}
 
 	for i, entry := range cfg.Backends {
@@ -181,11 +190,11 @@ func (r *Router) HealthCheck(ctx context.Context) ([]BackendHealth, bool) {
 			allHealthy = false
 			// Only update the metric for genuine backend failures.
 			// Context cancellation reflects the request lifecycle, not backend health.
-			if ctx.Err() == nil {
-				metrics.BackendHealthy.WithLabelValues(b.Name()).Set(0)
+			if r.backendHealthy != nil && ctx.Err() == nil {
+				r.backendHealthy.WithLabelValues(b.Name()).Set(0)
 			}
-		} else {
-			metrics.BackendHealthy.WithLabelValues(b.Name()).Set(1)
+		} else if r.backendHealthy != nil {
+			r.backendHealthy.WithLabelValues(b.Name()).Set(1)
 		}
 
 		results = append(results, health)

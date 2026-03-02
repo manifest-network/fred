@@ -12,10 +12,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sony/gobreaker"
 
 	"github.com/manifest-network/fred/internal/hmacauth"
-	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
@@ -307,6 +307,11 @@ type HTTPClient struct {
 	maxProvisionsBytes int64
 	maxLogsBytes       int64
 	maxReleasesBytes   int64
+
+	// Optional Prometheus metrics (nil = skip recording)
+	requestDuration     *prometheus.HistogramVec
+	requestsTotal       *prometheus.CounterVec
+	circuitBreakerState *prometheus.GaugeVec
 }
 
 // Default response body size limits (defense-in-depth against buggy/misrouted backends).
@@ -340,6 +345,13 @@ type HTTPClientConfig struct {
 	MaxProvisionsBytes int64 // ListProvisions response limit (default: 8 MiB)
 	MaxLogsBytes       int64 // GetLogs response limit (default: 16 MiB)
 	MaxReleasesBytes   int64 // GetReleases response limit (default: 8 MiB)
+
+	// Optional Prometheus metrics. When nil, metric recording is skipped.
+	// This prevents binaries that don't use these metrics (e.g., docker-backend)
+	// from registering phantom fred-level gauges via transitive imports.
+	RequestDuration     *prometheus.HistogramVec // labels: backend, operation, status
+	RequestsTotal       *prometheus.CounterVec   // labels: backend, operation, status
+	CircuitBreakerState *prometheus.GaugeVec     // labels: backend
 }
 
 // positiveOr returns v if v > 0, otherwise returns fallback.
@@ -401,7 +413,9 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 				"from", from.String(),
 				"to", to.String(),
 			)
-			metrics.BackendCircuitBreakerState.WithLabelValues(name).Set(float64(to))
+			if cfg.CircuitBreakerState != nil {
+				cfg.CircuitBreakerState.WithLabelValues(name).Set(float64(to))
+			}
 		},
 	})
 
@@ -413,12 +427,15 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			Timeout:   timeout,
 			Transport: transport,
 		},
-		cb:                 cb,
-		maxInfoBytes:       positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
-		maxProvisionBytes:  positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
-		maxProvisionsBytes: positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
-		maxLogsBytes:       positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
-		maxReleasesBytes:   positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
+		cb:                  cb,
+		maxInfoBytes:        positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
+		maxProvisionBytes:   positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
+		maxProvisionsBytes:  positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
+		maxLogsBytes:        positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
+		maxReleasesBytes:    positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
+		requestDuration:     cfg.RequestDuration,
+		requestsTotal:       cfg.RequestsTotal,
+		circuitBreakerState: cfg.CircuitBreakerState,
 	}
 }
 
@@ -428,14 +445,18 @@ func (c *HTTPClient) Name() string {
 }
 
 // recordMetrics records request duration and count for a backend operation.
+// No-op when metrics are not configured.
 func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error) {
+	if c.requestDuration == nil {
+		return
+	}
 	duration := time.Since(start).Seconds()
 	status := "success"
 	if err != nil {
 		status = "error"
 	}
-	metrics.BackendRequestDuration.WithLabelValues(c.name, operation, status).Observe(duration)
-	metrics.BackendRequestsTotal.WithLabelValues(c.name, operation, status).Inc()
+	c.requestDuration.WithLabelValues(c.name, operation, status).Observe(duration)
+	c.requestsTotal.WithLabelValues(c.name, operation, status).Inc()
 }
 
 // readErrorBodyBytes reads up to 4 KiB from an HTTP response body for
