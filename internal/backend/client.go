@@ -347,7 +347,7 @@ type HTTPClientConfig struct {
 
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
-	// from registering phantom fred-level gauges via transitive imports.
+	// from registering phantom fred-level metrics via transitive imports.
 	RequestDuration     *prometheus.HistogramVec // labels: backend, operation, status
 	RequestsTotal       *prometheus.CounterVec   // labels: backend, operation, status
 	CircuitBreakerState *prometheus.GaugeVec     // labels: backend
@@ -448,13 +448,12 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	if c.requestDuration == nil && c.requestsTotal == nil {
 		return
 	}
-	duration := time.Since(start).Seconds()
 	status := "success"
 	if err != nil {
 		status = "error"
 	}
 	if c.requestDuration != nil {
-		c.requestDuration.WithLabelValues(c.name, operation, status).Observe(duration)
+		c.requestDuration.WithLabelValues(c.name, operation, status).Observe(time.Since(start).Seconds())
 	}
 	if c.requestsTotal != nil {
 		c.requestsTotal.WithLabelValues(c.name, operation, status).Inc()
