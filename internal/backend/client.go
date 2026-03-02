@@ -426,14 +426,14 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			Timeout:   timeout,
 			Transport: transport,
 		},
-		cb:                  cb,
-		maxInfoBytes:        positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
-		maxProvisionBytes:   positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
-		maxProvisionsBytes:  positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
-		maxLogsBytes:        positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
-		maxReleasesBytes:    positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
-		requestDuration: cfg.RequestDuration,
-		requestsTotal:   cfg.RequestsTotal,
+		cb:                 cb,
+		maxInfoBytes:       positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
+		maxProvisionBytes:  positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
+		maxProvisionsBytes: positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
+		maxLogsBytes:       positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
+		maxReleasesBytes:   positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
+		requestDuration:    cfg.RequestDuration,
+		requestsTotal:      cfg.RequestsTotal,
 	}
 }
 
