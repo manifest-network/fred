@@ -1136,7 +1136,13 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	ch := h.eventBroker.Subscribe(leaseUUID)
+	ch, subErr := h.eventBroker.Subscribe(leaseUUID)
+	if subErr != nil {
+		slog.Warn("subscription rejected", "lease_uuid", leaseUUID, "error", subErr)
+		_ = conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "too many connections"))
+		return
+	}
 	if ch == nil {
 		_ = conn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseGoingAway, "broker closed"))

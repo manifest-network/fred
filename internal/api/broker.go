@@ -1,13 +1,27 @@
 package api
 
 import (
+	"errors"
 	"log/slog"
 	"sync"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-const eventChannelBuffer = 16
+const (
+	eventChannelBuffer = 16
+
+	// DefaultMaxSubscriptionsPerLease is the maximum number of concurrent
+	// WebSocket subscriptions allowed per lease UUID.
+	DefaultMaxSubscriptionsPerLease = 10
+
+	// DefaultMaxTotalSubscriptions is the maximum number of concurrent
+	// WebSocket subscriptions allowed globally across all leases.
+	DefaultMaxTotalSubscriptions = 1000
+)
+
+// ErrTooManySubscriptions is returned when a subscription limit is reached.
+var ErrTooManySubscriptions = errors.New("too many subscriptions")
 
 // EventBroker manages per-lease event client subscriptions with non-blocking fan-out.
 // Slow clients drop events; they can re-fetch via REST.
@@ -15,24 +29,54 @@ type EventBroker struct {
 	mu      sync.RWMutex
 	clients map[string]map[chan backend.LeaseStatusEvent]struct{} // leaseUUID → set of channels
 	closed  bool
+	total   int // total subscriptions across all leases
+
+	maxPerLease int
+	maxTotal    int
 }
 
-// NewEventBroker creates a new event broker.
+// NewEventBroker creates a new event broker with default subscription limits.
 func NewEventBroker() *EventBroker {
+	return NewEventBrokerWithLimits(DefaultMaxSubscriptionsPerLease, DefaultMaxTotalSubscriptions)
+}
+
+// NewEventBrokerWithLimits creates a new event broker with the given subscription limits.
+// maxPerLease limits concurrent subscriptions per lease UUID.
+// maxTotal limits concurrent subscriptions globally across all leases.
+func NewEventBrokerWithLimits(maxPerLease, maxTotal int) *EventBroker {
 	return &EventBroker{
-		clients: make(map[string]map[chan backend.LeaseStatusEvent]struct{}),
+		clients:     make(map[string]map[chan backend.LeaseStatusEvent]struct{}),
+		maxPerLease: maxPerLease,
+		maxTotal:    maxTotal,
 	}
 }
 
 // Subscribe registers a client channel for events on the given lease UUID.
 // The returned channel is buffered; the caller should read from it in a loop.
-// Returns nil if the broker has been closed.
-func (b *EventBroker) Subscribe(leaseUUID string) <-chan backend.LeaseStatusEvent {
+// Returns nil and ErrTooManySubscriptions if a subscription limit is reached.
+// Returns nil and nil error if the broker has been closed.
+func (b *EventBroker) Subscribe(leaseUUID string) (<-chan backend.LeaseStatusEvent, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.closed {
-		return nil
+		return nil, nil
+	}
+
+	if b.total >= b.maxTotal {
+		slog.Warn("global subscription limit reached",
+			"limit", b.maxTotal,
+			"lease_uuid", leaseUUID,
+		)
+		return nil, ErrTooManySubscriptions
+	}
+	if subs := b.clients[leaseUUID]; len(subs) >= b.maxPerLease {
+		slog.Warn("per-lease subscription limit reached",
+			"limit", b.maxPerLease,
+			"lease_uuid", leaseUUID,
+			"current", len(subs),
+		)
+		return nil, ErrTooManySubscriptions
 	}
 
 	ch := make(chan backend.LeaseStatusEvent, eventChannelBuffer)
@@ -40,8 +84,9 @@ func (b *EventBroker) Subscribe(leaseUUID string) <-chan backend.LeaseStatusEven
 		b.clients[leaseUUID] = make(map[chan backend.LeaseStatusEvent]struct{})
 	}
 	b.clients[leaseUUID][ch] = struct{}{}
+	b.total++
 
-	return ch
+	return ch, nil
 }
 
 // Unsubscribe removes a client channel. The channel is closed after removal.
@@ -62,6 +107,7 @@ func (b *EventBroker) Unsubscribe(leaseUUID string, ch <-chan backend.LeaseStatu
 		if (<-chan backend.LeaseStatusEvent)(sendCh) == ch {
 			delete(subs, sendCh)
 			close(sendCh)
+			b.total--
 			break
 		}
 	}
@@ -111,4 +157,5 @@ func (b *EventBroker) Close() {
 		}
 		delete(b.clients, leaseUUID)
 	}
+	b.total = 0
 }
