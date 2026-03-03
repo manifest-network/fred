@@ -1360,10 +1360,9 @@ func TestGetInfo_Success(t *testing.T) {
 	info, err := b.GetInfo(context.Background(), "lease-1")
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "192.168.1.100", (*info)["host"])
-	instances := (*info)["instances"].([]map[string]any)
-	assert.Len(t, instances, 1)
-	assert.Equal(t, "running", instances[0]["status"])
+	assert.Equal(t, "192.168.1.100", info.Host)
+	require.Len(t, info.Instances, 1)
+	assert.Equal(t, "running", info.Instances[0].Status)
 }
 
 func TestGetInfo_NotProvisioned(t *testing.T) {
@@ -1412,8 +1411,7 @@ func TestGetInfo_MultiContainer(t *testing.T) {
 
 	info, err := b.GetInfo(context.Background(), "lease-1")
 	require.NoError(t, err)
-	instances := (*info)["instances"].([]map[string]any)
-	assert.Len(t, instances, 3)
+	assert.Len(t, info.Instances, 3)
 }
 
 // --- GetLogs tests ---

@@ -69,79 +69,62 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 
 	// Stack response: group instances by service name.
 	if isStack {
-		services := make(map[string]any)
+		services := make(map[string]backend.LeaseService, len(serviceContainers))
 		for svcName, svcContainerIDs := range serviceContainers {
-			var instances []map[string]any
+			var instances []backend.LeaseInstance
 			for _, containerID := range svcContainerIDs {
 				info, err := b.docker.InspectContainer(ctx, containerID)
 				if err != nil {
 					return nil, fmt.Errorf("failed to inspect container: %w", err)
 				}
-				ports := make(map[string]map[string]string)
-				for portSpec, binding := range info.Ports {
-					ports[portSpec] = map[string]string{
-						"host_ip":   binding.HostIP,
-						"host_port": binding.HostPort,
-					}
-				}
-				instance := map[string]any{
-					"instance_index": info.InstanceIndex,
-					"container_id":   shortID(info.ContainerID),
-					"image":          info.Image,
-					"status":         info.Status,
-					"ports":          ports,
-				}
-				if info.FQDN != "" {
-					instance["fqdn"] = info.FQDN
-				}
-				instances = append(instances, instance)
+				instances = append(instances, inspectToInstance(info))
 			}
-			services[svcName] = map[string]any{
-				"instances": instances,
-			}
+			services[svcName] = backend.LeaseService{Instances: instances}
 		}
 		leaseInfo := backend.LeaseInfo{
-			"host":     b.cfg.HostAddress,
-			"services": services,
+			Host:     b.cfg.HostAddress,
+			Services: services,
 		}
 		return &leaseInfo, nil
 	}
 
-	// Legacy response: flat instances array.
-	var instances []map[string]any
+	// Flat instances array.
+	var instances []backend.LeaseInstance
 	for _, containerID := range containerIDs {
 		info, err := b.docker.InspectContainer(ctx, containerID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to inspect container: %w", err)
 		}
-
-		ports := make(map[string]map[string]string)
-		for portSpec, binding := range info.Ports {
-			ports[portSpec] = map[string]string{
-				"host_ip":   binding.HostIP,
-				"host_port": binding.HostPort,
-			}
-		}
-
-		instance := map[string]any{
-			"instance_index": info.InstanceIndex,
-			"container_id":   shortID(info.ContainerID),
-			"image":          info.Image,
-			"status":         info.Status,
-			"ports":          ports,
-		}
-		if info.FQDN != "" {
-			instance["fqdn"] = info.FQDN
-		}
-		instances = append(instances, instance)
+		instances = append(instances, inspectToInstance(info))
 	}
 
 	leaseInfo := backend.LeaseInfo{
-		"host":      b.cfg.HostAddress,
-		"instances": instances,
+		Host:      b.cfg.HostAddress,
+		Instances: instances,
 	}
 
 	return &leaseInfo, nil
+}
+
+// inspectToInstance converts a ContainerInfo from Docker inspect into a backend LeaseInstance.
+func inspectToInstance(info *ContainerInfo) backend.LeaseInstance {
+	inst := backend.LeaseInstance{
+		InstanceIndex: info.InstanceIndex,
+		ContainerID:   shortID(info.ContainerID),
+		Image:         info.Image,
+		Status:        info.Status,
+		FQDN:          info.FQDN,
+	}
+	if len(info.Ports) > 0 {
+		inst.Ports = make(map[string]backend.PortBinding, len(info.Ports))
+		for portSpec, binding := range info.Ports {
+			inst.Ports[portSpec] = backend.PortBinding{
+				HostIP:   binding.HostIP,
+				HostPort: binding.HostPort,
+			}
+		}
+	}
+	return inst
 }
 
 // RefreshState synchronizes in-memory provision state with Docker.

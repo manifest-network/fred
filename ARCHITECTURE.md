@@ -102,6 +102,7 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  │  events.lease.expired       →  handleLeaseExpired                   │   │
 │  │  events.payload.received    →  handlePayloadReceived                │   │
 │  │  events.backend.callback    →  handleBackendCallback                │   │
+│  │  events.lease.event         →  (fan-out to WebSocket subscribers)   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                   │                                         │
 │                                   ▼                                         │
@@ -381,12 +382,47 @@ Used tokens are tracked in bbolt to prevent replay attacks:
 ### Metrics (Prometheus)
 
 Key metrics exposed at `/metrics`:
-- `fred_api_requests_total` - API request count by method/path/status
-- `fred_chain_transactions_total` - Chain transactions by type/outcome
-- `fred_backend_requests_total` - Backend request count by backend/operation/status
+
+**API:**
+- `fred_api_requests_total` - Request count by method/path/status
+- `fred_api_request_duration_seconds` - Request latency histogram
+- `fred_api_rate_limit_rejections_total` - Rate limit rejections by limiter (global, tenant)
+- `fred_api_non_in_flight_callbacks_total` - Callbacks for non-tracked leases
+
+**Provisioner:**
 - `fred_provisioner_in_flight_provisions` - Current in-flight provisions gauge
+- `fred_provisioner_provisioning_total` - Provisioning operations by outcome/backend
+- `fred_provisioner_provisioning_duration_seconds` - Provisioning latency histogram
+- `fred_provisioner_callback_timeouts_total` - Backend callback timeouts
+
+**Reconciler:**
+- `fred_reconciler_runs_total` - Reconciliation runs by outcome
 - `fred_reconciler_duration_seconds` - Reconciliation timing histogram
-- `fred_backend_circuit_breaker_state` - Backend circuit breaker states (0=closed, 1=half-open, 2=open)
+- `fred_reconciler_actions_total` - Actions taken (provisioned, acknowledged, deprovisioned, anomaly)
+- `fred_reconciler_last_success_timestamp_seconds` - Last successful run timestamp
+- `fred_reconciler_conflicts_total` - Lease already in-flight conflicts
+
+**Backend:**
+- `fred_backend_requests_total` - Request count by backend/operation/status
+- `fred_backend_request_duration_seconds` - Request latency histogram
+- `fred_backend_circuit_breaker_state` - Circuit breaker state (0=closed, 1=half-open, 2=open)
+- `fred_backend_healthy` - Backend health status gauge
+- `fred_backend_insufficient_resources_total` - Capacity rejections by backend
+
+**Chain:**
+- `fred_chain_transactions_total` - Chain transactions by type/outcome
+- `fred_chain_query_duration_seconds` - Chain query latency histogram
+
+**Payload:**
+- `fred_payload_uploads_total` - Upload count by outcome
+- `fred_payload_stored_count` - Currently stored payloads gauge
+- `fred_payload_size_bytes` - Upload size histogram
+
+**Watermill:**
+- `fred_watermill_messages_total` - Messages processed by topic/outcome
+- `fred_watermill_poisoned_messages_total` - Messages sent to poison queue
+- `fred_events_dropped_total` - Events dropped due to full subscriber channels
+- `fred_messages_malformed_total` - Unparseable messages by topic
 
 ### Logging (slog)
 

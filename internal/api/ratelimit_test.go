@@ -111,14 +111,14 @@ func TestGetClientIP_WithTrustedProxy(t *testing.T) {
 			expected: "203.0.113.195",
 		},
 		{
-			name:     "multiple IPs",
+			name:     "multiple IPs - rightmost non-trusted wins",
 			xff:      "203.0.113.195, 70.41.3.18, 150.172.238.178",
-			expected: "203.0.113.195",
+			expected: "150.172.238.178",
 		},
 		{
-			name:     "with spaces",
+			name:     "with spaces - rightmost non-trusted wins",
 			xff:      "  203.0.113.195  ,  70.41.3.18  ",
-			expected: "203.0.113.195",
+			expected: "70.41.3.18",
 		},
 	}
 
@@ -234,13 +234,43 @@ func TestGetClientIP_InvalidXForwardedFor_WithTrustedProxy(t *testing.T) {
 	trustedProxies := NewTrustedProxyConfig([]string{"192.168.1.1"})
 	rl := NewRateLimiter(10, 10, trustedProxies)
 
-	// Invalid IP in X-Forwarded-For should fall back to RemoteAddr
+	// Rightmost valid non-trusted IP wins, invalid IPs are skipped
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("X-Forwarded-For", "not-an-ip, 10.0.0.1")
 	req.RemoteAddr = "192.168.1.1:12345"
 
 	ip := rl.getClientIP(req)
-	assert.Equal(t, "192.168.1.1", ip, "should fall back to RemoteAddr for invalid IP")
+	assert.Equal(t, "10.0.0.1", ip, "should use rightmost valid non-trusted IP")
+}
+
+func TestGetClientIP_MultiProxySpoofingPrevention(t *testing.T) {
+	// Simulate multi-proxy chain: Client -> Proxy1 (10.0.0.1) -> Proxy2 (10.0.0.2) -> Fred
+	// Attacker prepends fake IP to X-Forwarded-For
+	trustedProxies := NewTrustedProxyConfig([]string{"10.0.0.1", "10.0.0.2"})
+	rl := NewRateLimiter(10, 10, trustedProxies)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	// Attacker set "spoofed-ip" before reaching proxy chain;
+	// Proxy1 appended real client IP, Proxy2 appended Proxy1's IP
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.50, 10.0.0.1")
+	req.RemoteAddr = "10.0.0.2:12345" // Trusted proxy
+
+	ip := rl.getClientIP(req)
+	// Should return 203.0.113.50 (the real client), not 1.2.3.4 (attacker-controlled)
+	assert.Equal(t, "203.0.113.50", ip, "should skip trusted proxy IPs and return real client")
+}
+
+func TestGetClientIP_AllTrustedProxiesInXFF(t *testing.T) {
+	// All IPs in XFF are trusted proxies — should fall through to RemoteAddr
+	trustedProxies := NewTrustedProxyConfig([]string{"10.0.0.0/8", "127.0.0.1"})
+	rl := NewRateLimiter(10, 10, trustedProxies)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	req.RemoteAddr = "127.0.0.1:12345"
+
+	ip := rl.getClientIP(req)
+	assert.Equal(t, "127.0.0.1", ip, "should fall through to RemoteAddr when all XFF IPs are trusted")
 }
 
 func TestTrustedProxyConfig(t *testing.T) {

@@ -87,10 +87,28 @@ type ServerConfig struct {
 	CallbackBaseURL      string // Base URL for backend callbacks (used by restart/update)
 }
 
+// ServerDeps holds the runtime dependencies for the API server.
+// These are the collaborators injected into the server at startup.
+type ServerDeps struct {
+	ChainClient       ChainClient
+	BackendRouter     *backend.Router
+	CallbackPublisher CallbackPublisher
+	PayloadPublisher  PayloadPublisher
+	StatusChecker     StatusChecker
+	PlacementLookup   PlacementLookup // Optional — if nil, placement routing is disabled.
+	EventBroker       *EventBroker    // Optional — if nil, the events endpoint returns 501.
+}
+
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
-// eventBroker is optional — if nil, the events endpoint returns 501.
-func NewServer(cfg ServerConfig, client ChainClient, backendRouter *backend.Router, callbackPublisher CallbackPublisher, payloadPublisher PayloadPublisher, statusChecker StatusChecker, placementLookup PlacementLookup, eventBroker *EventBroker) (*Server, error) {
+func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
+	client := deps.ChainClient
+	backendRouter := deps.BackendRouter
+	callbackPublisher := deps.CallbackPublisher
+	payloadPublisher := deps.PayloadPublisher
+	statusChecker := deps.StatusChecker
+	placementLookup := deps.PlacementLookup
+	eventBroker := deps.EventBroker
 	// Create token tracker if path is configured (enables replay protection)
 	var tokenTracker *TokenTracker
 	if cfg.TokenTrackerDBPath != "" {

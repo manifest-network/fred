@@ -461,7 +461,7 @@ func (m *mockLatencyBackend) Provision(ctx context.Context, req backend.Provisio
 }
 func (m *mockLatencyBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
 	time.Sleep(m.latency)
-	info := backend.LeaseInfo{"host": "10.0.0.1", "port": 8080}
+	info := backend.LeaseInfo{Host: "10.0.0.1"}
 	return &info, nil
 }
 func (m *mockLatencyBackend) Deprovision(ctx context.Context, leaseUUID string) error {

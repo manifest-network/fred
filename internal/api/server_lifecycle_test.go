@@ -42,13 +42,11 @@ func newTestServer(t *testing.T, addr string) *Server {
 			IdleTimeout:    30 * time.Second,
 			RequestTimeout: 5 * time.Second,
 		},
-		&mockChainClient{},
-		nil, // no backend router
-		&mockCallbackPublisher{},
-		nil, // no payload publisher
-		&mockStatusChecker{},
-		nil, // no placement lookup
-		nil, // no event broker
+		ServerDeps{
+			ChainClient:       &mockChainClient{},
+			CallbackPublisher: &mockCallbackPublisher{},
+			StatusChecker:     &mockStatusChecker{},
+		},
 	)
 	require.NoError(t, err)
 	return s
@@ -164,13 +162,11 @@ func TestServer_ShutdownClosesTokenTracker(t *testing.T) {
 			RequestTimeout:     5 * time.Second,
 			TokenTrackerDBPath: dbPath,
 		},
-		&mockChainClient{},
-		nil,
-		&mockCallbackPublisher{},
-		nil,
-		&mockStatusChecker{},
-		nil, // no placement lookup
-		nil, // no event broker
+		ServerDeps{
+			ChainClient:       &mockChainClient{},
+			CallbackPublisher: &mockCallbackPublisher{},
+			StatusChecker:     &mockStatusChecker{},
+		},
 	)
 	require.NoError(t, err)
 
@@ -209,13 +205,11 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 				IdleTimeout:    30 * time.Second,
 				RequestTimeout: 5 * time.Second,
 			},
-			&mockChainClient{},
-			nil,
-			&mockCallbackPublisher{},
-			nil, // No payload publisher - handler won't be set
-			&mockStatusChecker{},
-			nil, // no placement lookup
-			nil, // no event broker
+			ServerDeps{
+				ChainClient:       &mockChainClient{},
+				CallbackPublisher: &mockCallbackPublisher{},
+				StatusChecker:     &mockStatusChecker{},
+			},
 		)
 		require.NoError(t, err)
 
@@ -248,13 +242,12 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 				IdleTimeout:    30 * time.Second,
 				RequestTimeout: 5 * time.Second,
 			},
-			&mockChainClient{},
-			nil,
-			&mockCallbackPublisher{},
-			payloadPub, // Provide publisher so handler is configured
-			&mockStatusChecker{},
-			nil, // no placement lookup
-			nil, // no event broker
+			ServerDeps{
+				ChainClient:       &mockChainClient{},
+				CallbackPublisher: &mockCallbackPublisher{},
+				PayloadPublisher:  payloadPub,
+				StatusChecker:     &mockStatusChecker{},
+			},
 		)
 		require.NoError(t, err)
 
@@ -410,13 +403,11 @@ func TestServer_StartBackground(t *testing.T) {
 				TLSCertFile:    "/nonexistent/cert.pem",
 				TLSKeyFile:     "/nonexistent/key.pem",
 			},
-			&mockChainClient{},
-			nil,
-			&mockCallbackPublisher{},
-			nil,
-			&mockStatusChecker{},
-			nil, // no placement lookup
-			nil, // no event broker
+			ServerDeps{
+				ChainClient:       &mockChainClient{},
+				CallbackPublisher: &mockCallbackPublisher{},
+				StatusChecker:     &mockStatusChecker{},
+			},
 		)
 		require.NoError(t, err)
 

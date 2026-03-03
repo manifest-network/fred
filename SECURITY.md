@@ -103,7 +103,7 @@ Used tokens are tracked in a persistent bbolt database keyed by the normalized s
 | `GET /events` | No | Read-only WebSocket stream |
 | `POST /data` | No | Has own idempotency guard (409 on duplicate upload) |
 
-**Configuration:** Requires `token_tracker_db_path`. Mandatory when `production_mode: true`.
+**Configuration:** Requires `token_tracker_db_path`. Mandatory when `production_mode: true`. When not configured (non-production), replay protection is disabled entirely — tokens can be replayed within their 30-second validity window. This is acceptable for development but **must not be used in production**.
 
 **Implementation:** `internal/api/token_tracker.go`
 
@@ -240,7 +240,7 @@ Network isolation places each tenant's containers in a dedicated Docker bridge n
 
 - **Client responses:** Generic error messages (`"internal server error"`) for 500-class errors. Validation errors (400) include specific messages since these describe client input problems.
 - **Server-side logging:** Full error details logged via `slog` including stack context, lease UUIDs, and backend names.
-- **Error truncation:** `LastError` in provision diagnostics is truncated to 256 characters.
+- **Error truncation:** Callback error messages (on-chain rejection reasons) are truncated to 256 characters. `LastError` in provision diagnostics retains the full untruncated error for authenticated API access.
 - **Auth errors:** Generic `"unauthorized"` message — does not distinguish between missing token, invalid signature, or expired token.
 
 ## Secrets Management

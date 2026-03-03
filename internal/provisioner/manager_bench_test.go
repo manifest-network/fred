@@ -34,7 +34,7 @@ func (m *mockBenchBackend) Provision(ctx context.Context, req backend.ProvisionR
 	return nil
 }
 func (m *mockBenchBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
-	info := backend.LeaseInfo{"host": "10.0.0.1", "port": 8080}
+	info := backend.LeaseInfo{Host: "10.0.0.1"}
 	return &info, nil
 }
 func (m *mockBenchBackend) Deprovision(ctx context.Context, leaseUUID string) error { return nil }

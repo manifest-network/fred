@@ -18,7 +18,7 @@ type mockBenchBackend struct {
 func (m *mockBenchBackend) Name() string                                              { return m.name }
 func (m *mockBenchBackend) Provision(ctx context.Context, req ProvisionRequest) error { return nil }
 func (m *mockBenchBackend) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo, error) {
-	info := LeaseInfo{"host": "10.0.0.1", "port": 8080}
+	info := LeaseInfo{Host: "10.0.0.1"}
 	return &info, nil
 }
 func (m *mockBenchBackend) Deprovision(ctx context.Context, leaseUUID string) error { return nil }
@@ -215,15 +215,7 @@ func BenchmarkHTTPClient_GetInfo(b *testing.B) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{
-			"lease_uuid": "test",
-			"status": "ready",
-			"connection": {
-				"host": "10.0.0.1",
-				"port": 8080,
-				"protocol": "https"
-			}
-		}`))
+		w.Write([]byte(`{"host":"10.0.0.1","protocol":"https","ports":{"8080/tcp":{"host_ip":"0.0.0.0","host_port":"8080"}}}`))
 	}))
 	defer server.Close()
 
@@ -250,15 +242,7 @@ func BenchmarkHTTPClient_GetInfo_Parallel(b *testing.B) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{
-			"lease_uuid": "test",
-			"status": "ready",
-			"connection": {
-				"host": "10.0.0.1",
-				"port": 8080,
-				"protocol": "https"
-			}
-		}`))
+		w.Write([]byte(`{"host":"10.0.0.1","protocol":"https","ports":{"8080/tcp":{"host_ip":"0.0.0.0","host_port":"8080"}}}`))
 	}))
 	defer server.Close()
 

@@ -297,7 +297,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 
 	// Configure TLS if needed
 	if cfg.CallbackInsecureSkipVerify {
-		logger.Warn("callback TLS verification disabled - only use for development")
+		logger.Error("INSECURE: callback TLS verification disabled — do NOT use in production")
 		httpClient.Transport = &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true, //nolint:gosec // Intentional for development

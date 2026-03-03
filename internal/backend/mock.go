@@ -147,17 +147,14 @@ func (m *MockBackend) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo
 	hostSuffix := hex.EncodeToString(hash[:4])
 
 	info := LeaseInfo{
-		"host":     fmt.Sprintf("mock-%s.example.com", hostSuffix),
-		"port":     8080,
-		"protocol": "https",
-		"credentials": map[string]string{
-			"token": hex.EncodeToString(hash[4:20]),
-		},
-		"metadata": map[string]string{
+		Host:     fmt.Sprintf("mock-%s.example.com", hostSuffix),
+		Protocol: "https",
+		Metadata: map[string]string{
 			"backend":    m.name,
 			"lease_uuid": leaseUUID,
 			"tenant":     provision.Tenant,
 			"sku":        provision.SKU,
+			"token":      hex.EncodeToString(hash[4:20]),
 		},
 	}
 	return &info, nil
