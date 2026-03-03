@@ -35,7 +35,14 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	// Mark as failed before removing containers to prevent handleContainerDeath
 	// from racing with removal. Die events emitted during RemoveContainer will
 	// see a non-Ready status and be skipped.
+	// Decrement activeProvisions immediately on Ready→Failed transition so
+	// the gauge stays accurate even if the rest of Deprovision fails partially
+	// and must be retried (at which point the provision is already Failed).
+	wasReady := prov.Status == backend.ProvisionStatusReady
 	prov.Status = backend.ProvisionStatusFailed
+	if wasReady {
+		activeProvisions.Dec()
+	}
 	isStack := prov.IsStack()
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
 	items := append([]backend.LeaseItem(nil), prov.Items...)
@@ -153,7 +160,6 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 					}
 				}
 				deprovisionsTotal.Inc()
-				activeProvisions.Dec()
 				updateResourceMetrics(b.pool.Stats())
 
 				logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
@@ -191,7 +197,6 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	deprovisionsTotal.Inc()
-	activeProvisions.Dec()
 	updateResourceMetrics(b.pool.Stats())
 	logger.Info("deprovisioned", "containers_removed", len(containerIDs))
 	return nil

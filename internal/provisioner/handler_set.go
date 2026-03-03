@@ -92,8 +92,9 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	// Check if lease requires a payload (has MetaHash)
 	// If so, skip immediate provisioning - wait for payload upload
 	if len(lease.MetaHash) > 0 {
-		h.awaitingPayload.Store(event.LeaseUUID, struct{}{})
-		metrics.LeasesAwaitingPayload.Inc()
+		if _, alreadyTracked := h.awaitingPayload.LoadOrStore(event.LeaseUUID, struct{}{}); !alreadyTracked {
+			metrics.LeasesAwaitingPayload.Inc()
+		}
 		slog.Info("lease requires payload, awaiting upload",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,

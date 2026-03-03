@@ -143,6 +143,16 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 	}
 	payload, _ := json.Marshal(event)
 
+	// Drain and ack messages concurrently to prevent publish from blocking
+	// when OutputChannelBuffer fills.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for msg := range messages {
+			msg.Ack()
+		}
+	}()
+
 	b.ResetTimer()
 	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
 	i := 0
@@ -151,12 +161,11 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 		pubSub.Publish("test-topic", msg)
 		i++
 	}
+	b.StopTimer()
 
-	// Drain all published messages from the consumer.
-	for range i {
-		msg := <-messages
-		msg.Ack()
-	}
+	// Close the pubsub so the drainer goroutine exits, then wait for it.
+	pubSub.Close()
+	<-done
 }
 
 // TestManager_HighThroughput tests manager under high message throughput.
