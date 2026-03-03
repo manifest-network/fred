@@ -135,21 +135,7 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 		Persistent:          true,
 	}, logger)
 
-	var received atomic.Int64
-
 	messages, _ := pubSub.Subscribe(context.Background(), "test-topic")
-
-	// Consumer
-	done := make(chan struct{})
-	go func() {
-		for msg := range messages {
-			msg.Ack()
-			if received.Add(1) >= int64(b.N) {
-				close(done)
-				return
-			}
-		}
-	}()
 
 	event := chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
@@ -166,7 +152,11 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 		i++
 	}
 
-	<-done
+	// Drain all published messages from the consumer.
+	for range i {
+		msg := <-messages
+		msg.Ack()
+	}
 }
 
 // TestManager_HighThroughput tests manager under high message throughput.

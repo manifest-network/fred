@@ -430,15 +430,17 @@ func (b *Backend) reconcileLoop() {
 		case <-b.stopCtx.Done():
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := b.recoverState(ctx); err != nil {
-				b.logger.Error("reconciliation failed", "error", err)
-				reconciliationTotal.WithLabelValues("error").Inc()
-			} else {
-				reconciliationTotal.WithLabelValues("success").Inc()
-				reconcilerLastSuccessTimestamp.SetToCurrentTime()
-			}
-			cancel()
+			func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := b.recoverState(ctx); err != nil {
+					b.logger.Error("reconciliation failed", "error", err)
+					reconciliationTotal.WithLabelValues("error").Inc()
+				} else {
+					reconciliationTotal.WithLabelValues("success").Inc()
+					reconcilerLastSuccessTimestamp.SetToCurrentTime()
+				}
+			}()
 		}
 	}
 }

@@ -160,12 +160,6 @@ func (b *AckBatcher) batchLoop(ctx context.Context) {
 
 		slog.Debug("flushing ack batch", "count", len(pending))
 
-		// Build a set of requested lease UUIDs for quick lookup
-		requestedUUIDs := make(map[string]ackRequest, len(pending))
-		for _, req := range pending {
-			requestedUUIDs[req.leaseUUID] = req
-		}
-
 		// Query all pending leases for this provider in a single RPC call.
 		// This is much more efficient than N individual GetLease calls.
 		chainPendingLeases, err := b.chainClient.GetPendingLeases(ctx, b.providerUUID)

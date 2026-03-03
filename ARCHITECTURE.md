@@ -97,11 +97,11 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  │                                                                     │   │
 │  │  Topics → Handlers (HandlerSet):                                    │   │
 │  │  ─────────────────────────────────────────────────────────────      │   │
-│  │  events.lease.created       →  handleLeaseCreated                   │   │
-│  │  events.lease.closed        →  handleLeaseClosed                    │   │
-│  │  events.lease.expired       →  handleLeaseExpired                   │   │
-│  │  events.payload.received    →  handlePayloadReceived                │   │
-│  │  events.backend.callback    →  handleBackendCallback                │   │
+│  │  events.lease.created       →  HandleLeaseCreated                   │   │
+│  │  events.lease.closed        →  HandleLeaseClosed                    │   │
+│  │  events.lease.expired       →  HandleLeaseExpired                   │   │
+│  │  events.payload.received    →  HandlePayloadReceived                │   │
+│  │  events.backend.callback    →  HandleBackendCallback                │   │
 │  │  events.lease.event         →  (fan-out to WebSocket subscribers)   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                   │                                         │
@@ -227,10 +227,11 @@ Key interfaces defined where they're consumed:
 ```
 1. Tenant closes lease (or credit depleted)
 2. Chain emits lease_closed event
-3. handleLeaseClosed:
-   a. Route to backend by SKU
-   b. Call backend POST /deprovision
-   c. Backend cleans up resources (idempotent)
+3. HandleLeaseClosed:
+   a. Clean up stored payload (if any)
+   b. Fetch lease from chain for SKU routing hint
+   c. Route to backend by SKU, call backend POST /deprovision
+   d. Backend cleans up resources (idempotent)
 ```
 
 ## Concurrency Model
@@ -417,6 +418,7 @@ Key metrics exposed at `/metrics`:
 - `fred_payload_uploads_total` - Upload count by outcome
 - `fred_payload_stored_count` - Currently stored payloads gauge
 - `fred_payload_size_bytes` - Upload size histogram
+- `fred_payload_leases_awaiting_total` - Leases seen that require payload upload
 
 **Watermill:**
 - `fred_watermill_messages_total` - Messages processed by topic/outcome
