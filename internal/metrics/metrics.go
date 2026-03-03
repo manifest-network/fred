@@ -101,12 +101,12 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(1024, 2, 14), // 1KB to ~16MB
 	})
 
-	// LeasesAwaitingPayloadTotal tracks leases that are waiting for payload upload.
-	LeasesAwaitingPayloadTotal = promauto.NewCounter(prometheus.CounterOpts{
+	// LeasesAwaitingPayload tracks the number of leases currently waiting for payload upload.
+	LeasesAwaitingPayload = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Subsystem: "payload",
-		Name:      "leases_awaiting_total",
-		Help:      "Total number of leases seen that require payload upload",
+		Name:      "leases_awaiting",
+		Help:      "Number of leases currently waiting for payload upload",
 	})
 )
 

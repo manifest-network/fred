@@ -418,7 +418,7 @@ Key metrics exposed at `/metrics`:
 - `fred_payload_uploads_total` - Upload count by outcome
 - `fred_payload_stored_count` - Currently stored payloads gauge
 - `fred_payload_size_bytes` - Upload size histogram
-- `fred_payload_leases_awaiting_total` - Leases seen that require payload upload
+- `fred_payload_leases_awaiting` - Leases currently waiting for payload upload
 
 **Watermill:**
 - `fred_watermill_messages_total` - Messages processed by topic/outcome
