@@ -88,12 +88,8 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 
 	// Async phase
 	b.wg.Go(func() {
-		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
-		ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+		ctx, cancel := b.shutdownAwareContext()
 		defer cancel()
-
-		stop := context.AfterFunc(b.stopCtx, cancel)
-		defer stop()
 
 		if isStack {
 			b.doRestartStack(ctx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
@@ -829,12 +825,8 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 
 		// Async phase
 		b.wg.Go(func() {
-			provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
-			ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+			ctx, cancel := b.shutdownAwareContext()
 			defer cancel()
-
-			stop := context.AfterFunc(b.stopCtx, cancel)
-			defer stop()
 
 			b.doUpdateStack(ctx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
 		})
@@ -878,12 +870,8 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	}
 
 	b.wg.Go(func() {
-		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
-		ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+		ctx, cancel := b.shutdownAwareContext()
 		defer cancel()
-
-		stop := context.AfterFunc(b.stopCtx, cancel)
-		defer stop()
 
 		b.doUpdate(ctx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
 	})

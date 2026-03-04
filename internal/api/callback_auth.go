@@ -1,8 +1,6 @@
 package api
 
 import (
-	"crypto/hmac"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -144,29 +142,5 @@ func (a *CallbackAuthenticator) VerifyRequest(r *http.Request) ([]byte, error) {
 
 // verifySignatureWithError is like VerifySignature but returns a descriptive error.
 func (a *CallbackAuthenticator) verifySignatureWithError(payload []byte, signature string, now time.Time) error {
-	timestamp, sigHex, ok := hmacauth.ParseSignature(signature)
-	if !ok {
-		return fmt.Errorf("invalid signature format: expected t=<timestamp>,sha256=<hex>")
-	}
-
-	signedAt := time.Unix(timestamp, 0)
-	if now.Sub(signedAt) > a.maxAge {
-		return fmt.Errorf("signature expired: signed %v ago, max age is %v", now.Sub(signedAt).Round(time.Second), a.maxAge)
-	}
-	if signedAt.After(now.Add(callbackClockSkewTolerance)) {
-		return fmt.Errorf("signature timestamp too far in future: %v ahead", signedAt.Sub(now).Round(time.Second))
-	}
-
-	expectedSig := hmacauth.ComputeMAC(a.secret, timestamp, payload)
-
-	providedSig, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return fmt.Errorf("invalid signature encoding: %w", err)
-	}
-
-	if !hmac.Equal(providedSig, expectedSig) {
-		return fmt.Errorf("signature mismatch")
-	}
-
-	return nil
+	return hmacauth.VerifyWithTime(a.secret, payload, signature, a.maxAge, callbackClockSkewTolerance, now)
 }

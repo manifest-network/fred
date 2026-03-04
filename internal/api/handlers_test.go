@@ -3843,6 +3843,226 @@ func TestHealthCheck_WithStatusChecker(t *testing.T) {
 	assert.Equal(t, 42, response.Stats.InFlightProvisions)
 }
 
+// mockPlacementLookup implements PlacementLookup for testing.
+type mockPlacementLookup struct {
+	getFunc     func(leaseUUID string) string
+	healthyFunc func() error
+}
+
+func (m *mockPlacementLookup) Get(leaseUUID string) string {
+	if m.getFunc != nil {
+		return m.getFunc(leaseUUID)
+	}
+	return ""
+}
+
+func (m *mockPlacementLookup) Healthy() error {
+	if m.healthyFunc != nil {
+		return m.healthyFunc()
+	}
+	return nil
+}
+
+// TestResolveBackend_PlacementRouting tests that resolveBackend checks
+// the placement store first and falls back to SKU routing.
+func TestResolveBackend_PlacementRouting(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	t.Run("placement_routes_to_correct_backend", func(t *testing.T) {
+		// Set up two backends — "placed-backend" has the lease via placement,
+		// "default-backend" is the SKU fallback.
+		placedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "placed-host.example.com",
+				"protocol": "https",
+				"ports":    map[string]any{},
+			})
+		}))
+		defer placedServer.Close()
+
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "default-host.example.com",
+				"protocol": "https",
+				"ports":    map[string]any{},
+			})
+		}))
+		defer defaultServer.Close()
+
+		placedBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "placed-backend",
+			BaseURL: placedServer.URL,
+			Timeout: 5 * time.Second,
+		})
+		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "default-backend",
+			BaseURL: defaultServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: placedBackend},
+				{Backend: defaultBackend, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		placement := &mockPlacementLookup{
+			getFunc: func(uuid string) string {
+				if uuid == leaseUUID {
+					return "placed-backend"
+				}
+				return ""
+			},
+		}
+
+		h := &Handlers{
+			client:          chainClient,
+			backendRouter:   router,
+			placementLookup: placement,
+			providerUUID:    providerUUID,
+			bech32Prefix:    "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var resp ConnectionResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "placed-host.example.com", resp.Connection.Host,
+			"should route to placement backend, not default")
+	})
+
+	t.Run("stale_placement_falls_back_to_sku", func(t *testing.T) {
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "default-host.example.com",
+				"protocol": "https",
+				"ports":    map[string]any{},
+			})
+		}))
+		defer defaultServer.Close()
+
+		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "default-backend",
+			BaseURL: defaultServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: defaultBackend, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		// Placement returns a backend name that doesn't exist in the router
+		placement := &mockPlacementLookup{
+			getFunc: func(uuid string) string {
+				return "removed-backend"
+			},
+		}
+
+		h := &Handlers{
+			client:          chainClient,
+			backendRouter:   router,
+			placementLookup: placement,
+			providerUUID:    providerUUID,
+			bech32Prefix:    "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var resp ConnectionResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "default-host.example.com", resp.Connection.Host,
+			"should fall back to SKU routing when placement backend is missing")
+	})
+
+	t.Run("no_placement_uses_sku_routing", func(t *testing.T) {
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "sku-host.example.com",
+				"protocol": "https",
+				"ports":    map[string]any{},
+			})
+		}))
+		defer defaultServer.Close()
+
+		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "default-backend",
+			BaseURL: defaultServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: defaultBackend, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		// Placement returns empty string (no placement record)
+		placement := &mockPlacementLookup{}
+
+		h := &Handlers{
+			client:          chainClient,
+			backendRouter:   router,
+			placementLookup: placement,
+			providerUUID:    providerUUID,
+			bech32Prefix:    "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var resp ConnectionResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "sku-host.example.com", resp.Connection.Host)
+	})
+}
+
 func TestHealthCheck_WithoutStatusChecker(t *testing.T) {
 	h := &Handlers{
 		providerUUID: testutil.ValidUUID1,

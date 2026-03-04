@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -563,4 +564,16 @@ func (b *Backend) removeProvision(leaseUUID string) {
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
 	b.provisionsMu.Unlock()
+}
+
+// shutdownAwareContext returns a context that cancels on either:
+//  1. Provision timeout exceeded (cfg.ProvisionTimeout or 10m default)
+//  2. Backend shutdown (stopCtx canceled)
+//
+// The caller must call the returned cancel function when done.
+func (b *Backend) shutdownAwareContext() (context.Context, context.CancelFunc) {
+	provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+	stop := context.AfterFunc(b.stopCtx, cancel)
+	return ctx, func() { stop(); cancel() }
 }
