@@ -39,6 +39,13 @@ func TestSignAndVerify(t *testing.T) {
 	t.Run("malformed signature missing timestamp", func(t *testing.T) {
 		assert.Error(t, Verify(secret, body, "sha256=abc123", 5*time.Minute))
 	})
+
+	t.Run("future timestamp rejected", func(t *testing.T) {
+		sig := SignWithTime(secret, body, time.Now().Add(10*time.Minute))
+		err := Verify(secret, body, sig, 5*time.Minute)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "future")
+	})
 }
 
 func TestParseSignature(t *testing.T) {

@@ -15,6 +15,7 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 | DockerHost | `docker_host` | string | `"unix:///var/run/docker.sock"` | Docker daemon socket path or URL |
 | HostAddress | `host_address` | string | *(required)* | External IP/hostname for port mappings. Must be a valid IP or hostname, not a URL |
 | HostBindIP | `host_bind_ip` | string | `"0.0.0.0"` | IP address to bind container ports to |
+| LogLevel | `log_level` | string | `"info"` | Log verbosity: `debug`, `info`, `warn`, `error` |
 
 ### Resources
 
@@ -68,6 +69,13 @@ Images are validated before pull. The registry is extracted from the image refer
 
 When a provision fails (during provisioning, state recovery, or partial deprovision), the backend persists full failure diagnostics and container logs to a bbolt database. `GET /provisions/{lease_uuid}` and `GET /logs/{lease_uuid}` fall back to this store when the provision is no longer in memory (e.g., after deprovision or restart), returning the persisted error and logs with a 7-day default retention.
 
+### Releases
+
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| ReleasesDBPath | `releases_db_path` | string | `"releases.db"` | Path to bbolt database for persisting release history |
+| ReleasesMaxAge | `releases_max_age` | duration | `90d` | Maximum age of persisted release entries before cleanup |
+
 ### Tenant Quotas
 
 | Field | YAML Key | Type | Default | Description |
@@ -89,6 +97,7 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation. Setting to `0` uses the default (10m) via `cmp.Or` |
 | ReconcileInterval | `reconcile_interval` | duration | `5m` | How often to reconcile state with Docker |
 | StartupVerifyDuration | `startup_verify_duration` | duration | `5s` | Grace period after start before verifying containers are still running |
+| ContainerStopTimeout | `container_stop_timeout` | duration | `30s` | Grace period before SIGKILL when stopping containers |
 
 ### Container Hardening
 
@@ -98,6 +107,26 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | ContainerReadonlyRootfs | `container_readonly_rootfs` | *bool | `true` | Read-only root filesystem |
 | ContainerPidsLimit | `container_pids_limit` | *int64 | `256` | Maximum PIDs per container |
 | ContainerTmpfsSizeMB | `container_tmpfs_size_mb` | int | `64` | Tmpfs size (MB) for `/tmp` and `/run` when readonly rootfs is enabled |
+
+### Ingress (Traefik Integration)
+
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| Ingress.Enabled | `ingress.enabled` | bool | `false` | Enable reverse proxy label generation |
+| Ingress.WildcardDomain | `ingress.wildcard_domain` | string | *(required when enabled)* | Base domain for tenant subdomains (e.g., `apps.example.com`) |
+| Ingress.CertResolver | `ingress.cert_resolver` | string | *(required when enabled)* | Traefik certificate resolver name |
+| Ingress.Entrypoint | `ingress.entrypoint` | string | *(required when enabled)* | Traefik entrypoint name (e.g., `websecure`) |
+
+When enabled, containers with routable TCP ports receive Traefik Docker labels for automatic HTTPS routing. Each container gets a unique subdomain under `wildcard_domain` derived from lease UUID and service metadata (guaranteed ≤63 chars per RFC 1035). Port selection: 80 > 8080 > lowest TCP port. Requires `network_isolation` to be enabled — Traefik routes traffic via the per-tenant Docker network.
+
+Example:
+```yaml
+ingress:
+  enabled: true
+  wildcard_domain: "apps.example.com"
+  cert_resolver: "letsencrypt"
+  entrypoint: "websecure"
+```
 
 ### Volume Management
 
@@ -481,7 +510,7 @@ Returns a single provision record. This is the primary endpoint for retrieving f
 }
 ```
 
-`status` is one of: `provisioning`, `ready`, `failed`, `unknown`. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
+`status` is one of: `provisioning`, `ready`, `failed`, `unknown`, `restarting`, `updating`. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
 
 ### `GET /provisions` (authenticated)
 

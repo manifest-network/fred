@@ -397,7 +397,7 @@ func TestLoadActiveTenants(t *testing.T) {
 
 		w := New(client, nil, providerUUID)
 
-		err := w.loadActiveTenants(context.Background())
+		err := w.loadActiveTenants(t.Context())
 		require.NoError(t, err)
 
 		w.mu.Lock()
@@ -416,7 +416,7 @@ func TestLoadActiveTenants(t *testing.T) {
 
 		w := New(client, nil, providerUUID)
 
-		err := w.loadActiveTenants(context.Background())
+		err := w.loadActiveTenants(t.Context())
 		require.NoError(t, err)
 
 		w.mu.Lock()
@@ -435,7 +435,7 @@ func TestLoadActiveTenants(t *testing.T) {
 
 		w := New(client, nil, providerUUID)
 
-		err := w.loadActiveTenants(context.Background())
+		err := w.loadActiveTenants(t.Context())
 		assert.Error(t, err, "loadActiveTenants() should return error on chain failure")
 	})
 }
@@ -532,7 +532,7 @@ func TestWatcher_Start(t *testing.T) {
 		w := New(client, eventSub, providerUUID)
 
 		// Use a non-cancellable context - we want to test channel close, not context cancellation
-		ctx := context.Background()
+		ctx := t.Context()
 
 		errCh := make(chan error, 1)
 		go func() {

@@ -410,7 +410,7 @@ func TestAckBatcher_AcknowledgeAfterStopReturnsError(t *testing.T) {
 		BatchSize:     10,
 	})
 
-	ctx := context.Background()
+	ctx := t.Context()
 	batcher.Start(ctx)
 	batcher.Stop()
 

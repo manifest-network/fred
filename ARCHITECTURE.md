@@ -201,7 +201,7 @@ Key interfaces defined where they're consumed:
    b. Parse and validate callback payload
    c. Publish to Watermill topic (events.backend.callback)
 8. handleBackendCallback (Watermill handler):
-   a. Peek in-flight tracker for lease (non-destructive)
+   a. GetInFlight from in-flight tracker for lease (non-destructive)
    b. If success: acknowledge lease on chain via AckBatcher
    c. If failed + PENDING: reject lease on chain, then untrack
    d. If failed + ACTIVE: untrack and defer to reconciler (retry/reject by FailCount)
@@ -294,11 +294,13 @@ The startup order is critical to avoid race conditions:
 2. Wait for in-flight provisions to drain (with timeout)
    └─ API server stays running to receive backend callbacks
 3. Stop API server (stop accepting new requests)
-4. Cancel context (signals all components)
-5. Stop withdrawal scheduler (wait for in-flight tx)
-6. Close event subscriber
-7. Wait for all goroutines (with timeout)
-8. Close provision manager (cleanup Watermill + stores)
+4. Close event broker (send clean close frames to WebSocket clients)
+5. Cancel context (signals all components)
+6. Stop withdrawal scheduler (wait for in-flight tx)
+7. Close event subscriber
+8. Wait for all goroutines (with timeout)
+9. Close provision manager (cleanup Watermill + stores)
+10. If timed out: additional 2s grace period for lingering components
 ```
 
 ## Backend Integration
