@@ -769,7 +769,7 @@ Get lease information for a provisioned resource.
 - `protocol` - Connection protocol (e.g., "https", "ssh")
 - `metadata` - Additional key-value metadata
 
-Any additional fields are passed through to the tenant in the `metadata` section.
+Backends should use the `metadata` field for any custom key-value data to surface to tenants.
 
 **Response:** `404 Not Found` if not provisioned.
 

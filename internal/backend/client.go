@@ -140,13 +140,13 @@ type ProvisionResponse struct {
 
 // LeaseInfo contains backend-specific information about a provisioned lease.
 type LeaseInfo struct {
-	Host      string                      `json:"host,omitempty"`
-	FQDN      string                      `json:"fqdn,omitempty"`
-	Protocol  string                      `json:"protocol,omitempty"`
-	Ports     map[string]PortBinding      `json:"ports,omitempty"`
-	Instances []LeaseInstance             `json:"instances,omitempty"`
-	Services  map[string]LeaseService     `json:"services,omitempty"`
-	Metadata  map[string]string           `json:"metadata,omitempty"`
+	Host      string                  `json:"host,omitempty"`
+	FQDN      string                  `json:"fqdn,omitempty"`
+	Protocol  string                  `json:"protocol,omitempty"`
+	Ports     map[string]PortBinding  `json:"ports,omitempty"`
+	Instances []LeaseInstance         `json:"instances,omitempty"`
+	Services  map[string]LeaseService `json:"services,omitempty"`
+	Metadata  map[string]string       `json:"metadata,omitempty"`
 }
 
 // PortBinding represents a port mapping from container to host as reported by a backend.

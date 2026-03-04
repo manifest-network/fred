@@ -163,8 +163,8 @@ type replaceStackContainersOp struct {
 	Items             []backend.LeaseItem
 	Profiles          map[string]SKUProfile
 	OldContainerIDs   []string
-	ServiceContainers map[string][]string    // old service → container IDs mapping
-	Operation         string                 // "restart" or "update"
+	ServiceContainers map[string][]string     // old service → container IDs mapping
+	Operation         string                  // "restart" or "update"
 	PrevStatus        backend.ProvisionStatus // status before the operation began, for gauge accuracy
 	Logger            *slog.Logger
 
@@ -454,8 +454,8 @@ type replaceContainersOp struct {
 	SKU             string
 	Profile         SKUProfile
 	OldContainerIDs []string
-	Quantity        int                    // Number of new containers to create
-	Operation       string                 // "restart" or "update" — used in log and callback messages
+	Quantity        int                     // Number of new containers to create
+	Operation       string                  // "restart" or "update" — used in log and callback messages
 	PrevStatus      backend.ProvisionStatus // status before the operation began, for gauge accuracy
 	Logger          *slog.Logger
 

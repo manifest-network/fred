@@ -600,4 +600,3 @@ func (b *Backend) findLeaseByContainerID(containerID string) (string, bool) {
 	}
 	return "", false
 }
-
