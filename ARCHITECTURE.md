@@ -145,7 +145,7 @@ each component in isolation with mocks and allows swapping implementations.
 ```
 Manager (coordinator)
 ├── ChainClient          interface → chain.Client
-├── BackendRouter        *backend.Router (passed to Orchestrator via interface)
+├── BackendRouter        interface → *backend.Router (passed to Orchestrator)
 ├── InFlightTracker      interface → inFlightMap (sync.RWMutex-protected map)
 ├── PlacementStore       interface → placement.Store (bbolt + cache, optional)
 ├── Orchestrator         struct    → uses BackendRouter + InFlightTracker + PlacementStore
@@ -156,13 +156,13 @@ Manager (coordinator)
 
 Reconciler (independent)
 ├── ReconcilerChainClient  interface → chain.Client
-├── BackendRouter          *backend.Router
+├── BackendRouter          interface → *backend.Router
 ├── PlacementStore         interface → placement.Store (syncs on startup)
 └── ReconcilerTracker      interface → Manager (extends InFlightTracker)
 
 API Handlers
 ├── PlacementLookup        interface → placement.Store (read-only, optional)
-└── BackendRouter          *backend.Router
+└── BackendRouter          *backend.Router (concrete; only provisioner uses interface)
 ```
 
 Key interfaces defined where they're consumed:
@@ -190,7 +190,7 @@ Key interfaces defined where they're consumed:
 2. Chain emits lease_created event
 3. Event Subscriber receives via WebSocket
 4. Event Bridge publishes to Watermill topic
-5. handleLeaseCreated:
+5. HandleLeaseCreated:
    a. Check if lease already in-flight (idempotency)
    b. Route to backend by SKU (round-robin if multiple backends match)
    c. Call backend POST /provision with callback URL
@@ -212,7 +212,7 @@ Key interfaces defined where they're consumed:
 ```
 1. Tenant creates lease with meta_hash on chain
 2. Chain emits lease_created event
-3. handleLeaseCreated sees meta_hash, waits for payload
+3. HandleLeaseCreated sees meta_hash, waits for payload
 4. Tenant POSTs payload to /v1/leases/{uuid}/data
 5. Fred validates SHA-256(payload) == lease.meta_hash
 6. Fred stores payload, publishes to Watermill
