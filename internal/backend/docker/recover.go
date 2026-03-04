@@ -583,6 +583,10 @@ func (b *Backend) handleContainerDeath(containerID string) {
 // findLeaseByContainerID returns the lease UUID and true if a provision
 // containing the given container ID is found. Returns ("", false) otherwise.
 // Called under no lock; acquires read lock internally.
+//
+// O(N*M) linear scan over all leases and their containers. A reverse index
+// would be O(1) but adds sync overhead across provision/deprovision/restart/
+// update/recover. Fine at expected scale (hundreds of leases, 1-10 containers).
 func (b *Backend) findLeaseByContainerID(containerID string) (string, bool) {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
