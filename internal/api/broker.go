@@ -140,6 +140,13 @@ func (b *EventBroker) Publish(event backend.LeaseStatusEvent) {
 	}
 }
 
+// SubscriberCount returns the number of active subscribers for a given lease UUID.
+func (b *EventBroker) SubscriberCount(leaseUUID string) int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.clients[leaseUUID])
+}
+
 // Close closes all subscriber channels and prevents new subscriptions.
 // Safe to call multiple times.
 func (b *EventBroker) Close() {
