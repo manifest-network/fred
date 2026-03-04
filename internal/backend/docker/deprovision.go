@@ -136,6 +136,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	if len(volumeErrs) > 0 {
+		var diagSnap shared.DiagnosticEntry
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
 			p.VolumeCleanupAttempts++
@@ -144,8 +145,15 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			if p.VolumeCleanupAttempts >= maxVolumeCleanupAttempts {
 				// Too many failed attempts — give up and remove the provision.
 				// The leaked volumes require manual cleanup by the operator.
+				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
+					p.VolumeCleanupAttempts, errors.Join(volumeErrs...))
+				diagSnap = diagnosticSnapshot(p)
 				delete(b.provisions, leaseUUID)
 				b.provisionsMu.Unlock()
+
+				// Persist diagnostics before losing the provision so operators
+				// can see the final error via the diagnostics API.
+				b.persistDiagnostics(diagSnap, nil)
 
 				// Perform the same cleanup as the normal success path.
 				if b.releaseStore != nil {
@@ -171,8 +179,12 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			// Under the limit — keep provision visible for retry.
 			p.Status = backend.ProvisionStatusFailed
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
+			diagSnap = diagnosticSnapshot(p)
 		}
 		b.provisionsMu.Unlock()
+		// Persist diagnostics outside the lock so failure state survives
+		// a process restart (no containers remain to recover from).
+		b.persistDiagnostics(diagSnap, nil)
 		return fmt.Errorf("volume cleanup failed: %w", errors.Join(volumeErrs...))
 	}
 
