@@ -25,6 +25,7 @@
 //	TopicLeaseExpired     - Lease expired, deprovision resources
 //	TopicPayloadReceived  - Tenant uploaded payload, start provisioning
 //	TopicBackendCallback  - Backend reported provisioning result
+//	TopicLeaseEvent       - Real-time lease status events for WebSocket delivery
 //
 // # Reconciler
 //

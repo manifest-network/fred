@@ -639,7 +639,7 @@ func TestHandleDeprovision(t *testing.T) {
 
 func TestHandleGetInfo(t *testing.T) {
 	t.Run("success returns 200 with LeaseInfo", func(t *testing.T) {
-		info := &backend.LeaseInfo{"host": "example.com", "port": float64(8080)}
+		info := &backend.LeaseInfo{Host: "example.com"}
 		mb := &mockBackend{
 			GetInfoFunc: func(_ context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
 				assert.Equal(t, "lease-1", leaseUUID)
@@ -652,7 +652,7 @@ func TestHandleGetInfo(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 		var got backend.LeaseInfo
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-		assert.Equal(t, "example.com", got["host"])
+		assert.Equal(t, "example.com", got.Host)
 	})
 
 	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {

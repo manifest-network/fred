@@ -643,29 +643,17 @@ func TestExtractConnectionDetails(t *testing.T) {
 		{
 			name: "full info with ports and metadata",
 			input: backend.LeaseInfo{
-				"host":     "test.example.com",
-				"protocol": "https",
-				"ports": map[string]map[string]string{
-					"80/tcp": {"host_ip": "0.0.0.0", "host_port": "8080"},
+				Host:     "test.example.com",
+				Protocol: "https",
+				Ports: map[string]backend.PortBinding{
+					"80/tcp": {HostIP: "0.0.0.0", HostPort: "8080"},
 				},
-				"metadata": map[string]string{"key": "value"},
+				Metadata: map[string]string{"key": "value"},
 			},
 			expectedHost:  "test.example.com",
 			expectedProto: "https",
 			expectedMeta:  map[string]string{"key": "value"},
 			expectedPorts: map[string]PortMapping{"80/tcp": {HostIP: "0.0.0.0", HostPort: 8080}},
-		},
-		{
-			name: "ports with any type values",
-			input: backend.LeaseInfo{
-				"host": "test.example.com",
-				"ports": map[string]any{
-					"443/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "8443"},
-				},
-			},
-			expectedHost:  "test.example.com",
-			expectedMeta:  map[string]string{},
-			expectedPorts: map[string]PortMapping{"443/tcp": {HostIP: "0.0.0.0", HostPort: 8443}},
 		},
 		{
 			name:         "empty info",
@@ -675,44 +663,32 @@ func TestExtractConnectionDetails(t *testing.T) {
 		{
 			name: "missing optional fields",
 			input: backend.LeaseInfo{
-				"host": "test.example.com",
+				Host: "test.example.com",
 			},
 			expectedHost: "test.example.com",
 			expectedMeta: map[string]string{},
 		},
 		{
-			name: "unknown string fields go to metadata",
+			name: "metadata passed through",
 			input: backend.LeaseInfo{
-				"host":        "test.example.com",
-				"region":      "us-east-1",
-				"backend":     "kubernetes",
-				"credentials": map[string]string{"token": "secret"}, // non-string, ignored
+				Host:     "test.example.com",
+				Metadata: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
 			},
 			expectedHost: "test.example.com",
 			expectedMeta: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
 		},
 		{
-			name: "unknown fields merged with explicit metadata",
-			input: backend.LeaseInfo{
-				"host":     "test.example.com",
-				"metadata": map[string]string{"key": "value"},
-				"region":   "us-west-2",
-			},
-			expectedHost: "test.example.com",
-			expectedMeta: map[string]string{"key": "value", "region": "us-west-2"},
-		},
-		{
 			name: "single instance with ports",
 			input: backend.LeaseInfo{
-				"host": "docker-host.example.com",
-				"instances": []any{
-					map[string]any{
-						"instance_index": float64(0),
-						"container_id":   "abc123def456",
-						"image":          "nginx:latest",
-						"status":         "running",
-						"ports": map[string]any{
-							"80/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "32768"},
+				Host: "docker-host.example.com",
+				Instances: []backend.LeaseInstance{
+					{
+						InstanceIndex: 0,
+						ContainerID:   "abc123def456",
+						Image:         "nginx:latest",
+						Status:        "running",
+						Ports: map[string]backend.PortBinding{
+							"80/tcp": {HostIP: "0.0.0.0", HostPort: "32768"},
 						},
 					},
 				},
@@ -732,28 +708,28 @@ func TestExtractConnectionDetails(t *testing.T) {
 		{
 			name: "multiple instances",
 			input: backend.LeaseInfo{
-				"host": "docker-host.example.com",
-				"instances": []any{
-					map[string]any{
-						"instance_index": float64(0),
-						"container_id":   "container1",
-						"image":          "nginx:latest",
-						"status":         "running",
-						"ports": map[string]any{
-							"80/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "32768"},
+				Host: "docker-host.example.com",
+				Instances: []backend.LeaseInstance{
+					{
+						InstanceIndex: 0,
+						ContainerID:   "container1",
+						Image:         "nginx:latest",
+						Status:        "running",
+						Ports: map[string]backend.PortBinding{
+							"80/tcp": {HostIP: "0.0.0.0", HostPort: "32768"},
 						},
 					},
-					map[string]any{
-						"instance_index": float64(1),
-						"container_id":   "container2",
-						"image":          "redis:alpine",
-						"status":         "running",
-						"ports": map[string]any{
-							"6379/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "32769"},
+					{
+						InstanceIndex: 1,
+						ContainerID:   "container2",
+						Image:         "redis:alpine",
+						Status:        "running",
+						Ports: map[string]backend.PortBinding{
+							"6379/tcp": {HostIP: "0.0.0.0", HostPort: "32769"},
 						},
 					},
 				},
-				"metadata": map[string]any{"backend": "docker"},
+				Metadata: map[string]string{"backend": "docker"},
 			},
 			expectedHost: "docker-host.example.com",
 			expectedMeta: map[string]string{"backend": "docker"},
@@ -775,39 +751,15 @@ func TestExtractConnectionDetails(t *testing.T) {
 			},
 		},
 		{
-			name: "instance with numeric host_port",
-			input: backend.LeaseInfo{
-				"host": "docker-host.example.com",
-				"instances": []any{
-					map[string]any{
-						"instance_index": float64(0),
-						"container_id":   "abc123",
-						"ports": map[string]any{
-							"8080/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": float64(32770)},
-						},
-					},
-				},
-			},
-			expectedHost: "docker-host.example.com",
-			expectedMeta: map[string]string{},
-			expectedInstances: []InstanceInfo{
-				{
-					InstanceIndex: 0,
-					ContainerID:   "abc123",
-					Ports:         map[string]PortMapping{"8080/tcp": {HostIP: "0.0.0.0", HostPort: 32770}},
-				},
-			},
-		},
-		{
 			name: "instance without ports",
 			input: backend.LeaseInfo{
-				"host": "docker-host.example.com",
-				"instances": []any{
-					map[string]any{
-						"instance_index": float64(0),
-						"container_id":   "abc123",
-						"image":          "busybox:latest",
-						"status":         "running",
+				Host: "docker-host.example.com",
+				Instances: []backend.LeaseInstance{
+					{
+						InstanceIndex: 0,
+						ContainerID:   "abc123",
+						Image:         "busybox:latest",
+						Status:        "running",
 					},
 				},
 			},
@@ -819,51 +771,6 @@ func TestExtractConnectionDetails(t *testing.T) {
 					ContainerID:   "abc123",
 					Image:         "busybox:latest",
 					Status:        "running",
-				},
-			},
-		},
-		{
-			name: "instance with typed port map from docker backend",
-			input: backend.LeaseInfo{
-				"host": "docker-host.example.com",
-				"instances": []any{
-					map[string]any{
-						"instance_index": 0,
-						"container_id":   "abc123",
-						"ports": map[string]map[string]string{
-							"80/tcp": {"host_ip": "0.0.0.0", "host_port": "8080"},
-						},
-					},
-				},
-			},
-			expectedHost: "docker-host.example.com",
-			expectedMeta: map[string]string{},
-			expectedInstances: []InstanceInfo{
-				{
-					InstanceIndex: 0,
-					ContainerID:   "abc123",
-					Ports:         map[string]PortMapping{"80/tcp": {HostIP: "0.0.0.0", HostPort: 8080}},
-				},
-			},
-		},
-		{
-			name: "instances field is not included in metadata",
-			input: backend.LeaseInfo{
-				"host": "docker-host.example.com",
-				"instances": []any{
-					map[string]any{
-						"instance_index": float64(0),
-						"container_id":   "abc123",
-					},
-				},
-				"region": "us-east-1",
-			},
-			expectedHost: "docker-host.example.com",
-			expectedMeta: map[string]string{"region": "us-east-1"},
-			expectedInstances: []InstanceInfo{
-				{
-					InstanceIndex: 0,
-					ContainerID:   "abc123",
 				},
 			},
 		},
@@ -905,28 +812,28 @@ func TestExtractConnectionDetails(t *testing.T) {
 func TestExtractConnectionDetails_Services(t *testing.T) {
 	t.Run("stack with two services", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"services": map[string]any{
-				"web": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "abc123",
-							"image":          "nginx:latest",
-							"status":         "running",
-							"ports": map[string]any{
-								"80/tcp": map[string]any{"host_ip": "0.0.0.0", "host_port": "8080"},
+			Host: "docker-host.example.com",
+			Services: map[string]backend.LeaseService{
+				"web": {
+					Instances: []backend.LeaseInstance{
+						{
+							InstanceIndex: 0,
+							ContainerID:   "abc123",
+							Image:         "nginx:latest",
+							Status:        "running",
+							Ports: map[string]backend.PortBinding{
+								"80/tcp": {HostIP: "0.0.0.0", HostPort: "8080"},
 							},
 						},
 					},
 				},
-				"db": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "def456",
-							"image":          "postgres:16",
-							"status":         "running",
+				"db": {
+					Instances: []backend.LeaseInstance{
+						{
+							InstanceIndex: 0,
+							ContainerID:   "def456",
+							Image:         "postgres:16",
+							Status:        "running",
 						},
 					},
 				},
@@ -954,17 +861,17 @@ func TestExtractConnectionDetails_Services(t *testing.T) {
 		assert.Equal(t, "postgres:16", dbSvc.Instances[0].Image)
 	})
 
-	t.Run("service instance ports with typed map from docker backend", func(t *testing.T) {
+	t.Run("service with instance index", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"services": map[string]any{
-				"web": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": 2,
-							"container_id":   "abc123",
-							"ports": map[string]map[string]string{
-								"80/tcp": {"host_ip": "0.0.0.0", "host_port": "8080"},
+			Host: "docker-host.example.com",
+			Services: map[string]backend.LeaseService{
+				"web": {
+					Instances: []backend.LeaseInstance{
+						{
+							InstanceIndex: 2,
+							ContainerID:   "abc123",
+							Ports: map[string]backend.PortBinding{
+								"80/tcp": {HostIP: "0.0.0.0", HostPort: "8080"},
 							},
 						},
 					},
@@ -979,53 +886,23 @@ func TestExtractConnectionDetails_Services(t *testing.T) {
 		require.Len(t, webSvc.Instances[0].Ports, 1)
 		assert.Equal(t, PortMapping{HostIP: "0.0.0.0", HostPort: 8080}, webSvc.Instances[0].Ports["80/tcp"])
 	})
-
-	t.Run("services field not in metadata", func(t *testing.T) {
-		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"services": map[string]any{
-				"web": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "abc",
-						},
-					},
-				},
-			},
-			"region": "us-east-1",
-		}
-
-		result := extractConnectionDetails(input)
-		assert.Len(t, result.Services, 1)
-		assert.Equal(t, "us-east-1", result.Metadata["region"])
-		// "services" should NOT appear in metadata.
-		_, inMeta := result.Metadata["services"]
-		assert.False(t, inMeta)
-	})
 }
 
 func TestExtractConnectionDetails_FQDN(t *testing.T) {
 	t.Run("direct fqdn in lease info", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"fqdn": "myapp.example.com",
+			Host: "docker-host.example.com",
+			FQDN: "myapp.example.com",
 		}
 		result := extractConnectionDetails(input)
 		assert.Equal(t, "myapp.example.com", result.FQDN)
-		_, inMeta := result.Metadata["fqdn"]
-		assert.False(t, inMeta, "fqdn should not appear in metadata")
 	})
 
 	t.Run("fqdn propagated from first instance", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"instances": []any{
-				map[string]any{
-					"instance_index": float64(0),
-					"container_id":   "abc123",
-					"fqdn":           "inst.example.com",
-				},
+			Host: "docker-host.example.com",
+			Instances: []backend.LeaseInstance{
+				{InstanceIndex: 0, ContainerID: "abc123", FQDN: "inst.example.com"},
 			},
 		}
 		result := extractConnectionDetails(input)
@@ -1036,14 +913,10 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 
 	t.Run("direct fqdn takes precedence over instance fqdn", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"fqdn": "top-level.example.com",
-			"instances": []any{
-				map[string]any{
-					"instance_index": float64(0),
-					"container_id":   "abc123",
-					"fqdn":           "instance-level.example.com",
-				},
+			Host: "docker-host.example.com",
+			FQDN: "top-level.example.com",
+			Instances: []backend.LeaseInstance{
+				{InstanceIndex: 0, ContainerID: "abc123", FQDN: "instance-level.example.com"},
 			},
 		}
 		result := extractConnectionDetails(input)
@@ -1054,18 +927,10 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 
 	t.Run("multi-instance each with unique fqdn", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"instances": []any{
-				map[string]any{
-					"instance_index": float64(0),
-					"container_id":   "container0",
-					"fqdn":           "0-abc1234.example.com",
-				},
-				map[string]any{
-					"instance_index": float64(1),
-					"container_id":   "container1",
-					"fqdn":           "1-def5678.example.com",
-				},
+			Host: "docker-host.example.com",
+			Instances: []backend.LeaseInstance{
+				{InstanceIndex: 0, ContainerID: "container0", FQDN: "0-abc1234.example.com"},
+				{InstanceIndex: 1, ContainerID: "container1", FQDN: "1-def5678.example.com"},
 			},
 		}
 		result := extractConnectionDetails(input)
@@ -1077,12 +942,9 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 
 	t.Run("no fqdn anywhere", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"instances": []any{
-				map[string]any{
-					"instance_index": float64(0),
-					"container_id":   "abc123",
-				},
+			Host: "docker-host.example.com",
+			Instances: []backend.LeaseInstance{
+				{InstanceIndex: 0, ContainerID: "abc123"},
 			},
 		}
 		result := extractConnectionDetails(input)
@@ -1093,26 +955,14 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 
 	t.Run("service-level fqdn propagated from first instance", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"services": map[string]any{
-				"web": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "abc123",
-							"fqdn":           "web.example.com",
-						},
-					},
-				},
-				"db": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "def456",
-							"fqdn":           "db.example.com",
-						},
-					},
-				},
+			Host: "docker-host.example.com",
+			Services: map[string]backend.LeaseService{
+				"web": {Instances: []backend.LeaseInstance{
+					{InstanceIndex: 0, ContainerID: "abc123", FQDN: "web.example.com"},
+				}},
+				"db": {Instances: []backend.LeaseInstance{
+					{InstanceIndex: 0, ContainerID: "def456", FQDN: "db.example.com"},
+				}},
 			},
 		}
 		result := extractConnectionDetails(input)
@@ -1125,22 +975,12 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 
 	t.Run("service with multi-instance unique fqdns", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"services": map[string]any{
-				"web": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "web0",
-							"fqdn":           "web-0-abc.example.com",
-						},
-						map[string]any{
-							"instance_index": float64(1),
-							"container_id":   "web1",
-							"fqdn":           "web-1-def.example.com",
-						},
-					},
-				},
+			Host: "docker-host.example.com",
+			Services: map[string]backend.LeaseService{
+				"web": {Instances: []backend.LeaseInstance{
+					{InstanceIndex: 0, ContainerID: "web0", FQDN: "web-0-abc.example.com"},
+					{InstanceIndex: 1, ContainerID: "web1", FQDN: "web-1-def.example.com"},
+				}},
 			},
 		}
 		result := extractConnectionDetails(input)
@@ -1154,16 +994,12 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 
 	t.Run("explicit service fqdn takes precedence over instance fqdn", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"services": map[string]any{
-				"web": map[string]any{
-					"fqdn": "explicit-web.example.com",
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "abc123",
-							"fqdn":           "instance-web.example.com",
-						},
+			Host: "docker-host.example.com",
+			Services: map[string]backend.LeaseService{
+				"web": {
+					FQDN: "explicit-web.example.com",
+					Instances: []backend.LeaseInstance{
+						{InstanceIndex: 0, ContainerID: "abc123", FQDN: "instance-web.example.com"},
 					},
 				},
 			},
@@ -1176,16 +1012,11 @@ func TestExtractConnectionDetails_FQDN(t *testing.T) {
 
 	t.Run("service without fqdn in instances", func(t *testing.T) {
 		input := backend.LeaseInfo{
-			"host": "docker-host.example.com",
-			"services": map[string]any{
-				"web": map[string]any{
-					"instances": []any{
-						map[string]any{
-							"instance_index": float64(0),
-							"container_id":   "abc123",
-						},
-					},
-				},
+			Host: "docker-host.example.com",
+			Services: map[string]backend.LeaseService{
+				"web": {Instances: []backend.LeaseInstance{
+					{InstanceIndex: 0, ContainerID: "abc123"},
+				}},
 			},
 		}
 		result := extractConnectionDetails(input)

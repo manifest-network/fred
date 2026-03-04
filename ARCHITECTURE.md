@@ -97,11 +97,12 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  │                                                                     │   │
 │  │  Topics → Handlers (HandlerSet):                                    │   │
 │  │  ─────────────────────────────────────────────────────────────      │   │
-│  │  events.lease.created       →  handleLeaseCreated                   │   │
-│  │  events.lease.closed        →  handleLeaseClosed                    │   │
-│  │  events.lease.expired       →  handleLeaseExpired                   │   │
-│  │  events.payload.received    →  handlePayloadReceived                │   │
-│  │  events.backend.callback    →  handleBackendCallback                │   │
+│  │  events.lease.created       →  HandleLeaseCreated                   │   │
+│  │  events.lease.closed        →  HandleLeaseClosed                    │   │
+│  │  events.lease.expired       →  HandleLeaseExpired                   │   │
+│  │  events.payload.received    →  HandlePayloadReceived                │   │
+│  │  events.backend.callback    →  HandleBackendCallback                │   │
+│  │  events.lease.event         →  (fan-out to WebSocket subscribers)   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                   │                                         │
 │                                   ▼                                         │
@@ -144,7 +145,7 @@ each component in isolation with mocks and allows swapping implementations.
 ```
 Manager (coordinator)
 ├── ChainClient          interface → chain.Client
-├── BackendRouter        *backend.Router (passed to Orchestrator via interface)
+├── BackendRouter        interface → *backend.Router (passed to Orchestrator)
 ├── InFlightTracker      interface → inFlightMap (sync.RWMutex-protected map)
 ├── PlacementStore       interface → placement.Store (bbolt + cache, optional)
 ├── Orchestrator         struct    → uses BackendRouter + InFlightTracker + PlacementStore
@@ -155,13 +156,13 @@ Manager (coordinator)
 
 Reconciler (independent)
 ├── ReconcilerChainClient  interface → chain.Client
-├── BackendRouter          *backend.Router
+├── BackendRouter          interface → *backend.Router
 ├── PlacementStore         interface → placement.Store (syncs on startup)
 └── ReconcilerTracker      interface → Manager (extends InFlightTracker)
 
 API Handlers
 ├── PlacementLookup        interface → placement.Store (read-only, optional)
-└── BackendRouter          *backend.Router
+└── BackendRouter          *backend.Router (concrete; only provisioner uses interface)
 ```
 
 Key interfaces defined where they're consumed:
@@ -189,7 +190,7 @@ Key interfaces defined where they're consumed:
 2. Chain emits lease_created event
 3. Event Subscriber receives via WebSocket
 4. Event Bridge publishes to Watermill topic
-5. handleLeaseCreated:
+5. HandleLeaseCreated:
    a. Check if lease already in-flight (idempotency)
    b. Route to backend by SKU (round-robin if multiple backends match)
    c. Call backend POST /provision with callback URL
@@ -211,7 +212,7 @@ Key interfaces defined where they're consumed:
 ```
 1. Tenant creates lease with meta_hash on chain
 2. Chain emits lease_created event
-3. handleLeaseCreated sees meta_hash, waits for payload
+3. HandleLeaseCreated sees meta_hash, waits for payload
 4. Tenant POSTs payload to /v1/leases/{uuid}/data
 5. Fred validates SHA-256(payload) == lease.meta_hash
 6. Fred stores payload, publishes to Watermill
@@ -226,10 +227,11 @@ Key interfaces defined where they're consumed:
 ```
 1. Tenant closes lease (or credit depleted)
 2. Chain emits lease_closed event
-3. handleLeaseClosed:
-   a. Route to backend by SKU
-   b. Call backend POST /deprovision
-   c. Backend cleans up resources (idempotent)
+3. HandleLeaseClosed:
+   a. Clean up stored payload (if any)
+   b. Fetch lease from chain for SKU routing hint
+   c. Route to backend by SKU, call backend POST /deprovision
+   d. Backend cleans up resources (idempotent)
 ```
 
 ## Concurrency Model
@@ -381,12 +383,48 @@ Used tokens are tracked in bbolt to prevent replay attacks:
 ### Metrics (Prometheus)
 
 Key metrics exposed at `/metrics`:
-- `fred_api_requests_total` - API request count by method/path/status
-- `fred_chain_transactions_total` - Chain transactions by type/outcome
-- `fred_backend_requests_total` - Backend request count by backend/operation/status
+
+**API:**
+- `fred_api_requests_total` - Request count by method/path/status
+- `fred_api_request_duration_seconds` - Request latency histogram
+- `fred_api_rate_limit_rejections_total` - Rate limit rejections by limiter (global, tenant)
+- `fred_api_non_in_flight_callbacks_total` - Callbacks for non-tracked leases
+
+**Provisioner:**
 - `fred_provisioner_in_flight_provisions` - Current in-flight provisions gauge
+- `fred_provisioner_provisioning_total` - Provisioning operations by outcome/backend
+- `fred_provisioner_provisioning_duration_seconds` - Provisioning latency histogram
+- `fred_provisioner_callback_timeouts_total` - Backend callback timeouts
+
+**Reconciler:**
+- `fred_reconciler_runs_total` - Reconciliation runs by outcome
 - `fred_reconciler_duration_seconds` - Reconciliation timing histogram
-- `fred_backend_circuit_breaker_state` - Backend circuit breaker states (0=closed, 1=half-open, 2=open)
+- `fred_reconciler_actions_total` - Actions taken (provisioned, acknowledged, deprovisioned, anomaly)
+- `fred_reconciler_last_success_timestamp_seconds` - Last successful run timestamp
+- `fred_reconciler_conflicts_total` - Lease already in-flight conflicts
+
+**Backend:**
+- `fred_backend_requests_total` - Request count by backend/operation/status
+- `fred_backend_request_duration_seconds` - Request latency histogram
+- `fred_backend_circuit_breaker_state` - Circuit breaker state (0=closed, 1=half-open, 2=open)
+- `fred_backend_healthy` - Backend health status gauge
+- `fred_backend_insufficient_resources_total` - Capacity rejections by backend
+
+**Chain:**
+- `fred_chain_transactions_total` - Chain transactions by type/outcome
+- `fred_chain_query_duration_seconds` - Chain query latency histogram
+
+**Payload:**
+- `fred_payload_uploads_total` - Upload count by outcome
+- `fred_payload_stored_count` - Currently stored payloads gauge
+- `fred_payload_size_bytes` - Upload size histogram
+- `fred_payload_leases_awaiting` - Leases currently waiting for payload upload
+
+**Watermill:**
+- `fred_watermill_messages_total` - Messages processed by topic/outcome
+- `fred_watermill_poisoned_messages_total` - Messages sent to poison queue
+- `fred_events_dropped_total` - Events dropped due to full subscriber channels
+- `fred_messages_malformed_total` - Unparseable messages by topic
 
 ### Logging (slog)
 

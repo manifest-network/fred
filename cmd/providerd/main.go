@@ -300,7 +300,15 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackSecret:       string(cfg.CallbackSecret),
 		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,
 		CallbackBaseURL:      cfg.CallbackBaseURL,
-	}, chainClient, backendRouter, provisionMgr, provisionMgr, provisionMgr, placementStore, eventBroker)
+	}, api.ServerDeps{
+		ChainClient:       chainClient,
+		BackendRouter:     backendRouter,
+		CallbackPublisher: provisionMgr,
+		PayloadPublisher:  provisionMgr,
+		StatusChecker:     provisionMgr,
+		PlacementLookup:   placementStore,
+		EventBroker:       eventBroker,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
 	}

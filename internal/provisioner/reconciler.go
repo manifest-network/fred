@@ -54,7 +54,7 @@ type Reconciler struct {
 	providerUUID    string
 	callbackBaseURL string
 	chainClient     ReconcilerChainClient
-	backendRouter   *backend.Router
+	backendRouter   BackendRouter
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
 	placementStore  PlacementStore    // Optional placement store for round-robin routing
 
@@ -80,7 +80,7 @@ type ReconcilerConfig struct {
 // NewReconciler creates a new reconciler.
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
 // The placementStore parameter is optional - if nil, round-robin placement tracking is disabled.
-func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter *backend.Router, tracker ReconcilerTracker, placementStore PlacementStore) (*Reconciler, error) {
+func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter BackendRouter, tracker ReconcilerTracker, placementStore PlacementStore) (*Reconciler, error) {
 	if chainClient == nil {
 		return nil, errors.New("chain client is required")
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/ThreeDotsLabs/watermill"
@@ -32,7 +33,8 @@ type HandlerDeps struct {
 // HandlerSet contains the Watermill message handlers for the provisioner.
 // It encapsulates all handler methods and their dependencies.
 type HandlerSet struct {
-	deps HandlerDeps
+	deps            HandlerDeps
+	awaitingPayload sync.Map // tracks lease UUIDs awaiting payload for gauge accuracy
 }
 
 // NewHandlerSet creates a new HandlerSet with the given dependencies.
@@ -90,7 +92,9 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	// Check if lease requires a payload (has MetaHash)
 	// If so, skip immediate provisioning - wait for payload upload
 	if len(lease.MetaHash) > 0 {
-		metrics.LeasesAwaitingPayloadTotal.Inc()
+		if _, alreadyTracked := h.awaitingPayload.LoadOrStore(event.LeaseUUID, struct{}{}); !alreadyTracked {
+			metrics.LeasesAwaitingPayload.Inc()
+		}
 		slog.Info("lease requires payload, awaiting upload",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
@@ -133,6 +137,11 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 	}
 
 	slog.Info("processing lease close", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant, "topic", topic)
+
+	// If the lease was still awaiting payload, decrement the gauge.
+	if _, loaded := h.awaitingPayload.LoadAndDelete(event.LeaseUUID); loaded {
+		metrics.LeasesAwaitingPayload.Dec()
+	}
 
 	// Clean up any stored payload for this lease.
 	// This handles the case where a tenant uploaded a payload but canceled the lease
@@ -385,6 +394,11 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		"lease_uuid", event.LeaseUUID,
 		"tenant", event.Tenant,
 	)
+
+	// Lease is no longer awaiting payload — decrement gauge if it was tracked.
+	if _, loaded := h.awaitingPayload.LoadAndDelete(event.LeaseUUID); loaded {
+		metrics.LeasesAwaitingPayload.Dec()
+	}
 
 	// Fetch lease details from chain to get SKU for routing
 	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)

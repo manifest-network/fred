@@ -139,20 +139,36 @@ type ProvisionResponse struct {
 }
 
 // LeaseInfo contains backend-specific information about a provisioned lease.
-// The structure is flexible to allow different backends to return different data.
-// For single-instance leases, fields are at the top level.
-// For multi-instance leases, use the "instances" key with an array of instance info.
-// Common fields include: host, ports, protocol, status, container_id, image.
-type LeaseInfo map[string]any
+type LeaseInfo struct {
+	Host      string                  `json:"host,omitempty"`
+	FQDN      string                  `json:"fqdn,omitempty"`
+	Protocol  string                  `json:"protocol,omitempty"`
+	Ports     map[string]PortBinding  `json:"ports,omitempty"`
+	Instances []LeaseInstance         `json:"instances,omitempty"`
+	Services  map[string]LeaseService `json:"services,omitempty"`
+	Metadata  map[string]string       `json:"metadata,omitempty"`
+}
 
-// InstanceInfo represents information about a single provisioned instance.
-// Used when a lease has multiple containers/pods/allocations.
-type InstanceInfo struct {
-	ID       string            `json:"id"`                 // Instance identifier (e.g., container ID)
-	Host     string            `json:"host"`               // Host address
-	Ports    map[string]any    `json:"ports,omitempty"`    // Port mappings
-	Status   string            `json:"status"`             // Instance status
-	Metadata map[string]string `json:"metadata,omitempty"` // Additional metadata
+// PortBinding represents a port mapping from container to host as reported by a backend.
+type PortBinding struct {
+	HostIP   string `json:"host_ip"`
+	HostPort string `json:"host_port"`
+}
+
+// LeaseInstance represents a single provisioned instance (container/pod).
+type LeaseInstance struct {
+	InstanceIndex int                    `json:"instance_index"`
+	ContainerID   string                 `json:"container_id,omitempty"`
+	Image         string                 `json:"image,omitempty"`
+	Status        string                 `json:"status,omitempty"`
+	FQDN          string                 `json:"fqdn,omitempty"`
+	Ports         map[string]PortBinding `json:"ports,omitempty"`
+}
+
+// LeaseService groups instances belonging to a single service in a stack lease.
+type LeaseService struct {
+	FQDN      string          `json:"fqdn,omitempty"`
+	Instances []LeaseInstance `json:"instances,omitempty"`
 }
 
 // ProvisionInfo describes a single provisioned resource.
@@ -532,6 +548,53 @@ func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
 	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(c.secret, body))
 }
 
+// doGet executes a GET request through the circuit breaker, decoding the
+// JSON response as T. It handles 404→ErrNotProvisioned and enforces a
+// response size limit.
+func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxBytes int64) (_ *T, err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics(metric, start, err) }()
+
+	result, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		c.signRequest(httpReq, nil)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("%s request failed: %w", metric, err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotProvisioned
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("%s failed with status %d: %s", metric, resp.StatusCode, readErrorBody(resp))
+		}
+
+		var v T
+		if err := decodeJSONLimited(resp.Body, maxBytes, &v); err != nil {
+			return nil, fmt.Errorf("decode %s response: %w", metric, err)
+		}
+		return &v, nil
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return nil, ErrCircuitOpen
+	}
+	if cbErr != nil {
+		return nil, cbErr
+	}
+	v, ok := result.(*T)
+	if !ok {
+		return nil, fmt.Errorf("%s: unexpected result type %T", metric, result)
+	}
+	return v, nil
+}
+
 // Provision sends a provision request to the backend.
 func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err error) {
 	start := time.Now()
@@ -584,52 +647,8 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 }
 
 // GetInfo retrieves lease information including connection details.
-func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (_ *LeaseInfo, err error) {
-	start := time.Now()
-	defer func() { c.recordMetrics("get_info", start, err) }()
-
-	url := fmt.Sprintf("%s/info/%s", c.baseURL, leaseUUID)
-
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		c.signRequest(httpReq, nil)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("get info request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, ErrNotProvisioned
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("get info failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-
-		var info LeaseInfo
-		if err := decodeJSONLimited(resp.Body, c.maxInfoBytes, &info); err != nil {
-			return nil, fmt.Errorf("decode info response: %w", err)
-		}
-
-		return &info, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return nil, ErrCircuitOpen
-	}
-	if cbErr != nil {
-		return nil, cbErr
-	}
-	info, ok := result.(*LeaseInfo)
-	if !ok {
-		return nil, fmt.Errorf("get info: unexpected result type %T", result)
-	}
-	return info, nil
+func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo, error) {
+	return doGet[LeaseInfo](c, ctx, "get_info", fmt.Sprintf("%s/info/%s", c.baseURL, leaseUUID), c.maxInfoBytes)
 }
 
 // Deprovision releases resources for a lease.
@@ -715,101 +734,17 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 }
 
 // GetProvision retrieves status information for a single provision.
-func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (_ *ProvisionInfo, err error) {
-	start := time.Now()
-	defer func() { c.recordMetrics("get_provision", start, err) }()
-
-	url := fmt.Sprintf("%s/provisions/%s", c.baseURL, leaseUUID)
-
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		c.signRequest(httpReq, nil)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("get provision request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, ErrNotProvisioned
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("get provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-
-		var info ProvisionInfo
-		if err := decodeJSONLimited(resp.Body, c.maxProvisionBytes, &info); err != nil {
-			return nil, fmt.Errorf("decode provision response: %w", err)
-		}
-
-		return &info, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return nil, ErrCircuitOpen
-	}
-	if cbErr != nil {
-		return nil, cbErr
-	}
-	info, ok := result.(*ProvisionInfo)
-	if !ok {
-		return nil, fmt.Errorf("get provision: unexpected result type %T", result)
-	}
-	return info, nil
+func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error) {
+	return doGet[ProvisionInfo](c, ctx, "get_provision", fmt.Sprintf("%s/provisions/%s", c.baseURL, leaseUUID), c.maxProvisionBytes)
 }
 
 // GetLogs retrieves container logs for a provisioned lease.
-func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (_ map[string]string, err error) {
-	start := time.Now()
-	defer func() { c.recordMetrics("get_logs", start, err) }()
-
-	url := fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail)
-
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		c.signRequest(httpReq, nil)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("get logs request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, ErrNotProvisioned
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("get logs failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-
-		var logs map[string]string
-		if err := decodeJSONLimited(resp.Body, c.maxLogsBytes, &logs); err != nil {
-			return nil, fmt.Errorf("decode logs response: %w", err)
-		}
-
-		return logs, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return nil, ErrCircuitOpen
+func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
+	result, err := doGet[map[string]string](c, ctx, "get_logs", fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail), c.maxLogsBytes)
+	if err != nil {
+		return nil, err
 	}
-	if cbErr != nil {
-		return nil, cbErr
-	}
-	logs, ok := result.(map[string]string)
-	if !ok {
-		return nil, fmt.Errorf("get logs: unexpected result type %T", result)
-	}
-	return logs, nil
+	return *result, nil
 }
 
 // Restart sends a restart request to the backend.
@@ -899,52 +834,12 @@ func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) 
 }
 
 // GetReleases retrieves release history for a lease.
-func (c *HTTPClient) GetReleases(ctx context.Context, leaseUUID string) (_ []ReleaseInfo, err error) {
-	start := time.Now()
-	defer func() { c.recordMetrics("get_releases", start, err) }()
-
-	url := fmt.Sprintf("%s/releases/%s", c.baseURL, leaseUUID)
-
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		c.signRequest(httpReq, nil)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("get releases request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, ErrNotProvisioned
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("get releases failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-
-		var releases []ReleaseInfo
-		if err := decodeJSONLimited(resp.Body, c.maxReleasesBytes, &releases); err != nil {
-			return nil, fmt.Errorf("decode releases response: %w", err)
-		}
-
-		return releases, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return nil, ErrCircuitOpen
+func (c *HTTPClient) GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error) {
+	result, err := doGet[[]ReleaseInfo](c, ctx, "get_releases", fmt.Sprintf("%s/releases/%s", c.baseURL, leaseUUID), c.maxReleasesBytes)
+	if err != nil {
+		return nil, err
 	}
-	if cbErr != nil {
-		return nil, cbErr
-	}
-	releases, ok := result.([]ReleaseInfo)
-	if !ok {
-		return nil, fmt.Errorf("get releases: unexpected result type %T", result)
-	}
-	return releases, nil
+	return *result, nil
 }
 
 // RefreshState is a no-op for remote backends (they refresh server-side).

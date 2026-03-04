@@ -49,7 +49,7 @@ func (m *mockReconcilerBackend) Provision(ctx context.Context, req backend.Provi
 }
 
 func (m *mockReconcilerBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
-	info := backend.LeaseInfo{"host": "localhost", "port": 8080}
+	info := backend.LeaseInfo{Host: "localhost"}
 	return &info, nil
 }
 
@@ -108,7 +108,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 		name        string
 		cfg         ReconcilerConfig
 		chainClient ReconcilerChainClient
-		router      *backend.Router
+		router      BackendRouter
 		wantErr     string
 	}{
 		{

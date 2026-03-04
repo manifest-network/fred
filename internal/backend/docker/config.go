@@ -77,7 +77,8 @@ type Config struct {
 	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
 
 	// CallbackInsecureSkipVerify skips TLS certificate verification for callbacks.
-	// WARNING: Only use for development with self-signed certificates.
+	// WARNING: This disables TLS certificate validation, enabling MITM attacks.
+	// NEVER enable in production. Only use for local development with self-signed certificates.
 	CallbackInsecureSkipVerify bool `yaml:"callback_insecure_skip_verify"`
 
 	// CallbackDBPath is the path to the bbolt database for persisting pending callbacks.

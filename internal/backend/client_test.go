@@ -203,9 +203,8 @@ func TestHTTPClient_GetInfo(t *testing.T) {
 		if r.URL.Path == "/info/found-uuid" {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(LeaseInfo{
-				"host":     "test.example.com",
-				"port":     8080,
-				"protocol": "https",
+				Host:     "test.example.com",
+				Protocol: "https",
 			})
 			return
 		}
@@ -222,7 +221,7 @@ func TestHTTPClient_GetInfo(t *testing.T) {
 	// Test found
 	info, err := client.GetInfo(context.Background(), "found-uuid")
 	require.NoError(t, err)
-	assert.Equal(t, "test.example.com", (*info)["host"])
+	assert.Equal(t, "test.example.com", info.Host)
 
 	// Test not found
 	_, err = client.GetInfo(context.Background(), "not-found-uuid")
@@ -654,7 +653,7 @@ func TestHTTPClient_GetInfo_WithHMAC(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(LeaseInfo{"host": "example.com"})
+		json.NewEncoder(w).Encode(LeaseInfo{Host: "example.com"})
 	}))
 	defer server.Close()
 
@@ -708,7 +707,7 @@ func TestHTTPClient_GetInfo_NoHMAC_NoHeader(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(LeaseInfo{"host": "example.com"})
+		json.NewEncoder(w).Encode(LeaseInfo{Host: "example.com"})
 	}))
 	defer server.Close()
 
@@ -1090,7 +1089,7 @@ func TestDecodeJSONLimited(t *testing.T) {
 		var info LeaseInfo
 		err := decodeJSONLimited(body, 1024, &info)
 		require.NoError(t, err)
-		assert.Equal(t, "example.com", info["host"])
+		assert.Equal(t, "example.com", info.Host)
 	})
 
 	t.Run("exactly at limit", func(t *testing.T) {
@@ -1236,7 +1235,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 	t.Run("within-limit responses still succeed", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(LeaseInfo{"host": "ok.example.com"})
+			json.NewEncoder(w).Encode(LeaseInfo{Host: "ok.example.com"})
 		}))
 		defer server.Close()
 
@@ -1249,7 +1248,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 
 		info, err := client.GetInfo(context.Background(), "lease-1")
 		require.NoError(t, err)
-		assert.Equal(t, "ok.example.com", (*info)["host"])
+		assert.Equal(t, "ok.example.com", info.Host)
 	})
 }
 

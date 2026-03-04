@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +30,8 @@ func testEvent(leaseUUID string, status backend.ProvisionStatus) backend.LeaseSt
 
 func TestEventBroker_SubscribeAndPublish(t *testing.T) {
 	broker := NewEventBroker()
-	ch := broker.Subscribe("lease-1")
+	ch, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
 
 	event := testEvent("lease-1", backend.ProvisionStatusReady)
 	broker.Publish(event)
@@ -45,8 +47,10 @@ func TestEventBroker_SubscribeAndPublish(t *testing.T) {
 
 func TestEventBroker_MultipleClientsForSameLease(t *testing.T) {
 	broker := NewEventBroker()
-	ch1 := broker.Subscribe("lease-1")
-	ch2 := broker.Subscribe("lease-1")
+	ch1, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	ch2, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
 
 	event := backend.LeaseStatusEvent{
 		LeaseUUID: "lease-1",
@@ -69,7 +73,8 @@ func TestEventBroker_MultipleClientsForSameLease(t *testing.T) {
 
 func TestEventBroker_UnsubscribeStopsDelivery(t *testing.T) {
 	broker := NewEventBroker()
-	ch := broker.Subscribe("lease-1")
+	ch, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
 
 	broker.Unsubscribe("lease-1", ch)
 
@@ -83,7 +88,8 @@ func TestEventBroker_UnsubscribeStopsDelivery(t *testing.T) {
 
 func TestEventBroker_SlowClientDropsEvents(t *testing.T) {
 	broker := NewEventBroker()
-	ch := broker.Subscribe("lease-1")
+	ch, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
 
 	// Fill the buffer (eventChannelBuffer = 16).
 	for range eventChannelBuffer + 5 {
@@ -106,8 +112,10 @@ done:
 
 func TestEventBroker_DifferentLeasesAreIsolated(t *testing.T) {
 	broker := NewEventBroker()
-	ch1 := broker.Subscribe("lease-1")
-	ch2 := broker.Subscribe("lease-2")
+	ch1, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	ch2, err := broker.Subscribe("lease-2")
+	require.NoError(t, err)
 
 	broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
 
@@ -149,8 +157,10 @@ func TestEventBroker_PublishToNoSubscribers(t *testing.T) {
 
 func TestEventBroker_Close(t *testing.T) {
 	broker := NewEventBroker()
-	ch1 := broker.Subscribe("lease-1")
-	ch2 := broker.Subscribe("lease-2")
+	ch1, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	ch2, err := broker.Subscribe("lease-2")
+	require.NoError(t, err)
 
 	broker.Close()
 
@@ -161,7 +171,8 @@ func TestEventBroker_Close(t *testing.T) {
 	assert.False(t, ok2, "expected ch2 to be closed after broker.Close()")
 
 	// Subscribe after close returns nil.
-	ch3 := broker.Subscribe("lease-3")
+	ch3, err := broker.Subscribe("lease-3")
+	require.NoError(t, err)
 	assert.Nil(t, ch3, "expected nil channel from Subscribe after Close")
 
 	// Publish after close should not panic.
@@ -173,6 +184,83 @@ func TestEventBroker_Close(t *testing.T) {
 	require.NotPanics(t, func() {
 		broker.Close()
 	})
+}
+
+func TestEventBroker_PerLeaseSubscriptionLimit(t *testing.T) {
+	broker := NewEventBrokerWithLimits(3, 100)
+
+	for range 3 {
+		ch, err := broker.Subscribe("lease-1")
+		require.NoError(t, err)
+		require.NotNil(t, ch)
+	}
+
+	// 4th subscription for the same lease should be rejected.
+	ch, err := broker.Subscribe("lease-1")
+	assert.Nil(t, ch)
+	assert.ErrorIs(t, err, ErrTooManySubscriptions)
+
+	// Different lease should still work.
+	ch, err = broker.Subscribe("lease-2")
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+}
+
+func TestEventBroker_GlobalSubscriptionLimit(t *testing.T) {
+	broker := NewEventBrokerWithLimits(10, 5)
+
+	for i := range 5 {
+		ch, err := broker.Subscribe("lease-" + strconv.Itoa(i))
+		require.NoError(t, err)
+		require.NotNil(t, ch)
+	}
+
+	// 6th subscription globally should be rejected.
+	ch, err := broker.Subscribe("lease-new")
+	assert.Nil(t, ch)
+	assert.ErrorIs(t, err, ErrTooManySubscriptions)
+}
+
+func TestEventBroker_UnsubscribeFreesSlot(t *testing.T) {
+	broker := NewEventBrokerWithLimits(2, 100)
+
+	ch1, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	ch2, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+
+	// At limit — next subscribe should fail.
+	_, err = broker.Subscribe("lease-1")
+	require.ErrorIs(t, err, ErrTooManySubscriptions)
+
+	// Unsubscribe one — should free a slot.
+	broker.Unsubscribe("lease-1", ch1)
+
+	ch3, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, ch3)
+
+	_ = ch2 // keep reference to avoid GC
+}
+
+func TestEventBroker_GlobalLimitFreedByUnsubscribe(t *testing.T) {
+	broker := NewEventBrokerWithLimits(10, 2)
+
+	ch1, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	_, err = broker.Subscribe("lease-2")
+	require.NoError(t, err)
+
+	// At global limit.
+	_, err = broker.Subscribe("lease-3")
+	require.ErrorIs(t, err, ErrTooManySubscriptions)
+
+	// Unsubscribe frees global slot.
+	broker.Unsubscribe("lease-1", ch1)
+
+	ch3, err := broker.Subscribe("lease-3")
+	require.NoError(t, err)
+	require.NotNil(t, ch3)
 }
 
 // --- WebSocket handler integration tests ---

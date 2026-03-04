@@ -71,6 +71,11 @@ type AckBatcher struct {
 	// Channel for incoming ack requests
 	requests chan ackRequest
 
+	// done is closed when batchLoop exits, signaling Acknowledge callers
+	// that no goroutine will drain requests. Without this, Acknowledge
+	// blocks forever on a send to b.requests after Stop().
+	done chan struct{}
+
 	// For graceful shutdown
 	cancel context.CancelFunc
 	wg     *sync.WaitGroup
@@ -88,6 +93,7 @@ func NewAckBatcher(chainClient ChainClient, cfg AckBatcherConfig) *AckBatcher {
 		batchInterval: interval,
 		batchSize:     size,
 		requests:      make(chan ackRequest, size*2), // Buffer to prevent blocking
+		done:          make(chan struct{}),
 		wg:            &sync.WaitGroup{},
 	}
 }
@@ -122,6 +128,8 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 
 	select {
 	case b.requests <- ackRequest{leaseUUID: leaseUUID, resultCh: resultCh}:
+	case <-b.done:
+		return false, "", context.Canceled
 	case <-ctx.Done():
 		return false, "", ctx.Err()
 	}
@@ -129,6 +137,8 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 	select {
 	case result := <-resultCh:
 		return result.acknowledged, result.txHash, result.err
+	case <-b.done:
+		return false, "", context.Canceled
 	case <-ctx.Done():
 		return false, "", ctx.Err()
 	}
@@ -137,6 +147,7 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 // batchLoop collects requests and flushes them periodically or when batch is full.
 // Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
 func (b *AckBatcher) batchLoop(ctx context.Context) {
+	defer close(b.done)
 
 	var pending []ackRequest
 	timer := time.NewTimer(b.batchInterval)
@@ -148,12 +159,6 @@ func (b *AckBatcher) batchLoop(ctx context.Context) {
 		}
 
 		slog.Debug("flushing ack batch", "count", len(pending))
-
-		// Build a set of requested lease UUIDs for quick lookup
-		requestedUUIDs := make(map[string]ackRequest, len(pending))
-		for _, req := range pending {
-			requestedUUIDs[req.leaseUUID] = req
-		}
 
 		// Query all pending leases for this provider in a single RPC call.
 		// This is much more efficient than N individual GetLease calls.

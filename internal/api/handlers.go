@@ -164,6 +164,36 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 	}, http.StatusOK, nil
 }
 
+// authenticateAndResolve performs the common handler preamble: extract lease UUID
+// from the path, authenticate, verify the backend router is configured, and resolve
+// the correct backend for the lease. On failure it writes the appropriate HTTP error
+// and returns ok=false; the caller should return immediately.
+func (h *Handlers) authenticateAndResolve(w http.ResponseWriter, r *http.Request, checkReplay, requireActive bool) (auth *AuthenticatedRequest, leaseUUID string, b backend.Backend, ok bool) {
+	leaseUUID = r.PathValue("lease_uuid")
+
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, checkReplay, requireActive)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return nil, leaseUUID, nil, false
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return nil, leaseUUID, nil, false
+	}
+
+	sku := provisioner.ExtractRoutingSKU(auth.Lease)
+	b = h.resolveBackend(leaseUUID, sku)
+	if b == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+		return nil, leaseUUID, nil, false
+	}
+
+	return auth, leaseUUID, b, true
+}
+
 // resolveBackend determines the correct backend for a lease.
 // Checks placement first (handles round-robin routing), falls back to SKU routing.
 func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
@@ -251,32 +281,11 @@ const (
 
 // GetLeaseConnection handles GET /v1/leases/{lease_uuid}/connection
 func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
-	leaseUUID := r.PathValue("lease_uuid")
-
-	// Authenticate and authorize the request (requires active lease, checks replay)
-	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
-	if err != nil {
-		writeError(w, err.Error(), status)
+	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, true)
+	if !ok {
 		return
 	}
 
-	// Check if backend router is configured
-	if h.backendRouter == nil {
-		slog.Error("backend router not configured")
-		writeError(w, "service not configured", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Extract SKU for routing (use first item's SKU - all items share same provider)
-	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-
-	// Resolve backend: placement first, then SKU routing
-	backendClient := h.resolveBackend(leaseUUID, sku)
-	if backendClient == nil {
-		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
-		writeError(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
 	info, err := backendClient.GetInfo(r.Context(), leaseUUID)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
@@ -400,26 +409,8 @@ type LeaseLogsResponse struct {
 
 // GetLeaseProvision handles GET /v1/leases/{lease_uuid}/provision
 func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
-	leaseUUID := r.PathValue("lease_uuid")
-
-	// Authenticate and authorize (any lease state, no replay check for read endpoint)
-	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
-	if err != nil {
-		writeError(w, err.Error(), status)
-		return
-	}
-
-	if h.backendRouter == nil {
-		slog.Error("backend router not configured")
-		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
-		return
-	}
-
-	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-	backendClient := h.resolveBackend(leaseUUID, sku)
-	if backendClient == nil {
-		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
-		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, false, false)
+	if !ok {
 		return
 	}
 
@@ -455,18 +446,8 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 
 // GetLeaseLogs handles GET /v1/leases/{lease_uuid}/logs
 func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
-	leaseUUID := r.PathValue("lease_uuid")
-
-	// Authenticate and authorize (any lease state, no replay check for read endpoint)
-	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
-	if err != nil {
-		writeError(w, err.Error(), status)
-		return
-	}
-
-	if h.backendRouter == nil {
-		slog.Error("backend router not configured")
-		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, false, false)
+	if !ok {
 		return
 	}
 
@@ -483,14 +464,6 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tail = n
-	}
-
-	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-	backendClient := h.resolveBackend(leaseUUID, sku)
-	if backendClient == nil {
-		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
-		writeError(w, "service unavailable", http.StatusServiceUnavailable)
-		return
 	}
 
 	logs, err := backendClient.GetLogs(r.Context(), leaseUUID, tail)
@@ -530,30 +503,12 @@ type LeaseReleasesResponse struct {
 
 // RestartLease handles POST /v1/leases/{lease_uuid}/restart
 func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
-	leaseUUID := r.PathValue("lease_uuid")
-
-	// Authenticate and authorize (requires active lease, checks replay)
-	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
-	if err != nil {
-		writeError(w, err.Error(), status)
+	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, true)
+	if !ok {
 		return
 	}
 
-	if h.backendRouter == nil {
-		slog.Error("backend router not configured")
-		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
-		return
-	}
-
-	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-	backendClient := h.resolveBackend(leaseUUID, sku)
-	if backendClient == nil {
-		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
-		writeError(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	err = backendClient.Restart(r.Context(), backend.RestartRequest{
+	err := backendClient.Restart(r.Context(), backend.RestartRequest{
 		LeaseUUID:   leaseUUID,
 		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
 	})
@@ -594,18 +549,8 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update
 func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
-	leaseUUID := r.PathValue("lease_uuid")
-
-	// Authenticate and authorize (requires active lease, checks replay)
-	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, true, true)
-	if err != nil {
-		writeError(w, err.Error(), status)
-		return
-	}
-
-	if h.backendRouter == nil {
-		slog.Error("backend router not configured")
-		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, true)
+	if !ok {
 		return
 	}
 
@@ -622,15 +567,7 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-	backendClient := h.resolveBackend(leaseUUID, sku)
-	if backendClient == nil {
-		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
-		writeError(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	err = backendClient.Update(r.Context(), backend.UpdateRequest{
+	err := backendClient.Update(r.Context(), backend.UpdateRequest{
 		LeaseUUID:   leaseUUID,
 		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
 		Payload:     updateReq.Payload,
@@ -677,26 +614,8 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 
 // GetLeaseReleases handles GET /v1/leases/{lease_uuid}/releases
 func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
-	leaseUUID := r.PathValue("lease_uuid")
-
-	// Authenticate and authorize (any lease state, no replay check for read endpoint)
-	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
-	if err != nil {
-		writeError(w, err.Error(), status)
-		return
-	}
-
-	if h.backendRouter == nil {
-		slog.Error("backend router not configured")
-		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
-		return
-	}
-
-	sku := provisioner.ExtractRoutingSKU(auth.Lease)
-	backendClient := h.resolveBackend(leaseUUID, sku)
-	if backendClient == nil {
-		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
-		writeError(w, "service unavailable", http.StatusServiceUnavailable)
+	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, false, false)
+	if !ok {
 		return
 	}
 
@@ -909,195 +828,75 @@ func writeError(w http.ResponseWriter, message string, status int) {
 	writeJSON(w, response, status)
 }
 
-// extractPortMapping extracts a PortMapping from a binding map (JSON unmarshaled format).
-// Handles both string and float64 representations of host_port.
-func extractPortMapping(binding map[string]any) PortMapping {
-	var hostPort int
-	if hp, ok := binding["host_port"].(string); ok {
-		if parsed, err := strconv.Atoi(hp); err == nil {
-			hostPort = parsed
-		}
-	} else if hp, ok := binding["host_port"].(float64); ok {
-		hostPort = int(hp)
+// convertPortBinding converts a backend PortBinding (string host_port) to an API PortMapping (int host_port).
+func convertPortBinding(b backend.PortBinding) PortMapping {
+	var port int
+	if b.HostPort != "" {
+		port, _ = strconv.Atoi(b.HostPort)
 	}
-	hostIP, _ := binding["host_ip"].(string)
-	return PortMapping{
-		HostIP:   hostIP,
-		HostPort: hostPort,
-	}
+	return PortMapping{HostIP: b.HostIP, HostPort: port}
 }
 
-// parseInstanceInfo extracts an InstanceInfo from an untyped instance map.
-// Handles two port-binding representations:
-//   - map[string]map[string]string: the typed Go format used when LeaseInfo is
-//     constructed in-process (e.g., in tests or future in-process backends)
-//   - map[string]any: the JSON-unmarshaled format produced when data has been
-//     round-tripped through JSON (the normal production path via HTTP)
-func parseInstanceInfo(inst map[string]any) InstanceInfo {
-	instance := InstanceInfo{}
-
-	if idx, ok := inst["instance_index"].(float64); ok {
-		instance.InstanceIndex = int(idx)
-	} else if idx, ok := inst["instance_index"].(int); ok {
-		instance.InstanceIndex = idx
+// convertInstance converts a backend LeaseInstance to an API InstanceInfo.
+func convertInstance(inst backend.LeaseInstance) InstanceInfo {
+	ii := InstanceInfo{
+		InstanceIndex: inst.InstanceIndex,
+		ContainerID:   inst.ContainerID,
+		Image:         inst.Image,
+		Status:        inst.Status,
+		FQDN:          inst.FQDN,
 	}
-	if cid, ok := inst["container_id"].(string); ok {
-		instance.ContainerID = cid
-	}
-	if img, ok := inst["image"].(string); ok {
-		instance.Image = img
-	}
-	if status, ok := inst["status"].(string); ok {
-		instance.Status = status
-	}
-	if fqdn, ok := inst["fqdn"].(string); ok {
-		instance.FQDN = fqdn
-	}
-
-	// Handle typed format from Docker backend
-	if ports, ok := inst["ports"].(map[string]map[string]string); ok {
-		instance.Ports = make(map[string]PortMapping, len(ports))
-		for containerPort, binding := range ports {
-			var hostPort int
-			if hp, ok := binding["host_port"]; ok {
-				if parsed, err := strconv.Atoi(hp); err == nil {
-					hostPort = parsed
-				}
-			}
-			instance.Ports[containerPort] = PortMapping{
-				HostIP:   binding["host_ip"],
-				HostPort: hostPort,
-			}
-		}
-	} else if ports, ok := inst["ports"].(map[string]any); ok {
-		// Handle JSON-unmarshaled format
-		instance.Ports = make(map[string]PortMapping, len(ports))
-		for containerPort, bindingAny := range ports {
-			if binding, ok := bindingAny.(map[string]any); ok {
-				instance.Ports[containerPort] = extractPortMapping(binding)
-			}
+	if len(inst.Ports) > 0 {
+		ii.Ports = make(map[string]PortMapping, len(inst.Ports))
+		for k, v := range inst.Ports {
+			ii.Ports[k] = convertPortBinding(v)
 		}
 	}
-
-	return instance
+	return ii
 }
 
-// extractConnectionDetails extracts ConnectionDetails from a backend LeaseInfo map.
-// Known fields (host, port, ports, protocol, metadata) are mapped to struct fields.
-// Unknown top-level string fields are placed in Metadata.
+// extractConnectionDetails converts a backend LeaseInfo into API ConnectionDetails.
 func extractConnectionDetails(info backend.LeaseInfo) ConnectionDetails {
 	details := ConnectionDetails{
-		Metadata: make(map[string]string),
+		Host:     info.Host,
+		FQDN:     info.FQDN,
+		Protocol: info.Protocol,
+		Metadata: info.Metadata,
+	}
+	if details.Metadata == nil {
+		details.Metadata = make(map[string]string)
 	}
 
-	// Known fields that map to struct fields
-	knownFields := map[string]bool{
-		"host":      true,
-		"fqdn":      true,
-		"ports":     true,
-		"instances": true,
-		"services":  true,
-		"protocol":  true,
-		"metadata":  true,
-	}
-
-	// Extract known fields
-	if host, ok := info["host"].(string); ok {
-		details.Host = host
-	}
-	if fqdn, ok := info["fqdn"].(string); ok {
-		details.FQDN = fqdn
-	}
-	if protocol, ok := info["protocol"].(string); ok {
-		details.Protocol = protocol
-	}
-
-	// Extract ports map (from docker backend format)
-	if ports, ok := info["ports"].(map[string]map[string]string); ok {
-		details.Ports = make(map[string]PortMapping)
-		for containerPort, binding := range ports {
-			var hostPort int
-			if hp, ok := binding["host_port"]; ok {
-				if parsed, err := strconv.Atoi(hp); err == nil {
-					hostPort = parsed
-				}
-			}
-			details.Ports[containerPort] = PortMapping{
-				HostIP:   binding["host_ip"],
-				HostPort: hostPort,
-			}
-		}
-	} else if ports, ok := info["ports"].(map[string]any); ok {
-		// Handle JSON unmarshaled format (map[string]any)
-		details.Ports = make(map[string]PortMapping)
-		for containerPort, bindingAny := range ports {
-			if binding, ok := bindingAny.(map[string]any); ok {
-				details.Ports[containerPort] = extractPortMapping(binding)
-			}
+	// Convert top-level ports.
+	if len(info.Ports) > 0 {
+		details.Ports = make(map[string]PortMapping, len(info.Ports))
+		for k, v := range info.Ports {
+			details.Ports[k] = convertPortBinding(v)
 		}
 	}
 
-	// Extract instances array (for multi-container leases)
-	if instances, ok := info["instances"].([]any); ok {
-		for _, instAny := range instances {
-			if inst, ok := instAny.(map[string]any); ok {
-				details.Instances = append(details.Instances, parseInstanceInfo(inst))
-			}
-		}
+	// Convert flat instances.
+	for _, inst := range info.Instances {
+		details.Instances = append(details.Instances, convertInstance(inst))
 	}
 
-	// Propagate FQDN from the first instance to the top level (single-container leases)
+	// Propagate FQDN from the first instance to the top level.
 	if details.FQDN == "" && len(details.Instances) > 0 {
 		details.FQDN = details.Instances[0].FQDN
 	}
 
-	// Extract services map (for stack leases)
-	if services, ok := info["services"].(map[string]any); ok {
-		details.Services = make(map[string]ServiceConnectionDetails, len(services))
-		for svcName, svcDataAny := range services {
-			svcData, ok := svcDataAny.(map[string]any)
-			if !ok {
-				continue
+	// Convert services (stack leases).
+	if len(info.Services) > 0 {
+		details.Services = make(map[string]ServiceConnectionDetails, len(info.Services))
+		for name, svc := range info.Services {
+			svcDetails := ServiceConnectionDetails{FQDN: svc.FQDN}
+			for _, inst := range svc.Instances {
+				svcDetails.Instances = append(svcDetails.Instances, convertInstance(inst))
 			}
-			var svcDetails ServiceConnectionDetails
-			if fqdn, ok := svcData["fqdn"].(string); ok {
-				svcDetails.FQDN = fqdn
-			}
-			if svcInstances, ok := svcData["instances"].([]any); ok {
-				for _, instAny := range svcInstances {
-					if inst, ok := instAny.(map[string]any); ok {
-						svcDetails.Instances = append(svcDetails.Instances, parseInstanceInfo(inst))
-					}
-				}
-			}
-			// Propagate FQDN from the first instance to the service level
 			if svcDetails.FQDN == "" && len(svcDetails.Instances) > 0 {
 				svcDetails.FQDN = svcDetails.Instances[0].FQDN
 			}
-			details.Services[svcName] = svcDetails
-		}
-	}
-
-	// Extract explicit metadata field first
-	if metadata, ok := info["metadata"].(map[string]string); ok {
-		for k, v := range metadata {
-			details.Metadata[k] = v
-		}
-	} else if metadata, ok := info["metadata"].(map[string]any); ok {
-		for k, v := range metadata {
-			if s, ok := v.(string); ok {
-				details.Metadata[k] = s
-			}
-		}
-	}
-
-	// Add unknown top-level string fields to Metadata
-	for k, v := range info {
-		if knownFields[k] {
-			continue
-		}
-		if s, ok := v.(string); ok {
-			details.Metadata[k] = s
+			details.Services[name] = svcDetails
 		}
 	}
 
@@ -1136,7 +935,13 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	ch := h.eventBroker.Subscribe(leaseUUID)
+	ch, subErr := h.eventBroker.Subscribe(leaseUUID)
+	if subErr != nil {
+		slog.Warn("subscription rejected", "lease_uuid", leaseUUID, "error", subErr)
+		_ = conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "too many connections"))
+		return
+	}
 	if ch == nil {
 		_ = conn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseGoingAway, "broker closed"))

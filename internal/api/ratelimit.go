@@ -163,6 +163,11 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 // It only trusts X-Forwarded-For and X-Real-IP headers if the request
 // comes from a configured trusted proxy. This prevents IP spoofing attacks
 // where malicious clients set these headers to bypass rate limiting.
+//
+// For X-Forwarded-For, it uses rightmost-trusted extraction: walking from
+// right to left, skipping trusted proxy IPs, and returning the first
+// non-trusted IP. This prevents spoofing in multi-proxy chains where an
+// attacker can prepend arbitrary IPs to the header.
 func (rl *RateLimiter) getClientIP(r *http.Request) string {
 	// Extract the direct connection IP first
 	directIP := extractDirectIP(r.RemoteAddr)
@@ -171,14 +176,20 @@ func (rl *RateLimiter) getClientIP(r *http.Request) string {
 	if rl.trustedProxies != nil && rl.trustedProxies.IsTrusted(directIP) {
 		// Check X-Forwarded-For header (may contain multiple IPs)
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Take the first IP (original client)
-			ip, _, _ := strings.Cut(xff, ",")
-			ip = strings.TrimSpace(ip)
-			// Validate it's a real IP address
-			if validIP := net.ParseIP(ip); validIP != nil {
-				return ip
+			// Rightmost-trusted: walk from right to left, skip trusted proxies.
+			// The first non-trusted IP is the real client. This prevents spoofing
+			// because only trusted proxies append IPs, so we trust the chain from
+			// the right (closest to us) until we hit a non-trusted IP.
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				ip := strings.TrimSpace(parts[i])
+				if validIP := net.ParseIP(ip); validIP != nil {
+					if !rl.trustedProxies.IsTrusted(ip) {
+						return ip
+					}
+				}
 			}
-			// Invalid IP in header, fall through to X-Real-IP
+			// All IPs are trusted proxies or invalid, fall through to X-Real-IP
 		}
 
 		// Check X-Real-IP header

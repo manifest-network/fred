@@ -398,3 +398,34 @@ func TestAckBatcher_SkipsNotFoundLeases(t *testing.T) {
 	// AcknowledgeLeases should NOT have been called
 	assert.False(t, ackCalled.Load(), "AcknowledgeLeases was called for non-existent lease")
 }
+
+func TestAckBatcher_AcknowledgeAfterStopReturnsError(t *testing.T) {
+	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-1"},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+	})
+
+	ctx := context.Background()
+	batcher.Start(ctx)
+	batcher.Stop()
+
+	// Acknowledge after Stop must not hang — it should return an error promptly.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, err := batcher.Acknowledge(ctx, "lease-1")
+		assert.Error(t, err, "Acknowledge after Stop should return an error")
+	}()
+
+	select {
+	case <-done:
+		// Success — Acknowledge returned without hanging.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Acknowledge blocked after Stop — goroutine leak")
+	}
+}

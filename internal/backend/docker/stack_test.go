@@ -810,30 +810,24 @@ func TestGetInfo_Stack(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 
-	// Should have "host" and "services" (not "instances").
-	assert.Equal(t, "10.0.0.1", (*info)["host"])
-	assert.Nil(t, (*info)["instances"], "stack GetInfo should not have flat instances")
+	// Should have Host and Services (not Instances).
+	assert.Equal(t, "10.0.0.1", info.Host)
+	assert.Empty(t, info.Instances, "stack GetInfo should not have flat instances")
 
-	services, ok := (*info)["services"].(map[string]any)
-	require.True(t, ok, "services should be a map")
-	assert.Len(t, services, 2)
+	require.Len(t, info.Services, 2)
 
 	// Verify web service.
-	webSvc, ok := services["web"].(map[string]any)
+	webSvc, ok := info.Services["web"]
 	require.True(t, ok)
-	webInstances, ok := webSvc["instances"].([]map[string]any)
-	require.True(t, ok)
-	require.Len(t, webInstances, 1)
-	assert.Equal(t, "running", webInstances[0]["status"])
-	assert.Equal(t, "nginx:latest", webInstances[0]["image"])
+	require.Len(t, webSvc.Instances, 1)
+	assert.Equal(t, "running", webSvc.Instances[0].Status)
+	assert.Equal(t, "nginx:latest", webSvc.Instances[0].Image)
 
 	// Verify db service.
-	dbSvc, ok := services["db"].(map[string]any)
+	dbSvc, ok := info.Services["db"]
 	require.True(t, ok)
-	dbInstances, ok := dbSvc["instances"].([]map[string]any)
-	require.True(t, ok)
-	require.Len(t, dbInstances, 1)
-	assert.Equal(t, "postgres:16", dbInstances[0]["image"])
+	require.Len(t, dbSvc.Instances, 1)
+	assert.Equal(t, "postgres:16", dbSvc.Instances[0].Image)
 }
 
 // --- Stack GetLogs tests ---

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -304,6 +305,72 @@ func TestProvision_MultiItem_PartialResourceRollback(t *testing.T) {
 	// All allocations should have been rolled back
 	stats := b.pool.Stats()
 	assert.Equal(t, 0, stats.AllocationCount)
+}
+
+// TestDoProvision_MultiItem_QuantityPassesTotalNotPerItem verifies that
+// CreateContainerParams.Quantity receives the lease-wide totalQuantity, not
+// the per-item quantity. This is critical for ComputeSubdomain/RouterName
+// consistency between provision and restart/update paths.
+func TestDoProvision_MultiItem_QuantityPassesTotalNotPerItem(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var capturedQuantities []int
+	createCalls := 0
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			capturedQuantities = append(capturedQuantities, params.Quantity)
+			createCalls++
+			return fmt.Sprintf("container-%d", createCalls), nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	// Two items, each with Quantity=1 → totalQuantity=2.
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusProvisioning,
+			Quantity:  2,
+		},
+	})
+	b.provisions["lease-1"].CallbackURL = callbackServer.URL
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
+
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1},
+			{SKU: "docker-small", Quantity: 1},
+		},
+		CallbackURL: callbackServer.URL,
+		Payload:     validManifestJSON("nginx:latest"),
+	}
+	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+
+	// Both containers must receive totalQuantity (2), not item.Quantity (1).
+	// This ensures ComputeSubdomain produces the same FQDN format on
+	// restart/update (which passes prov.Quantity = totalQuantity).
+	require.Len(t, capturedQuantities, 2)
+	assert.Equal(t, 2, capturedQuantities[0], "first container should get totalQuantity")
+	assert.Equal(t, 2, capturedQuantities[1], "second container should get totalQuantity")
 }
 
 // --- doProvision (async) tests ---
@@ -1146,6 +1213,43 @@ func TestDeprovision_PartialContainerFailure(t *testing.T) {
 	assert.Equal(t, 0, stats.AllocationCount)
 }
 
+func TestDeprovision_PartialFailure_UpdatesResourceMetrics(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			if containerID == "c2" {
+				return errors.New("permission denied")
+			}
+			return nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     2,
+			ContainerIDs: []string{"c1", "c2"},
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+
+	// Set gauges to a known stale value so we can detect the update.
+	resourceCPUAllocatedRatio.Set(0.99)
+	resourceMemoryAllocatedRatio.Set(0.99)
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.Error(t, err, "partial failure expected")
+
+	// Pool allocations were released, so the gauges must reflect 0 allocation
+	// even though Deprovision returned an error.
+	assert.InDelta(t, 0.0, testutil.ToFloat64(resourceCPUAllocatedRatio), 0.001,
+		"CPU gauge should be updated after partial-failure release")
+	assert.InDelta(t, 0.0, testutil.ToFloat64(resourceMemoryAllocatedRatio), 0.001,
+		"memory gauge should be updated after partial-failure release")
+}
+
 func TestDeprovision_PartialFailure_RetryOnlyStuck(t *testing.T) {
 	removeCalls := 0
 	mock := &mockDockerClient{
@@ -1360,10 +1464,9 @@ func TestGetInfo_Success(t *testing.T) {
 	info, err := b.GetInfo(context.Background(), "lease-1")
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "192.168.1.100", (*info)["host"])
-	instances := (*info)["instances"].([]map[string]any)
-	assert.Len(t, instances, 1)
-	assert.Equal(t, "running", instances[0]["status"])
+	assert.Equal(t, "192.168.1.100", info.Host)
+	require.Len(t, info.Instances, 1)
+	assert.Equal(t, "running", info.Instances[0].Status)
 }
 
 func TestGetInfo_NotProvisioned(t *testing.T) {
@@ -1412,8 +1515,7 @@ func TestGetInfo_MultiContainer(t *testing.T) {
 
 	info, err := b.GetInfo(context.Background(), "lease-1")
 	require.NoError(t, err)
-	instances := (*info)["instances"].([]map[string]any)
-	assert.Len(t, instances, 3)
+	assert.Len(t, info.Instances, 3)
 }
 
 // --- GetLogs tests ---
@@ -2625,6 +2727,133 @@ func TestDeprovision_ProvisioningLease(t *testing.T) {
 	_, exists := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, exists)
+}
+
+// TestDeprovision_ActiveProvisionsGauge verifies that the activeProvisions gauge
+// is decremented exactly once on Ready→Failed transitions and never for non-Ready
+// provisions, even across partial-failure retry sequences.
+func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
+	t.Run("ready provision decrements gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				return nil
+			},
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusReady,
+				Quantity:     1,
+				ContainerIDs: []string{"c1"},
+			},
+		})
+		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+		err := b.Deprovision(context.Background(), "lease-1")
+		require.NoError(t, err)
+		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions))
+	})
+
+	t.Run("failed provision does not decrement gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				return nil
+			},
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusFailed,
+				Quantity:     1,
+				ContainerIDs: []string{"c1"},
+			},
+		})
+		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+		err := b.Deprovision(context.Background(), "lease-1")
+		require.NoError(t, err)
+		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
+			"gauge must not change when deprovisioning an already-failed provision")
+	})
+
+	t.Run("provisioning lease does not decrement gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				return nil
+			},
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusProvisioning,
+				Quantity:     1,
+				ContainerIDs: []string{"c1"},
+			},
+		})
+		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+
+		err := b.Deprovision(context.Background(), "lease-1")
+		require.NoError(t, err)
+		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
+			"gauge must not change when deprovisioning a provisioning lease")
+	})
+
+	t.Run("partial failure then retry decrements gauge exactly once", func(t *testing.T) {
+		activeProvisions.Set(5)
+		callCount := 0
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				callCount++
+				// c2 fails during the first deprovision attempt (callCount=2);
+				// on retry c2 is the only container and succeeds (callCount=3).
+				if containerID == "c2" && callCount == 2 {
+					return errors.New("device busy")
+				}
+				return nil
+			},
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusReady,
+				Quantity:     2,
+				ContainerIDs: []string{"c1", "c2"},
+			},
+		})
+		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+		_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
+
+		// First attempt: partial failure. Gauge should still decrement
+		// because the provision transitions Ready→Failed.
+		err := b.Deprovision(context.Background(), "lease-1")
+		require.Error(t, err)
+		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
+			"gauge should decrement on Ready→Failed even with partial failure")
+
+		// Retry: provision is already Failed, gauge must not decrement again.
+		err = b.Deprovision(context.Background(), "lease-1")
+		require.NoError(t, err)
+		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
+			"gauge must not double-decrement on retry")
+	})
+
+	t.Run("idempotent call on missing lease does not decrement gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+		mock := &mockDockerClient{}
+		b := newBackendForProvisionTest(t, mock, nil)
+
+		err := b.Deprovision(context.Background(), "nonexistent")
+		require.NoError(t, err)
+		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
+			"gauge must not change for nonexistent lease")
+	})
 }
 
 // Fix 4: GetLogs on a failed lease still returns logs for remaining containers.
@@ -4142,7 +4371,7 @@ func TestDoRestart_WritablePathBinds(t *testing.T) {
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	manifest := &DockerManifest{Image: "nginx:latest"}
-	b.doRestart(context.Background(), "lease-1", manifest, []string{"old-container"}, "docker-small", b.logger)
+	b.doRestart(context.Background(), "lease-1", manifest, []string{"old-container"}, "docker-small", backend.ProvisionStatusReady, b.logger)
 
 	assert.True(t, extractCalled, "ExtractImageContent should be called on restart")
 }

@@ -243,11 +243,9 @@ func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	info, err := b.GetInfo(ctx, leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "127.0.0.1", (*info)["host"])
-	instances, ok := (*info)["instances"].([]map[string]any)
-	require.True(t, ok, "expected instances array")
-	require.Len(t, instances, 1)
-	assert.Equal(t, "running", instances[0]["status"])
+	assert.Equal(t, "127.0.0.1", info.Host)
+	require.Len(t, info.Instances, 1)
+	assert.Equal(t, "running", info.Instances[0].Status)
 
 	// ListProvisions should include our lease
 	provisions, err := b.ListProvisions(ctx)
@@ -621,9 +619,7 @@ func TestIntegration_Docker_MultiContainerProvision(t *testing.T) {
 	info, err := b.GetInfo(ctx, leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	instances, ok := (*info)["instances"].([]map[string]any)
-	require.True(t, ok, "expected instances array")
-	assert.Len(t, instances, 2, "expected 2 instances")
+	assert.Len(t, info.Instances, 2, "expected 2 instances")
 
 	// ListProvisions → verify status=Ready
 	prov := getProvisionInfo(t, b, leaseUUID)
@@ -925,7 +921,7 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	info, err := b2.GetInfo(ctx, leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "127.0.0.1", (*info)["host"])
+	assert.Equal(t, "127.0.0.1", info.Host)
 
 	// Cleanup
 	err = b2.Deprovision(ctx, leaseUUID)
@@ -1553,7 +1549,7 @@ func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
 	info, err := b.GetInfo(ctx, leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "127.0.0.1", (*info)["host"])
+	assert.Equal(t, "127.0.0.1", info.Host)
 
 	// Status is Ready after restart
 	prov := getProvisionInfo(t, b, leaseUUID)
@@ -2517,20 +2513,15 @@ func TestIntegration_Stack_ProvisionLifecycle(t *testing.T) {
 	info, err := b.GetInfo(ctx, leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "127.0.0.1", (*info)["host"])
+	assert.Equal(t, "127.0.0.1", info.Host)
 
-	services, ok := (*info)["services"].(map[string]any)
-	require.True(t, ok, "expected services map in stack GetInfo response")
-	require.Contains(t, services, "web")
-	require.Contains(t, services, "db")
+	require.Contains(t, info.Services, "web")
+	require.Contains(t, info.Services, "db")
 
 	for _, svcName := range []string{"web", "db"} {
-		svc, ok := services[svcName].(map[string]any)
-		require.True(t, ok, "expected map for service %s", svcName)
-		instances, ok := svc["instances"].([]map[string]any)
-		require.True(t, ok, "expected instances array for service %s", svcName)
-		require.Len(t, instances, 1, "expected 1 instance for service %s", svcName)
-		assert.Equal(t, "running", instances[0]["status"])
+		svc := info.Services[svcName]
+		require.Len(t, svc.Instances, 1, "expected 1 instance for service %s", svcName)
+		assert.Equal(t, "running", svc.Instances[0].Status)
 	}
 
 	// GetLogs should return service-keyed logs
@@ -3059,20 +3050,11 @@ func TestIntegration_Stack_MultiQuantity(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 
-	services, ok := (*info)["services"].(map[string]any)
-	require.True(t, ok, "expected services map")
+	require.Contains(t, info.Services, "web")
+	require.Contains(t, info.Services, "db")
 
-	webSvc, ok := services["web"].(map[string]any)
-	require.True(t, ok, "expected web service map")
-	webInstances, ok := webSvc["instances"].([]map[string]any)
-	require.True(t, ok, "expected web instances array")
-	assert.Len(t, webInstances, 2, "expected 2 web instances")
-
-	dbSvc, ok := services["db"].(map[string]any)
-	require.True(t, ok, "expected db service map")
-	dbInstances, ok := dbSvc["instances"].([]map[string]any)
-	require.True(t, ok, "expected db instances array")
-	assert.Len(t, dbInstances, 1, "expected 1 db instance")
+	assert.Len(t, info.Services["web"].Instances, 2, "expected 2 web instances")
+	assert.Len(t, info.Services["db"].Instances, 1, "expected 1 db instance")
 
 	// Verify 3 total containers
 	containers := inspectProvisionContainers(t, leaseUUID)

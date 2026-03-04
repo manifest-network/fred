@@ -34,7 +34,7 @@ func (m *mockBenchBackend) Provision(ctx context.Context, req backend.ProvisionR
 	return nil
 }
 func (m *mockBenchBackend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
-	info := backend.LeaseInfo{"host": "10.0.0.1", "port": 8080}
+	info := backend.LeaseInfo{Host: "10.0.0.1"}
 	return &info, nil
 }
 func (m *mockBenchBackend) Deprovision(ctx context.Context, leaseUUID string) error { return nil }
@@ -135,27 +135,23 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 		Persistent:          true,
 	}, logger)
 
-	var received atomic.Int64
-
 	messages, _ := pubSub.Subscribe(context.Background(), "test-topic")
-
-	// Consumer
-	done := make(chan struct{})
-	go func() {
-		for msg := range messages {
-			msg.Ack()
-			if received.Add(1) >= int64(b.N) {
-				close(done)
-				return
-			}
-		}
-	}()
 
 	event := chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
 		LeaseUUID: "test-lease",
 	}
 	payload, _ := json.Marshal(event)
+
+	// Drain and ack messages concurrently to prevent publish from blocking
+	// when OutputChannelBuffer fills.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for msg := range messages {
+			msg.Ack()
+		}
+	}()
 
 	b.ResetTimer()
 	// Use b.Loop() for Go 1.24+ - faster and more accurate benchmarking
@@ -165,7 +161,9 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 		pubSub.Publish("test-topic", msg)
 		i++
 	}
-
+	// Close the pubsub so the drainer goroutine exits, then wait for it.
+	// Note: b.Loop() already stopped the timer on its final false return.
+	pubSub.Close()
 	<-done
 }
 

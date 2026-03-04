@@ -97,10 +97,8 @@ func TestMockBackend_GetInfo(t *testing.T) {
 
 	info, err := mock.GetInfo(context.Background(), "lease-1")
 	require.NoError(t, err)
-	assert.NotEmpty(t, (*info)["host"])
-	metadata, ok := (*info)["metadata"].(map[string]string)
-	require.True(t, ok)
-	assert.Equal(t, "lease-1", metadata["lease_uuid"])
+	assert.NotEmpty(t, info.Host)
+	assert.Equal(t, "lease-1", info.Metadata["lease_uuid"])
 }
 
 func TestMockBackend_Deprovision(t *testing.T) {
