@@ -108,7 +108,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 	if profErr != nil {
 		b.recordPreflightFailure(leaseUUID, "restart failed",
 			fmt.Errorf("SKU profile lookup failed: %w", profErr),
-			backend.ProvisionStatusReady, prevStatus, logger)
+			prevStatus, logger)
 		return
 	}
 
@@ -137,7 +137,7 @@ func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *S
 		if profErr != nil {
 			b.recordPreflightFailure(leaseUUID, "restart failed",
 				fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr),
-				backend.ProvisionStatusReady, prevStatus, logger)
+				prevStatus, logger)
 			return
 		}
 		profiles[item.SKU] = profile
@@ -465,12 +465,12 @@ type replaceContainersOp struct {
 }
 
 // recordPreflightFailure handles errors that occur before any containers are modified
-// (e.g., profile lookup, image pull). It persists diagnostics, updates release status,
-// and sends a failure callback with callbackMsg.
-// prevStatus is the provision's status before the operation began (Ready or Failed),
-// used to adjust the activeProvisions gauge when the provision transitions to a
-// different status.
-func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, err error, failStatus backend.ProvisionStatus, prevStatus backend.ProvisionStatus, logger *slog.Logger) {
+// (e.g., profile lookup, image pull). It records LastError, persists diagnostics,
+// updates release status, and sends a failure callback with callbackMsg.
+// Because no containers were modified, the provision's status is restored to
+// prevStatus (the status before the operation began) so that the observable
+// state and activeProvisions gauge remain accurate.
+func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, err error, prevStatus backend.ProvisionStatus, logger *slog.Logger) {
 	logger.Error("preflight failed", "error", err)
 
 	var diagSnap shared.DiagnosticEntry
@@ -478,12 +478,8 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, e
 	if prov, ok := b.provisions[leaseUUID]; ok {
 		prov.LastError = err.Error()
 		prov.FailCount++
-		prov.Status = failStatus
+		prov.Status = prevStatus
 		diagSnap = diagnosticSnapshot(prov)
-		// Adjust gauge when a Ready provision transitions to Failed.
-		if prevStatus == backend.ProvisionStatusReady && failStatus == backend.ProvisionStatusFailed {
-			activeProvisions.Dec()
-		}
 	}
 	b.provisionsMu.Unlock()
 	b.persistDiagnostics(diagSnap, nil)
@@ -895,7 +891,7 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 	if pullErr := b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); pullErr != nil {
 		b.recordPreflightFailure(leaseUUID, "image pull failed",
 			fmt.Errorf("image pull failed: %w", pullErr),
-			backend.ProvisionStatusFailed, prevStatus, logger)
+			prevStatus, logger)
 		return
 	}
 
@@ -938,7 +934,7 @@ func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *St
 		if pullErr := b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); pullErr != nil {
 			b.recordPreflightFailure(leaseUUID, "image pull failed",
 				fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr),
-				backend.ProvisionStatusFailed, prevStatus, logger)
+				prevStatus, logger)
 			return
 		}
 		pulledImages[svc.Image] = true

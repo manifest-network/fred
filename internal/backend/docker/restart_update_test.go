@@ -874,8 +874,9 @@ func TestUpdate_Failure_ImagePullFails(t *testing.T) {
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
-	// Update failure always marks status as Failed (desired state was not achieved).
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	// Preflight failures restore prevStatus since no containers were modified —
+	// old containers are still running and serving traffic.
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 	assert.Equal(t, 1, prov.FailCount)
 	assert.Contains(t, prov.LastError, "registry unreachable")
 }
@@ -2079,7 +2080,7 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 // TestUpdate_ActiveProvisionsGauge verifies that the activeProvisions gauge
 // is adjusted correctly when an update image pull fails (preflight failure).
 func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
-	t.Run("image pull failure from Ready decrements gauge", func(t *testing.T) {
+	t.Run("image pull failure from Ready keeps gauge unchanged", func(t *testing.T) {
 		activeProvisions.Set(5)
 
 		mock := &mockDockerClient{
@@ -2127,11 +2128,15 @@ func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
 
 		b.provisionsMu.RLock()
 		status := b.provisions["lease-1"].Status
+		lastError := b.provisions["lease-1"].LastError
 		b.provisionsMu.RUnlock()
 
-		assert.Equal(t, backend.ProvisionStatusFailed, status)
-		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
-			"gauge must decrement when a Ready provision fails due to image pull error")
+		// Preflight failures restore prevStatus since no containers were
+		// modified — old containers are still running and serving traffic.
+		assert.Equal(t, backend.ProvisionStatusReady, status)
+		assert.Contains(t, lastError, "image pull failed")
+		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
+			"gauge must not change when preflight fails and old containers are still running")
 	})
 
 	t.Run("image pull failure from Failed does not decrement gauge", func(t *testing.T) {
