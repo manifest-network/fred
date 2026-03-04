@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1787,4 +1788,401 @@ func TestConcurrentRestartAndUpdate_OnlyOneSucceeds(t *testing.T) {
 		failedErr = err2
 	}
 	assert.ErrorIs(t, failedErr, backend.ErrInvalidState)
+}
+
+// TestRestart_ActiveProvisionsGauge verifies that the activeProvisions gauge
+// is adjusted correctly across restart success and failure paths.
+func TestRestart_ActiveProvisionsGauge(t *testing.T) {
+	t.Run("rollback failure from Ready decrements gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+
+		mock := &mockDockerClient{
+			PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+				return nil
+			},
+			StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				return nil
+			},
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				return nil
+			},
+			CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+				return "new-c1", nil
+			},
+			StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				// Both new container start and rollback start fail.
+				return fmt.Errorf("docker daemon unavailable")
+			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+			},
+		}
+
+		var callbackReceived = make(chan struct{}, 1)
+		callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			select {
+			case callbackReceived <- struct{}{}:
+			default:
+			}
+		}))
+		defer callbackServer.Close()
+
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				ProviderUUID: "prov-1",
+				SKU:          "docker-small",
+				Status:       backend.ProvisionStatusReady,
+				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Image:        "nginx:latest",
+				ContainerIDs: []string{"old-c1"},
+				Quantity:     1,
+			},
+		})
+		b.httpClient = callbackServer.Client()
+		rebuildCallbackSender(b)
+
+		err := b.Restart(context.Background(), backend.RestartRequest{
+			LeaseUUID:   "lease-1",
+			CallbackURL: callbackServer.URL,
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-callbackReceived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for callback")
+		}
+
+		b.provisionsMu.RLock()
+		status := b.provisions["lease-1"].Status
+		b.provisionsMu.RUnlock()
+
+		assert.Equal(t, backend.ProvisionStatusFailed, status)
+		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
+			"gauge must decrement when a Ready provision fails with no rollback")
+	})
+
+	t.Run("rollback failure from Failed does not decrement gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+
+		mock := &mockDockerClient{
+			PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+				return nil
+			},
+			StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				return nil
+			},
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				return nil
+			},
+			CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+				return "new-c1", nil
+			},
+			StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				return fmt.Errorf("docker daemon unavailable")
+			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "exited"}, nil
+			},
+		}
+
+		var callbackReceived = make(chan struct{}, 1)
+		callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			select {
+			case callbackReceived <- struct{}{}:
+			default:
+			}
+		}))
+		defer callbackServer.Close()
+
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				ProviderUUID: "prov-1",
+				SKU:          "docker-small",
+				Status:       backend.ProvisionStatusFailed,
+				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Image:        "nginx:latest",
+				ContainerIDs: []string{"old-c1"},
+				Quantity:     1,
+			},
+		})
+		b.httpClient = callbackServer.Client()
+		rebuildCallbackSender(b)
+
+		err := b.Restart(context.Background(), backend.RestartRequest{
+			LeaseUUID:   "lease-1",
+			CallbackURL: callbackServer.URL,
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-callbackReceived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for callback")
+		}
+
+		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
+			"gauge must not change when a Failed provision fails again")
+	})
+
+	t.Run("successful restart from Failed increments gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+
+		mock := &mockDockerClient{
+			PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+				return nil
+			},
+			StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				return nil
+			},
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				return nil
+			},
+			CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+				return "new-c1", nil
+			},
+			StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				return nil
+			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+			},
+		}
+
+		var callbackReceived = make(chan struct{}, 1)
+		callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			select {
+			case callbackReceived <- struct{}{}:
+			default:
+			}
+		}))
+		defer callbackServer.Close()
+
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				ProviderUUID: "prov-1",
+				SKU:          "docker-small",
+				Status:       backend.ProvisionStatusFailed,
+				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Image:        "nginx:latest",
+				ContainerIDs: []string{"old-c1"},
+				Quantity:     1,
+			},
+		})
+		b.httpClient = callbackServer.Client()
+		b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+		rebuildCallbackSender(b)
+
+		err := b.Restart(context.Background(), backend.RestartRequest{
+			LeaseUUID:   "lease-1",
+			CallbackURL: callbackServer.URL,
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-callbackReceived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for callback")
+		}
+
+		b.provisionsMu.RLock()
+		status := b.provisions["lease-1"].Status
+		b.provisionsMu.RUnlock()
+
+		assert.Equal(t, backend.ProvisionStatusReady, status)
+		assert.Equal(t, float64(6), testutil.ToFloat64(activeProvisions),
+			"gauge must increment when a Failed provision is successfully restarted")
+	})
+
+	t.Run("successful restart from Ready keeps gauge unchanged", func(t *testing.T) {
+		activeProvisions.Set(5)
+
+		mock := &mockDockerClient{
+			PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+				return nil
+			},
+			StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				return nil
+			},
+			RemoveContainerFn: func(ctx context.Context, containerID string) error {
+				return nil
+			},
+			CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+				return "new-c1", nil
+			},
+			StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+				return nil
+			},
+			InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+			},
+		}
+
+		var callbackReceived = make(chan struct{}, 1)
+		callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			select {
+			case callbackReceived <- struct{}{}:
+			default:
+			}
+		}))
+		defer callbackServer.Close()
+
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				ProviderUUID: "prov-1",
+				SKU:          "docker-small",
+				Status:       backend.ProvisionStatusReady,
+				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Image:        "nginx:latest",
+				ContainerIDs: []string{"old-c1"},
+				Quantity:     1,
+			},
+		})
+		b.httpClient = callbackServer.Client()
+		b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+		rebuildCallbackSender(b)
+
+		err := b.Restart(context.Background(), backend.RestartRequest{
+			LeaseUUID:   "lease-1",
+			CallbackURL: callbackServer.URL,
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-callbackReceived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for callback")
+		}
+
+		b.provisionsMu.RLock()
+		status := b.provisions["lease-1"].Status
+		b.provisionsMu.RUnlock()
+
+		assert.Equal(t, backend.ProvisionStatusReady, status)
+		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
+			"gauge must not change when a Ready provision is successfully restarted")
+	})
+}
+
+// TestUpdate_ActiveProvisionsGauge verifies that the activeProvisions gauge
+// is adjusted correctly when an update image pull fails (preflight failure).
+func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
+	t.Run("image pull failure from Ready decrements gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+
+		mock := &mockDockerClient{
+			PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+				return fmt.Errorf("registry unreachable")
+			},
+		}
+
+		callbackReceived := make(chan struct{}, 1)
+		callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			select {
+			case callbackReceived <- struct{}{}:
+			default:
+			}
+		}))
+		defer callbackServer.Close()
+
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				ProviderUUID: "prov-1",
+				SKU:          "docker-small",
+				Status:       backend.ProvisionStatusReady,
+				ContainerIDs: []string{"old-c1"},
+				Quantity:     1,
+			},
+		})
+		b.httpClient = callbackServer.Client()
+		rebuildCallbackSender(b)
+
+		err := b.Update(context.Background(), backend.UpdateRequest{
+			LeaseUUID:   "lease-1",
+			CallbackURL: callbackServer.URL,
+			Payload:     validManifestJSON("nginx:1.26"),
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-callbackReceived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for callback")
+		}
+
+		b.provisionsMu.RLock()
+		status := b.provisions["lease-1"].Status
+		b.provisionsMu.RUnlock()
+
+		assert.Equal(t, backend.ProvisionStatusFailed, status)
+		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
+			"gauge must decrement when a Ready provision fails due to image pull error")
+	})
+
+	t.Run("image pull failure from Failed does not decrement gauge", func(t *testing.T) {
+		activeProvisions.Set(5)
+
+		mock := &mockDockerClient{
+			PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+				return fmt.Errorf("registry unreachable")
+			},
+		}
+
+		callbackReceived := make(chan struct{}, 1)
+		callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			select {
+			case callbackReceived <- struct{}{}:
+			default:
+			}
+		}))
+		defer callbackServer.Close()
+
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				ProviderUUID: "prov-1",
+				SKU:          "docker-small",
+				Status:       backend.ProvisionStatusFailed,
+				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Image:        "nginx:latest",
+				ContainerIDs: []string{"old-c1"},
+				Quantity:     1,
+			},
+		})
+		b.httpClient = callbackServer.Client()
+		rebuildCallbackSender(b)
+
+		err := b.Update(context.Background(), backend.UpdateRequest{
+			LeaseUUID:   "lease-1",
+			CallbackURL: callbackServer.URL,
+			Payload:     validManifestJSON("nginx:1.26"),
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-callbackReceived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for callback")
+		}
+
+		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
+			"gauge must not change when a Failed provision fails again")
+	})
 }

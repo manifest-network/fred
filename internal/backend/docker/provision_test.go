@@ -4268,7 +4268,7 @@ func TestDoRestart_WritablePathBinds(t *testing.T) {
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	manifest := &DockerManifest{Image: "nginx:latest"}
-	b.doRestart(context.Background(), "lease-1", manifest, []string{"old-container"}, "docker-small", b.logger)
+	b.doRestart(context.Background(), "lease-1", manifest, []string{"old-container"}, "docker-small", backend.ProvisionStatusReady, b.logger)
 
 	assert.True(t, extractCalled, "ExtractImageContent should be called on restart")
 }
