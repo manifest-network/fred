@@ -96,6 +96,9 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
 		}
 	}
+	// Update gauges immediately after releasing allocations so metrics stay
+	// accurate on every path (partial failure, volume-cleanup retry, success).
+	updateResourceMetrics(b.pool.Stats())
 
 	if len(errs) > 0 {
 		// Partial failure: keep provision visible with only the stuck containers
@@ -167,7 +170,6 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 					}
 				}
 				deprovisionsTotal.Inc()
-				updateResourceMetrics(b.pool.Stats())
 
 				logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
 					"attempts", p.VolumeCleanupAttempts,
@@ -208,7 +210,6 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	deprovisionsTotal.Inc()
-	updateResourceMetrics(b.pool.Stats())
 	logger.Info("deprovisioned", "containers_removed", len(containerIDs))
 	return nil
 }
