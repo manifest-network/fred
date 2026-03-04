@@ -35,6 +35,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	}
 	isStack := prov.IsStack()
 	prevStatus := prov.Status
+	prevCallbackURL := prov.CallbackURL
 	prov.Status = backend.ProvisionStatusRestarting
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
@@ -67,6 +68,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		if marshalErr != nil {
 			b.provisionsMu.Lock()
 			prov.Status = prevStatus
+			prov.CallbackURL = prevCallbackURL
 			b.provisionsMu.Unlock()
 			return fmt.Errorf("failed to marshal manifest for release: %w", marshalErr)
 		}
@@ -78,6 +80,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		}); relErr != nil {
 			b.provisionsMu.Lock()
 			prov.Status = prevStatus
+			prov.CallbackURL = prevCallbackURL
 			b.provisionsMu.Unlock()
 			return fmt.Errorf("failed to record release: %w", relErr)
 		}
@@ -800,6 +803,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		}
 		items := append([]backend.LeaseItem(nil), prov.Items...)
 		prevStatus := prov.Status
+		prevCallbackURL := prov.CallbackURL
 		prov.Status = backend.ProvisionStatusUpdating
 		if req.CallbackURL != "" {
 			prov.CallbackURL = req.CallbackURL
@@ -817,6 +821,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			}); relErr != nil {
 				b.provisionsMu.Lock()
 				prov.Status = prevStatus
+				prov.CallbackURL = prevCallbackURL
 				b.provisionsMu.Unlock()
 				return fmt.Errorf("failed to record release: %w", relErr)
 			}
@@ -850,6 +855,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 
 	oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
 	prevStatus := prov.Status
+	prevCallbackURL := prov.CallbackURL
 	prov.Status = backend.ProvisionStatusUpdating
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
@@ -865,6 +871,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		}); relErr != nil {
 			b.provisionsMu.Lock()
 			prov.Status = prevStatus
+			prov.CallbackURL = prevCallbackURL
 			b.provisionsMu.Unlock()
 			return fmt.Errorf("failed to record release: %w", relErr)
 		}
