@@ -144,7 +144,6 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			if p.VolumeCleanupAttempts >= maxVolumeCleanupAttempts {
 				// Too many failed attempts — give up and remove the provision.
 				// The leaked volumes require manual cleanup by the operator.
-				tenant := p.Tenant
 				delete(b.provisions, leaseUUID)
 				b.provisionsMu.Unlock()
 
