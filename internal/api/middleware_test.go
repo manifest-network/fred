@@ -467,3 +467,174 @@ type errorReader struct {
 func (r *errorReader) Read(p []byte) (n int, err error) {
 	return 0, r.err
 }
+
+// --- WSTokenPromoter tests ---
+
+func TestWSTokenPromoter_PromotesToken(t *testing.T) {
+	var capturedAuth string
+	var capturedURL string
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		capturedURL = r.URL.String()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := WSTokenPromoter(inner)
+	req := httptest.NewRequest("GET", "/v1/leases/abc/events?token=my-secret-token&other=keep", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, "Bearer my-secret-token", capturedAuth)
+	assert.NotContains(t, capturedURL, "token=")
+	assert.Contains(t, capturedURL, "other=keep")
+}
+
+func TestWSTokenPromoter_ExistingAuthHeader(t *testing.T) {
+	var capturedAuth string
+	var capturedURL string
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		capturedURL = r.URL.String()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := WSTokenPromoter(inner)
+	req := httptest.NewRequest("GET", "/v1/leases/abc/events?token=query-token", nil)
+	req.Header.Set("Authorization", "Bearer existing-token")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	// Should NOT overwrite existing Authorization header
+	assert.Equal(t, "Bearer existing-token", capturedAuth)
+	// Should still strip the token from the URL
+	assert.NotContains(t, capturedURL, "token=")
+}
+
+func TestWSTokenPromoter_NoToken(t *testing.T) {
+	var capturedAuth string
+	var capturedURL string
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		capturedURL = r.URL.String()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := WSTokenPromoter(inner)
+	req := httptest.NewRequest("GET", "/v1/leases/abc/events?other=value", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Empty(t, capturedAuth)
+	assert.Contains(t, capturedURL, "other=value")
+}
+
+func TestWSTokenPromoter_EmptyToken(t *testing.T) {
+	var capturedAuth string
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := WSTokenPromoter(inner)
+	req := httptest.NewRequest("GET", "/v1/leases/abc/events?token=", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	// Empty token value should be ignored (Query().Get returns "" for empty values)
+	assert.Empty(t, capturedAuth)
+}
+
+// --- securityHeadersMiddleware tests ---
+
+func TestSecurityHeadersMiddleware(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := securityHeadersMiddleware(inner)
+	req := httptest.NewRequest("GET", "/test", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", rec.Header().Get("X-Frame-Options"))
+	assert.Equal(t, "1; mode=block", rec.Header().Get("X-XSS-Protection"))
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+}
+
+// --- maxBodySizeMiddleware tests ---
+
+func TestMaxBodySizeMiddleware_WithinLimit(t *testing.T) {
+	const limit int64 = 1024
+	middleware := maxBodySizeMiddleware(limit)
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	})
+
+	body := bytes.Repeat([]byte("a"), 100)
+	req := httptest.NewRequest("POST", "/test", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	middleware(inner).ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, body, rec.Body.Bytes())
+}
+
+func TestMaxBodySizeMiddleware_ExceedsLimit(t *testing.T) {
+	const limit int64 = 64
+	middleware := maxBodySizeMiddleware(limit)
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	body := bytes.Repeat([]byte("x"), 200) // Exceeds 64 byte limit
+	req := httptest.NewRequest("POST", "/test", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	middleware(inner).ServeHTTP(rec, req)
+
+	// Handler should receive a read error from MaxBytesReader
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+}
+
+func TestMaxBodySizeMiddleware_NilBody(t *testing.T) {
+	const limit int64 = 1024
+	middleware := maxBodySizeMiddleware(limit)
+
+	handlerCalled := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+		assert.Nil(t, r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Body = nil // Explicitly nil
+	rec := httptest.NewRecorder()
+
+	middleware(inner).ServeHTTP(rec, req)
+
+	assert.True(t, handlerCalled)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
