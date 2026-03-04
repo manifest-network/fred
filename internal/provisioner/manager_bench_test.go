@@ -161,9 +161,8 @@ func BenchmarkWatermill_PublishSubscribe(b *testing.B) {
 		pubSub.Publish("test-topic", msg)
 		i++
 	}
-	b.StopTimer()
-
 	// Close the pubsub so the drainer goroutine exits, then wait for it.
+	// Note: b.Loop() already stopped the timer on its final false return.
 	pubSub.Close()
 	<-done
 }

@@ -2707,8 +2707,9 @@ func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
 		mock := &mockDockerClient{
 			RemoveContainerFn: func(ctx context.Context, containerID string) error {
 				callCount++
-				// Fail c2 on the first two calls (first deprovision attempt)
-				if containerID == "c2" && callCount <= 2 {
+				// c2 fails during the first deprovision attempt (callCount=2);
+				// on retry c2 is the only container and succeeds (callCount=3).
+				if containerID == "c2" && callCount == 2 {
 					return errors.New("device busy")
 				}
 				return nil
