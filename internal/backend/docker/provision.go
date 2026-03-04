@@ -793,7 +793,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				BackendName:       b.cfg.Name,
 				Ingress:           b.cfg.Ingress,
 				NetworkName:       TenantNetworkName(req.Tenant),
-				Quantity:          item.Quantity,
+				Quantity:          totalQuantity,
 			}, b.cfg.ContainerCreateTimeout)
 			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
 			if createErr != nil {
