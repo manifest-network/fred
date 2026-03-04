@@ -24,7 +24,7 @@ import (
 func awaitSubscriber(t *testing.T, broker *EventBroker, leaseUUID string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		return broker.SubscriberCount(leaseUUID) > 0
+		return broker.subscriberCount(leaseUUID) > 0
 	}, 2*time.Second, 5*time.Millisecond, "timed out waiting for subscriber on %s", leaseUUID)
 }
 
@@ -639,7 +639,7 @@ func TestStreamLeaseEvents_ClientDisconnect(t *testing.T) {
 
 	// Wait for the server to process the close and unsubscribe.
 	require.Eventually(t, func() bool {
-		return broker.SubscriberCount(leaseUUID) == 0
+		return broker.subscriberCount(leaseUUID) == 0
 	}, 2*time.Second, 5*time.Millisecond, "timed out waiting for unsubscribe")
 
 	// Verify server unsubscribed: publish should not block or panic.

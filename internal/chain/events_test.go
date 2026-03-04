@@ -561,6 +561,8 @@ func TestEventSubscriber_Start_ReconnectsOnFailure(t *testing.T) {
 }
 
 func TestEventSubscriber_Start_StopsOnClose(t *testing.T) {
+	var subscribeCount atomic.Int32
+
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -576,6 +578,7 @@ func TestEventSubscriber_Start_StopsOnClose(t *testing.T) {
 			}
 			var req jsonRPCRequest
 			if json.Unmarshal(msg, &req) == nil && req.Method == "subscribe" {
+				subscribeCount.Add(1)
 				conn.WriteJSON(jsonRPCResponse{JSONRPC: "2.0", ID: req.ID})
 			}
 		}
@@ -599,8 +602,10 @@ func TestEventSubscriber_Start_StopsOnClose(t *testing.T) {
 		errCh <- sub.Start(ctx)
 	}()
 
-	// Give it time to connect
-	time.Sleep(100 * time.Millisecond)
+	// Wait until all 4 subscriptions are established
+	require.Eventually(t, func() bool {
+		return subscribeCount.Load() >= 4
+	}, 5*time.Second, 10*time.Millisecond, "timed out waiting for subscriptions")
 
 	// Close should cause Start to return nil
 	sub.Close()

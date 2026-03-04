@@ -573,7 +573,5 @@ func (b *Backend) removeProvision(leaseUUID string) {
 // The caller must call the returned cancel function when done.
 func (b *Backend) shutdownAwareContext() (context.Context, context.CancelFunc) {
 	provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
-	ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
-	stop := context.AfterFunc(b.stopCtx, cancel)
-	return ctx, func() { stop(); cancel() }
+	return context.WithTimeout(b.stopCtx, provisionTimeout)
 }
