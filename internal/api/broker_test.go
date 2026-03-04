@@ -18,6 +18,16 @@ import (
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
+// awaitSubscriber polls until the broker has at least one subscriber for the
+// given lease UUID. This replaces fixed time.Sleep calls that were flaky on
+// slow CI runners.
+func awaitSubscriber(t *testing.T, broker *EventBroker, leaseUUID string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return broker.subscriberCount(leaseUUID) > 0
+	}, 2*time.Second, 5*time.Millisecond, "timed out waiting for subscriber on %s", leaseUUID)
+}
+
 func testEvent(leaseUUID string, status backend.ProvisionStatus) backend.LeaseStatusEvent {
 	return backend.LeaseStatusEvent{
 		LeaseUUID: leaseUUID,
@@ -339,14 +349,12 @@ func TestStreamLeaseEvents_QueryParamAuth(t *testing.T) {
 	defer conn.Close()
 
 	// Verify the connection works by publishing and receiving an event.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		broker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusReady,
-			Timestamp: time.Now(),
-		})
-	}()
+	awaitSubscriber(t, broker, leaseUUID)
+	broker.Publish(backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusReady,
+		Timestamp: time.Now(),
+	})
 
 	var event backend.LeaseStatusEvent
 	err = conn.ReadJSON(&event)
@@ -400,15 +408,13 @@ func TestStreamLeaseEvents_ReceivesEvent(t *testing.T) {
 	require.NotNil(t, conn)
 	defer conn.Close()
 
-	// Publish an event after a short delay to ensure the client is subscribed.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		broker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusReady,
-			Timestamp: time.Now(),
-		})
-	}()
+	// Wait for the server goroutine to subscribe before publishing.
+	awaitSubscriber(t, broker, leaseUUID)
+	broker.Publish(backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusReady,
+		Timestamp: time.Now(),
+	})
 
 	var event backend.LeaseStatusEvent
 	err := conn.ReadJSON(&event)
@@ -447,15 +453,16 @@ func TestStreamLeaseEvents_SurvivesBeyondRequestTimeout(t *testing.T) {
 	require.NotNil(t, conn)
 	defer conn.Close()
 
-	// Publish an event after 200ms — well beyond a hypothetical 100ms timeout.
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		broker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusReady,
-			Timestamp: time.Now(),
-		})
-	}()
+	// Wait for subscription, then delay 200ms — well beyond a hypothetical
+	// 100ms request timeout — to prove the WebSocket connection stays alive
+	// without requestTimeoutMiddleware.
+	awaitSubscriber(t, broker, leaseUUID)
+	time.Sleep(200 * time.Millisecond)
+	broker.Publish(backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusReady,
+		Timestamp: time.Now(),
+	})
 
 	var event backend.LeaseStatusEvent
 	err := conn.ReadJSON(&event)
@@ -497,14 +504,12 @@ func TestStreamLeaseEvents_WorksThroughLoggingMiddleware(t *testing.T) {
 	defer conn.Close()
 
 	// Verify an event can actually be received (not just the upgrade).
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		broker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusReady,
-			Timestamp: time.Now(),
-		})
-	}()
+	awaitSubscriber(t, broker, leaseUUID)
+	broker.Publish(backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusReady,
+		Timestamp: time.Now(),
+	})
 
 	var event backend.LeaseStatusEvent
 	err := conn.ReadJSON(&event)
@@ -582,8 +587,8 @@ func TestStreamLeaseEvents_CleanCloseOnBrokerShutdown(t *testing.T) {
 	require.NotNil(t, conn)
 	defer conn.Close()
 
-	// Give the server goroutine time to subscribe, then close the broker.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the server goroutine to subscribe, then close the broker.
+	awaitSubscriber(t, broker, leaseUUID)
 
 	// Close the broker — server should send a CloseGoingAway frame.
 	broker.Close()
@@ -624,16 +629,18 @@ func TestStreamLeaseEvents_ClientDisconnect(t *testing.T) {
 	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
 	require.NotNil(t, conn)
 
-	// Give the server goroutine time to subscribe.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the server goroutine to subscribe.
+	awaitSubscriber(t, broker, leaseUUID)
 
 	// Client sends close frame.
 	_ = conn.WriteMessage(websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	conn.Close()
 
-	// Give server time to process the close and unsubscribe.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the server to process the close and unsubscribe.
+	require.Eventually(t, func() bool {
+		return broker.subscriberCount(leaseUUID) == 0
+	}, 2*time.Second, 5*time.Millisecond, "timed out waiting for unsubscribe")
 
 	// Verify server unsubscribed: publish should not block or panic.
 	require.NotPanics(t, func() {
@@ -678,16 +685,14 @@ func TestStreamLeaseEvents_ReceivesRestartAndUpdateEvents(t *testing.T) {
 		backend.ProvisionStatusReady,
 	}
 
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		for _, s := range statuses {
-			broker.Publish(backend.LeaseStatusEvent{
-				LeaseUUID: leaseUUID,
-				Status:    s,
-				Timestamp: time.Now(),
-			})
-		}
-	}()
+	awaitSubscriber(t, broker, leaseUUID)
+	for _, s := range statuses {
+		broker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    s,
+			Timestamp: time.Now(),
+		})
+	}
 
 	for _, expected := range statuses {
 		var event backend.LeaseStatusEvent

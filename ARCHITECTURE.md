@@ -169,7 +169,7 @@ Key interfaces defined where they're consumed:
 
 | Interface | Defined in | Used by |
 |-----------|-----------|---------|
-| `ChainClient` | `provisioner/manager.go` | Manager, HandlerSet, AckBatcher |
+| `ChainClient` | `provisioner/topics.go` | Manager, HandlerSet, AckBatcher |
 | `ReconcilerChainClient` | `provisioner/reconciler.go` | Reconciler |
 | `BackendRouter` | `provisioner/interfaces.go` | Orchestrator |
 | `InFlightTracker` | `provisioner/tracker.go` | Orchestrator, HandlerSet, TimeoutChecker |

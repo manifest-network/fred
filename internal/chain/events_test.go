@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -503,6 +504,117 @@ func TestEventSubscriber_ConnectAndRunSubscriptions(t *testing.T) {
 	// Verify all queries include tm.event='Tx'
 	for id, query := range subByID {
 		assert.Contains(t, query, "tm.event='Tx'", "subscription %d should filter for Tx events", id)
+	}
+}
+
+func TestEventSubscriber_Start_ReconnectsOnFailure(t *testing.T) {
+	// Track how many times the server accepts a WebSocket connection.
+	var connectCount atomic.Int32
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		// Close immediately to trigger a read error in connectAndRun,
+		// which will cause Start() to reconnect.
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/websocket"
+
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
+		URL:              wsURL,
+		ProviderUUID:     testProviderUUID,
+		PingInterval:     time.Hour, // avoid interference
+		ReconnectInitial: 10 * time.Millisecond,
+		ReconnectMax:     50 * time.Millisecond,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sub.Start(ctx)
+	}()
+
+	// Wait for at least 3 connections (initial + 2 reconnects).
+	assert.Eventually(t, func() bool {
+		return connectCount.Load() >= 3
+	}, 5*time.Second, 10*time.Millisecond,
+		"expected at least 3 connections, got %d", connectCount.Load())
+
+	// Shut down via context cancellation
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Start() to return")
+	}
+}
+
+func TestEventSubscriber_Start_StopsOnClose(t *testing.T) {
+	var subscribeCount atomic.Int32
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Read and respond to subscriptions, then hold connection open
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var req jsonRPCRequest
+			if json.Unmarshal(msg, &req) == nil && req.Method == "subscribe" {
+				subscribeCount.Add(1)
+				conn.WriteJSON(jsonRPCResponse{JSONRPC: "2.0", ID: req.ID})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/websocket"
+
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
+		URL:              wsURL,
+		ProviderUUID:     testProviderUUID,
+		PingInterval:     time.Hour,
+		ReconnectInitial: 10 * time.Millisecond,
+		ReconnectMax:     50 * time.Millisecond,
+	})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sub.Start(ctx)
+	}()
+
+	// Wait until all 4 subscriptions are established
+	require.Eventually(t, func() bool {
+		return subscribeCount.Load() >= 4
+	}, 5*time.Second, 10*time.Millisecond, "timed out waiting for subscriptions")
+
+	// Close should cause Start to return nil
+	sub.Close()
+
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Start() to return after Close()")
 	}
 }
 

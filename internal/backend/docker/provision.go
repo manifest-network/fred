@@ -208,12 +208,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// 1. Provision timeout exceeded
 	// 2. Backend shutdown (stopCtx canceled)
 	b.wg.Go(func() {
-		provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
-		ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+		ctx, cancel := b.shutdownAwareContext()
 		defer cancel()
-
-		stop := context.AfterFunc(b.stopCtx, cancel)
-		defer stop()
 
 		if isStack {
 			b.doProvisionStack(ctx, req, stackManifest, profiles, logger)

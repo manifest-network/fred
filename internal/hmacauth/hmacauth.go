@@ -72,18 +72,25 @@ func SignWithTime(secret string, payload []byte, t time.Time) string {
 // Verify verifies an HMAC-SHA256 signature against the payload.
 // It checks signature format, timestamp freshness (within maxAge), and HMAC correctness.
 // Uses hmac.Equal on raw bytes for constant-time comparison.
+// Clock skew tolerance for future timestamps is 1 minute.
 func Verify(secret string, payload []byte, signature string, maxAge time.Duration) error {
+	return VerifyWithTime(secret, payload, signature, maxAge, time.Minute, time.Now())
+}
+
+// VerifyWithTime verifies an HMAC-SHA256 signature with an explicit reference time
+// and configurable clock skew tolerance for future timestamps.
+func VerifyWithTime(secret string, payload []byte, signature string, maxAge, clockSkew time.Duration, now time.Time) error {
 	timestamp, sigHex, ok := ParseSignature(signature)
 	if !ok {
 		return fmt.Errorf("invalid signature format: expected t=<timestamp>,sha256=<hex>")
 	}
 
-	age := time.Since(time.Unix(timestamp, 0))
-	if age > maxAge {
-		return fmt.Errorf("signature expired: age %v exceeds max %v", age.Round(time.Second), maxAge)
+	signedAt := time.Unix(timestamp, 0)
+	if now.Sub(signedAt) > maxAge {
+		return fmt.Errorf("signature expired: signed %v ago, max age is %v", now.Sub(signedAt).Round(time.Second), maxAge)
 	}
-	if age < -time.Minute {
-		return fmt.Errorf("signature timestamp too far in future: %v ahead", (-age).Round(time.Second))
+	if signedAt.After(now.Add(clockSkew)) {
+		return fmt.Errorf("signature timestamp too far in future: %v ahead", signedAt.Sub(now).Round(time.Second))
 	}
 
 	providedSig, err := hex.DecodeString(sigHex)
