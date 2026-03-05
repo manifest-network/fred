@@ -532,7 +532,7 @@ func TestWatcher_Start(t *testing.T) {
 		w := New(client, eventSub, providerUUID)
 
 		// Use a non-cancellable context - we want to test channel close, not context cancellation
-		ctx := t.Context()
+		ctx := context.Background()
 
 		errCh := make(chan error, 1)
 		go func() {

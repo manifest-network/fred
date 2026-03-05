@@ -65,7 +65,7 @@ Images are validated before pull. The registry is extracted from the image refer
 | Field | YAML Key | Type | Default | Description |
 |---|---|---|---|---|
 | DiagnosticsDBPath | `diagnostics_db_path` | string | `"diagnostics.db"` | Path to bbolt database for persisting failure diagnostics |
-| DiagnosticsMaxAge | `diagnostics_max_age` | duration | `7d` | Maximum age of persisted diagnostic entries before cleanup |
+| DiagnosticsMaxAge | `diagnostics_max_age` | duration | `168h` | Maximum age of persisted diagnostic entries before cleanup (7 days) |
 
 When a provision fails (during provisioning, state recovery, or partial deprovision), the backend persists full failure diagnostics and container logs to a bbolt database. `GET /provisions/{lease_uuid}` and `GET /logs/{lease_uuid}` fall back to this store when the provision is no longer in memory (e.g., after deprovision or restart), returning the persisted error and logs with a 7-day default retention.
 
@@ -74,7 +74,7 @@ When a provision fails (during provisioning, state recovery, or partial deprovis
 | Field | YAML Key | Type | Default | Description |
 |---|---|---|---|---|
 | ReleasesDBPath | `releases_db_path` | string | `"releases.db"` | Path to bbolt database for persisting release history |
-| ReleasesMaxAge | `releases_max_age` | duration | `90d` | Maximum age of persisted release entries before cleanup |
+| ReleasesMaxAge | `releases_max_age` | duration | `2160h` | Maximum age of persisted release entries before cleanup (90 days) |
 
 ### Tenant Quotas
 
