@@ -885,8 +885,11 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	}, mockChain, router, manager, nil)
 	require.NoError(t, err)
 
-	// Simulate concurrent provisioning attempts
+	// Simulate concurrent provisioning attempts.
+	// Capture ctx before spawning goroutines to avoid calling t.Context()
+	// from a background goroutine, which can panic if the test exits early.
 	const numGoroutines = 50
+	ctx := t.Context()
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
@@ -904,7 +907,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 			// manager.handleLeaseCreated and reconciler.startProvisioning
 			if manager.TryTrackInFlight(leaseUUID, "tenant-1", testItems(""), "test") {
 				// Only provision if we successfully tracked
-				_ = mockBackend.Provision(t.Context(), backend.ProvisionRequest{
+				_ = mockBackend.Provision(ctx, backend.ProvisionRequest{
 					LeaseUUID:    leaseUUID,
 					Tenant:       "tenant-1",
 					ProviderUUID: "provider-1",
