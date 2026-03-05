@@ -596,7 +596,7 @@ func TestEventSubscriber_Start_StopsOnClose(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- sub.Start(ctx)

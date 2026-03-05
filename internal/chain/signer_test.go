@@ -1,7 +1,6 @@
 package chain
 
 import (
-	"context"
 	"testing"
 
 	"cosmossdk.io/math"
@@ -126,7 +125,7 @@ func TestSigner_SignTx(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 42, 7)
 
-	txBytes, err := s.SignTx(context.Background(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
 	require.NoError(t, err)
 	require.NotEmpty(t, txBytes)
 
@@ -153,7 +152,7 @@ func TestSigner_SignTx_MinimumFee(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(context.Background(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
 	require.NoError(t, err)
 
 	tx, err := s.txConfig.TxDecoder()(txBytes)
@@ -176,6 +175,6 @@ func TestSigner_SignTx_InvalidAccount(t *testing.T) {
 		Value:   []byte("garbage"),
 	}
 
-	_, err := s.SignTx(context.Background(), newTestMsg(s.address), wrongAny)
+	_, err := s.SignTx(t.Context(), newTestMsg(s.address), wrongAny)
 	assert.Error(t, err)
 }

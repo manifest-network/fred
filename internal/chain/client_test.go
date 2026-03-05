@@ -355,7 +355,7 @@ func TestClient_GetPendingLeases(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		leases, err := c.GetPendingLeases(context.Background(), "prov-1")
+		leases, err := c.GetPendingLeases(t.Context(), "prov-1")
 		require.NoError(t, err)
 		assert.Len(t, leases, 2)
 	})
@@ -379,7 +379,7 @@ func TestClient_GetPendingLeases(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		leases, err := c.GetPendingLeases(context.Background(), "prov-1")
+		leases, err := c.GetPendingLeases(t.Context(), "prov-1")
 		require.NoError(t, err)
 		assert.Len(t, leases, 2)
 		assert.Equal(t, 2, calls)
@@ -393,7 +393,7 @@ func TestClient_GetPendingLeases(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		_, err := c.GetPendingLeases(context.Background(), "prov-1")
+		_, err := c.GetPendingLeases(t.Context(), "prov-1")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query pending leases")
 	})
@@ -411,7 +411,7 @@ func TestClient_GetActiveLeasesByProvider(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		leases, err := c.GetActiveLeasesByProvider(context.Background(), "prov-1")
+		leases, err := c.GetActiveLeasesByProvider(t.Context(), "prov-1")
 		require.NoError(t, err)
 		assert.Len(t, leases, 1)
 	})
@@ -424,7 +424,7 @@ func TestClient_GetActiveLeasesByProvider(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		_, err := c.GetActiveLeasesByProvider(context.Background(), "prov-1")
+		_, err := c.GetActiveLeasesByProvider(t.Context(), "prov-1")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query active leases")
 	})
@@ -441,7 +441,7 @@ func TestClient_GetLease(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		lease, err := c.GetLease(context.Background(), "lease-123")
+		lease, err := c.GetLease(t.Context(), "lease-123")
 		require.NoError(t, err)
 		require.NotNil(t, lease)
 		assert.Equal(t, "lease-123", lease.Uuid)
@@ -455,7 +455,7 @@ func TestClient_GetLease(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		lease, err := c.GetLease(context.Background(), "nope")
+		lease, err := c.GetLease(t.Context(), "nope")
 		assert.NoError(t, err)
 		assert.Nil(t, lease)
 	})
@@ -468,7 +468,7 @@ func TestClient_GetLease(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		_, err := c.GetLease(context.Background(), "nope")
+		_, err := c.GetLease(t.Context(), "nope")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query lease")
 	})
@@ -485,7 +485,7 @@ func TestClient_GetActiveLease(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		lease, err := c.GetActiveLease(context.Background(), "a1")
+		lease, err := c.GetActiveLease(t.Context(), "a1")
 		require.NoError(t, err)
 		require.NotNil(t, lease)
 		assert.Equal(t, billingtypes.LEASE_STATE_ACTIVE, lease.State)
@@ -499,7 +499,7 @@ func TestClient_GetActiveLease(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		lease, err := c.GetActiveLease(context.Background(), "missing")
+		lease, err := c.GetActiveLease(t.Context(), "missing")
 		assert.NoError(t, err)
 		assert.Nil(t, lease)
 	})
@@ -514,7 +514,7 @@ func TestClient_GetActiveLease(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		lease, err := c.GetActiveLease(context.Background(), "p1")
+		lease, err := c.GetActiveLease(t.Context(), "p1")
 		require.NoError(t, err)
 		assert.Nil(t, lease)
 	})
@@ -527,7 +527,7 @@ func TestClient_GetActiveLease(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		_, err := c.GetActiveLease(context.Background(), "x")
+		_, err := c.GetActiveLease(t.Context(), "x")
 		require.Error(t, err)
 	})
 }
@@ -543,7 +543,7 @@ func TestClient_GetProvider(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.skuQuery = sq })
 
-		prov, err := c.GetProvider(context.Background(), "prov-abc")
+		prov, err := c.GetProvider(t.Context(), "prov-abc")
 		require.NoError(t, err)
 		assert.Equal(t, "prov-abc", prov.Uuid)
 	})
@@ -556,7 +556,7 @@ func TestClient_GetProvider(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.skuQuery = sq })
 
-		_, err := c.GetProvider(context.Background(), "nope")
+		_, err := c.GetProvider(t.Context(), "nope")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query provider")
 	})
@@ -574,7 +574,7 @@ func TestClient_GetCreditAccount(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		acct, balances, err := c.GetCreditAccount(context.Background(), "tenant-1")
+		acct, balances, err := c.GetCreditAccount(t.Context(), "tenant-1")
 		require.NoError(t, err)
 		assert.Equal(t, "tenant-1", acct.Tenant)
 		assert.False(t, balances.IsZero())
@@ -588,7 +588,7 @@ func TestClient_GetCreditAccount(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		_, _, err := c.GetCreditAccount(context.Background(), "t")
+		_, _, err := c.GetCreditAccount(t.Context(), "t")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query credit account")
 	})
@@ -607,7 +607,7 @@ func TestClient_GetProviderWithdrawable(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		amounts, err := c.GetProviderWithdrawable(context.Background(), "prov-1")
+		amounts, err := c.GetProviderWithdrawable(t.Context(), "prov-1")
 		require.NoError(t, err)
 		assert.False(t, amounts.IsZero())
 	})
@@ -620,7 +620,7 @@ func TestClient_GetProviderWithdrawable(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		_, err := c.GetProviderWithdrawable(context.Background(), "prov-1")
+		_, err := c.GetProviderWithdrawable(t.Context(), "prov-1")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query provider withdrawable")
 	})
@@ -636,7 +636,7 @@ func TestClient_Ping(t *testing.T) {
 		s := newTestSigner(t)
 		c := newMockClient(func(c *Client) { c.authQuery = aq; c.signer = s })
 
-		err := c.Ping(context.Background())
+		err := c.Ping(t.Context())
 		assert.NoError(t, err)
 	})
 
@@ -649,7 +649,7 @@ func TestClient_Ping(t *testing.T) {
 		s := newTestSigner(t)
 		c := newMockClient(func(c *Client) { c.authQuery = aq; c.signer = s })
 
-		err := c.Ping(context.Background())
+		err := c.Ping(t.Context())
 		assert.Error(t, err)
 	})
 }
@@ -663,7 +663,7 @@ func TestClient_GetLeasesByProvider_Pagination(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		leases, err := c.getLeasesByProviderWithState(context.Background(), "p", billingtypes.LEASE_STATE_ACTIVE)
+		leases, err := c.getLeasesByProviderWithState(t.Context(), "p", billingtypes.LEASE_STATE_ACTIVE)
 		require.NoError(t, err)
 		assert.Empty(t, leases)
 	})
@@ -696,7 +696,7 @@ func TestClient_GetLeasesByProvider_Pagination(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.billingQuery = bq })
 
-		leases, err := c.getLeasesByProviderWithState(context.Background(), "p", billingtypes.LEASE_STATE_ACTIVE)
+		leases, err := c.getLeasesByProviderWithState(t.Context(), "p", billingtypes.LEASE_STATE_ACTIVE)
 		require.NoError(t, err)
 		assert.Len(t, leases, 3)
 		assert.Equal(t, 3, calls)
@@ -753,7 +753,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		c, _ := setupTxMocks(t)
 
 		msg := newTestMsg(c.signer.Address())
-		hash, err := c.doBroadcastTx(context.Background(), msg)
+		hash, err := c.doBroadcastTx(t.Context(), msg)
 		require.NoError(t, err)
 		assert.NotEmpty(t, hash)
 	})
@@ -767,7 +767,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq })
 
-		_, err := c.doBroadcastTx(context.Background(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query account")
 	})
@@ -789,7 +789,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTx(context.Background(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to broadcast transaction")
 	})
@@ -813,7 +813,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTx(context.Background(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -844,7 +844,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTx(context.Background(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -864,7 +864,7 @@ func TestClient_WaitForTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.txService = ts })
 
-		resp, err := c.waitForTx(context.Background(), "TX1")
+		resp, err := c.waitForTx(t.Context(), "TX1")
 		require.NoError(t, err)
 		assert.Equal(t, "TX1", resp.TxResponse.TxHash)
 	})
@@ -884,7 +884,7 @@ func TestClient_WaitForTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.txService = ts })
 
-		resp, err := c.waitForTx(context.Background(), "TX2")
+		resp, err := c.waitForTx(t.Context(), "TX2")
 		require.NoError(t, err)
 		assert.Equal(t, "TX2", resp.TxResponse.TxHash)
 		assert.GreaterOrEqual(t, int(calls.Load()), 3)
@@ -901,7 +901,7 @@ func TestClient_WaitForTx(t *testing.T) {
 			c.txTimeout = 100 * time.Millisecond
 		})
 
-		_, err := c.waitForTx(context.Background(), "TX3")
+		_, err := c.waitForTx(t.Context(), "TX3")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.DeadlineExceeded)
 	})
@@ -910,7 +910,7 @@ func TestClient_WaitForTx(t *testing.T) {
 func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 	t.Run("empty input", func(t *testing.T) {
 		c := newMockClient()
-		n, hashes, err := c.broadcastBatchedMsgs(context.Background(), nil, "test", "tested",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), nil, "test", "tested",
 			func(batch []string) sdktypes.Msg { return nil })
 		assert.Equal(t, uint64(0), n)
 		assert.Nil(t, hashes)
@@ -925,7 +925,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 			uuids[i] = fmt.Sprintf("l-%d", i)
 		}
 
-		n, hashes, err := c.broadcastBatchedMsgs(context.Background(), uuids, "acknowledge", "acknowledged",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{
 					Sender:     c.signer.Address(),
@@ -946,7 +946,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 			uuids[i] = fmt.Sprintf("l-%d", i)
 		}
 
-		n, hashes, err := c.broadcastBatchedMsgs(context.Background(), uuids, "acknowledge", "acknowledged",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{
 					Sender:     c.signer.Address(),
@@ -991,7 +991,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 			uuids[i] = fmt.Sprintf("l-%d", i)
 		}
 
-		n, hashes, err := c.broadcastBatchedMsgs(context.Background(), uuids, "acknowledge", "acknowledged",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{Sender: s.Address(), LeaseUuids: batch}
 			})
@@ -1005,7 +1005,7 @@ func TestClient_AcknowledgeLeases(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		c, _ := setupTxMocks(t)
 
-		n, hashes, err := c.AcknowledgeLeases(context.Background(), []string{"l1", "l2"})
+		n, hashes, err := c.AcknowledgeLeases(t.Context(), []string{"l1", "l2"})
 		require.NoError(t, err)
 		assert.Equal(t, uint64(2), n)
 		assert.Len(t, hashes, 1)
@@ -1013,7 +1013,7 @@ func TestClient_AcknowledgeLeases(t *testing.T) {
 
 	t.Run("empty input", func(t *testing.T) {
 		c := newMockClient()
-		n, hashes, err := c.AcknowledgeLeases(context.Background(), nil)
+		n, hashes, err := c.AcknowledgeLeases(t.Context(), nil)
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(0), n)
 		assert.Nil(t, hashes)
@@ -1023,7 +1023,7 @@ func TestClient_AcknowledgeLeases(t *testing.T) {
 func TestClient_RejectLeases(t *testing.T) {
 	c, _ := setupTxMocks(t)
 
-	n, hashes, err := c.RejectLeases(context.Background(), []string{"l1"}, "out of capacity")
+	n, hashes, err := c.RejectLeases(t.Context(), []string{"l1"}, "out of capacity")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), n)
 	assert.Len(t, hashes, 1)
@@ -1032,7 +1032,7 @@ func TestClient_RejectLeases(t *testing.T) {
 func TestClient_CloseLeases(t *testing.T) {
 	c, _ := setupTxMocks(t)
 
-	n, hashes, err := c.CloseLeases(context.Background(), []string{"l1", "l2"}, "maintenance")
+	n, hashes, err := c.CloseLeases(t.Context(), []string{"l1", "l2"}, "maintenance")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(2), n)
 	assert.Len(t, hashes, 1)
@@ -1042,7 +1042,7 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		c, _ := setupTxMocks(t)
 
-		hash, err := c.WithdrawByProvider(context.Background(), "prov-1")
+		hash, err := c.WithdrawByProvider(t.Context(), "prov-1")
 		require.NoError(t, err)
 		assert.NotEmpty(t, hash)
 	})
@@ -1064,7 +1064,7 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.WithdrawByProvider(context.Background(), "prov-1")
+		_, err := c.WithdrawByProvider(t.Context(), "prov-1")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to withdraw")
 	})

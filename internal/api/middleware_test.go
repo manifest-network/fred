@@ -353,7 +353,7 @@ func TestRequestTimeoutMiddleware_SlowHandlerDoesNotBlockOthers(t *testing.T) {
 // Tests for readBodyWithContext
 
 func TestReadBodyWithContext_Success(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	data := []byte("test payload data")
 	body := bytes.NewReader(data)
 
@@ -363,7 +363,7 @@ func TestReadBodyWithContext_Success(t *testing.T) {
 }
 
 func TestReadBodyWithContext_EmptyBody(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	body := bytes.NewReader([]byte{})
 
 	result, err := readBodyWithContext(ctx, body)
@@ -372,7 +372,7 @@ func TestReadBodyWithContext_EmptyBody(t *testing.T) {
 }
 
 func TestReadBodyWithContext_LargeBody(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	// Create a body larger than the chunk size (32KB)
 	data := make([]byte, 100*1024) // 100KB
 	for i := range data {
@@ -415,7 +415,7 @@ func TestReadBodyWithContext_ContextCancelledDuringRead(t *testing.T) {
 }
 
 func TestReadBodyWithContext_ReadError(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	expectedErr := io.ErrUnexpectedEOF
 	body := &errorReader{err: expectedErr}
 
@@ -637,4 +637,3 @@ func TestMaxBodySizeMiddleware_NilBody(t *testing.T) {
 	assert.True(t, handlerCalled)
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
-

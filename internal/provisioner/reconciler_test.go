@@ -185,7 +185,7 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify provisioning was started
@@ -230,7 +230,7 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was acknowledged
@@ -264,7 +264,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify provisioning was attempted (anomaly recovery)
@@ -308,7 +308,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify nothing was done
@@ -348,7 +348,7 @@ func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify orphan was deprovisioned
@@ -404,7 +404,7 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 			}, mockChain, router, nil, nil)
 			require.NoError(t, err)
 
-			ctx := context.Background()
+			ctx := t.Context()
 			err = reconciler.ReconcileAll(ctx)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
@@ -518,7 +518,7 @@ func TestReconciler_RunOnce(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.RunOnce(ctx))
 
 	// Verify provisioning was started
@@ -557,7 +557,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 	}, mockChain, router, manager, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify provisioning was NOT started (lease is in-flight)
@@ -596,7 +596,7 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Both orphans should be deprovisioned
@@ -647,7 +647,7 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify no actions were taken
@@ -702,7 +702,7 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify no provisioning or deprovisioning
@@ -756,7 +756,7 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	// ReconcileAll should succeed even if individual acknowledges fail
 	// (errors are logged, not propagated)
 	err = reconciler.ReconcileAll(ctx)
@@ -788,7 +788,7 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	// ReconcileAll should succeed even if deprovisions fail
 	// (errors are logged, not propagated)
 	err = reconciler.ReconcileAll(ctx)
@@ -829,7 +829,7 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify only our orphans were deprovisioned (not the other provider's)
@@ -885,8 +885,11 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	}, mockChain, router, manager, nil)
 	require.NoError(t, err)
 
-	// Simulate concurrent provisioning attempts
+	// Simulate concurrent provisioning attempts.
+	// Capture ctx before spawning goroutines to avoid calling t.Context()
+	// from a background goroutine, which can panic if the test exits early.
 	const numGoroutines = 50
+	ctx := t.Context()
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
@@ -904,7 +907,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 			// manager.handleLeaseCreated and reconciler.startProvisioning
 			if manager.TryTrackInFlight(leaseUUID, "tenant-1", testItems(""), "test") {
 				// Only provision if we successfully tracked
-				_ = mockBackend.Provision(context.Background(), backend.ProvisionRequest{
+				_ = mockBackend.Provision(ctx, backend.ProvisionRequest{
 					LeaseUUID:    leaseUUID,
 					Tenant:       "tenant-1",
 					ProviderUUID: "provider-1",
@@ -935,7 +938,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	mockBackend.mu.Unlock()
 
 	// Run reconciliation - should NOT provision again (already in-flight)
-	assert.NoError(t, reconciler.ReconcileAll(context.Background()))
+	assert.NoError(t, reconciler.ReconcileAll(t.Context()))
 
 	mockBackend.mu.Lock()
 	additionalProvisions := len(mockBackend.provisionCalls)
@@ -970,10 +973,13 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	// Start first reconciliation in background
+	// Start first reconciliation in background.
+	// Capture ctx before the goroutine to avoid calling t.Context() from a
+	// background goroutine, which can panic if the test exits early.
+	ctx := t.Context()
 	firstDone := make(chan error, 1)
 	go func() {
-		firstDone <- reconciler.ReconcileAll(context.Background())
+		firstDone <- reconciler.ReconcileAll(ctx)
 	}()
 
 	// Wait for first reconciliation to start
@@ -981,7 +987,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 
 	// Try second reconciliation - should return immediately (non-blocking)
 	secondStart := time.Now()
-	err = reconciler.ReconcileAll(context.Background())
+	err = reconciler.ReconcileAll(t.Context())
 	secondDuration := time.Since(secondStart)
 
 	// Second call should return quickly (not block waiting for first)
@@ -998,7 +1004,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	mockChain.GetPendingLeasesFunc = func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 		return nil, nil
 	}
-	assert.NoError(t, reconciler.ReconcileAll(context.Background()))
+	assert.NoError(t, reconciler.ReconcileAll(t.Context()))
 }
 
 func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
@@ -1218,7 +1224,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify GPU lease went to GPU backend
@@ -1342,7 +1348,7 @@ func TestReconciler_ParallelProcessing(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	mu.Lock()
@@ -1412,7 +1418,7 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	mu.Lock()
@@ -1512,7 +1518,7 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	mu.Lock()
@@ -1748,7 +1754,7 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	}, mockChain, router, mockTracker, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify orphaned payloads were cleaned up
@@ -1815,7 +1821,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was closed (not rejected — it's ACTIVE, not PENDING)
@@ -1866,7 +1872,7 @@ func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify re-provisioning was attempted (not closed)
@@ -1914,8 +1920,11 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	// Start multiple concurrent ReconcileAll calls
+	// Start multiple concurrent ReconcileAll calls.
+	// Capture ctx before spawning goroutines to avoid calling t.Context()
+	// from a background goroutine, which can panic if the test exits early.
 	const numGoroutines = 10
+	ctx := t.Context()
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
@@ -1927,7 +1936,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			_ = reconciler.ReconcileAll(context.Background())
+			_ = reconciler.ReconcileAll(ctx)
 			completed <- struct{}{}
 		}()
 	}
@@ -1991,7 +2000,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was rejected (not left to retry forever)
@@ -2038,7 +2047,7 @@ func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was rejected (not left pending forever)
@@ -2103,7 +2112,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	}, mockChain, router, mockTracker, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was rejected
@@ -2150,7 +2159,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was closed (not rejected — it's ACTIVE)
@@ -2204,7 +2213,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify lease was closed (validation error is permanent)
@@ -2257,7 +2266,7 @@ func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
 	}, mockChain, router, nil, ps)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify placements were synced from backend state
@@ -2291,7 +2300,7 @@ func TestReconciler_ReconcileAll_StartProvisioning_RecordsPlacement(t *testing.T
 	}, mockChain, router, nil, ps)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify placement was recorded after provisioning
@@ -2329,7 +2338,7 @@ func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
 	}, mockChain, router, nil, ps)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after rejection")
@@ -2357,7 +2366,7 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	}, mockChain, router, nil, ps)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	assert.Empty(t, ps.Get("orphan-1"), "placement should be cleaned up after orphan deprovision")
@@ -2399,7 +2408,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	}, mockChain, router, nil, ps)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after lease close")
@@ -2434,7 +2443,7 @@ func TestReconciler_ReconcileAll_ListProvisionError_AbortsReconciliation(t *test
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	err = reconciler.ReconcileAll(ctx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "incomplete backend data")
@@ -2507,7 +2516,7 @@ func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Closes(t *testi
 	}, mockChain, router, tracker, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify the lease was closed (permanent failure, not transient)
@@ -2578,7 +2587,7 @@ func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.
 	}, mockChain, router, tracker, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify no actions were taken — waiting for payload upload
@@ -2643,7 +2652,7 @@ func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *te
 	}, mockChain, router, tracker, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	// ReconcileAll succeeds even with per-lease errors
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
@@ -2715,7 +2724,7 @@ func TestReconciler_ReconcileAll_PayloadStoreGetError_TransientError(t *testing.
 	}, mockChain, router, tracker, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	// ReconcileAll succeeds even with per-lease errors
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
@@ -2758,7 +2767,7 @@ func TestReconciler_ReconcileAll_RefreshStateError_ContinuesWithStaleData(t *tes
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	err = reconciler.ReconcileAll(ctx)
 	assert.NoError(t, err, "should succeed despite RefreshState error")
 
@@ -2814,7 +2823,7 @@ func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
 	}, mockChain, router, tracker, nil)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	// ReconcileAll succeeds even with per-lease errors
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
@@ -2854,7 +2863,7 @@ func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
 
 	before := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
 
-	err = reconciler.ReconcileAll(context.Background())
+	err = reconciler.ReconcileAll(t.Context())
 	require.NoError(t, err)
 
 	after := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
@@ -2892,7 +2901,7 @@ func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
 
 	before := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("cap-backend"))
 
-	_ = reconciler.ReconcileAll(context.Background())
+	_ = reconciler.ReconcileAll(t.Context())
 
 	after := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("cap-backend"))
 	assert.Equal(t, 1.0, after-before, "BackendInsufficientResourcesTotal should increment by 1 for reconciler path")
@@ -2930,7 +2939,7 @@ func TestReconciler_ReconcileAll_PartialFailureDoesNotUpdateTimestamp(t *testing
 
 	before := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
 
-	_ = reconciler.ReconcileAll(context.Background())
+	_ = reconciler.ReconcileAll(t.Context())
 
 	after := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
 	assert.Equal(t, before, after, "ReconcilerLastSuccessTimestamp should NOT be updated on partial failure")
