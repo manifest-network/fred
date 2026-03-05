@@ -21,7 +21,7 @@ type TenantQuotaConfig = shared.TenantQuotaConfig
 // Config holds the configuration for the Docker backend.
 type Config struct {
 	// LogLevel controls the log verbosity (debug, info, warn, error).
-	// Defaults to "info".
+	// When empty, defaults to "info" at startup (see cmd/docker-backend/main.go).
 	LogLevel string `yaml:"log_level"`
 
 	// Name is the backend identifier.

@@ -15,7 +15,7 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 | DockerHost | `docker_host` | string | `"unix:///var/run/docker.sock"` | Docker daemon socket path or URL |
 | HostAddress | `host_address` | string | *(required)* | External IP/hostname for port mappings. Must be a valid IP or hostname, not a URL |
 | HostBindIP | `host_bind_ip` | string | `"0.0.0.0"` | IP address to bind container ports to |
-| LogLevel | `log_level` | string | `"info"` | Log verbosity: `debug`, `info`, `warn`, `error` |
+| LogLevel | `log_level` | string | `"info"` | Log verbosity: `debug`, `info`, `warn`, `error`. Not set in `DefaultConfig()`; defaults to `"info"` at startup via `cmp.Or` |
 
 ### Resources
 

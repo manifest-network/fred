@@ -970,10 +970,13 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	// Start first reconciliation in background
+	// Start first reconciliation in background.
+	// Capture ctx before the goroutine to avoid calling t.Context() from a
+	// background goroutine, which can panic if the test exits early.
+	ctx := t.Context()
 	firstDone := make(chan error, 1)
 	go func() {
-		firstDone <- reconciler.ReconcileAll(t.Context())
+		firstDone <- reconciler.ReconcileAll(ctx)
 	}()
 
 	// Wait for first reconciliation to start
@@ -1914,8 +1917,11 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	}, mockChain, router, nil, nil)
 	require.NoError(t, err)
 
-	// Start multiple concurrent ReconcileAll calls
+	// Start multiple concurrent ReconcileAll calls.
+	// Capture ctx before spawning goroutines to avoid calling t.Context()
+	// from a background goroutine, which can panic if the test exits early.
 	const numGoroutines = 10
+	ctx := t.Context()
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
@@ -1927,7 +1933,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			_ = reconciler.ReconcileAll(t.Context())
+			_ = reconciler.ReconcileAll(ctx)
 			completed <- struct{}{}
 		}()
 	}
