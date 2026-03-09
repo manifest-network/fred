@@ -311,6 +311,7 @@ func TestTracker_InFlightGauge_DoubleUntrackDoesNotGoNegative(t *testing.T) {
 
 func TestTracker_InFlightGauge_PopNonexistent(t *testing.T) {
 	tracker := NewInFlightTracker()
+	t.Cleanup(func() { tracker.UntrackInFlight("lease-1") })
 
 	tracker.TrackInFlight("lease-1", "t", nil, "b")
 	tracker.PopInFlight("nonexistent")
@@ -321,6 +322,7 @@ func TestTracker_InFlightGauge_PopNonexistent(t *testing.T) {
 func TestTracker_InFlightGauge_TryTrack(t *testing.T) {
 	tracker := NewInFlightTracker()
 	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}
+	t.Cleanup(func() { tracker.UntrackInFlight("lease-1") })
 
 	ok := tracker.TryTrackInFlight("lease-1", "t", items, "b")
 	assert.True(t, ok)

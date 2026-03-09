@@ -1460,7 +1460,8 @@ func TestHandlerSet_LeasesAwaitingGauge_PayloadReceivedDecrementsGauge(t *testin
 	defer store.Close()
 
 	// Store payload so HandlePayloadReceived can read it
-	store.Store("lease-pay", []byte("manifest-data"))
+	ok := store.Store("lease-pay", []byte("manifest-data"))
+	require.True(t, ok, "failed to store payload for test")
 
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chain.MockClient{
