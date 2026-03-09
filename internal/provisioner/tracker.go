@@ -117,7 +117,7 @@ func (t *DefaultInFlightTracker) TrackInFlight(leaseUUID, tenant string, items [
 		Backend:   backendName,
 		StartTime: time.Now(),
 	}
-	metrics.InFlightProvisions.Inc()
+	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 }
 
 // TryTrackInFlight atomically checks if a lease is already in-flight and tracks it if not.
@@ -136,7 +136,7 @@ func (t *DefaultInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, item
 		Backend:   backendName,
 		StartTime: time.Now(),
 	}
-	metrics.InFlightProvisions.Inc()
+	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 	return true
 }
 
@@ -146,7 +146,7 @@ func (t *DefaultInFlightTracker) UntrackInFlight(leaseUUID string) {
 	defer t.mu.Unlock()
 	if _, exists := t.inFlight[leaseUUID]; exists {
 		delete(t.inFlight, leaseUUID)
-		metrics.InFlightProvisions.Dec()
+		metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 	}
 }
 
@@ -165,7 +165,7 @@ func (t *DefaultInFlightTracker) PopInFlight(leaseUUID string) (InFlightProvisio
 	provision, exists := t.inFlight[leaseUUID]
 	if exists {
 		delete(t.inFlight, leaseUUID)
-		metrics.InFlightProvisions.Dec()
+		metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 	}
 	return provision, exists
 }
@@ -271,5 +271,5 @@ func (t *DefaultInFlightTracker) TrackInFlightWithStartTime(leaseUUID, tenant st
 		Backend:   backendName,
 		StartTime: startTime,
 	}
-	metrics.InFlightProvisions.Inc()
+	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 }

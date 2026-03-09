@@ -34,12 +34,16 @@ type HandlerDeps struct {
 // It encapsulates all handler methods and their dependencies.
 type HandlerSet struct {
 	deps            HandlerDeps
-	awaitingPayload sync.Map // tracks lease UUIDs awaiting payload for gauge accuracy
+	awaitingMu      sync.Mutex
+	awaitingPayload map[string]struct{} // tracks lease UUIDs awaiting payload for gauge accuracy
 }
 
 // NewHandlerSet creates a new HandlerSet with the given dependencies.
 func NewHandlerSet(deps HandlerDeps) *HandlerSet {
-	return &HandlerSet{deps: deps}
+	return &HandlerSet{
+		deps:            deps,
+		awaitingPayload: make(map[string]struct{}),
+	}
 }
 
 // rejectOnValidationError rejects a lease on chain after a validation error.
@@ -92,9 +96,10 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	// Check if lease requires a payload (has MetaHash)
 	// If so, skip immediate provisioning - wait for payload upload
 	if len(lease.MetaHash) > 0 {
-		if _, alreadyTracked := h.awaitingPayload.LoadOrStore(event.LeaseUUID, struct{}{}); !alreadyTracked {
-			metrics.LeasesAwaitingPayload.Inc()
-		}
+		h.awaitingMu.Lock()
+		h.awaitingPayload[event.LeaseUUID] = struct{}{}
+		metrics.LeasesAwaitingPayload.Set(float64(len(h.awaitingPayload)))
+		h.awaitingMu.Unlock()
 		slog.Info("lease requires payload, awaiting upload",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
@@ -138,10 +143,11 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 
 	slog.Info("processing lease close", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant, "topic", topic)
 
-	// If the lease was still awaiting payload, decrement the gauge.
-	if _, loaded := h.awaitingPayload.LoadAndDelete(event.LeaseUUID); loaded {
-		metrics.LeasesAwaitingPayload.Dec()
-	}
+	// If the lease was still awaiting payload, update the gauge.
+	h.awaitingMu.Lock()
+	delete(h.awaitingPayload, event.LeaseUUID)
+	metrics.LeasesAwaitingPayload.Set(float64(len(h.awaitingPayload)))
+	h.awaitingMu.Unlock()
 
 	// Clean up any stored payload for this lease.
 	// This handles the case where a tenant uploaded a payload but canceled the lease
@@ -395,10 +401,11 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		"tenant", event.Tenant,
 	)
 
-	// Lease is no longer awaiting payload — decrement gauge if it was tracked.
-	if _, loaded := h.awaitingPayload.LoadAndDelete(event.LeaseUUID); loaded {
-		metrics.LeasesAwaitingPayload.Dec()
-	}
+	// Lease is no longer awaiting payload — update gauge.
+	h.awaitingMu.Lock()
+	delete(h.awaitingPayload, event.LeaseUUID)
+	metrics.LeasesAwaitingPayload.Set(float64(len(h.awaitingPayload)))
+	h.awaitingMu.Unlock()
 
 	// Fetch lease details from chain to get SKU for routing
 	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)

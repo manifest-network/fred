@@ -1352,6 +1352,151 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallb
 	assert.Equal(t, 1.0, after-before, "NonInFlightCallbacksTotal should increment by 1")
 }
 
+func TestHandlerSet_LeasesAwaitingGauge_MatchesMapSize(t *testing.T) {
+	// Two leases with MetaHash → both should be awaiting payload
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:     leaseUUID,
+				Tenant:   "tenant-a",
+				State:    billingtypes.LEASE_STATE_PENDING,
+				MetaHash: []byte{0x01, 0x02},
+				Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}, nil
+		},
+	}
+
+	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
+
+	// Create two leases awaiting payload
+	for _, id := range []string{"lease-1", "lease-2"} {
+		msg := newLeaseEventMsg(t, chain.LeaseEvent{
+			Type:      chain.LeaseCreated,
+			LeaseUUID: id,
+			Tenant:    "tenant-a",
+		})
+		err := hs.HandleLeaseCreated(msg)
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, 2.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+
+	// Close one lease → gauge should drop
+	mockChain.GetLeaseFunc = func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+		return nil, nil
+	}
+	closeMsg := newLeaseEventMsg(t, chain.LeaseEvent{
+		Type:      chain.LeaseClosed,
+		LeaseUUID: "lease-1",
+		Tenant:    "tenant-a",
+	})
+	err := hs.HandleLeaseClosed(closeMsg)
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+
+	// Close same lease again → gauge unchanged (idempotent)
+	err = hs.HandleLeaseClosed(closeMsg)
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+
+	// Close the other lease
+	closeMsg2 := newLeaseEventMsg(t, chain.LeaseEvent{
+		Type:      chain.LeaseClosed,
+		LeaseUUID: "lease-2",
+		Tenant:    "tenant-a",
+	})
+	err = hs.HandleLeaseClosed(closeMsg2)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+}
+
+func TestHandlerSet_LeasesAwaitingGauge_DuplicateLeaseCreatedDoesNotDrift(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:     leaseUUID,
+				Tenant:   "tenant-a",
+				State:    billingtypes.LEASE_STATE_PENDING,
+				MetaHash: []byte{0x01, 0x02},
+				Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}, nil
+		},
+	}
+
+	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
+
+	// Send the same lease-created event twice (Watermill retry)
+	for range 2 {
+		msg := newLeaseEventMsg(t, chain.LeaseEvent{
+			Type:      chain.LeaseCreated,
+			LeaseUUID: "lease-dup",
+			Tenant:    "tenant-a",
+		})
+		err := hs.HandleLeaseCreated(msg)
+		assert.NoError(t, err)
+	}
+
+	// With set-based gauge, duplicates don't cause drift
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+
+	// Single close should bring gauge to 0
+	mockChain.GetLeaseFunc = func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+		return nil, nil
+	}
+	closeMsg := newLeaseEventMsg(t, chain.LeaseEvent{
+		Type:      chain.LeaseClosed,
+		LeaseUUID: "lease-dup",
+		Tenant:    "tenant-a",
+	})
+	err := hs.HandleLeaseClosed(closeMsg)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+}
+
+func TestHandlerSet_LeasesAwaitingGauge_PayloadReceivedDecrementsGauge(t *testing.T) {
+	store, err := payload.NewStore(payload.StoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "payload.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Store payload so HandlePayloadReceived can read it
+	store.Store("lease-pay", []byte("manifest-data"))
+
+	mb := &mockManagerBackend{name: "test-backend"}
+	mockChain := &chain.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:     leaseUUID,
+				Tenant:   "tenant-a",
+				State:    billingtypes.LEASE_STATE_PENDING,
+				MetaHash: []byte{0x01, 0x02},
+				Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}, nil
+		},
+	}
+
+	hs, _ := newTestHandlerSet(mockChain, mb, nil, store)
+
+	// Create lease awaiting payload
+	createMsg := newLeaseEventMsg(t, chain.LeaseEvent{
+		Type:      chain.LeaseCreated,
+		LeaseUUID: "lease-pay",
+		Tenant:    "tenant-a",
+	})
+	err = hs.HandleLeaseCreated(createMsg)
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+
+	// Payload received → gauge should drop
+	payMsg := newLeaseEventMsg_raw(t, payload.Event{
+		LeaseUUID: "lease-pay",
+		Tenant:    "tenant-a",
+	})
+	err = hs.HandlePayloadReceived(payMsg)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.LeasesAwaitingPayload))
+}
+
 // --- Helper ---
 
 // newCallbackMsg creates a Watermill message from a CallbackPayload.

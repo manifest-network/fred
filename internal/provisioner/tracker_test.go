@@ -8,10 +8,12 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 func TestTracker_TrackInFlight(t *testing.T) {
@@ -252,6 +254,82 @@ func TestTracker_GetTimedOutProvisions_None(t *testing.T) {
 
 	timedOut := tracker.GetTimedOutProvisions(1 * time.Hour)
 	assert.Empty(t, timedOut)
+}
+
+func TestTracker_InFlightGauge_MatchesMapSize(t *testing.T) {
+	tracker := NewInFlightTracker()
+	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}
+
+	gaugeValue := func() float64 {
+		return promtestutil.ToFloat64(metrics.InFlightProvisions)
+	}
+
+	// Track 3 leases — gauge should equal map size
+	tracker.TrackInFlight("lease-1", "t", items, "b")
+	tracker.TrackInFlight("lease-2", "t", items, "b")
+	tracker.TrackInFlight("lease-3", "t", items, "b")
+	assert.Equal(t, 3.0, gaugeValue())
+
+	// Untrack 1
+	tracker.UntrackInFlight("lease-2")
+	assert.Equal(t, 2.0, gaugeValue())
+
+	// Pop 1
+	tracker.PopInFlight("lease-1")
+	assert.Equal(t, 1.0, gaugeValue())
+
+	// Untrack remaining
+	tracker.UntrackInFlight("lease-3")
+	assert.Equal(t, 0.0, gaugeValue())
+}
+
+func TestTracker_InFlightGauge_OverwriteDoesNotDrift(t *testing.T) {
+	tracker := NewInFlightTracker()
+	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}
+
+	// Track the same lease twice (overwrite). With Inc/Dec this would
+	// double-increment the gauge; with Set(len) it stays correct.
+	tracker.TrackInFlight("lease-1", "tenant-a", items, "backend-1")
+	tracker.TrackInFlight("lease-1", "tenant-b", items, "backend-2")
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.InFlightProvisions),
+		"gauge must reflect map size (1), not number of TrackInFlight calls (2)")
+
+	// Single untrack should bring gauge to 0
+	tracker.UntrackInFlight("lease-1")
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.InFlightProvisions))
+}
+
+func TestTracker_InFlightGauge_DoubleUntrackDoesNotGoNegative(t *testing.T) {
+	tracker := NewInFlightTracker()
+
+	tracker.TrackInFlight("lease-1", "t", nil, "b")
+	tracker.UntrackInFlight("lease-1")
+	tracker.UntrackInFlight("lease-1") // no-op
+
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.InFlightProvisions))
+}
+
+func TestTracker_InFlightGauge_PopNonexistent(t *testing.T) {
+	tracker := NewInFlightTracker()
+
+	tracker.TrackInFlight("lease-1", "t", nil, "b")
+	tracker.PopInFlight("nonexistent")
+
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.InFlightProvisions))
+}
+
+func TestTracker_InFlightGauge_TryTrack(t *testing.T) {
+	tracker := NewInFlightTracker()
+	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}
+
+	ok := tracker.TryTrackInFlight("lease-1", "t", items, "b")
+	assert.True(t, ok)
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.InFlightProvisions))
+
+	// Duplicate — should not change gauge
+	ok = tracker.TryTrackInFlight("lease-1", "t", items, "b")
+	assert.False(t, ok)
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.InFlightProvisions))
 }
 
 func TestTracker_RoutingSKU(t *testing.T) {
