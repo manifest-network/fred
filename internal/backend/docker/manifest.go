@@ -200,7 +200,7 @@ func (m *DockerManifest) validate(inStack bool) error {
 	}
 
 	// Validate port specifications
-	ingressHintCount := 0
+	var ingressPorts []string
 	for portSpec, portCfg := range m.Ports {
 		if err := validatePortSpec(portSpec); err != nil {
 			return fmt.Errorf("invalid port %q: %w", portSpec, err)
@@ -209,15 +209,14 @@ func (m *DockerManifest) validate(inStack bool) error {
 			return fmt.Errorf("invalid port %q: host_port must be between 0 and 65535", portSpec)
 		}
 		if portCfg.Ingress {
-			ingressHintCount++
-			parts := strings.SplitN(portSpec, "/", 2)
-			if len(parts) != 2 || strings.ToLower(parts[1]) != "tcp" {
+			ingressPorts = append(ingressPorts, portSpec)
+			if _, ok := parseTCPPort(portSpec); !ok {
 				return fmt.Errorf("invalid port %q: ingress hint requires TCP protocol", portSpec)
 			}
 		}
 	}
-	if ingressHintCount > 1 {
-		return fmt.Errorf("at most one port may have ingress set to true")
+	if len(ingressPorts) > 1 {
+		return fmt.Errorf("at most one port may have ingress set to true, got %v", ingressPorts)
 	}
 
 	// Validate health check if present
