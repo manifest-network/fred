@@ -81,32 +81,34 @@ func (m *tcBandwidthManager) Validate() error {
 	const probeName = "ifb-fred-probe"
 
 	ifb := &netlink.Ifb{LinkAttrs: netlink.LinkAttrs{Name: probeName}}
-	if err := netlink.LinkAdd(ifb); err != nil {
+	err := netlink.LinkAdd(ifb)
+
+	// If EEXIST, a previous run left a stale probe — delete it and retry once.
+	if errors.Is(err, syscall.EEXIST) {
+		if stale, lookupErr := netlink.LinkByName(probeName); lookupErr == nil {
+			_ = netlink.LinkDel(stale) //nolint:errcheck // best-effort cleanup
+		}
+		err = netlink.LinkAdd(ifb)
+	}
+
+	if err != nil {
 		// If we lack CAP_NET_ADMIN, egress shaping will also fail.
 		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
 			return fmt.Errorf("CAP_NET_ADMIN required for bandwidth shaping: %w", err)
 		}
-		// If EEXIST, a previous run left a stale probe — delete it and retry.
+		// Persistent EEXIST after delete+retry means the IFB module IS loaded
+		// (the device exists), but the stale probe could not be removed. Treat
+		// IFB as available since the module is clearly present.
 		if errors.Is(err, syscall.EEXIST) {
-			if stale, lookupErr := netlink.LinkByName(probeName); lookupErr == nil {
-				_ = netlink.LinkDel(stale) //nolint:errcheck // best-effort cleanup
-			}
-			// Retry once.
-			if retryErr := netlink.LinkAdd(ifb); retryErr != nil {
-				if errors.Is(retryErr, syscall.EPERM) || errors.Is(retryErr, syscall.EACCES) {
-					return fmt.Errorf("CAP_NET_ADMIN required for bandwidth shaping: %w", retryErr)
-				}
-				m.logger.Warn("IFB kernel module not available — ingress (upload) bandwidth shaping will be disabled; "+
-					"egress (download) shaping still works. Load the ifb module: modprobe ifb",
-					"error", retryErr)
-				return nil
-			}
-		} else {
-			m.logger.Warn("IFB kernel module not available — ingress (upload) bandwidth shaping will be disabled; "+
-				"egress (download) shaping still works. Load the ifb module: modprobe ifb",
-				"error", err)
+			m.logger.Warn("stale IFB probe device could not be removed; treating IFB as available",
+				"device", probeName, "error", err)
+			m.ifbSupport = true
 			return nil
 		}
+		m.logger.Warn("IFB kernel module not available — ingress (upload) bandwidth shaping will be disabled; "+
+			"egress (download) shaping still works. Load the ifb module: modprobe ifb",
+			"error", err)
+		return nil
 	}
 	// Probe succeeded — clean up and record support.
 	if delErr := netlink.LinkDel(ifb); delErr != nil {
@@ -312,8 +314,10 @@ func applyTBF(link netlink.Link, rate uint64, burst, limit uint32) error {
 
 // applyIngressViaIFB creates an IFB device, attaches an ingress qdisc to the
 // veth, redirects all ingress traffic to the IFB, and applies TBF on the IFB.
-// If any step after IFB creation fails, the IFB device and any ingress qdisc
-// installed on the veth are cleaned up to avoid leaving stale redirects.
+// If the IFB already exists (EEXIST), it is reused to make Apply idempotent.
+// On failure: if we created the IFB, both the IFB device and the ingress qdisc
+// are cleaned up. If we reused a pre-existing IFB, cleanup is skipped to
+// preserve the old working setup.
 func applyIngressViaIFB(veth netlink.Link, ifbName string, rate uint64, burst, limit uint32) (retErr error) {
 	// Create IFB device. If it already exists (e.g., stale from a previous
 	// Apply), reuse it to make Apply idempotent for a given containerID.
@@ -327,28 +331,25 @@ func applyIngressViaIFB(veth netlink.Link, ifbName string, rate uint64, burst, l
 		}
 	}
 
-	// Clean up IFB device and ingress qdisc if any subsequent step fails.
-	ingressInstalled := false
+	// Clean up on failure. When we created the IFB, clean up both the ingress
+	// qdisc and the IFB device. When reusing a pre-existing IFB, skip cleanup
+	// entirely to preserve the old working setup.
 	success := false
 	defer func() {
-		if !success {
-			// Remove ingress qdisc from the veth if we installed one.
-			if ingressInstalled {
-				ingress := &netlink.Ingress{
-					QdiscAttrs: netlink.QdiscAttrs{
-						LinkIndex: veth.Attrs().Index,
-						Handle:    netlink.MakeHandle(0xffff, 0),
-						Parent:    netlink.HANDLE_INGRESS,
-					},
-				}
-				_ = netlink.QdiscDel(ingress) //nolint:errcheck // best-effort cleanup
-			}
-			// Only delete IFB if we created it (not if reused).
-			if createdIFB {
-				if delErr := netlink.LinkDel(ifb); delErr != nil {
-					retErr = errors.Join(retErr, fmt.Errorf("IFB cleanup of %s failed: %w", ifbName, delErr))
-				}
-			}
+		if success || !createdIFB {
+			return
+		}
+		// Best-effort: remove ingress qdisc from the veth.
+		ingress := &netlink.Ingress{
+			QdiscAttrs: netlink.QdiscAttrs{
+				LinkIndex: veth.Attrs().Index,
+				Handle:    netlink.MakeHandle(0xffff, 0),
+				Parent:    netlink.HANDLE_INGRESS,
+			},
+		}
+		_ = netlink.QdiscDel(ingress) //nolint:errcheck // best-effort cleanup
+		if delErr := netlink.LinkDel(ifb); delErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("IFB cleanup of %s failed: %w", ifbName, delErr))
 		}
 	}()
 
@@ -372,7 +373,6 @@ func applyIngressViaIFB(veth netlink.Link, ifbName string, rate uint64, burst, l
 	if err := netlink.QdiscReplace(ingress); err != nil {
 		return fmt.Errorf("add ingress qdisc to %s: %w", veth.Attrs().Name, err)
 	}
-	ingressInstalled = true
 
 	// Redirect all ingress traffic to the IFB device.
 	filter := &netlink.U32{
