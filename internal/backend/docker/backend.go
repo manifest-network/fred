@@ -54,12 +54,13 @@ type ContainerEvent struct {
 
 // Backend implements the backend.Backend interface for Docker containers.
 type Backend struct {
-	cfg     Config
-	docker  dockerClient
-	compose composeExecutor
-	pool    *shared.ResourcePool
-	volumes volumeManager
-	logger  *slog.Logger
+	cfg       Config
+	docker    dockerClient
+	compose   composeExecutor
+	pool      *shared.ResourcePool
+	volumes   volumeManager
+	bandwidth bandwidthManager
+	logger    *slog.Logger
 
 	// provisions tracks active provisions by lease UUID
 	provisions   map[string]*provision
@@ -287,6 +288,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		cfg.TotalCPUCores,
 		cfg.TotalMemoryMB,
 		cfg.TotalDiskMB,
+		cfg.TotalBandwidthMbps,
 		cfg.GetSKUProfile, // Use Config's resolver to avoid duplicating SKU mapping logic
 		cfg.TenantQuota,
 	)
@@ -355,6 +357,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		compose:          composeSvc,
 		pool:             pool,
 		volumes:          volumes,
+		bandwidth:        newBandwidthManager(docker, cfg.HasBandwidthSKUs(), logger),
 		logger:           logger.With("backend", cfg.Name),
 		provisions:       make(map[string]*provision),
 		callbackStore:    cbStore,
@@ -392,6 +395,11 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Validate volume manager (filesystem support, permissions)
 	if err := b.volumes.Validate(); err != nil {
 		return fmt.Errorf("volume manager validation failed: %w", err)
+	}
+
+	// Validate bandwidth manager (CAP_NET_ADMIN, IFB kernel module)
+	if err := b.bandwidth.Validate(); err != nil {
+		return fmt.Errorf("bandwidth manager validation failed: %w", err)
 	}
 
 	// Check daemon capabilities for hardening configuration
@@ -513,6 +521,19 @@ func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, lo
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Resolve bandwidth profile once before the loop (SKU doesn't change between containers).
+	var rollbackProfile SKUProfile
+	b.provisionsMu.RLock()
+	if prov, ok := b.provisions[leaseUUID]; ok {
+		if p, profErr := b.cfg.GetSKUProfile(prov.SKU); profErr == nil {
+			rollbackProfile = p
+		} else {
+			logger.Warn("rollback: could not resolve SKU profile for bandwidth",
+				"sku", prov.SKU, "error", profErr)
+		}
+	}
+	b.provisionsMu.RUnlock()
+
 	restored := 0
 	for i, cid := range containerIDs {
 		// Check if container needs rollback — it might still be running if
@@ -535,6 +556,7 @@ func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, lo
 			logger.Error("rollback: failed to restart container", "container_id", shortID(cid), "error", err)
 		} else {
 			restored++
+			b.applyBandwidthLimit(ctx, cid, rollbackProfile, logger)
 		}
 	}
 	return restored == len(containerIDs)

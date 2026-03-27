@@ -202,6 +202,13 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 				}
 			}
 
+			// Clean up IFB devices for failed new containers before rollback.
+			bwCleanupCtx, bwCleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer bwCleanupCancel()
+			for _, cid := range newContainerIDs {
+				b.removeBandwidthLimit(bwCleanupCtx, cid, op.Logger)
+			}
+
 			// Rollback: rebuild the Project from the previous StackManifest and
 			// Compose Up to restore the old containers.
 			restored := b.rollbackStackViaCompose(op)
@@ -321,6 +328,11 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 		Ingress:      b.cfg.Ingress,
 	})
 
+	// Clean up IFB devices for old containers before Compose replaces them.
+	for _, cid := range op.OldContainerIDs {
+		b.removeBandwidthLimit(ctx, cid, op.Logger)
+	}
+
 	op.Logger.Info("compose up for "+op.Operation, "project", projectName, "services", len(project.Services))
 	forceRecreate := op.Operation == "restart"
 	if upErr := b.compose.Up(ctx, project, composeUpOpts{ForceRecreate: forceRecreate}); upErr != nil {
@@ -338,6 +350,9 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	}
 
 	newContainerIDs, newServiceContainers = mapComposeContainers(containers, op.Items)
+
+	// Apply bandwidth limits per-container (best-effort).
+	b.applyStackBandwidthLimits(ctx, op.Items, op.Profiles, newServiceContainers, op.Logger)
 
 	// Verify startup per-service so each service uses its own health check config.
 	for svcName, svcCIDs := range newServiceContainers {
@@ -435,6 +450,10 @@ func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
 	}
 
 	containerIDs, serviceContainers := mapComposeContainers(containers, op.Items)
+
+	// Re-apply bandwidth limits to restored containers (best-effort).
+	b.applyStackBandwidthLimits(rollbackCtx, op.Items, op.Profiles, serviceContainers, op.Logger)
+
 	b.provisionsMu.Lock()
 	if p, ok := b.provisions[op.LeaseUUID]; ok {
 		p.ContainerIDs = containerIDs
@@ -524,10 +543,11 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				}
 			}
 
-			// Clean up failed new containers.
+			// Clean up failed new containers (IFB devices + containers).
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
 			for _, cid := range newContainerIDs {
+				b.removeBandwidthLimit(cleanupCtx, cid, op.Logger)
 				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
 					op.Logger.Warn("failed to cleanup container after "+op.Operation+" error", "container_id", shortID(cid), "error", rmErr)
 				}
@@ -574,6 +594,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
 		for _, cid := range op.OldContainerIDs {
+			b.removeBandwidthLimit(cleanupCtx, cid, op.Logger)
 			if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
 				op.Logger.Warn("failed to remove old container after "+op.Operation, "container_id", shortID(cid), "error", rmErr)
 			}
@@ -717,6 +738,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			callbackErr = op.Operation + " failed"
 			return
 		}
+		b.applyBandwidthLimit(ctx, containerID, op.Profile, op.Logger)
 	}
 
 	// Startup verification.

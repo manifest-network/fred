@@ -55,6 +55,11 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	// removal if Compose fails. For single-container leases, use RemoveContainer.
 	var errs []error
 	var failedIDs []string
+	// Remove IFB devices for all containers before removal.
+	for _, cid := range containerIDs {
+		b.removeBandwidthLimit(ctx, cid, logger)
+	}
+
 	if isStack {
 		stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 		if downErr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); downErr != nil {

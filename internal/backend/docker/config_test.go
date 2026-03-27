@@ -522,6 +522,61 @@ func TestConfig_Validate_TenantQuota(t *testing.T) {
 		}
 		require.NoError(t, cfg.Validate())
 	})
+
+	t.Run("quota bandwidth exceeds total", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &shared.TenantQuotaConfig{
+			MaxCPUCores:      4.0,
+			MaxMemoryMB:      8192,
+			MaxDiskMB:        51200,
+			MaxBandwidthMbps: 9999, // exceeds TotalBandwidthMbps
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "tenant_quota.max_bandwidth_mbps")
+		assert.ErrorContains(t, err, "exceeds total_bandwidth_mbps")
+	})
+
+	t.Run("quota bandwidth zero is valid", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TenantQuota = &shared.TenantQuotaConfig{
+			MaxCPUCores:      4.0,
+			MaxMemoryMB:      8192,
+			MaxDiskMB:        51200,
+			MaxBandwidthMbps: 0, // no bandwidth quota
+		}
+		require.NoError(t, cfg.Validate())
+	})
+}
+
+func TestConfig_Validate_Bandwidth(t *testing.T) {
+	t.Run("bandwidth SKUs require total_bandwidth_mbps", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TotalBandwidthMbps = 0
+		cfg.SKUProfiles["small"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024, BandwidthMbps: 100}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "total_bandwidth_mbps must be positive")
+	})
+
+	t.Run("no bandwidth SKUs allows zero total_bandwidth_mbps", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TotalBandwidthMbps = 0
+		// Override profiles to have no bandwidth
+		cfg.SKUProfiles = map[string]SKUProfile{
+			"nobw": {CPUCores: 1, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 0},
+		}
+		cfg.SKUMapping = nil
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("negative kernel_hz rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.KernelHZ = -1
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "kernel_hz must be non-negative")
+	})
 }
 
 func TestConfig_Validate_IngressRequiresNetworkIsolation(t *testing.T) {
@@ -647,6 +702,30 @@ func TestConfig_Helpers(t *testing.T) {
 	t.Run("GetTmpfsSizeMB custom", func(t *testing.T) {
 		cfg := Config{ContainerTmpfsSizeMB: 128}
 		assert.Equal(t, 128, cfg.GetTmpfsSizeMB())
+	})
+
+	t.Run("HasBandwidthSKUs false", func(t *testing.T) {
+		cfg := Config{SKUProfiles: map[string]SKUProfile{
+			"nobw": {CPUCores: 1, MemoryMB: 512, BandwidthMbps: 0},
+		}}
+		assert.False(t, cfg.HasBandwidthSKUs())
+	})
+
+	t.Run("HasBandwidthSKUs true", func(t *testing.T) {
+		cfg := Config{SKUProfiles: map[string]SKUProfile{
+			"bw": {CPUCores: 1, MemoryMB: 512, BandwidthMbps: 100},
+		}}
+		assert.True(t, cfg.HasBandwidthSKUs())
+	})
+
+	t.Run("GetKernelHZ default", func(t *testing.T) {
+		cfg := Config{}
+		assert.Equal(t, 250, cfg.GetKernelHZ())
+	})
+
+	t.Run("GetKernelHZ custom", func(t *testing.T) {
+		cfg := Config{KernelHZ: 1000}
+		assert.Equal(t, 1000, cfg.GetKernelHZ())
 	})
 
 	t.Run("HasStatefulSKUs false", func(t *testing.T) {

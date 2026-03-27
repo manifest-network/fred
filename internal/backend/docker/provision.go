@@ -89,6 +89,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		// across re-provisions. Volumes are reused via idempotent Create in
 		// doProvision, and only destroyed on explicit deprovision.
 		for _, cid := range oldContainerIDs {
+			b.removeBandwidthLimit(ctx, cid, logger)
 			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
 				logger.Warn("failed to remove old container during re-provision",
 					"container_id", shortID(cid), "error", err)
@@ -595,6 +596,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
 			for _, cid := range containerIDs {
+				b.removeBandwidthLimit(cleanupCtx, cid, logger)
 				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
 					logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
 				}
@@ -809,6 +811,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				return
 			}
 
+			b.applyBandwidthLimit(ctx, containerID, profile, instanceLogger)
 			instanceLogger.Info("container provisioned successfully", "container_id", shortID(containerID))
 			instanceIndex++
 		}
@@ -859,9 +862,12 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 			b.provisionsMu.Unlock()
 			b.persistDiagnostics(diagSnap, containerIDs, stackContainerLogKeys(serviceContainers))
 
-			// Clean up via Compose Down (removes all project containers).
+			// Clean up IFB devices and containers via Compose Down.
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
+			for _, cid := range containerIDs {
+				b.removeBandwidthLimit(cleanupCtx, cid, logger)
+			}
 			if downErr := b.compose.Down(cleanupCtx, projectName, 10*time.Second); downErr != nil {
 				logger.Warn("compose down failed during cleanup, falling back to individual removal", "error", downErr)
 				for _, cid := range containerIDs {
@@ -1011,6 +1017,9 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 	}
 
 	containerIDs, serviceContainers = mapComposeContainers(containers, req.Items)
+
+	// Apply bandwidth limits per-container (best-effort).
+	b.applyStackBandwidthLimits(ctx, req.Items, profiles, serviceContainers, logger)
 
 	// Verify startup per-service so each service uses its own health check config.
 	for svcName, svcCIDs := range serviceContainers {

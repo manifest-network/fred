@@ -24,6 +24,8 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 | TotalCPUCores | `total_cpu_cores` | float64 | `8.0` | Total CPU cores in the resource pool |
 | TotalMemoryMB | `total_memory_mb` | int64 | `16384` | Total memory available (MB) |
 | TotalDiskMB | `total_disk_mb` | int64 | `102400` | Total disk space available (MB) |
+| TotalBandwidthMbps | `total_bandwidth_mbps` | int64 | `1000` | Total link bandwidth (Mbps). Required when any SKU has `bandwidth_mbps > 0` |
+| KernelHZ | `kernel_hz` | int | `250` | Host kernel `CONFIG_HZ` value. Affects auto-calculated burst floor. Common values: 100, 250, 300, 1000 |
 
 ### SKU Management
 
@@ -34,12 +36,14 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 
 Default SKU profiles:
 
-| Profile | CPU Cores | Memory MB | Disk MB |
-|---|---|---|---|
-| `docker-micro` | 0.25 | 256 | 512 |
-| `docker-small` | 0.5 | 512 | 1024 |
-| `docker-medium` | 1.0 | 1024 | 2048 |
-| `docker-large` | 2.0 | 2048 | 4096 |
+| Profile | CPU Cores | Memory MB | Disk MB | Bandwidth Mbps |
+|---|---|---|---|---|
+| `docker-micro` | 0.25 | 256 | 512 | 10 |
+| `docker-small` | 0.5 | 512 | 1024 | 50 |
+| `docker-medium` | 1.0 | 1024 | 2048 | 100 |
+| `docker-large` | 2.0 | 2048 | 4096 | 250 |
+
+SKU profiles support per-container bandwidth limiting via `bandwidth_mbps` (0 = unlimited, not pool-tracked). Optional tuning: `burst_kb` (0 = auto-calculated from rate and kernel HZ) and `latency_ms` (0 = default 50ms).
 
 SKU resolution: the backend first checks `SKUMapping` for a UUID-to-name translation, then looks up the name in `SKUProfiles`. This allows on-chain UUIDs to map to human-readable profile names.
 
@@ -84,8 +88,9 @@ When a provision fails (during provisioning, state recovery, or partial deprovis
 | TenantQuota.MaxCPUCores | `tenant_quota.max_cpu_cores` | float64 | - | Maximum CPU cores per tenant |
 | TenantQuota.MaxMemoryMB | `tenant_quota.max_memory_mb` | int64 | - | Maximum memory per tenant (MB) |
 | TenantQuota.MaxDiskMB | `tenant_quota.max_disk_mb` | int64 | - | Maximum disk per tenant (MB) |
+| TenantQuota.MaxBandwidthMbps | `tenant_quota.max_bandwidth_mbps` | int64 | `0` | Maximum bandwidth per tenant (Mbps). 0 = no bandwidth quota |
 
-When `tenant_quota` is configured, no single tenant can consume more than the specified limits, even if the resource pool has capacity available. Quota values cannot exceed the total pool capacity.
+When `tenant_quota` is configured, no single tenant can consume more than the specified limits, even if the resource pool has capacity available. CPU, memory, and disk quota values cannot exceed the total pool capacity. Bandwidth quota is optional (0 = no per-tenant bandwidth limit); when set, it cannot exceed `total_bandwidth_mbps`.
 
 ### Timeouts
 
@@ -181,6 +186,9 @@ When provisioning `redis:latest` on this SKU:
 | CPUCores | `cpu_cores` | float64 | — | CPU cores allocated to each container |
 | MemoryMB | `memory_mb` | int64 | — | Memory in MB allocated to each container |
 | DiskMB | `disk_mb` | int64 | `0` | Disk budget in MB. When `> 0`, a quota-enforced host directory is bind-mounted to image VOLUME paths (requires `volume_data_path`). When `0`, image VOLUME paths are overridden with tmpfs |
+| BandwidthMbps | `bandwidth_mbps` | int64 | `0` | Per-container bandwidth limit in Mbps. 0 = unlimited (not pool-tracked). Max: 100000 |
+| BurstKB | `burst_kb` | int | `0` | Burst allowance in KB. 0 = auto-calculated from rate and kernel HZ. Max: 1048576 |
+| LatencyMs | `latency_ms` | int | `0` | Max queuing latency in ms. 0 = default 50ms. Max: 10000 |
 
 ## Tenant Manifest Reference
 
@@ -565,12 +573,15 @@ Resource pool usage.
   "total_cpu_cores": 8.0,
   "total_memory_mb": 16384,
   "total_disk_mb": 102400,
+  "total_bandwidth_mbps": 1000,
   "allocated_cpu_cores": 2.5,
   "allocated_memory_mb": 4096,
   "allocated_disk_mb": 10240,
+  "allocated_bandwidth_mbps": 350,
   "available_cpu_cores": 5.5,
   "available_memory_mb": 12288,
   "available_disk_mb": 92160,
+  "available_bandwidth_mbps": 650,
   "active_containers": 5
 }
 ```
@@ -581,12 +592,12 @@ Prometheus metrics in exposition format. Served by `promhttp.Handler()`.
 
 ## Resource Pool
 
-The resource pool tracks CPU, memory, and disk allocations.
+The resource pool tracks CPU, memory, disk, and bandwidth allocations.
 
 - **Allocation IDs** are per-instance: `<lease-uuid>-<instance-index>` for single-container leases (e.g., `abc123-0`, `abc123-1`), or `<lease-uuid>-<service-name>-<instance-index>` for stack leases (e.g., `abc123-web-0`, `abc123-db-0`).
-- **TryAllocate** atomically checks capacity and reserves resources for a SKU. On insufficient resources, returns an error and the caller rolls back any partial allocations.
+- **TryAllocate** atomically checks capacity and reserves resources for a SKU. On insufficient resources, returns an error and the caller rolls back any partial allocations. SKUs with `bandwidth_mbps = 0` (unlimited) skip the bandwidth check and do not consume pool bandwidth.
 - **Release** is idempotent -- releasing a non-existent allocation is a no-op.
-- **Stats** returns total, allocated, and available CPU/memory/disk.
+- **Stats** returns total, allocated, and available CPU/memory/disk/bandwidth.
 - **Reset** clears all allocations and rebuilds from a provided list. Used during state recovery to synchronize with Docker's actual state.
 
 ## Tenant Network Isolation
@@ -631,40 +642,39 @@ User-provided labels in the manifest are also applied, but may not use the `fred
 
 ## Bandwidth Limiting
 
-Network bandwidth limiting is an operational concern handled outside of the docker-backend process. Operators can use Linux `tc` (traffic control) to rate-limit container network traffic on the host.
+The docker-backend applies per-container network bandwidth limits using Linux `tc` (traffic control) with TBF (Token Bucket Filter) qdiscs on host-side veth interfaces. This is the same approach used by the Kubernetes CNI bandwidth plugin.
 
-### Identifying container interfaces
+### How it works
 
-Each Docker container gets a veth pair. The host-side interface can be found by inspecting the container's network namespace:
+When a container is started with a bandwidth-limited SKU (`bandwidth_mbps > 0`):
 
-```bash
-# Get the container's PID
-PID=$(docker inspect --format '{{.State.Pid}}' <container_id>)
+1. The backend finds the host-side veth by entering the container's network namespace via `netns`
+2. **Egress shaping** (limits container download): applies a TBF qdisc on the host-veth's egress
+3. **Ingress shaping** (limits container upload): creates a per-container IFB device, redirects ingress traffic to it, and applies TBF on the IFB's egress
 
-# Get the veth peer index from inside the container's namespace
-PEER_IDX=$(nsenter -t $PID -n ip link show eth0 | grep -oP '(?<=@if)\d+')
+Bandwidth limits are applied after `StartContainer` in all provisioning paths: initial provision, restart, update, and rollback. On deprovision, IFB devices are cleaned up before container removal.
 
-# Find the host-side veth interface by index
-HOST_VETH=$(ip link | grep "^${PEER_IDX}:" | awk '{print $2}' | tr -d ':@')
-```
+### Configuration
 
-### Applying rate limits with tc
+Set `bandwidth_mbps` on SKU profiles to enable per-container rate limiting. Set `total_bandwidth_mbps` to the host's link capacity to enable pool-level oversubscription prevention.
 
-Use `tc` to set ingress and egress limits on the host-side veth interface:
+Optional per-SKU tuning:
+- `burst_kb`: burst allowance in KB (0 = auto-calculated from rate and kernel HZ)
+- `latency_ms`: maximum queuing latency in ms (0 = default 50ms)
 
-```bash
-# Egress (container → network): limit to 10 Mbit/s with 32KB burst
-tc qdisc add dev $HOST_VETH root tbf rate 10mbit burst 32kbit latency 50ms
+### Best-effort enforcement
 
-# Ingress (network → container): use an IFB (intermediate functional block) device
-modprobe ifb
-ip link set dev ifb0 up
-tc qdisc add dev $HOST_VETH ingress
-tc filter add dev $HOST_VETH parent ffff: protocol ip u32 match u32 0 0 \
-    action mirred egress redirect dev ifb0
-tc qdisc add dev ifb0 root tbf rate 10mbit burst 32kbit latency 50ms
-```
+Bandwidth application is best-effort: if `tc` rule application fails (e.g., missing `CAP_NET_ADMIN`, veth not found), the failure is logged as a warning and the container is still marked as successfully provisioned. This is intentional — bandwidth limiting is a quality-of-service enforcement, not a correctness requirement.
 
-### Automation
+### Deployment requirements
 
-For production use, integrate `tc` rules into a container lifecycle hook or a script triggered by Docker events (`docker events --filter event=start`). The docker-backend does not manage bandwidth limits directly to keep the provisioning path simple and avoid requiring `CAP_NET_ADMIN`.
+The docker-backend process needs `CAP_NET_ADMIN` to manipulate `tc` rules via netlink. The `ifb` kernel module must be loaded for ingress (upload) shaping. Without IFB, only egress (download) shaping is active.
+
+### Recovery
+
+After a backend restart, `tc` rules are not re-applied to existing running containers (they are kernel state tied to the veth, which may have changed). A warning is logged for each container with a bandwidth SKU. Pool accounting is correctly restored. Limits are re-applied on the next restart/update/reprovision.
+
+### Metrics
+
+- `fred_docker_backend_resource_bandwidth_allocated_ratio`: ratio of committed bandwidth to total link capacity
+- `fred_docker_backend_bandwidth_apply_total{outcome="success|failure"}`: tc rule application attempts

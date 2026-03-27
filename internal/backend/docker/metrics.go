@@ -120,6 +120,22 @@ var (
 		Name:      "reconciliation_last_success_timestamp_seconds",
 		Help:      "Unix timestamp of the last successful reconciliation run",
 	})
+
+	// resourceBandwidthAllocatedRatio tracks the ratio of allocated to total bandwidth.
+	resourceBandwidthAllocatedRatio = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "resource_bandwidth_allocated_ratio",
+		Help:      "Ratio of allocated bandwidth to total link bandwidth",
+	})
+
+	// bandwidthApplyTotal tracks bandwidth limit application attempts.
+	bandwidthApplyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "bandwidth_apply_total",
+		Help:      "Total number of bandwidth limit application attempts",
+	}, []string{"outcome"})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
@@ -132,5 +148,8 @@ func updateResourceMetrics(stats shared.ResourceStats) {
 	}
 	if stats.TotalDiskMB > 0 {
 		resourceDiskAllocatedRatio.Set(float64(stats.AllocatedDiskMB) / float64(stats.TotalDiskMB))
+	}
+	if stats.TotalBandwidthMbps > 0 {
+		resourceBandwidthAllocatedRatio.Set(float64(stats.AllocatedBandwidthMbps) / float64(stats.TotalBandwidthMbps))
 	}
 }

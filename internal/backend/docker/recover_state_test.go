@@ -265,6 +265,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		cfg.TotalCPUCores,
 		cfg.TotalMemoryMB,
 		cfg.TotalDiskMB,
+		cfg.TotalBandwidthMbps,
 		cfg.GetSKUProfile,
 		nil,
 	)
@@ -282,6 +283,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		compose:    &mockComposeExecutor{},
 		pool:       pool,
 		volumes:    &noopVolumeManager{},
+		bandwidth:  &noopBandwidthManager{},
 		logger:     slog.Default(),
 		provisions: provs,
 		stopCtx:    stopCtx,
@@ -934,7 +936,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 
 		cfg := DefaultConfig()
 		cfg.NetworkIsolation = ptrBool(true)
-		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.TotalBandwidthMbps, cfg.GetSKUProfile, nil)
 		stopCtx, stopCancel := context.WithCancel(context.Background())
 		defer stopCancel()
 
@@ -985,7 +987,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 
 		cfg := DefaultConfig()
 		cfg.NetworkIsolation = ptrBool(true)
-		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.TotalBandwidthMbps, cfg.GetSKUProfile, nil)
 		stopCtx, stopCancel := context.WithCancel(context.Background())
 		defer stopCancel()
 
@@ -1024,7 +1026,7 @@ func TestCleanupOrphanedNetworks(t *testing.T) {
 
 		cfg := DefaultConfig()
 		cfg.NetworkIsolation = ptrBool(true)
-		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+		pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.TotalBandwidthMbps, cfg.GetSKUProfile, nil)
 		stopCtx, stopCancel := context.WithCancel(context.Background())
 		defer stopCancel()
 

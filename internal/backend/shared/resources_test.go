@@ -26,7 +26,7 @@ func TestResourcePool(t *testing.T) {
 	}
 
 	t.Run("allocate and release", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		// Allocate
 		err := pool.TryAllocate("lease-1", "small", "tenant-a")
@@ -45,7 +45,7 @@ func TestResourcePool(t *testing.T) {
 
 	t.Run("insufficient resources", func(t *testing.T) {
 		// Small pool
-		pool := NewResourcePool(2.0, 1024, 2048, makeResolver(profiles), nil)
+		pool := NewResourcePool(2.0, 1024, 2048, 0, makeResolver(profiles), nil)
 
 		// First allocation succeeds
 		err := pool.TryAllocate("lease-1", "small", "tenant-a")
@@ -57,14 +57,14 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("unknown SKU", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		err := pool.TryAllocate("lease-1", "nonexistent", "tenant-a")
 		assert.Error(t, err)
 	})
 
 	t.Run("duplicate allocation", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		err := pool.TryAllocate("lease-1", "small", "tenant-a")
 		require.NoError(t, err)
@@ -74,14 +74,14 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("release nonexistent", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		// Should not panic
 		pool.Release("nonexistent")
 	})
 
 	t.Run("reset", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		// Allocate something
 		pool.TryAllocate("lease-1", "small", "tenant-a")
@@ -107,7 +107,7 @@ func TestResourcePool(t *testing.T) {
 			MaxMemoryMB: 1024,
 			MaxDiskMB:   2048,
 		}
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), quota)
 
 		// First allocation within quota succeeds
 		err := pool.TryAllocate("lease-1", "small", "tenant-a")
@@ -138,7 +138,7 @@ func TestResourcePool(t *testing.T) {
 			MaxMemoryMB: 4096,
 			MaxDiskMB:   8192,
 		}
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), quota)
 
 		pool.TryAllocate("lease-1", "small", "tenant-a")
 
@@ -158,7 +158,7 @@ func TestResourcePool(t *testing.T) {
 			MaxMemoryMB: 600,
 			MaxDiskMB:   102400,
 		}
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), quota)
 
 		err := pool.TryAllocate("lease-1", "small", "tenant-a")
 		require.NoError(t, err)
@@ -175,7 +175,7 @@ func TestResourcePool(t *testing.T) {
 			MaxMemoryMB: 16384,
 			MaxDiskMB:   1500,
 		}
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), quota)
 
 		err := pool.TryAllocate("lease-1", "small", "tenant-a")
 		require.NoError(t, err)
@@ -187,7 +187,7 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("no quota allows full pool usage by one tenant", func(t *testing.T) {
-		pool := NewResourcePool(2.0, 1024, 2048, makeResolver(profiles), nil)
+		pool := NewResourcePool(2.0, 1024, 2048, 0, makeResolver(profiles), nil)
 
 		err := pool.TryAllocate("lease-1", "small", "tenant-a")
 		require.NoError(t, err)
@@ -201,7 +201,7 @@ func TestResourcePool(t *testing.T) {
 			MaxMemoryMB: 1,
 			MaxDiskMB:   1,
 		}
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), quota)
 
 		// Empty tenant string should bypass tenant quota
 		err := pool.TryAllocate("lease-1", "small", "")
@@ -214,7 +214,7 @@ func TestResourcePool(t *testing.T) {
 			MaxMemoryMB: 1024,
 			MaxDiskMB:   2048,
 		}
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), quota)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), quota)
 
 		pool.TryAllocate("lease-1", "small", "tenant-a")
 
@@ -233,7 +233,7 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("release cleans up tenant entry at zero", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		pool.TryAllocate("lease-1", "small", "tenant-a")
 		pool.Release("lease-1")
@@ -245,7 +245,7 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("allocation stores tenant in record", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		pool.TryAllocate("lease-1", "small", "tenant-a")
 
@@ -255,7 +255,7 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("list allocations", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		pool.TryAllocate("lease-1", "small", "tenant-a")
 		pool.TryAllocate("lease-2", "large", "tenant-b")
@@ -273,7 +273,7 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("available resources", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		stats := pool.Stats()
 		assert.Equal(t, 8.0, stats.AvailableCPU())
@@ -289,7 +289,7 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("concurrent allocate and release", func(t *testing.T) {
-		pool := NewResourcePool(100.0, 102400, 1024000, makeResolver(profiles), nil)
+		pool := NewResourcePool(100.0, 102400, 1024000, 0, makeResolver(profiles), nil)
 
 		const goroutines = 20
 		var wg sync.WaitGroup
@@ -315,7 +315,7 @@ func TestResourcePool(t *testing.T) {
 
 	t.Run("insufficient memory with ample CPU and disk", func(t *testing.T) {
 		// Ample CPU (100) and disk (100000), but tight memory (600 MB)
-		pool := NewResourcePool(100.0, 600, 100000, makeResolver(profiles), nil)
+		pool := NewResourcePool(100.0, 600, 100000, 0, makeResolver(profiles), nil)
 
 		err := pool.TryAllocate("lease-1", "small", "tenant-a") // 512 MB
 		require.NoError(t, err)
@@ -327,7 +327,7 @@ func TestResourcePool(t *testing.T) {
 
 	t.Run("insufficient disk with ample CPU and memory", func(t *testing.T) {
 		// Ample CPU (100) and memory (100000), but tight disk (1500 MB)
-		pool := NewResourcePool(100.0, 100000, 1500, makeResolver(profiles), nil)
+		pool := NewResourcePool(100.0, 100000, 1500, 0, makeResolver(profiles), nil)
 
 		err := pool.TryAllocate("lease-1", "small", "tenant-a") // 1024 MB disk
 		require.NoError(t, err)
@@ -338,7 +338,7 @@ func TestResourcePool(t *testing.T) {
 	})
 
 	t.Run("TryAllocate after Reset respects restored usage", func(t *testing.T) {
-		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
+		pool := NewResourcePool(8.0, 16384, 102400, 0, makeResolver(profiles), nil)
 
 		// Reset with an allocation consuming most of the CPU
 		pool.Reset([]ResourceAllocation{
@@ -357,7 +357,135 @@ func TestResourcePool(t *testing.T) {
 
 	t.Run("nil resolver panics", func(t *testing.T) {
 		assert.Panics(t, func() {
-			NewResourcePool(8.0, 16384, 102400, nil, nil)
+			NewResourcePool(8.0, 16384, 102400, 0, nil, nil)
 		})
+	})
+
+	t.Run("bandwidth allocation reduces available bandwidth", func(t *testing.T) {
+		bwProfiles := map[string]SKUProfile{
+			"small": {CPUCores: 1.0, MemoryMB: 512, DiskMB: 1024, BandwidthMbps: 100},
+			"large": {CPUCores: 4.0, MemoryMB: 4096, DiskMB: 8192, BandwidthMbps: 250},
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, 1000, makeResolver(bwProfiles), nil)
+
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
+		require.NoError(t, err)
+
+		stats := pool.Stats()
+		assert.Equal(t, int64(100), stats.AllocatedBandwidthMbps)
+		assert.Equal(t, int64(900), stats.AvailableBandwidthMbps())
+	})
+
+	t.Run("bandwidth exhaustion", func(t *testing.T) {
+		bwProfiles := map[string]SKUProfile{
+			"big": {CPUCores: 1.0, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 600},
+		}
+		pool := NewResourcePool(100.0, 102400, 102400, 1000, makeResolver(bwProfiles), nil)
+
+		err := pool.TryAllocate("lease-1", "big", "tenant-a")
+		require.NoError(t, err)
+
+		err = pool.TryAllocate("lease-2", "big", "tenant-a")
+		assert.ErrorContains(t, err, "insufficient bandwidth")
+	})
+
+	t.Run("unlimited SKU does not consume bandwidth pool", func(t *testing.T) {
+		bwProfiles := map[string]SKUProfile{
+			"unlimited": {CPUCores: 1.0, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 0},
+			"limited":   {CPUCores: 1.0, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 500},
+		}
+		pool := NewResourcePool(100.0, 102400, 102400, 500, makeResolver(bwProfiles), nil)
+
+		// Unlimited SKU should succeed even though pool only has 500 Mbps
+		err := pool.TryAllocate("lease-1", "unlimited", "tenant-a")
+		require.NoError(t, err)
+
+		stats := pool.Stats()
+		assert.Equal(t, int64(0), stats.AllocatedBandwidthMbps)
+
+		// Limited SKU can still use the full pool
+		err = pool.TryAllocate("lease-2", "limited", "tenant-a")
+		require.NoError(t, err)
+
+		stats = pool.Stats()
+		assert.Equal(t, int64(500), stats.AllocatedBandwidthMbps)
+	})
+
+	t.Run("tenant bandwidth quota enforcement", func(t *testing.T) {
+		bwProfiles := map[string]SKUProfile{
+			"small": {CPUCores: 1.0, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 100},
+		}
+		quota := &TenantQuotaConfig{
+			MaxCPUCores:      100,
+			MaxMemoryMB:      102400,
+			MaxDiskMB:        102400,
+			MaxBandwidthMbps: 250,
+		}
+		pool := NewResourcePool(100.0, 102400, 102400, 1000, makeResolver(bwProfiles), quota)
+
+		err := pool.TryAllocate("lease-1", "small", "tenant-a")
+		require.NoError(t, err)
+		err = pool.TryAllocate("lease-2", "small", "tenant-a")
+		require.NoError(t, err)
+
+		// Third would be 300 Mbps > quota of 250 Mbps
+		err = pool.TryAllocate("lease-3", "small", "tenant-a")
+		assert.ErrorContains(t, err, "bandwidth quota exceeded")
+
+		// Different tenant can still allocate
+		err = pool.TryAllocate("lease-4", "small", "tenant-b")
+		require.NoError(t, err)
+	})
+
+	t.Run("tenant bandwidth quota skipped when zero", func(t *testing.T) {
+		bwProfiles := map[string]SKUProfile{
+			"small": {CPUCores: 1.0, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 100},
+		}
+		quota := &TenantQuotaConfig{
+			MaxCPUCores:      100,
+			MaxMemoryMB:      102400,
+			MaxDiskMB:        102400,
+			MaxBandwidthMbps: 0, // No bandwidth quota
+		}
+		pool := NewResourcePool(100.0, 102400, 102400, 1000, makeResolver(bwProfiles), quota)
+
+		// Should allocate many without hitting bandwidth quota
+		for i := range 5 {
+			err := pool.TryAllocate(fmt.Sprintf("lease-%d", i), "small", "tenant-a")
+			require.NoError(t, err)
+		}
+
+		stats := pool.Stats()
+		assert.Equal(t, int64(500), stats.AllocatedBandwidthMbps)
+	})
+
+	t.Run("release returns bandwidth to pool", func(t *testing.T) {
+		bwProfiles := map[string]SKUProfile{
+			"small": {CPUCores: 1.0, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 100},
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, 1000, makeResolver(bwProfiles), nil)
+
+		pool.TryAllocate("lease-1", "small", "tenant-a")
+		pool.Release("lease-1")
+
+		stats := pool.Stats()
+		assert.Equal(t, int64(0), stats.AllocatedBandwidthMbps)
+		assert.Equal(t, int64(1000), stats.AvailableBandwidthMbps())
+	})
+
+	t.Run("reset rebuilds bandwidth counters", func(t *testing.T) {
+		bwProfiles := map[string]SKUProfile{
+			"small": {CPUCores: 1.0, MemoryMB: 512, DiskMB: 0, BandwidthMbps: 100},
+		}
+		pool := NewResourcePool(8.0, 16384, 102400, 1000, makeResolver(bwProfiles), nil)
+
+		pool.Reset([]ResourceAllocation{
+			{LeaseUUID: "lease-1", Tenant: "tenant-a", SKU: "small", CPUCores: 1.0, MemoryMB: 512, BandwidthMbps: 100},
+			{LeaseUUID: "lease-2", Tenant: "tenant-a", SKU: "small", CPUCores: 1.0, MemoryMB: 512, BandwidthMbps: 100},
+		})
+
+		stats := pool.Stats()
+		assert.Equal(t, int64(200), stats.AllocatedBandwidthMbps)
+		assert.Equal(t, int64(800), stats.AvailableBandwidthMbps())
 	})
 }

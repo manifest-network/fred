@@ -24,6 +24,14 @@ total_cpu_cores: 8.0
 total_memory_mb: 16384
 total_disk_mb: 102400
 
+# Total link bandwidth in Mbps. Required when any SKU has bandwidth_mbps > 0.
+# Set to your host's link capacity (e.g., 1000 for 1 GbE, 10000 for 10 GbE).
+total_bandwidth_mbps: 1000
+
+# Host kernel CONFIG_HZ value. Affects auto-calculated burst floor when a SKU
+# has burst_kb: 0. Common values: 100, 250, 300, 1000. Default: 250.
+# kernel_hz: 250
+
 # =============================================================================
 # SKU MAPPING (REQUIRED)
 # =============================================================================
@@ -47,25 +55,40 @@ sku_mapping:
   "019c1ee8-9d9c-7003-8d01-4188dfe9e204": "docker-large"
   # Add your SKU UUIDs here...
 
-# SKU profiles define resource limits for each tier
-# Profile names are referenced by sku_mapping above
+# SKU profiles define resource limits for each tier.
+# Profile names are referenced by sku_mapping above.
+#
+# Bandwidth limiting (optional):
+#   bandwidth_mbps: per-container rate limit in Mbps (0 = unlimited, not pool-tracked)
+#   burst_kb: burst allowance in KB (0 = auto-calculated from rate and kernel_hz)
+#   latency_ms: max queuing latency in ms (0 = default 50ms)
+#
+# The docker-backend applies tc (traffic control) rules on host-side veth
+# interfaces after container start. Requires CAP_NET_ADMIN on the host process
+# and the ifb kernel module for ingress (upload) shaping.
 sku_profiles:
   docker-micro:
     cpu_cores: 0.25
     memory_mb: 256
     disk_mb: 512
+    bandwidth_mbps: 10
   docker-small:
     cpu_cores: 0.5
     memory_mb: 512
     disk_mb: 1024
+    bandwidth_mbps: 50
   docker-medium:
     cpu_cores: 1.0
     memory_mb: 1024
     disk_mb: 2048
+    bandwidth_mbps: 100
   docker-large:
     cpu_cores: 2.0
     memory_mb: 2048
     disk_mb: 4096
+    bandwidth_mbps: 250
+    # burst_kb: 128      # optional: explicit burst (auto-calculated if omitted)
+    # latency_ms: 50     # optional: queuing latency (default 50ms)
 
   # Stateful SKU profiles — containers with disk_mb > 0 get bind-mounted
   # volumes with quota enforcement (btrfs subvolumes, xfs project quotas, or
@@ -76,10 +99,12 @@ sku_profiles:
     cpu_cores: 0.5
     memory_mb: 512
     disk_mb: 2048
+    bandwidth_mbps: 50
   docker-postgres:
     cpu_cores: 1.0
     memory_mb: 1024
     disk_mb: 4096
+    bandwidth_mbps: 100
 
 # =============================================================================
 # TENANT QUOTAS (optional)
@@ -91,6 +116,7 @@ sku_profiles:
 #   max_cpu_cores: 4.0      # Max CPU cores per tenant
 #   max_memory_mb: 8192     # Max memory per tenant (MB)
 #   max_disk_mb: 51200      # Max disk per tenant (MB)
+#   max_bandwidth_mbps: 500 # Max bandwidth per tenant (Mbps, 0 = no limit)
 
 # =============================================================================
 # ALLOWED REGISTRIES

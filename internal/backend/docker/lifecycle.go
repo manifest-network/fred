@@ -111,6 +111,18 @@ func NewDockerClient(host string, backendName string) (*DockerClient, error) {
 	return &DockerClient{client: cli, backendName: backendName}, nil
 }
 
+// ContainerPID returns the host PID of a running container.
+func (d *DockerClient) ContainerPID(ctx context.Context, containerID string) (int, error) {
+	resp, err := d.client.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return 0, err
+	}
+	if resp.State.Pid == 0 {
+		return 0, fmt.Errorf("container %s has no PID (not running?)", shortID(containerID))
+	}
+	return resp.State.Pid, nil
+}
+
 // Close closes the Docker client.
 func (d *DockerClient) Close() error {
 	return d.client.Close()

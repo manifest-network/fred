@@ -49,6 +49,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			continue
 		}
 
+		if profile.BandwidthMbps > 0 {
+			b.logger.Warn("bandwidth limit not restored after restart; container runs without rate limiting until next reprovision",
+				"container_id", shortID(c.ContainerID),
+				"lease_uuid", c.LeaseUUID,
+				"bandwidth_mbps", profile.BandwidthMbps)
+		}
+
 		// Check if we already have a provision record for this lease
 		prov, exists := recovered[c.LeaseUUID]
 		if !exists {
@@ -140,12 +147,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			instanceID = fmt.Sprintf("%s-%d", c.LeaseUUID, c.InstanceIndex)
 		}
 		allocsByLease[c.LeaseUUID] = append(allocsByLease[c.LeaseUUID], shared.ResourceAllocation{
-			LeaseUUID: instanceID,
-			Tenant:    c.Tenant,
-			SKU:       c.SKU,
-			CPUCores:  profile.CPUCores,
-			MemoryMB:  profile.MemoryMB,
-			DiskMB:    profile.DiskMB,
+			LeaseUUID:     instanceID,
+			Tenant:        c.Tenant,
+			SKU:           c.SKU,
+			CPUCores:      profile.CPUCores,
+			MemoryMB:      profile.MemoryMB,
+			DiskMB:        profile.DiskMB,
+			BandwidthMbps: profile.BandwidthMbps,
 		})
 	}
 

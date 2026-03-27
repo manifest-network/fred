@@ -272,7 +272,7 @@ func TestProvision_InsufficientResources(t *testing.T) {
 	// Exhaust the pool
 	b.cfg.TotalCPUCores = 0.1
 	b.cfg.TotalMemoryMB = 1
-	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
+	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.TotalBandwidthMbps, b.cfg.GetSKUProfile, nil)
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
 	err := b.Provision(context.Background(), req)
@@ -287,7 +287,7 @@ func TestProvision_MultiItem_PartialResourceRollback(t *testing.T) {
 	// Only enough resources for 1 docker-small, not 2
 	b.cfg.TotalCPUCores = 0.6
 	b.cfg.TotalMemoryMB = 600
-	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
+	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.TotalBandwidthMbps, b.cfg.GetSKUProfile, nil)
 
 	req := backend.ProvisionRequest{
 		LeaseUUID:    "lease-1",
@@ -3845,7 +3845,7 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 	b.cfg.SKUProfiles = map[string]SKUProfile{
 		"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0},
 	}
-	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
+	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.TotalBandwidthMbps, b.cfg.GetSKUProfile, nil)
 
 	req := newProvisionRequest("lease-wp", "tenant-a", "docker-small", 1, validManifestJSON("grafana/grafana:latest"))
 	req.CallbackURL = callbackServer.URL
@@ -4451,4 +4451,187 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+func TestProvision_BandwidthApplied(t *testing.T) {
+	var appliedContainers []string
+	bwMock := &mockBandwidthManager{
+		ApplyFn: func(_ context.Context, containerID string, rateMbps int64, _ int, _ int, _ int) error {
+			appliedContainers = append(appliedContainers, containerID)
+			assert.Equal(t, int64(50), rateMbps) // docker-small default = 50 Mbps
+			return nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		CreateContainerFn: func(_ context.Context, _ CreateContainerParams, _ time.Duration) (string, error) {
+			return "bw-container-1", nil
+		},
+		StartContainerFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.bandwidth = bwMock
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	req := newProvisionRequest("lease-bw-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	<-callbackReceived
+	assert.Equal(t, []string{"bw-container-1"}, appliedContainers, "bandwidth Apply should be called for the container")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestProvision_BandwidthNotAppliedWhenZero(t *testing.T) {
+	applied := false
+	bwMock := &mockBandwidthManager{
+		ApplyFn: func(_ context.Context, _ string, _ int64, _ int, _ int, _ int) error {
+			applied = true
+			return nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		CreateContainerFn: func(_ context.Context, _ CreateContainerParams, _ time.Duration) (string, error) {
+			return "nobw-container-1", nil
+		},
+		StartContainerFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, cid string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: cid, Status: "running"}, nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.bandwidth = bwMock
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	// Override SKU to have zero bandwidth
+	b.cfg.SKUProfiles["docker-small"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024, BandwidthMbps: 0}
+
+	req := newProvisionRequest("lease-nobw-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	<-callbackReceived
+	assert.False(t, applied, "bandwidth Apply should NOT be called when BandwidthMbps=0")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestProvision_BandwidthFailureDoesNotFailProvision(t *testing.T) {
+	bwMock := &mockBandwidthManager{
+		ApplyFn: func(_ context.Context, _ string, _ int64, _ int, _ int, _ int) error {
+			return fmt.Errorf("tc: operation not permitted")
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		CreateContainerFn: func(_ context.Context, _ CreateContainerParams, _ time.Duration) (string, error) {
+			return "fail-bw-container-1", nil
+		},
+		StartContainerFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, cid string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: cid, Status: "running"}, nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.bandwidth = bwMock
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	req := newProvisionRequest("lease-bwfail-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	<-callbackReceived
+
+	// Bandwidth Apply failed, but the provision should still be Ready.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-bwfail-1"]
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,
+		"provision should succeed even if bandwidth Apply fails")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestProvision_ErrorCleanupRemovesBandwidth(t *testing.T) {
+	var removedContainers []string
+	bwMock := &mockBandwidthManager{
+		ApplyFn: func(_ context.Context, _ string, _ int64, _ int, _ int, _ int) error { return nil },
+		RemoveFn: func(_ context.Context, containerID string) error {
+			removedContainers = append(removedContainers, containerID)
+			return nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		CreateContainerFn: func(_ context.Context, _ CreateContainerParams, _ time.Duration) (string, error) {
+			return "cleanup-container-1", nil
+		},
+		StartContainerFn: func(_ context.Context, _ string, _ time.Duration) error {
+			return fmt.Errorf("start failed")
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.bandwidth = bwMock
+
+	req := newProvisionRequest("lease-cleanup-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	<-callbackReceived
+	assert.Contains(t, removedContainers, "cleanup-container-1", "bandwidth Remove should be called during error cleanup")
+
+	b.stopCancel()
+	b.wg.Wait()
 }

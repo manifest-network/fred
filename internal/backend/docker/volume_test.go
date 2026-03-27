@@ -216,7 +216,7 @@ func TestCleanupOrphanedVolumes_DestroysOrphans(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.NetworkIsolation = ptrBool(false)
-	pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+	pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.TotalBandwidthMbps, cfg.GetSKUProfile, nil)
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	defer stopCancel()
 
@@ -254,7 +254,7 @@ func TestCleanupOrphanedVolumes_ListFailure(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.NetworkIsolation = ptrBool(false)
-	pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
+	pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.TotalBandwidthMbps, cfg.GetSKUProfile, nil)
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	defer stopCancel()
 

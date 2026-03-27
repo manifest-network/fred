@@ -42,6 +42,15 @@ type Config struct {
 	// TotalDiskMB is the total disk space available in MB.
 	TotalDiskMB int64 `yaml:"total_disk_mb"`
 
+	// TotalBandwidthMbps is the total link bandwidth in Mbps (e.g., 1000 for 1 GbE).
+	// Required when any SKU profile has BandwidthMbps > 0.
+	TotalBandwidthMbps int64 `yaml:"total_bandwidth_mbps"`
+
+	// KernelHZ matches the host kernel's CONFIG_HZ value. Only affects the
+	// auto-calculated burst floor when a SKU has BurstKB = 0.
+	// Common kernel CONFIG_HZ values: 100, 250 (default), 300, 1000.
+	KernelHZ int `yaml:"kernel_hz"`
+
 	// SKUMapping maps on-chain SKU UUIDs to profile names.
 	// This allows the backend to translate chain SKU UUIDs to local resource profiles.
 	// Example: {"019c1ee7-1aaf-7000-802c-ad775c72cc27": "docker-small"}
@@ -220,6 +229,25 @@ func (c *Config) HasStatefulSKUs() bool {
 	return false
 }
 
+// HasBandwidthSKUs returns true if any SKU profile has BandwidthMbps > 0,
+// indicating that bandwidth limiting is needed.
+func (c *Config) HasBandwidthSKUs() bool {
+	for _, p := range c.SKUProfiles {
+		if p.BandwidthMbps > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// GetKernelHZ returns the configured kernel HZ value, defaulting to 250.
+func (c *Config) GetKernelHZ() int {
+	if c.KernelHZ > 0 {
+		return c.KernelHZ
+	}
+	return 250
+}
+
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
@@ -229,6 +257,7 @@ func DefaultConfig() Config {
 		TotalCPUCores:           8.0,
 		TotalMemoryMB:           16384,
 		TotalDiskMB:             102400,
+		TotalBandwidthMbps:      1000,
 		ImagePullTimeout:        5 * time.Minute,
 		ContainerCreateTimeout:  30 * time.Second,
 		ContainerStartTimeout:   30 * time.Second,
@@ -247,24 +276,28 @@ func DefaultConfig() Config {
 		ReleasesMaxAge:          90 * 24 * time.Hour,
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
-				CPUCores: 0.25,
-				MemoryMB: 256,
-				DiskMB:   512,
+				CPUCores:      0.25,
+				MemoryMB:      256,
+				DiskMB:        512,
+				BandwidthMbps: 10,
 			},
 			"docker-small": {
-				CPUCores: 0.5,
-				MemoryMB: 512,
-				DiskMB:   1024,
+				CPUCores:      0.5,
+				MemoryMB:      512,
+				DiskMB:        1024,
+				BandwidthMbps: 50,
 			},
 			"docker-medium": {
-				CPUCores: 1.0,
-				MemoryMB: 1024,
-				DiskMB:   2048,
+				CPUCores:      1.0,
+				MemoryMB:      1024,
+				DiskMB:        2048,
+				BandwidthMbps: 100,
 			},
 			"docker-large": {
-				CPUCores: 2.0,
-				MemoryMB: 2048,
-				DiskMB:   4096,
+				CPUCores:      2.0,
+				MemoryMB:      2048,
+				DiskMB:        4096,
+				BandwidthMbps: 250,
 			},
 		},
 		AllowedRegistries: []string{
@@ -298,6 +331,14 @@ func (c *Config) Validate() error {
 
 	if c.TotalDiskMB <= 0 {
 		return fmt.Errorf("total_disk_mb must be positive")
+	}
+
+	if c.HasBandwidthSKUs() && c.TotalBandwidthMbps <= 0 {
+		return fmt.Errorf("total_bandwidth_mbps must be positive when any SKU has bandwidth_mbps > 0")
+	}
+
+	if c.KernelHZ < 0 {
+		return fmt.Errorf("kernel_hz must be non-negative")
 	}
 
 	if len(c.SKUProfiles) == 0 {
@@ -445,6 +486,9 @@ func (c *Config) Validate() error {
 		}
 		if tq.MaxDiskMB > c.TotalDiskMB {
 			return fmt.Errorf("tenant_quota.max_disk_mb (%d) exceeds total_disk_mb (%d)", tq.MaxDiskMB, c.TotalDiskMB)
+		}
+		if tq.MaxBandwidthMbps > 0 && tq.MaxBandwidthMbps > c.TotalBandwidthMbps {
+			return fmt.Errorf("tenant_quota.max_bandwidth_mbps (%d) exceeds total_bandwidth_mbps (%d)", tq.MaxBandwidthMbps, c.TotalBandwidthMbps)
 		}
 	}
 

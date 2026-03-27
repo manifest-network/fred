@@ -454,16 +454,19 @@ func (s *Server) handleGetReleases(w http.ResponseWriter, r *http.Request) {
 
 // StatsResponse is the response body for /stats.
 type StatsResponse struct {
-	TotalCPUCores     float64 `json:"total_cpu_cores"`
-	TotalMemoryMB     int64   `json:"total_memory_mb"`
-	TotalDiskMB       int64   `json:"total_disk_mb"`
-	AllocatedCPUCores float64 `json:"allocated_cpu_cores"`
-	AllocatedMemoryMB int64   `json:"allocated_memory_mb"`
-	AllocatedDiskMB   int64   `json:"allocated_disk_mb"`
-	AvailableCPUCores float64 `json:"available_cpu_cores"`
-	AvailableMemoryMB int64   `json:"available_memory_mb"`
-	AvailableDiskMB   int64   `json:"available_disk_mb"`
-	ActiveContainers  int     `json:"active_containers"`
+	TotalCPUCores          float64 `json:"total_cpu_cores"`
+	TotalMemoryMB          int64   `json:"total_memory_mb"`
+	TotalDiskMB            int64   `json:"total_disk_mb"`
+	TotalBandwidthMbps     int64   `json:"total_bandwidth_mbps"`
+	AllocatedCPUCores      float64 `json:"allocated_cpu_cores"`
+	AllocatedMemoryMB      int64   `json:"allocated_memory_mb"`
+	AllocatedDiskMB        int64   `json:"allocated_disk_mb"`
+	AllocatedBandwidthMbps int64   `json:"allocated_bandwidth_mbps"`
+	AvailableCPUCores      float64 `json:"available_cpu_cores"`
+	AvailableMemoryMB      int64   `json:"available_memory_mb"`
+	AvailableDiskMB        int64   `json:"available_disk_mb"`
+	AvailableBandwidthMbps int64   `json:"available_bandwidth_mbps"`
+	ActiveContainers       int     `json:"active_containers"`
 }
 
 // StatusResponse is a simple status response.
@@ -516,16 +519,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.backend.Stats()
 
 	s.writeJSON(w, http.StatusOK, StatsResponse{
-		TotalCPUCores:     stats.TotalCPU,
-		TotalMemoryMB:     stats.TotalMemoryMB,
-		TotalDiskMB:       stats.TotalDiskMB,
-		AllocatedCPUCores: stats.AllocatedCPU,
-		AllocatedMemoryMB: stats.AllocatedMemoryMB,
-		AllocatedDiskMB:   stats.AllocatedDiskMB,
-		AvailableCPUCores: stats.AvailableCPU(),
-		AvailableMemoryMB: stats.AvailableMemoryMB(),
-		AvailableDiskMB:   stats.AvailableDiskMB(),
-		ActiveContainers:  stats.AllocationCount,
+		TotalCPUCores:          stats.TotalCPU,
+		TotalMemoryMB:          stats.TotalMemoryMB,
+		TotalDiskMB:            stats.TotalDiskMB,
+		TotalBandwidthMbps:     stats.TotalBandwidthMbps,
+		AllocatedCPUCores:      stats.AllocatedCPU,
+		AllocatedMemoryMB:      stats.AllocatedMemoryMB,
+		AllocatedDiskMB:        stats.AllocatedDiskMB,
+		AllocatedBandwidthMbps: stats.AllocatedBandwidthMbps,
+		AvailableCPUCores:      stats.AvailableCPU(),
+		AvailableMemoryMB:      stats.AvailableMemoryMB(),
+		AvailableDiskMB:        stats.AvailableDiskMB(),
+		AvailableBandwidthMbps: stats.AvailableBandwidthMbps(),
+		ActiveContainers:       stats.AllocationCount,
 	})
 }
 

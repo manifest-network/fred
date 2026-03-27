@@ -1075,13 +1075,15 @@ func TestHandleStats(t *testing.T) {
 		mb := &mockBackend{
 			StatsFunc: func() shared.ResourceStats {
 				return shared.ResourceStats{
-					TotalCPU:          8.0,
-					TotalMemoryMB:     16384,
-					TotalDiskMB:       102400,
-					AllocatedCPU:      3.0,
-					AllocatedMemoryMB: 4096,
-					AllocatedDiskMB:   20480,
-					AllocationCount:   2,
+					TotalCPU:               8.0,
+					TotalMemoryMB:          16384,
+					TotalDiskMB:            102400,
+					TotalBandwidthMbps:     1000,
+					AllocatedCPU:           3.0,
+					AllocatedMemoryMB:      4096,
+					AllocatedDiskMB:        20480,
+					AllocatedBandwidthMbps: 350,
+					AllocationCount:        2,
 				}
 			},
 		}
@@ -1099,14 +1101,17 @@ func TestHandleStats(t *testing.T) {
 		assert.InDelta(t, 8.0, got.TotalCPUCores, 0.001)
 		assert.Equal(t, int64(16384), got.TotalMemoryMB)
 		assert.Equal(t, int64(102400), got.TotalDiskMB)
+		assert.Equal(t, int64(1000), got.TotalBandwidthMbps)
 		assert.InDelta(t, 3.0, got.AllocatedCPUCores, 0.001)
 		assert.Equal(t, int64(4096), got.AllocatedMemoryMB)
 		assert.Equal(t, int64(20480), got.AllocatedDiskMB)
+		assert.Equal(t, int64(350), got.AllocatedBandwidthMbps)
 
 		// Verify Available* fields are computed (Total - Allocated)
 		assert.InDelta(t, 5.0, got.AvailableCPUCores, 0.001)
 		assert.Equal(t, int64(12288), got.AvailableMemoryMB)
 		assert.Equal(t, int64(81920), got.AvailableDiskMB)
+		assert.Equal(t, int64(650), got.AvailableBandwidthMbps)
 
 		assert.Equal(t, 2, got.ActiveContainers)
 	})

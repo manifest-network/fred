@@ -2191,3 +2191,66 @@ func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
 			"gauge must not change when a Failed provision fails again")
 	})
 }
+
+func TestRestart_BandwidthApplied(t *testing.T) {
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	provisions := map[string]*provision{
+		"lease-bw": {
+			LeaseUUID:    "lease-bw",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     manifest,
+			ContainerIDs: []string{"old-c1"},
+		},
+	}
+
+	var appliedContainers []string
+	bwMock := &mockBandwidthManager{
+		ApplyFn: func(_ context.Context, containerID string, rateMbps int64, _ int, _ int, _ int) error {
+			appliedContainers = append(appliedContainers, containerID)
+			return nil
+		},
+	}
+
+	mock := &mockDockerClient{
+		StopContainerFn:   func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+		CreateContainerFn: func(_ context.Context, _ CreateContainerParams, _ time.Duration) (string, error) {
+			return "new-bw-c1", nil
+		},
+		StartContainerFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, cid string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: cid, Status: "running"}, nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.bandwidth = bwMock
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	err := b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-bw",
+		CallbackURL: callbackServer.URL,
+	})
+	require.NoError(t, err)
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+
+	assert.Equal(t, []string{"new-bw-c1"}, appliedContainers,
+		"bandwidth Apply should be called for the new container after restart")
+}
