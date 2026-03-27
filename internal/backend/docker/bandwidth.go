@@ -203,7 +203,7 @@ func ifbDeviceName(containerID string) string {
 
 // findHostVeth enters the container's network namespace, finds the eth0 peer
 // index, then looks up the corresponding veth on the host.
-func findHostVeth(pid int) (netlink.Link, error) {
+func findHostVeth(pid int) (_ netlink.Link, retErr error) {
 	// Lock OS thread because netns operations change the calling thread's namespace.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -225,27 +225,32 @@ func findHostVeth(pid int) (netlink.Link, error) {
 	if err := netns.Set(containerNS); err != nil {
 		return nil, fmt.Errorf("enter container netns: %w", err)
 	}
+	// Always attempt to restore host netns before returning. This prevents
+	// leaking a thread stuck in the container netns back into the Go scheduler.
+	// The explicit restore below handles the happy path; this defer is a safety
+	// net for early error returns.
+	restored := false
+	defer func() {
+		if !restored {
+			if restoreErr := netns.Set(hostNS); restoreErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("CRITICAL: failed to restore host netns: %w", restoreErr))
+			}
+		}
+	}()
 
 	// Find eth0 inside container namespace and get its peer index.
 	eth0, err := netlink.LinkByName("eth0")
 	if err != nil {
-		// Restore host netns before returning.
-		if restoreErr := netns.Set(hostNS); restoreErr != nil {
-			return nil, errors.Join(
-				fmt.Errorf("find eth0 in container netns: %w", err),
-				fmt.Errorf("CRITICAL: failed to restore host netns: %w", restoreErr),
-			)
-		}
 		return nil, fmt.Errorf("find eth0 in container netns: %w", err)
 	}
 	peerIndex := eth0.Attrs().ParentIndex
 
-	// Return to host netns.
+	// Return to host netns before looking up the veth on the host side.
 	if err := netns.Set(hostNS); err != nil {
 		return nil, fmt.Errorf("restore host netns: %w", err)
 	}
+	restored = true
 
-	// Look up the host-side veth by the peer index.
 	hostVeth, err := netlink.LinkByIndex(peerIndex)
 	if err != nil {
 		return nil, fmt.Errorf("find host veth by index %d: %w", peerIndex, err)
@@ -440,7 +445,12 @@ func (b *Backend) removeBandwidthLimit(ctx context.Context, containerID string, 
 // their SKU profile.
 func (b *Backend) applyStackBandwidthLimits(ctx context.Context, items []backend.LeaseItem, profiles map[string]SKUProfile, serviceContainers map[string][]string, logger *slog.Logger) {
 	for _, item := range items {
-		profile := profiles[item.SKU]
+		profile, ok := profiles[item.SKU]
+		if !ok {
+			logger.Warn("missing bandwidth profile for SKU",
+				"service", item.ServiceName, "sku", item.SKU)
+			continue
+		}
 		if profile.BandwidthMbps <= 0 {
 			continue
 		}

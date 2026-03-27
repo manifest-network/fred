@@ -333,7 +333,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("total_disk_mb must be positive")
 	}
 
-	if c.HasBandwidthSKUs() && c.TotalBandwidthMbps <= 0 {
+	if c.TotalBandwidthMbps < 0 {
+		return fmt.Errorf("total_bandwidth_mbps must be non-negative")
+	}
+	if c.HasBandwidthSKUs() && c.TotalBandwidthMbps == 0 {
 		return fmt.Errorf("total_bandwidth_mbps must be positive when any SKU has bandwidth_mbps > 0")
 	}
 

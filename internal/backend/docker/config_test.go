@@ -577,6 +577,18 @@ func TestConfig_Validate_Bandwidth(t *testing.T) {
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "kernel_hz must be non-negative")
 	})
+
+	t.Run("negative total_bandwidth_mbps rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TotalBandwidthMbps = -1
+		cfg.SKUProfiles = map[string]SKUProfile{
+			"nobw": {CPUCores: 1, MemoryMB: 512, DiskMB: 0},
+		}
+		cfg.SKUMapping = nil
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "total_bandwidth_mbps must be non-negative")
+	})
 }
 
 func TestConfig_Validate_IngressRequiresNetworkIsolation(t *testing.T) {

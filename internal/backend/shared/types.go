@@ -43,6 +43,9 @@ func (p SKUProfile) Validate() error {
 	if p.LatencyMs > 10_000 {
 		return fmt.Errorf("latency_ms must be <= 10000 (10 seconds)")
 	}
+	if p.BandwidthMbps == 0 && (p.BurstKB != 0 || p.LatencyMs != 0) {
+		return fmt.Errorf("burst_kb and latency_ms have no effect when bandwidth_mbps is 0")
+	}
 	return nil
 }
 
