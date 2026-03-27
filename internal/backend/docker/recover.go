@@ -50,7 +50,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 
 		if profile.BandwidthMbps > 0 {
-			b.logger.Warn("bandwidth limit not restored after restart; container runs without rate limiting until next reprovision",
+			b.logger.Warn("bandwidth limit not restored after restart; container runs without rate limiting until next restart, update, or reprovision",
 				"container_id", shortID(c.ContainerID),
 				"lease_uuid", c.LeaseUUID,
 				"bandwidth_mbps", profile.BandwidthMbps)

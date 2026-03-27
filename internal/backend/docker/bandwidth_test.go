@@ -24,7 +24,7 @@ func TestTbfParams(t *testing.T) {
 		// 250 Mbps at HZ=250: rate = 31,250,000 bytes/sec
 		// min burst = ceil(31,250,000 / 250) = 125,000 bytes = ~122 KB
 		_, burst, _ := tbfParams(250, 0, 50, 250)
-		assert.True(t, burst >= 125000, "burst must be >= rate/HZ at high rates, got %d", burst)
+		assert.GreaterOrEqual(t, burst, uint32(125000), "burst must be >= rate/HZ at high rates")
 	})
 
 	t.Run("auto burst floor 32KB at low rates", func(t *testing.T) {
@@ -37,7 +37,7 @@ func TestTbfParams(t *testing.T) {
 	t.Run("burst floor at MTU", func(t *testing.T) {
 		// Tiny explicit burst gets raised to MTU
 		_, burst, _ := tbfParams(1, 1, 50, 250) // 1KB explicit, below MTU
-		assert.True(t, burst >= 1500, "burst must be >= MTU, got %d", burst)
+		assert.GreaterOrEqual(t, burst, uint32(1500), "burst must be >= MTU")
 	})
 
 	t.Run("latency default 50ms", func(t *testing.T) {
