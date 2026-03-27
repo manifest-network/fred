@@ -225,16 +225,13 @@ func findHostVeth(pid int) (_ netlink.Link, retErr error) {
 	if err := netns.Set(containerNS); err != nil {
 		return nil, fmt.Errorf("enter container netns: %w", err)
 	}
-	// Always attempt to restore host netns before returning. This prevents
-	// leaking a thread stuck in the container netns back into the Go scheduler.
-	// The explicit restore below handles the happy path; this defer is a safety
-	// net for early error returns.
-	restored := false
+	// Always restore host netns before returning. This prevents leaking a
+	// thread stuck in the container netns back into the Go scheduler. The
+	// explicit restore below handles the happy path; the defer is a safety
+	// net for early error returns (redundant but harmless on the happy path).
 	defer func() {
-		if !restored {
-			if restoreErr := netns.Set(hostNS); restoreErr != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("CRITICAL: failed to restore host netns: %w", restoreErr))
-			}
+		if restoreErr := netns.Set(hostNS); restoreErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("CRITICAL: failed to restore host netns: %w", restoreErr))
 		}
 	}()
 
@@ -249,7 +246,6 @@ func findHostVeth(pid int) (_ netlink.Link, retErr error) {
 	if err := netns.Set(hostNS); err != nil {
 		return nil, fmt.Errorf("restore host netns: %w", err)
 	}
-	restored = true
 
 	hostVeth, err := netlink.LinkByIndex(peerIndex)
 	if err != nil {
