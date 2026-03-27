@@ -85,27 +85,30 @@ func RouterName(leaseUUID, serviceName string, instanceIndex, quantity int) stri
 }
 
 // SelectIngressPort picks the best TCP port for ingress routing.
-// Preference: 80 > 8080 > lowest TCP port number.
+// Preference: ingress hint > 80 > 8080 > lowest TCP port number.
 // Returns (port, true) if a suitable port is found, (0, false) otherwise.
 func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 	if len(ports) == 0 {
 		return 0, false
 	}
 
+	// First pass: check for an explicit ingress hint (highest priority).
+	for spec, cfg := range ports {
+		if !cfg.Ingress {
+			continue
+		}
+		if port, ok := parseTCPPort(spec); ok {
+			return port, true
+		}
+	}
+
+	// Second pass: default preference order (80 > 8080 > lowest).
 	bestPort := 0
 	found := false
 
 	for spec := range ports {
-		parts := strings.SplitN(spec, "/", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		proto := parts[1]
-		if proto != "tcp" {
-			continue
-		}
-		port, err := strconv.Atoi(parts[0])
-		if err != nil {
+		port, ok := parseTCPPort(spec)
+		if !ok {
 			continue
 		}
 
@@ -117,14 +120,29 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 		case !found:
 			bestPort = port
 			found = true
-		case port == 8080 && bestPort != 80:
+		case port == 8080:
 			bestPort = 8080
-		case bestPort != 80 && bestPort != 8080 && port < bestPort:
+		case bestPort != 8080 && port < bestPort:
 			bestPort = port
 		}
 	}
 
 	return bestPort, found
+}
+
+// parseTCPPort extracts the port number from a "port/tcp" spec string
+// (case-insensitive protocol). Returns (port, true) for valid TCP specs,
+// (0, false) otherwise.
+func parseTCPPort(spec string) (int, bool) {
+	parts := strings.SplitN(spec, "/", 2)
+	if len(parts) != 2 || strings.ToLower(parts[1]) != "tcp" {
+		return 0, false
+	}
+	port, err := strconv.Atoi(parts[0])
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
 }
 
 // TraefikLabels generates the Docker labels that Traefik uses for
