@@ -92,6 +92,12 @@ type PortConfig struct {
 	// HostPort optionally specifies a fixed host port.
 	// If not set, Docker assigns a random available port.
 	HostPort int `json:"host_port,omitempty"`
+
+	// Ingress marks this port as the preferred ingress port for routing.
+	// Only valid on TCP ports; at most one port in a manifest may set
+	// this to true. When set, SelectIngressPort returns this port
+	// regardless of the default preference order (80 > 8080 > lowest TCP).
+	Ingress bool `json:"ingress,omitempty"`
 }
 
 // HealthCheckConfig specifies container health check parameters.
@@ -194,6 +200,7 @@ func (m *DockerManifest) validate(inStack bool) error {
 	}
 
 	// Validate port specifications
+	var ingressPorts []string
 	for portSpec, portCfg := range m.Ports {
 		if err := validatePortSpec(portSpec); err != nil {
 			return fmt.Errorf("invalid port %q: %w", portSpec, err)
@@ -201,6 +208,15 @@ func (m *DockerManifest) validate(inStack bool) error {
 		if portCfg.HostPort < 0 || portCfg.HostPort > 65535 {
 			return fmt.Errorf("invalid port %q: host_port must be between 0 and 65535", portSpec)
 		}
+		if portCfg.Ingress {
+			ingressPorts = append(ingressPorts, portSpec)
+			if _, ok := parseTCPPort(portSpec); !ok {
+				return fmt.Errorf("invalid port %q: ingress hint requires TCP protocol", portSpec)
+			}
+		}
+	}
+	if len(ingressPorts) > 1 {
+		return fmt.Errorf("at most one port may have ingress set to true, got %v", ingressPorts)
 	}
 
 	// Validate health check if present

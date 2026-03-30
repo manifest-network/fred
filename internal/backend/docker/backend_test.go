@@ -448,6 +448,51 @@ func TestPortSpecValidation(t *testing.T) {
 	}
 }
 
+func TestPortIngressHintValidation(t *testing.T) {
+	t.Run("single ingress hint is valid", func(t *testing.T) {
+		m := &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{
+				"18789/tcp": {Ingress: true},
+				"8083/tcp":  {},
+			},
+		}
+		assert.NoError(t, m.Validate())
+	})
+
+	t.Run("multiple ingress hints rejected", func(t *testing.T) {
+		m := &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{
+				"18789/tcp": {Ingress: true},
+				"8083/tcp":  {Ingress: true},
+			},
+		}
+		err := m.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "at most one port")
+	})
+
+	t.Run("ingress hint on UDP rejected", func(t *testing.T) {
+		m := &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{
+				"53/udp": {Ingress: true},
+			},
+		}
+		err := m.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ingress hint requires TCP")
+	})
+
+	t.Run("ingress hint roundtrip via ParseManifest", func(t *testing.T) {
+		data := []byte(`{"image":"nginx","ports":{"18789/tcp":{"ingress":true}}}`)
+		m, err := ParseManifest(data)
+		require.NoError(t, err)
+		assert.True(t, m.Ports["18789/tcp"].Ingress)
+	})
+}
+
 func TestSKUMapping(t *testing.T) {
 	cfg := Config{
 		SKUMapping: map[string]string{

@@ -182,6 +182,11 @@
           "maximum": 65535,
           "default": 0,
           "description": "Fixed host port. 0 or omitted means Docker assigns a random available port."
+        },
+        "ingress": {
+          "type": "boolean",
+          "default": false,
+          "description": "Marks this port as the preferred ingress port for FQDN routing. At most one TCP port per manifest may set this. When set, overrides the default selection order (80 > 8080 > lowest)."
         }
       }
     },

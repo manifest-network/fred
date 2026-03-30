@@ -210,6 +210,33 @@ func TestSelectIngressPort(t *testing.T) {
 			wantPort: 8080,
 			wantOK:   true,
 		},
+		{
+			name: "ingress hint overrides default preference",
+			ports: map[string]PortConfig{
+				"80/tcp":    {},
+				"18789/tcp": {Ingress: true},
+				"8083/tcp":  {},
+			},
+			wantPort: 18789,
+			wantOK:   true,
+		},
+		{
+			name: "ingress hint on single port",
+			ports: map[string]PortConfig{
+				"9090/tcp": {Ingress: true},
+			},
+			wantPort: 9090,
+			wantOK:   true,
+		},
+		{
+			name: "ingress hint beats 8080",
+			ports: map[string]PortConfig{
+				"8080/tcp": {},
+				"3000/tcp": {Ingress: true},
+			},
+			wantPort: 3000,
+			wantOK:   true,
+		},
 	}
 
 	for _, tt := range tests {
