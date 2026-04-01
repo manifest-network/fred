@@ -798,7 +798,7 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 			provisions, err := b.ListProvisions(r.Context())
 			if err != nil {
 				slog.Warn("workloads: backend ListProvisions failed", "backend", b.Name(), "error", err)
-				warnings = append(warnings, fmt.Sprintf("backend %q: %s", b.Name(), err))
+				warnings = append(warnings, fmt.Sprintf("backend %q unavailable", b.Name()))
 				continue
 			}
 			for _, p := range provisions {
