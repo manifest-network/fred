@@ -140,15 +140,8 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 	prov, ok := b.provisions[leaseUUID]
 	var info *backend.ProvisionInfo
 	if ok {
-		info = &backend.ProvisionInfo{
-			LeaseUUID:    prov.LeaseUUID,
-			ProviderUUID: prov.ProviderUUID,
-			Status:       prov.Status,
-			CreatedAt:    prov.CreatedAt,
-			BackendName:  b.cfg.Name,
-			FailCount:    prov.FailCount,
-			LastError:    prov.LastError,
-		}
+		pi := provisionToInfo(prov, b.cfg.Name)
+		info = &pi
 	}
 	b.provisionsMu.RUnlock()
 
@@ -185,15 +178,7 @@ func (b *Backend) ListProvisions(_ context.Context) ([]backend.ProvisionInfo, er
 
 	result := make([]backend.ProvisionInfo, 0, len(b.provisions))
 	for _, prov := range b.provisions {
-		result = append(result, backend.ProvisionInfo{
-			LeaseUUID:    prov.LeaseUUID,
-			ProviderUUID: prov.ProviderUUID,
-			Status:       prov.Status,
-			CreatedAt:    prov.CreatedAt,
-			BackendName:  b.cfg.Name,
-			FailCount:    prov.FailCount,
-			LastError:    prov.LastError,
-		})
+		result = append(result, provisionToInfo(prov, b.cfg.Name))
 	}
 
 	return result, nil
@@ -276,6 +261,44 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	}
 
 	return nil, backend.ErrNotProvisioned
+}
+
+// provisionToInfo converts a provision to a backend.ProvisionInfo.
+// For stack leases, Items are defensively copied and ServiceImages are
+// extracted from the StackManifest. For non-stack leases, the top-level
+// Image and SKU fields are set instead.
+func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo {
+	info := backend.ProvisionInfo{
+		LeaseUUID:    prov.LeaseUUID,
+		ProviderUUID: prov.ProviderUUID,
+		Status:       prov.Status,
+		CreatedAt:    prov.CreatedAt,
+		BackendName:  backendName,
+		FailCount:    prov.FailCount,
+		LastError:    prov.LastError,
+		Quantity:     prov.Quantity,
+	}
+	if len(prov.Items) > 0 {
+		info.Items = append([]backend.LeaseItem(nil), prov.Items...)
+		info.ServiceImages = serviceImages(prov.StackManifest)
+	} else {
+		info.Image = prov.Image
+		info.SKU = prov.SKU
+	}
+	return info
+}
+
+// serviceImages extracts a service name → image map from a StackManifest.
+// Returns nil if the manifest is nil (e.g., after cold restart with no release store).
+func serviceImages(sm *StackManifest) map[string]string {
+	if sm == nil {
+		return nil
+	}
+	images := make(map[string]string, len(sm.Services))
+	for name, m := range sm.Services {
+		images[name] = m.Image
+	}
+	return images
 }
 
 // Stats returns current resource usage statistics.

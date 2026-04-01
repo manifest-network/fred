@@ -33,7 +33,7 @@ type Backend interface {
 	Deprovision(ctx context.Context, leaseUUID string) error
 
 	// ListProvisions returns all currently provisioned resources.
-	// Used for reconciliation to detect orphans.
+	// Used by the reconciler for orphan detection and by the /workloads endpoint for observability.
 	ListProvisions(ctx context.Context) ([]ProvisionInfo, error)
 
 	// Health checks if the backend is reachable and healthy.
@@ -179,7 +179,14 @@ type ProvisionInfo struct {
 	CreatedAt    time.Time       `json:"created_at"`
 	FailCount    int             `json:"fail_count"`
 	LastError    string          `json:"last_error,omitempty"`
-	BackendName  string          `json:"-"` // Set by reconciler, not from backend
+	BackendName  string          `json:"-"` // Set by the backend or reconciler; excluded from JSON serialization
+
+	// Workload metadata — populated by ListProvisions/GetProvision to describe what is running.
+	Image         string            `json:"image,omitempty"`          // Docker image (non-stack leases)
+	SKU           string            `json:"sku,omitempty"`            // SKU identifier (non-stack leases)
+	Quantity      int               `json:"quantity"`                 // Total expected container count
+	Items         []LeaseItem       `json:"items,omitempty"`          // Per-service items (stack leases)
+	ServiceImages map[string]string `json:"service_images,omitempty"` // service name → image (stack leases)
 }
 
 // ListProvisionsResponse is the response from the /provisions endpoint.

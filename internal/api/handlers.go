@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -761,6 +762,86 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, response, httpStatus)
+}
+
+// WorkloadsResponse is the response from the GET /workloads endpoint.
+type WorkloadsResponse struct {
+	ProviderUUID string          `json:"provider_uuid"`
+	Workloads    []WorkloadEntry `json:"workloads"`
+	Warnings     []string        `json:"warnings,omitempty"`
+}
+
+// WorkloadEntry describes a single lease's workload for observability.
+type WorkloadEntry struct {
+	LeaseUUID   string         `json:"lease_uuid"`
+	Status      string         `json:"status"`
+	CreatedAt   time.Time      `json:"created_at"`
+	BackendName string         `json:"backend_name"`
+	Items       []WorkloadItem `json:"items"`
+}
+
+// WorkloadItem describes a single SKU+image within a workload.
+type WorkloadItem struct {
+	ServiceName string `json:"service_name,omitempty"`
+	SKU         string `json:"sku"`
+	Image       string `json:"image"`
+	Count       int    `json:"count"`
+}
+
+// GetWorkloads handles GET /workloads
+func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
+	workloads := []WorkloadEntry{}
+	var warnings []string
+
+	if h.backendRouter != nil {
+		for _, b := range h.backendRouter.Backends() {
+			provisions, err := b.ListProvisions(r.Context())
+			if err != nil {
+				slog.Warn("workloads: backend ListProvisions failed", "backend", b.Name(), "error", err)
+				warnings = append(warnings, fmt.Sprintf("backend %q: %s", b.Name(), err))
+				continue
+			}
+			for _, p := range provisions {
+				workloads = append(workloads, provisionToWorkloadEntry(p, b.Name()))
+			}
+		}
+	}
+
+	writeJSON(w, WorkloadsResponse{
+		ProviderUUID: h.providerUUID,
+		Workloads:    workloads,
+		Warnings:     warnings,
+	}, http.StatusOK)
+}
+
+// provisionToWorkloadEntry converts a ProvisionInfo into a WorkloadEntry.
+// Stack leases produce one WorkloadItem per service; non-stack leases produce
+// a single item with the top-level SKU/Image/Quantity.
+func provisionToWorkloadEntry(p backend.ProvisionInfo, backendName string) WorkloadEntry {
+	entry := WorkloadEntry{
+		LeaseUUID:   p.LeaseUUID,
+		Status:      string(p.Status),
+		CreatedAt:   p.CreatedAt,
+		BackendName: backendName,
+	}
+	if len(p.Items) > 0 {
+		entry.Items = make([]WorkloadItem, len(p.Items))
+		for i, item := range p.Items {
+			entry.Items[i] = WorkloadItem{
+				ServiceName: item.ServiceName,
+				SKU:         item.SKU,
+				Image:       p.ServiceImages[item.ServiceName],
+				Count:       item.Quantity,
+			}
+		}
+	} else {
+		entry.Items = []WorkloadItem{{
+			SKU:   p.SKU,
+			Image: p.Image,
+			Count: p.Quantity,
+		}}
+	}
+	return entry
 }
 
 // verifyLeaseAccess queries a lease from chain and verifies tenant and provider ownership.
