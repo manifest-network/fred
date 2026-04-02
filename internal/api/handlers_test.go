@@ -4240,6 +4240,40 @@ func TestGetWorkloads_StackProvisions(t *testing.T) {
 	assert.Equal(t, 1, items[1].Count)
 }
 
+func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
+	// Simulates cold restart where Items survive but StackManifest (and thus
+	// ServiceImages) is nil. Image fields should be omitted, not empty strings.
+	srv := newProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID: testutil.ValidUUID2,
+			Status:    backend.ProvisionStatusReady,
+			Quantity:  2,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+			},
+			ServiceImages: nil,
+		},
+	})
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	code, response := callGetWorkloads(t, h)
+	assert.Equal(t, http.StatusOK, code)
+
+	require.Len(t, response.Workloads, 1)
+	require.Len(t, response.Workloads[0].Items, 1)
+
+	item := response.Workloads[0].Items[0]
+	assert.Equal(t, "web", item.ServiceName)
+	assert.Equal(t, "docker-micro", item.SKU)
+	assert.Equal(t, 2, item.Count)
+	assert.Empty(t, item.Image, "image should be empty when ServiceImages is nil")
+}
+
 func TestGetWorkloads_BackendError_PartialResults(t *testing.T) {
 	healthySrv := newProvisionServer(t, []backend.ProvisionInfo{
 		{

@@ -784,7 +784,7 @@ type WorkloadEntry struct {
 type WorkloadItem struct {
 	ServiceName string `json:"service_name,omitempty"`
 	SKU         string `json:"sku"`
-	Image       string `json:"image"`
+	Image       string `json:"image,omitempty"`
 	Count       int    `json:"count"`
 }
 
