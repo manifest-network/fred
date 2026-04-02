@@ -4242,7 +4242,8 @@ func TestGetWorkloads_StackProvisions(t *testing.T) {
 
 func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
 	// Simulates cold restart where Items survive but StackManifest (and thus
-	// ServiceImages) is nil. Image fields should be omitted, not empty strings.
+	// ServiceImages) is nil. The "image" key should be absent from the JSON
+	// (omitempty), not present as an empty string.
 	srv := newProvisionServer(t, []backend.ProvisionInfo{
 		{
 			LeaseUUID: testutil.ValidUUID2,
@@ -4261,17 +4262,25 @@ func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
 
-	code, response := callGetWorkloads(t, h)
-	assert.Equal(t, http.StatusOK, code)
+	// Decode into raw JSON to verify the "image" key is actually absent.
+	req := httptest.NewRequest("GET", "/workloads", nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
 
-	require.Len(t, response.Workloads, 1)
-	require.Len(t, response.Workloads[0].Items, 1)
+	var raw map[string]any
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&raw))
 
-	item := response.Workloads[0].Items[0]
-	assert.Equal(t, "web", item.ServiceName)
-	assert.Equal(t, "docker-micro", item.SKU)
-	assert.Equal(t, 2, item.Count)
-	assert.Empty(t, item.Image, "image should be empty when ServiceImages is nil")
+	workloads := raw["workloads"].([]any)
+	require.Len(t, workloads, 1)
+	items := workloads[0].(map[string]any)["items"].([]any)
+	require.Len(t, items, 1)
+
+	item := items[0].(map[string]any)
+	assert.Equal(t, "web", item["service_name"])
+	assert.Equal(t, "docker-micro", item["sku"])
+	_, hasImage := item["image"]
+	assert.False(t, hasImage, "image key should be absent from JSON when ServiceImages is nil")
 }
 
 func TestGetWorkloads_BackendError_PartialResults(t *testing.T) {
