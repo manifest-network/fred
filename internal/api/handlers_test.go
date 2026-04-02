@@ -4083,3 +4083,284 @@ func TestHealthCheck_WithoutStatusChecker(t *testing.T) {
 	assert.Equal(t, "healthy", response.Status)
 	assert.Nil(t, response.Stats, "stats should be absent without statusChecker")
 }
+
+// --- GetWorkloads tests ---
+
+// newProvisionServer returns an httptest.Server that serves the given provisions
+// on /provisions and responds 200 to /health.
+func newProvisionServer(t *testing.T, provisions []backend.ProvisionInfo) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/provisions" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(backend.ListProvisionsResponse{Provisions: provisions})
+			return
+		}
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
+// newFailingServer returns an httptest.Server that responds 500 to all
+// requests except /health.
+func newFailingServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+}
+
+// newWorkloadsHandler builds a Handlers with a backend router wired to the
+// given backend entries.
+func newWorkloadsHandler(t *testing.T, entries []backend.BackendEntry) *Handlers {
+	t.Helper()
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
+	require.NoError(t, err)
+	return &Handlers{
+		providerUUID:  testutil.ValidUUID1,
+		backendRouter: router,
+	}
+}
+
+// callGetWorkloads invokes GetWorkloads and decodes the response.
+func callGetWorkloads(t *testing.T, h *Handlers) (int, WorkloadsResponse) {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/workloads", nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
+	var resp WorkloadsResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	return rec.Code, resp
+}
+
+func TestGetWorkloads_NilRouter(t *testing.T) {
+	h := &Handlers{providerUUID: testutil.ValidUUID1}
+
+	req := httptest.NewRequest("GET", "/workloads", nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+	var response WorkloadsResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, testutil.ValidUUID1, response.ProviderUUID)
+	assert.Empty(t, response.Workloads)
+}
+
+func TestGetWorkloads_NonStackProvisions(t *testing.T) {
+	srv := newProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID:    testutil.ValidUUID2,
+			ProviderUUID: testutil.ValidUUID1,
+			Status:       backend.ProvisionStatusReady,
+			CreatedAt:    time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC),
+			Image:        "nginx:1.25",
+			SKU:          "docker-micro",
+			Quantity:     2,
+		},
+	})
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	code, response := callGetWorkloads(t, h)
+	assert.Equal(t, http.StatusOK, code)
+
+	require.Len(t, response.Workloads, 1)
+	w := response.Workloads[0]
+	assert.Equal(t, testutil.ValidUUID2, w.LeaseUUID)
+	assert.Equal(t, "ready", w.Status)
+	assert.Equal(t, "test-backend", w.BackendName)
+
+	require.Len(t, w.Items, 1)
+	assert.Equal(t, "docker-micro", w.Items[0].SKU)
+	assert.Equal(t, "nginx:1.25", w.Items[0].Image)
+	assert.Equal(t, 2, w.Items[0].Count)
+	assert.Empty(t, w.Items[0].ServiceName)
+}
+
+func TestGetWorkloads_StackProvisions(t *testing.T) {
+	srv := newProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID:    testutil.ValidUUID2,
+			ProviderUUID: testutil.ValidUUID1,
+			Status:       backend.ProvisionStatusReady,
+			CreatedAt:    time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC),
+			Quantity:     3,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+				{SKU: "docker-large", Quantity: 1, ServiceName: "db"},
+			},
+			ServiceImages: map[string]string{
+				"web": "nginx:1.25",
+				"db":  "postgres:16",
+			},
+		},
+	})
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	code, response := callGetWorkloads(t, h)
+	assert.Equal(t, http.StatusOK, code)
+
+	require.Len(t, response.Workloads, 1)
+	w := response.Workloads[0]
+	require.Len(t, w.Items, 2)
+
+	// Items may be in any order; swap so "web" is first for deterministic assertions.
+	items := w.Items
+	if items[0].ServiceName == "db" {
+		items[0], items[1] = items[1], items[0]
+	}
+	assert.Equal(t, "web", items[0].ServiceName)
+	assert.Equal(t, "docker-micro", items[0].SKU)
+	assert.Equal(t, "nginx:1.25", items[0].Image)
+	assert.Equal(t, 2, items[0].Count)
+
+	assert.Equal(t, "db", items[1].ServiceName)
+	assert.Equal(t, "docker-large", items[1].SKU)
+	assert.Equal(t, "postgres:16", items[1].Image)
+	assert.Equal(t, 1, items[1].Count)
+}
+
+func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
+	// Simulates cold restart where Items survive but StackManifest (and thus
+	// ServiceImages) is nil. The "image" key should be absent from the JSON
+	// (omitempty), not present as an empty string.
+	srv := newProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID: testutil.ValidUUID2,
+			Status:    backend.ProvisionStatusReady,
+			Quantity:  2,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+			},
+			ServiceImages: nil,
+		},
+	})
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	// Decode into raw JSON to verify the "image" key is actually absent.
+	req := httptest.NewRequest("GET", "/workloads", nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var raw map[string]any
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&raw))
+
+	workloadsAny, ok := raw["workloads"].([]any)
+	require.True(t, ok, "workloads should be a JSON array")
+	require.Len(t, workloadsAny, 1)
+
+	firstWorkload, ok := workloadsAny[0].(map[string]any)
+	require.True(t, ok, "workload entry should be a JSON object")
+
+	itemsAny, ok := firstWorkload["items"].([]any)
+	require.True(t, ok, "items should be a JSON array")
+	require.Len(t, itemsAny, 1)
+
+	item, ok := itemsAny[0].(map[string]any)
+	require.True(t, ok, "item should be a JSON object")
+	assert.Equal(t, "web", item["service_name"])
+	assert.Equal(t, "docker-micro", item["sku"])
+	_, hasImage := item["image"]
+	assert.False(t, hasImage, "image key should be absent from JSON when ServiceImages is nil")
+}
+
+func TestGetWorkloads_BackendError_PartialResults(t *testing.T) {
+	healthySrv := newProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID: testutil.ValidUUID2,
+			Status:    backend.ProvisionStatusReady,
+			Image:     "nginx:1.25",
+			SKU:       "docker-micro",
+			Quantity:  1,
+		},
+	})
+	defer healthySrv.Close()
+
+	failingSrv := newFailingServer(t)
+	defer failingSrv.Close()
+
+	healthyClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "healthy-backend", BaseURL: healthySrv.URL, Timeout: 5 * time.Second,
+	})
+	failingClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "failing-backend", BaseURL: failingSrv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{
+		{Backend: healthyClient, IsDefault: true},
+		{Backend: failingClient},
+	})
+
+	code, response := callGetWorkloads(t, h)
+
+	assert.Equal(t, http.StatusOK, code)
+	assert.Len(t, response.Workloads, 1)
+	assert.Equal(t, testutil.ValidUUID2, response.Workloads[0].LeaseUUID)
+
+	require.Len(t, response.Warnings, 1)
+	assert.Equal(t, `backend "failing-backend" unavailable`, response.Warnings[0])
+}
+
+func TestGetWorkloads_AllBackendsFail(t *testing.T) {
+	failingSrv1 := newFailingServer(t)
+	defer failingSrv1.Close()
+	failingSrv2 := newFailingServer(t)
+	defer failingSrv2.Close()
+
+	client1 := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "backend-1", BaseURL: failingSrv1.URL, Timeout: 5 * time.Second,
+	})
+	client2 := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "backend-2", BaseURL: failingSrv2.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{
+		{Backend: client1, IsDefault: true},
+		{Backend: client2},
+	})
+
+	code, response := callGetWorkloads(t, h)
+
+	assert.Equal(t, http.StatusOK, code)
+	assert.Empty(t, response.Workloads)
+	assert.Len(t, response.Warnings, 2, "all backend failures should be surfaced as warnings")
+}
+
+func TestGetWorkloads_EmptyBackend(t *testing.T) {
+	srv := newProvisionServer(t, nil)
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	code, response := callGetWorkloads(t, h)
+
+	assert.Equal(t, http.StatusOK, code)
+	assert.Empty(t, response.Workloads)
+}

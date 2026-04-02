@@ -209,6 +209,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	// Unauthenticated routes
 	mux.Handle("GET /health", withTimeout(http.HandlerFunc(handlers.HealthCheck)))
 	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
+	mux.Handle("GET /workloads", withTimeout(http.HandlerFunc(handlers.GetWorkloads)))
 	mux.Handle("POST /callbacks/provision", withTimeout(http.HandlerFunc(s.handleProvisionCallback)))
 
 	// Authenticated routes with optional tenant rate limiting.

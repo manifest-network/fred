@@ -1604,27 +1604,128 @@ func TestGetProvision_NotFound(t *testing.T) {
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 }
 
+// --- Workload field fixtures ---
+
+// nonStackProvision returns a simple non-stack provision fixture.
+func nonStackProvision() *provision {
+	return &provision{
+		LeaseUUID:    "lease-1",
+		ProviderUUID: "prov-1",
+		Status:       backend.ProvisionStatusReady,
+		SKU:          "docker-micro",
+		Image:        "nginx:1.25",
+		Quantity:     2,
+	}
+}
+
+// stackProvision returns a stack provision fixture with web + db services.
+func stackProvision() *provision {
+	return &provision{
+		LeaseUUID:    "lease-1",
+		ProviderUUID: "prov-1",
+		Status:       backend.ProvisionStatusReady,
+		Quantity:     3,
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+			{SKU: "docker-large", Quantity: 1, ServiceName: "db"},
+		},
+		StackManifest: &StackManifest{
+			Services: map[string]*DockerManifest{
+				"web": {Image: "nginx:1.25"},
+				"db":  {Image: "postgres:16"},
+			},
+		},
+	}
+}
+
+// stackProvisionNilManifest returns a stack provision with a nil StackManifest
+// (simulates cold restart with no release store).
+func stackProvisionNilManifest() *provision {
+	return &provision{
+		LeaseUUID:     "lease-1",
+		ProviderUUID:  "prov-1",
+		Status:        backend.ProvisionStatusReady,
+		Quantity:      2,
+		Items:         []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}},
+		StackManifest: nil,
+	}
+}
+
+// assertNonStackFields verifies workload fields on a non-stack ProvisionInfo.
+func assertNonStackFields(t *testing.T, info *backend.ProvisionInfo) {
+	t.Helper()
+	assert.Equal(t, "docker-micro", info.SKU)
+	assert.Equal(t, "nginx:1.25", info.Image)
+	assert.Equal(t, 2, info.Quantity)
+	assert.Nil(t, info.Items)
+	assert.Nil(t, info.ServiceImages)
+}
+
+// assertStackFields verifies workload fields on a stack ProvisionInfo.
+func assertStackFields(t *testing.T, info *backend.ProvisionInfo) {
+	t.Helper()
+	assert.Equal(t, 3, info.Quantity)
+	assert.Empty(t, info.Image, "stack lease should not set top-level Image")
+	assert.Empty(t, info.SKU, "stack lease should not set top-level SKU")
+	require.Len(t, info.Items, 2)
+	require.NotNil(t, info.ServiceImages)
+	assert.Equal(t, "nginx:1.25", info.ServiceImages["web"])
+	assert.Equal(t, "postgres:16", info.ServiceImages["db"])
+}
+
+// assertNilManifestFields verifies workload fields when StackManifest is nil.
+func assertNilManifestFields(t *testing.T, info *backend.ProvisionInfo) {
+	t.Helper()
+	require.Len(t, info.Items, 1)
+	assert.Nil(t, info.ServiceImages, "nil StackManifest should produce nil ServiceImages")
+}
+
+// backendWithProvision creates a test backend with a single provision keyed by lease UUID.
+func backendWithProvision(t *testing.T, prov *provision) *Backend {
+	t.Helper()
+	return newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		prov.LeaseUUID: prov,
+	})
+}
+
+func TestGetProvision_WorkloadFields_NonStack(t *testing.T) {
+	b := backendWithProvision(t, nonStackProvision())
+	info, err := b.GetProvision(context.Background(), "lease-1")
+	require.NoError(t, err)
+	assertNonStackFields(t, info)
+}
+
+func TestGetProvision_WorkloadFields_Stack(t *testing.T) {
+	b := backendWithProvision(t, stackProvision())
+	info, err := b.GetProvision(context.Background(), "lease-1")
+	require.NoError(t, err)
+	assertStackFields(t, info)
+}
+
+func TestGetProvision_WorkloadFields_Stack_NilManifest(t *testing.T) {
+	b := backendWithProvision(t, stackProvisionNilManifest())
+	info, err := b.GetProvision(context.Background(), "lease-1")
+	require.NoError(t, err)
+	assertNilManifestFields(t, info)
+}
+
 // --- ListProvisions tests ---
 
 func TestListProvisions_Empty(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForProvisionTest(t, mock, nil)
-
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
 	result, err := b.ListProvisions(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, result)
 }
 
 func TestListProvisions_Multiple(t *testing.T) {
-	mock := &mockDockerClient{}
 	now := time.Now()
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusReady,
 			CreatedAt:    now,
-			FailCount:    0,
 		},
 		"lease-2": {
 			LeaseUUID:    "lease-2",
@@ -1639,12 +1740,58 @@ func TestListProvisions_Multiple(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, result, 2)
 
-	// Verify field mapping
 	for _, pi := range result {
 		assert.NotEmpty(t, pi.LeaseUUID)
 		assert.Equal(t, "prov-1", pi.ProviderUUID)
 		assert.NotEmpty(t, pi.BackendName)
 	}
+}
+
+func TestListProvisions_WorkloadFields_NonStack(t *testing.T) {
+	b := backendWithProvision(t, nonStackProvision())
+	result, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assertNonStackFields(t, &result[0])
+}
+
+func TestListProvisions_WorkloadFields_Stack(t *testing.T) {
+	b := backendWithProvision(t, stackProvision())
+	result, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assertStackFields(t, &result[0])
+}
+
+func TestListProvisions_WorkloadFields_Stack_NilManifest(t *testing.T) {
+	b := backendWithProvision(t, stackProvisionNilManifest())
+	result, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assertNilManifestFields(t, &result[0])
+}
+
+func TestListProvisions_ItemsDefensivelyCopied(t *testing.T) {
+	originalItems := []backend.LeaseItem{
+		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+	}
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:     "lease-1",
+			ProviderUUID:  "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      2,
+			Items:         originalItems,
+			StackManifest: &StackManifest{Services: map[string]*DockerManifest{"web": {Image: "nginx:1.25"}}},
+		},
+	})
+
+	result, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	result[0].Items[0].SKU = "mutated"
+	assert.Equal(t, "docker-micro", originalItems[0].SKU, "returned Items should be a copy, not share backing array")
 }
 
 // --- sendCallback / trySendCallback tests ---
