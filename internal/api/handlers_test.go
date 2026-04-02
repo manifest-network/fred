@@ -4323,7 +4323,7 @@ func TestGetWorkloads_BackendError_PartialResults(t *testing.T) {
 	assert.Equal(t, testutil.ValidUUID2, response.Workloads[0].LeaseUUID)
 
 	require.Len(t, response.Warnings, 1)
-	assert.Contains(t, response.Warnings[0], "failing-backend")
+	assert.Equal(t, `backend "failing-backend" unavailable`, response.Warnings[0])
 }
 
 func TestGetWorkloads_AllBackendsFail(t *testing.T) {
