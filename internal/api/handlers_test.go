@@ -4271,12 +4271,19 @@ func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
 	var raw map[string]any
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&raw))
 
-	workloads := raw["workloads"].([]any)
-	require.Len(t, workloads, 1)
-	items := workloads[0].(map[string]any)["items"].([]any)
-	require.Len(t, items, 1)
+	workloadsAny, ok := raw["workloads"].([]any)
+	require.True(t, ok, "workloads should be a JSON array")
+	require.Len(t, workloadsAny, 1)
 
-	item := items[0].(map[string]any)
+	firstWorkload, ok := workloadsAny[0].(map[string]any)
+	require.True(t, ok, "workload entry should be a JSON object")
+
+	itemsAny, ok := firstWorkload["items"].([]any)
+	require.True(t, ok, "items should be a JSON array")
+	require.Len(t, itemsAny, 1)
+
+	item, ok := itemsAny[0].(map[string]any)
+	require.True(t, ok, "item should be a JSON object")
 	assert.Equal(t, "web", item["service_name"])
 	assert.Equal(t, "docker-micro", item["sku"])
 	_, hasImage := item["image"]
