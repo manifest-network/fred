@@ -1,0 +1,71 @@
+version: 2
+
+builds:
+  - id: providerd
+    main: ./cmd/providerd
+    binary: providerd
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+  - id: docker-backend
+    main: ./cmd/docker-backend
+    binary: docker-backend
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: providerd
+    ids: [providerd]
+    name_template: "providerd_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: docker-backend
+    ids: [docker-backend]
+    name_template: "docker-backend_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+dockers:
+  - ids: [providerd]
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/manifest-network/fred:{{ .Version }}"
+      - "ghcr.io/manifest-network/fred:{{ if not .Prerelease }}latest{{ end }}"
+      - "ghcr.io/manifest-network/fred:{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "ghcr.io/manifest-network/fred:{{ if not .Prerelease }}{{ .Major }}{{ end }}"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=providerd"
+      - "--label=org.opencontainers.image.description=Manifest Network provider daemon"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+
+changelog:
+  sort: asc
+  groups:
+    - title: New Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"
+      - "^test:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  prerelease: auto

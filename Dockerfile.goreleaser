@@ -1,0 +1,5 @@
+FROM gcr.io/distroless/static-debian12
+COPY providerd /providerd
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/providerd"]
