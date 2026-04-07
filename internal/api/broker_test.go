@@ -293,15 +293,17 @@ func wsDialWithAuth(t *testing.T, serverURL, leaseUUID, token string) (*websocke
 }
 
 func newTestHandlers(broker *EventBroker, chainClient ChainClient, providerUUID string) *Handlers {
-	return &Handlers{
-		client:            chainClient,
-		eventBroker:       broker,
-		wsUpgrader:        websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-		wsMaxMessageSize:  wsDefaultMaxMessageSize,
-		wsMaxConnLifetime: wsDefaultMaxConnLifetime,
-		providerUUID:      providerUUID,
-		bech32Prefix:      "manifest",
-	}
+	// Delegate to NewHandlers so tests exercise the same init path as
+	// production (and so future required init added to NewHandlers is
+	// picked up automatically instead of silently skipped). Tests that
+	// need to override the WS tunables do so by assigning to the returned
+	// Handlers' fields after construction.
+	return NewHandlers(HandlersConfig{
+		Client:       chainClient,
+		EventBroker:  broker,
+		ProviderUUID: providerUUID,
+		Bech32Prefix: "manifest",
+	})
 }
 
 func TestStreamLeaseEvents_RequiresAuth(t *testing.T) {
@@ -735,11 +737,11 @@ func streamEventsTestEnv(t *testing.T) (h *Handlers, broker *EventBroker, server
 	return h, broker, server, leaseUUID, validToken
 }
 
-func TestStreamLeaseEvents_RejectsOversizedFrame(t *testing.T) {
-	// The lease events stream is server-push only — clients should never send
-	// data frames. The server enforces a small read limit so a buggy or
-	// malicious client cannot exhaust memory by sending oversized frames or
-	// hold a per-lease subscription slot indefinitely.
+func TestStreamLeaseEvents_RejectsOversizedMessage(t *testing.T) {
+	// The lease events stream is server-push only — clients should never
+	// send application messages. The server enforces a small read limit so
+	// a buggy or malicious client cannot exhaust memory with an oversized
+	// message or hold a per-lease subscription slot indefinitely.
 	_, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
 
 	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
@@ -748,9 +750,9 @@ func TestStreamLeaseEvents_RejectsOversizedFrame(t *testing.T) {
 
 	awaitSubscriber(t, broker, leaseUUID)
 
-	// Send a binary frame strictly larger than the read limit. The server's
-	// read pump should trip ErrReadLimit, and gorilla auto-sends a 1009
-	// CloseMessageTooBig frame back to the client.
+	// Send a binary message strictly larger than the read limit. The
+	// server's read pump should trip ErrReadLimit, and gorilla auto-sends
+	// a 1009 CloseMessageTooBig frame back to the client.
 	payload := make([]byte, wsDefaultMaxMessageSize+1)
 	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
 
@@ -765,12 +767,12 @@ func TestStreamLeaseEvents_RejectsOversizedFrame(t *testing.T) {
 	var closeErr *websocket.CloseError
 	require.ErrorAs(t, err, &closeErr)
 	assert.Equal(t, websocket.CloseMessageTooBig, closeErr.Code,
-		"expected server to send 1009 CloseMessageTooBig on oversized frame")
+		"expected server to send 1009 CloseMessageTooBig on oversized message")
 
 	// And the subscription slot must be freed so a reconnect can succeed.
 	require.Eventually(t, func() bool {
 		return broker.subscriberCount(leaseUUID) == 0
-	}, 2*time.Second, 5*time.Millisecond, "expected server to unsubscribe after oversized frame")
+	}, 2*time.Second, 5*time.Millisecond, "expected server to unsubscribe after oversized message")
 }
 
 func TestStreamLeaseEvents_RejectsAnyClientMessage(t *testing.T) {
@@ -807,14 +809,21 @@ func TestStreamLeaseEvents_RejectsAnyClientMessage(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond, "expected server to unsubscribe after policy violation")
 }
 
-func TestStreamLeaseEvents_BoundaryFrameTripsPolicyNotReadLimit(t *testing.T) {
-	// Boundary check: gorilla rejects messages STRICTLY larger than the read
-	// limit, so a frame of exactly wsDefaultMaxMessageSize bytes must NOT
-	// trip the read limit — it should hit our application-level policy
-	// check instead and close with 1008 ClosePolicyViolation. Asserting
-	// "policy, not read limit" locks the boundary: if SetReadLimit were
-	// off-by-one (rejecting at == instead of only at >), we'd see 1009
-	// CloseMessageTooBig and the assertion would fail.
+func TestStreamLeaseEvents_BoundaryMessageTripsPolicyNotReadLimit(t *testing.T) {
+	// Ordering invariant at the exact read-limit boundary: gorilla rejects
+	// messages STRICTLY larger than the read limit, so a message of exactly
+	// wsDefaultMaxMessageSize bytes must NOT trip the read limit — it
+	// should flow through as a successful ReadMessage and hit our
+	// application-level policy check, closing with 1008 ClosePolicyViolation
+	// instead of 1009 CloseMessageTooBig.
+	//
+	// This test locks the ordering "policy check runs at the exact limit"
+	// rather than the SetReadLimit off-by-one directly (after the policy
+	// change, a SetReadLimit off-by-one at a fixed 512-byte payload would
+	// still surface as 1008 because policy fires first on a successful
+	// ReadMessage). A dedicated SetReadLimit off-by-one test would need to
+	// vary h.wsMaxMessageSize independently; that's captured elsewhere by
+	// the 513-byte RejectsOversizedMessage test which pins the >-relation.
 	_, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
 
 	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
@@ -832,7 +841,7 @@ func TestStreamLeaseEvents_BoundaryFrameTripsPolicyNotReadLimit(t *testing.T) {
 	var closeErr *websocket.CloseError
 	require.ErrorAs(t, err, &closeErr)
 	assert.Equal(t, websocket.ClosePolicyViolation, closeErr.Code,
-		"expected 1008 ClosePolicyViolation; 1009 CloseMessageTooBig would mean SetReadLimit is off-by-one")
+		"expected 1008 ClosePolicyViolation at the exact read-limit boundary; 1009 CloseMessageTooBig would mean gorilla rejected == instead of only >")
 }
 
 func TestStreamLeaseEvents_MaxLifetimeForcesReconnect(t *testing.T) {

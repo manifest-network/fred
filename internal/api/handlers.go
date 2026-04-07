@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1088,9 +1090,11 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	// On this push-only endpoint a successful ReadMessage therefore means
 	// the client violated the application contract by sending application
 	// data; close with 1008 ClosePolicyViolation to prevent CPU/slot
-	// exhaustion via small-message spam. An error means a benign disconnect,
-	// peer close, read deadline expiry, or oversized message (the last is
-	// handled separately so abuse is visible in operator logs).
+	// exhaustion via small-message spam. An error means one of three things:
+	// oversized message (ErrReadLimit — logged; gorilla also auto-sends a
+	// 1009 frame back), a benign disconnect (peer close, read deadline
+	// expiry, TCP drop — silently ignored), or a protocol violation / other
+	// abuse signal (logged).
 	closeCh := make(chan struct{})
 	conn.SetPongHandler(func(string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -1101,14 +1105,23 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 		defer close(closeCh)
 		_, _, err := conn.ReadMessage()
 		if err != nil {
-			// Distinguish abuse (oversized message tripped SetReadLimit)
-			// from a benign disconnect. gorilla also auto-sends a 1009
-			// CloseMessageTooBig frame back to the client in this case.
-			if errors.Is(err, websocket.ErrReadLimit) {
+			switch {
+			case errors.Is(err, websocket.ErrReadLimit):
 				slog.Warn("websocket oversized message from client",
 					"lease_uuid", leaseUUID,
 					"remote_addr", r.RemoteAddr,
 					"limit", maxMessageSize,
+				)
+			case isBenignReadError(err):
+				// Normal disconnect — silent.
+			default:
+				// Protocol violation or unexpected error; log as abuse
+				// signal so weird client behavior is visible in operator
+				// logs rather than vanishing into the benign bucket.
+				slog.Warn("websocket read error from client",
+					"lease_uuid", leaseUUID,
+					"remote_addr", r.RemoteAddr,
+					"error", err,
 				)
 			}
 			return
@@ -1183,6 +1196,25 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// isBenignReadError returns true for error categories that represent a
+// normal client disconnect on an /events WebSocket: a peer-initiated close
+// (any code), any net.Error (timeout, "use of closed network connection",
+// etc.), or a plain EOF. Everything else — including gorilla's plain
+// `errors.New("websocket: ...")` protocol-violation errors (bad opcode,
+// bad mask, invalid utf8 in close frame, continuation after FIN, etc.) —
+// is treated as a potential abuse signal by the caller and logged.
+func isBenignReadError(err error) bool {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // extractBearerToken extracts the raw token string from the Authorization header.
