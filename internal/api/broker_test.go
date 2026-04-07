@@ -707,8 +707,8 @@ func TestStreamLeaseEvents_ReceivesRestartAndUpdateEvents(t *testing.T) {
 	}
 }
 
-// streamEventsTestEnv builds a Handlers + httptest server + valid token for a
-// single lease. Used by the four StreamLeaseEvents read-limit and lifetime
+// streamEventsTestEnv builds a Handlers + httptest server + valid token for
+// a single lease. Used by the StreamLeaseEvents read-limit and lifetime
 // tests below.
 func streamEventsTestEnv(t *testing.T) (h *Handlers, broker *EventBroker, server *httptest.Server, leaseUUID, validToken string) {
 	t.Helper()

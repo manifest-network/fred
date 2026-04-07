@@ -20,10 +20,14 @@ import (
 )
 
 // TestNewHandlers_AppliesWebSocketDefaults pins the WebSocket security
-// defaults set by NewHandlers. The lease events stream relies on a non-zero
-// SetReadLimit (gorilla treats 0 as "no limit") and a non-zero connection
-// lifetime; a future change that drops either field from NewHandlers would
-// silently revert the read-size and slot-occupation mitigations.
+// defaults set by NewHandlers. StreamLeaseEvents has a defensive fallback
+// that substitutes the production defaults and logs an slog.Error if either
+// field is non-positive, so a future change that drops either field init
+// from NewHandlers would NOT silently disable the mitigations — but it
+// would force every /events connection onto the fallback path, emitting a
+// per-connection error log and making the fallback the de-facto main code
+// path instead of a safety net. This test keeps the constructor honest so
+// the fallback stays reserved for genuinely misconfigured callers.
 func TestNewHandlers_AppliesWebSocketDefaults(t *testing.T) {
 	h := NewHandlers(HandlersConfig{
 		ProviderUUID: testutil.ValidUUID1,
@@ -31,9 +35,9 @@ func TestNewHandlers_AppliesWebSocketDefaults(t *testing.T) {
 	})
 
 	assert.Equal(t, wsDefaultMaxMessageSize, h.wsMaxMessageSize,
-		"NewHandlers must set wsMaxMessageSize — gorilla treats 0 as no limit")
+		"NewHandlers must set wsMaxMessageSize so the production path doesn't fall through to StreamLeaseEvents' defensive default (which would log an slog.Error per connection)")
 	assert.Equal(t, wsDefaultMaxConnLifetime, h.wsMaxConnLifetime,
-		"NewHandlers must set wsMaxConnLifetime — a zero lifetime would close every /events connection immediately")
+		"NewHandlers must set wsMaxConnLifetime so the production path doesn't fall through to StreamLeaseEvents' defensive default (which would log an slog.Error per connection)")
 }
 
 func TestHealthCheck(t *testing.T) {
