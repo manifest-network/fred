@@ -1046,7 +1046,21 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	// contract this endpoint is server-push only, so any client message
 	// larger than the limit indicates a buggy or malicious client and must
 	// not be allowed to allocate memory.
-	conn.SetReadLimit(h.wsMaxMessageSize)
+	//
+	// Defensive fallback: gorilla treats SetReadLimit(0) as "no limit", so
+	// a zero-valued field (e.g., from a Handlers literal that bypassed
+	// NewHandlers) would silently disable the protection. Treat anything
+	// non-positive as misconfiguration: log loudly and fall back to the
+	// production default rather than serve traffic without the cap.
+	maxMessageSize := h.wsMaxMessageSize
+	if maxMessageSize <= 0 {
+		slog.Error("websocket read limit misconfigured, falling back to default",
+			"configured", maxMessageSize,
+			"default", wsDefaultMaxMessageSize,
+		)
+		maxMessageSize = wsDefaultMaxMessageSize
+	}
+	conn.SetReadLimit(maxMessageSize)
 
 	ch, subErr := h.eventBroker.Subscribe(leaseUUID)
 	if subErr != nil {
@@ -1094,7 +1108,7 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 				slog.Warn("websocket oversized message from client",
 					"lease_uuid", leaseUUID,
 					"remote_addr", r.RemoteAddr,
-					"limit", h.wsMaxMessageSize,
+					"limit", maxMessageSize,
 				)
 			}
 			return
@@ -1121,7 +1135,21 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	// CloseTryAgainLater (1013) tells the client this is a transient,
 	// server-initiated rotation — distinct from CloseGoingAway used for
 	// broker shutdown below — so reconnect logic can be unconditional.
-	lifetimeTimer := time.NewTimer(h.wsMaxConnLifetime)
+	//
+	// Defensive fallback (same shape as the read-limit guard above):
+	// time.NewTimer(0) — or any non-positive duration — fires immediately,
+	// which would close every /events connection right after subscribe.
+	// Treat <= 0 as misconfiguration and fall back to the production
+	// default rather than introduce a "disable the cap" knob.
+	maxLifetime := h.wsMaxConnLifetime
+	if maxLifetime <= 0 {
+		slog.Error("websocket lifetime misconfigured, falling back to default",
+			"configured", maxLifetime,
+			"default", wsDefaultMaxConnLifetime,
+		)
+		maxLifetime = wsDefaultMaxConnLifetime
+	}
+	lifetimeTimer := time.NewTimer(maxLifetime)
 	defer lifetimeTimer.Stop()
 
 	for {

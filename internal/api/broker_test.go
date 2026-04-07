@@ -858,6 +858,46 @@ func TestStreamLeaseEvents_MaxLifetimeForcesReconnect(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond, "expected server to unsubscribe after lifetime expiry")
 }
 
+func TestStreamLeaseEvents_FallsBackOnZeroTunables(t *testing.T) {
+	// Defensive guard: a *Handlers literal that bypasses NewHandlers (or a
+	// future test that overrides the fields without setting them) would
+	// produce zero-valued wsMaxMessageSize and wsMaxConnLifetime, which
+	// would silently disable the read limit (gorilla treats SetReadLimit(0)
+	// as "no limit") AND immediately close every connection
+	// (time.NewTimer(0) fires immediately). The handler must fall back to
+	// the production defaults instead.
+	h, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
+	h.wsMaxMessageSize = 0
+	h.wsMaxConnLifetime = 0
+
+	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
+	require.NotNil(t, conn)
+	defer conn.Close()
+
+	awaitSubscriber(t, broker, leaseUUID)
+
+	// Lifetime fallback: the connection must NOT close immediately (which
+	// it would if time.NewTimer(0) had fired). Publishing and reading an
+	// event back proves the connection is still serving.
+	broker.Publish(testEvent(leaseUUID, backend.ProvisionStatusReady))
+	var event backend.LeaseStatusEvent
+	require.NoError(t, conn.ReadJSON(&event), "connection must survive zero-valued lifetime")
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
+
+	// Read-limit fallback: an oversized payload (> wsDefaultMaxMessageSize)
+	// must still trip CloseMessageTooBig — proving the read limit was
+	// applied at the default value rather than left at 0 (unlimited).
+	payload := make([]byte, wsDefaultMaxMessageSize+1)
+	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
+
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	assert.Equal(t, websocket.CloseMessageTooBig, closeErr.Code,
+		"expected default read limit to apply (1009); got %d", closeErr.Code)
+}
+
 func TestStreamLeaseEvents_DeliversEventBeforeLifetimeExpiry(t *testing.T) {
 	// Regression guard: events published before the lifetime timer fires
 	// must still be delivered to the client. Catches a future change that
