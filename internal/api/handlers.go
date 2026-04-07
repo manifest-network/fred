@@ -1068,15 +1068,15 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 		pongWait     = 40 * time.Second
 	)
 
-	// Read pump. gorilla handles ping/pong/close control frames internally
-	// (close/pong are processed by SetPongHandler / advanceFrame and never
-	// surface here) and only returns from ReadMessage on a data message or
-	// an error. On this push-only endpoint a successful ReadMessage means
+	// Read pump. gorilla handles ping/pong control frames silently and
+	// surfaces a peer-initiated close as a *websocket.CloseError from
+	// ReadMessage — neither path appears as a successful data-message read.
+	// On this push-only endpoint a successful ReadMessage therefore means
 	// the client violated the application contract by sending application
-	// data — close the connection with 1008 ClosePolicyViolation to prevent
-	// CPU/slot exhaustion via small-message spam. An error means a benign
-	// disconnect, read deadline expiry, or oversized message (handled
-	// separately so abuse is visible in operator logs).
+	// data; close with 1008 ClosePolicyViolation to prevent CPU/slot
+	// exhaustion via small-message spam. An error means a benign disconnect,
+	// peer close, read deadline expiry, or oversized message (the last is
+	// handled separately so abuse is visible in operator logs).
 	closeCh := make(chan struct{})
 	conn.SetPongHandler(func(string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
