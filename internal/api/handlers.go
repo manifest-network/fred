@@ -51,7 +51,7 @@ type Handlers struct {
 	placementLookup   PlacementLookup
 	eventBroker       *EventBroker
 	wsUpgrader        websocket.Upgrader
-	wsMaxMessageSize  int64         // max bytes the server will read from a client frame on /events
+	wsMaxMessageSize  int64         // max bytes the server will read from a client message on /events
 	wsMaxConnLifetime time.Duration // max lifetime of an /events subscription before forced reconnect
 	providerUUID      string
 	bech32Prefix      string
