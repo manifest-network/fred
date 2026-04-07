@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,16 +46,18 @@ type PlacementLookup interface {
 
 // Handlers contains HTTP request handlers.
 type Handlers struct {
-	client          ChainClient
-	backendRouter   *backend.Router
-	tokenTracker    TokenTrackerInterface
-	statusChecker   StatusChecker
-	placementLookup PlacementLookup
-	eventBroker     *EventBroker
-	wsUpgrader      websocket.Upgrader
-	providerUUID    string
-	bech32Prefix    string
-	callbackBaseURL string
+	client            ChainClient
+	backendRouter     *backend.Router
+	tokenTracker      TokenTrackerInterface
+	statusChecker     StatusChecker
+	placementLookup   PlacementLookup
+	eventBroker       *EventBroker
+	wsUpgrader        websocket.Upgrader
+	wsMaxMessageSize  int64         // max bytes the server will read from a client message on /events
+	wsMaxConnLifetime time.Duration // max lifetime of an /events subscription before forced reconnect
+	providerUUID      string
+	bech32Prefix      string
+	callbackBaseURL   string
 }
 
 // HandlersConfig configures a Handlers instance.
@@ -85,9 +89,11 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 			// break non-browser clients that don't send Origin headers.
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		providerUUID:    cfg.ProviderUUID,
-		bech32Prefix:    cfg.Bech32Prefix,
-		callbackBaseURL: cfg.CallbackBaseURL,
+		wsMaxMessageSize:  wsDefaultMaxMessageSize,
+		wsMaxConnLifetime: wsDefaultMaxConnLifetime,
+		providerUUID:      cfg.ProviderUUID,
+		bech32Prefix:      cfg.Bech32Prefix,
+		callbackBaseURL:   cfg.CallbackBaseURL,
 	}
 }
 
@@ -990,6 +996,28 @@ var (
 	errInvalidAuthFormat = errors.New("invalid authorization format, expected 'Bearer <token>'")
 )
 
+// WebSocket subscription tunables for StreamLeaseEvents. Production values
+// are conservative for an event-only stream where the client never sends
+// application data. Tests override the per-Handlers fields (either through
+// newTestHandlers or by direct assignment after construction); these consts
+// are the production defaults wired in by NewHandlers.
+const (
+	// wsDefaultMaxMessageSize bounds the size of any message the server will
+	// read from a client (gorilla's SetReadLimit caps the assembled message
+	// size, summed across fragments). The lease events stream is push-only —
+	// clients only ever send tiny control frames (close, ping/pong) — so a
+	// small limit is sufficient and prevents memory exhaustion via oversized
+	// messages. Matches the gorilla/websocket chat example.
+	wsDefaultMaxMessageSize int64 = 512
+
+	// wsDefaultMaxConnLifetime caps the total lifetime of a single
+	// subscription. On expiry the server sends a clean close frame and the
+	// client must reconnect (and re-authenticate). This prevents a single
+	// tenant from holding a slot in the per-lease subscription pool
+	// indefinitely.
+	wsDefaultMaxConnLifetime = time.Hour
+)
+
 // StreamLeaseEvents serves a WebSocket stream of lease status events.
 // GET /v1/leases/{lease_uuid}/events
 func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
@@ -1016,6 +1044,26 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
+	// Bound the size of messages the server will read. Per the application
+	// contract this endpoint is server-push only, so any client message
+	// larger than the limit indicates a buggy or malicious client and must
+	// not be allowed to allocate memory.
+	//
+	// Defensive fallback: gorilla treats SetReadLimit(0) as "no limit", so
+	// a zero-valued field (e.g., from a Handlers literal that bypassed
+	// NewHandlers) would silently disable the protection. Treat anything
+	// non-positive as misconfiguration: log loudly and fall back to the
+	// production default rather than serve traffic without the cap.
+	maxMessageSize := h.wsMaxMessageSize
+	if maxMessageSize <= 0 {
+		slog.Error("websocket read limit misconfigured, falling back to default",
+			"configured", maxMessageSize,
+			"default", wsDefaultMaxMessageSize,
+		)
+		maxMessageSize = wsDefaultMaxMessageSize
+	}
+	conn.SetReadLimit(maxMessageSize)
+
 	ch, subErr := h.eventBroker.Subscribe(leaseUUID)
 	if subErr != nil {
 		slog.Warn("subscription rejected", "lease_uuid", leaseUUID, "error", subErr)
@@ -1036,7 +1084,17 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 		pongWait     = 40 * time.Second
 	)
 
-	// Read pump: detect client disconnect via close frames or pong timeout.
+	// Read pump. gorilla handles ping/pong control frames silently and
+	// surfaces a peer-initiated close as a *websocket.CloseError from
+	// ReadMessage — neither path appears as a successful data-message read.
+	// On this push-only endpoint a successful ReadMessage therefore means
+	// the client violated the application contract by sending application
+	// data; close with 1008 ClosePolicyViolation to prevent CPU/slot
+	// exhaustion via small-message spam. An error means one of three things:
+	// oversized message (ErrReadLimit — logged; gorilla also auto-sends a
+	// 1009 frame back), a benign disconnect (peer close, read deadline
+	// expiry, TCP drop — silently ignored), or a protocol violation / other
+	// abuse signal (logged).
 	closeCh := make(chan struct{})
 	conn.SetPongHandler(func(string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -1045,20 +1103,77 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	go func() {
 		defer close(closeCh)
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			switch {
+			case errors.Is(err, websocket.ErrReadLimit):
+				slog.Warn("websocket oversized message from client",
+					"lease_uuid", leaseUUID,
+					"remote_addr", r.RemoteAddr,
+					"limit", maxMessageSize,
+				)
+			case isBenignReadError(err):
+				// Normal disconnect — silent.
+			default:
+				// Protocol violation or unexpected error; log as abuse
+				// signal so weird client behavior is visible in operator
+				// logs rather than vanishing into the benign bucket.
+				slog.Warn("websocket read error from client",
+					"lease_uuid", leaseUUID,
+					"remote_addr", r.RemoteAddr,
+					"error", err,
+				)
 			}
+			return
 		}
+		// Successful read = unexpected client data message. Per gorilla's
+		// docs WriteControl is concurrent-safe with the main goroutine's
+		// writes, so it's OK to send the close frame from here.
+		slog.Warn("websocket unexpected client message",
+			"lease_uuid", leaseUUID,
+			"remote_addr", r.RemoteAddr,
+		)
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "client messages not allowed"),
+			time.Now().Add(writeWait))
 	}()
 
 	// Write pump: send events + ping frames.
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
+	// Cap the total connection lifetime so a single tenant cannot hold a
+	// per-lease subscription slot indefinitely. On expiry we send a clean
+	// close frame; the client is expected to reconnect with a fresh token.
+	// CloseTryAgainLater (1013) tells the client this is a transient,
+	// server-initiated rotation — distinct from CloseGoingAway used for
+	// broker shutdown below — so reconnect logic can be unconditional.
+	//
+	// Defensive fallback (same shape as the read-limit guard above):
+	// time.NewTimer(0) — or any non-positive duration — fires immediately,
+	// which would close every /events connection right after subscribe.
+	// Treat <= 0 as misconfiguration and fall back to the production
+	// default rather than introduce a "disable the cap" knob.
+	maxLifetime := h.wsMaxConnLifetime
+	if maxLifetime <= 0 {
+		slog.Error("websocket lifetime misconfigured, falling back to default",
+			"configured", maxLifetime,
+			"default", wsDefaultMaxConnLifetime,
+		)
+		maxLifetime = wsDefaultMaxConnLifetime
+	}
+	lifetimeTimer := time.NewTimer(maxLifetime)
+	defer lifetimeTimer.Stop()
+
 	for {
 		select {
 		case <-closeCh:
+			return
+		case <-lifetimeTimer.C:
+			slog.Info("websocket max lifetime reached", "lease_uuid", leaseUUID)
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "max connection lifetime reached"),
+				time.Now().Add(writeWait))
 			return
 		case event, ok := <-ch:
 			if !ok {
@@ -1081,6 +1196,25 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// isBenignReadError returns true for error categories that represent a
+// normal client disconnect on an /events WebSocket: a peer-initiated close
+// (any code), any net.Error (timeout, "use of closed network connection",
+// etc.), or a plain EOF. Everything else — including gorilla's plain
+// `errors.New("websocket: ...")` protocol-violation errors (bad opcode,
+// bad mask, invalid utf8 in close frame, continuation after FIN, etc.) —
+// is treated as a potential abuse signal by the caller and logged.
+func isBenignReadError(err error) bool {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // extractBearerToken extracts the raw token string from the Authorization header.

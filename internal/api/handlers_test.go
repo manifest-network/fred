@@ -19,6 +19,27 @@ import (
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
+// TestNewHandlers_AppliesWebSocketDefaults pins the WebSocket security
+// defaults set by NewHandlers. StreamLeaseEvents has a defensive fallback
+// that substitutes the production defaults and logs an slog.Error if either
+// field is non-positive, so a future change that drops either field init
+// from NewHandlers would NOT silently disable the mitigations — but it
+// would force every /events connection onto the fallback path, emitting a
+// per-connection error log and making the fallback the de-facto main code
+// path instead of a safety net. This test keeps the constructor honest so
+// the fallback stays reserved for genuinely misconfigured callers.
+func TestNewHandlers_AppliesWebSocketDefaults(t *testing.T) {
+	h := NewHandlers(HandlersConfig{
+		ProviderUUID: testutil.ValidUUID1,
+		Bech32Prefix: "manifest",
+	})
+
+	assert.Equal(t, wsDefaultMaxMessageSize, h.wsMaxMessageSize,
+		"NewHandlers must set wsMaxMessageSize so the production path doesn't fall through to StreamLeaseEvents' defensive default (which would log an slog.Error per connection)")
+	assert.Equal(t, wsDefaultMaxConnLifetime, h.wsMaxConnLifetime,
+		"NewHandlers must set wsMaxConnLifetime so the production path doesn't fall through to StreamLeaseEvents' defensive default (which would log an slog.Error per connection)")
+}
+
 func TestHealthCheck(t *testing.T) {
 	h := &Handlers{
 		providerUUID: testutil.ValidUUID1,
