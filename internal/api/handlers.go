@@ -1068,7 +1068,15 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 		pongWait     = 40 * time.Second
 	)
 
-	// Read pump: detect client disconnect via close frames or pong timeout.
+	// Read pump. gorilla handles ping/pong/close control frames internally
+	// (close/pong are processed by SetPongHandler / advanceFrame and never
+	// surface here) and only returns from ReadMessage on a data message or
+	// an error. On this push-only endpoint a successful ReadMessage means
+	// the client violated the application contract by sending application
+	// data — close the connection with 1008 ClosePolicyViolation to prevent
+	// CPU/slot exhaustion via small-message spam. An error means a benign
+	// disconnect, read deadline expiry, or oversized message (handled
+	// separately so abuse is visible in operator logs).
 	closeCh := make(chan struct{})
 	conn.SetPongHandler(func(string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -1077,21 +1085,30 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	go func() {
 		defer close(closeCh)
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				// Distinguish abuse (oversized message tripped SetReadLimit)
-				// from a benign disconnect. gorilla also auto-sends a 1009
-				// CloseMessageTooBig frame back to the client in this case.
-				if errors.Is(err, websocket.ErrReadLimit) {
-					slog.Warn("websocket oversized message from client",
-						"lease_uuid", leaseUUID,
-						"remote_addr", r.RemoteAddr,
-						"limit", h.wsMaxMessageSize,
-					)
-				}
-				return
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			// Distinguish abuse (oversized message tripped SetReadLimit)
+			// from a benign disconnect. gorilla also auto-sends a 1009
+			// CloseMessageTooBig frame back to the client in this case.
+			if errors.Is(err, websocket.ErrReadLimit) {
+				slog.Warn("websocket oversized message from client",
+					"lease_uuid", leaseUUID,
+					"remote_addr", r.RemoteAddr,
+					"limit", h.wsMaxMessageSize,
+				)
 			}
+			return
 		}
+		// Successful read = unexpected client data message. Per gorilla's
+		// docs WriteControl is concurrent-safe with the main goroutine's
+		// writes, so it's OK to send the close frame from here.
+		slog.Warn("websocket unexpected client message",
+			"lease_uuid", leaseUUID,
+			"remote_addr", r.RemoteAddr,
+		)
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "client messages not allowed"),
+			time.Now().Add(writeWait))
 	}()
 
 	// Write pump: send events + ping frames.
