@@ -1000,11 +1000,12 @@ var (
 // newTestHandlers or by direct assignment after construction); these consts
 // are the production defaults wired in by NewHandlers.
 const (
-	// wsDefaultMaxMessageSize bounds the size of any frame the server will
-	// read from a client. The lease events stream is push-only — clients only
-	// ever send tiny control frames (close, ping/pong) — so a small limit is
-	// sufficient and prevents memory exhaustion via oversized frames. Matches
-	// the gorilla/websocket chat example.
+	// wsDefaultMaxMessageSize bounds the size of any message the server will
+	// read from a client (gorilla's SetReadLimit caps the assembled message
+	// size, summed across fragments). The lease events stream is push-only —
+	// clients only ever send tiny control frames (close, ping/pong) — so a
+	// small limit is sufficient and prevents memory exhaustion via oversized
+	// messages. Matches the gorilla/websocket chat example.
 	wsDefaultMaxMessageSize int64 = 512
 
 	// wsDefaultMaxConnLifetime caps the total lifetime of a single
@@ -1041,10 +1042,10 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Bound the size of frames the server will read. Per the application
-	// contract this endpoint is server-push only, so any data frame larger
-	// than the limit indicates a buggy or malicious client and must not be
-	// allowed to allocate memory.
+	// Bound the size of messages the server will read. Per the application
+	// contract this endpoint is server-push only, so any client message
+	// larger than the limit indicates a buggy or malicious client and must
+	// not be allowed to allocate memory.
 	conn.SetReadLimit(h.wsMaxMessageSize)
 
 	ch, subErr := h.eventBroker.Subscribe(leaseUUID)
@@ -1078,11 +1079,11 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 		defer close(closeCh)
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
-				// Distinguish abuse (oversized frame tripped SetReadLimit)
+				// Distinguish abuse (oversized message tripped SetReadLimit)
 				// from a benign disconnect. gorilla also auto-sends a 1009
 				// CloseMessageTooBig frame back to the client in this case.
 				if errors.Is(err, websocket.ErrReadLimit) {
-					slog.Warn("websocket oversized frame from client",
+					slog.Warn("websocket oversized message from client",
 						"lease_uuid", leaseUUID,
 						"remote_addr", r.RemoteAddr,
 						"limit", h.wsMaxMessageSize,
