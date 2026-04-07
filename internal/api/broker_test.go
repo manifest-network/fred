@@ -294,11 +294,13 @@ func wsDialWithAuth(t *testing.T, serverURL, leaseUUID, token string) (*websocke
 
 func newTestHandlers(broker *EventBroker, chainClient ChainClient, providerUUID string) *Handlers {
 	return &Handlers{
-		client:       chainClient,
-		eventBroker:  broker,
-		wsUpgrader:   websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-		providerUUID: providerUUID,
-		bech32Prefix: "manifest",
+		client:            chainClient,
+		eventBroker:       broker,
+		wsUpgrader:        websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		wsMaxMessageSize:  wsDefaultMaxMessageSize,
+		wsMaxConnLifetime: wsDefaultMaxConnLifetime,
+		providerUUID:      providerUUID,
+		bech32Prefix:      "manifest",
 	}
 }
 
@@ -701,4 +703,153 @@ func TestStreamLeaseEvents_ReceivesRestartAndUpdateEvents(t *testing.T) {
 		assert.Equal(t, leaseUUID, event.LeaseUUID)
 		assert.Equal(t, expected, event.Status, "expected status %s", expected)
 	}
+}
+
+// streamEventsTestEnv builds a Handlers + httptest server + valid token for a
+// single lease. Used by the read-limit and lifetime tests below.
+func streamEventsTestEnv(t *testing.T) (h *Handlers, broker *EventBroker, server *httptest.Server, leaseUUID, validToken string) {
+	t.Helper()
+	broker = NewEventBroker()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID = testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken = testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       kp.Address,
+				ProviderUuid: providerUUID,
+				State:        billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+
+	h = newTestHandlers(broker, chainClient, providerUUID)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/leases/{lease_uuid}/events", h.StreamLeaseEvents)
+	server = httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return h, broker, server, leaseUUID, validToken
+}
+
+func TestStreamLeaseEvents_RejectsOversizedFrame(t *testing.T) {
+	// The lease events stream is server-push only — clients should never send
+	// data frames. The server enforces a small read limit so a buggy or
+	// malicious client cannot exhaust memory by sending oversized frames or
+	// hold a per-lease subscription slot indefinitely.
+	_, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
+
+	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
+	require.NotNil(t, conn)
+	defer conn.Close()
+
+	awaitSubscriber(t, broker, leaseUUID)
+
+	// Send a binary frame strictly larger than the read limit. The server's
+	// read pump should trip ErrReadLimit, and gorilla auto-sends a 1009
+	// CloseMessageTooBig frame back to the client.
+	payload := make([]byte, wsDefaultMaxMessageSize+1)
+	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
+
+	// Asserting the close code (not just slot teardown) proves the read
+	// limit actually fired — a future regression that closed the connection
+	// for an unrelated reason would otherwise still pass this test.
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	assert.Equal(t, websocket.CloseMessageTooBig, closeErr.Code,
+		"expected server to send 1009 CloseMessageTooBig on oversized frame")
+
+	// And the subscription slot must be freed so a reconnect can succeed.
+	require.Eventually(t, func() bool {
+		return broker.subscriberCount(leaseUUID) == 0
+	}, 2*time.Second, 5*time.Millisecond, "expected server to unsubscribe after oversized frame")
+}
+
+func TestStreamLeaseEvents_AllowsExactlyMaxFrame(t *testing.T) {
+	// Boundary check: gorilla rejects messages STRICTLY larger than the read
+	// limit. A frame of exactly wsDefaultMaxMessageSize bytes must NOT trip
+	// the limit. This locks the boundary against off-by-one regressions in
+	// either fred or gorilla.
+	_, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
+
+	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
+	require.NotNil(t, conn)
+	defer conn.Close()
+
+	awaitSubscriber(t, broker, leaseUUID)
+
+	payload := make([]byte, wsDefaultMaxMessageSize)
+	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
+
+	// Subscription must still be alive: publishing an event and reading it
+	// back proves the read pump did not trip and the server is still serving.
+	broker.Publish(testEvent(leaseUUID, backend.ProvisionStatusReady))
+	var event backend.LeaseStatusEvent
+	require.NoError(t, conn.ReadJSON(&event))
+	assert.Equal(t, leaseUUID, event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
+}
+
+func TestStreamLeaseEvents_MaxLifetimeForcesReconnect(t *testing.T) {
+	// The server caps the total lifetime of a single subscription so a tenant
+	// cannot hold a per-lease slot indefinitely. On expiry the server sends a
+	// CloseTryAgainLater frame and the client must reconnect.
+	h, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
+	h.wsMaxConnLifetime = 100 * time.Millisecond
+
+	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
+	require.NotNil(t, conn)
+	defer conn.Close()
+
+	awaitSubscriber(t, broker, leaseUUID)
+
+	// Read should fail with a CloseTryAgainLater frame after the configured
+	// max lifetime.
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	assert.Equal(t, websocket.CloseTryAgainLater, closeErr.Code)
+	assert.Equal(t, "max connection lifetime reached", closeErr.Text)
+
+	// Subscription slot should be freed so a reconnect can succeed.
+	require.Eventually(t, func() bool {
+		return broker.subscriberCount(leaseUUID) == 0
+	}, 2*time.Second, 5*time.Millisecond, "expected server to unsubscribe after lifetime expiry")
+}
+
+func TestStreamLeaseEvents_DeliversEventBeforeLifetimeExpiry(t *testing.T) {
+	// Regression guard: events published before the lifetime timer fires
+	// must still be delivered to the client. Catches a future change that
+	// reorders the for-select to check the lifetime timer before draining
+	// the broker channel, or splits the pumps in a way that races teardown
+	// against in-flight events.
+	h, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
+	h.wsMaxConnLifetime = 500 * time.Millisecond
+
+	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
+	require.NotNil(t, conn)
+	defer conn.Close()
+
+	awaitSubscriber(t, broker, leaseUUID)
+
+	// Publish well before the 500ms lifetime expires. The event must arrive
+	// first; the close frame follows after expiry.
+	broker.Publish(testEvent(leaseUUID, backend.ProvisionStatusReady))
+
+	var event backend.LeaseStatusEvent
+	require.NoError(t, conn.ReadJSON(&event), "expected event before lifetime expiry")
+	assert.Equal(t, leaseUUID, event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
+
+	// Then the close frame.
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	assert.Equal(t, websocket.CloseTryAgainLater, closeErr.Code)
 }
