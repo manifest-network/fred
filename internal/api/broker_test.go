@@ -849,7 +849,12 @@ func TestStreamLeaseEvents_MaxLifetimeForcesReconnect(t *testing.T) {
 	// cannot hold a per-lease slot indefinitely. On expiry the server sends a
 	// CloseTryAgainLater frame and the client must reconnect.
 	h, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
-	h.wsMaxConnLifetime = 100 * time.Millisecond
+	// Keep the lifetime comfortably above subscriber establishment time so
+	// the test doesn't race awaitSubscriber on slow or loaded CI runners:
+	// a 100ms lifetime leaves only a 100ms subscriber-observable window
+	// before the goroutine returns via expiry, which can be missed by
+	// awaitSubscriber's poll if the runner is thrashing.
+	h.wsMaxConnLifetime = 2 * time.Second
 
 	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
 	require.NotNil(t, conn)
