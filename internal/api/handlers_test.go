@@ -19,6 +19,23 @@ import (
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
+// TestNewHandlers_AppliesWebSocketDefaults pins the WebSocket security
+// defaults set by NewHandlers. The lease events stream relies on a non-zero
+// SetReadLimit (gorilla treats 0 as "no limit") and a non-zero connection
+// lifetime; a future change that drops either field from NewHandlers would
+// silently revert the read-size and slot-occupation mitigations.
+func TestNewHandlers_AppliesWebSocketDefaults(t *testing.T) {
+	h := NewHandlers(HandlersConfig{
+		ProviderUUID: testutil.ValidUUID1,
+		Bech32Prefix: "manifest",
+	})
+
+	assert.Equal(t, wsDefaultMaxMessageSize, h.wsMaxMessageSize,
+		"NewHandlers must set wsMaxMessageSize — gorilla treats 0 as no limit")
+	assert.Equal(t, wsDefaultMaxConnLifetime, h.wsMaxConnLifetime,
+		"NewHandlers must set wsMaxConnLifetime — a zero lifetime would close every /events connection immediately")
+}
+
 func TestHealthCheck(t *testing.T) {
 	h := &Handlers{
 		providerUUID: testutil.ValidUUID1,

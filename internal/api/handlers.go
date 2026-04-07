@@ -996,8 +996,9 @@ var (
 
 // WebSocket subscription tunables for StreamLeaseEvents. Production values
 // are conservative for an event-only stream where the client never sends
-// application data. Tests override the per-Handlers fields directly via
-// newTestHandlers; these consts are the production defaults.
+// application data. Tests override the per-Handlers fields (either through
+// newTestHandlers or by direct assignment after construction); these consts
+// are the production defaults wired in by NewHandlers.
 const (
 	// wsDefaultMaxMessageSize bounds the size of any frame the server will
 	// read from a client. The lease events stream is push-only — clients only
@@ -1040,9 +1041,10 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Bound the size of frames the server will read. Clients on this endpoint
-	// only ever send control frames, so an oversized data frame indicates a
-	// buggy or malicious client and must not be allowed to allocate memory.
+	// Bound the size of frames the server will read. Per the application
+	// contract this endpoint is server-push only, so any data frame larger
+	// than the limit indicates a buggy or malicious client and must not be
+	// allowed to allocate memory.
 	conn.SetReadLimit(h.wsMaxMessageSize)
 
 	ch, subErr := h.eventBroker.Subscribe(leaseUUID)

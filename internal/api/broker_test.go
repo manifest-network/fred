@@ -706,7 +706,8 @@ func TestStreamLeaseEvents_ReceivesRestartAndUpdateEvents(t *testing.T) {
 }
 
 // streamEventsTestEnv builds a Handlers + httptest server + valid token for a
-// single lease. Used by the read-limit and lifetime tests below.
+// single lease. Used by the four StreamLeaseEvents read-limit and lifetime
+// tests below.
 func streamEventsTestEnv(t *testing.T) (h *Handlers, broker *EventBroker, server *httptest.Server, leaseUUID, validToken string) {
 	t.Helper()
 	broker = NewEventBroker()
@@ -829,7 +830,11 @@ func TestStreamLeaseEvents_DeliversEventBeforeLifetimeExpiry(t *testing.T) {
 	// the broker channel, or splits the pumps in a way that races teardown
 	// against in-flight events.
 	h, broker, server, leaseUUID, validToken := streamEventsTestEnv(t)
-	h.wsMaxConnLifetime = 500 * time.Millisecond
+	// 2s lifetime: long enough that dial → handshake → awaitSubscriber →
+	// Publish → ReadJSON completes well before expiry even on a slow CI
+	// runner (awaitSubscriber alone can poll for up to 2s in the worst case,
+	// but in practice resolves in microseconds).
+	h.wsMaxConnLifetime = 2 * time.Second
 
 	conn, _ := wsDialWithAuth(t, server.URL, leaseUUID, validToken)
 	require.NotNil(t, conn)
@@ -837,8 +842,8 @@ func TestStreamLeaseEvents_DeliversEventBeforeLifetimeExpiry(t *testing.T) {
 
 	awaitSubscriber(t, broker, leaseUUID)
 
-	// Publish well before the 500ms lifetime expires. The event must arrive
-	// first; the close frame follows after expiry.
+	// Publish well before the lifetime expires. The event must arrive first;
+	// the close frame follows after expiry.
 	broker.Publish(testEvent(leaseUUID, backend.ProvisionStatusReady))
 
 	var event backend.LeaseStatusEvent
