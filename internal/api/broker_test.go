@@ -757,6 +757,9 @@ func TestStreamLeaseEvents_RejectsOversizedFrame(t *testing.T) {
 	// Asserting the close code (not just slot teardown) proves the read
 	// limit actually fired — a future regression that closed the connection
 	// for an unrelated reason would otherwise still pass this test.
+	// Client-side deadline so a regressed handler that fails to close fails
+	// the test fast instead of hanging until go test's 10-minute timeout.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
 	var closeErr *websocket.CloseError
@@ -789,6 +792,7 @@ func TestStreamLeaseEvents_RejectsAnyClientMessage(t *testing.T) {
 	// naive size check, but is still a contract violation.
 	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, []byte{0x42}))
 
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
 	var closeErr *websocket.CloseError
@@ -822,6 +826,7 @@ func TestStreamLeaseEvents_BoundaryFrameTripsPolicyNotReadLimit(t *testing.T) {
 	payload := make([]byte, wsDefaultMaxMessageSize)
 	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
 
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
 	var closeErr *websocket.CloseError
@@ -845,6 +850,7 @@ func TestStreamLeaseEvents_MaxLifetimeForcesReconnect(t *testing.T) {
 
 	// Read should fail with a CloseTryAgainLater frame after the configured
 	// max lifetime.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
 	var closeErr *websocket.CloseError
@@ -881,6 +887,7 @@ func TestStreamLeaseEvents_FallsBackOnZeroTunables(t *testing.T) {
 	// event back proves the connection is still serving.
 	broker.Publish(testEvent(leaseUUID, backend.ProvisionStatusReady))
 	var event backend.LeaseStatusEvent
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	require.NoError(t, conn.ReadJSON(&event), "connection must survive zero-valued lifetime")
 	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
 
@@ -890,6 +897,7 @@ func TestStreamLeaseEvents_FallsBackOnZeroTunables(t *testing.T) {
 	payload := make([]byte, wsDefaultMaxMessageSize+1)
 	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
 
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
 	var closeErr *websocket.CloseError
@@ -921,11 +929,13 @@ func TestStreamLeaseEvents_DeliversEventBeforeLifetimeExpiry(t *testing.T) {
 	broker.Publish(testEvent(leaseUUID, backend.ProvisionStatusReady))
 
 	var event backend.LeaseStatusEvent
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	require.NoError(t, conn.ReadJSON(&event), "expected event before lifetime expiry")
 	assert.Equal(t, leaseUUID, event.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusReady, event.Status)
 
-	// Then the close frame.
+	// Then the close frame. 10s deadline > the 5s lifetime + slack.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
 	var closeErr *websocket.CloseError
