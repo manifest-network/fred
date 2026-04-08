@@ -528,7 +528,6 @@ func TestConfig_Validate_IngressRequiresNetworkIsolation(t *testing.T) {
 	ingress := IngressConfig{
 		Enabled:        true,
 		WildcardDomain: "example.com",
-		CertResolver:   "letsencrypt",
 		Entrypoint:     "websecure",
 	}
 

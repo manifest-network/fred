@@ -14,10 +14,15 @@ import (
 // Requires network_isolation to be enabled (validated at config load time).
 // Currently generates Traefik-specific labels; the config layer is
 // proxy-agnostic so a future backend swap only changes label generation.
+//
+// The wildcard certificate covering *.WildcardDomain must be provisioned
+// at the Traefik level (e.g. via a DNS-01 ACME resolver with domains in
+// static config, or a default cert in tls.stores). Fred does not drive
+// per-domain ACME challenges — routers are emitted with tls=true but
+// name no certresolver, so Traefik serves whichever cert matches SNI.
 type IngressConfig struct {
 	Enabled        bool   `yaml:"enabled"`
 	WildcardDomain string `yaml:"wildcard_domain"`
-	CertResolver   string `yaml:"cert_resolver"`
 	Entrypoint     string `yaml:"entrypoint"`
 }
 
@@ -150,13 +155,16 @@ func parseTCPPort(spec string) (int, bool) {
 // per-tenant Docker network that Traefik should use to reach the
 // container (set via traefik.docker.network). This is the only
 // Traefik-specific function; everything else is proxy-agnostic.
+//
+// Routers are emitted with tls=true and no certresolver; see
+// IngressConfig for the wildcard-cert provisioning contract.
 func TraefikLabels(cfg IngressConfig, networkName, routerName, fqdn string, containerPort int) map[string]string {
 	return map[string]string{
 		"traefik.enable":         "true",
 		"traefik.docker.network": networkName,
 		fmt.Sprintf("traefik.http.routers.%s.rule", routerName):                      fmt.Sprintf("Host(`%s`)", fqdn),
 		fmt.Sprintf("traefik.http.routers.%s.entrypoints", routerName):               cfg.Entrypoint,
-		fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", routerName):          cfg.CertResolver,
+		fmt.Sprintf("traefik.http.routers.%s.tls", routerName):                       "true",
 		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", routerName): strconv.Itoa(containerPort),
 	}
 }
@@ -174,9 +182,6 @@ func (ic *IngressConfig) Validate() error {
 	}
 	if strings.HasSuffix(ic.WildcardDomain, ".") {
 		return fmt.Errorf("ingress.wildcard_domain must not end with '.'")
-	}
-	if ic.CertResolver == "" {
-		return fmt.Errorf("ingress.cert_resolver is required when ingress is enabled")
 	}
 	if ic.Entrypoint == "" {
 		return fmt.Errorf("ingress.entrypoint is required when ingress is enabled")
