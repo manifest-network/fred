@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +60,36 @@ func TestCORS_PreflightAllowed(t *testing.T) {
 		"preflight should succeed with 2xx, got %d", resp.StatusCode)
 	assert.Equal(t, allowedOrigin, resp.Header.Get("Access-Control-Allow-Origin"),
 		"allowed origin should be echoed back")
+}
+
+func TestCORS_PreflightAllowsAuthorizationHeader(t *testing.T) {
+	// Browser clients calling /v1/leases/* routes need to send an Authorization
+	// header (Bearer tokens). The CORS preflight must echo Authorization in
+	// Access-Control-Allow-Headers or the browser blocks the real request.
+	const allowedOrigin = "https://admin.example.com"
+	addr := freePort(t)
+	s := newCORSTestServer(t, addr, []string{allowedOrigin})
+	client := startAndWaitForServer(t, s, addr)
+	defer s.Shutdown(context.Background())
+
+	req, err := http.NewRequest(http.MethodOptions,
+		fmt.Sprintf("http://%s/v1/leases/01234567-89ab-cdef-0123-456789abcdef/connection", addr), nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", allowedOrigin)
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	// Real browsers send Access-Control-Request-Headers values in lowercase
+	// per the Fetch spec; rs/cors enforces this strictly. See cors.go:192.
+	req.Header.Set("Access-Control-Request-Headers", "authorization")
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.True(t, resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"preflight should succeed with 2xx, got %d", resp.StatusCode)
+	allowedHeaders := resp.Header.Get("Access-Control-Allow-Headers")
+	assert.Contains(t, strings.ToLower(allowedHeaders), "authorization",
+		"Authorization must appear in Access-Control-Allow-Headers")
 }
 
 func TestCORS_PreflightBlockedOnDisallowedOrigin(t *testing.T) {

@@ -260,7 +260,13 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		handler = cors.New(cors.Options{
 			AllowedOrigins: cfg.CORSOrigins,
 			// rs/cors handles OPTIONS preflight implicitly; only list real methods.
-			AllowedMethods:   []string{http.MethodGet, http.MethodPost},
+			AllowedMethods: []string{http.MethodGet, http.MethodPost},
+			// Authorization is required for the /v1/leases/* routes (Bearer tokens
+			// extracted by handlers.go:extractBearerToken). Content-Type is required
+			// for any POST with a JSON body (application/json is not a CORS-simple
+			// type). /workloads itself is unauthenticated, but the CORS middleware
+			// applies globally so we list every header any route may need.
+			AllowedHeaders:   []string{"Authorization", "Content-Type"},
 			AllowCredentials: false,
 		}).Handler(handler)
 	} else {
