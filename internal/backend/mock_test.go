@@ -139,6 +139,59 @@ func TestMockBackend_ListProvisions(t *testing.T) {
 	assert.Len(t, provisions, 2)
 }
 
+// TestMockBackend_ListProvisions_PopulatesWorkloadFields locks the
+// SKU/Quantity round-trip on ListProvisions: the mock stores these from
+// the request and must surface them so test consumers see the same
+// data the production docker backend would.
+func TestMockBackend_ListProvisions_PopulatesWorkloadFields(t *testing.T) {
+	mock := NewMockBackend(MockBackendConfig{Name: "test"})
+	require.NoError(t, mock.Provision(context.Background(), ProvisionRequest{
+		LeaseUUID: "lease-1",
+		Items:     []LeaseItem{{SKU: "docker-large", Quantity: 3}},
+	}))
+
+	provisions, err := mock.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, provisions, 1)
+	assert.Equal(t, "docker-large", provisions[0].SKU)
+	assert.Equal(t, 3, provisions[0].Quantity)
+}
+
+func TestMockBackend_LookupProvisions(t *testing.T) {
+	mock := NewMockBackend(MockBackendConfig{Name: "test"})
+	require.NoError(t, mock.Provision(context.Background(), ProvisionRequest{
+		LeaseUUID: "lease-1",
+		Items:     []LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+	}))
+	require.NoError(t, mock.Provision(context.Background(), ProvisionRequest{
+		LeaseUUID: "lease-2",
+		Items:     []LeaseItem{{SKU: "docker-large", Quantity: 2}},
+	}))
+
+	t.Run("returns subset with workload fields populated", func(t *testing.T) {
+		got, err := mock.LookupProvisions(context.Background(), []string{"lease-1"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "lease-1", got[0].LeaseUUID)
+		assert.Equal(t, "docker-micro", got[0].SKU)
+		assert.Equal(t, 1, got[0].Quantity)
+	})
+
+	t.Run("unknown leases omitted", func(t *testing.T) {
+		got, err := mock.LookupProvisions(context.Background(), []string{"lease-1", "lease-unknown"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "lease-1", got[0].LeaseUUID)
+	})
+
+	t.Run("all unknown returns non-nil empty slice", func(t *testing.T) {
+		got, err := mock.LookupProvisions(context.Background(), []string{"missing"})
+		require.NoError(t, err)
+		assert.NotNil(t, got)
+		assert.Empty(t, got)
+	})
+}
+
 func TestMockBackend_Clear(t *testing.T) {
 	mock := NewMockBackend(MockBackendConfig{Name: "test"})
 
