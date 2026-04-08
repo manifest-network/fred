@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"sort"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,8 +35,18 @@ type Backend interface {
 	Deprovision(ctx context.Context, leaseUUID string) error
 
 	// ListProvisions returns all currently provisioned resources.
-	// Used by the reconciler for orphan detection and by the /workloads endpoint for observability.
+	// Used by the reconciler for orphan detection.
 	ListProvisions(ctx context.Context) ([]ProvisionInfo, error)
+
+	// LookupProvisions returns provision info for the requested lease UUIDs.
+	// Missing leases are simply absent from the returned slice (not an error).
+	// Used by the /workloads endpoint to fetch metadata for a known set of leases
+	// without scanning the full provisions corpus. Caller is responsible for
+	// enforcing MaxLookupUUIDs; implementations may also enforce it defensively.
+	//
+	// Named LookupProvisions (not GetProvisions) to avoid visual ambiguity with
+	// the existing singular GetProvision.
+	LookupProvisions(ctx context.Context, leaseUUIDs []string) ([]ProvisionInfo, error)
 
 	// Health checks if the backend is reachable and healthy.
 	// Returns nil if healthy, error otherwise.
@@ -325,24 +337,33 @@ type HTTPClient struct {
 	cb         *gobreaker.CircuitBreaker
 
 	// Response body size limits
-	maxInfoBytes       int64
-	maxProvisionBytes  int64
-	maxProvisionsBytes int64
-	maxLogsBytes       int64
-	maxReleasesBytes   int64
+	maxInfoBytes             int64
+	maxProvisionBytes        int64
+	maxProvisionsBytes       int64
+	maxLookupProvisionsBytes int64
+	maxLogsBytes             int64
+	maxReleasesBytes         int64
 
 	// Optional Prometheus metrics (nil = skip recording)
 	requestDuration *prometheus.HistogramVec
 	requestsTotal   *prometheus.CounterVec
 }
 
+// MaxLookupUUIDs caps the number of lease UUIDs accepted by a single
+// LookupProvisions call (and the matching server-side filter on
+// GET /provisions?lease_uuid=...). Shared across the HTTP client, the
+// docker-backend handler, and the Fred-level GetWorkloads handler so a
+// future change to the cap stays consistent end-to-end.
+const MaxLookupUUIDs = 100
+
 // Default response body size limits (defense-in-depth against buggy/misrouted backends).
 const (
-	DefaultMaxInfoBytes       int64 = 1 << 20  // 1 MiB — single lease info
-	DefaultMaxProvisionBytes  int64 = 1 << 20  // 1 MiB — single provision record
-	DefaultMaxProvisionsBytes int64 = 8 << 20  // 8 MiB — list of all provisions
-	DefaultMaxLogsBytes       int64 = 16 << 20 // 16 MiB — container logs can be large
-	DefaultMaxReleasesBytes   int64 = 8 << 20  // 8 MiB — release history with manifests
+	DefaultMaxInfoBytes             int64 = 1 << 20  // 1 MiB — single lease info
+	DefaultMaxProvisionBytes        int64 = 1 << 20  // 1 MiB — single provision record
+	DefaultMaxProvisionsBytes       int64 = 8 << 20  // 8 MiB — list of all provisions
+	DefaultMaxLookupProvisionsBytes int64 = 8 << 20  // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because each ProvisionInfo carries an unbounded LastError and stack leases carry unbounded ServiceImages
+	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
+	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
 )
 
 // HTTPClientConfig configures an HTTP backend client.
@@ -362,11 +383,12 @@ type HTTPClientConfig struct {
 
 	// Response body size limits (0 = use default). Defense-in-depth caps to prevent
 	// a buggy or misrouted backend from pressuring memory with unbounded responses.
-	MaxInfoBytes       int64 // GetInfo response limit (default: 1 MiB)
-	MaxProvisionBytes  int64 // GetProvision response limit (default: 1 MiB)
-	MaxProvisionsBytes int64 // ListProvisions response limit (default: 8 MiB)
-	MaxLogsBytes       int64 // GetLogs response limit (default: 16 MiB)
-	MaxReleasesBytes   int64 // GetReleases response limit (default: 8 MiB)
+	MaxInfoBytes             int64 // GetInfo response limit (default: 1 MiB)
+	MaxProvisionBytes        int64 // GetProvision response limit (default: 1 MiB)
+	MaxProvisionsBytes       int64 // ListProvisions response limit (default: 8 MiB)
+	MaxLookupProvisionsBytes int64 // LookupProvisions response limit (default: 8 MiB)
+	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
+	MaxReleasesBytes         int64 // GetReleases response limit (default: 8 MiB)
 
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
@@ -449,14 +471,15 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			Timeout:   timeout,
 			Transport: transport,
 		},
-		cb:                 cb,
-		maxInfoBytes:       positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
-		maxProvisionBytes:  positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
-		maxProvisionsBytes: positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
-		maxLogsBytes:       positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
-		maxReleasesBytes:   positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
-		requestDuration:    cfg.RequestDuration,
-		requestsTotal:      cfg.RequestsTotal,
+		cb:                       cb,
+		maxInfoBytes:             positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
+		maxProvisionBytes:        positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
+		maxProvisionsBytes:       positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
+		maxLookupProvisionsBytes: positiveOr(cfg.MaxLookupProvisionsBytes, DefaultMaxLookupProvisionsBytes),
+		maxLogsBytes:             positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
+		maxReleasesBytes:         positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
+		requestDuration:          cfg.RequestDuration,
+		requestsTotal:            cfg.RequestsTotal,
 	}
 }
 
@@ -743,6 +766,41 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 // GetProvision retrieves status information for a single provision.
 func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error) {
 	return doGet[ProvisionInfo](c, ctx, "get_provision", fmt.Sprintf("%s/provisions/%s", c.baseURL, leaseUUID), c.maxProvisionBytes)
+}
+
+// LookupProvisions returns provision info for the requested lease UUIDs.
+// Missing leases are absent from the returned slice (not an error).
+//
+// Wire path: GET {baseURL}/provisions?lease_uuid=...&lease_uuid=...
+// The docker-backend handler shares the same route as the unfiltered ListProvisions
+// path; the filter param toggles the subset behavior. Same wire type either way.
+func (c *HTTPClient) LookupProvisions(ctx context.Context, uuids []string) ([]ProvisionInfo, error) {
+	if len(uuids) == 0 || len(uuids) > MaxLookupUUIDs {
+		return nil, fmt.Errorf("lookup provisions: invalid uuid count: %d", len(uuids))
+	}
+
+	// Copy and sort to produce a stable URL for the same UUID set, regardless of
+	// caller order (HTTP cache friendliness; HMAC is over body so URL order is
+	// signature-irrelevant). Don't mutate the caller's slice.
+	sortedUUIDs := append([]string(nil), uuids...)
+	sort.Strings(sortedUUIDs)
+
+	q := url.Values{"lease_uuid": sortedUUIDs}
+	target := c.baseURL + "/provisions?" + q.Encode()
+
+	resp, err := doGet[ListProvisionsResponse](c, ctx, "lookup_provisions", target, c.maxLookupProvisionsBytes)
+	if errors.Is(err, ErrNotProvisioned) {
+		// doGet maps 404 to ErrNotProvisioned. The filtered /provisions handler
+		// always returns 200 with a possibly-empty Provisions list, so this branch
+		// is defensive — but if any backend ever does return 404, treat it as
+		// "no matches" so the top-level GetWorkloads handler can still merge
+		// other backends' results.
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return resp.Provisions, nil
 }
 
 // GetLogs retrieves container logs for a provisioned lease.

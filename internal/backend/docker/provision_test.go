@@ -1794,6 +1794,67 @@ func TestListProvisions_ItemsDefensivelyCopied(t *testing.T) {
 	assert.Equal(t, "docker-micro", originalItems[0].SKU, "returned Items should be a copy, not share backing array")
 }
 
+// --- LookupProvisions tests ---
+
+func TestLookupProvisions_Empty(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+	result, err := b.LookupProvisions(context.Background(), []string{"lease-1"})
+	require.NoError(t, err)
+	assert.Empty(t, result)
+}
+
+func TestLookupProvisions_Subset(t *testing.T) {
+	now := time.Now()
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now},
+		"lease-2": {LeaseUUID: "lease-2", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now},
+		"lease-3": {LeaseUUID: "lease-3", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now},
+	})
+
+	result, err := b.LookupProvisions(context.Background(), []string{"lease-1", "lease-3"})
+	require.NoError(t, err)
+	assert.Len(t, result, 2)
+
+	got := make(map[string]bool, len(result))
+	for _, p := range result {
+		got[p.LeaseUUID] = true
+	}
+	assert.True(t, got["lease-1"])
+	assert.True(t, got["lease-3"])
+	assert.False(t, got["lease-2"])
+}
+
+func TestLookupProvisions_UnknownIgnored(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+	})
+
+	result, err := b.LookupProvisions(context.Background(), []string{"lease-1", "lease-unknown"})
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.Equal(t, "lease-1", result[0].LeaseUUID)
+}
+
+func TestLookupProvisions_AllUnknownReturnsEmpty(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+	})
+
+	result, err := b.LookupProvisions(context.Background(), []string{"lease-unknown-1", "lease-unknown-2"})
+	require.NoError(t, err)
+	assert.Empty(t, result)
+	// The slice is non-nil so it serializes as `[]` not `null`.
+	assert.NotNil(t, result)
+}
+
+func TestLookupProvisions_StackImageRoundTrip(t *testing.T) {
+	b := backendWithProvision(t, stackProvision())
+	result, err := b.LookupProvisions(context.Background(), []string{"lease-1"})
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assertStackFields(t, &result[0])
+}
+
 // --- sendCallback / trySendCallback tests ---
 
 func TestSendCallback_Success(t *testing.T) {

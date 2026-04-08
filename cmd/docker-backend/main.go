@@ -175,6 +175,7 @@ type backendService interface {
 	GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
 	GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
 	ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error)
+	LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	Restart(ctx context.Context, req backend.RestartRequest) error
 	Update(ctx context.Context, req backend.UpdateRequest) error
 	GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
@@ -492,6 +493,38 @@ func (s *Server) handleGetProvision(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
+	// If lease_uuid query params are present, switch to the filtered subset path.
+	// Same wire shape as the unfiltered path: ListProvisionsResponse{Provisions: [...]}.
+	// Successful responses are 200 with a (possibly empty) Provisions slice — never
+	// 404 — so the caller can distinguish "no matches" from "endpoint missing".
+	// Validation failures still return 400 and backend errors still return 500.
+	if uuids, ok := r.URL.Query()["lease_uuid"]; ok {
+		if len(uuids) == 0 || len(uuids) > backend.MaxLookupUUIDs {
+			s.errorResponse(w, http.StatusBadRequest,
+				fmt.Sprintf("lease_uuid count must be between 1 and %d", backend.MaxLookupUUIDs))
+			return
+		}
+		for _, u := range uuids {
+			if !config.IsValidUUID(u) {
+				s.errorResponse(w, http.StatusBadRequest, "invalid lease_uuid")
+				return
+			}
+		}
+
+		provisions, err := s.backend.LookupProvisions(r.Context(), uuids)
+		if err != nil {
+			s.errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Ensure the slice serializes as `[]` not `null` even if the backend
+		// returned a nil slice (defensive — current impls return non-nil).
+		if provisions == nil {
+			provisions = []backend.ProvisionInfo{}
+		}
+		s.writeJSON(w, http.StatusOK, backend.ListProvisionsResponse{Provisions: provisions})
+		return
+	}
+
 	provisions, err := s.backend.ListProvisions(r.Context())
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())

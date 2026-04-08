@@ -187,6 +187,27 @@ func (m *MockBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, erro
 	return result, nil
 }
 
+// LookupProvisions returns provision info for the requested lease UUIDs.
+// Missing leases are absent from the returned slice.
+func (m *MockBackend) LookupProvisions(ctx context.Context, uuids []string) ([]ProvisionInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	result := make([]ProvisionInfo, 0, len(uuids))
+	for _, uuid := range uuids {
+		if p, ok := m.provisions[uuid]; ok {
+			result = append(result, ProvisionInfo{
+				LeaseUUID:    p.LeaseUUID,
+				ProviderUUID: p.ProviderUUID,
+				Status:       p.Status,
+				CreatedAt:    p.CreatedAt,
+			})
+		}
+	}
+
+	return result, nil
+}
+
 // Health always returns nil (healthy) for mock backend.
 func (m *MockBackend) Health(ctx context.Context) error {
 	return nil
