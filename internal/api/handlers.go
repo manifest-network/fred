@@ -831,6 +831,24 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Dedupe input UUIDs. Repeated values would otherwise propagate to each
+	// backend's LookupProvisions, which iterates the input slice and emits the
+	// matching ProvisionInfo once per occurrence — wasted work, and the merge
+	// loop below would log a misleading "lease reported by multiple backends"
+	// warning even though it was the same backend reporting the same lease twice.
+	if len(uuids) > 1 {
+		seen := make(map[string]struct{}, len(uuids))
+		deduped := make([]string, 0, len(uuids))
+		for _, u := range uuids {
+			if _, dup := seen[u]; dup {
+				continue
+			}
+			seen[u] = struct{}{}
+			deduped = append(deduped, u)
+		}
+		uuids = deduped
+	}
+
 	// Initialize with non-nil zero values so JSON serialization is `{}` and `[]`
 	// rather than `null` even when no backend returns anything.
 	merged := make(map[string]WorkloadEntry)
@@ -869,14 +887,25 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 				defer mu.Unlock()
 				for _, p := range provisions {
 					if existing, dup := merged[p.LeaseUUID]; dup {
-						// Chain enforces single-provider-per-lease, so a duplicate
-						// across backends is an invariant violation. Keep the first
-						// entry and log; we don't surface this in the response.
-						slog.Warn("workloads: lease reported by multiple backends",
-							"lease_uuid", p.LeaseUUID,
-							"first_backend", existing.BackendName,
-							"duplicate_backend", b.Name(),
-						)
+						// Two distinct violations to log differently:
+						//   - Same backend twice: a backend impl bug (its LookupProvisions
+						//     should return at most one entry per requested UUID).
+						//   - Different backends: chain invariant violation
+						//     (single-provider-per-lease).
+						// Both keep the first entry and skip; neither is surfaced in
+						// the response.
+						if existing.BackendName == b.Name() {
+							slog.Warn("workloads: backend returned duplicate lease",
+								"lease_uuid", p.LeaseUUID,
+								"backend", b.Name(),
+							)
+						} else {
+							slog.Warn("workloads: lease reported by multiple backends",
+								"lease_uuid", p.LeaseUUID,
+								"first_backend", existing.BackendName,
+								"duplicate_backend", b.Name(),
+							)
+						}
 						continue
 					}
 					merged[p.LeaseUUID] = provisionToWorkloadEntry(p, b.Name())

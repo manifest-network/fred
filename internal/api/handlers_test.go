@@ -4315,6 +4315,53 @@ func TestGetWorkloads_StackImageRoundTrip(t *testing.T) {
 	assert.Equal(t, 1, byName["db"].Count)
 }
 
+// TestGetWorkloads_DedupesRepeatedLeaseUUIDs locks the input-dedupe behavior:
+// a request with the same lease_uuid repeated must call each backend with the
+// deduped set (so the backend doesn't iterate-and-emit-twice) and must return
+// exactly one entry in the response. Without dedupe, the merge loop would log
+// a misleading "lease reported by multiple backends" warning.
+func TestGetWorkloads_DedupesRepeatedLeaseUUIDs(t *testing.T) {
+	var capturedFilter []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		capturedFilter = r.URL.Query()["lease_uuid"]
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
+			Provisions: []backend.ProvisionInfo{
+				{
+					LeaseUUID: testutil.ValidUUID2,
+					Status:    backend.ProvisionStatusReady,
+					Image:     "nginx:1.25",
+					SKU:       "docker-micro",
+					Quantity:  1,
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	// Send the same UUID three times.
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2, testutil.ValidUUID2, testutil.ValidUUID2)
+	assert.Equal(t, http.StatusOK, code)
+
+	// Backend was called with exactly one lease_uuid (the dedupe happens before fan-out).
+	assert.Equal(t, []string{testutil.ValidUUID2}, capturedFilter,
+		"backend should receive the deduped UUID list, not the raw input")
+
+	// Response contains exactly one workload entry, no warnings.
+	require.Len(t, response.Workloads, 1)
+	assert.Contains(t, response.Workloads, testutil.ValidUUID2)
+	assert.Empty(t, response.Warnings)
+}
+
 func TestGetWorkloads_FanOutAcrossBackends(t *testing.T) {
 	srv1 := newFilteredProvisionServer(t, []backend.ProvisionInfo{
 		{
