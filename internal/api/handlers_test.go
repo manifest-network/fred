@@ -4239,7 +4239,7 @@ func TestGetWorkloads_NonStackImageRoundTrip(t *testing.T) {
 			ProviderUUID: testutil.ValidUUID1,
 			Status:       backend.ProvisionStatusReady,
 			CreatedAt:    time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC),
-			Image:        "nginx:1.25",
+			Image:        "registry.local:5000/manifest-network/fred:v1.2.3@sha256:deadbeef",
 			SKU:          "docker-micro",
 			Quantity:     2,
 		},
@@ -4262,7 +4262,12 @@ func TestGetWorkloads_NonStackImageRoundTrip(t *testing.T) {
 
 	require.Len(t, w.Items, 1)
 	assert.Equal(t, "docker-micro", w.Items[0].SKU)
-	assert.Equal(t, "nginx:1.25", w.Items[0].Image)
+	// Backend reports a host:port + tag + digest reference; the handler must
+	// strip the tag and digest while keeping the registry port intact. This
+	// is the end-to-end proof that provisionToWorkloadEntry routes image
+	// fields through stripImageTag — a future regression that inlines a
+	// naive "split on last colon" would fail here by returning "registry".
+	assert.Equal(t, "registry.local:5000/manifest-network/fred", w.Items[0].Image)
 	assert.Equal(t, 2, w.Items[0].Count)
 	assert.Empty(t, w.Items[0].ServiceName)
 }
@@ -4308,10 +4313,11 @@ func TestGetWorkloads_StackImageRoundTrip(t *testing.T) {
 	require.Contains(t, byName, "web")
 	require.Contains(t, byName, "db")
 	assert.Equal(t, "docker-micro", byName["web"].SKU)
-	assert.Equal(t, "nginx:1.25", byName["web"].Image)
+	// Tags stripped on the way out — see stripImageTag.
+	assert.Equal(t, "nginx", byName["web"].Image)
 	assert.Equal(t, 2, byName["web"].Count)
 	assert.Equal(t, "docker-large", byName["db"].SKU)
-	assert.Equal(t, "postgres:16", byName["db"].Image)
+	assert.Equal(t, "postgres", byName["db"].Image)
 	assert.Equal(t, 1, byName["db"].Count)
 }
 
@@ -4568,6 +4574,71 @@ func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
 	assert.Equal(t, "docker-micro", item["sku"])
 	_, hasImage := item["image"]
 	assert.False(t, hasImage, "image key should be absent from JSON when ServiceImages is nil")
+}
+
+// TestStripImageTag locks the redaction contract. Cases fall into three
+// groups: valid references (must be stripped correctly while preserving
+// host:port), deliberately-malformed inputs (pinned so a future refactor
+// toward a grammar-aware parser is a conscious decision, not a silent
+// behavior change), and degenerate edge cases (empty, bare digest).
+func TestStripImageTag(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		// --- Valid references ---
+		{"empty", "", ""},
+		{"no tag", "nginx", "nginx"},
+		{"simple tag", "nginx:1.25", "nginx"},
+		{"patch tag", "nginx:1.25.3", "nginx"},
+		{"latest tag", "nginx:latest", "nginx"},
+		{"dash tag", "nginx:1.25-alpine3.18", "nginx"},
+		// Mixed case: refs are spec-lowercase but the helper must not
+		// silently normalize — that would corrupt the admin UI display.
+		{"mixed case registry", "GHCR.IO/Org/Repo:v1", "GHCR.IO/Org/Repo"},
+		{"registry with org", "ghcr.io/manifest-network/fred:v1.2.3", "ghcr.io/manifest-network/fred"},
+		// host:port is the critical preservation case. Naive "strip after
+		// last colon" would collapse these to "registry" or "localhost".
+		{"registry with port no tag", "registry.local:5000/org/repo", "registry.local:5000/org/repo"},
+		{"registry with port and tag", "registry.local:5000/org/repo:v1", "registry.local:5000/org/repo"},
+		{"localhost with port and tag", "localhost:5000/foo:v1", "localhost:5000/foo"},
+		// Bare localhost without a port is a legitimate reference and
+		// distinguishes "first segment has a dot" from "has a slash".
+		{"localhost no port with tag", "localhost/foo:v1", "localhost/foo"},
+		// IPv6 literal host — the colons inside the bracketed host are
+		// before the last "/" so they pass through untouched. Pinned so a
+		// future "parse host properly" rewrite doesn't silently regress.
+		{"ipv6 host with port and tag", "[::1]:5000/foo:v1", "[::1]:5000/foo"},
+		// --- Digest handling ---
+		{"digest only", "nginx@sha256:abc123", "nginx"},
+		{"tag and digest", "nginx:1.25@sha256:abc123", "nginx"},
+		{"registry port tag digest", "registry.local:5000/org/repo:v1@sha256:abc", "registry.local:5000/org/repo"},
+		// Port + digest with *no* tag — exercises the @-strip leaving the
+		// host:port intact and the colon-after-slash rule then correctly
+		// not-stripping the remaining port colon.
+		{"registry port digest no tag", "registry.local:5000/org/repo@sha256:abc", "registry.local:5000/org/repo"},
+		// --- Malformed / degenerate inputs (contract pins) ---
+		// Empty tag / empty digest: return the name. These are garbage-in,
+		// but the behavior is locked so a defensive trim doesn't change it.
+		{"empty tag", "nginx:", "nginx"},
+		{"empty digest", "nginx@", "nginx"},
+		// Double "@" — not grammar-valid. Pinned so the "strip from first
+		// @" semantics documented in the helper stays stable.
+		{"double at", "nginx@sha256:a@b", "nginx"},
+		// Colon before slash: invalid Docker ref. The helper leaves it
+		// untouched because the "tag colon" is not after the last "/".
+		// Pinned as a non-behavior — garbage-in, garbage-out.
+		{"colon before slash", "foo:1.25/bar", "foo:1.25/bar"},
+		// Bare digest with no name — degenerate; returns empty. Pinned so
+		// a future "require non-empty repo" check is a conscious decision.
+		{"bare digest", "@sha256:abc", ""},
+		// Trailing slash: no tag to strip, no crash on colon == -1.
+		{"trailing slash", "nginx/", "nginx/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, stripImageTag(tc.in))
+		})
+	}
 }
 
 func TestGetWorkloads_ContextCancelled(t *testing.T) {

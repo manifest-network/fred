@@ -948,6 +948,10 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 // provisionToWorkloadEntry converts a ProvisionInfo into a WorkloadEntry.
 // Stack leases produce one WorkloadItem per service; non-stack leases produce
 // a single item with the top-level SKU/Image/Quantity.
+//
+// Image references are passed through stripImageTag so /workloads exposes
+// only the repository name, not the tag or digest. See stripImageTag for the
+// reasoning.
 func provisionToWorkloadEntry(p backend.ProvisionInfo, backendName string) WorkloadEntry {
 	entry := WorkloadEntry{
 		Status:      p.Status,
@@ -960,18 +964,47 @@ func provisionToWorkloadEntry(p backend.ProvisionInfo, backendName string) Workl
 			entry.Items[i] = WorkloadItem{
 				ServiceName: item.ServiceName,
 				SKU:         item.SKU,
-				Image:       p.ServiceImages[item.ServiceName],
+				Image:       stripImageTag(p.ServiceImages[item.ServiceName]),
 				Count:       item.Quantity,
 			}
 		}
 	} else {
 		entry.Items = []WorkloadItem{{
 			SKU:   p.SKU,
-			Image: p.Image,
+			Image: stripImageTag(p.Image),
 			Count: p.Quantity,
 		}}
 	}
 	return entry
+}
+
+// stripImageTag returns the image reference with its tag and digest removed,
+// preserving registry "host:port" syntax (e.g. "registry:5000/foo:tag" →
+// "registry:5000/foo"). Used to redact patch-level version info from the
+// unauthenticated /workloads response so it can't be used as an authoritative
+// CVE-version oracle across every lease on the provider. LastError and
+// internal callers still see full references; only the public response is
+// redacted.
+func stripImageTag(image string) string {
+	if image == "" {
+		return ""
+	}
+	// A digest ("@sha256:...") follows any tag, so drop it first. This
+	// always truncates at the *first* "@" — multiple "@" in a reference is
+	// not grammar-valid, but if one appears anyway we prefer to strip more,
+	// not less.
+	if at := strings.Index(image, "@"); at >= 0 {
+		image = image[:at]
+	}
+	// The tag separator is the last ":" that appears after the last "/".
+	// An earlier ":" is part of a "host:port" registry prefix and must be
+	// preserved — otherwise "registry:5000/foo" would collapse to "registry".
+	slash := strings.LastIndex(image, "/")
+	colon := strings.LastIndex(image, ":")
+	if colon > slash {
+		image = image[:colon]
+	}
+	return image
 }
 
 // verifyLeaseAccess queries a lease from chain and verifies tenant and provider ownership.
