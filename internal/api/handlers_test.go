@@ -4206,7 +4206,7 @@ func TestGetWorkloads_RejectsOverCap(t *testing.T) {
 	h.GetWorkloads(rec, req)
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "too many lease_uuids")
+	assert.Contains(t, rec.Body.String(), "too many lease_uuid values")
 }
 
 func TestGetWorkloads_RejectsBadUUID(t *testing.T) {

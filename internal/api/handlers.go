@@ -821,7 +821,7 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(uuids) > backend.MaxLookupUUIDs {
-		writeError(w, fmt.Sprintf("too many lease_uuids (max %d)", backend.MaxLookupUUIDs), http.StatusBadRequest)
+		writeError(w, fmt.Sprintf("too many lease_uuid values (max %d)", backend.MaxLookupUUIDs), http.StatusBadRequest)
 		return
 	}
 	for _, u := range uuids {
