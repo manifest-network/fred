@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/cors"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
@@ -76,6 +77,7 @@ type ServerConfig struct {
 	TenantRateLimitRPS   float64  // Per-tenant rate limit (requests per second), 0 = disabled
 	TenantRateLimitBurst int      // Per-tenant burst limit
 	TrustedProxies       []string // CIDR blocks of trusted reverse proxies for X-Forwarded-For
+	CORSOrigins          []string // Allowed CORS origins; empty disables CORS middleware entirely
 	ReadTimeout          time.Duration
 	WriteTimeout         time.Duration
 	IdleTimeout          time.Duration
@@ -244,12 +246,32 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:
-	// securityHeaders → rateLimiter → maxBody → logging → mux → [per-route timeout] → handler
+	// cors → securityHeaders → rateLimiter → maxBody → logging → mux → [per-route timeout] → handler
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	handler = maxBodySizeMiddleware(maxBodySize)(handler)
 	handler = rateLimiter.Middleware(handler)
 	handler = securityHeadersMiddleware(handler)
+	if len(cfg.CORSOrigins) > 0 {
+		// CORS must be the outermost layer so OPTIONS preflights short-circuit
+		// before rateLimiter consumes a token. rs/cors handles preflight in its
+		// own Handler without invoking next.ServeHTTP, so per-route withTimeout
+		// wrappers are bypassed for preflight (correct behavior).
+		handler = cors.New(cors.Options{
+			AllowedOrigins: cfg.CORSOrigins,
+			// rs/cors handles OPTIONS preflight implicitly; only list real methods.
+			AllowedMethods: []string{http.MethodGet, http.MethodPost},
+			// Authorization is required for the /v1/leases/* routes (Bearer tokens
+			// extracted by handlers.go:extractBearerToken). Content-Type is required
+			// for any POST with a JSON body (application/json is not a CORS-simple
+			// type). /workloads itself is unauthenticated, but the CORS middleware
+			// applies globally so we list every header any route may need.
+			AllowedHeaders:   []string{"Authorization", "Content-Type"},
+			AllowCredentials: false,
+		}).Handler(handler)
+	} else {
+		slog.Warn("CORS disabled — browser clients will be blocked unless cors_origins is set")
+	}
 
 	s.server = &http.Server{
 		Addr:         cfg.Addr,

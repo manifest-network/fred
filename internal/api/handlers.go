@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
@@ -770,20 +772,24 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, httpStatus)
 }
 
-// WorkloadsResponse is the response from the GET /workloads endpoint.
-type WorkloadsResponse struct {
-	ProviderUUID string          `json:"provider_uuid"`
-	Workloads    []WorkloadEntry `json:"workloads"`
-	Warnings     []string        `json:"warnings,omitempty"`
+// WorkloadLookupResponse is the response from the GET /workloads endpoint.
+// Workloads is a map keyed by lease_uuid so callers can join by UUID without
+// building a client-side index. Unknown leases are absent from the map.
+// Warnings is non-nil and may be empty (initialized as []string{} for stable
+// JSON serialization as `[]` rather than `null`).
+type WorkloadLookupResponse struct {
+	Workloads map[string]WorkloadEntry `json:"workloads"`
+	Warnings  []string                 `json:"warnings"`
 }
 
 // WorkloadEntry describes a single lease's workload for observability.
+// LeaseUUID is intentionally absent — the map key in WorkloadLookupResponse
+// carries it.
 type WorkloadEntry struct {
-	LeaseUUID   string         `json:"lease_uuid"`
-	Status      string         `json:"status"`
-	CreatedAt   time.Time      `json:"created_at"`
-	BackendName string         `json:"backend_name"`
-	Items       []WorkloadItem `json:"items"`
+	Status      backend.ProvisionStatus `json:"status"`
+	CreatedAt   time.Time               `json:"created_at"`
+	BackendName string                  `json:"backend_name"`
+	Items       []WorkloadItem          `json:"items"`
 }
 
 // WorkloadItem describes a single SKU+image within a workload.
@@ -794,29 +800,148 @@ type WorkloadItem struct {
 	Count       int    `json:"count"`
 }
 
-// GetWorkloads handles GET /workloads
+// GetWorkloads handles GET /workloads?lease_uuid=<u1>&lease_uuid=<u2>...
+//
+// Returns workload metadata for the requested lease UUIDs from any backend
+// that knows about them. Caller is the manifest-admin SPA (cross-origin via
+// CORS); the visible page of leases on the admin's leases pages drives the
+// UUID list. The 1..MaxLookupUUIDs cap matches the admin's PAGE_SIZE (25)
+// with headroom.
+//
+// Per-backend errors are surfaced via the Warnings slice rather than failing
+// the whole request, so a single broken backend doesn't blank the admin's
+// image column. This is a deliberate divergence from reconciler.go's
+// fetchAllProvisions, which aborts on any backend error to avoid mistaking
+// a transient failure for "lease no longer exists" — that concern doesn't
+// apply here since /workloads is read-only metadata for display.
 func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
-	workloads := []WorkloadEntry{}
-	var warnings []string
-
-	if h.backendRouter != nil {
-		for _, b := range h.backendRouter.Backends() {
-			provisions, err := b.ListProvisions(r.Context())
-			if err != nil {
-				slog.Warn("workloads: backend ListProvisions failed", "backend", b.Name(), "error", err)
-				warnings = append(warnings, fmt.Sprintf("backend %q unavailable", b.Name()))
-				continue
-			}
-			for _, p := range provisions {
-				workloads = append(workloads, provisionToWorkloadEntry(p, b.Name()))
-			}
+	uuids := r.URL.Query()["lease_uuid"]
+	if len(uuids) == 0 {
+		writeError(w, "lease_uuid query parameter required", http.StatusBadRequest)
+		return
+	}
+	if len(uuids) > backend.MaxLookupUUIDs {
+		writeError(w, fmt.Sprintf("too many lease_uuid values (max %d)", backend.MaxLookupUUIDs), http.StatusBadRequest)
+		return
+	}
+	for _, u := range uuids {
+		if !config.IsValidUUID(u) {
+			writeError(w, "invalid lease_uuid", http.StatusBadRequest)
+			return
 		}
 	}
 
-	writeJSON(w, WorkloadsResponse{
-		ProviderUUID: h.providerUUID,
-		Workloads:    workloads,
-		Warnings:     warnings,
+	// Dedupe input UUIDs. Repeated values would otherwise propagate to each
+	// backend's LookupProvisions, which iterates the input slice and emits the
+	// matching ProvisionInfo once per occurrence — wasted work, and the merge
+	// loop below would log a misleading "lease reported by multiple backends"
+	// warning even though it was the same backend reporting the same lease twice.
+	if len(uuids) > 1 {
+		seen := make(map[string]struct{}, len(uuids))
+		deduped := make([]string, 0, len(uuids))
+		for _, u := range uuids {
+			if _, dup := seen[u]; dup {
+				continue
+			}
+			seen[u] = struct{}{}
+			deduped = append(deduped, u)
+		}
+		if len(deduped) < len(uuids) {
+			// Forensic breadcrumb: a client sending duplicates is either buggy
+			// or hammering the endpoint. Debug-level so it's silent in normal
+			// operation but available when investigating misuse.
+			slog.Debug("workloads: deduped lease_uuid input",
+				"raw", len(uuids),
+				"deduped", len(deduped),
+			)
+		}
+		uuids = deduped
+	}
+
+	// Initialize with non-nil zero values so JSON serialization is `{}` and `[]`
+	// rather than `null` even when no backend returns anything.
+	merged := make(map[string]WorkloadEntry)
+	warnings := []string{}
+	var mu sync.Mutex
+
+	if h.backendRouter != nil {
+		backends := h.backendRouter.Backends()
+		g, gctx := errgroup.WithContext(r.Context())
+		for _, b := range backends {
+			g.Go(func() error {
+				provisions, err := b.LookupProvisions(gctx, uuids)
+				if err != nil {
+					// If the parent context was canceled (client went away), gctx.Err()
+					// is non-nil and the error is the propagation of that cancel.
+					// Skip logging — the post-Wait check below discards the response.
+					// We check gctx.Err() rather than errors.Is(err, context.Canceled)
+					// because the backend HTTP client has its own Timeout, which also
+					// produces a context.DeadlineExceeded that we DO want to surface
+					// as a backend failure.
+					if gctx.Err() != nil {
+						return nil
+					}
+					slog.Error("workloads: backend LookupProvisions failed",
+						"backend", b.Name(), "error", err)
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("backend %q unavailable", b.Name()))
+					mu.Unlock()
+					// Return nil so a single backend failure doesn't cancel sibling
+					// fetches via gctx (same convention as fetchAllProvisions in
+					// internal/provisioner/reconciler.go).
+					return nil
+				}
+
+				mu.Lock()
+				defer mu.Unlock()
+				for _, p := range provisions {
+					if existing, dup := merged[p.LeaseUUID]; dup {
+						// Two distinct violations to log differently:
+						//   - Same backend twice: a backend impl bug (its LookupProvisions
+						//     should return at most one entry per requested UUID).
+						//   - Different backends: chain invariant violation
+						//     (single-provider-per-lease).
+						// Both keep the first entry and skip; neither is surfaced in
+						// the response.
+						if existing.BackendName == b.Name() {
+							slog.Warn("workloads: backend returned duplicate lease",
+								"lease_uuid", p.LeaseUUID,
+								"backend", b.Name(),
+							)
+						} else {
+							slog.Warn("workloads: lease reported by multiple backends",
+								"lease_uuid", p.LeaseUUID,
+								"first_backend", existing.BackendName,
+								"duplicate_backend", b.Name(),
+							)
+						}
+						continue
+					}
+					merged[p.LeaseUUID] = provisionToWorkloadEntry(p, b.Name())
+				}
+				return nil
+			})
+		}
+		// Goroutines always return nil (errors are collected into `warnings`),
+		// so g.Wait() is expected to return nil. Defensively log if a future
+		// change ever returns an error from a goroutine.
+		if err := g.Wait(); err != nil {
+			slog.Error("workloads: errgroup returned unexpected error", "error", err)
+		}
+	}
+
+	// If the client canceled mid-fan-out, the partial response would silently
+	// mask the cancellation. Bail without writing a body — the Go HTTP server
+	// handles the dead connection. (Reconciler.fetchAllProvisions doesn't do
+	// this check because it's not user-facing; we add it here so admin doesn't
+	// see partial data on a flaky connection.)
+	if err := r.Context().Err(); err != nil {
+		return
+	}
+
+	writeJSON(w, WorkloadLookupResponse{
+		Workloads: merged,
+		Warnings:  warnings,
 	}, http.StatusOK)
 }
 
@@ -825,8 +950,7 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 // a single item with the top-level SKU/Image/Quantity.
 func provisionToWorkloadEntry(p backend.ProvisionInfo, backendName string) WorkloadEntry {
 	entry := WorkloadEntry{
-		LeaseUUID:   p.LeaseUUID,
-		Status:      string(p.Status),
+		Status:      p.Status,
 		CreatedAt:   p.CreatedAt,
 		BackendName: backendName,
 	}

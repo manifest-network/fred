@@ -72,6 +72,25 @@ func (m *mockReconcilerBackend) ListProvisions(ctx context.Context) ([]backend.P
 	return m.provisions, nil
 }
 
+func (m *mockReconcilerBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	result := make([]backend.ProvisionInfo, 0, len(uuids))
+	wanted := make(map[string]struct{}, len(uuids))
+	for _, u := range uuids {
+		wanted[u] = struct{}{}
+	}
+	for _, p := range m.provisions {
+		if _, ok := wanted[p.LeaseUUID]; ok {
+			result = append(result, p)
+		}
+	}
+	return result, nil
+}
+
 func (m *mockReconcilerBackend) Health(ctx context.Context) error {
 	return nil
 }
@@ -1153,6 +1172,10 @@ func (m *mockCancellingBackend) ListProvisions(ctx context.Context) ([]backend.P
 	return m.provisions, nil
 }
 
+func (m *mockCancellingBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
+	return nil, nil
+}
+
 func (m *mockCancellingBackend) Health(ctx context.Context) error {
 	return nil
 }
@@ -1567,6 +1590,10 @@ func (m *mockConcurrencyBackend) ListProvisions(ctx context.Context) ([]backend.
 		m.onListProvisions()
 	}
 	return m.provisions, nil
+}
+
+func (m *mockConcurrencyBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
+	return nil, nil
 }
 
 func (m *mockConcurrencyBackend) Health(ctx context.Context) error {

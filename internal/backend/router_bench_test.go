@@ -25,6 +25,9 @@ func (m *mockBenchBackend) Deprovision(ctx context.Context, leaseUUID string) er
 func (m *mockBenchBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, error) {
 	return nil, nil
 }
+func (m *mockBenchBackend) LookupProvisions(ctx context.Context, uuids []string) ([]ProvisionInfo, error) {
+	return nil, nil
+}
 func (m *mockBenchBackend) Health(ctx context.Context) error       { return nil }
 func (m *mockBenchBackend) RefreshState(ctx context.Context) error { return nil }
 func (m *mockBenchBackend) GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error) {

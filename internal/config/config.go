@@ -53,6 +53,7 @@ type Config struct {
 	TenantRateLimitRPS   float64       `mapstructure:"tenant_rate_limit_rps"`   // Per-tenant rate limit (requests per second)
 	TenantRateLimitBurst int           `mapstructure:"tenant_rate_limit_burst"` // Per-tenant burst limit
 	TrustedProxies       []string      `mapstructure:"trusted_proxies"`         // CIDR blocks of trusted proxies for X-Forwarded-For
+	CORSOrigins          []string      `mapstructure:"cors_origins"`            // Allowed CORS origins for browser clients (e.g., manifest-admin SPA). Empty disables CORS.
 	GRPCTLSEnabled       bool          `mapstructure:"grpc_tls_enabled"`
 	GRPCTLSCAFile        string        `mapstructure:"grpc_tls_ca_file"`
 	GRPCTLSSkipVerify    bool          `mapstructure:"grpc_tls_skip_verify"`
@@ -142,6 +143,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("rate_limit_burst", 20)        // burst of 20 requests (global)
 	v.SetDefault("tenant_rate_limit_rps", 5.0)  // 5 requests per second per tenant
 	v.SetDefault("tenant_rate_limit_burst", 10) // burst of 10 requests per tenant
+	v.SetDefault("cors_origins", []string{})    // CORS disabled by default (empty allowlist)
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)

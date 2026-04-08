@@ -73,6 +73,10 @@ func (m *mockManagerBackend) ListProvisions(ctx context.Context) ([]backend.Prov
 	return nil, nil
 }
 
+func (m *mockManagerBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
+	return nil, nil
+}
+
 func (m *mockManagerBackend) Health(ctx context.Context) error {
 	return nil
 }

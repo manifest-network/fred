@@ -390,17 +390,18 @@ func TestGetReleases_PassesAuth(t *testing.T) {
 // --- mockBackend and helpers for handler logic tests ---
 
 type mockBackend struct {
-	ProvisionFunc      func(ctx context.Context, req backend.ProvisionRequest) error
-	DeprovisionFunc    func(ctx context.Context, leaseUUID string) error
-	GetInfoFunc        func(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
-	GetLogsFunc        func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
-	GetProvisionFunc   func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
-	ListProvisionsFunc func(ctx context.Context) ([]backend.ProvisionInfo, error)
-	RestartFunc        func(ctx context.Context, req backend.RestartRequest) error
-	UpdateFunc         func(ctx context.Context, req backend.UpdateRequest) error
-	GetReleasesFunc    func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
-	HealthFunc         func(ctx context.Context) error
-	StatsFunc          func() shared.ResourceStats
+	ProvisionFunc        func(ctx context.Context, req backend.ProvisionRequest) error
+	DeprovisionFunc      func(ctx context.Context, leaseUUID string) error
+	GetInfoFunc          func(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
+	GetLogsFunc          func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
+	GetProvisionFunc     func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
+	ListProvisionsFunc   func(ctx context.Context) ([]backend.ProvisionInfo, error)
+	LookupProvisionsFunc func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
+	RestartFunc          func(ctx context.Context, req backend.RestartRequest) error
+	UpdateFunc           func(ctx context.Context, req backend.UpdateRequest) error
+	GetReleasesFunc      func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
+	HealthFunc           func(ctx context.Context) error
+	StatsFunc            func() shared.ResourceStats
 }
 
 func (m *mockBackend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
@@ -443,6 +444,13 @@ func (m *mockBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionIn
 		panic("mockBackend.ListProvisions called but not configured")
 	}
 	return m.ListProvisionsFunc(ctx)
+}
+
+func (m *mockBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
+	if m.LookupProvisionsFunc == nil {
+		panic("mockBackend.LookupProvisions called but not configured")
+	}
+	return m.LookupProvisionsFunc(ctx, uuids)
 }
 
 func (m *mockBackend) Restart(ctx context.Context, req backend.RestartRequest) error {
@@ -826,6 +834,100 @@ func TestHandleListProvisions(t *testing.T) {
 		}
 		w := httptest.NewRecorder()
 		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+}
+
+func TestHandleListProvisions_Filtered(t *testing.T) {
+	const u1 = "01234567-89ab-cdef-0123-456789abcdef"
+	const u2 = "abcdef01-2345-6789-abcd-ef0123456789"
+	const u3 = "12345678-1234-1234-1234-123456789abc"
+
+	t.Run("filter returns subset", func(t *testing.T) {
+		mb := &mockBackend{
+			LookupProvisionsFunc: func(_ context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
+				assert.Equal(t, []string{u1, u2}, uuids)
+				return []backend.ProvisionInfo{
+					{LeaseUUID: u1, Status: backend.ProvisionStatusReady},
+				}, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?lease_uuid="+u1+"&lease_uuid="+u2))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var got backend.ListProvisionsResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		require.Len(t, got.Provisions, 1)
+		assert.Equal(t, u1, got.Provisions[0].LeaseUUID)
+	})
+
+	t.Run("unknown leases omitted (empty result)", func(t *testing.T) {
+		mb := &mockBackend{
+			LookupProvisionsFunc: func(context.Context, []string) ([]backend.ProvisionInfo, error) {
+				return nil, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?lease_uuid="+u3))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		// Verify the wire format is `[]` not `null` for an empty slice.
+		assert.Contains(t, w.Body.String(), `"provisions":[]`,
+			"empty filtered result should serialize as [] not null")
+	})
+
+	t.Run("rejects empty filter value", func(t *testing.T) {
+		mb := &mockBackend{}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?lease_uuid="))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	t.Run("rejects bad UUID", func(t *testing.T) {
+		mb := &mockBackend{}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?lease_uuid=not-a-uuid"))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "invalid lease_uuid")
+	})
+
+	t.Run("rejects over cap", func(t *testing.T) {
+		mb := &mockBackend{}
+		// Build a query with MaxLookupUUIDs+1 valid UUIDs.
+		path := "/provisions?"
+		for i := 0; i <= backend.MaxLookupUUIDs; i++ {
+			if i > 0 {
+				path += "&"
+			}
+			path += "lease_uuid=" + u1
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest(path))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	t.Run("requires auth", func(t *testing.T) {
+		mb := &mockBackend{}
+		req := httptest.NewRequest("GET", "/provisions?lease_uuid="+u1, nil)
+		// No HMAC signature header.
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("backend error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			LookupProvisionsFunc: func(context.Context, []string) ([]backend.ProvisionInfo, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?lease_uuid="+u1))
 
 		assert.Equal(t, http.StatusInternalServerError, w.Code)
 	})

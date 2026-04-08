@@ -702,6 +702,127 @@ func TestHTTPClient_ListProvisions_WithHMAC(t *testing.T) {
 	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
 }
 
+func TestHTTPClient_LookupProvisions(t *testing.T) {
+	t.Run("OK with subset", func(t *testing.T) {
+		var capturedQuery []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedQuery = r.URL.Query()["lease_uuid"]
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(ListProvisionsResponse{
+				Provisions: []ProvisionInfo{
+					{LeaseUUID: "uuid-1", Status: ProvisionStatusReady},
+				},
+			})
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		got, err := client.LookupProvisions(context.Background(), []string{"uuid-1", "uuid-2"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "uuid-1", got[0].LeaseUUID)
+		assert.Equal(t, []string{"uuid-1", "uuid-2"}, capturedQuery)
+	})
+
+	t.Run("rejects empty input", func(t *testing.T) {
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: "http://example.com"})
+		_, err := client.LookupProvisions(context.Background(), nil)
+		assert.Error(t, err)
+		_, err = client.LookupProvisions(context.Background(), []string{})
+		assert.Error(t, err)
+	})
+
+	t.Run("rejects over cap", func(t *testing.T) {
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: "http://example.com"})
+		tooMany := make([]string, MaxLookupUUIDs+1)
+		for i := range tooMany {
+			tooMany[i] = "uuid"
+		}
+		_, err := client.LookupProvisions(context.Background(), tooMany)
+		assert.Error(t, err)
+	})
+
+	t.Run("404 returns nil result with no error (defensive)", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		got, err := client.LookupProvisions(context.Background(), []string{"uuid-1"})
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+
+	t.Run("backend error propagates", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		_, err := client.LookupProvisions(context.Background(), []string{"uuid-1"})
+		assert.Error(t, err)
+	})
+
+	t.Run("HMAC signing on GET (nil body)", func(t *testing.T) {
+		const secret = "test-secret-for-lookup-provisions"
+
+		var capturedSig string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{}})
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name: "test-hmac-lookup", BaseURL: server.URL, Timeout: 5 * time.Second, Secret: secret,
+		})
+
+		_, err := client.LookupProvisions(context.Background(), []string{"uuid-1"})
+		require.NoError(t, err)
+		assert.NotEmpty(t, capturedSig)
+		assert.NoError(t, hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute))
+	})
+
+	t.Run("stable URL ordering across permutations", func(t *testing.T) {
+		// Verify the in-place sort produces identical URLs regardless of caller order.
+		var capturedURLs []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capturedURLs = append(capturedURLs, r.URL.RawQuery)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{}})
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		_, err := client.LookupProvisions(context.Background(), []string{"uuid-3", "uuid-1", "uuid-2"})
+		require.NoError(t, err)
+		_, err = client.LookupProvisions(context.Background(), []string{"uuid-1", "uuid-3", "uuid-2"})
+		require.NoError(t, err)
+
+		require.Len(t, capturedURLs, 2)
+		assert.Equal(t, capturedURLs[0], capturedURLs[1],
+			"identical UUID sets should produce identical URLs regardless of caller order")
+	})
+
+	t.Run("does not mutate caller slice", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{}})
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		input := []string{"uuid-3", "uuid-1", "uuid-2"}
+		original := append([]string(nil), input...)
+		_, err := client.LookupProvisions(context.Background(), input)
+		require.NoError(t, err)
+		assert.Equal(t, original, input, "LookupProvisions must not sort the caller's slice")
+	})
+}
+
 func TestHTTPClient_GetInfo_NoHMAC_NoHeader(t *testing.T) {
 	var capturedSig string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1189,6 +1310,26 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		})
 
 		_, err := client.ListProvisions(context.Background())
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+	})
+
+	t.Run("LookupProvisions rejects oversized response", func(t *testing.T) {
+		const limit int64 = 256
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(oversizedJSON(int(limit) + 100))
+		}))
+		defer server.Close()
+
+		client := NewHTTPClient(HTTPClientConfig{
+			Name:                     "test-size-lookup",
+			BaseURL:                  server.URL,
+			Timeout:                  5 * time.Second,
+			MaxLookupProvisionsBytes: limit,
+		})
+
+		_, err := client.LookupProvisions(context.Background(), []string{"uuid-1"})
 		assert.ErrorIs(t, err, ErrResponseTooLarge)
 	})
 

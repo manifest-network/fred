@@ -169,19 +169,44 @@ func (m *MockBackend) Deprovision(ctx context.Context, leaseUUID string) error {
 	return nil
 }
 
+// provisionInfoFrom builds a ProvisionInfo from a stored mockProvision,
+// populating every field MockBackend tracks. Centralized so ListProvisions
+// and LookupProvisions stay in sync.
+func provisionInfoFrom(p *mockProvision) ProvisionInfo {
+	return ProvisionInfo{
+		LeaseUUID:    p.LeaseUUID,
+		ProviderUUID: p.ProviderUUID,
+		Status:       p.Status,
+		CreatedAt:    p.CreatedAt,
+		SKU:          p.SKU,
+		Quantity:     p.Quantity,
+	}
+}
+
 // ListProvisions returns all provisions.
 func (m *MockBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var result []ProvisionInfo
+	result := make([]ProvisionInfo, 0, len(m.provisions))
 	for _, p := range m.provisions {
-		result = append(result, ProvisionInfo{
-			LeaseUUID:    p.LeaseUUID,
-			ProviderUUID: p.ProviderUUID,
-			Status:       p.Status,
-			CreatedAt:    p.CreatedAt,
-		})
+		result = append(result, provisionInfoFrom(p))
+	}
+
+	return result, nil
+}
+
+// LookupProvisions returns provision info for the requested lease UUIDs.
+// Missing leases are absent from the returned slice.
+func (m *MockBackend) LookupProvisions(ctx context.Context, uuids []string) ([]ProvisionInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	result := make([]ProvisionInfo, 0, len(uuids))
+	for _, uuid := range uuids {
+		if p, ok := m.provisions[uuid]; ok {
+			result = append(result, provisionInfoFrom(p))
+		}
 	}
 
 	return result, nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -4107,21 +4108,38 @@ func TestHealthCheck_WithoutStatusChecker(t *testing.T) {
 
 // --- GetWorkloads tests ---
 
-// newProvisionServer returns an httptest.Server that serves the given provisions
-// on /provisions and responds 200 to /health.
-func newProvisionServer(t *testing.T, provisions []backend.ProvisionInfo) *httptest.Server {
+// newFilteredProvisionServer returns an httptest.Server that serves provisions
+// on GET /provisions, supporting the optional ?lease_uuid=... filter.
+// All provisions are stored upfront; filter is applied per-request.
+func newFilteredProvisionServer(t *testing.T, provisions []backend.ProvisionInfo) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/provisions" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(backend.ListProvisionsResponse{Provisions: provisions})
-			return
-		}
 		if r.URL.Path == "/health" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		w.WriteHeader(http.StatusNotFound)
+		if r.URL.Path != "/provisions" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		filter := r.URL.Query()["lease_uuid"]
+		out := provisions
+		if len(filter) > 0 {
+			wanted := make(map[string]struct{}, len(filter))
+			for _, u := range filter {
+				wanted[u] = struct{}{}
+			}
+			out = make([]backend.ProvisionInfo, 0, len(filter))
+			for _, p := range provisions {
+				if _, ok := wanted[p.LeaseUUID]; ok {
+					out = append(out, p)
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(backend.ListProvisionsResponse{Provisions: out})
 	}))
 }
 
@@ -4150,36 +4168,72 @@ func newWorkloadsHandler(t *testing.T, entries []backend.BackendEntry) *Handlers
 	}
 }
 
-// callGetWorkloads invokes GetWorkloads and decodes the response.
-func callGetWorkloads(t *testing.T, h *Handlers) (int, WorkloadsResponse) {
+// callGetWorkloads invokes GetWorkloads with the given lease_uuid query params.
+func callGetWorkloads(t *testing.T, h *Handlers, leaseUUIDs ...string) (int, WorkloadLookupResponse) {
 	t.Helper()
-	req := httptest.NewRequest("GET", "/workloads", nil)
+	q := url.Values{"lease_uuid": leaseUUIDs}
+	req := httptest.NewRequest("GET", "/workloads?"+q.Encode(), nil)
 	rec := httptest.NewRecorder()
 	h.GetWorkloads(rec, req)
-	var resp WorkloadsResponse
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	var resp WorkloadLookupResponse
+	if rec.Code == http.StatusOK {
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	}
 	return rec.Code, resp
 }
 
-func TestGetWorkloads_NilRouter(t *testing.T) {
+func TestGetWorkloads_RequiresLeaseUUID(t *testing.T) {
 	h := &Handlers{providerUUID: testutil.ValidUUID1}
 
 	req := httptest.NewRequest("GET", "/workloads", nil)
 	rec := httptest.NewRecorder()
 	h.GetWorkloads(rec, req)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-
-	var response WorkloadsResponse
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
-
-	assert.Equal(t, testutil.ValidUUID1, response.ProviderUUID)
-	assert.Empty(t, response.Workloads)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "lease_uuid query parameter required")
 }
 
-func TestGetWorkloads_NonStackProvisions(t *testing.T) {
-	srv := newProvisionServer(t, []backend.ProvisionInfo{
+func TestGetWorkloads_RejectsOverCap(t *testing.T) {
+	h := &Handlers{providerUUID: testutil.ValidUUID1}
+
+	tooMany := make([]string, backend.MaxLookupUUIDs+1)
+	for i := range tooMany {
+		tooMany[i] = testutil.ValidUUID2
+	}
+	q := url.Values{"lease_uuid": tooMany}
+	req := httptest.NewRequest("GET", "/workloads?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "too many lease_uuid values")
+}
+
+func TestGetWorkloads_RejectsBadUUID(t *testing.T) {
+	h := &Handlers{providerUUID: testutil.ValidUUID1}
+
+	q := url.Values{"lease_uuid": []string{"not-a-uuid"}}
+	req := httptest.NewRequest("GET", "/workloads?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid lease_uuid")
+}
+
+func TestGetWorkloads_NilRouter(t *testing.T) {
+	h := &Handlers{providerUUID: testutil.ValidUUID1}
+
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2)
+	assert.Equal(t, http.StatusOK, code)
+	assert.NotNil(t, response.Workloads)
+	assert.Empty(t, response.Workloads)
+	assert.NotNil(t, response.Warnings)
+	assert.Empty(t, response.Warnings)
+}
+
+func TestGetWorkloads_NonStackImageRoundTrip(t *testing.T) {
+	srv := newFilteredProvisionServer(t, []backend.ProvisionInfo{
 		{
 			LeaseUUID:    testutil.ValidUUID2,
 			ProviderUUID: testutil.ValidUUID1,
@@ -4197,13 +4251,13 @@ func TestGetWorkloads_NonStackProvisions(t *testing.T) {
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
 
-	code, response := callGetWorkloads(t, h)
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2)
 	assert.Equal(t, http.StatusOK, code)
 
 	require.Len(t, response.Workloads, 1)
-	w := response.Workloads[0]
-	assert.Equal(t, testutil.ValidUUID2, w.LeaseUUID)
-	assert.Equal(t, "ready", w.Status)
+	w, ok := response.Workloads[testutil.ValidUUID2]
+	require.True(t, ok, "lease should appear keyed by UUID")
+	assert.Equal(t, backend.ProvisionStatusReady, w.Status)
 	assert.Equal(t, "test-backend", w.BackendName)
 
 	require.Len(t, w.Items, 1)
@@ -4213,8 +4267,8 @@ func TestGetWorkloads_NonStackProvisions(t *testing.T) {
 	assert.Empty(t, w.Items[0].ServiceName)
 }
 
-func TestGetWorkloads_StackProvisions(t *testing.T) {
-	srv := newProvisionServer(t, []backend.ProvisionInfo{
+func TestGetWorkloads_StackImageRoundTrip(t *testing.T) {
+	srv := newFilteredProvisionServer(t, []backend.ProvisionInfo{
 		{
 			LeaseUUID:    testutil.ValidUUID2,
 			ProviderUUID: testutil.ValidUUID1,
@@ -4238,44 +4292,55 @@ func TestGetWorkloads_StackProvisions(t *testing.T) {
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
 
-	code, response := callGetWorkloads(t, h)
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2)
 	assert.Equal(t, http.StatusOK, code)
 
 	require.Len(t, response.Workloads, 1)
-	w := response.Workloads[0]
+	w, ok := response.Workloads[testutil.ValidUUID2]
+	require.True(t, ok)
 	require.Len(t, w.Items, 2)
 
-	// Items may be in any order; swap so "web" is first for deterministic assertions.
-	items := w.Items
-	if items[0].ServiceName == "db" {
-		items[0], items[1] = items[1], items[0]
+	// Items preserve the backend's order — match by ServiceName.
+	byName := make(map[string]WorkloadItem, 2)
+	for _, item := range w.Items {
+		byName[item.ServiceName] = item
 	}
-	assert.Equal(t, "web", items[0].ServiceName)
-	assert.Equal(t, "docker-micro", items[0].SKU)
-	assert.Equal(t, "nginx:1.25", items[0].Image)
-	assert.Equal(t, 2, items[0].Count)
-
-	assert.Equal(t, "db", items[1].ServiceName)
-	assert.Equal(t, "docker-large", items[1].SKU)
-	assert.Equal(t, "postgres:16", items[1].Image)
-	assert.Equal(t, 1, items[1].Count)
+	require.Contains(t, byName, "web")
+	require.Contains(t, byName, "db")
+	assert.Equal(t, "docker-micro", byName["web"].SKU)
+	assert.Equal(t, "nginx:1.25", byName["web"].Image)
+	assert.Equal(t, 2, byName["web"].Count)
+	assert.Equal(t, "docker-large", byName["db"].SKU)
+	assert.Equal(t, "postgres:16", byName["db"].Image)
+	assert.Equal(t, 1, byName["db"].Count)
 }
 
-func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
-	// Simulates cold restart where Items survive but StackManifest (and thus
-	// ServiceImages) is nil. The "image" key should be absent from the JSON
-	// (omitempty), not present as an empty string.
-	srv := newProvisionServer(t, []backend.ProvisionInfo{
-		{
-			LeaseUUID: testutil.ValidUUID2,
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  2,
-			Items: []backend.LeaseItem{
-				{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+// TestGetWorkloads_DedupesRepeatedLeaseUUIDs locks the input-dedupe behavior:
+// a request with the same lease_uuid repeated must call each backend with the
+// deduped set (so the backend doesn't iterate-and-emit-twice) and must return
+// exactly one entry in the response. Without dedupe, the merge loop would log
+// a misleading "lease reported by multiple backends" warning.
+func TestGetWorkloads_DedupesRepeatedLeaseUUIDs(t *testing.T) {
+	var capturedFilter []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		capturedFilter = r.URL.Query()["lease_uuid"]
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
+			Provisions: []backend.ProvisionInfo{
+				{
+					LeaseUUID: testutil.ValidUUID2,
+					Status:    backend.ProvisionStatusReady,
+					Image:     "nginx:1.25",
+					SKU:       "docker-micro",
+					Quantity:  1,
+				},
 			},
-			ServiceImages: nil,
-		},
-	})
+		})
+	}))
 	defer srv.Close()
 
 	client := backend.NewHTTPClient(backend.HTTPClientConfig{
@@ -4283,36 +4348,69 @@ func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
 
-	// Decode into raw JSON to verify the "image" key is actually absent.
-	req := httptest.NewRequest("GET", "/workloads", nil)
-	rec := httptest.NewRecorder()
-	h.GetWorkloads(rec, req)
-	assert.Equal(t, http.StatusOK, rec.Code)
+	// Send the same UUID three times.
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2, testutil.ValidUUID2, testutil.ValidUUID2)
+	assert.Equal(t, http.StatusOK, code)
 
-	var raw map[string]any
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&raw))
+	// Backend was called with exactly one lease_uuid (the dedupe happens before fan-out).
+	assert.Equal(t, []string{testutil.ValidUUID2}, capturedFilter,
+		"backend should receive the deduped UUID list, not the raw input")
 
-	workloadsAny, ok := raw["workloads"].([]any)
-	require.True(t, ok, "workloads should be a JSON array")
-	require.Len(t, workloadsAny, 1)
-
-	firstWorkload, ok := workloadsAny[0].(map[string]any)
-	require.True(t, ok, "workload entry should be a JSON object")
-
-	itemsAny, ok := firstWorkload["items"].([]any)
-	require.True(t, ok, "items should be a JSON array")
-	require.Len(t, itemsAny, 1)
-
-	item, ok := itemsAny[0].(map[string]any)
-	require.True(t, ok, "item should be a JSON object")
-	assert.Equal(t, "web", item["service_name"])
-	assert.Equal(t, "docker-micro", item["sku"])
-	_, hasImage := item["image"]
-	assert.False(t, hasImage, "image key should be absent from JSON when ServiceImages is nil")
+	// Response contains exactly one workload entry, no warnings.
+	require.Len(t, response.Workloads, 1)
+	assert.Contains(t, response.Workloads, testutil.ValidUUID2)
+	assert.Empty(t, response.Warnings)
 }
 
-func TestGetWorkloads_BackendError_PartialResults(t *testing.T) {
-	healthySrv := newProvisionServer(t, []backend.ProvisionInfo{
+func TestGetWorkloads_FanOutAcrossBackends(t *testing.T) {
+	srv1 := newFilteredProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID: testutil.ValidUUID2,
+			Status:    backend.ProvisionStatusReady,
+			Image:     "nginx:1.25",
+			SKU:       "docker-micro",
+			Quantity:  1,
+		},
+	})
+	defer srv1.Close()
+
+	srv2 := newFilteredProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID: testutil.ValidUUID3,
+			Status:    backend.ProvisionStatusReady,
+			Image:     "redis:7",
+			SKU:       "docker-large",
+			Quantity:  1,
+		},
+	})
+	defer srv2.Close()
+
+	client1 := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "backend-1", BaseURL: srv1.URL, Timeout: 5 * time.Second,
+	})
+	client2 := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "backend-2", BaseURL: srv2.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{
+		{Backend: client1, IsDefault: true},
+		{Backend: client2},
+	})
+
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2, testutil.ValidUUID3)
+	assert.Equal(t, http.StatusOK, code)
+
+	require.Len(t, response.Workloads, 2)
+	assert.Contains(t, response.Workloads, testutil.ValidUUID2)
+	assert.Contains(t, response.Workloads, testutil.ValidUUID3)
+	assert.Equal(t, "backend-1", response.Workloads[testutil.ValidUUID2].BackendName)
+	assert.Equal(t, "backend-2", response.Workloads[testutil.ValidUUID3].BackendName)
+	assert.Empty(t, response.Warnings)
+}
+
+func TestGetWorkloads_BackendErrorWarning(t *testing.T) {
+	// One healthy backend has the lease; another backend is failing.
+	// Expect: 200 OK, lease present in workloads map, warning naming the failed backend.
+	healthySrv := newFilteredProvisionServer(t, []backend.ProvisionInfo{
 		{
 			LeaseUUID: testutil.ValidUUID2,
 			Status:    backend.ProvisionStatusReady,
@@ -4337,14 +4435,65 @@ func TestGetWorkloads_BackendError_PartialResults(t *testing.T) {
 		{Backend: failingClient},
 	})
 
-	code, response := callGetWorkloads(t, h)
-
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2)
 	assert.Equal(t, http.StatusOK, code)
-	assert.Len(t, response.Workloads, 1)
-	assert.Equal(t, testutil.ValidUUID2, response.Workloads[0].LeaseUUID)
+
+	// Healthy backend's data is still present despite the other backend failing
+	// (errgroup must NOT cancel siblings).
+	require.Len(t, response.Workloads, 1)
+	assert.Contains(t, response.Workloads, testutil.ValidUUID2)
 
 	require.Len(t, response.Warnings, 1)
-	assert.Equal(t, `backend "failing-backend" unavailable`, response.Warnings[0])
+	assert.Contains(t, response.Warnings[0], `backend "failing-backend" unavailable`)
+}
+
+func TestGetWorkloads_UnknownLeasesOmitted(t *testing.T) {
+	srv := newFilteredProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID: testutil.ValidUUID2,
+			Status:    backend.ProvisionStatusReady,
+			Image:     "nginx:1.25",
+			SKU:       "docker-micro",
+			Quantity:  1,
+		},
+	})
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	// Request both a known and an unknown lease.
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2, testutil.ValidUUID3)
+	assert.Equal(t, http.StatusOK, code)
+
+	require.Len(t, response.Workloads, 1)
+	assert.Contains(t, response.Workloads, testutil.ValidUUID2)
+	assert.NotContains(t, response.Workloads, testutil.ValidUUID3)
+	assert.Empty(t, response.Warnings)
+}
+
+func TestGetWorkloads_AllUnknownReturnsEmptyMap(t *testing.T) {
+	srv := newFilteredProvisionServer(t, nil)
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	// Decode raw JSON to verify the wire format is `{}` and `[]`, not `null`.
+	q := url.Values{"lease_uuid": []string{testutil.ValidUUID2}}
+	req := httptest.NewRequest("GET", "/workloads?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, `"workloads":{}`, "empty workloads should serialize as object, not null")
+	assert.Contains(t, body, `"warnings":[]`, "empty warnings should serialize as array, not null")
 }
 
 func TestGetWorkloads_AllBackendsFail(t *testing.T) {
@@ -4364,15 +4513,27 @@ func TestGetWorkloads_AllBackendsFail(t *testing.T) {
 		{Backend: client2},
 	})
 
-	code, response := callGetWorkloads(t, h)
-
+	code, response := callGetWorkloads(t, h, testutil.ValidUUID2)
 	assert.Equal(t, http.StatusOK, code)
 	assert.Empty(t, response.Workloads)
 	assert.Len(t, response.Warnings, 2, "all backend failures should be surfaced as warnings")
 }
 
-func TestGetWorkloads_EmptyBackend(t *testing.T) {
-	srv := newProvisionServer(t, nil)
+func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
+	// Simulates cold restart where Items survive but StackManifest (and thus
+	// ServiceImages) is nil. The "image" key should be absent from the JSON
+	// (omitempty), not present as an empty string.
+	srv := newFilteredProvisionServer(t, []backend.ProvisionInfo{
+		{
+			LeaseUUID: testutil.ValidUUID2,
+			Status:    backend.ProvisionStatusReady,
+			Quantity:  2,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+			},
+			ServiceImages: nil,
+		},
+	})
 	defer srv.Close()
 
 	client := backend.NewHTTPClient(backend.HTTPClientConfig{
@@ -4380,8 +4541,67 @@ func TestGetWorkloads_EmptyBackend(t *testing.T) {
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
 
-	code, response := callGetWorkloads(t, h)
+	q := url.Values{"lease_uuid": []string{testutil.ValidUUID2}}
+	req := httptest.NewRequest("GET", "/workloads?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	h.GetWorkloads(rec, req)
 
-	assert.Equal(t, http.StatusOK, code)
-	assert.Empty(t, response.Workloads)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var raw map[string]any
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&raw))
+
+	workloads, ok := raw["workloads"].(map[string]any)
+	require.True(t, ok, "workloads should be a JSON object")
+	require.Contains(t, workloads, testutil.ValidUUID2)
+
+	entry, ok := workloads[testutil.ValidUUID2].(map[string]any)
+	require.True(t, ok)
+
+	itemsAny, ok := entry["items"].([]any)
+	require.True(t, ok, "items should be a JSON array")
+	require.Len(t, itemsAny, 1)
+
+	item, ok := itemsAny[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "web", item["service_name"])
+	assert.Equal(t, "docker-micro", item["sku"])
+	_, hasImage := item["image"]
+	assert.False(t, hasImage, "image key should be absent from JSON when ServiceImages is nil")
+}
+
+func TestGetWorkloads_ContextCancelled(t *testing.T) {
+	// Simulate a slow backend that blocks until context is cancelled,
+	// then verify that GetWorkloads short-circuits with no body when the
+	// request context is cancelled mid-fan-out.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		// Server side: context cancelled, just return.
+	}))
+	defer srv.Close()
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "slow-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
+	})
+	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	q := url.Values{"lease_uuid": []string{testutil.ValidUUID2}}
+	req := httptest.NewRequestWithContext(ctx, "GET", "/workloads?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+
+	// Cancel after a brief delay so the goroutine has time to start.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	h.GetWorkloads(rec, req)
+
+	// Handler should bail without writing a body. We don't strictly enforce a
+	// status code (the recorder defaults to 200 if no header is written), but
+	// the body must NOT be a populated WorkloadLookupResponse.
+	body := rec.Body.String()
+	assert.NotContains(t, body, `"workloads":`,
+		"handler should not write a body when request context is cancelled")
 }

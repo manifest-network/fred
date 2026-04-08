@@ -184,6 +184,23 @@ func (b *Backend) ListProvisions(_ context.Context) ([]backend.ProvisionInfo, er
 	return result, nil
 }
 
+// LookupProvisions returns provision info for the requested lease UUIDs.
+// Missing leases are absent from the returned slice (not an error). O(k) lookups
+// against the in-memory provisions map, where k = len(uuids).
+func (b *Backend) LookupProvisions(_ context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+
+	result := make([]backend.ProvisionInfo, 0, len(uuids))
+	for _, uuid := range uuids {
+		if prov, ok := b.provisions[uuid]; ok {
+			result = append(result, provisionToInfo(prov, b.cfg.Name))
+		}
+	}
+
+	return result, nil
+}
+
 // GetLogs returns the last N lines of stdout/stderr for each container in
 // a lease, keyed by instance index (e.g., "0", "1").
 // Falls back to the diagnostics store when the provision is not in memory

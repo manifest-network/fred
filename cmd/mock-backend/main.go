@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/config"
 )
 
 func main() {
@@ -321,6 +322,38 @@ func (s *MockBackendServer) handleDeprovision(w http.ResponseWriter, r *http.Req
 }
 
 func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.Request) {
+	// If lease_uuid query params are present, switch to the filtered subset path.
+	// Same wire shape as the unfiltered path; always returns 200 (possibly empty).
+	if uuids, ok := r.URL.Query()["lease_uuid"]; ok {
+		if len(uuids) == 0 || len(uuids) > backend.MaxLookupUUIDs {
+			http.Error(w, fmt.Sprintf("lease_uuid count must be between 1 and %d", backend.MaxLookupUUIDs), http.StatusBadRequest)
+			return
+		}
+		for _, u := range uuids {
+			if !config.IsValidUUID(u) {
+				http.Error(w, "invalid lease_uuid", http.StatusBadRequest)
+				return
+			}
+		}
+
+		provisions, err := s.backend.LookupProvisions(r.Context(), uuids)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if provisions == nil {
+			provisions = []backend.ProvisionInfo{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
+			Provisions: provisions,
+		}); err != nil {
+			slog.Error("failed to encode provisions response", "error", err)
+		}
+		return
+	}
+
 	provisions, err := s.backend.ListProvisions(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
