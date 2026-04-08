@@ -114,17 +114,17 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 |---|---|---|---|---|
 | Ingress.Enabled | `ingress.enabled` | bool | `false` | Enable reverse proxy label generation |
 | Ingress.WildcardDomain | `ingress.wildcard_domain` | string | *(required when enabled)* | Base domain for tenant subdomains (e.g., `apps.example.com`) |
-| Ingress.CertResolver | `ingress.cert_resolver` | string | *(required when enabled)* | Traefik certificate resolver name |
 | Ingress.Entrypoint | `ingress.entrypoint` | string | *(required when enabled)* | Traefik entrypoint name (e.g., `websecure`) |
 
 When enabled, containers with routable TCP ports receive Traefik Docker labels for automatic HTTPS routing. Each container gets a unique subdomain under `wildcard_domain` derived from lease UUID and service metadata (guaranteed ≤63 chars per RFC 1035). Port selection: 80 > 8080 > lowest TCP port. Requires `network_isolation` to be enabled — Traefik routes traffic via the per-tenant Docker network.
+
+Routers are generated with `tls=true` but no `certresolver`. The wildcard certificate for `wildcard_domain` must be provisioned at the Traefik level — typically via a DNS-01 ACME resolver with `domains` set in Traefik's static config, or via a default certificate in `tls.stores`. Fred does not drive per-domain ACME challenges.
 
 Example:
 ```yaml
 ingress:
   enabled: true
   wildcard_domain: "apps.example.com"
-  cert_resolver: "letsencrypt"
   entrypoint: "websecure"
 ```
 

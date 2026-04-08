@@ -252,8 +252,12 @@ reconcile_interval: 5m
 # Note: Traefik must run with host networking (or equivalent access) to reach
 # containers on per-tenant bridge networks.
 #
+# Routers are emitted with tls=true but no certresolver. The wildcard
+# certificate for wildcard_domain must be provisioned at the Traefik level
+# (e.g. via a DNS-01 ACME resolver with domains in static config, or a
+# default cert in tls.stores). Fred does not drive per-domain ACME challenges.
+#
 # ingress:
 #   enabled: true
 #   wildcard_domain: "example.com"    # *.example.com DNS must point to this host
-#   cert_resolver: "letsencrypt"      # Traefik ACME cert resolver name
 #   entrypoint: "websecure"           # Traefik entrypoint for HTTPS

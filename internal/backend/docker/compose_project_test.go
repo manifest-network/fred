@@ -695,7 +695,6 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 	ingress := IngressConfig{
 		Enabled:        true,
 		WildcardDomain: "barney8.manifest0.net",
-		CertResolver:   "letsencrypt",
 		Entrypoint:     "websecure",
 	}
 
@@ -723,6 +722,12 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 		assert.Equal(t, params.NetworkName, svc.Labels["traefik.docker.network"])
 		assert.NotEmpty(t, svc.Labels[LabelFQDN])
 		assert.Contains(t, svc.Labels[LabelFQDN], "barney8.manifest0.net")
+
+		// Router must declare tls=true and no certresolver (wildcard cert is
+		// provisioned at the Traefik level, not via per-router ACME).
+		routerName := RouterName(params.LeaseUUID, "web", 0, 1)
+		assert.Equal(t, "true", svc.Labels["traefik.http.routers."+routerName+".tls"])
+		assert.NotContains(t, svc.Labels, "traefik.http.routers."+routerName+".tls.certresolver")
 	})
 
 	t.Run("non-routable service does not get traefik labels", func(t *testing.T) {
