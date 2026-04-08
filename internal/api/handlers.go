@@ -846,6 +846,15 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 			seen[u] = struct{}{}
 			deduped = append(deduped, u)
 		}
+		if len(deduped) < len(uuids) {
+			// Forensic breadcrumb: a client sending duplicates is either buggy
+			// or hammering the endpoint. Debug-level so it's silent in normal
+			// operation but available when investigating misuse.
+			slog.Debug("workloads: deduped lease_uuid input",
+				"raw", len(uuids),
+				"deduped", len(deduped),
+			)
+		}
 		uuids = deduped
 	}
 
