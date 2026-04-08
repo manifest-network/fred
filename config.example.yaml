@@ -182,6 +182,27 @@ tenant_rate_limit_burst: 10
 #   - "192.168.0.0/16"      # Private network
 
 # =============================================================================
+# CORS (optional)
+# =============================================================================
+# Allowed origins for browser-based clients (e.g. the manifest-admin SPA)
+# calling fred's HTTP API cross-origin.
+#
+# Leave empty/unset to disable CORS middleware entirely. Fred will log a
+# startup warning ("CORS disabled — browser clients will be blocked unless
+# cors_origins is set") and any browser making a cross-origin request will
+# be blocked by the browser's same-origin policy. Non-browser clients (CLI,
+# server-to-server) are unaffected either way.
+#
+# This is an explicit allowlist — no wildcards. Only GET and POST are
+# allowed; the only permitted request headers are Authorization and
+# Content-Type; credentials (cookies) are disabled, so browser clients must
+# send their bearer token via the Authorization header, not via cookies.
+#
+# cors_origins:
+#   - "https://admin.example.com"
+#   - "http://localhost:5173"  # Vite dev server
+
+# =============================================================================
 # BACKEND CONFIGURATION (required)
 # =============================================================================
 # Backends handle the actual provisioning of resources when leases are created.
