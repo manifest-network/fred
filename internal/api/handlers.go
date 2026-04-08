@@ -844,7 +844,7 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 			g.Go(func() error {
 				provisions, err := b.LookupProvisions(gctx, uuids)
 				if err != nil {
-					// If the parent context cancelled (client went away), gctx.Err()
+					// If the parent context was canceled (client went away), gctx.Err()
 					// is non-nil and the error is the propagation of that cancel.
 					// Skip logging — the post-Wait check below discards the response.
 					// We check gctx.Err() rather than errors.Is(err, context.Canceled)
@@ -892,7 +892,7 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If the client cancelled mid-fan-out, the partial response would silently
+	// If the client canceled mid-fan-out, the partial response would silently
 	// mask the cancellation. Bail without writing a body — the Go HTTP server
 	// handles the dead connection. (Reconciler.fetchAllProvisions doesn't do
 	// this check because it's not user-facing; we add it here so admin doesn't
