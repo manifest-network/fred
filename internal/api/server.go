@@ -77,7 +77,7 @@ type ServerConfig struct {
 	TenantRateLimitRPS   float64  // Per-tenant rate limit (requests per second), 0 = disabled
 	TenantRateLimitBurst int      // Per-tenant burst limit
 	TrustedProxies       []string // CIDR blocks of trusted reverse proxies for X-Forwarded-For
-	CORSOrigins          []string // Allowed CORS origins; empty disables CORS middleware entirely
+	CORSOrigins          []string // Allowed CORS origins (e.g. ["*"] for all). Empty or nil disables CORS middleware.
 	ReadTimeout          time.Duration
 	WriteTimeout         time.Duration
 	IdleTimeout          time.Duration
@@ -253,6 +253,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	handler = rateLimiter.Middleware(handler)
 	handler = securityHeadersMiddleware(handler)
 	if len(cfg.CORSOrigins) > 0 {
+		slog.Info("CORS middleware enabled", "origins", cfg.CORSOrigins)
 		// CORS must be the outermost layer so OPTIONS preflights short-circuit
 		// before rateLimiter consumes a token. rs/cors handles preflight in its
 		// own Handler without invoking next.ServeHTTP, so per-route withTimeout
@@ -270,7 +271,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 			AllowCredentials: false,
 		}).Handler(handler)
 	} else {
-		slog.Warn("CORS disabled — browser clients will be blocked unless cors_origins is set")
+		slog.Info("CORS middleware disabled (cors_origins is empty)")
 	}
 
 	s.server = &http.Server{

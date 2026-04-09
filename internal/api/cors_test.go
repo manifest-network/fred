@@ -92,6 +92,31 @@ func TestCORS_PreflightAllowsAuthorizationHeader(t *testing.T) {
 		"Authorization must appear in Access-Control-Allow-Headers")
 }
 
+func TestCORS_WildcardPreflightAllowed(t *testing.T) {
+	addr := freePort(t)
+	s := newCORSTestServer(t, addr, []string{"*"})
+	client := startAndWaitForServer(t, s, addr)
+	defer s.Shutdown(context.Background())
+
+	req, err := http.NewRequest(http.MethodOptions,
+		fmt.Sprintf("http://%s/v1/leases/01234567-89ab-cdef-0123-456789abcdef/connection", addr), nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", "https://anywhere.example.com")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers", "authorization")
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.True(t, resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"wildcard preflight should succeed with 2xx, got %d", resp.StatusCode)
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"),
+		"wildcard origin should be returned for preflight")
+	assert.Contains(t, strings.ToLower(resp.Header.Get("Access-Control-Allow-Headers")), "authorization",
+		"Authorization must appear in Access-Control-Allow-Headers")
+}
+
 func TestCORS_PreflightBlockedOnDisallowedOrigin(t *testing.T) {
 	addr := freePort(t)
 	s := newCORSTestServer(t, addr, []string{"https://admin.example.com"})
@@ -112,14 +137,32 @@ func TestCORS_PreflightBlockedOnDisallowedOrigin(t *testing.T) {
 		"disallowed origin must not appear in Access-Control-Allow-Origin")
 }
 
+func TestCORS_WildcardAllowsAnyOrigin(t *testing.T) {
+	addr := freePort(t)
+	s := newCORSTestServer(t, addr, []string{"*"})
+	client := startAndWaitForServer(t, s, addr)
+	defer s.Shutdown(context.Background())
+
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/health", addr), nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", "https://anywhere.example.com")
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"),
+		"wildcard origin should allow any request")
+}
+
 func TestCORS_DisabledWhenOriginsEmpty(t *testing.T) {
 	addr := freePort(t)
 	s := newCORSTestServer(t, addr, nil)
 	client := startAndWaitForServer(t, s, addr)
 	defer s.Shutdown(context.Background())
 
-	// Without CORS middleware, the response carries no Access-Control headers,
-	// even when the request includes an Origin.
+	// Passing nil (or an empty list) opts out of CORS entirely.
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/health", addr), nil)
 	require.NoError(t, err)
 	req.Header.Set("Origin", "https://anywhere.example.com")
