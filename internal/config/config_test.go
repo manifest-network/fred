@@ -670,6 +670,7 @@ backends:
 	assert.Equal(t, "manifest", cfg.Bech32Prefix)
 	assert.Equal(t, 10.0, cfg.RateLimitRPS)
 	assert.Equal(t, 20, cfg.RateLimitBurst)
+	assert.Equal(t, []string{"*"}, cfg.CORSOrigins)
 }
 
 func TestLoad_ConfigOverrides(t *testing.T) {
@@ -697,6 +698,52 @@ backends:
 
 	assert.Equal(t, "test-chain-1", cfg.ChainID)
 	assert.Equal(t, 50.0, cfg.RateLimitRPS)
+}
+
+func TestLoad_CORSOriginsOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	t.Run("explicit list overrides wildcard default", func(t *testing.T) {
+		configContent := `
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1abc"
+key_name: "provider"
+keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+cors_origins:
+  - "https://admin.example.com"
+backends:
+  - name: "mock"
+    url: "http://localhost:9000"
+    default: true
+`
+		require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+		cfg, err := Load(configPath)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"https://admin.example.com"}, cfg.CORSOrigins)
+	})
+
+	t.Run("empty list disables CORS", func(t *testing.T) {
+		configContent := `
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1abc"
+key_name: "provider"
+keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+cors_origins: []
+backends:
+  - name: "mock"
+    url: "http://localhost:9000"
+    default: true
+`
+		require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+		cfg, err := Load(configPath)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.CORSOrigins)
+	})
 }
 
 func TestConfig_Validate_BackendURLs(t *testing.T) {
