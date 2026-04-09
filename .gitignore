@@ -23,6 +23,8 @@ go.work.sum
 # Config with real values (use config.example.yaml as template)
 config.yaml
 config-*.yaml
+config.*.yaml
+docker-backend.yaml
 
 # TLS certificates and keys
 *.pem
