@@ -69,7 +69,21 @@ jobs:
       - name: Run govulncheck
         # Advisory: docker/docker (GO-2026-4887, GO-2026-4883) has no patched
         # release and moby/buildkit + docker/cli fixes are blocked by
-        # docker/compose v2 compatibility.  Unblock CI until upstream ships
-        # fixes, but still surface the report.
-        continue-on-error: true
-        run: govulncheck ./...
+        # docker/compose v2 compatibility.  Treat exit-code 3 (vulns found)
+        # as a warning until upstream ships fixes; other failures still break CI.
+        run: |
+          set +e
+          govulncheck ./...
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          if [ "$status" -eq 3 ]; then
+            echo "::warning::govulncheck found known vulnerabilities; see report above."
+            exit 0
+          fi
+
+          exit "$status"
