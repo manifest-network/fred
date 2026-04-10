@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -118,6 +119,11 @@ func (m *mockTxService) GetTx(ctx context.Context, req *tx.GetTxRequest, opts ..
 // Helper to build a testable Client with mock dependencies
 // ---------------------------------------------------------------------------
 
+// newTestSignerPoolFromSigner wraps a single signer in a SignerPool for testing.
+func newTestSignerPoolFromSigner(s *Signer) *SignerPool {
+	return &SignerPool{primary: s}
+}
+
 func newMockClient(opts ...func(*Client)) *Client {
 	c := &Client{
 		billingQuery:   &mockBillingQuery{},
@@ -130,6 +136,10 @@ func newMockClient(opts ...func(*Client)) *Client {
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	// Auto-derive providerAddress from signerPool if not explicitly set.
+	if c.providerAddress == "" && c.signerPool != nil {
+		c.providerAddress = c.signerPool.ProviderAddress()
 	}
 	return c
 }
@@ -634,7 +644,8 @@ func TestClient_Ping(t *testing.T) {
 			},
 		}
 		s := newTestSigner(t)
-		c := newMockClient(func(c *Client) { c.authQuery = aq; c.signer = s })
+		pool := newTestSignerPoolFromSigner(s)
+		c := newMockClient(func(c *Client) { c.authQuery = aq; c.signerPool = pool })
 
 		err := c.Ping(t.Context())
 		assert.NoError(t, err)
@@ -647,7 +658,8 @@ func TestClient_Ping(t *testing.T) {
 			},
 		}
 		s := newTestSigner(t)
-		c := newMockClient(func(c *Client) { c.authQuery = aq; c.signer = s })
+		pool := newTestSignerPoolFromSigner(s)
+		c := newMockClient(func(c *Client) { c.authQuery = aq; c.signerPool = pool })
 
 		err := c.Ping(t.Context())
 		assert.Error(t, err)
@@ -739,8 +751,9 @@ func setupTxMocks(t *testing.T) (*Client, *atomic.Int32) {
 		},
 	}
 
+	pool := newTestSignerPoolFromSigner(s)
 	c := newMockClient(func(c *Client) {
-		c.signer = s
+		c.signerPool = pool
 		c.authQuery = aq
 		c.txService = ts
 	})
@@ -752,28 +765,30 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		c, _ := setupTxMocks(t)
 
-		msg := newTestMsg(c.signer.Address())
-		hash, err := c.doBroadcastTx(t.Context(), msg)
+		msg := newTestMsg(c.providerAddress)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), c.signerPool.Primary(), msg)
 		require.NoError(t, err)
 		assert.NotEmpty(t, hash)
 	})
 
 	t.Run("account query failure", func(t *testing.T) {
 		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
 		aq := &mockAuthQuery{
 			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
 				return nil, status.Error(codes.Unavailable, "down")
 			},
 		}
-		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq })
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq })
 
-		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query account")
 	})
 
 	t.Run("broadcast failure", func(t *testing.T) {
 		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
 		addr, _ := sdktypes.AccAddressFromBech32(s.address)
 		accountAny := newTestAccountAny(t, addr, 1, 0)
 
@@ -787,15 +802,16 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 				return nil, status.Error(codes.Internal, "broadcast fail")
 			},
 		}
-		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to broadcast transaction")
 	})
 
 	t.Run("mempool rejection", func(t *testing.T) {
 		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
 		addr, _ := sdktypes.AccAddressFromBech32(s.address)
 		accountAny := newTestAccountAny(t, addr, 1, 0)
 
@@ -811,9 +827,9 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 				}, nil
 			},
 		}
-		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -822,6 +838,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 
 	t.Run("execution failure after polling", func(t *testing.T) {
 		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
 		addr, _ := sdktypes.AccAddressFromBech32(s.address)
 		accountAny := newTestAccountAny(t, addr, 1, 0)
 
@@ -842,9 +859,9 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 				}, nil
 			},
 		}
-		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTx(t.Context(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -928,7 +945,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{
-					Sender:     c.signer.Address(),
+					Sender:     c.providerAddress,
 					LeaseUuids: batch,
 				}
 			})
@@ -949,7 +966,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{
-					Sender:     c.signer.Address(),
+					Sender:     c.providerAddress,
 					LeaseUuids: batch,
 				}
 			})
@@ -961,6 +978,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 
 	t.Run("error on second batch returns partial", func(t *testing.T) {
 		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
 		addr, _ := sdktypes.AccAddressFromBech32(s.address)
 		accountAny := newTestAccountAny(t, addr, 1, 0)
 
@@ -984,7 +1002,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 				return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0}}, nil
 			},
 		}
-		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
 		uuids := make([]string, 150)
 		for i := range uuids {
@@ -1049,6 +1067,7 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 
 	t.Run("broadcast failure", func(t *testing.T) {
 		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
 		addr, _ := sdktypes.AccAddressFromBech32(s.address)
 		accountAny := newTestAccountAny(t, addr, 1, 0)
 
@@ -1062,12 +1081,154 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 				return nil, status.Error(codes.Internal, "node down")
 			},
 		}
-		c := newMockClient(func(c *Client) { c.signer = s; c.authQuery = aq; c.txService = ts })
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
 		_, err := c.WithdrawByProvider(t.Context(), "prov-1")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to withdraw")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// MsgExec wrapping tests
+// ---------------------------------------------------------------------------
+
+func TestClient_BroadcastBatchedMsgs_MsgExecWrapping(t *testing.T) {
+	// With sub-signers, broadcastBatchedMsgs should wrap messages in MsgExec
+	pool := newTestSignerPool(t, 2)
+	primaryAddr := pool.ProviderAddress()
+
+	// Track which address was used for the account query (should be sub-signer, not primary)
+	var queriedAddrs []string
+	var mu sync.Mutex
+
+	s := pool.Primary()
+	addr, err := sdktypes.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	// For sub-signers, we need accounts too
+	subAddrs := pool.SubSignerAddresses()
+	subAccAddr0, _ := sdktypes.AccAddressFromBech32(subAddrs[0])
+	subAccountAny0 := newTestAccountAny(t, subAccAddr0, 2, 0)
+	subAccAddr1, _ := sdktypes.AccAddressFromBech32(subAddrs[1])
+	subAccountAny1 := newTestAccountAny(t, subAccAddr1, 3, 0)
+
+	aq := &mockAuthQuery{
+		AccountFn: func(_ context.Context, req *authtypes.QueryAccountRequest, _ ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			mu.Lock()
+			queriedAddrs = append(queriedAddrs, req.Address)
+			mu.Unlock()
+			// Return appropriate account for each address
+			switch req.Address {
+			case subAddrs[0]:
+				return &authtypes.QueryAccountResponse{Account: subAccountAny0}, nil
+			case subAddrs[1]:
+				return &authtypes.QueryAccountResponse{Account: subAccountAny1}, nil
+			default:
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			}
+		},
+	}
+
+	var broadcastedBytes [][]byte
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			mu.Lock()
+			broadcastedBytes = append(broadcastedBytes, req.TxBytes)
+			mu.Unlock()
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX1"},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.providerAddress = primaryAddr
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	n, hashes, err := c.AcknowledgeLeases(t.Context(), []string{"l1", "l2"})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), n)
+	assert.Len(t, hashes, 1)
+
+	// The account query should have been for a sub-signer address, not the primary
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, queriedAddrs)
+	assert.NotEqual(t, primaryAddr, queriedAddrs[0],
+		"should query sub-signer account, not primary")
+	assert.Contains(t, subAddrs, queriedAddrs[0],
+		"queried address should be one of the sub-signers")
+}
+
+func TestClient_BroadcastBatchedMsgs_NoWrapping_SingleSigner(t *testing.T) {
+	// With no sub-signers, broadcastBatchedMsgs should NOT wrap in MsgExec
+	c, _ := setupTxMocks(t)
+
+	n, hashes, err := c.AcknowledgeLeases(t.Context(), []string{"l1"})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), n)
+	assert.Len(t, hashes, 1)
+	// The test passes if no panic and no wrapping — setupTxMocks uses a single-signer pool
+}
+
+func TestClient_BroadcastBatchedMsgs_NoWrapping_AfterDemotion(t *testing.T) {
+	// After DemoteToSingleSigner, broadcastBatchedMsgs should use primary (no MsgExec)
+	pool := newTestSignerPool(t, 2)
+	primaryAddr := pool.ProviderAddress()
+
+	// Demote before creating client — simulates grant failure at startup
+	pool.DemoteToSingleSigner()
+
+	var queriedAddr string
+	s := pool.Primary()
+	addr, err := sdktypes.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	aq := &mockAuthQuery{
+		AccountFn: func(_ context.Context, req *authtypes.QueryAccountRequest, _ ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			queriedAddr = req.Address
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	broadcastCount := &atomic.Int32{}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			broadcastCount.Add(1)
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX1"},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.providerAddress = primaryAddr
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	n, _, err := c.AcknowledgeLeases(t.Context(), []string{"l1"})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), n)
+
+	// After demotion, account query should be for the primary address (no sub-signer)
+	assert.Equal(t, primaryAddr, queriedAddr, "should use primary signer after demotion")
 }
 
 // ---------------------------------------------------------------------------

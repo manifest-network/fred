@@ -274,6 +274,25 @@ var (
 	})
 )
 
+// Signer pool metrics
+var (
+	// SignerPoolSize tracks the total number of signers (1 = single, >1 = parallel).
+	SignerPoolSize = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "signer",
+		Name:      "pool_size",
+		Help:      "Total number of signers in the pool (primary + sub-signers)",
+	})
+
+	// SignerPoolLaneCount tracks the number of active batcher lanes.
+	SignerPoolLaneCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "signer",
+		Name:      "pool_lane_count",
+		Help:      "Number of active batcher lanes for parallel signing",
+	})
+)
+
 // Outcome constants for consistent labeling
 const (
 	OutcomeSuccess = "success"

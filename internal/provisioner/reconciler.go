@@ -54,6 +54,7 @@ type Reconciler struct {
 	providerUUID    string
 	callbackBaseURL string
 	chainClient     ReconcilerChainClient
+	acknowledger    Acknowledger      // Routes acks through the batcher for parallel signing
 	backendRouter   BackendRouter
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
 	placementStore  PlacementStore    // Optional placement store for round-robin routing
@@ -78,11 +79,15 @@ type ReconcilerConfig struct {
 }
 
 // NewReconciler creates a new reconciler.
+// The acknowledger routes ack operations through the batcher for parallel signing.
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
 // The placementStore parameter is optional - if nil, round-robin placement tracking is disabled.
-func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, backendRouter BackendRouter, tracker ReconcilerTracker, placementStore PlacementStore) (*Reconciler, error) {
+func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, acknowledger Acknowledger, backendRouter BackendRouter, tracker ReconcilerTracker, placementStore PlacementStore) (*Reconciler, error) {
 	if chainClient == nil {
 		return nil, errors.New("chain client is required")
+	}
+	if acknowledger == nil {
+		return nil, errors.New("acknowledger is required")
 	}
 	if backendRouter == nil {
 		return nil, errors.New("backend router is required")
@@ -103,6 +108,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, back
 		providerUUID:           cfg.ProviderUUID,
 		callbackBaseURL:        cfg.CallbackBaseURL,
 		chainClient:            chainClient,
+		acknowledger:           acknowledger,
 		backendRouter:          backendRouter,
 		tracker:                tracker,
 		placementStore:         placementStore,
@@ -460,9 +466,9 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	return nil
 }
 
-// acknowledgeLease acknowledges a lease on chain.
+// acknowledgeLease acknowledges a lease via the batcher for parallel signing.
 func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) error {
-	acknowledged, txHashes, err := r.chainClient.AcknowledgeLeases(ctx, []string{leaseUUID})
+	acknowledged, txHash, err := r.acknowledger.Acknowledge(ctx, leaseUUID)
 	if err != nil {
 		return err
 	}
@@ -470,7 +476,7 @@ func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) err
 	slog.Info("reconcile: acknowledged lease",
 		"lease_uuid", leaseUUID,
 		"acknowledged", acknowledged,
-		"tx_hashes", txHashes,
+		"tx_hash", txHash,
 	)
 
 	return nil

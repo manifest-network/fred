@@ -289,6 +289,39 @@ callback_base_url: "http://localhost:8080"
 callback_secret: "your-secret-key-at-least-32-characters-long"
 
 # =============================================================================
+# PARALLEL SIGNING (optional — improves transaction throughput)
+# =============================================================================
+# Uses CosmosSDK's authz module to create sub-signer accounts that can
+# broadcast transactions in parallel on behalf of the provider. Each
+# sub-signer has its own sequence number, enabling N batches per block.
+#
+# ENVIRONMENT VARIABLES (secrets — not in config file):
+#   FRED_KEYRING_PASSPHRASE  — required for "file" keyring backend
+#   FRED_MNEMONIC            — required on first boot to derive sub-signer keys
+#                              (can be removed after first successful startup)
+#
+# FIRST BOOT: Fred derives sub-signer keys from the mnemonic, creates authz
+# grants, and funds the sub-signers. This adds ~12s to startup (two batched txs).
+# SUBSEQUENT BOOTS: Keys exist in keyring, grants on-chain. Near-instant.
+# FALLBACK: If grants fail, Fred falls back to single signer automatically.
+#
+# KEY DERIVATION: Sub-keys use BIP-44 path m/44'/118'/i'/0/0 (varying account
+# index). To recover manually: manifestd keys add --recover --account i
+
+# Number of sub-signer accounts. 0 = single signer (default, backward compat).
+# 3 is a good starting point — enables 3 batches per block (up to ~150 acks/block).
+# sub_signer_count: 0
+
+# Minimum balance for sub-signer accounts. Top-up triggered when below this.
+# sub_signer_min_balance: "10000000umfx"   # 10 MFX
+
+# Amount to send per top-up when a sub-signer is below minimum balance.
+# sub_signer_top_up_amount: "50000000umfx"  # 50 MFX (~22h at full load)
+
+# How often to check sub-signer balances and top up if needed.
+# sub_signer_fund_check_interval: "1h"
+
+# =============================================================================
 # WITHDRAWAL CONFIGURATION
 # =============================================================================
 # Settings for automated withdrawal of accumulated lease payments.

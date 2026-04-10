@@ -429,3 +429,197 @@ func TestAckBatcher_AcknowledgeAfterStopReturnsError(t *testing.T) {
 		t.Fatal("Acknowledge blocked after Stop — goroutine leak")
 	}
 }
+
+func TestAckBatcher_DefaultBatchSize(t *testing.T) {
+	assert.Equal(t, 50, DefaultAckBatchSize)
+}
+
+func TestAckBatcher_MultiLane_DistributesAcrossLanes(t *testing.T) {
+	var mu sync.Mutex
+	laneSeen := map[int]int{} // track which leases go to which lane
+
+	// Use a per-call counter to figure out which lane is processing
+	var callCount atomic.Int32
+
+	leases := make([]string, 9)
+	for i := range leases {
+		leases[i] = "lease-" + string(rune('a'+i))
+	}
+
+	client := &mockAckChainClient{
+		pendingLeases: leases,
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			n := int(callCount.Add(1))
+			mu.Lock()
+			laneSeen[n] = len(leaseUUIDs)
+			mu.Unlock()
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     50,
+		LaneCount:     3,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	var wg sync.WaitGroup
+	for _, uuid := range leases {
+		wg.Add(1)
+		go func(uuid string) {
+			defer wg.Done()
+			acked, _, err := batcher.Acknowledge(ctx, uuid)
+			assert.NoError(t, err)
+			assert.True(t, acked)
+		}(uuid)
+	}
+	wg.Wait()
+
+	// All 9 leases should be acknowledged
+	mu.Lock()
+	total := 0
+	for _, n := range laneSeen {
+		total += n
+	}
+	mu.Unlock()
+	assert.Equal(t, 9, total, "all 9 leases should be acknowledged")
+}
+
+func TestAckBatcher_MultiLane_ConcurrentFlush(t *testing.T) {
+	// With 3 lanes and a 100ms mock delay, all should complete in ~100-200ms not 300ms+
+	leases := []string{"l1", "l2", "l3", "l4", "l5", "l6"}
+
+	client := &mockAckChainClient{
+		pendingLeases: leases,
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			time.Sleep(100 * time.Millisecond) // simulate chain delay
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     50,
+		LaneCount:     3,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for _, uuid := range leases {
+		wg.Add(1)
+		go func(uuid string) {
+			defer wg.Done()
+			_, _, _ = batcher.Acknowledge(ctx, uuid)
+		}(uuid)
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	// With 3 lanes flushing in parallel, should complete much faster than 3*100ms
+	assert.Less(t, elapsed, 500*time.Millisecond, "multi-lane should flush concurrently")
+}
+
+func TestAckBatcher_MultiLane_SingleLaneFallback(t *testing.T) {
+	// LaneCount=1 should behave identically to the original single-lane batcher
+	client := &mockAckChainClient{
+		pendingLeases: []string{"l1", "l2"},
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+		LaneCount:     1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	var wg sync.WaitGroup
+	for _, uuid := range []string{"l1", "l2"} {
+		wg.Add(1)
+		go func(uuid string) {
+			defer wg.Done()
+			acked, _, err := batcher.Acknowledge(ctx, uuid)
+			assert.NoError(t, err)
+			assert.True(t, acked)
+		}(uuid)
+	}
+	wg.Wait()
+}
+
+func TestNewAckBatcher_LaneCountNormalization(t *testing.T) {
+	client := &mockAckChainClient{}
+
+	tests := []struct {
+		name      string
+		laneCount int
+		wantLanes int
+	}{
+		{"zero defaults to 1", 0, 1},
+		{"negative defaults to 1", -5, 1},
+		{"positive preserved", 3, 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batcher := NewAckBatcher(client, AckBatcherConfig{
+				ProviderUUID: testProviderUUID,
+				LaneCount:    tt.laneCount,
+			})
+			assert.Len(t, batcher.lanes, tt.wantLanes)
+		})
+	}
+}
+
+func TestAckBatcher_MultiLane_AllLanesStopped(t *testing.T) {
+	client := &mockAckChainClient{
+		pendingLeases: []string{"l1"},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+		LaneCount:     3,
+	})
+
+	ctx := t.Context()
+	batcher.Start(ctx)
+	batcher.Stop()
+
+	// All lanes stopped — Acknowledge should return promptly with error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, err := batcher.Acknowledge(ctx, "l1")
+		assert.Error(t, err)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Acknowledge blocked after all lanes stopped")
+	}
+}

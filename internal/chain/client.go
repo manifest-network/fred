@@ -24,6 +24,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/types/query"
 	"github.com/cosmos/cosmos-sdk/types/tx"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+	"github.com/cosmos/cosmos-sdk/x/authz"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	skutypes "github.com/manifest-network/manifest-ledger/x/sku/types"
@@ -60,15 +61,16 @@ const (
 
 // Client provides methods to query and submit transactions to the chain.
 type Client struct {
-	conn           *grpc.ClientConn
-	signer         *Signer
-	billingQuery   billingtypes.QueryClient
-	skuQuery       skutypes.QueryClient
-	authQuery      authtypes.QueryClient
-	txService      tx.ServiceClient
-	txPollInterval time.Duration
-	txTimeout      time.Duration
-	queryPageLimit uint64
+	conn            *grpc.ClientConn
+	signerPool      *SignerPool
+	providerAddress string
+	billingQuery    billingtypes.QueryClient
+	skuQuery        skutypes.QueryClient
+	authQuery       authtypes.QueryClient
+	txService       tx.ServiceClient
+	txPollInterval  time.Duration
+	txTimeout       time.Duration
+	queryPageLimit  uint64
 }
 
 // ClientConfig holds configuration for the chain client.
@@ -83,7 +85,7 @@ type ClientConfig struct {
 }
 
 // NewClient creates a new chain client connected to the given gRPC endpoint.
-func NewClient(cfg ClientConfig, signer *Signer) (*Client, error) {
+func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 	dialOpts := []grpc.DialOption{
 		// Keepalive must respect the server's enforcement policy.
 		// Cosmos SDK / gRPC defaults: MinTime=5m, PermitWithoutStream=false.
@@ -116,16 +118,22 @@ func NewClient(cfg ClientConfig, signer *Signer) (*Client, error) {
 	txTimeout := cmp.Or(cfg.TxTimeout, defaultTxTimeout)
 	queryPageLimit := cmp.Or(max(cfg.QueryPageLimit, 0), 100)
 
+	var providerAddress string
+	if pool != nil {
+		providerAddress = pool.ProviderAddress()
+	}
+
 	return &Client{
-		conn:           conn,
-		signer:         signer,
-		billingQuery:   billingtypes.NewQueryClient(conn),
-		skuQuery:       skutypes.NewQueryClient(conn),
-		authQuery:      authtypes.NewQueryClient(conn),
-		txService:      tx.NewServiceClient(conn),
-		txPollInterval: txPollInterval,
-		txTimeout:      txTimeout,
-		queryPageLimit: uint64(queryPageLimit),
+		conn:            conn,
+		signerPool:      pool,
+		providerAddress: providerAddress,
+		billingQuery:    billingtypes.NewQueryClient(conn),
+		skuQuery:        skutypes.NewQueryClient(conn),
+		authQuery:       authtypes.NewQueryClient(conn),
+		txService:       tx.NewServiceClient(conn),
+		txPollInterval:  txPollInterval,
+		txTimeout:       txTimeout,
+		queryPageLimit:  uint64(queryPageLimit),
 	}, nil
 }
 
@@ -158,6 +166,67 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// Conn returns the underlying gRPC connection for creating query clients.
+func (c *Client) Conn() *grpc.ClientConn {
+	return c.conn
+}
+
+// broadcastMultiMsgTx broadcasts multiple messages in a single transaction
+// using the primary signer. Returns error on failure; callers handle fallback.
+func (c *Client) broadcastMultiMsgTx(ctx context.Context, msgs []sdktypes.Msg) (string, error) {
+	if len(msgs) == 0 {
+		return "", nil
+	}
+	if len(msgs) == 1 {
+		return c.broadcastTx(ctx, msgs[0])
+	}
+
+	signer := c.signerPool.Primary()
+	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
+		Address: signer.Address(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to query account: %w", err)
+	}
+
+	txBytes, err := signer.SignTxMulti(ctx, msgs, accResp.Account)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign multi-msg transaction: %w", err)
+	}
+
+	resp, err := c.txService.BroadcastTx(ctx, &tx.BroadcastTxRequest{
+		TxBytes: txBytes,
+		Mode:    tx.BroadcastMode_BROADCAST_MODE_SYNC,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to broadcast transaction: %w", err)
+	}
+
+	if resp.TxResponse.Code != 0 {
+		return "", &ChainTxError{
+			Code:      resp.TxResponse.Code,
+			Codespace: resp.TxResponse.Codespace,
+			RawLog:    resp.TxResponse.RawLog,
+		}
+	}
+
+	txHash := resp.TxResponse.TxHash
+	execResp, err := c.waitForTx(ctx, txHash)
+	if err != nil {
+		return "", fmt.Errorf("failed waiting for tx %s: %w", txHash, err)
+	}
+
+	if execResp.TxResponse.Code != 0 {
+		return "", &ChainTxError{
+			Code:      execResp.TxResponse.Code,
+			Codespace: execResp.TxResponse.Codespace,
+			RawLog:    execResp.TxResponse.RawLog,
+		}
+	}
+
+	return txHash, nil
+}
+
 // recordQueryMetrics records duration for a chain query.
 func recordQueryMetrics(queryName string, start time.Time) {
 	duration := time.Since(start).Seconds()
@@ -181,7 +250,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	defer cancel()
 
 	_, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
-		Address: c.signer.Address(),
+		Address: c.providerAddress,
 	})
 	return err
 }
@@ -294,13 +363,35 @@ func (c *Client) broadcastBatchedMsgs(
 		return 0, nil, nil
 	}
 
+	// Acquire signer once for all sub-batches — fixed for the entire call.
+	// Each ack lane calls this method once per flush; the signer stays the same
+	// across sub-batches and retries to avoid sequence mismatches.
+	signer, isSub := c.signerPool.Acquire()
+
+	var granteeAddr sdktypes.AccAddress
+	if isSub {
+		var err error
+		granteeAddr, err = sdktypes.AccAddressFromBech32(signer.Address())
+		if err != nil {
+			return 0, nil, fmt.Errorf("invalid sub-signer address: %w", err)
+		}
+	}
+
 	var totalProcessed uint64
 	var txHashes []string
 
 	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
-		msg := msgFactory(batch)
+		innerMsg := msgFactory(batch)
 
-		txHash, err := c.broadcastTx(ctx, msg)
+		var msg sdktypes.Msg
+		if isSub {
+			execMsg := authz.NewMsgExec(granteeAddr, []sdktypes.Msg{innerMsg})
+			msg = &execMsg
+		} else {
+			msg = innerMsg
+		}
+
+		txHash, err := c.broadcastTxWithSigner(ctx, signer, msg)
 		recordTxMetrics(metricType, err)
 		if err != nil {
 			return totalProcessed, txHashes, fmt.Errorf("failed to %s leases: %w", metricType, err)
@@ -324,7 +415,7 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "acknowledge", "acknowledged",
 		func(batch []string) sdktypes.Msg {
 			return &billingtypes.MsgAcknowledgeLease{
-				Sender:     c.signer.Address(),
+				Sender:     c.providerAddress,
 				LeaseUuids: batch,
 			}
 		},
@@ -337,7 +428,7 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 // which matches the behavior of the CLI's `manifestd tx billing withdraw --provider` command.
 func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (string, error) {
 	msg := &billingtypes.MsgWithdraw{
-		Sender:       c.signer.Address(),
+		Sender:       c.providerAddress,
 		ProviderUuid: providerUUID,
 		Limit:        0, // Use chain's default limit
 	}
@@ -352,31 +443,34 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (s
 	return txHash, nil
 }
 
-// broadcastTx signs and broadcasts a transaction, waits for execution, returns tx hash.
-// It automatically retries on transient errors and sequence mismatches with exponential backoff.
+// broadcastTx signs and broadcasts a transaction using the primary signer.
+// Used for operations that must use the provider key (withdrawals, grants, funding).
 func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
+	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), msg)
+}
+
+// broadcastTxWithSigner signs and broadcasts a transaction using the given signer.
+// The signer is fixed for the entire retry cycle (signer affinity).
+func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg) (string, error) {
 	var txHash string
 
-	// Configure exponential backoff with jitter
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = txInitialBackoff
 	bo.MaxInterval = txMaxBackoff
-	bo.MaxElapsedTime = 0 // We control max retries via WithMaxRetries
+	bo.MaxElapsedTime = 0
 
-	// Wrap with context and max retries
 	boCtx := backoff.WithContext(
-		backoff.WithMaxRetries(bo, txMaxRetries-1), // -1 because first attempt doesn't count as retry
+		backoff.WithMaxRetries(bo, txMaxRetries-1),
 		ctx,
 	)
 
 	operation := func() error {
 		var err error
-		txHash, err = c.doBroadcastTx(ctx, msg)
+		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msg)
 		if err == nil {
 			return nil
 		}
 
-		// Check if error is retryable
 		if !c.isRetryableTxError(err) {
 			return backoff.Permanent(err)
 		}
@@ -450,18 +544,18 @@ func (c *Client) isRetryableGRPCCode(code codes.Code) bool {
 	}
 }
 
-// doBroadcastTx performs a single broadcast attempt.
-func (c *Client) doBroadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
-	// Get account info for sequence/account number
+// doBroadcastTxWithSigner performs a single broadcast attempt using the given signer.
+func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg) (string, error) {
+	// Get account info for the signer's sequence/account number
 	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
-		Address: c.signer.Address(),
+		Address: signer.Address(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to query account: %w", err)
 	}
 
 	// Build, sign, and broadcast the transaction
-	txBytes, err := c.signer.SignTx(ctx, msg, accResp.Account)
+	txBytes, err := signer.SignTx(ctx, msg, accResp.Account)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %w", err)
 	}
@@ -610,7 +704,7 @@ func (c *Client) RejectLeases(ctx context.Context, leaseUUIDs []string, reason s
 	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "reject", "rejected",
 		func(batch []string) sdktypes.Msg {
 			return &billingtypes.MsgRejectLease{
-				Sender:     c.signer.Address(),
+				Sender:     c.providerAddress,
 				LeaseUuids: batch,
 				Reason:     reason,
 			}
@@ -624,7 +718,7 @@ func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string, reason st
 	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "close", "closed",
 		func(batch []string) sdktypes.Msg {
 			return &billingtypes.MsgCloseLease{
-				Sender:     c.signer.Address(),
+				Sender:     c.providerAddress,
 				LeaseUuids: batch,
 				Reason:     reason,
 			}

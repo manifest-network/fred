@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"fmt"
+	"io"
 	stdmath "math"
 
 	"cosmossdk.io/math"
@@ -16,6 +17,8 @@ import (
 	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
 	authtx "github.com/cosmos/cosmos-sdk/x/auth/tx"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+	"github.com/cosmos/cosmos-sdk/x/authz"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
@@ -49,29 +52,46 @@ type SignerConfig struct {
 	GasLimit       uint64
 	GasPrice       int64
 	FeeDenom       string
+	Passphrase     string // Keyring passphrase for "file" backend (read from FRED_KEYRING_PASSPHRASE env)
 }
 
-// NewSigner creates a new signer using the specified configuration.
-func NewSigner(cfg SignerConfig) (*Signer, error) {
-	// Create codec with required types
-	interfaceRegistry := codectypes.NewInterfaceRegistry()
+// passphraseReader supplies the same passphrase on every Read call.
+// The Cosmos SDK file keyring calls input.GetPassword via a bufio.NewReader
+// wrapping this reader on each password prompt. On first boot, the password
+// is read twice (enter + re-enter). Read must never return io.EOF — doing so
+// would cause the second GetPassword to fail and exhaust prompt retries.
+type passphraseReader struct {
+	data []byte
+}
 
-	// Register crypto types for keyring deserialization
+func newPassphraseReader(passphrase string) io.Reader {
+	return &passphraseReader{data: []byte(passphrase + "\n")}
+}
+
+func (r *passphraseReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	return n, nil
+}
+
+// newCodecAndTxConfig creates the shared codec and tx config used by all signers.
+func newCodecAndTxConfig() (codec.Codec, client.TxConfig) {
+	interfaceRegistry := codectypes.NewInterfaceRegistry()
 	cryptocodec.RegisterInterfaces(interfaceRegistry)
 	authtypes.RegisterInterfaces(interfaceRegistry)
 	billingtypes.RegisterInterfaces(interfaceRegistry)
+	authz.RegisterInterfaces(interfaceRegistry)
+	banktypes.RegisterInterfaces(interfaceRegistry)
 	cdc := codec.NewProtoCodec(interfaceRegistry)
+	txConfig := authtx.NewTxConfig(cdc, authtx.DefaultSignModes)
+	return cdc, txConfig
+}
 
-	// Create keyring
-	kr, err := keyring.New("manifest", cfg.KeyringBackend, cfg.KeyringDir, nil, cdc)
+// newSignerFromKeyring creates a Signer from a pre-opened keyring.
+// The codec and txConfig are shared across all signers in a pool.
+func newSignerFromKeyring(kr keyring.Keyring, keyName string, cfg SignerConfig, cdc codec.Codec, txConfig client.TxConfig) (*Signer, error) {
+	keyInfo, err := kr.Key(keyName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create keyring: %w", err)
-	}
-
-	// Get key info
-	keyInfo, err := kr.Key(cfg.KeyName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get key %s: %w", cfg.KeyName, err)
+		return nil, fmt.Errorf("failed to get key %s: %w", keyName, err)
 	}
 
 	addr, err := keyInfo.GetAddress()
@@ -79,12 +99,9 @@ func NewSigner(cfg SignerConfig) (*Signer, error) {
 		return nil, fmt.Errorf("failed to get address: %w", err)
 	}
 
-	// Create tx config
-	txConfig := authtx.NewTxConfig(cdc, authtx.DefaultSignModes)
-
 	return &Signer{
 		keyring:  kr,
-		keyName:  cfg.KeyName,
+		keyName:  keyName,
 		address:  addr.String(),
 		chainID:  cfg.ChainID,
 		txConfig: txConfig,
@@ -100,21 +117,23 @@ func (s *Signer) Address() string {
 	return s.address
 }
 
-// SignTx builds, signs, and encodes a transaction.
+// SignTx builds, signs, and encodes a single-message transaction.
 func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
-	// Unpack account
+	return s.SignTxMulti(ctx, []sdk.Msg{msg}, accountAny)
+}
+
+// SignTxMulti builds, signs, and encodes a transaction with one or more messages.
+func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
 	var account authtypes.AccountI
 	if err := s.cdc.UnpackAny(accountAny, &account); err != nil {
 		return nil, fmt.Errorf("failed to unpack account: %w", err)
 	}
 
-	// Build the transaction
 	txBuilder := s.txConfig.NewTxBuilder()
-	if err := txBuilder.SetMsgs(msg); err != nil {
+	if err := txBuilder.SetMsgs(msgs...); err != nil {
 		return nil, fmt.Errorf("failed to set messages: %w", err)
 	}
 
-	// Set gas and fees from configuration
 	if s.gasLimit > uint64(stdmath.MaxInt64) {
 		return nil, fmt.Errorf("gas limit %d overflows int64", s.gasLimit)
 	}
@@ -125,7 +144,6 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 	}
 	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, math.NewInt(feeAmount))))
 
-	// Get the key
 	keyInfo, err := s.keyring.Key(s.keyName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get key: %w", err)
@@ -136,7 +154,6 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 		return nil, fmt.Errorf("failed to get public key: %w", err)
 	}
 
-	// Set signature with empty signature bytes first (for sign mode direct)
 	sigV2 := signing.SignatureV2{
 		PubKey: pubKey,
 		Data: &signing.SingleSignatureData{
@@ -149,7 +166,6 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 		return nil, fmt.Errorf("failed to set signatures: %w", err)
 	}
 
-	// Sign the transaction
 	signerData := authsigning.SignerData{
 		ChainID:       s.chainID,
 		AccountNumber: account.GetAccountNumber(),
@@ -176,7 +192,6 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 		return nil, fmt.Errorf("failed to set final signature: %w", err)
 	}
 
-	// Encode the transaction
 	txBytes, err := s.txConfig.TxEncoder()(txBuilder.GetTx())
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode transaction: %w", err)
