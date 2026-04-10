@@ -31,6 +31,11 @@ const (
 	// defaultRequestTimeout is the default timeout for individual request processing.
 	// This is separate from HTTP server timeouts and applies to handler logic.
 	defaultRequestTimeout = 30 * time.Second
+
+	// readHeaderTimeout caps how long the server waits for request headers.
+	// Set independently of ReadTimeout to prevent Slowloris attacks even if
+	// ReadTimeout is tuned to 0 for streaming endpoints.
+	readHeaderTimeout = 5 * time.Second
 )
 
 // CallbackPublisher publishes backend callbacks to the provisioner.
@@ -277,7 +282,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	s.server = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
