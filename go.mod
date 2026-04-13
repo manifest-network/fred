@@ -314,7 +314,7 @@ replace (
 	// Match manifest-ledger replace directives
 	cosmossdk.io/core => cosmossdk.io/core v0.11.3
 	github.com/cosmos/cosmos-sdk => github.com/manifest-network/cosmos-sdk v0.50.14-liftedinit.1
-	github.com/manifest-network/manifest-ledger => github.com/manifest-network/manifest-ledger v2.0.2+incompatible
+	github.com/manifest-network/manifest-ledger => github.com/manifest-network/manifest-ledger v1.0.15-0.20260408152841-d72a0d6f180a
 	github.com/spf13/viper => github.com/spf13/viper v1.17.0
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 )

@@ -1578,8 +1578,8 @@ github.com/mailru/easyjson v0.7.7 h1:UGYAvKxe3sBsEDzO8ZeWOSlIQfWFlxbzLZe7hwFURr0
 github.com/mailru/easyjson v0.7.7/go.mod h1:xzfreul335JAWq5oZzymOObrkdz5UnU4kGfJJLY9Nlc=
 github.com/manifest-network/cosmos-sdk v0.50.14-liftedinit.1 h1:51XJsBI88Ppq0Z+ZEAZhXLUPL1K5gVeIr7GXtlexYTo=
 github.com/manifest-network/cosmos-sdk v0.50.14-liftedinit.1/go.mod h1:hrWEFMU1eoXqLJeE6VVESpJDQH67FS1nnMrQIjO2daw=
-github.com/manifest-network/manifest-ledger v2.0.2+incompatible h1:IuxoM/5eHWIa+r2TCIT+fiJvtcTt8dE24F/U4lALnNk=
-github.com/manifest-network/manifest-ledger v2.0.2+incompatible/go.mod h1:M+bLUnUo33OG58H+j1XC4UKsnEmneQd5Yj5+11l/pPU=
+github.com/manifest-network/manifest-ledger v1.0.15-0.20260408152841-d72a0d6f180a h1:OBZnHt95CdKe1dkOt72vR4SgcZ/F3oqaGrs8y+aoV1k=
+github.com/manifest-network/manifest-ledger v1.0.15-0.20260408152841-d72a0d6f180a/go.mod h1:M+bLUnUo33OG58H+j1XC4UKsnEmneQd5Yj5+11l/pPU=
 github.com/manifoldco/promptui v0.9.0 h1:3V4HzJk1TtXW1MTZMP7mdlwbBpIinw3HztaIlYthEiA=
 github.com/manifoldco/promptui v0.9.0/go.mod h1:ka04sppxSGFAtxX0qhlYQjISsg9mR4GWtQEhdbn6Pgg=
 github.com/mattn/go-colorable v0.0.9/go.mod h1:9vuHe8Xs5qXnSaW/c/ABM9alt+Vo+STaOChaDxuIBZU=
