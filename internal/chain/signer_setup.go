@@ -67,7 +67,7 @@ func EnsureGrants(ctx context.Context, authzQ authzQuerier, broadcaster txBroadc
 				return fmt.Errorf("invalid grantee address: %w", err)
 			}
 
-			// Zero time = no expiration (permanent grant until explicitly revoked)
+			// nil expiration = permanent grant (revocable only via MsgRevoke)
 			grant, err := authz.NewGrant(time.Time{}, authz.NewGenericAuthorization(msgType), nil)
 			if err != nil {
 				return fmt.Errorf("failed to create grant: %w", err)

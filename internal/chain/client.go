@@ -363,8 +363,8 @@ func (c *Client) broadcastBatchedMsgs(
 	}
 
 	// Acquire signer once for all sub-batches — fixed for the entire call.
-	// Each ack lane calls this method once per flush; the signer stays the same
-	// across sub-batches and retries to avoid sequence mismatches.
+	// The signer stays the same across sub-batches and retries to avoid
+	// sequence mismatches.
 	signer, isSub := c.signerPool.Acquire()
 
 	var granteeAddr sdktypes.AccAddress
