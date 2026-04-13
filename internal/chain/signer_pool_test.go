@@ -2,7 +2,9 @@ package chain
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cosmos/cosmos-sdk/codec"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
@@ -82,6 +84,7 @@ func newTestSignerPool(t *testing.T, subCount int) *SignerPool {
 		require.NoError(t, err)
 		pool.subSigners = append(pool.subSigners, sub)
 	}
+	pool.signerMu = make([]sync.Mutex, len(pool.subSigners))
 	return pool
 }
 
@@ -91,9 +94,10 @@ func TestSignerPool_Acquire_RoundRobin(t *testing.T) {
 	// 9 calls should cycle sub1→sub2→sub3 three times
 	seen := make([]string, 9)
 	for i := range 9 {
-		signer, isSub := pool.Acquire()
+		signer, isSub, release := pool.Acquire()
 		assert.True(t, isSub, "Acquire should return sub-signer")
 		seen[i] = signer.Address()
+		release()
 	}
 
 	// Verify round-robin: indices 0,3,6 same; 1,4,7 same; 2,5,8 same
@@ -118,9 +122,10 @@ func TestSignerPool_Acquire_SingleSigner_ReturnsPrimary(t *testing.T) {
 	pool := newTestSignerPool(t, 0)
 
 	for range 5 {
-		signer, isSub := pool.Acquire()
+		signer, isSub, release := pool.Acquire()
 		assert.False(t, isSub)
 		assert.Equal(t, pool.ProviderAddress(), signer.Address())
+		release()
 	}
 }
 
@@ -132,7 +137,8 @@ func TestSignerPool_Acquire_ConcurrentSafety(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			signer, isSub := pool.Acquire()
+			signer, isSub, release := pool.Acquire()
+			defer release()
 			assert.True(t, isSub)
 			assert.NotEmpty(t, signer.Address())
 		}()
@@ -145,7 +151,8 @@ func TestSignerPool_Primary_AlwaysReturnsPrimary(t *testing.T) {
 
 	// Acquire some sub-signers to advance the counter
 	for range 5 {
-		pool.Acquire()
+		_, _, release := pool.Acquire()
+		release()
 	}
 
 	// Primary should be unaffected
@@ -161,7 +168,8 @@ func TestSignerPool_ProviderAddress_Invariant(t *testing.T) {
 
 	// Even after acquiring sub-signers
 	for range 10 {
-		pool.Acquire()
+		_, _, release := pool.Acquire()
+		release()
 	}
 	assert.Equal(t, expected, pool.ProviderAddress())
 }
@@ -218,9 +226,10 @@ func TestSignerPool_DemoteToSingleSigner(t *testing.T) {
 	assert.Empty(t, pool.SubSignerAddresses())
 
 	// Acquire should now return primary
-	signer, isSub := pool.Acquire()
+	signer, isSub, release := pool.Acquire()
 	assert.False(t, isSub)
 	assert.Equal(t, pool.ProviderAddress(), signer.Address())
+	release()
 }
 
 func TestSignerPool_DemoteToSingleSigner_ConcurrentRead(t *testing.T) {
@@ -233,7 +242,8 @@ func TestSignerPool_DemoteToSingleSigner_ConcurrentRead(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			signer, _ := pool.Acquire()
+			signer, _, release := pool.Acquire()
+			defer release()
 			assert.NotEmpty(t, signer.Address())
 		}()
 	}
@@ -248,9 +258,86 @@ func TestSignerPool_DemoteToSingleSigner_ConcurrentRead(t *testing.T) {
 	wg.Wait()
 
 	// After demotion, should be single signer
-	signer, isSub := pool.Acquire()
+	signer, isSub, release := pool.Acquire()
 	assert.False(t, isSub)
 	assert.Equal(t, pool.ProviderAddress(), signer.Address())
+	release()
+}
+
+// TestSignerPool_Acquire_ExclusiveAccess is a regression test for the sequence
+// mismatch bug: before per-signer locking, Acquire could hand the same
+// sub-signer to multiple goroutines simultaneously. Under load, both would
+// query the same chain sequence number and one transaction would fail with
+// "account sequence mismatch". The race detector didn't catch this because
+// there was no data race — just a logical race on the on-chain sequence.
+//
+// This test verifies that no two concurrent holders ever hold the same signer.
+func TestSignerPool_Acquire_ExclusiveAccess(t *testing.T) {
+	pool := newTestSignerPool(t, 3)
+
+	// Track concurrent holders per signer address — must never exceed 1.
+	held := make(map[string]int)
+	var mu sync.Mutex
+	var violations atomic.Int64
+
+	var wg sync.WaitGroup
+	for range 30 { // 30 goroutines competing for 3 signers ensures contention
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				signer, _, release := pool.Acquire()
+				addr := signer.Address()
+
+				mu.Lock()
+				held[addr]++
+				if held[addr] > 1 {
+					violations.Add(1)
+				}
+				mu.Unlock()
+
+				time.Sleep(10 * time.Microsecond) // simulate broadcast work
+
+				mu.Lock()
+				held[addr]--
+				mu.Unlock()
+
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Zero(t, violations.Load(),
+		"concurrent goroutines held the same sub-signer — per-signer locking is broken")
+}
+
+// TestSignerPool_Acquire_DemoteDuringHold verifies that a goroutine holding a
+// sub-signer via Acquire can safely release it after DemoteToSingleSigner runs.
+// This exercises the snapshot consistency of Acquire: both subSigners and
+// signerMu must be captured in the same RLock section, otherwise the release
+// closure could reference a nil'd signerMu slice (panic) or an inconsistent
+// index.
+func TestSignerPool_Acquire_DemoteDuringHold(t *testing.T) {
+	pool := newTestSignerPool(t, 3)
+
+	// Acquire a sub-signer and hold it.
+	signer, isSub, release := pool.Acquire()
+	require.True(t, isSub, "expected sub-signer before demotion")
+	require.NotEqual(t, pool.ProviderAddress(), signer.Address())
+
+	// Demote while the signer is held — this nils subSigners but must
+	// not affect the held signer's release closure.
+	pool.DemoteToSingleSigner()
+
+	// Post-demotion, Acquire must return primary.
+	primary, isSub2, release2 := pool.Acquire()
+	assert.False(t, isSub2, "post-demotion Acquire should return primary (isSub=false)")
+	assert.Equal(t, pool.ProviderAddress(), primary.Address())
+	release2()
+
+	// Release the pre-demotion signer — must not panic.
+	assert.NotPanics(t, func() { release() })
 }
 
 func TestNewSignerPool_KeyDerivation_FirstBoot(t *testing.T) {

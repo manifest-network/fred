@@ -368,7 +368,8 @@ func (c *Client) broadcastBatchedMsgs(
 	// Acquire signer once for all sub-batches — fixed for the entire call.
 	// The signer stays the same across sub-batches and retries to avoid
 	// sequence mismatches.
-	signer, isSub := c.signerPool.Acquire()
+	signer, isSub, release := c.signerPool.Acquire()
+	defer release()
 
 	var granteeAddr sdktypes.AccAddress
 	if isSub {
