@@ -85,7 +85,11 @@ type ClientConfig struct {
 }
 
 // NewClient creates a new chain client connected to the given gRPC endpoint.
+// The pool parameter is required; pass a single-signer pool for backward compatibility.
 func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
+	if pool == nil {
+		return nil, fmt.Errorf("signer pool is required")
+	}
 	dialOpts := []grpc.DialOption{
 		// Keepalive must respect the server's enforcement policy.
 		// Cosmos SDK / gRPC defaults: MinTime=5m, PermitWithoutStream=false.
@@ -118,15 +122,10 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 	txTimeout := cmp.Or(cfg.TxTimeout, defaultTxTimeout)
 	queryPageLimit := cmp.Or(max(cfg.QueryPageLimit, 0), 100)
 
-	var providerAddress string
-	if pool != nil {
-		providerAddress = pool.ProviderAddress()
-	}
-
 	return &Client{
 		conn:            conn,
 		signerPool:      pool,
-		providerAddress: providerAddress,
+		providerAddress: pool.ProviderAddress(),
 		billingQuery:    billingtypes.NewQueryClient(conn),
 		skuQuery:        skutypes.NewQueryClient(conn),
 		authQuery:       authtypes.NewQueryClient(conn),

@@ -165,17 +165,19 @@ func run(cmd *cobra.Command, args []string) error {
 	defer chainClient.Close()
 	slog.Info("chain client connected", "endpoint", cfg.GRPCEndpoint, "tls", cfg.GRPCTLSEnabled)
 
-	// Parse funding coin amounts early (no chain needed, fail fast on bad config)
-	subSignerMinBalance, err := sdk.ParseCoinNormalized(cfg.SubSignerMinBalance)
-	if err != nil {
-		return fmt.Errorf("invalid sub_signer_min_balance: %w", err)
-	}
-	subSignerTopUpAmount, err := sdk.ParseCoinNormalized(cfg.SubSignerTopUpAmount)
-	if err != nil {
-		return fmt.Errorf("invalid sub_signer_top_up_amount: %w", err)
+	// Parse funding coin amounts and setup sub-signers (if any)
+	var subSignerMinBalance, subSignerTopUpAmount sdk.Coin
+	if signerPool.LaneCount() > 1 {
+		subSignerMinBalance, err = sdk.ParseCoinNormalized(cfg.SubSignerMinBalance)
+		if err != nil {
+			return fmt.Errorf("invalid sub_signer_min_balance: %w", err)
+		}
+		subSignerTopUpAmount, err = sdk.ParseCoinNormalized(cfg.SubSignerTopUpAmount)
+		if err != nil {
+			return fmt.Errorf("invalid sub_signer_top_up_amount: %w", err)
+		}
 	}
 
-	// Setup authz grants and funding for sub-signers (if any)
 	if signerPool.LaneCount() > 1 {
 		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
 		authzQ := authz.NewQueryClient(chainClient.Conn())

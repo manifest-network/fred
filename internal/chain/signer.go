@@ -62,6 +62,7 @@ type SignerConfig struct {
 // would cause the second GetPassword to fail and exhaust prompt retries.
 type passphraseReader struct {
 	data []byte
+	pos  int
 }
 
 func newPassphraseReader(passphrase string) io.Reader {
@@ -69,7 +70,11 @@ func newPassphraseReader(passphrase string) io.Reader {
 }
 
 func (r *passphraseReader) Read(p []byte) (int, error) {
-	n := copy(p, r.data)
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	if r.pos >= len(r.data) {
+		r.pos = 0 // reset for the next prompt (first-boot reads twice)
+	}
 	return n, nil
 }
 

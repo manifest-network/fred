@@ -230,12 +230,13 @@ func TestNewClient_Defaults(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			pool := newTestSignerPoolFromSigner(newTestSigner(t))
 			c, err := NewClient(ClientConfig{
 				Endpoint:       "localhost:9999",
 				TxPollInterval: tt.txPollInterval,
 				TxTimeout:      tt.txTimeout,
 				QueryPageLimit: tt.queryPageLimit,
-			}, nil)
+			}, pool)
 			require.NoError(t, err)
 			defer c.Close()
 
