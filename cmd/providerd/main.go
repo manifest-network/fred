@@ -480,9 +480,11 @@ func run(cmd *cobra.Command, args []string) error {
 				case <-ctx.Done():
 					return nil
 				case <-ticker.C:
-					if err := chain.EnsureFunding(ctx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
+					fundCtx, fundCancel := context.WithTimeout(ctx, 60*time.Second)
+					if err := chain.EnsureFunding(fundCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
 						slog.Warn("sub-signer funding check failed", "error", err)
 					}
+					fundCancel()
 				}
 			}
 		})
