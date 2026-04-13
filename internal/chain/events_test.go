@@ -126,62 +126,30 @@ func TestEventSubscriber_Subscribe(t *testing.T) {
 	sub.Unsubscribe(ch2)
 }
 
-func TestGetEventAttribute(t *testing.T) {
+func TestSafeIndex(t *testing.T) {
 	tests := []struct {
-		name   string
-		events map[string][]string
-		key    string
-		want   string
+		name  string
+		slice []string
+		index int
+		want  string
 	}{
-		{
-			name: "existing attribute",
-			events: map[string][]string{
-				"lease_created.lease_uuid": {"uuid-123"},
-			},
-			key:  "lease_created.lease_uuid",
-			want: "uuid-123",
-		},
-		{
-			name: "missing attribute",
-			events: map[string][]string{
-				"other.attr": {"value"},
-			},
-			key:  "lease_created.lease_uuid",
-			want: "",
-		},
-		{
-			name:   "empty events",
-			events: map[string][]string{},
-			key:    "lease_created.lease_uuid",
-			want:   "",
-		},
-		{
-			name: "empty array",
-			events: map[string][]string{
-				"lease_created.lease_uuid": {},
-			},
-			key:  "lease_created.lease_uuid",
-			want: "",
-		},
-		{
-			name: "multiple values returns first",
-			events: map[string][]string{
-				"lease_created.lease_uuid": {"first", "second"},
-			},
-			key:  "lease_created.lease_uuid",
-			want: "first",
-		},
+		{name: "valid index", slice: []string{"a", "b", "c"}, index: 1, want: "b"},
+		{name: "first element", slice: []string{"a", "b"}, index: 0, want: "a"},
+		{name: "out of bounds", slice: []string{"a"}, index: 5, want: ""},
+		{name: "nil slice", slice: nil, index: 0, want: ""},
+		{name: "empty slice", slice: []string{}, index: 0, want: ""},
+		{name: "negative index", slice: []string{"a", "b"}, index: -1, want: ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := getEventAttribute(tt.events, tt.key)
+			got := safeIndex(tt.slice, tt.index)
 			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
-func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
+func TestEventSubscriber_ParseLeaseEvents(t *testing.T) {
 	sub, err := NewEventSubscriber(EventSubscriberConfig{
 		URL:          "ws://localhost:26657/websocket",
 		ProviderUUID: testProviderUUID,
@@ -191,34 +159,28 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 	tests := []struct {
 		name   string
 		events map[string][]string
-		want   *LeaseEvent
+		want   []LeaseEvent
 	}{
 		{
-			name: "lease_created event",
+			name: "single lease_created event",
 			events: map[string][]string{
 				"lease_created.lease_uuid":    {"lease-uuid-1"},
 				"lease_created.provider_uuid": {testProviderUUID},
 				"lease_created.tenant":        {"tenant-addr"},
 			},
-			want: &LeaseEvent{
-				Type:         LeaseCreated,
-				LeaseUUID:    "lease-uuid-1",
-				ProviderUUID: testProviderUUID,
-				Tenant:       "tenant-addr",
+			want: []LeaseEvent{
+				{Type: LeaseCreated, LeaseUUID: "lease-uuid-1", ProviderUUID: testProviderUUID, Tenant: "tenant-addr"},
 			},
 		},
 		{
-			name: "lease_acknowledged event",
+			name: "single lease_acknowledged event",
 			events: map[string][]string{
 				"lease_acknowledged.lease_uuid":    {"lease-uuid-2"},
 				"lease_acknowledged.provider_uuid": {testProviderUUID},
 				"lease_acknowledged.tenant":        {"tenant-addr"},
 			},
-			want: &LeaseEvent{
-				Type:         LeaseAcknowledged,
-				LeaseUUID:    "lease-uuid-2",
-				ProviderUUID: testProviderUUID,
-				Tenant:       "tenant-addr",
+			want: []LeaseEvent{
+				{Type: LeaseAcknowledged, LeaseUUID: "lease-uuid-2", ProviderUUID: testProviderUUID, Tenant: "tenant-addr"},
 			},
 		},
 		{
@@ -231,18 +193,15 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "auto_closed event",
+			name: "single auto_closed event",
 			events: map[string][]string{
 				"lease_auto_closed.lease_uuid":    {"lease-uuid-4"},
 				"lease_auto_closed.provider_uuid": {"any-provider"},
 				"lease_auto_closed.tenant":        {"tenant-addr"},
 				"lease_auto_closed.reason":        {"credit_exhausted"},
 			},
-			want: &LeaseEvent{
-				Type:         LeaseAutoClosed,
-				LeaseUUID:    "lease-uuid-4",
-				ProviderUUID: "any-provider",
-				Tenant:       "tenant-addr",
+			want: []LeaseEvent{
+				{Type: LeaseAutoClosed, LeaseUUID: "lease-uuid-4", ProviderUUID: "any-provider", Tenant: "tenant-addr"},
 			},
 		},
 		{
@@ -250,20 +209,130 @@ func TestEventSubscriber_ParseLeaseEvent(t *testing.T) {
 			events: map[string][]string{},
 			want:   nil,
 		},
+		// Batch scenarios
+		{
+			name: "batch lease_closed - 3 events same provider",
+			events: map[string][]string{
+				"lease_closed.lease_uuid":    {"uuid-1", "uuid-2", "uuid-3"},
+				"lease_closed.provider_uuid": {testProviderUUID, testProviderUUID, testProviderUUID},
+				"lease_closed.tenant":        {"tenant-1", "tenant-2", "tenant-3"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseClosed, LeaseUUID: "uuid-1", ProviderUUID: testProviderUUID, Tenant: "tenant-1"},
+				{Type: LeaseClosed, LeaseUUID: "uuid-2", ProviderUUID: testProviderUUID, Tenant: "tenant-2"},
+				{Type: LeaseClosed, LeaseUUID: "uuid-3", ProviderUUID: testProviderUUID, Tenant: "tenant-3"},
+			},
+		},
+		{
+			name: "batch lease_closed - mixed providers filters correctly",
+			events: map[string][]string{
+				"lease_closed.lease_uuid":    {"uuid-1", "uuid-2", "uuid-3"},
+				"lease_closed.provider_uuid": {testProviderUUID, testProviderUUID2, testProviderUUID},
+				"lease_closed.tenant":        {"tenant-1", "tenant-2", "tenant-3"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseClosed, LeaseUUID: "uuid-1", ProviderUUID: testProviderUUID, Tenant: "tenant-1"},
+				{Type: LeaseClosed, LeaseUUID: "uuid-3", ProviderUUID: testProviderUUID, Tenant: "tenant-3"},
+			},
+		},
+		{
+			name: "batch lease_closed - all other provider returns nil",
+			events: map[string][]string{
+				"lease_closed.lease_uuid":    {"uuid-1", "uuid-2"},
+				"lease_closed.provider_uuid": {testProviderUUID2, testProviderUUID2},
+				"lease_closed.tenant":        {"tenant-1", "tenant-2"},
+			},
+			want: nil,
+		},
+		{
+			name: "batch auto_closed - multiple events",
+			events: map[string][]string{
+				"lease_auto_closed.lease_uuid":    {"uuid-1", "uuid-2"},
+				"lease_auto_closed.provider_uuid": {"prov-1", "prov-2"},
+				"lease_auto_closed.tenant":        {"tenant-1", "tenant-2"},
+				"lease_auto_closed.reason":        {"credit_exhausted", "credit_exhausted"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseAutoClosed, LeaseUUID: "uuid-1", ProviderUUID: "prov-1", Tenant: "tenant-1"},
+				{Type: LeaseAutoClosed, LeaseUUID: "uuid-2", ProviderUUID: "prov-2", Tenant: "tenant-2"},
+			},
+		},
+		{
+			name: "empty UUID in middle of batch - skipped",
+			events: map[string][]string{
+				"lease_closed.lease_uuid":    {"uuid-1", "", "uuid-3"},
+				"lease_closed.provider_uuid": {testProviderUUID, testProviderUUID, testProviderUUID},
+				"lease_closed.tenant":        {"tenant-1", "tenant-2", "tenant-3"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseClosed, LeaseUUID: "uuid-1", ProviderUUID: testProviderUUID, Tenant: "tenant-1"},
+				{Type: LeaseClosed, LeaseUUID: "uuid-3", ProviderUUID: testProviderUUID, Tenant: "tenant-3"},
+			},
+		},
+		{
+			name: "mismatched tenant array - shorter than lease_uuid",
+			events: map[string][]string{
+				"lease_closed.lease_uuid":    {"uuid-1", "uuid-2", "uuid-3"},
+				"lease_closed.provider_uuid": {testProviderUUID, testProviderUUID, testProviderUUID},
+				"lease_closed.tenant":        {"tenant-1"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseClosed, LeaseUUID: "uuid-1", ProviderUUID: testProviderUUID, Tenant: "tenant-1"},
+				{Type: LeaseClosed, LeaseUUID: "uuid-2", ProviderUUID: testProviderUUID, Tenant: ""},
+				{Type: LeaseClosed, LeaseUUID: "uuid-3", ProviderUUID: testProviderUUID, Tenant: ""},
+			},
+		},
+		{
+			name: "mismatched provider_uuid array - shorter entries warned and skipped",
+			events: map[string][]string{
+				"lease_closed.lease_uuid":    {"uuid-1", "uuid-2", "uuid-3"},
+				"lease_closed.provider_uuid": {testProviderUUID},
+				"lease_closed.tenant":        {"tenant-1", "tenant-2", "tenant-3"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseClosed, LeaseUUID: "uuid-1", ProviderUUID: testProviderUUID, Tenant: "tenant-1"},
+			},
+		},
+		{
+			name: "auto_closed takes priority over lease_closed in same message",
+			events: map[string][]string{
+				"lease_auto_closed.lease_uuid":    {"uuid-ac"},
+				"lease_auto_closed.provider_uuid": {"any-provider"},
+				"lease_auto_closed.tenant":        {"tenant-ac"},
+				"lease_auto_closed.reason":        {"credit_exhausted"},
+				"lease_closed.lease_uuid":         {"uuid-lc"},
+				"lease_closed.provider_uuid":      {testProviderUUID},
+				"lease_closed.tenant":             {"tenant-lc"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseAutoClosed, LeaseUUID: "uuid-ac", ProviderUUID: "any-provider", Tenant: "tenant-ac"},
+			},
+		},
+		{
+			name: "auto_closed mismatched tenant - entries without tenant warned and skipped",
+			events: map[string][]string{
+				"lease_auto_closed.lease_uuid":    {"uuid-1", "uuid-2"},
+				"lease_auto_closed.provider_uuid": {"prov-1", "prov-2"},
+				"lease_auto_closed.tenant":        {"tenant-1"},
+				"lease_auto_closed.reason":        {"credit_exhausted"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseAutoClosed, LeaseUUID: "uuid-1", ProviderUUID: "prov-1", Tenant: "tenant-1"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := sub.parseLeaseEvent(tt.events)
+			got := sub.parseLeaseEvents(tt.events)
 			if tt.want == nil {
-				assert.Nil(t, got)
+				assert.Empty(t, got)
 				return
 			}
-			require.NotNil(t, got)
-			assert.Equal(t, tt.want.Type, got.Type)
-			assert.Equal(t, tt.want.LeaseUUID, got.LeaseUUID)
-			assert.Equal(t, tt.want.ProviderUUID, got.ProviderUUID)
-			assert.Equal(t, tt.want.Tenant, got.Tenant)
+			require.Len(t, got, len(tt.want))
+			for i := range tt.want {
+				assert.Equal(t, tt.want[i], got[i], "event at index %d", i)
+			}
 		})
 	}
 }
@@ -363,6 +432,59 @@ func TestEventSubscriber_HandleMessage(t *testing.T) {
 			}
 		})
 	}
+
+	// Test batch message: verify all events arrive in order with correct content
+	t.Run("batch lease_closed emits multiple events in order", func(t *testing.T) {
+		// Drain channel
+		for len(events) > 0 {
+			<-events
+		}
+
+		msg := func() []byte {
+			resp := jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      3,
+				Result: makeResultJSON(map[string][]string{
+					"lease_closed.lease_uuid":    {"uuid-1", "uuid-2", "uuid-3"},
+					"lease_closed.provider_uuid": {testProviderUUID, testProviderUUID, testProviderUUID},
+					"lease_closed.tenant":        {"tenant-1", "tenant-2", "tenant-3"},
+				}),
+			}
+			data, _ := json.Marshal(resp)
+			return data
+		}()
+
+		sub.handleMessage(msg)
+
+		var received []LeaseEvent
+		for range 3 {
+			select {
+			case ev := <-events:
+				received = append(received, ev)
+			case <-time.After(100 * time.Millisecond):
+				t.Fatalf("expected 3 events, got %d", len(received))
+			}
+		}
+
+		require.Len(t, received, 3)
+		for i, ev := range received {
+			assert.Equal(t, LeaseClosed, ev.Type, "event %d type", i)
+			assert.Equal(t, testProviderUUID, ev.ProviderUUID, "event %d provider", i)
+		}
+		assert.Equal(t, "uuid-1", received[0].LeaseUUID)
+		assert.Equal(t, "tenant-1", received[0].Tenant)
+		assert.Equal(t, "uuid-2", received[1].LeaseUUID)
+		assert.Equal(t, "tenant-2", received[1].Tenant)
+		assert.Equal(t, "uuid-3", received[2].LeaseUUID)
+		assert.Equal(t, "tenant-3", received[2].Tenant)
+
+		// Verify no extra events
+		select {
+		case ev := <-events:
+			t.Fatalf("unexpected extra event: %+v", ev)
+		default:
+		}
+	})
 }
 
 func TestEventSubscriber_TrackInvalidMessage(t *testing.T) {
