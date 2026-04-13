@@ -489,10 +489,11 @@ func (s *EventSubscriber) trackInvalidMessage(reason string, err error) {
 // parseLeaseEvents extracts all LeaseEvents from CometBFT events.
 // A single Cosmos TX can contain multiple lease operations (e.g. batch close),
 // so event attributes are parallel arrays that must be iterated in lockstep.
-// Returns after the first event type that produces results, or nil if no events
-// match this provider. CometBFT TXs typically contain only one lease event type;
-// short-circuiting avoids emitting duplicates if the same TX is delivered on
-// multiple subscription channels.
+// By design, this returns events for only the first lease event type in the
+// check order that produces results for this provider, or nil if no events
+// match. CometBFT TXs typically contain only one lease event type; if multiple
+// lease event types are present in the same TX payload, later types are
+// intentionally ignored rather than emitted alongside the first match.
 func (s *EventSubscriber) parseLeaseEvents(events map[string][]string) []LeaseEvent {
 	// Check for lease_auto_closed events first (these are not filtered by provider)
 	if result := s.parseAutoClosedEvents(events); len(result) > 0 {
@@ -539,6 +540,13 @@ func (s *EventSubscriber) parseLeaseEvents(events map[string][]string) []LeaseEv
 			}
 
 			tenant := safeIndex(tenants, i)
+			if tenant == "" && i >= len(tenants) {
+				slog.Warn("lease event has missing tenant at index",
+					"index", i, "lease_uuid", leaseUUID, "event_type", eventType,
+					"tenant_array_len", len(tenants),
+					"lease_uuid_array_len", len(leaseUUIDs),
+				)
+			}
 
 			slog.Info("received lease event",
 				"type", eventType,
@@ -595,6 +603,13 @@ func (s *EventSubscriber) parseAutoClosedEvents(events map[string][]string) []Le
 		}
 
 		providerUUID := safeIndex(providerUUIDs, i)
+		if providerUUID == "" && i >= len(providerUUIDs) {
+			slog.Warn("auto-closed event has missing provider_uuid at index",
+				"index", i, "lease_uuid", leaseUUID,
+				"provider_uuid_array_len", len(providerUUIDs),
+				"lease_uuid_array_len", len(leaseUUIDs),
+			)
+		}
 		reason := safeIndex(reasons, i)
 
 		slog.Info("received lease auto-closed event",
