@@ -16,12 +16,17 @@ import (
 
 const cosmosHDCoinType = 118
 
+// nopRelease is the release function returned when Acquire hands back the
+// primary signer (no per-signer mutex to unlock).
+var nopRelease = func() {}
+
 // SignerPool manages a primary signer and optional sub-signers for parallel
 // transaction broadcasting via CosmosSDK authz.
 type SignerPool struct {
 	primary    *Signer
 	mu         sync.RWMutex // protects subSigners (for DemoteToSingleSigner)
 	subSigners []*Signer
+	signerMu   []sync.Mutex // per-signer mutex for exclusive access
 	next       atomic.Uint64
 }
 
@@ -290,24 +295,42 @@ func NewSignerPool(cfg SignerPoolConfig) (*SignerPool, error) {
 			"found", len(pool.subSigners), "requested", cfg.SubSignerCount)
 	}
 
+	pool.signerMu = make([]sync.Mutex, len(pool.subSigners))
+
 	return pool, nil
 }
 
-// Acquire returns the next sub-signer via round-robin. If no sub-signers
-// exist, returns the primary signer.
-// The second return value indicates whether the returned signer is a sub-signer
-// (true) or the primary signer (false).
-func (p *SignerPool) Acquire() (*Signer, bool) {
+// Acquire returns the next available sub-signer with exclusive access.
+// If no sub-signers exist, returns the primary signer (no locking needed).
+// The caller MUST call the returned release function when done;
+// failing to do so will deadlock the pool.
+func (p *SignerPool) Acquire() (*Signer, bool, func()) {
+	// Snapshot both slices under the same lock so they stay consistent
+	// even if DemoteToSingleSigner runs concurrently.
 	p.mu.RLock()
 	subs := p.subSigners
+	mus := p.signerMu
 	p.mu.RUnlock()
 
 	if len(subs) == 0 {
-		return p.primary, false
+		return p.primary, false, nopRelease
 	}
 
-	idx := p.next.Add(1) - 1
-	return subs[idx%uint64(len(subs))], true
+	n := uint64(len(subs))
+	startIdx := p.next.Add(1) - 1
+
+	// Try each signer starting from round-robin target, prefer unlocked.
+	for i := uint64(0); i < n; i++ {
+		idx := (startIdx + i) % n
+		if mus[idx].TryLock() {
+			return subs[idx], true, func() { mus[idx].Unlock() }
+		}
+	}
+
+	// All signers busy — block on the round-robin target.
+	idx := startIdx % n
+	mus[idx].Lock()
+	return subs[idx], true, func() { mus[idx].Unlock() }
 }
 
 // Primary returns the primary signer. Used for operations that must use the
@@ -365,4 +388,5 @@ func (p *SignerPool) DemoteToSingleSigner() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.subSigners = nil
+	p.signerMu = nil
 }
