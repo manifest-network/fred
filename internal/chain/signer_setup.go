@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"cosmossdk.io/math"
@@ -110,6 +111,11 @@ func grantExists(ctx context.Context, authzQ authzQuerier, granter, grantee, msg
 		MsgTypeUrl: msgType,
 	})
 	if err != nil {
+		// The authz module returns an error (codespace authz, code 2) when no
+		// grant exists, rather than an empty list. Treat as "not found".
+		if strings.Contains(err.Error(), "authorization not found") {
+			return false, nil
+		}
 		return false, err
 	}
 	return len(resp.Grants) > 0, nil
