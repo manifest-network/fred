@@ -194,6 +194,12 @@ func TestBuildTLSConfig_InvalidCertificate(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestNewClient_NilPoolRejected(t *testing.T) {
+	_, err := NewClient(ClientConfig{Endpoint: "localhost:9999"}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "signer pool is required")
+}
+
 func TestNewClient_Defaults(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -1230,6 +1236,130 @@ func TestClient_BroadcastBatchedMsgs_NoWrapping_AfterDemotion(t *testing.T) {
 
 	// After demotion, account query should be for the primary address (no sub-signer)
 	assert.Equal(t, primaryAddr, queriedAddr, "should use primary signer after demotion")
+}
+
+func TestClient_BroadcastTxWithSigner_SequenceMismatchRetry(t *testing.T) {
+	// Sequence mismatch (code 32) should trigger retry and succeed on 2nd attempt
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var attempts atomic.Int32
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			if n == 1 {
+				// First attempt: sequence mismatch
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 32, Codespace: "sdk", RawLog: "account sequence mismatch"},
+				}, nil
+			}
+			// Second attempt: success
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_RETRY"},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_RETRY", hash)
+	assert.GreaterOrEqual(t, int(attempts.Load()), 2, "should have retried after sequence mismatch")
+}
+
+func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {
+	// With >100 leases (multiple sub-batches), Acquire should be called exactly once
+	pool := newTestSignerPool(t, 2)
+
+	var acquireCount atomic.Int32
+	originalAcquire := pool.Acquire
+	// We can't easily mock Acquire on a real pool, so we track via account queries.
+	// Each sub-batch calls doBroadcastTxWithSigner which queries the signer's account.
+	// If signer is acquired once, all queries should be for the same address.
+	var mu sync.Mutex
+	var queriedAddrs []string
+
+	s := pool.Primary()
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+	subAddrs := pool.SubSignerAddresses()
+	subAddr0, _ := sdktypes.AccAddressFromBech32(subAddrs[0])
+	subAccountAny0 := newTestAccountAny(t, subAddr0, 2, 0)
+	subAddr1, _ := sdktypes.AccAddressFromBech32(subAddrs[1])
+	subAccountAny1 := newTestAccountAny(t, subAddr1, 3, 0)
+
+	_ = originalAcquire
+	_ = acquireCount
+
+	aq := &mockAuthQuery{
+		AccountFn: func(_ context.Context, req *authtypes.QueryAccountRequest, _ ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			mu.Lock()
+			queriedAddrs = append(queriedAddrs, req.Address)
+			mu.Unlock()
+			switch req.Address {
+			case subAddrs[0]:
+				return &authtypes.QueryAccountResponse{Account: subAccountAny0}, nil
+			case subAddrs[1]:
+				return &authtypes.QueryAccountResponse{Account: subAccountAny1}, nil
+			default:
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			}
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX1"},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.providerAddress = pool.ProviderAddress()
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	// Create 150 leases — should produce 2 sub-batches (100 + 50) with maxLeasesPerBatch=100
+	uuids := make([]string, 150)
+	for i := range uuids {
+		uuids[i] = fmt.Sprintf("l-%d", i)
+	}
+
+	n, hashes, err := c.AcknowledgeLeases(t.Context(), uuids)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(150), n)
+	assert.Len(t, hashes, 2, "should produce 2 sub-batches")
+
+	// All account queries should be for the same address (signer acquired once)
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(queriedAddrs), 2, "should have at least 2 account queries (one per sub-batch)")
+	for _, addr := range queriedAddrs[1:] {
+		assert.Equal(t, queriedAddrs[0], addr, "all sub-batches should query the same signer address")
+	}
 }
 
 // ---------------------------------------------------------------------------

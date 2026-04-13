@@ -215,6 +215,29 @@ func TestEnsureFunding_ProviderInsufficientBalance(t *testing.T) {
 	assert.Contains(t, err.Error(), "insufficient")
 }
 
+func TestEnsureGrants_AuthzNotFoundTreatedAsMissing(t *testing.T) {
+	// The authz module returns an error (not empty grants) when no grant exists.
+	// grantExists must treat "authorization not found" as false, not as an error.
+	pool := newTestSignerPool(t, 1)
+	var broadcastCount atomic.Int32
+
+	authzQ := &mockAuthzQuerier{
+		grantsFn: func(ctx context.Context, in *authz.QueryGrantsRequest, opts ...grpc.CallOption) (*authz.QueryGrantsResponse, error) {
+			return nil, errors.New("codespace authz code 2: authorization not found: authorization not found for /liftedinit.billing.v1.MsgAcknowledgeLease type")
+		},
+	}
+	broadcaster := &mockTxBroadcaster{
+		broadcastMultiMsgFn: func(ctx context.Context, msgs []sdk.Msg) (string, error) {
+			broadcastCount.Add(1)
+			return "tx-hash", nil
+		},
+	}
+
+	err := EnsureGrants(t.Context(), authzQ, broadcaster, pool)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), broadcastCount.Load(), "should create grants when authz returns not-found error")
+}
+
 func TestEnsureGrants_QueryError(t *testing.T) {
 	pool := newTestSignerPool(t, 1)
 
