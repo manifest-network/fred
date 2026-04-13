@@ -79,7 +79,7 @@ type ReconcilerConfig struct {
 }
 
 // NewReconciler creates a new reconciler.
-// The acknowledger routes ack operations through the batcher for parallel signing.
+// The acknowledger (required) routes ack operations through the batcher for parallel signing.
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
 // The placementStore parameter is optional - if nil, round-robin placement tracking is disabled.
 func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, acknowledger Acknowledger, backendRouter BackendRouter, tracker ReconcilerTracker, placementStore PlacementStore) (*Reconciler, error) {

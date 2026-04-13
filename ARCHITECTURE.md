@@ -113,10 +113,10 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  │                                                                     │   │
 │  │  ┌──────────────────┐  ┌─────────────────┐  ┌──────────────────┐  │   │
 │  │  │   Orchestrator   │  │  InFlightTracker │  │   AckBatcher     │  │   │
-│  │  │  Routes to       │  │  (interface)     │  │  Batches chain   │  │   │
-│  │  │  backends,       │  │  Ephemeral map,  │  │  ack txns for    │  │   │
-│  │  │  starts          │  │  recovered via   │  │  efficiency      │  │   │
-│  │  │  provisioning    │  │  reconciliation  │  │                  │  │   │
+│  │  │  Routes to       │  │  (interface)     │  │  N parallel      │  │   │
+│  │  │  backends,       │  │  Ephemeral map,  │  │  lanes via authz │  │   │
+│  │  │  starts          │  │  recovered via   │  │  sub-signers     │  │   │
+│  │  │  provisioning    │  │  reconciliation  │  │  (round-robin)   │  │   │
 │  │  └──────────────────┘  └─────────────────┘  └──────────────────┘  │   │
 │  │                                                                     │   │
 │  │  ┌──────────────────┐  ┌─────────────────┐                        │   │
@@ -144,18 +144,20 @@ each component in isolation with mocks and allows swapping implementations.
 
 ```
 Manager (coordinator)
-├── ChainClient          interface → chain.Client
+├── ChainClient          interface → chain.Client (backed by SignerPool)
+│   └── SignerPool       primary + N sub-signers for authz parallel signing
 ├── BackendRouter        interface → *backend.Router (passed to Orchestrator)
 ├── InFlightTracker      interface → inFlightMap (sync.RWMutex-protected map)
 ├── PlacementStore       interface → placement.Store (bbolt + cache, optional)
 ├── Orchestrator         struct    → uses BackendRouter + InFlightTracker + PlacementStore
 ├── HandlerSet           struct    → uses Orchestrator + Tracker + AckBatcher
-├── AckBatcher           struct    → uses ChainClient
+├── AckBatcher           struct    → N parallel ackLane workers, round-robin dispatch
 ├── TimeoutChecker       struct    → uses InFlightTracker + LeaseRejecter
 └── PayloadStore         struct    → bbolt-backed (optional)
 
 Reconciler (independent)
 ├── ReconcilerChainClient  interface → chain.Client
+├── Acknowledger           interface → AckBatcher (routes acks through parallel lanes)
 ├── BackendRouter          interface → *backend.Router
 ├── PlacementStore         interface → placement.Store (syncs on startup)
 └── ReconcilerTracker      interface → Manager (extends InFlightTracker)
@@ -177,7 +179,7 @@ Key interfaces defined where they're consumed:
 | `PlacementStore` | `provisioner/interfaces.go` | Orchestrator, Reconciler |
 | `PlacementLookup` | `api/handlers.go` | API read handlers |
 | `LeaseRejecter` | `provisioner/interfaces.go` | TimeoutChecker |
-| `Acknowledger` | `provisioner/ack_batcher.go` | HandlerSet (lease acknowledgement) |
+| `Acknowledger` | `provisioner/ack_batcher.go` | HandlerSet, Reconciler (lease acknowledgement via parallel lanes) |
 | `CallbackPublisher` | `api/server.go` | API callback handler |
 | `StatusChecker` | `api/server.go` | API status handler |
 

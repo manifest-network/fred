@@ -174,7 +174,7 @@ Based on benchmark results:
 
 1. **Watermill GoChannel buffer**: Production uses unbuffered (default), benchmarks use 1000-10000
 2. **Handler concurrency**: Watermill handles this automatically with goroutines
-3. **Batch acknowledgments**: Ack batcher (10 items / 500ms) reduces chain transactions
+3. **Batch acknowledgments**: Ack batcher (50 items / 500ms per lane) reduces chain transactions. With authz sub-signers, N lanes flush in parallel — total throughput is up to N × 50 acks per block
 4. **PayloadStore batch size**: 100-200 provides good write throughput
 5. **Memory**: Allocate 2-4 GB for sustained high-throughput workloads
 

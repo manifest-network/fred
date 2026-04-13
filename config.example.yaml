@@ -114,6 +114,10 @@ keyring_dir: "/home/provider/.manifest"
 # The key must correspond to provider_address above.
 key_name: "provider"
 
+# ENVIRONMENT VARIABLE (secret — not in config file):
+#   FRED_KEYRING_PASSPHRASE  — required for "file" keyring backend.
+#   Without it, Fred cannot open the keyring and will fail to start.
+
 # =============================================================================
 # API SERVER
 # =============================================================================
@@ -295,18 +299,21 @@ callback_secret: "your-secret-key-at-least-32-characters-long"
 # broadcast transactions in parallel on behalf of the provider. Each
 # sub-signer has its own sequence number, enabling N batches per block.
 #
-# ENVIRONMENT VARIABLES (secrets — not in config file):
-#   FRED_KEYRING_PASSPHRASE  — required for "file" keyring backend
-#   FRED_MNEMONIC            — required on first boot to derive sub-signer keys
-#                              (can be removed after first successful startup)
+# ENVIRONMENT VARIABLE (secret — not in config file):
+#   FRED_MNEMONIC  — supply on first boot to derive sub-signer keys.
+#                    Without it, Fred runs in single-signer mode even if
+#                    sub_signer_count > 0. Can be removed after first startup.
 #
-# FIRST BOOT: Fred derives sub-signer keys from the mnemonic, creates authz
-# grants, and funds the sub-signers. This adds ~12s to startup (two batched txs).
+# FIRST BOOT: Fred derives sub-signer keys from the mnemonic (verifying it
+# matches the primary key), creates authz grants, and funds the sub-signers.
+# This requires two on-chain transactions (~12s on mainnet with ~6s blocks).
 # SUBSEQUENT BOOTS: Keys exist in keyring, grants on-chain. Near-instant.
 # FALLBACK: If grants fail, Fred falls back to single signer automatically.
 #
 # KEY DERIVATION: Sub-keys use BIP-44 path m/44'/118'/i'/0/0 (varying account
-# index). To recover manually: manifestd keys add --recover --account i
+# index). To recover manually:
+#   manifestd keys add <key_name>-sub-<i> --recover --account i \
+#     --keyring-backend file --keyring-dir <your-dir>
 
 # Number of sub-signer accounts. 0 = single signer (default, backward compat).
 # 3 is a good starting point — enables 3 batches per block (up to ~150 acks/block).
