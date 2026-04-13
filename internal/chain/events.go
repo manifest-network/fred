@@ -523,6 +523,10 @@ func (s *EventSubscriber) parseLeaseEvents(events map[string][]string) []LeaseEv
 		var result []LeaseEvent
 		for i, leaseUUID := range leaseUUIDs {
 			if leaseUUID == "" {
+				slog.Warn("skipping lease event: empty lease_uuid at index",
+					"index", i, "event_type", eventType,
+					"lease_uuid_array_len", len(leaseUUIDs),
+				)
 				continue
 			}
 
@@ -589,6 +593,10 @@ func (s *EventSubscriber) parseAutoClosedEvents(events map[string][]string) []Le
 	var result []LeaseEvent
 	for i, leaseUUID := range leaseUUIDs {
 		if leaseUUID == "" {
+			slog.Warn("skipping auto-closed event: empty lease_uuid at index",
+				"index", i,
+				"lease_uuid_array_len", len(leaseUUIDs),
+			)
 			continue
 		}
 

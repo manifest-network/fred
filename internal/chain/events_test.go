@@ -309,6 +309,19 @@ func TestEventSubscriber_ParseLeaseEvents(t *testing.T) {
 			},
 		},
 		{
+			name: "auto_closed mismatched provider_uuid - events still emitted with warning",
+			events: map[string][]string{
+				"lease_auto_closed.lease_uuid":    {"uuid-1", "uuid-2"},
+				"lease_auto_closed.provider_uuid": {"prov-1"},
+				"lease_auto_closed.tenant":        {"tenant-1", "tenant-2"},
+				"lease_auto_closed.reason":        {"credit_exhausted", "credit_exhausted"},
+			},
+			want: []LeaseEvent{
+				{Type: LeaseAutoClosed, LeaseUUID: "uuid-1", ProviderUUID: "prov-1", Tenant: "tenant-1"},
+				{Type: LeaseAutoClosed, LeaseUUID: "uuid-2", ProviderUUID: "", Tenant: "tenant-2"},
+			},
+		},
+		{
 			name: "auto_closed mismatched tenant - entries without tenant warned and skipped",
 			events: map[string][]string{
 				"lease_auto_closed.lease_uuid":    {"uuid-1", "uuid-2"},
