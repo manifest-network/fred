@@ -12,6 +12,8 @@ import (
 	"time"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/x/authz"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	"github.com/spf13/cobra"
 
 	"github.com/manifest-network/fred/internal/api"
@@ -121,20 +123,31 @@ func run(cmd *cobra.Command, args []string) error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Initialize signer
-	signer, err := chain.NewSigner(chain.SignerConfig{
-		KeyringBackend: cfg.KeyringBackend,
-		KeyringDir:     cfg.KeyringDir,
-		KeyName:        cfg.KeyName,
-		ChainID:        cfg.ChainID,
-		GasLimit:       cfg.GasLimit,
-		GasPrice:       cfg.GasPrice,
-		FeeDenom:       cfg.FeeDenom,
+	// Initialize signer pool (derives sub-keys on first boot if mnemonic available)
+	signerPool, err := chain.NewSignerPool(chain.SignerPoolConfig{
+		SignerConfig: chain.SignerConfig{
+			KeyringBackend: cfg.KeyringBackend,
+			KeyringDir:     cfg.KeyringDir,
+			KeyName:        cfg.KeyName,
+			ChainID:        cfg.ChainID,
+			GasLimit:       cfg.GasLimit,
+			GasPrice:       cfg.GasPrice,
+			FeeDenom:       cfg.FeeDenom,
+			Passphrase:     os.Getenv("FRED_KEYRING_PASSPHRASE"),
+		},
+		SubSignerCount: cfg.SubSignerCount,
+		Mnemonic:       os.Getenv("FRED_MNEMONIC"),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create signer: %w", err)
+		return fmt.Errorf("failed to create signer pool: %w", err)
 	}
-	slog.Info("signer initialized", "address", signer.Address())
+	slog.Info("signer pool initialized",
+		"address", signerPool.ProviderAddress(),
+		"size", signerPool.Size(),
+		"lanes", signerPool.LaneCount(),
+	)
+	metrics.SignerPoolSize.Set(float64(signerPool.Size()))
+	metrics.SignerPoolLaneCount.Set(float64(signerPool.LaneCount()))
 
 	// Initialize chain client
 	chainClient, err := chain.NewClient(chain.ClientConfig{
@@ -145,12 +158,49 @@ func run(cmd *cobra.Command, args []string) error {
 		TxPollInterval: cfg.TxPollInterval,
 		TxTimeout:      cfg.TxTimeout,
 		QueryPageLimit: cfg.QueryPageLimit,
-	}, signer)
+	}, signerPool)
 	if err != nil {
 		return fmt.Errorf("failed to create chain client: %w", err)
 	}
 	defer chainClient.Close()
 	slog.Info("chain client connected", "endpoint", cfg.GRPCEndpoint, "tls", cfg.GRPCTLSEnabled)
+
+	// Parse funding coin amounts and setup sub-signers (if any)
+	var subSignerMinBalance, subSignerTopUpAmount sdk.Coin
+	if signerPool.HasSubSigners() {
+		subSignerMinBalance, err = sdk.ParseCoinNormalized(cfg.SubSignerMinBalance)
+		if err != nil {
+			return fmt.Errorf("invalid sub_signer_min_balance: %w", err)
+		}
+		subSignerTopUpAmount, err = sdk.ParseCoinNormalized(cfg.SubSignerTopUpAmount)
+		if err != nil {
+			return fmt.Errorf("invalid sub_signer_top_up_amount: %w", err)
+		}
+	}
+
+	if signerPool.HasSubSigners() {
+		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
+		authzQ := authz.NewQueryClient(chainClient.Conn())
+		if err := chain.EnsureGrants(setupCtx, authzQ, chainClient, signerPool); err != nil {
+			slog.Warn("grant setup failed, falling back to single signer", "error", err)
+			signerPool.DemoteToSingleSigner()
+			metrics.SignerPoolSize.Set(float64(signerPool.Size()))
+			metrics.SignerPoolLaneCount.Set(float64(signerPool.LaneCount()))
+		}
+		setupCancel()
+	}
+
+	if signerPool.HasSubSigners() {
+		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
+		bankQ := banktypes.NewQueryClient(chainClient.Conn())
+		if err := chain.EnsureFunding(setupCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
+			slog.Warn("initial sub-signer funding failed, sub-signers may be underfunded",
+				"error", err,
+				"sub_signer_addresses", signerPool.SubSignerAddresses(),
+			)
+		}
+		setupCancel()
+	}
 
 	// Initialize event subscriber
 	eventSub, err := chain.NewEventSubscriber(chain.EventSubscriberConfig{
@@ -264,6 +314,7 @@ func run(cmd *cobra.Command, args []string) error {
 		PayloadStore:    payloadStore,
 		PlacementStore:  placementStore,
 		LeaseEventSink:  eventBroker,
+		AckLaneCount:    signerPool.LaneCount(),
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -328,7 +379,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ProviderUUID:    cfg.ProviderUUID,
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		Interval:        cfg.ReconciliationInterval,
-	}, chainClient, backendRouter, provisionMgr, placementStore)
+	}, chainClient, provisionMgr.AckBatcher(), backendRouter, provisionMgr, placementStore)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)
 	}
@@ -342,7 +393,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// Each component is wrapped with panic recovery via safeGo() to prevent
 	// silent crashes and convert panics to errors.
 	var wg sync.WaitGroup
-	errChan := make(chan error, 7)
+	errChan := make(chan error, 8)
 
 	// Start API server FIRST and wait for it to be listening.
 	// This is critical because startup reconciliation may trigger backend callbacks
@@ -417,6 +468,27 @@ func run(cmd *cobra.Command, args []string) error {
 	safeGo(&wg, errChan, "reconciler", func() error {
 		return reconciler.Start(ctx)
 	})
+
+	// Start periodic sub-signer funding check (if multi-signer)
+	if signerPool.HasSubSigners() {
+		bankQ := banktypes.NewQueryClient(chainClient.Conn())
+		safeGo(&wg, errChan, "sub-signer funding", func() error {
+			ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+					fundCtx, fundCancel := context.WithTimeout(ctx, 60*time.Second)
+					if err := chain.EnsureFunding(fundCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
+						slog.Warn("sub-signer funding check failed", "error", err)
+					}
+					fundCancel()
+				}
+			}
+		})
+	}
 
 	slog.Info("providerd started successfully",
 		"api_addr", cfg.APIListenAddr,

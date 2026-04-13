@@ -413,6 +413,21 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			},
 			wantErr: "shutdown_timeout must be positive",
 		},
+		{
+			name: "sub_signer_fund_check_interval zero with sub_signer_count > 0",
+			modify: func(c *Config) {
+				c.SubSignerCount = 3
+				c.SubSignerFundCheckInterval = 0
+			},
+			wantErr: "sub_signer_fund_check_interval must be positive when sub_signer_count > 0",
+		},
+		{
+			name: "negative sub_signer_count",
+			modify: func(c *Config) {
+				c.SubSignerCount = -1
+			},
+			wantErr: "sub_signer_count must be non-negative",
+		},
 	}
 
 	for _, tt := range tests {

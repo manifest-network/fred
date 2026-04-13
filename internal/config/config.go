@@ -89,6 +89,12 @@ type Config struct {
 	CallbackBaseURL string          `mapstructure:"callback_base_url"`
 	CallbackSecret  Secret          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
 
+	// Parallel signing (authz sub-signers)
+	SubSignerCount             int           `mapstructure:"sub_signer_count"`               // 0 = single signer (default)
+	SubSignerMinBalance        string        `mapstructure:"sub_signer_min_balance"`         // Top-up when below this (default: "10000000umfx")
+	SubSignerTopUpAmount       string        `mapstructure:"sub_signer_top_up_amount"`       // Amount per top-up (default: "50000000umfx")
+	SubSignerFundCheckInterval time.Duration `mapstructure:"sub_signer_fund_check_interval"` // Balance check interval (default: 1h)
+
 	// Reconciliation configuration
 	ReconciliationInterval time.Duration `mapstructure:"reconciliation_interval"`
 
@@ -173,6 +179,12 @@ func Load(configPath string) (*Config, error) {
 	// Credit check defaults
 	v.SetDefault("credit_check_error_threshold", 3)
 	v.SetDefault("credit_check_retry_interval", "30s")
+
+	// Parallel signing defaults
+	v.SetDefault("sub_signer_count", 0)
+	v.SetDefault("sub_signer_min_balance", "10000000umfx")
+	v.SetDefault("sub_signer_top_up_amount", "50000000umfx")
+	v.SetDefault("sub_signer_fund_check_interval", "1h")
 
 	// Reconciliation defaults
 	v.SetDefault("reconciliation_interval", "5m")
@@ -318,6 +330,14 @@ func (c *Config) Validate() error {
 	}
 	if c.CreditCheckRetryInterval <= 0 {
 		return fmt.Errorf("credit_check_retry_interval must be positive")
+	}
+
+	// Parallel signing validations
+	if c.SubSignerCount < 0 {
+		return fmt.Errorf("sub_signer_count must be non-negative")
+	}
+	if c.SubSignerCount > 0 && c.SubSignerFundCheckInterval <= 0 {
+		return fmt.Errorf("sub_signer_fund_check_interval must be positive when sub_signer_count > 0")
 	}
 
 	// Reconciliation validations

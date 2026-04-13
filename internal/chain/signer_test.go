@@ -79,28 +79,99 @@ func newTestAccountAny(t *testing.T, addr sdk.AccAddress, accNum, seq uint64) *c
 	return accountAny
 }
 
-func TestNewSigner_Success(t *testing.T) {
-	s := newTestSigner(t)
+func TestPassphraseReader_RepeatedReads(t *testing.T) {
+	r := newPassphraseReader("mypassword")
+	expected := []byte("mypassword\n")
 
-	assert.NotEmpty(t, s.address)
+	for i := range 5 {
+		buf := make([]byte, 64)
+		n, err := r.Read(buf)
+		assert.NoError(t, err, "read %d should not error", i)
+		assert.Equal(t, expected, buf[:n], "read %d should return full passphrase", i)
+	}
 }
 
-func TestNewSigner_KeyNotFound(t *testing.T) {
-	_, err := NewSigner(SignerConfig{
-		KeyringBackend: "test",
-		KeyringDir:     t.TempDir(),
-		KeyName:        "nonexistent",
-		ChainID:        "test-1",
+func TestPassphraseReader_PartialBuffer(t *testing.T) {
+	r := newPassphraseReader("longpassphrase")
+	// Buffer smaller than passphrase+newline (15 bytes)
+	buf := make([]byte, 5)
+	n, err := r.Read(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, 5, n)
+	assert.Equal(t, []byte("longp"), buf)
+}
+
+func TestNewSignerPool_FileBackendRequiresPassphrase(t *testing.T) {
+	_, err := NewSignerPool(SignerPoolConfig{
+		SignerConfig: SignerConfig{
+			KeyringBackend: "file",
+			KeyringDir:     t.TempDir(),
+			KeyName:        "testkey",
+			ChainID:        "test-1",
+			Passphrase:     "",
+		},
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "passphrase is required")
+}
+
+func TestNewSignerPool_PassphraseIgnoredForTestBackend(t *testing.T) {
+	_, err := NewSignerPool(SignerPoolConfig{
+		SignerConfig: SignerConfig{
+			KeyringBackend: "test",
+			KeyringDir:     t.TempDir(),
+			KeyName:        "nonexistent",
+			ChainID:        "test-1",
+			Passphrase:     "somepassphrase",
+		},
+	})
+	// Should fail on key lookup, not on keyring creation
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to create primary signer")
+}
+
+func TestNewSignerPool_Success(t *testing.T) {
+	dir := t.TempDir()
+	newTestKeyringWithPrimary(t, dir)
+
+	pool, err := NewSignerPool(SignerPoolConfig{
+		SignerConfig: SignerConfig{
+			KeyringBackend: "test",
+			KeyringDir:     dir,
+			KeyName:        "testkey",
+			ChainID:        "test-1",
+			GasLimit:       200000,
+			GasPrice:       100,
+			FeeDenom:       "umfx",
+		},
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, pool.ProviderAddress())
+	assert.Equal(t, 1, pool.Size())
+	assert.Equal(t, 1, pool.LaneCount())
+	assert.False(t, pool.HasSubSigners())
+}
+
+func TestNewSignerPool_KeyNotFound(t *testing.T) {
+	_, err := NewSignerPool(SignerPoolConfig{
+		SignerConfig: SignerConfig{
+			KeyringBackend: "test",
+			KeyringDir:     t.TempDir(),
+			KeyName:        "nonexistent",
+			ChainID:        "test-1",
+		},
 	})
 	assert.Error(t, err)
 }
 
-func TestNewSigner_InvalidBackend(t *testing.T) {
-	_, err := NewSigner(SignerConfig{
-		KeyringBackend: "invalid-backend",
-		KeyringDir:     t.TempDir(),
-		KeyName:        "testkey",
-		ChainID:        "test-1",
+func TestNewSignerPool_InvalidBackend(t *testing.T) {
+	_, err := NewSignerPool(SignerPoolConfig{
+		SignerConfig: SignerConfig{
+			KeyringBackend: "invalid-backend",
+			KeyringDir:     t.TempDir(),
+			KeyName:        "testkey",
+			ChainID:        "test-1",
+		},
 	})
 	assert.Error(t, err)
 }
@@ -164,6 +235,33 @@ func TestSigner_SignTx_MinimumFee(t *testing.T) {
 	// Fee should be clamped to minimum of 1
 	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(1)))
 	assert.True(t, feeTx.GetFee().Equal(expectedFee))
+}
+
+func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
+	s := newTestSigner(t)
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	msgs := []sdk.Msg{
+		newTestMsg(s.address),
+		newTestMsg(s.address),
+		newTestMsg(s.address),
+	}
+
+	txBytes, err := s.SignTxMulti(t.Context(), msgs, accountAny)
+	require.NoError(t, err)
+	require.NotEmpty(t, txBytes)
+
+	// Decode and verify the transaction contains all 3 messages
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+
+	txWithMsgs, ok := tx.(sdk.HasMsgs)
+	require.True(t, ok)
+	assert.Len(t, txWithMsgs.GetMsgs(), 3)
 }
 
 func TestSigner_SignTx_InvalidAccount(t *testing.T) {

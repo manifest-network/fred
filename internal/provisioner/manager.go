@@ -74,6 +74,7 @@ type ManagerConfig struct {
 	TimeoutCheckInterval time.Duration  // How often to check for timeouts (default: 1 minute)
 	AckBatchInterval     time.Duration  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
 	AckBatchSize         int            // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
+	AckLaneCount         int            // Number of parallel ack lanes (default: 1)
 }
 
 // NewManager creates a new provision manager with Watermill routing.
@@ -134,6 +135,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		ProviderUUID:  cfg.ProviderUUID,
 		BatchInterval: cfg.AckBatchInterval,
 		BatchSize:     cfg.AckBatchSize,
+		LaneCount:     cfg.AckLaneCount,
 	})
 	// Start ack batcher immediately so handlers can use it without waiting for Start()
 	// This uses a background context; Stop() will still properly shut it down.
@@ -275,6 +277,11 @@ func (m *Manager) Start(ctx context.Context) error {
 // This can be used to wait for the manager to be ready before publishing events.
 func (m *Manager) Running() chan struct{} {
 	return m.wmRouter.Running()
+}
+
+// AckBatcher returns the batcher as an Acknowledger for use by the reconciler.
+func (m *Manager) AckBatcher() Acknowledger {
+	return m.ackBatcher
 }
 
 // Close shuts down the provision manager.

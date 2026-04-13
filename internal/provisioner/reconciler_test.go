@@ -21,6 +21,10 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
+// noopAck is a no-op acknowledger for tests that don't exercise the ack path.
+// The zero-value mockAcknowledger returns (true, "tx-hash", nil) by default.
+var noopAck = &mockAcknowledger{}
+
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
 	mu               sync.Mutex
@@ -127,6 +131,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 		name        string
 		cfg         ReconcilerConfig
 		chainClient ReconcilerChainClient
+		ack         Acknowledger
 		router      BackendRouter
 		wantErr     string
 	}{
@@ -134,13 +139,23 @@ func TestNewReconciler_Validation(t *testing.T) {
 			name:        "missing chain client",
 			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			chainClient: nil,
+			ack:         noopAck,
 			router:      router,
 			wantErr:     "chain client is required",
+		},
+		{
+			name:        "missing acknowledger",
+			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			chainClient: mockChain,
+			ack:         nil,
+			router:      router,
+			wantErr:     "acknowledger is required",
 		},
 		{
 			name:        "missing router",
 			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			chainClient: mockChain,
+			ack:         noopAck,
 			router:      nil,
 			wantErr:     "backend router is required",
 		},
@@ -148,6 +163,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 			name:        "missing provider UUID",
 			cfg:         ReconcilerConfig{CallbackBaseURL: "http://localhost"},
 			chainClient: mockChain,
+			ack:         noopAck,
 			router:      router,
 			wantErr:     "provider UUID is required",
 		},
@@ -155,6 +171,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 			name:        "missing callback URL",
 			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid"},
 			chainClient: mockChain,
+			ack:         noopAck,
 			router:      router,
 			wantErr:     "callback base URL is required",
 		},
@@ -162,6 +179,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 			name:        "valid config",
 			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			chainClient: mockChain,
+			ack:         noopAck,
 			router:      router,
 			wantErr:     "",
 		},
@@ -169,7 +187,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewReconciler(tt.cfg, tt.chainClient, tt.router, nil, nil)
+			_, err := NewReconciler(tt.cfg, tt.chainClient, tt.ack, tt.router, nil, nil)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
@@ -201,7 +219,7 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -216,7 +234,7 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 
 func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	// Setup: Pending lease on chain, provisioned and ready on backend
-	// Expected: Acknowledge the lease
+	// Expected: Acknowledge the lease via the acknowledger
 	var acknowledgedLeases []string
 	var mu sync.Mutex
 
@@ -226,11 +244,13 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
 			}, nil
 		},
-		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+	}
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			acknowledgedLeases = append(acknowledgedLeases, leaseUUIDs...)
-			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+			acknowledgedLeases = append(acknowledgedLeases, leaseUUID)
+			return true, "tx-hash", nil
 		},
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -246,13 +266,13 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, ack, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
-	// Verify lease was acknowledged
+	// Verify lease was acknowledged via the acknowledger
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Len(t, acknowledgedLeases, 1)
@@ -280,7 +300,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -324,7 +344,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -364,7 +384,7 @@ func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -420,7 +440,7 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 			reconciler, err := NewReconciler(ReconcilerConfig{
 				ProviderUUID:    "provider-1",
 				CallbackBaseURL: "http://localhost:8080",
-			}, mockChain, router, nil, nil)
+			}, mockChain, noopAck, router, nil, nil)
 			require.NoError(t, err)
 
 			ctx := t.Context()
@@ -448,7 +468,7 @@ func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	// Cancel context before calling ReconcileAll
@@ -471,7 +491,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		Interval:        100 * time.Millisecond, // Short interval for test
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -507,7 +527,7 @@ func TestReconciler_DefaultInterval(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// Interval not set
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	// Verify default interval is 5 minutes
@@ -534,7 +554,7 @@ func TestReconciler_RunOnce(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -573,7 +593,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, manager, nil)
+	}, mockChain, noopAck, router, manager, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -612,7 +632,7 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -663,7 +683,7 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -718,7 +738,7 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -754,8 +774,10 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 				{Uuid: "lease-2", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_PENDING},
 			}, nil
 		},
-		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
-			return 0, nil, acknowledgeErr
+	}
+	failingAck := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			return false, "", acknowledgeErr
 		},
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -772,7 +794,7 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, failingAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -804,7 +826,7 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -845,7 +867,7 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -901,7 +923,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, manager, nil)
+	}, mockChain, noopAck, router, manager, nil)
 	require.NoError(t, err)
 
 	// Simulate concurrent provisioning attempts.
@@ -989,7 +1011,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	// Start first reconciliation in background.
@@ -1066,7 +1088,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	err = reconciler.ReconcileAll(ctx)
@@ -1121,7 +1143,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	err = reconciler.ReconcileAll(ctx)
@@ -1244,7 +1266,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -1290,7 +1312,7 @@ func TestReconciler_MaxWorkers_Default(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// MaxWorkers not set - should use default
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, DefaultReconcileWorkers, reconciler.maxWorkers)
@@ -1309,7 +1331,7 @@ func TestReconciler_MaxWorkers_Custom(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5,
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, 5, reconciler.maxWorkers)
@@ -1368,7 +1390,7 @@ func TestReconciler_ParallelProcessing(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5, // Limit to 5 concurrent workers
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -1438,7 +1460,7 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      4, // Limit to 4 concurrent workers
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -1538,7 +1560,7 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -1778,7 +1800,7 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, mockTracker, nil)
+	}, mockChain, noopAck, router, mockTracker, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -1845,7 +1867,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -1896,7 +1918,7 @@ func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -1944,7 +1966,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080/callbacks",
 		MaxWorkers:      2,
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	// Start multiple concurrent ReconcileAll calls.
@@ -2024,7 +2046,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2071,7 +2093,7 @@ func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2136,7 +2158,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, mockTracker, nil)
+	}, mockChain, noopAck, router, mockTracker, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2183,7 +2205,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2237,7 +2259,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2290,7 +2312,7 @@ func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, ps)
+	}, mockChain, noopAck, router, nil, ps)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2324,7 +2346,7 @@ func TestReconciler_ReconcileAll_StartProvisioning_RecordsPlacement(t *testing.T
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, ps)
+	}, mockChain, noopAck, router, nil, ps)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2362,7 +2384,7 @@ func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, ps)
+	}, mockChain, noopAck, router, nil, ps)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2390,7 +2412,7 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, ps)
+	}, mockChain, noopAck, router, nil, ps)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2432,7 +2454,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, ps)
+	}, mockChain, noopAck, router, nil, ps)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2467,7 +2489,7 @@ func TestReconciler_ReconcileAll_ListProvisionError_AbortsReconciliation(t *test
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2540,7 +2562,7 @@ func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Closes(t *testi
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, tracker, nil)
+	}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2611,7 +2633,7 @@ func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, tracker, nil)
+	}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2676,7 +2698,7 @@ func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *te
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, tracker, nil)
+	}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2748,7 +2770,7 @@ func TestReconciler_ReconcileAll_PayloadStoreGetError_TransientError(t *testing.
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, tracker, nil)
+	}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2791,7 +2813,7 @@ func TestReconciler_ReconcileAll_RefreshStateError_ContinuesWithStaleData(t *tes
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2847,7 +2869,7 @@ func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, tracker, nil)
+	}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
 	ctx := t.Context()
@@ -2885,7 +2907,7 @@ func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, nil, nil)
+	}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
 	before := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
@@ -2923,7 +2945,7 @@ func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, tracker, nil)
+	}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
 	before := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("cap-backend"))
@@ -2961,7 +2983,7 @@ func TestReconciler_ReconcileAll_PartialFailureDoesNotUpdateTimestamp(t *testing
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, mockChain, router, tracker, nil)
+	}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
 	before := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)

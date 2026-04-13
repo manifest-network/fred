@@ -23,6 +23,23 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
+// integrationAcknowledger wraps a chain client as an Acknowledger for integration tests.
+type integrationAcknowledger struct {
+	chainClient provisioner.ReconcilerChainClient
+}
+
+func (a *integrationAcknowledger) Acknowledge(ctx context.Context, leaseUUID string) (bool, string, error) {
+	n, hashes, err := a.chainClient.AcknowledgeLeases(ctx, []string{leaseUUID})
+	if err != nil {
+		return false, "", err
+	}
+	var hash string
+	if len(hashes) > 0 {
+		hash = hashes[0]
+	}
+	return n > 0, hash, nil
+}
+
 // testReconcilerTracker adapts InFlightTracker + PayloadStore to satisfy ReconcilerTracker.
 type testReconcilerTracker struct {
 	provisioner.InFlightTracker
@@ -83,6 +100,9 @@ func testReconcilerSetup(t *testing.T, chainClient *chain.MockClient) *reconcile
 
 	providerUUID := "test-provider"
 
+	// Create a simple acknowledger that delegates to chainClient for integration tests
+	integrationAck := &integrationAcknowledger{chainClient: chainClient}
+
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
 			ProviderUUID:           providerUUID,
@@ -91,6 +111,7 @@ func testReconcilerSetup(t *testing.T, chainClient *chain.MockClient) *reconcile
 			MaxReprovisionAttempts: 3,
 		},
 		chainClient,
+		integrationAck,
 		router,
 		tracker,
 		nil,
@@ -706,6 +727,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	}
 
 	providerUUID := "test-provider"
+	integrationAck2 := &integrationAcknowledger{chainClient: mockChain}
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
 			ProviderUUID:           providerUUID,
@@ -714,6 +736,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 			MaxReprovisionAttempts: 3,
 		},
 		mockChain,
+		integrationAck2,
 		router,
 		tracker,
 		nil,

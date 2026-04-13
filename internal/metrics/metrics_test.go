@@ -43,6 +43,8 @@ func TestMetricsRegistered(t *testing.T) {
 		PoisonedMessagesTotal,
 		EventsDroppedTotal,
 		MalformedMessagesTotal,
+		SignerPoolSize,
+		SignerPoolLaneCount,
 	}
 
 	for _, c := range collectors {
@@ -76,6 +78,8 @@ func TestMetricsRegistered(t *testing.T) {
 		"fred_api_non_in_flight_callbacks_total",
 		"fred_watermill_poisoned_messages_total",
 		"fred_reconciler_last_success_timestamp_seconds",
+		"fred_signer_pool_size",
+		"fred_signer_pool_lane_count",
 	} {
 		assert.True(t, names[expected], "metric %q should be gathered", expected)
 	}
