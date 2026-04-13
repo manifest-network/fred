@@ -454,10 +454,11 @@ func (s *EventSubscriber) handleMessage(message []byte) {
 	s.invalidMsgCount = 0
 	s.mu.Unlock()
 
-	// Extract lease events and broadcast to all subscribers
-	event := s.parseLeaseEvent(result.Events)
-	if event != nil {
-		s.broadcast(*event)
+	// Extract lease events and broadcast to all subscribers.
+	// A single TX can contain multiple lease operations (e.g. batch close),
+	// so we must iterate all extracted events.
+	for _, event := range s.parseLeaseEvents(result.Events) {
+		s.broadcast(event)
 	}
 }
 
@@ -485,11 +486,18 @@ func (s *EventSubscriber) trackInvalidMessage(reason string, err error) {
 	// After threshold, stop logging to avoid spam
 }
 
-// parseLeaseEvent extracts a LeaseEvent from CometBFT events.
-func (s *EventSubscriber) parseLeaseEvent(events map[string][]string) *LeaseEvent {
+// parseLeaseEvents extracts all LeaseEvents from CometBFT events.
+// A single Cosmos TX can contain multiple lease operations (e.g. batch close),
+// so event attributes are parallel arrays that must be iterated in lockstep.
+// By design, this returns events for only the first lease event type in the
+// check order that produces results for this provider, or nil if no events
+// match. CometBFT TXs typically contain only one lease event type; if multiple
+// lease event types are present in the same TX payload, later types are
+// intentionally ignored rather than emitted alongside the first match.
+func (s *EventSubscriber) parseLeaseEvents(events map[string][]string) []LeaseEvent {
 	// Check for lease_auto_closed events first (these are not filtered by provider)
-	if event := s.parseAutoClosedEvent(events); event != nil {
-		return event
+	if result := s.parseAutoClosedEvents(events); len(result) > 0 {
+		return result
 	}
 
 	// Check for provider-specific event types
@@ -504,72 +512,138 @@ func (s *EventSubscriber) parseLeaseEvent(events map[string][]string) *LeaseEven
 	for _, eventType := range eventTypes {
 		prefix := string(eventType)
 
-		leaseUUID := getEventAttribute(events, prefix+".lease_uuid")
-		if leaseUUID == "" {
+		leaseUUIDs := events[prefix+".lease_uuid"]
+		if len(leaseUUIDs) == 0 {
 			continue
 		}
 
-		providerUUID := getEventAttribute(events, prefix+".provider_uuid")
-		if providerUUID != s.providerUUID {
-			continue
+		providerUUIDs := events[prefix+".provider_uuid"]
+		tenants := events[prefix+".tenant"]
+
+		var result []LeaseEvent
+		for i, leaseUUID := range leaseUUIDs {
+			if leaseUUID == "" {
+				slog.Warn("skipping lease event: empty lease_uuid at index",
+					"index", i, "event_type", eventType,
+					"lease_uuid_array_len", len(leaseUUIDs),
+				)
+				continue
+			}
+
+			providerUUID := safeIndex(providerUUIDs, i)
+			if providerUUID == "" {
+				slog.Warn("skipping lease event: missing provider_uuid at index",
+					"index", i, "lease_uuid", leaseUUID, "event_type", eventType,
+					"provider_uuid_array_len", len(providerUUIDs),
+					"lease_uuid_array_len", len(leaseUUIDs),
+				)
+				continue
+			}
+			if providerUUID != s.providerUUID {
+				continue
+			}
+
+			tenant := safeIndex(tenants, i)
+			if tenant == "" && i >= len(tenants) {
+				slog.Warn("lease event has missing tenant at index",
+					"index", i, "lease_uuid", leaseUUID, "event_type", eventType,
+					"tenant_array_len", len(tenants),
+					"lease_uuid_array_len", len(leaseUUIDs),
+				)
+			}
+
+			slog.Info("received lease event",
+				"type", eventType,
+				"lease_uuid", leaseUUID,
+				"provider_uuid", providerUUID,
+				"tenant", tenant,
+			)
+
+			result = append(result, LeaseEvent{
+				Type:         eventType,
+				LeaseUUID:    leaseUUID,
+				ProviderUUID: providerUUID,
+				Tenant:       tenant,
+			})
 		}
 
-		tenant := getEventAttribute(events, prefix+".tenant")
-
-		slog.Info("received lease event",
-			"type", eventType,
-			"lease_uuid", leaseUUID,
-			"provider_uuid", providerUUID,
-			"tenant", tenant,
-		)
-
-		return &LeaseEvent{
-			Type:         eventType,
-			LeaseUUID:    leaseUUID,
-			ProviderUUID: providerUUID,
-			Tenant:       tenant,
+		if len(result) > 0 {
+			return result
 		}
 	}
 
 	return nil
 }
 
-// parseAutoClosedEvent parses lease_auto_closed events (from any provider).
-func (s *EventSubscriber) parseAutoClosedEvent(events map[string][]string) *LeaseEvent {
+// parseAutoClosedEvents parses lease_auto_closed events (from any provider).
+// A single TX can auto-close multiple leases (e.g. credit exhaustion).
+// Events missing a tenant field are skipped with a warning log.
+func (s *EventSubscriber) parseAutoClosedEvents(events map[string][]string) []LeaseEvent {
 	prefix := string(LeaseAutoClosed)
 
-	leaseUUID := getEventAttribute(events, prefix+".lease_uuid")
-	if leaseUUID == "" {
+	leaseUUIDs := events[prefix+".lease_uuid"]
+	if len(leaseUUIDs) == 0 {
 		return nil
 	}
 
-	tenant := getEventAttribute(events, prefix+".tenant")
-	if tenant == "" {
-		return nil
+	tenants := events[prefix+".tenant"]
+	providerUUIDs := events[prefix+".provider_uuid"]
+	reasons := events[prefix+".reason"]
+
+	var result []LeaseEvent
+	for i, leaseUUID := range leaseUUIDs {
+		if leaseUUID == "" {
+			slog.Warn("skipping auto-closed event: empty lease_uuid at index",
+				"index", i,
+				"lease_uuid_array_len", len(leaseUUIDs),
+			)
+			continue
+		}
+
+		tenant := safeIndex(tenants, i)
+		if tenant == "" {
+			slog.Warn("skipping auto-closed event: missing tenant at index",
+				"index", i, "lease_uuid", leaseUUID,
+				"tenant_array_len", len(tenants),
+				"lease_uuid_array_len", len(leaseUUIDs),
+			)
+			continue
+		}
+
+		providerUUID := safeIndex(providerUUIDs, i)
+		if providerUUID == "" && i >= len(providerUUIDs) {
+			slog.Warn("auto-closed event has missing provider_uuid at index",
+				"index", i, "lease_uuid", leaseUUID,
+				"provider_uuid_array_len", len(providerUUIDs),
+				"lease_uuid_array_len", len(leaseUUIDs),
+			)
+		}
+		reason := safeIndex(reasons, i)
+
+		slog.Info("received lease auto-closed event",
+			"lease_uuid", leaseUUID,
+			"tenant", tenant,
+			"provider_uuid", providerUUID,
+			"reason", reason,
+		)
+
+		result = append(result, LeaseEvent{
+			Type:         LeaseAutoClosed,
+			LeaseUUID:    leaseUUID,
+			ProviderUUID: providerUUID,
+			Tenant:       tenant,
+		})
 	}
 
-	providerUUID := getEventAttribute(events, prefix+".provider_uuid")
-	reason := getEventAttribute(events, prefix+".reason")
-
-	slog.Info("received lease auto-closed event",
-		"lease_uuid", leaseUUID,
-		"tenant", tenant,
-		"provider_uuid", providerUUID,
-		"reason", reason,
-	)
-
-	return &LeaseEvent{
-		Type:         LeaseAutoClosed,
-		LeaseUUID:    leaseUUID,
-		ProviderUUID: providerUUID,
-		Tenant:       tenant,
-	}
+	return result
 }
 
-// getEventAttribute extracts an attribute value from events.
-func getEventAttribute(events map[string][]string, key string) string {
-	if values, ok := events[key]; ok && len(values) > 0 {
-		return values[0]
+// safeIndex returns the element at index i, or "" if i is out of bounds.
+// Used for safe parallel-array access when CometBFT event arrays may have
+// mismatched lengths.
+func safeIndex(s []string, i int) string {
+	if i >= 0 && i < len(s) {
+		return s[i]
 	}
 	return ""
 }
