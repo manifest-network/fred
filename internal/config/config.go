@@ -333,6 +333,9 @@ func (c *Config) Validate() error {
 	}
 
 	// Parallel signing validations
+	if c.SubSignerCount < 0 {
+		return fmt.Errorf("sub_signer_count must be non-negative")
+	}
 	if c.SubSignerCount > 0 && c.SubSignerFundCheckInterval <= 0 {
 		return fmt.Errorf("sub_signer_fund_check_interval must be positive when sub_signer_count > 0")
 	}

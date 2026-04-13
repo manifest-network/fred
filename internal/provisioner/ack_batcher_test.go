@@ -435,11 +435,11 @@ func TestAckBatcher_DefaultBatchSize(t *testing.T) {
 }
 
 func TestAckBatcher_MultiLane_DistributesAcrossLanes(t *testing.T) {
+	// Use BatchSize=3 so each lane flushes after receiving 3 requests.
+	// With 9 requests round-robined across 3 lanes, each lane gets 3 → flushes once.
+	// We verify at least 2 distinct broadcast calls happen (proving multiple lanes flushed).
 	var mu sync.Mutex
-	laneSeen := map[int]int{} // track which leases go to which lane
-
-	// Use a per-call counter to figure out which lane is processing
-	var callCount atomic.Int32
+	var batchSizes []int
 
 	leases := make([]string, 9)
 	for i := range leases {
@@ -449,9 +449,8 @@ func TestAckBatcher_MultiLane_DistributesAcrossLanes(t *testing.T) {
 	client := &mockAckChainClient{
 		pendingLeases: leases,
 		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
-			n := int(callCount.Add(1))
 			mu.Lock()
-			laneSeen[n] = len(leaseUUIDs)
+			batchSizes = append(batchSizes, len(leaseUUIDs))
 			mu.Unlock()
 			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 		},
@@ -459,8 +458,8 @@ func TestAckBatcher_MultiLane_DistributesAcrossLanes(t *testing.T) {
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
 		ProviderUUID:  testProviderUUID,
-		BatchInterval: 50 * time.Millisecond,
-		BatchSize:     50,
+		BatchInterval: 200 * time.Millisecond, // long interval so only batch size triggers flush
+		BatchSize:     3,
 		LaneCount:     3,
 	})
 
@@ -482,14 +481,15 @@ func TestAckBatcher_MultiLane_DistributesAcrossLanes(t *testing.T) {
 	}
 	wg.Wait()
 
-	// All 9 leases should be acknowledged
 	mu.Lock()
+	defer mu.Unlock()
+
 	total := 0
-	for _, n := range laneSeen {
+	for _, n := range batchSizes {
 		total += n
 	}
-	mu.Unlock()
 	assert.Equal(t, 9, total, "all 9 leases should be acknowledged")
+	assert.GreaterOrEqual(t, len(batchSizes), 2, "should have multiple broadcast calls (proving multiple lanes flushed)")
 }
 
 func TestAckBatcher_MultiLane_ConcurrentFlush(t *testing.T) {

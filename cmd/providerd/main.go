@@ -167,7 +167,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Parse funding coin amounts and setup sub-signers (if any)
 	var subSignerMinBalance, subSignerTopUpAmount sdk.Coin
-	if signerPool.LaneCount() > 1 {
+	if signerPool.HasSubSigners() {
 		subSignerMinBalance, err = sdk.ParseCoinNormalized(cfg.SubSignerMinBalance)
 		if err != nil {
 			return fmt.Errorf("invalid sub_signer_min_balance: %w", err)
@@ -178,7 +178,7 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if signerPool.LaneCount() > 1 {
+	if signerPool.HasSubSigners() {
 		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
 		authzQ := authz.NewQueryClient(chainClient.Conn())
 		if err := chain.EnsureGrants(setupCtx, authzQ, chainClient, signerPool); err != nil {
@@ -190,7 +190,7 @@ func run(cmd *cobra.Command, args []string) error {
 		setupCancel()
 	}
 
-	if signerPool.LaneCount() > 1 {
+	if signerPool.HasSubSigners() {
 		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
 		bankQ := banktypes.NewQueryClient(chainClient.Conn())
 		if err := chain.EnsureFunding(setupCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
@@ -470,7 +470,7 @@ func run(cmd *cobra.Command, args []string) error {
 	})
 
 	// Start periodic sub-signer funding check (if multi-signer)
-	if signerPool.LaneCount() > 1 {
+	if signerPool.HasSubSigners() {
 		bankQ := banktypes.NewQueryClient(chainClient.Conn())
 		safeGo(&wg, errChan, "sub-signer funding", func() error {
 			ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)

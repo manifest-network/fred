@@ -294,6 +294,13 @@ func (p *SignerPool) ProviderAddress() string {
 	return p.primary.Address()
 }
 
+// HasSubSigners returns true if the pool has any sub-signers.
+func (p *SignerPool) HasSubSigners() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.subSigners) > 0
+}
+
 // Size returns the total number of signers (1 primary + N sub-signers).
 func (p *SignerPool) Size() int {
 	p.mu.RLock()

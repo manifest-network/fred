@@ -87,7 +87,7 @@ type AckBatcher struct {
 // NewAckBatcher creates a new acknowledgment batcher with N lanes.
 func NewAckBatcher(chainClient ChainClient, cfg AckBatcherConfig) *AckBatcher {
 	interval := cmp.Or(cfg.BatchInterval, DefaultAckBatchInterval)
-	size := cmp.Or(cfg.BatchSize, DefaultAckBatchSize)
+	size := cmp.Or(max(cfg.BatchSize, 0), DefaultAckBatchSize)
 	laneCount := cmp.Or(max(cfg.LaneCount, 0), 1)
 
 	lanes := make([]*ackLane, laneCount)

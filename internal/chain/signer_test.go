@@ -131,8 +131,25 @@ func TestNewSignerPool_PassphraseIgnoredForTestBackend(t *testing.T) {
 }
 
 func TestNewSignerPool_Success(t *testing.T) {
-	s := newTestSigner(t)
-	assert.NotEmpty(t, s.address)
+	dir := t.TempDir()
+	newTestKeyringWithPrimary(t, dir)
+
+	pool, err := NewSignerPool(SignerPoolConfig{
+		SignerConfig: SignerConfig{
+			KeyringBackend: "test",
+			KeyringDir:     dir,
+			KeyName:        "testkey",
+			ChainID:        "test-1",
+			GasLimit:       200000,
+			GasPrice:       100,
+			FeeDenom:       "umfx",
+		},
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, pool.ProviderAddress())
+	assert.Equal(t, 1, pool.Size())
+	assert.Equal(t, 1, pool.LaneCount())
+	assert.False(t, pool.HasSubSigners())
 }
 
 func TestNewSignerPool_KeyNotFound(t *testing.T) {
