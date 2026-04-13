@@ -178,6 +178,26 @@ func (lk *lockedKeyring) MigrateAll() ([]*keyring.Record, error) {
 	return lk.kr.MigrateAll()
 }
 
+// verifyMnemonicMatchesPrimary derives account 0 from the mnemonic in a
+// temporary in-memory keyring and checks that the resulting address matches
+// the primary signer. This prevents deriving sub-keys from a wrong mnemonic.
+func verifyMnemonicMatchesPrimary(lkr *lockedKeyring, mnemonic string, algo keyring.SignatureAlgo, primaryAddr string) error {
+	cdc, _ := newCodecAndTxConfig()
+	tmpKr := keyring.NewInMemory(cdc)
+	rec, err := tmpKr.NewAccount("_verify", mnemonic, keyring.DefaultBIP39Passphrase, sdk.FullFundraiserPath, algo)
+	if err != nil {
+		return fmt.Errorf("failed to verify mnemonic: %w", err)
+	}
+	addr, err := rec.GetAddress()
+	if err != nil {
+		return fmt.Errorf("failed to get address from mnemonic: %w", err)
+	}
+	if addr.String() != primaryAddr {
+		return fmt.Errorf("mnemonic does not match primary key: derived %s, expected %s", addr, primaryAddr)
+	}
+	return nil
+}
+
 // subKeyName returns the conventional name for a sub-signer key.
 func subKeyName(primaryName string, index int) string {
 	return fmt.Sprintf("%s-sub-%d", primaryName, index)
@@ -223,6 +243,13 @@ func NewSignerPool(cfg SignerPoolConfig) (*SignerPool, error) {
 			return nil, fmt.Errorf("keyring reports no supported signing algorithms")
 		}
 		algo := supported[0]
+
+		// Verify the mnemonic matches the primary key by deriving account 0
+		// and comparing addresses. Prevents creating unrelated sub-keys that
+		// can't be recovered from the same mnemonic.
+		if err := verifyMnemonicMatchesPrimary(lkr, cfg.Mnemonic, algo, primary.Address()); err != nil {
+			return nil, err
+		}
 
 		for i := 1; i <= cfg.SubSignerCount; i++ {
 			name := subKeyName(cfg.KeyName, i)

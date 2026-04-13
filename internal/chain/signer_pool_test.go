@@ -356,6 +356,31 @@ func TestNewSignerPool_MoreKeysThanCount(t *testing.T) {
 	assert.Equal(t, 3, pool.LaneCount()) // capped at configured count
 }
 
+func TestNewSignerPool_MnemonicMismatch(t *testing.T) {
+	dir := t.TempDir()
+	newTestKeyringWithPrimary(t, dir) // creates "testkey" with one mnemonic
+
+	// Generate a different mnemonic by creating a second key
+	cdc := newTestCodec()
+	tmpKr := keyring.NewInMemory(cdc)
+	supported, _ := tmpKr.SupportedAlgorithms()
+	_, wrongMnemonic, err := tmpKr.NewMnemonic("other", keyring.English, sdk.FullFundraiserPath, keyring.DefaultBIP39Passphrase, supported[0])
+	require.NoError(t, err)
+
+	_, err = NewSignerPool(SignerPoolConfig{
+		SignerConfig: SignerConfig{
+			KeyringBackend: "test",
+			KeyringDir:     dir,
+			KeyName:        "testkey",
+			ChainID:        "test-1",
+		},
+		SubSignerCount: 3,
+		Mnemonic:       wrongMnemonic,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mnemonic does not match primary key")
+}
+
 func TestNewSignerPool_SingleSigner_Default(t *testing.T) {
 	pool, err := NewSignerPool(SignerPoolConfig{
 		SignerConfig: SignerConfig{
