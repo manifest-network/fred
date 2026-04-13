@@ -181,7 +181,7 @@ func (lk *lockedKeyring) MigrateAll() ([]*keyring.Record, error) {
 // verifyMnemonicMatchesPrimary derives account 0 from the mnemonic in a
 // temporary in-memory keyring and checks that the resulting address matches
 // the primary signer. This prevents deriving sub-keys from a wrong mnemonic.
-func verifyMnemonicMatchesPrimary(lkr *lockedKeyring, mnemonic string, algo keyring.SignatureAlgo, primaryAddr string) error {
+func verifyMnemonicMatchesPrimary(mnemonic string, algo keyring.SignatureAlgo, primaryAddr string) error {
 	cdc, _ := newCodecAndTxConfig()
 	tmpKr := keyring.NewInMemory(cdc)
 	rec, err := tmpKr.NewAccount("_verify", mnemonic, keyring.DefaultBIP39Passphrase, sdk.FullFundraiserPath, algo)
@@ -247,7 +247,7 @@ func NewSignerPool(cfg SignerPoolConfig) (*SignerPool, error) {
 		// Verify the mnemonic matches the primary key by deriving account 0
 		// and comparing addresses. Prevents creating unrelated sub-keys that
 		// can't be recovered from the same mnemonic.
-		if err := verifyMnemonicMatchesPrimary(lkr, cfg.Mnemonic, algo, primary.Address()); err != nil {
+		if err := verifyMnemonicMatchesPrimary(cfg.Mnemonic, algo, primary.Address()); err != nil {
 			return nil, err
 		}
 

@@ -54,7 +54,7 @@ type Reconciler struct {
 	providerUUID    string
 	callbackBaseURL string
 	chainClient     ReconcilerChainClient
-	acknowledger    Acknowledger      // Routes acks through the batcher for parallel signing
+	acknowledger    Acknowledger // Routes acks through the batcher for parallel signing
 	backendRouter   BackendRouter
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
 	placementStore  PlacementStore    // Optional placement store for round-robin routing

@@ -90,9 +90,9 @@ type Config struct {
 	CallbackSecret  Secret          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
 
 	// Parallel signing (authz sub-signers)
-	SubSignerCount            int           `mapstructure:"sub_signer_count"`              // 0 = single signer (default)
-	SubSignerMinBalance       string        `mapstructure:"sub_signer_min_balance"`        // Top-up when below this (default: "10000000umfx")
-	SubSignerTopUpAmount      string        `mapstructure:"sub_signer_top_up_amount"`      // Amount per top-up (default: "50000000umfx")
+	SubSignerCount             int           `mapstructure:"sub_signer_count"`               // 0 = single signer (default)
+	SubSignerMinBalance        string        `mapstructure:"sub_signer_min_balance"`         // Top-up when below this (default: "10000000umfx")
+	SubSignerTopUpAmount       string        `mapstructure:"sub_signer_top_up_amount"`       // Amount per top-up (default: "50000000umfx")
 	SubSignerFundCheckInterval time.Duration `mapstructure:"sub_signer_fund_check_interval"` // Balance check interval (default: 1h)
 
 	// Reconciliation configuration

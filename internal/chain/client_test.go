@@ -1284,14 +1284,11 @@ func TestClient_BroadcastTxWithSigner_SequenceMismatchRetry(t *testing.T) {
 }
 
 func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {
-	// With >100 leases (multiple sub-batches), Acquire should be called exactly once
+	// With >100 leases (multiple sub-batches), Acquire should be called exactly once.
+	// We verify via account queries: each sub-batch queries the signer's account,
+	// so if signer is acquired once, all queries target the same address.
 	pool := newTestSignerPool(t, 2)
 
-	var acquireCount atomic.Int32
-	originalAcquire := pool.Acquire
-	// We can't easily mock Acquire on a real pool, so we track via account queries.
-	// Each sub-batch calls doBroadcastTxWithSigner which queries the signer's account.
-	// If signer is acquired once, all queries should be for the same address.
 	var mu sync.Mutex
 	var queriedAddrs []string
 
@@ -1303,9 +1300,6 @@ func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {
 	subAccountAny0 := newTestAccountAny(t, subAddr0, 2, 0)
 	subAddr1, _ := sdktypes.AccAddressFromBech32(subAddrs[1])
 	subAccountAny1 := newTestAccountAny(t, subAddr1, 3, 0)
-
-	_ = originalAcquire
-	_ = acquireCount
 
 	aq := &mockAuthQuery{
 		AccountFn: func(_ context.Context, req *authtypes.QueryAccountRequest, _ ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {

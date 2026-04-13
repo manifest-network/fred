@@ -43,8 +43,8 @@ func (m *mockBankQuerier) Balance(ctx context.Context, in *banktypes.QueryBalanc
 
 // mockTxBroadcaster implements txBroadcaster for tests.
 type mockTxBroadcaster struct {
-	broadcastTxFn        func(ctx context.Context, msg sdk.Msg) (string, error)
-	broadcastMultiMsgFn  func(ctx context.Context, msgs []sdk.Msg) (string, error)
+	broadcastTxFn       func(ctx context.Context, msg sdk.Msg) (string, error)
+	broadcastMultiMsgFn func(ctx context.Context, msgs []sdk.Msg) (string, error)
 }
 
 func (m *mockTxBroadcaster) broadcastTx(ctx context.Context, msg sdk.Msg) (string, error) {
