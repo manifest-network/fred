@@ -18,13 +18,13 @@ const cosmosHDCoinType = 118
 
 // nopRelease is the release function returned when Acquire hands back the
 // primary signer (no per-signer mutex to unlock).
-var nopRelease = func() {}
+func nopRelease() {}
 
 // SignerPool manages a primary signer and optional sub-signers for parallel
 // transaction broadcasting via CosmosSDK authz.
 type SignerPool struct {
 	primary    *Signer
-	mu         sync.RWMutex // protects subSigners (for DemoteToSingleSigner)
+	mu         sync.RWMutex // protects subSigners, signerMu, and their correspondence invariant
 	subSigners []*Signer
 	signerMu   []sync.Mutex // per-signer mutex for exclusive access
 	next       atomic.Uint64
