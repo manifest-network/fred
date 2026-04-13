@@ -332,7 +332,7 @@ func TestIsRetryableTxError(t *testing.T) {
 
 func TestTxRetryConstants(t *testing.T) {
 	assert.True(t, txMaxRetries >= 1 && txMaxRetries <= 10)
-	assert.True(t, txInitialBackoff >= 100*time.Millisecond && txInitialBackoff <= 5*time.Second)
+	assert.True(t, txInitialBackoff >= time.Second && txInitialBackoff <= 30*time.Second)
 	assert.True(t, txMaxBackoff >= txInitialBackoff)
 }
 

@@ -41,10 +41,13 @@ const (
 	txMaxRetries = 3
 
 	// txInitialBackoff is the initial backoff duration between retries.
-	txInitialBackoff = 500 * time.Millisecond
+	// Aligned with block time (~6s on mainnet) so that a sequence mismatch
+	// (stale committed state) resolves after the pending tx lands in a block.
+	txInitialBackoff = 6 * time.Second
 
 	// txMaxBackoff is the maximum backoff duration between retries.
-	txMaxBackoff = 5 * time.Second
+	// ~3 blocks: enough for the chain to include any in-flight txs.
+	txMaxBackoff = 18 * time.Second
 
 	// txPollInitialInterval is the initial polling interval for tx confirmation.
 	txPollInitialInterval = 500 * time.Millisecond
