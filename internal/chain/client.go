@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	stdmath "math"
 	"os"
 	"slices"
 	"time"
@@ -504,9 +505,15 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 					currentGas = *gasLimitOverride
 				}
 				increased := currentGas + currentGas/2
+				if increased < currentGas {
+					// uint64 overflow; clamp to MaxInt64.
+					increased = stdmath.MaxInt64
+				}
 				if signer.maxGasLimit > 0 {
 					increased = min(increased, signer.maxGasLimit)
 				}
+				// Ensure the increased value fits in int64 for fee calculation.
+				increased = min(increased, stdmath.MaxInt64)
 				if increased == currentGas {
 					// Already at the cap; retrying with the same gas is futile.
 					return backoff.Permanent(err)
