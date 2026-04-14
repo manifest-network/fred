@@ -616,10 +616,11 @@ func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, ms
 			txHash := resp.TxResponse.TxHash
 			execResp, err := c.waitForTx(ctx, txHash)
 			if err != nil {
-				// Tx was in mempool but didn't confirm in time. Return the
+				// Tx was in mempool but didn't confirm in time. Preserve both
+				// the wait error (for timeout/cancel classification) and the
 				// code 19 ChainTxError (non-retryable) to prevent the retry
 				// loop from re-broadcasting identical bytes.
-				return "", fmt.Errorf("tx %s in mempool but did not confirm (%v): %w", txHash, err, chainErr)
+				return "", fmt.Errorf("tx %s in mempool but did not confirm: %w", txHash, errors.Join(err, chainErr))
 			}
 			if execResp.TxResponse.Code != 0 {
 				return "", &ChainTxError{

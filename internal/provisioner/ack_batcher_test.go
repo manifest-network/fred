@@ -609,9 +609,9 @@ func TestAckBatcher_DedupsDuplicateLeaseUUIDs(t *testing.T) {
 
 	batcher := NewAckBatcher(client, AckBatcherConfig{
 		ProviderUUID:  testProviderUUID,
-		BatchInterval: 100 * time.Millisecond,
-		BatchSize:     10,
-		LaneCount:     1, // single lane ensures all requests land in same batch
+		BatchInterval: 10 * time.Second, // only batch size triggers flush
+		BatchSize:     5,                // flush exactly when all 5 requests arrive
+		LaneCount:     1,                // single lane ensures all requests land in same batch
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
