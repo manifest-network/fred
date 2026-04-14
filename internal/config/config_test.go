@@ -386,6 +386,13 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			wantErr: "gas_limit must be positive",
 		},
 		{
+			name: "max_gas_limit below gas_limit",
+			modify: func(c *Config) {
+				c.MaxGasLimit = 100
+			},
+			wantErr: "max_gas_limit (100) must be >= gas_limit",
+		},
+		{
 			name: "negative gas_price",
 			modify: func(c *Config) {
 				c.GasPrice = -1
