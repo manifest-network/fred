@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -391,6 +392,20 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 				c.MaxGasLimit = 100
 			},
 			wantErr: "max_gas_limit (100) must be >= gas_limit",
+		},
+		{
+			name: "gas_limit exceeds MaxInt64",
+			modify: func(c *Config) {
+				c.GasLimit = math.MaxInt64 + 1
+			},
+			wantErr: "gas_limit",
+		},
+		{
+			name: "max_gas_limit exceeds MaxInt64",
+			modify: func(c *Config) {
+				c.MaxGasLimit = math.MaxInt64 + 1
+			},
+			wantErr: "max_gas_limit",
 		},
 		{
 			name: "negative gas_price",
