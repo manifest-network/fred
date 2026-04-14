@@ -456,6 +456,7 @@ func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, err
 // The signer is fixed for the entire retry cycle (signer affinity).
 func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg) (string, error) {
 	var txHash string
+	var seqOverride *uint64 // sequence override from a previous sequence-mismatch error
 
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = txInitialBackoff
@@ -469,7 +470,7 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 
 	operation := func() error {
 		var err error
-		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msg)
+		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msg, seqOverride)
 		if err == nil {
 			return nil
 		}
@@ -478,8 +479,29 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 			return backoff.Permanent(err)
 		}
 
+		// On sequence mismatch, extract the expected sequence so the next
+		// attempt uses it directly instead of re-querying stale state.
+		// Clear on any other error so we don't carry a stale value.
+		seqOverride = nil
+		var chainErr *ChainTxError
+		if errors.As(err, &chainErr) {
+			if expected, ok := chainErr.ExpectedSequence(); ok {
+				seqOverride = &expected
+			} else if chainErr.IsSequenceMismatch() {
+				slog.Warn("sequence mismatch but could not parse expected sequence from error",
+					"raw_log", chainErr.RawLog,
+				)
+			}
+		}
+
+		// Dereference for logging so slog prints the value, not a pointer address.
+		var seqLog any
+		if seqOverride != nil {
+			seqLog = *seqOverride
+		}
 		slog.Warn("transaction failed, will retry",
 			"error", err,
+			"seq_override", seqLog,
 		)
 		return err
 	}
@@ -501,9 +523,7 @@ func (c *Client) isRetryableTxError(err error) bool {
 	// Check for ChainTxError to see if it's a sequence mismatch
 	var chainErr *ChainTxError
 	if errors.As(err, &chainErr) {
-		// Code 32 is "incorrect account sequence" in SDK
-		// Codespace "sdk" with code 32 = ErrWrongSequence
-		if chainErr.Codespace == "sdk" && chainErr.Code == 32 {
+		if chainErr.IsSequenceMismatch() {
 			return true
 		}
 		// Other chain errors are generally not retryable
@@ -548,7 +568,11 @@ func (c *Client) isRetryableGRPCCode(code codes.Code) bool {
 }
 
 // doBroadcastTxWithSigner performs a single broadcast attempt using the given signer.
-func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg) (string, error) {
+// If seqOverride is non-nil, its value is used instead of the on-chain sequence. This
+// handles races where the queried sequence is already stale by the time the transaction
+// is broadcast (e.g. another tx from the same signer was committed between query and
+// broadcast, or the mempool already holds a tx at the queried sequence).
+func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg, seqOverride *uint64) (string, error) {
 	// Get account info for the signer's sequence/account number
 	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
 		Address: signer.Address(),
@@ -557,8 +581,10 @@ func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, ms
 		return "", fmt.Errorf("failed to query account: %w", err)
 	}
 
-	// Build, sign, and broadcast the transaction
-	txBytes, err := signer.SignTx(ctx, msg, accResp.Account)
+	// Build, sign, and broadcast the transaction.
+	// When seqOverride is set (from a previous sequence-mismatch error),
+	// use it instead of the potentially stale on-chain sequence.
+	txBytes, err := signer.signTxInternal(ctx, []sdktypes.Msg{msg}, accResp.Account, seqOverride)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %w", err)
 	}

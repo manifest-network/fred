@@ -324,6 +324,17 @@ key_name: "$KEY_NAME"
 # API server
 api_listen_addr: ":8080"
 
+# CORS (optional)
+# Allowed origins for browser-based clients (e.g. the manifest-admin SPA).
+# Defaults to ["*"] (all origins) when omitted. Set to an empty list
+# (cors_origins: []) to disable CORS middleware — fred logs a startup
+# warning and browsers will block cross-origin requests. Non-browser
+# clients (CLI, server-to-server) are unaffected. Only GET/POST are
+# allowed; permitted headers are Authorization and Content-Type;
+# credentials are disabled.
+# cors_origins:
+#   - "http://localhost:5173"
+
 # TLS (self-signed for dev)
 tls_cert_file: "$REPO_ROOT/cert.pem"
 tls_key_file: "$REPO_ROOT/key.pem"

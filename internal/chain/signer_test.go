@@ -9,6 +9,7 @@ import (
 	cryptocodec "github.com/cosmos/cosmos-sdk/crypto/codec"
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
 	authtx "github.com/cosmos/cosmos-sdk/x/auth/tx"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	"github.com/stretchr/testify/assert"
@@ -262,6 +263,57 @@ func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
 	txWithMsgs, ok := tx.(sdk.HasMsgs)
 	require.True(t, ok)
 	assert.Len(t, txWithMsgs.GetMsgs(), 3)
+}
+
+func TestSigner_SignTxInternal_SequenceOverride(t *testing.T) {
+	s := newTestSigner(t)
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+
+	// Account on-chain has sequence 5; subtests verify nil, non-nil, and zero overrides.
+	accountAny := newTestAccountAny(t, addr, 1, 5)
+
+	t.Run("nil override uses account sequence", func(t *testing.T) {
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil)
+		require.NoError(t, err)
+
+		seq := extractTxSequence(t, s, txBytes)
+		assert.Equal(t, uint64(5), seq)
+	})
+
+	t.Run("non-nil override replaces account sequence", func(t *testing.T) {
+		override := uint64(42)
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, &override)
+		require.NoError(t, err)
+
+		seq := extractTxSequence(t, s, txBytes)
+		assert.Equal(t, uint64(42), seq)
+	})
+
+	t.Run("override with sequence 0", func(t *testing.T) {
+		override := uint64(0)
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, &override)
+		require.NoError(t, err)
+
+		seq := extractTxSequence(t, s, txBytes)
+		assert.Equal(t, uint64(0), seq, "sequence 0 is valid and should not be treated as 'no override'")
+	})
+}
+
+// extractTxSequence decodes tx bytes, asserts exactly one signature, and returns its sequence.
+func extractTxSequence(t *testing.T, s *Signer, txBytes []byte) uint64 {
+	t.Helper()
+	decodedTx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+
+	sigTx, ok := decodedTx.(authsigning.SigVerifiableTx)
+	require.True(t, ok, "decoded tx does not implement authsigning.SigVerifiableTx")
+
+	sigs, err := sigTx.GetSignaturesV2()
+	require.NoError(t, err)
+	require.Len(t, sigs, 1)
+	return sigs[0].Sequence
 }
 
 func TestSigner_SignTx_InvalidAccount(t *testing.T) {

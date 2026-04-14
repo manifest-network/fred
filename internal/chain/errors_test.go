@@ -87,6 +87,74 @@ func TestChainTxError_Is(t *testing.T) {
 	}
 }
 
+func TestChainTxError_ExpectedSequence(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     *ChainTxError
+		wantSeq uint64
+		wantOK  bool
+	}{
+		{
+			name: "standard sequence mismatch",
+			err: &ChainTxError{
+				Code:      32,
+				Codespace: "sdk",
+				RawLog:    "account sequence mismatch, expected 8754, got 8753: incorrect account sequence",
+			},
+			wantSeq: 8754,
+			wantOK:  true,
+		},
+		{
+			name: "not a sequence mismatch",
+			err: &ChainTxError{
+				Code:      4,
+				Codespace: "sdk",
+				RawLog:    "signature verification failed",
+			},
+			wantSeq: 0,
+			wantOK:  false,
+		},
+		{
+			name: "sequence mismatch without parseable number",
+			err: &ChainTxError{
+				Code:      32,
+				Codespace: "sdk",
+				RawLog:    "account sequence mismatch",
+			},
+			wantSeq: 0,
+			wantOK:  false,
+		},
+		{
+			name: "expected sequence 0",
+			err: &ChainTxError{
+				Code:      32,
+				Codespace: "sdk",
+				RawLog:    "account sequence mismatch, expected 0, got 1: incorrect account sequence",
+			},
+			wantSeq: 0,
+			wantOK:  true,
+		},
+		{
+			name: "wrong codespace",
+			err: &ChainTxError{
+				Code:      32,
+				Codespace: "billing",
+				RawLog:    "expected 100, got 99",
+			},
+			wantSeq: 0,
+			wantOK:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seq, ok := tt.err.ExpectedSequence()
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.wantSeq, seq)
+		})
+	}
+}
+
 func TestChainTxError_WorksWithErrorsIs(t *testing.T) {
 	// Test that ChainTxError works correctly with errors.Is()
 	// even when wrapped in fmt.Errorf

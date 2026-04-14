@@ -2,6 +2,8 @@ package chain
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 
 	sdkerrors "cosmossdk.io/errors"
 )
@@ -31,4 +33,32 @@ func (e *ChainTxError) Is(target error) bool {
 
 	// Match by codespace and code
 	return e.Codespace == sdkErr.Codespace() && e.Code == sdkErr.ABCICode()
+}
+
+// IsSequenceMismatch returns true if this error is a sequence mismatch (SDK code 32).
+func (e *ChainTxError) IsSequenceMismatch() bool {
+	return e.Codespace == "sdk" && e.Code == 32
+}
+
+// reExpectedSeq extracts "expected N, got M" from Cosmos SDK sequence mismatch errors.
+// False positives are prevented by the IsSequenceMismatch() guard in ExpectedSequence(),
+// which requires codespace "sdk" and code 32 before the regex is applied.
+var reExpectedSeq = regexp.MustCompile(`expected (\d+), got \d+`)
+
+// ExpectedSequence extracts the expected sequence number from a sequence
+// mismatch error. Returns 0, false if the error is not a sequence mismatch
+// or the expected sequence cannot be parsed.
+func (e *ChainTxError) ExpectedSequence() (uint64, bool) {
+	if !e.IsSequenceMismatch() {
+		return 0, false
+	}
+	m := reExpectedSeq.FindStringSubmatch(e.RawLog)
+	if len(m) < 2 {
+		return 0, false
+	}
+	seq, err := strconv.ParseUint(m[1], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return seq, true
 }
