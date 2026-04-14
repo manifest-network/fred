@@ -817,7 +817,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to broadcast transaction")
 	})
 
-	t.Run("mempool rejection", func(t *testing.T) {
+	t.Run("code 19 without tx hash returns error", func(t *testing.T) {
 		s := newTestSigner(t)
 		pool := newTestSignerPoolFromSigner(s)
 		addr, _ := sdktypes.AccAddressFromBech32(s.address)
@@ -842,6 +842,120 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
 		assert.Equal(t, uint32(19), chainErr.Code)
+	})
+
+	t.Run("code 19 falls through to waitForTx", func(t *testing.T) {
+		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
+		addr, _ := sdktypes.AccAddressFromBech32(s.address)
+		accountAny := newTestAccountAny(t, addr, 1, 0)
+
+		aq := &mockAuthQuery{
+			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			},
+		}
+		ts := &mockTxService{
+			BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code:      19,
+						Codespace: "sdk",
+						RawLog:    "tx already exists in cache",
+						TxHash:    "MEMPOOL_TX",
+					},
+				}, nil
+			},
+			GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+				}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
+
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		require.NoError(t, err)
+		assert.Equal(t, "MEMPOOL_TX", hash)
+	})
+
+	t.Run("code 19 with polling delay", func(t *testing.T) {
+		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
+		addr, _ := sdktypes.AccAddressFromBech32(s.address)
+		accountAny := newTestAccountAny(t, addr, 1, 0)
+
+		aq := &mockAuthQuery{
+			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			},
+		}
+		var getTxCalls atomic.Int32
+		ts := &mockTxService{
+			BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code:      19,
+						Codespace: "sdk",
+						RawLog:    "tx already exists in cache",
+						TxHash:    "MEMPOOL_DELAYED",
+					},
+				}, nil
+			},
+			GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+				n := getTxCalls.Add(1)
+				if n < 3 {
+					return nil, status.Error(codes.NotFound, "not indexed yet")
+				}
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+				}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
+
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		require.NoError(t, err)
+		assert.Equal(t, "MEMPOOL_DELAYED", hash)
+		assert.GreaterOrEqual(t, int(getTxCalls.Load()), 3)
+	})
+
+	t.Run("code 19 falls through but execution fails", func(t *testing.T) {
+		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
+		addr, _ := sdktypes.AccAddressFromBech32(s.address)
+		accountAny := newTestAccountAny(t, addr, 1, 0)
+
+		aq := &mockAuthQuery{
+			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			},
+		}
+		ts := &mockTxService{
+			BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code:      19,
+						Codespace: "sdk",
+						RawLog:    "tx already exists in cache",
+						TxHash:    "MEMPOOL_FAIL",
+					},
+				}, nil
+			},
+			GetTxFn: func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 5, Codespace: "billing", RawLog: "insufficient funds"},
+				}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
+
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		require.Error(t, err)
+		var chainErr *ChainTxError
+		require.ErrorAs(t, err, &chainErr)
+		assert.Equal(t, uint32(5), chainErr.Code)
+		assert.Equal(t, "billing", chainErr.Codespace)
 	})
 
 	t.Run("execution failure after polling", func(t *testing.T) {
@@ -1507,6 +1621,115 @@ func TestClient_BroadcastTxWithSigner_OverrideClearedOnNonSequenceError(t *testi
 	assert.Equal(t, int32(3), attempts.Load())
 	assert.Equal(t, uint64(7), secondAttemptSeq, "second attempt must use the override from the mismatch")
 	assert.Equal(t, uint64(9), thirdAttemptSeq, "after a non-sequence error, override must be cleared and chain query used")
+}
+
+func TestClient_BroadcastTxWithSigner_Code19WaitForTxTimeoutIsNotRetried(t *testing.T) {
+	// When code 19 fires and waitForTx times out, the error must NOT be retried
+	// (re-broadcasting identical bytes would hit code 19 again).
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var broadcastCount atomic.Int32
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			broadcastCount.Add(1)
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{
+					Code:      19,
+					Codespace: "sdk",
+					RawLog:    "tx already exists in cache",
+					TxHash:    "MEMPOOL_TIMEOUT",
+				},
+			}, nil
+		},
+		GetTxFn: func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return nil, status.Error(codes.NotFound, "not indexed")
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+		c.txTimeout = 100 * time.Millisecond
+	})
+
+	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.Error(t, err)
+	assert.Equal(t, int32(1), broadcastCount.Load(), "should not retry after code 19 timeout")
+
+	var chainErr *ChainTxError
+	require.ErrorAs(t, err, &chainErr)
+	assert.Equal(t, uint32(19), chainErr.Code)
+}
+
+func TestClient_BroadcastTxWithSigner_FirstTimeoutThenCode19Recovery(t *testing.T) {
+	// End-to-end: first broadcast accepted → waitForTx timeout → retry →
+	// code 19 (same tx still in mempool) → waitForTx succeeds.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var broadcastCount atomic.Int32
+	var round2GetTxCount atomic.Int32
+
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := broadcastCount.Add(1)
+			if n == 1 {
+				// First attempt: accepted into mempool
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_GHOST"},
+				}, nil
+			}
+			// Retry: same bytes → code 19
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{
+					Code:      19,
+					Codespace: "sdk",
+					RawLog:    "tx already exists in cache",
+					TxHash:    "TX_GHOST",
+				},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			if broadcastCount.Load() == 1 {
+				// First waitForTx invocation: always not found (ghost tx)
+				return nil, status.Error(codes.NotFound, "not indexed")
+			}
+			// Second waitForTx invocation (after code 19): succeed on 2nd poll
+			n := round2GetTxCount.Add(1)
+			if n < 2 {
+				return nil, status.Error(codes.NotFound, "not indexed yet")
+			}
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+		c.txTimeout = 200 * time.Millisecond
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_GHOST", hash)
+	assert.Equal(t, int32(2), broadcastCount.Load(), "should broadcast exactly twice")
 }
 
 // mustDecodeTxSequence decodes transaction bytes and returns the sequence from the sole signature.

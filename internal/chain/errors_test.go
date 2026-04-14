@@ -87,6 +87,36 @@ func TestChainTxError_Is(t *testing.T) {
 	}
 }
 
+func TestChainTxError_IsTxInMempool(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *ChainTxError
+		want bool
+	}{
+		{
+			name: "mempool duplicate",
+			err:  &ChainTxError{Code: 19, Codespace: "sdk", RawLog: "tx already exists in cache"},
+			want: true,
+		},
+		{
+			name: "sequence mismatch is not mempool",
+			err:  &ChainTxError{Code: 32, Codespace: "sdk", RawLog: "account sequence mismatch"},
+			want: false,
+		},
+		{
+			name: "wrong codespace",
+			err:  &ChainTxError{Code: 19, Codespace: "billing", RawLog: "something"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.err.IsTxInMempool())
+		})
+	}
+}
+
 func TestChainTxError_ExpectedSequence(t *testing.T) {
 	tests := []struct {
 		name    string
