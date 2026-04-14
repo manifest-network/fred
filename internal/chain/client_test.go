@@ -773,7 +773,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		c, _ := setupTxMocks(t)
 
 		msg := newTestMsg(c.providerAddress)
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), c.signerPool.Primary(), msg)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), c.signerPool.Primary(), msg, nil)
 		require.NoError(t, err)
 		assert.NotEmpty(t, hash)
 	})
@@ -788,7 +788,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query account")
 	})
@@ -811,7 +811,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to broadcast transaction")
 	})
@@ -836,7 +836,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -868,12 +868,44 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
 		assert.Equal(t, uint32(5), chainErr.Code)
 		assert.Equal(t, "billing", chainErr.Codespace)
+	})
+
+	t.Run("success with sequence override", func(t *testing.T) {
+		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
+		addr, _ := sdktypes.AccAddressFromBech32(s.address)
+		// Account has sequence 5, but we override with 10
+		accountAny := newTestAccountAny(t, addr, 1, 5)
+
+		aq := &mockAuthQuery{
+			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			},
+		}
+		ts := &mockTxService{
+			BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TXSEQOVERRIDE"},
+				}, nil
+			},
+			GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+				}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
+
+		overrideSeq := uint64(10)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), &overrideSeq)
+		require.NoError(t, err)
+		assert.Equal(t, "TXSEQOVERRIDE", hash)
 	})
 }
 
@@ -1281,6 +1313,59 @@ func TestClient_BroadcastTxWithSigner_SequenceMismatchRetry(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "TX_RETRY", hash)
 	assert.GreaterOrEqual(t, int(attempts.Load()), 2, "should have retried after sequence mismatch")
+}
+
+func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
+	// When the chain returns a sequence mismatch with "expected N", the retry
+	// should sign with sequence N instead of re-querying the stale on-chain value.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	// On-chain sequence is 5, but chain expects 7 (stale query)
+	accountAny := newTestAccountAny(t, addr, 1, 5)
+
+	var attempts atomic.Int32
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			// Always return stale sequence 5
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			if n == 1 {
+				// First attempt: sequence mismatch, chain says expected 7
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code:      32,
+						Codespace: "sdk",
+						RawLog:    "account sequence mismatch, expected 7, got 5: incorrect account sequence",
+					},
+				}, nil
+			}
+			// Second attempt succeeds (signed with sequence hint 7)
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_SEQHINT"},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_SEQHINT", hash)
+	assert.Equal(t, int32(2), attempts.Load(), "should have succeeded on retry with sequence hint")
 }
 
 func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {

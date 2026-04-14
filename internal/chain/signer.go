@@ -129,9 +129,22 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 
 // SignTxMulti builds, signs, and encodes a transaction with one or more messages.
 func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
+	return s.signTxInternal(ctx, msgs, accountAny, nil)
+}
+
+// signTxInternal is the shared implementation for signing transactions.
+// If seqOverride is non-nil, its value is used instead of the account's on-chain
+// sequence. A pointer is used because sequence 0 is a valid Cosmos SDK value
+// (first transaction from a new account).
+func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any, seqOverride *uint64) ([]byte, error) {
 	var account authtypes.AccountI
 	if err := s.cdc.UnpackAny(accountAny, &account); err != nil {
 		return nil, fmt.Errorf("failed to unpack account: %w", err)
+	}
+
+	seq := account.GetSequence()
+	if seqOverride != nil {
+		seq = *seqOverride
 	}
 
 	txBuilder := s.txConfig.NewTxBuilder()
@@ -165,7 +178,7 @@ func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *co
 			SignMode:  signing.SignMode_SIGN_MODE_DIRECT,
 			Signature: nil,
 		},
-		Sequence: account.GetSequence(),
+		Sequence: seq,
 	}
 	if err := txBuilder.SetSignatures(sigV2); err != nil {
 		return nil, fmt.Errorf("failed to set signatures: %w", err)
@@ -174,7 +187,7 @@ func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *co
 	signerData := authsigning.SignerData{
 		ChainID:       s.chainID,
 		AccountNumber: account.GetAccountNumber(),
-		Sequence:      account.GetSequence(),
+		Sequence:      seq,
 		PubKey:        pubKey,
 		Address:       s.address,
 	}
@@ -187,7 +200,7 @@ func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *co
 		s.keyring,
 		s.keyName,
 		s.txConfig,
-		account.GetSequence(),
+		seq,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign: %w", err)
