@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"strings"
@@ -278,8 +279,14 @@ func (c *Config) Validate() error {
 	if c.GasLimit == 0 {
 		return fmt.Errorf("gas_limit must be positive")
 	}
+	if c.GasLimit > math.MaxInt64 {
+		return fmt.Errorf("gas_limit %d exceeds maximum (%d)", c.GasLimit, int64(math.MaxInt64))
+	}
 	if c.MaxGasLimit != 0 && c.MaxGasLimit < c.GasLimit {
 		return fmt.Errorf("max_gas_limit (%d) must be >= gas_limit (%d)", c.MaxGasLimit, c.GasLimit)
+	}
+	if c.MaxGasLimit > math.MaxInt64 {
+		return fmt.Errorf("max_gas_limit %d exceeds maximum (%d)", c.MaxGasLimit, int64(math.MaxInt64))
 	}
 	if c.GasPrice < 0 {
 		return fmt.Errorf("gas_price cannot be negative")
