@@ -20,6 +20,7 @@ import (
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	"github.com/cosmos/cosmos-sdk/types/tx"
+	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1317,7 +1318,7 @@ func TestClient_BroadcastTxWithSigner_SequenceMismatchRetry(t *testing.T) {
 
 func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
 	// When the chain returns a sequence mismatch with "expected N", the retry
-	// should sign with sequence N instead of re-querying the stale on-chain value.
+	// must sign with sequence N (verified by decoding the tx bytes).
 	s := newTestSigner(t)
 	pool := newTestSignerPoolFromSigner(s)
 	addr, _ := sdktypes.AccAddressFromBech32(s.address)
@@ -1325,6 +1326,7 @@ func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
 	accountAny := newTestAccountAny(t, addr, 1, 5)
 
 	var attempts atomic.Int32
+	var secondAttemptSeq uint64
 	aq := &mockAuthQuery{
 		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
 			// Always return stale sequence 5
@@ -1333,7 +1335,7 @@ func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
 	}
 
 	ts := &mockTxService{
-		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			if n == 1 {
 				// First attempt: sequence mismatch, chain says expected 7
@@ -1345,7 +1347,8 @@ func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
 					},
 				}, nil
 			}
-			// Second attempt succeeds (signed with sequence hint 7)
+			// Decode the tx to verify the sequence hint was applied
+			secondAttemptSeq = mustDecodeTxSequence(s, req.TxBytes)
 			return &tx.BroadcastTxResponse{
 				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_SEQHINT"},
 			}, nil
@@ -1365,7 +1368,166 @@ func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
 	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
 	require.NoError(t, err)
 	assert.Equal(t, "TX_SEQHINT", hash)
-	assert.Equal(t, int32(2), attempts.Load(), "should have succeeded on retry with sequence hint")
+	assert.Equal(t, int32(2), attempts.Load(), "should have retried exactly once")
+	assert.Equal(t, uint64(7), secondAttemptSeq, "retry must use the expected sequence from the error, not the stale query")
+}
+
+func TestClient_BroadcastTxWithSigner_ConsecutiveMismatches(t *testing.T) {
+	// Two consecutive sequence mismatches with different expected values.
+	// The override must update on each iteration, not just the first.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 5)
+
+	var attempts atomic.Int32
+	var secondAttemptSeq, thirdAttemptSeq uint64
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			switch n {
+			case 1:
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code: 32, Codespace: "sdk",
+						RawLog: "account sequence mismatch, expected 7, got 5: incorrect account sequence",
+					},
+				}, nil
+			case 2:
+				// Verify the first override was applied, then return another mismatch
+				secondAttemptSeq = mustDecodeTxSequence(s, req.TxBytes)
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code: 32, Codespace: "sdk",
+						RawLog: "account sequence mismatch, expected 8, got 7: incorrect account sequence",
+					},
+				}, nil
+			case 3:
+				thirdAttemptSeq = mustDecodeTxSequence(s, req.TxBytes)
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_DOUBLE"},
+				}, nil
+			default:
+				panic(fmt.Sprintf("unexpected broadcast attempt %d", n))
+			}
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_DOUBLE", hash)
+	assert.Equal(t, int32(3), attempts.Load())
+	assert.Equal(t, uint64(7), secondAttemptSeq, "first retry must use the first expected sequence")
+	assert.Equal(t, uint64(8), thirdAttemptSeq, "second retry must use the updated expected sequence")
+}
+
+func TestClient_BroadcastTxWithSigner_OverrideClearedOnNonSequenceError(t *testing.T) {
+	// Sequence mismatch sets the override, then a non-sequence retryable error
+	// (gRPC Unavailable) must clear it so the next attempt re-queries the chain.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+
+	var attempts atomic.Int32
+	var queryCount atomic.Int32
+	var secondAttemptSeq, thirdAttemptSeq uint64
+	// First two queries see stale seq 5; third sees updated seq 9
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			n := queryCount.Add(1)
+			if n >= 3 {
+				// Chain has caught up by the third attempt
+				return &authtypes.QueryAccountResponse{
+					Account: newTestAccountAny(t, addr, 1, 9),
+				}, nil
+			}
+			return &authtypes.QueryAccountResponse{
+				Account: newTestAccountAny(t, addr, 1, 5),
+			}, nil
+		},
+	}
+
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			switch n {
+			case 1:
+				// Sequence mismatch — sets override to 7
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code: 32, Codespace: "sdk",
+						RawLog: "account sequence mismatch, expected 7, got 5: incorrect account sequence",
+					},
+				}, nil
+			case 2:
+				// Verify the override was applied, then return a transient gRPC error
+				secondAttemptSeq = mustDecodeTxSequence(s, req.TxBytes)
+				return nil, status.Error(codes.Unavailable, "connection reset")
+			case 3:
+				// Third attempt: should use fresh chain query (seq 9), not stale override (7)
+				thirdAttemptSeq = mustDecodeTxSequence(s, req.TxBytes)
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_CLEARED"},
+				}, nil
+			default:
+				panic(fmt.Sprintf("unexpected broadcast attempt %d", n))
+			}
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_CLEARED", hash)
+	assert.Equal(t, int32(3), attempts.Load())
+	assert.Equal(t, uint64(7), secondAttemptSeq, "second attempt must use the override from the mismatch")
+	assert.Equal(t, uint64(9), thirdAttemptSeq, "after a non-sequence error, override must be cleared and chain query used")
+}
+
+// mustDecodeTxSequence decodes transaction bytes and returns the sequence from the sole signature.
+// Panics on failure to keep the signature simple for use inside mock callbacks.
+func mustDecodeTxSequence(s *Signer, txBytes []byte) uint64 {
+	decodedTx, err := s.txConfig.TxDecoder()(txBytes)
+	if err != nil {
+		panic(fmt.Sprintf("failed to decode tx: %v", err))
+	}
+	sigTx, ok := decodedTx.(authsigning.SigVerifiableTx)
+	if !ok {
+		panic("decoded tx does not implement authsigning.SigVerifiableTx")
+	}
+	sigs, err := sigTx.GetSignaturesV2()
+	if err != nil {
+		panic(fmt.Sprintf("failed to get signatures: %v", err))
+	}
+	if len(sigs) == 0 {
+		panic("expected at least one signature")
+	}
+	return sigs[0].Sequence
 }
 
 func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {
