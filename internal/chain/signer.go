@@ -32,15 +32,16 @@ const (
 
 // Signer handles transaction signing using a Cosmos keyring.
 type Signer struct {
-	keyring  keyring.Keyring
-	keyName  string
-	address  string
-	chainID  string
-	txConfig client.TxConfig
-	cdc      codec.Codec
-	gasLimit uint64
-	gasPrice int64
-	feeDenom string
+	keyring     keyring.Keyring
+	keyName     string
+	address     string
+	chainID     string
+	txConfig    client.TxConfig
+	cdc         codec.Codec
+	gasLimit    uint64
+	maxGasLimit uint64 // 0 = no cap; if set, caps the gas limit during out-of-gas retries
+	gasPrice    int64
+	feeDenom    string
 }
 
 // SignerConfig holds configuration for the transaction signer.
@@ -50,6 +51,7 @@ type SignerConfig struct {
 	KeyName        string
 	ChainID        string
 	GasLimit       uint64
+	MaxGasLimit    uint64 // 0 = no cap; if set, caps the gas limit during out-of-gas retries
 	GasPrice       int64
 	FeeDenom       string
 	Passphrase     string // Keyring passphrase for "file" backend (read from FRED_KEYRING_PASSPHRASE env)
@@ -105,15 +107,16 @@ func newSignerFromKeyring(kr keyring.Keyring, keyName string, cfg SignerConfig, 
 	}
 
 	return &Signer{
-		keyring:  kr,
-		keyName:  keyName,
-		address:  addr.String(),
-		chainID:  cfg.ChainID,
-		txConfig: txConfig,
-		cdc:      cdc,
-		gasLimit: cfg.GasLimit,
-		gasPrice: cfg.GasPrice,
-		feeDenom: cfg.FeeDenom,
+		keyring:     kr,
+		keyName:     keyName,
+		address:     addr.String(),
+		chainID:     cfg.ChainID,
+		txConfig:    txConfig,
+		cdc:         cdc,
+		gasLimit:    cfg.GasLimit,
+		maxGasLimit: cfg.MaxGasLimit,
+		gasPrice:    cfg.GasPrice,
+		feeDenom:    cfg.FeeDenom,
 	}, nil
 }
 
@@ -129,14 +132,16 @@ func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes
 
 // SignTxMulti builds, signs, and encodes a transaction with one or more messages.
 func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
-	return s.signTxInternal(ctx, msgs, accountAny, nil)
+	return s.signTxInternal(ctx, msgs, accountAny, nil, nil)
 }
 
 // signTxInternal is the shared implementation for signing transactions.
 // If seqOverride is non-nil, its value is used instead of the account's on-chain
 // sequence. A pointer is used because sequence 0 is a valid Cosmos SDK value
 // (first transaction from a new account).
-func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any, seqOverride *uint64) ([]byte, error) {
+// If gasLimitOverride is non-nil, its value is used instead of the configured
+// gas limit, and the fee is recalculated accordingly.
+func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any, seqOverride *uint64, gasLimitOverride *uint64) ([]byte, error) {
 	var account authtypes.AccountI
 	if err := s.cdc.UnpackAny(accountAny, &account); err != nil {
 		return nil, fmt.Errorf("failed to unpack account: %w", err)
@@ -152,15 +157,20 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 		return nil, fmt.Errorf("failed to set messages: %w", err)
 	}
 
-	if s.gasLimit > uint64(stdmath.MaxInt64) {
-		return nil, fmt.Errorf("gas limit %d overflows int64", s.gasLimit)
+	gasLimit := s.gasLimit
+	if gasLimitOverride != nil {
+		gasLimit = *gasLimitOverride
 	}
-	txBuilder.SetGasLimit(s.gasLimit)
-	feeAmount := int64(s.gasLimit) * s.gasPrice / gasPriceDivisor
-	if feeAmount < minFeeAmount {
-		feeAmount = minFeeAmount
+	if gasLimit > uint64(stdmath.MaxInt64) {
+		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
 	}
-	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, math.NewInt(feeAmount))))
+	txBuilder.SetGasLimit(gasLimit)
+	// Use math.Int to avoid int64 overflow for large gasLimit * gasPrice products.
+	feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Quo(math.NewInt(gasPriceDivisor))
+	if feeInt.LT(math.NewInt(minFeeAmount)) {
+		feeInt = math.NewInt(minFeeAmount)
+	}
+	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, feeInt)))
 
 	keyInfo, err := s.keyring.Key(s.keyName)
 	if err != nil {

@@ -238,6 +238,35 @@ func TestSigner_SignTx_MinimumFee(t *testing.T) {
 	assert.True(t, feeTx.GetFee().Equal(expectedFee))
 }
 
+func TestSigner_SignTx_LargeGasFeeNoOverflow(t *testing.T) {
+	// Verify that large gasLimit * gasPrice products don't overflow int64.
+	// 5e18 * 2 = 1e19 which exceeds MaxInt64 (~9.2e18) but must still
+	// produce a correct fee via math.Int arithmetic.
+	s := newTestSigner(t)
+	s.gasLimit = 5_000_000_000_000_000_000 // 5e18
+	s.gasPrice = 2
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	require.NoError(t, err)
+
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+
+	feeTx, ok := tx.(sdk.FeeTx)
+	require.True(t, ok)
+
+	// 5e18 * 2 / 1e6 = 10_000_000_000_000 (10e12)
+	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(10_000_000_000_000)))
+	assert.True(t, feeTx.GetFee().Equal(expectedFee),
+		"fee must be correct even when gasLimit*gasPrice overflows int64; got %s, want %s",
+		feeTx.GetFee(), expectedFee)
+}
+
 func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
 	s := newTestSigner(t)
 
@@ -275,7 +304,7 @@ func TestSigner_SignTxInternal_SequenceOverride(t *testing.T) {
 	accountAny := newTestAccountAny(t, addr, 1, 5)
 
 	t.Run("nil override uses account sequence", func(t *testing.T) {
-		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil)
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 		require.NoError(t, err)
 
 		seq := extractTxSequence(t, s, txBytes)
@@ -284,7 +313,7 @@ func TestSigner_SignTxInternal_SequenceOverride(t *testing.T) {
 
 	t.Run("non-nil override replaces account sequence", func(t *testing.T) {
 		override := uint64(42)
-		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, &override)
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, &override, nil)
 		require.NoError(t, err)
 
 		seq := extractTxSequence(t, s, txBytes)
@@ -293,11 +322,47 @@ func TestSigner_SignTxInternal_SequenceOverride(t *testing.T) {
 
 	t.Run("override with sequence 0", func(t *testing.T) {
 		override := uint64(0)
-		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, &override)
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, &override, nil)
 		require.NoError(t, err)
 
 		seq := extractTxSequence(t, s, txBytes)
 		assert.Equal(t, uint64(0), seq, "sequence 0 is valid and should not be treated as 'no override'")
+	})
+}
+
+func TestSigner_SignTxInternal_GasLimitOverride(t *testing.T) {
+	s := newTestSigner(t)
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	t.Run("nil override uses default gas limit", func(t *testing.T) {
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
+		require.NoError(t, err)
+
+		decodedTx, err := s.txConfig.TxDecoder()(txBytes)
+		require.NoError(t, err)
+		feeTx, ok := decodedTx.(sdk.FeeTx)
+		require.True(t, ok)
+		assert.Equal(t, s.gasLimit, feeTx.GetGas())
+	})
+
+	t.Run("non-nil override replaces gas limit", func(t *testing.T) {
+		override := uint64(500000)
+		txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, &override)
+		require.NoError(t, err)
+
+		decodedTx, err := s.txConfig.TxDecoder()(txBytes)
+		require.NoError(t, err)
+		feeTx, ok := decodedTx.(sdk.FeeTx)
+		require.True(t, ok)
+		assert.Equal(t, uint64(500000), feeTx.GetGas())
+
+		// Fee must be recalculated: 500000 * 100 / 1_000_000 = 50
+		expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(50)))
+		assert.True(t, feeTx.GetFee().Equal(expectedFee), "fee must be recalculated from overridden gas")
 	})
 }
 

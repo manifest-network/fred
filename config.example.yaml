@@ -467,11 +467,15 @@ tx_timeout: "30s"
 
 # Gas limit for transactions.
 # Higher values allow more complex transactions but cost more on failure.
-# If transactions fail with "out of gas", increase this value.
+# On out-of-gas errors, Fred automatically retries with 1.5x gas (compounding per retry).
 gas_limit: 1500000
 
-# Gas price in minimal denomination (e.g., umfx).
-# Total fee = gas_limit * gas_price. Higher prices = faster inclusion.
+# Maximum gas limit for out-of-gas retries. Set to 0 for no cap.
+# If set, must be >= gas_limit. Prevents runaway gas costs during retries.
+# max_gas_limit: 5000000
+
+# Gas price in micro-units of the fee denomination per gas unit.
+# Total fee = gas_limit * gas_price / 1_000_000. Higher prices = faster inclusion.
 gas_price: 25
 
 # Fee denomination for transaction fees.

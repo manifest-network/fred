@@ -48,6 +48,11 @@ func (e *ChainTxError) IsTxInMempool() bool {
 	return e.Codespace == "sdk" && e.Code == 19
 }
 
+// IsOutOfGas returns true if this error is an out-of-gas error (SDK code 11).
+func (e *ChainTxError) IsOutOfGas() bool {
+	return e.Codespace == "sdk" && e.Code == 11
+}
+
 // reExpectedSeq extracts "expected N, got M" from Cosmos SDK sequence mismatch errors.
 // False positives are prevented by the IsSequenceMismatch() guard in ExpectedSequence(),
 // which requires codespace "sdk" and code 32 before the regex is applied.

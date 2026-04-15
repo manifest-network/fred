@@ -131,6 +131,7 @@ func run(cmd *cobra.Command, args []string) error {
 			KeyName:        cfg.KeyName,
 			ChainID:        cfg.ChainID,
 			GasLimit:       cfg.GasLimit,
+			MaxGasLimit:    cfg.MaxGasLimit,
 			GasPrice:       cfg.GasPrice,
 			FeeDenom:       cfg.FeeDenom,
 			Passphrase:     os.Getenv("FRED_KEYRING_PASSPHRASE"),

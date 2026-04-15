@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"strings"
@@ -58,6 +59,7 @@ type Config struct {
 	GRPCTLSCAFile        string        `mapstructure:"grpc_tls_ca_file"`
 	GRPCTLSSkipVerify    bool          `mapstructure:"grpc_tls_skip_verify"`
 	GasLimit             uint64        `mapstructure:"gas_limit"`
+	MaxGasLimit          uint64        `mapstructure:"max_gas_limit"` // 0 = no cap; if set, caps the gas limit during out-of-gas retries
 	GasPrice             int64         `mapstructure:"gas_price"`
 	FeeDenom             string        `mapstructure:"fee_denom"`
 
@@ -154,7 +156,8 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
 	v.SetDefault("gas_limit", 1500000)
-	v.SetDefault("gas_price", 25) // price per gas unit in smallest denom
+	v.SetDefault("max_gas_limit", 0) // 0 = no cap; if set, caps the gas limit during out-of-gas retries
+	v.SetDefault("gas_price", 25)    // micro-units of fee_denom per gas unit; fee = gas_limit * gas_price / 1_000_000
 	v.SetDefault("fee_denom", "umfx")
 
 	// Timeout defaults
@@ -275,6 +278,15 @@ func (c *Config) Validate() error {
 	}
 	if c.GasLimit == 0 {
 		return fmt.Errorf("gas_limit must be positive")
+	}
+	if c.GasLimit > math.MaxInt64 {
+		return fmt.Errorf("gas_limit %d exceeds maximum (%d)", c.GasLimit, int64(math.MaxInt64))
+	}
+	if c.MaxGasLimit != 0 && c.MaxGasLimit < c.GasLimit {
+		return fmt.Errorf("max_gas_limit (%d) must be >= gas_limit (%d)", c.MaxGasLimit, c.GasLimit)
+	}
+	if c.MaxGasLimit > math.MaxInt64 {
+		return fmt.Errorf("max_gas_limit %d exceeds maximum (%d)", c.MaxGasLimit, int64(math.MaxInt64))
 	}
 	if c.GasPrice < 0 {
 		return fmt.Errorf("gas_price cannot be negative")

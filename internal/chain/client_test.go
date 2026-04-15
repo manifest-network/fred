@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -311,6 +312,8 @@ func TestIsRetryableTxError(t *testing.T) {
 	}{
 		{name: "nil error", err: nil, wantRetry: false},
 		{name: "sequence mismatch", err: &ChainTxError{Code: 32, Codespace: "sdk", RawLog: "account sequence mismatch"}, wantRetry: true},
+		{name: "out of gas", err: &ChainTxError{Code: 11, Codespace: "sdk", RawLog: "out of gas"}, wantRetry: true},
+		{name: "wrapped out of gas", err: fmt.Errorf("exec: %w", &ChainTxError{Code: 11, Codespace: "sdk", RawLog: "out of gas"}), wantRetry: true},
 		{name: "other chain error", err: &ChainTxError{Code: 4, Codespace: "sdk", RawLog: "unauthorized"}, wantRetry: false},
 		{name: "billing module error", err: &ChainTxError{Code: 1, Codespace: "billing", RawLog: "lease not found"}, wantRetry: false},
 		{name: "wrapped sequence mismatch", err: fmt.Errorf("broadcast: %w", &ChainTxError{Code: 32, Codespace: "sdk"}), wantRetry: true},
@@ -774,7 +777,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		c, _ := setupTxMocks(t)
 
 		msg := newTestMsg(c.providerAddress)
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), c.signerPool.Primary(), msg, nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), c.signerPool.Primary(), msg, nil, nil)
 		require.NoError(t, err)
 		assert.NotEmpty(t, hash)
 	})
@@ -789,7 +792,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query account")
 	})
@@ -812,7 +815,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to broadcast transaction")
 	})
@@ -837,7 +840,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -874,7 +877,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "MEMPOOL_TX", hash)
 	})
@@ -914,7 +917,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "MEMPOOL_DELAYED", hash)
 		assert.GreaterOrEqual(t, int(getTxCalls.Load()), 3)
@@ -950,7 +953,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -983,7 +986,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -1018,7 +1021,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
 		overrideSeq := uint64(10)
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), &overrideSeq)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), &overrideSeq, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "TXSEQOVERRIDE", hash)
 	})
@@ -1751,6 +1754,420 @@ func mustDecodeTxSequence(s *Signer, txBytes []byte) uint64 {
 		panic("expected at least one signature")
 	}
 	return sigs[0].Sequence
+}
+
+// mustDecodeTxGasLimit decodes transaction bytes and returns the gas limit.
+// Panics on failure to keep the signature simple for use inside mock callbacks.
+func mustDecodeTxGasLimit(s *Signer, txBytes []byte) uint64 {
+	decodedTx, err := s.txConfig.TxDecoder()(txBytes)
+	if err != nil {
+		panic(fmt.Sprintf("failed to decode tx: %v", err))
+	}
+	feeTx, ok := decodedTx.(sdktypes.FeeTx)
+	if !ok {
+		panic("decoded tx does not implement sdk.FeeTx")
+	}
+	return feeTx.GetGas()
+}
+
+func TestClient_BroadcastTxWithSigner_OutOfGasRetry(t *testing.T) {
+	// Out-of-gas (code 11) at execution should trigger retry with 1.5x gas limit.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var attempts atomic.Int32
+	var retryGasLimit uint64
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			if n == 2 {
+				retryGasLimit = mustDecodeTxGasLimit(s, req.TxBytes)
+			}
+			// Mempool always accepts
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: fmt.Sprintf("TX_%d", n)},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			n := attempts.Load()
+			if n == 1 {
+				// First attempt: execution fails with out-of-gas
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code:      11,
+						Codespace: "sdk",
+						RawLog:    "out of gas in location: WriteFlat; gasWanted: 200000, gasUsed: 200100: out of gas",
+						TxHash:    req.Hash,
+					},
+				}, nil
+			}
+			// Second attempt: success
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_2", hash)
+	assert.Equal(t, int32(2), attempts.Load(), "should have retried exactly once")
+	assert.Equal(t, s.gasLimit+s.gasLimit/2, retryGasLimit, "retry must use 1.5x the default gas limit")
+}
+
+func TestClient_BroadcastTxWithSigner_ConsecutiveOutOfGas(t *testing.T) {
+	// Two consecutive out-of-gas errors: gas must compound (1.5x, then 2.25x of original).
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var attempts atomic.Int32
+	var secondGasLimit, thirdGasLimit uint64
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			switch n {
+			case 2:
+				secondGasLimit = mustDecodeTxGasLimit(s, req.TxBytes)
+			case 3:
+				thirdGasLimit = mustDecodeTxGasLimit(s, req.TxBytes)
+			}
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: fmt.Sprintf("TX_%d", n)},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			n := attempts.Load()
+			if n <= 2 {
+				// First two attempts: execution fails with out-of-gas
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code:      11,
+						Codespace: "sdk",
+						RawLog:    "out of gas",
+						TxHash:    req.Hash,
+					},
+				}, nil
+			}
+			// Third attempt: success
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_3", hash)
+	assert.Equal(t, int32(3), attempts.Load())
+
+	expectedFirst := s.gasLimit + s.gasLimit/2        // 1.5x
+	expectedSecond := expectedFirst + expectedFirst/2 // 2.25x of original
+	assert.Equal(t, expectedFirst, secondGasLimit, "first retry must use 1.5x gas")
+	assert.Equal(t, expectedSecond, thirdGasLimit, "second retry must use 2.25x gas (compounding)")
+}
+
+func TestClient_BroadcastTxWithSigner_OutOfGasRetryCappedByMaxGasLimit(t *testing.T) {
+	// When maxGasLimit is set, the gas override must not exceed it.
+	s := newTestSigner(t)
+	s.maxGasLimit = 250000 // cap below the 1.5x value (300000)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var attempts atomic.Int32
+	var retryGasLimit uint64
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			if n == 2 {
+				retryGasLimit = mustDecodeTxGasLimit(s, req.TxBytes)
+			}
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: fmt.Sprintf("TX_%d", n)},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			n := attempts.Load()
+			if n == 1 {
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code: 11, Codespace: "sdk", RawLog: "out of gas", TxHash: req.Hash,
+					},
+				}, nil
+			}
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_2", hash)
+	assert.Equal(t, uint64(250000), retryGasLimit, "retry gas must be capped at maxGasLimit")
+}
+
+func TestClient_BroadcastTxWithSigner_OutOfGasOverridePersistsThroughTransientError(t *testing.T) {
+	// Gas override must NOT be cleared on non-OOG errors (unlike seqOverride).
+	// Scenario: OOG on attempt 1, gRPC Unavailable on attempt 2, attempt 3 must still use elevated gas.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var attempts atomic.Int32
+	var thirdAttemptGas uint64
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			switch n {
+			case 1:
+				// Mempool accepts, execution will OOG
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_1"},
+				}, nil
+			case 2:
+				// Transient gRPC error
+				return nil, status.Error(codes.Unavailable, "connection reset")
+			case 3:
+				thirdAttemptGas = mustDecodeTxGasLimit(s, req.TxBytes)
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_3"},
+				}, nil
+			default:
+				panic(fmt.Sprintf("unexpected broadcast attempt %d", n))
+			}
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			n := attempts.Load()
+			if n == 1 {
+				// First attempt: execution OOG
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code: 11, Codespace: "sdk", RawLog: "out of gas", TxHash: req.Hash,
+					},
+				}, nil
+			}
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_3", hash)
+	assert.Equal(t, int32(3), attempts.Load())
+	assert.Equal(t, s.gasLimit+s.gasLimit/2, thirdAttemptGas,
+		"gas override must persist through transient gRPC error, not be cleared")
+}
+
+func TestClient_BroadcastTxWithSigner_OutOfGasThenSequenceMismatch(t *testing.T) {
+	// Both overrides active: OOG sets gasLimitOverride, then sequence mismatch
+	// sets seqOverride. The final attempt must use both.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 5)
+
+	var attempts atomic.Int32
+	var thirdAttemptGas uint64
+	var thirdAttemptSeq uint64
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			switch n {
+			case 1:
+				// Mempool accepts, execution will OOG
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_1"},
+				}, nil
+			case 2:
+				// Sequence mismatch at mempool
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code: 32, Codespace: "sdk",
+						RawLog: "account sequence mismatch, expected 7, got 5: incorrect account sequence",
+					},
+				}, nil
+			case 3:
+				thirdAttemptGas = mustDecodeTxGasLimit(s, req.TxBytes)
+				thirdAttemptSeq = mustDecodeTxSequence(s, req.TxBytes)
+				return &tx.BroadcastTxResponse{
+					TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX_3"},
+				}, nil
+			default:
+				panic(fmt.Sprintf("unexpected broadcast attempt %d", n))
+			}
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			n := attempts.Load()
+			if n == 1 {
+				return &tx.GetTxResponse{
+					TxResponse: &sdktypes.TxResponse{
+						Code: 11, Codespace: "sdk", RawLog: "out of gas", TxHash: req.Hash,
+					},
+				}, nil
+			}
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.NoError(t, err)
+	assert.Equal(t, "TX_3", hash)
+	assert.Equal(t, int32(3), attempts.Load())
+	assert.Equal(t, s.gasLimit+s.gasLimit/2, thirdAttemptGas,
+		"gas override from OOG must persist through sequence mismatch")
+	assert.Equal(t, uint64(7), thirdAttemptSeq,
+		"sequence override from mismatch must also be applied")
+}
+
+func TestClient_BroadcastTxWithSigner_OutOfGasRetriesExhausted(t *testing.T) {
+	// All 3 attempts fail with OOG. Verify the error propagates with ChainTxError details.
+	s := newTestSigner(t)
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var attempts atomic.Int32
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: fmt.Sprintf("TX_%d", n)},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{
+					Code: 11, Codespace: "sdk", RawLog: "out of gas", TxHash: req.Hash,
+				},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.Error(t, err)
+	assert.Equal(t, int32(3), attempts.Load(), "should exhaust all 3 attempts")
+
+	// The error must be unwrappable to ChainTxError for callers to inspect
+	var chainErr *ChainTxError
+	require.True(t, errors.As(err, &chainErr), "exhausted error must contain ChainTxError")
+	assert.True(t, chainErr.IsOutOfGas(), "ChainTxError must be out-of-gas")
+}
+
+func TestClient_BroadcastTxWithSigner_OutOfGasFutileRetryAtCap(t *testing.T) {
+	// When maxGasLimit == gasLimit, the first OOG retry is already capped at the same value.
+	// The code should detect this and stop immediately (backoff.Permanent) instead of
+	// wasting fees on retries with identical gas.
+	s := newTestSigner(t)
+	s.maxGasLimit = s.gasLimit // cap equals base — no room to escalate
+	pool := newTestSignerPoolFromSigner(s)
+	addr, _ := sdktypes.AccAddressFromBech32(s.address)
+	accountAny := newTestAccountAny(t, addr, 1, 0)
+
+	var attempts atomic.Int32
+	aq := &mockAuthQuery{
+		AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+		},
+	}
+	ts := &mockTxService{
+		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			n := attempts.Add(1)
+			return &tx.BroadcastTxResponse{
+				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: fmt.Sprintf("TX_%d", n)},
+			}, nil
+		},
+		GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+			return &tx.GetTxResponse{
+				TxResponse: &sdktypes.TxResponse{
+					Code: 11, Codespace: "sdk", RawLog: "out of gas", TxHash: req.Hash,
+				},
+			}, nil
+		},
+	}
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = aq
+		c.txService = ts
+	})
+
+	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	require.Error(t, err)
+	assert.Equal(t, int32(1), attempts.Load(),
+		"must stop after 1 attempt — retrying at the same gas is futile")
+
+	var chainErr *ChainTxError
+	require.True(t, errors.As(err, &chainErr))
+	assert.True(t, chainErr.IsOutOfGas())
 }
 
 func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {

@@ -117,6 +117,35 @@ func TestChainTxError_IsTxInMempool(t *testing.T) {
 	}
 }
 
+func TestChainTxError_IsOutOfGas(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *ChainTxError
+		want bool
+	}{
+		{
+			name: "out of gas",
+			err:  &ChainTxError{Code: 11, Codespace: "sdk", RawLog: "out of gas"},
+			want: true,
+		},
+		{
+			name: "wrong code",
+			err:  &ChainTxError{Code: 32, Codespace: "sdk", RawLog: "sequence mismatch"},
+			want: false,
+		},
+		{
+			name: "wrong codespace",
+			err:  &ChainTxError{Code: 11, Codespace: "billing", RawLog: "out of gas"},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.err.IsOutOfGas())
+		})
+	}
+}
+
 func TestChainTxError_ExpectedSequence(t *testing.T) {
 	tests := []struct {
 		name    string

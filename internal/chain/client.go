@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	stdmath "math"
 	"os"
 	"slices"
 	"time"
@@ -456,7 +457,8 @@ func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, err
 // The signer is fixed for the entire retry cycle (signer affinity).
 func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg) (string, error) {
 	var txHash string
-	var seqOverride *uint64 // sequence override from a previous sequence-mismatch error
+	var seqOverride *uint64      // sequence override from a previous sequence-mismatch error
+	var gasLimitOverride *uint64 // gas limit override from a previous out-of-gas error
 
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = txInitialBackoff
@@ -470,7 +472,7 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 
 	operation := func() error {
 		var err error
-		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msg, seqOverride)
+		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msg, seqOverride, gasLimitOverride)
 		if err == nil {
 			return nil
 		}
@@ -492,6 +494,32 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 					"raw_log", chainErr.RawLog,
 				)
 			}
+
+			// On out-of-gas, increase gas limit by 1.5x for the next attempt.
+			// Unlike seqOverride, gasLimitOverride is NOT cleared on non-OOG errors
+			// because the message's gas requirement (determined by lease count) does
+			// not decrease between retries.
+			if chainErr.IsOutOfGas() {
+				currentGas := signer.gasLimit
+				if gasLimitOverride != nil {
+					currentGas = *gasLimitOverride
+				}
+				increased := currentGas + currentGas/2
+				if increased < currentGas {
+					// uint64 overflow; clamp to MaxInt64.
+					increased = stdmath.MaxInt64
+				}
+				if signer.maxGasLimit > 0 {
+					increased = min(increased, signer.maxGasLimit)
+				}
+				// Ensure the increased value fits in int64 for fee calculation.
+				increased = min(increased, stdmath.MaxInt64)
+				if increased == currentGas {
+					// Already at the cap; retrying with the same gas is futile.
+					return backoff.Permanent(err)
+				}
+				gasLimitOverride = &increased
+			}
 		}
 
 		// Dereference for logging so slog prints the value, not a pointer address.
@@ -499,9 +527,14 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 		if seqOverride != nil {
 			seqLog = *seqOverride
 		}
+		var gasLog any
+		if gasLimitOverride != nil {
+			gasLog = *gasLimitOverride
+		}
 		slog.Warn("transaction failed, will retry",
 			"error", err,
 			"seq_override", seqLog,
+			"gas_limit_override", gasLog,
 		)
 		return err
 	}
@@ -520,10 +553,10 @@ func (c *Client) isRetryableTxError(err error) bool {
 		return false
 	}
 
-	// Check for ChainTxError to see if it's a sequence mismatch
+	// Check for ChainTxError: sequence mismatches and out-of-gas are retryable
 	var chainErr *ChainTxError
 	if errors.As(err, &chainErr) {
-		if chainErr.IsSequenceMismatch() {
+		if chainErr.IsSequenceMismatch() || chainErr.IsOutOfGas() {
 			return true
 		}
 		// Other chain errors are generally not retryable
@@ -572,7 +605,9 @@ func (c *Client) isRetryableGRPCCode(code codes.Code) bool {
 // handles races where the queried sequence is already stale by the time the transaction
 // is broadcast (e.g. another tx from the same signer was committed between query and
 // broadcast, or the mempool already holds a tx at the queried sequence).
-func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg, seqOverride *uint64) (string, error) {
+// If gasLimitOverride is non-nil, its value is used instead of the configured gas limit
+// (e.g. after an out-of-gas error triggered a retry with increased gas).
+func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg, seqOverride *uint64, gasLimitOverride *uint64) (string, error) {
 	// Get account info for the signer's sequence/account number
 	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
 		Address: signer.Address(),
@@ -584,7 +619,7 @@ func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, ms
 	// Build, sign, and broadcast the transaction.
 	// When seqOverride is set (from a previous sequence-mismatch error),
 	// use it instead of the potentially stale on-chain sequence.
-	txBytes, err := signer.signTxInternal(ctx, []sdktypes.Msg{msg}, accResp.Account, seqOverride)
+	txBytes, err := signer.signTxInternal(ctx, []sdktypes.Msg{msg}, accResp.Account, seqOverride, gasLimitOverride)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %w", err)
 	}
