@@ -165,11 +165,12 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
 	}
 	txBuilder.SetGasLimit(gasLimit)
-	feeAmount := int64(gasLimit) * s.gasPrice / gasPriceDivisor
-	if feeAmount < minFeeAmount {
-		feeAmount = minFeeAmount
+	// Use math.Int to avoid int64 overflow for large gasLimit * gasPrice products.
+	feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Quo(math.NewInt(gasPriceDivisor))
+	if feeInt.LT(math.NewInt(minFeeAmount)) {
+		feeInt = math.NewInt(minFeeAmount)
 	}
-	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, math.NewInt(feeAmount))))
+	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, feeInt)))
 
 	keyInfo, err := s.keyring.Key(s.keyName)
 	if err != nil {
