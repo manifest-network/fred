@@ -599,11 +599,40 @@ func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, ms
 
 	// SYNC mode only confirms mempool acceptance, not execution
 	if resp.TxResponse.Code != 0 {
-		return "", &ChainTxError{
+		chainErr := &ChainTxError{
 			Code:      resp.TxResponse.Code,
 			Codespace: resp.TxResponse.Codespace,
 			RawLog:    resp.TxResponse.RawLog,
 		}
+
+		// Code 19: the exact same tx bytes are already in the mempool cache.
+		// This happens when waitForTx timed out on a previous attempt and the
+		// retry re-signed with the same sequence, producing identical bytes.
+		// The tx IS being processed — wait for it instead of returning an error.
+		if chainErr.IsTxInMempool() && resp.TxResponse.TxHash != "" {
+			slog.Info("tx already in mempool, waiting for confirmation",
+				"tx_hash", resp.TxResponse.TxHash,
+			)
+			txHash := resp.TxResponse.TxHash
+			execResp, err := c.waitForTx(ctx, txHash)
+			if err != nil {
+				// Tx was in mempool but didn't confirm in time. Preserve both
+				// the wait error (for timeout/cancel classification) and the
+				// code 19 ChainTxError (non-retryable) to prevent the retry
+				// loop from re-broadcasting identical bytes.
+				return "", fmt.Errorf("tx %s in mempool but did not confirm: %w", txHash, errors.Join(err, chainErr))
+			}
+			if execResp.TxResponse.Code != 0 {
+				return "", &ChainTxError{
+					Code:      execResp.TxResponse.Code,
+					Codespace: execResp.TxResponse.Codespace,
+					RawLog:    execResp.TxResponse.RawLog,
+				}
+			}
+			return txHash, nil
+		}
+
+		return "", chainErr
 	}
 
 	// Wait for tx to be included in a block and check execution result

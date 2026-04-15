@@ -593,6 +593,130 @@ func TestNewAckBatcher_LaneCountNormalization(t *testing.T) {
 	}
 }
 
+func TestAckBatcher_DedupsDuplicateLeaseUUIDs(t *testing.T) {
+	var mu sync.Mutex
+	var ackCalls [][]string
+
+	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-a", "lease-b"},
+		acknowledgeFunc: func(_ context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			mu.Lock()
+			ackCalls = append(ackCalls, leaseUUIDs)
+			mu.Unlock()
+			return uint64(len(leaseUUIDs)), []string{"tx-dedup"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 10 * time.Second, // only batch size triggers flush
+		BatchSize:     5,                // flush exactly when all 5 requests arrive
+		LaneCount:     1,                // single lane ensures all requests land in same batch
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	// Send 5 requests with duplicates: a, b, a, a, b
+	leaseUUIDs := []string{"lease-a", "lease-b", "lease-a", "lease-a", "lease-b"}
+	results := make([]bool, len(leaseUUIDs))
+	txHashes := make([]string, len(leaseUUIDs))
+	errs := make([]error, len(leaseUUIDs))
+
+	var wg sync.WaitGroup
+	for i, uuid := range leaseUUIDs {
+		wg.Add(1)
+		go func(i int, uuid string) {
+			defer wg.Done()
+			results[i], txHashes[i], errs[i] = batcher.Acknowledge(ctx, uuid)
+		}(i, uuid)
+	}
+	wg.Wait()
+
+	// All callers must succeed
+	for i := range leaseUUIDs {
+		assert.NoError(t, errs[i], "Acknowledge[%d] error", i)
+		assert.True(t, results[i], "Acknowledge[%d] should be acknowledged", i)
+		assert.Equal(t, "tx-dedup", txHashes[i], "Acknowledge[%d] should have correct tx hash", i)
+	}
+
+	// Chain client should have received each UUID exactly once
+	mu.Lock()
+	defer mu.Unlock()
+	allUUIDs := make(map[string]int)
+	for _, batch := range ackCalls {
+		for _, uuid := range batch {
+			allUUIDs[uuid]++
+		}
+	}
+	assert.Len(t, allUUIDs, 2, "exactly 2 distinct UUIDs should have been sent to chain")
+	for uuid, count := range allUUIDs {
+		assert.Equal(t, 1, count, "UUID %s appeared %d times in chain calls", uuid, count)
+	}
+}
+
+func TestAckBatcher_DedupFanOutOnBatchFailure(t *testing.T) {
+	var mu sync.Mutex
+	var individualCalls []string
+
+	firstCall := &atomic.Bool{}
+	firstCall.Store(true)
+
+	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-x"},
+		acknowledgeFunc: func(_ context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			if firstCall.CompareAndSwap(true, false) {
+				// Batch call fails
+				return 0, nil, errors.New("batch failed")
+			}
+			// Individual calls succeed
+			mu.Lock()
+			individualCalls = append(individualCalls, leaseUUIDs...)
+			mu.Unlock()
+			return uint64(len(leaseUUIDs)), []string{"tx-individual"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 10 * time.Second, // only batch size triggers flush
+		BatchSize:     3,                // flush exactly when all 3 arrive
+		LaneCount:     1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	// Send 3 requests for the same UUID (simulating retries)
+	results := make([]bool, 3)
+	errs := make([]error, 3)
+
+	var wg sync.WaitGroup
+	for i := range 3 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], _, errs[i] = batcher.Acknowledge(ctx, "lease-x")
+		}(i)
+	}
+	wg.Wait()
+
+	// All callers must succeed (individual fallback handles it)
+	for i := range 3 {
+		assert.NoError(t, errs[i], "Acknowledge[%d] error", i)
+		assert.True(t, results[i], "Acknowledge[%d] should be acknowledged", i)
+	}
+
+	// Chain client should have received the UUID exactly once in individual fallback
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"lease-x"}, individualCalls, "individual fallback should process UUID exactly once")
+}
+
 func TestAckBatcher_MultiLane_AllLanesStopped(t *testing.T) {
 	client := &mockAckChainClient{
 		pendingLeases: []string{"l1"},

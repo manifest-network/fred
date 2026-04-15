@@ -40,6 +40,14 @@ func (e *ChainTxError) IsSequenceMismatch() bool {
 	return e.Codespace == "sdk" && e.Code == 32
 }
 
+// IsTxInMempool returns true if this error indicates the transaction is already
+// in the mempool cache (SDK code 19). This happens when waitForTx times out on
+// a previous attempt and the retry re-signs with the same sequence, producing
+// identical tx bytes whose hash is still cached in the CometBFT mempool.
+func (e *ChainTxError) IsTxInMempool() bool {
+	return e.Codespace == "sdk" && e.Code == 19
+}
+
 // reExpectedSeq extracts "expected N, got M" from Cosmos SDK sequence mismatch errors.
 // False positives are prevented by the IsSequenceMismatch() guard in ExpectedSequence(),
 // which requires codespace "sdk" and code 32 before the regex is applied.

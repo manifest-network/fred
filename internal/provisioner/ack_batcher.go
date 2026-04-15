@@ -218,6 +218,32 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 			}
 		}
 
+		// Dedup by leaseUUID: keep the first request for each UUID and
+		// collect extra resultCh channels for fan-out after the batch
+		// completes. This prevents "duplicate lease_uuid" (code 9) errors
+		// that poison the entire batch when Watermill retries or repeated
+		// backend callbacks queue the same lease multiple times.
+		var dupChans map[string][]chan<- ackResult
+		{
+			seen := make(map[string]struct{}, len(pendingLeases))
+			deduped := make([]ackRequest, 0, len(pendingLeases))
+			for _, req := range pendingLeases {
+				if _, dup := seen[req.leaseUUID]; dup {
+					if dupChans == nil {
+						dupChans = make(map[string][]chan<- ackResult)
+					}
+					dupChans[req.leaseUUID] = append(dupChans[req.leaseUUID], req.resultCh)
+					slog.Debug("duplicate lease in batch, will fan out result",
+						"lease_uuid", req.leaseUUID, "lane", laneIdx,
+					)
+					continue
+				}
+				seen[req.leaseUUID] = struct{}{}
+				deduped = append(deduped, req)
+			}
+			pendingLeases = deduped
+		}
+
 		pending = pending[:0]
 
 		if len(pendingLeases) == 0 {
@@ -239,9 +265,16 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 			}
 
 			for _, req := range pendingLeases {
+				result := ackResult{acknowledged: true, txHash: txHash}
 				select {
-				case req.resultCh <- ackResult{acknowledged: true, txHash: txHash}:
+				case req.resultCh <- result:
 				default:
+				}
+				for _, ch := range dupChans[req.leaseUUID] {
+					select {
+					case ch <- result:
+					default:
+					}
 				}
 			}
 
@@ -252,7 +285,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 			slog.Warn("batch acknowledgment failed, falling back to individual acks",
 				"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
 			)
-			l.acknowledgeIndividually(ctx, pendingLeases, pendingOnChain, laneIdx)
+			l.acknowledgeIndividually(ctx, pendingLeases, pendingOnChain, dupChans, laneIdx)
 		}
 	}
 
@@ -295,12 +328,21 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 
 // acknowledgeIndividually processes each request one at a time.
 // Reuses the pendingOnChain map from the caller's flush to avoid a redundant RPC.
-func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackRequest, pendingOnChain map[string]struct{}, laneIdx int) {
+// dupChans holds extra resultCh channels from deduped requests that must receive
+// the same result as their primary (may be nil when there are no duplicates).
+func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackRequest, pendingOnChain map[string]struct{}, dupChans map[string][]chan<- ackResult, laneIdx int) {
 	for _, req := range requests {
 		if ctx.Err() != nil {
+			result := ackResult{err: ctx.Err()}
 			select {
-			case req.resultCh <- ackResult{err: ctx.Err()}:
+			case req.resultCh <- result:
 			default:
+			}
+			for _, ch := range dupChans[req.leaseUUID] {
+				select {
+				case ch <- result:
+				default:
+				}
 			}
 			continue
 		}
@@ -310,9 +352,16 @@ func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackReq
 				slog.Debug("lease not pending during individual ack, skipping",
 					"lease_uuid", req.leaseUUID, "lane", laneIdx,
 				)
+				result := ackResult{acknowledged: true, txHash: ""}
 				select {
-				case req.resultCh <- ackResult{acknowledged: true, txHash: ""}:
+				case req.resultCh <- result:
 				default:
+				}
+				for _, ch := range dupChans[req.leaseUUID] {
+					select {
+					case ch <- result:
+					default:
+					}
 				}
 				continue
 			}
@@ -334,6 +383,12 @@ func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackReq
 		select {
 		case req.resultCh <- result:
 		default:
+		}
+		for _, ch := range dupChans[req.leaseUUID] {
+			select {
+			case ch <- result:
+			default:
+			}
 		}
 
 		if ackErr != nil {
