@@ -238,6 +238,35 @@ func TestSigner_SignTx_MinimumFee(t *testing.T) {
 	assert.True(t, feeTx.GetFee().Equal(expectedFee))
 }
 
+func TestSigner_SignTx_LargeGasFeeNoOverflow(t *testing.T) {
+	// Verify that large gasLimit * gasPrice products don't overflow int64.
+	// 5e18 * 2 = 1e19 which exceeds MaxInt64 (~9.2e18) but must still
+	// produce a correct fee via math.Int arithmetic.
+	s := newTestSigner(t)
+	s.gasLimit = 5_000_000_000_000_000_000 // 5e18
+	s.gasPrice = 2
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	require.NoError(t, err)
+
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+
+	feeTx, ok := tx.(sdk.FeeTx)
+	require.True(t, ok)
+
+	// 5e18 * 2 / 1e6 = 10_000_000_000_000 (10e12)
+	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(10_000_000_000_000)))
+	assert.True(t, feeTx.GetFee().Equal(expectedFee),
+		"fee must be correct even when gasLimit*gasPrice overflows int64; got %s, want %s",
+		feeTx.GetFee(), expectedFee)
+}
+
 func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
 	s := newTestSigner(t)
 
