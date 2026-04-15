@@ -157,7 +157,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("grpc_tls_skip_verify", false)
 	v.SetDefault("gas_limit", 1500000)
 	v.SetDefault("max_gas_limit", 0) // 0 = no cap; if set, caps the gas limit during out-of-gas retries
-	v.SetDefault("gas_price", 25)    // price per gas unit in smallest denom
+	v.SetDefault("gas_price", 25)    // micro-units of fee_denom per gas unit; fee = gas_limit * gas_price / 1_000_000
 	v.SetDefault("fee_denom", "umfx")
 
 	// Timeout defaults

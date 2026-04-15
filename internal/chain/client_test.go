@@ -877,7 +877,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "MEMPOOL_TX", hash)
 	})
@@ -917,7 +917,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "MEMPOOL_DELAYED", hash)
 		assert.GreaterOrEqual(t, int(getTxCalls.Load()), 3)
@@ -953,7 +953,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
