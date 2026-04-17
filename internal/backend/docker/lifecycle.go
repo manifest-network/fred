@@ -1196,10 +1196,12 @@ func isNameInUse(err error) bool {
 // collision on create) is safe to adopt in place of creating a new one.
 // It returns the existing container's ID on success, or a descriptive
 // error on mismatch. The predicate is strict: the existing container
-// must carry our lease UUID, the same image, and the same fail count.
-// Any difference means the caller's intent has drifted from what's
-// actually running (e.g. a payload mutated between attempts), so
-// adopting would silently run stale configuration.
+// must be fred-managed, owned by this backend instance, carry our lease
+// UUID, match our image and fail count, and not already be dying. Any
+// difference means the caller's intent has drifted from what's running
+// (e.g. a payload mutated between attempts, or the container is already
+// on its way out), so adopting would either silently run stale
+// configuration or hand back an ID that's about to vanish.
 func validateAdoption(existing container.InspectResponse, params CreateContainerParams, containerName string) (string, error) {
 	if existing.Config == nil {
 		return "", fmt.Errorf("create container failed: name %q in use and inspect returned no config", containerName)
@@ -1207,12 +1209,19 @@ func validateAdoption(existing container.InspectResponse, params CreateContainer
 	existingFailCount := existing.Config.Labels[LabelFailCount]
 	wantFailCount := strconv.Itoa(params.FailCount)
 	switch {
+	case existing.Config.Labels[LabelManaged] != "true":
+		return "", fmt.Errorf("create container failed: name %q in use by container not managed by Fred", containerName)
+	case existing.Config.Labels[LabelBackendName] != params.BackendName:
+		return "", fmt.Errorf("create container failed: name %q in use by container from backend %q, want %q", containerName, existing.Config.Labels[LabelBackendName], params.BackendName)
 	case existing.Config.Labels[LabelLeaseUUID] != params.LeaseUUID:
 		return "", fmt.Errorf("create container failed: name %q in use by container not owned by lease %s", containerName, params.LeaseUUID)
 	case existing.Config.Image != params.Manifest.Image:
 		return "", fmt.Errorf("create container failed: name %q in use by container with image %q, want %q", containerName, existing.Config.Image, params.Manifest.Image)
 	case existingFailCount != wantFailCount:
 		return "", fmt.Errorf("create container failed: name %q in use by container at fail_count=%s, want %s", containerName, existingFailCount, wantFailCount)
+	}
+	if existing.State != nil && existing.State.Status == container.StateRemoving {
+		return "", fmt.Errorf("create container failed: name %q in use by container being removed; retry after removal completes", containerName)
 	}
 	return existing.ID, nil
 }
@@ -1256,41 +1265,40 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 }
 
 // waitForContainerGone polls ContainerInspect until the container is no
-// longer found, the context is canceled, or containerRemovalPollTimeout
-// elapses. Returns nil once Docker reports NotFound. Non-NotFound inspect
-// errors (transient daemon/API issues) don't abort the poll — the daemon
-// may recover within the window — but the most recent one is surfaced in
-// the timeout error so operators aren't left guessing what went wrong.
-// On timeout we say "not confirmed removed" rather than "still present"
-// because inspect may have failed every time; we only know we never saw
-// NotFound.
+// longer found, the parent context is canceled, or containerRemovalPollTimeout
+// elapses. Returns nil once Docker reports NotFound. A derived context bounds
+// each inspect so a hung Docker API can't stretch the wait past our limit.
+// Non-NotFound inspect errors (transient daemon/API issues) don't abort the
+// poll — the daemon may recover within the window — but the most recent one
+// is surfaced in the timeout error. On timeout we say "not confirmed removed"
+// rather than "still present" because inspect may have failed every time; we
+// only know we never saw NotFound.
 func (d *DockerClient) waitForContainerGone(ctx context.Context, containerID string) error {
-	deadline := time.Now().Add(containerRemovalPollTimeout)
+	waitCtx, cancel := context.WithTimeout(ctx, containerRemovalPollTimeout)
+	defer cancel()
+
 	ticker := time.NewTicker(containerRemovalPollInterval)
 	defer ticker.Stop()
 	var lastInspectErr error
 	for {
-		_, inspectErr := d.client.ContainerInspect(ctx, containerID)
+		_, inspectErr := d.client.ContainerInspect(waitCtx, containerID)
 		if inspectErr != nil {
 			if client.IsErrNotFound(inspectErr) {
 				return nil
 			}
-			// Context errors are terminal — surface them immediately
-			// instead of burning one more poll iteration.
-			if errors.Is(inspectErr, context.Canceled) || errors.Is(inspectErr, context.DeadlineExceeded) {
-				return ctx.Err()
-			}
 			lastInspectErr = inspectErr
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-waitCtx.Done():
+			// Parent canceled/timed out: propagate parent's error as-is.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Our derived timeout fired — container still not confirmed gone.
 			if lastInspectErr != nil {
 				return fmt.Errorf("container %s not confirmed removed after %s; last inspect error: %w", containerID, containerRemovalPollTimeout, lastInspectErr)
 			}
 			return fmt.Errorf("container %s not confirmed removed after %s", containerID, containerRemovalPollTimeout)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
 		case <-ticker.C:
 		}
 	}

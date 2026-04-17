@@ -277,14 +277,16 @@ func TestIsRemovalInProgress(t *testing.T) {
 
 func TestValidateAdoption(t *testing.T) {
 	const (
-		name  = "fred-lease-abc-web-0"
-		lease = "lease-abc"
-		image = "nginx:1.25"
+		name    = "fred-lease-abc-web-0"
+		lease   = "lease-abc"
+		image   = "nginx:1.25"
+		backend = "docker-primary"
 	)
 	params := CreateContainerParams{
-		LeaseUUID: lease,
-		Manifest:  &DockerManifest{Image: image},
-		FailCount: 0,
+		LeaseUUID:   lease,
+		Manifest:    &DockerManifest{Image: image},
+		FailCount:   0,
+		BackendName: backend,
 	}
 
 	mkExisting := func(labels map[string]string, img string) container.InspectResponse {
@@ -297,8 +299,10 @@ func TestValidateAdoption(t *testing.T) {
 		}
 	}
 	goodLabels := map[string]string{
-		LabelLeaseUUID: lease,
-		LabelFailCount: "0",
+		LabelManaged:     "true",
+		LabelBackendName: backend,
+		LabelLeaseUUID:   lease,
+		LabelFailCount:   "0",
 	}
 
 	t.Run("happy path adopts", func(t *testing.T) {
@@ -318,11 +322,47 @@ func TestValidateAdoption(t *testing.T) {
 		assert.Contains(t, err.Error(), "inspect returned no config")
 	})
 
-	t.Run("lease UUID mismatch", func(t *testing.T) {
-		badLabels := map[string]string{
-			LabelLeaseUUID: "some-other-lease",
-			LabelFailCount: "0",
+	// cloneLabels returns a copy of goodLabels so tests can mutate without
+	// affecting sibling cases.
+	cloneLabels := func() map[string]string {
+		out := make(map[string]string, len(goodLabels))
+		for k, v := range goodLabels {
+			out[k] = v
 		}
+		return out
+	}
+
+	t.Run("missing fred.managed label is rejected", func(t *testing.T) {
+		badLabels := cloneLabels()
+		delete(badLabels, LabelManaged)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "not managed by Fred")
+	})
+
+	t.Run("backend name mismatch is rejected", func(t *testing.T) {
+		badLabels := cloneLabels()
+		badLabels[LabelBackendName] = "docker-other"
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), `from backend "docker-other"`)
+		assert.Contains(t, err.Error(), `want "docker-primary"`)
+	})
+
+	t.Run("missing backend name label is rejected", func(t *testing.T) {
+		badLabels := cloneLabels()
+		delete(badLabels, LabelBackendName)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "from backend")
+	})
+
+	t.Run("lease UUID mismatch", func(t *testing.T) {
+		badLabels := cloneLabels()
+		badLabels[LabelLeaseUUID] = "some-other-lease"
 		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
 		require.Error(t, err)
 		assert.Empty(t, id)
@@ -330,9 +370,8 @@ func TestValidateAdoption(t *testing.T) {
 	})
 
 	t.Run("missing lease label is rejected", func(t *testing.T) {
-		badLabels := map[string]string{
-			LabelFailCount: "0",
-		}
+		badLabels := cloneLabels()
+		delete(badLabels, LabelLeaseUUID)
 		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
 		require.Error(t, err)
 		assert.Empty(t, id)
@@ -348,10 +387,8 @@ func TestValidateAdoption(t *testing.T) {
 	})
 
 	t.Run("fail count mismatch", func(t *testing.T) {
-		badLabels := map[string]string{
-			LabelLeaseUUID: lease,
-			LabelFailCount: "3",
-		}
+		badLabels := cloneLabels()
+		badLabels[LabelFailCount] = "3"
 		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
 		require.Error(t, err)
 		assert.Empty(t, id)
@@ -372,11 +409,45 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("missing fail count label is treated as mismatch when caller has retries", func(t *testing.T) {
 		retryParams := params
 		retryParams.FailCount = 1
-		labelsNoFailCount := map[string]string{LabelLeaseUUID: lease}
+		labelsNoFailCount := cloneLabels()
+		delete(labelsNoFailCount, LabelFailCount)
 		id, err := validateAdoption(mkExisting(labelsNoFailCount, image), retryParams, name)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "fail_count=")
+	})
+
+	t.Run("container in removing state is rejected", func(t *testing.T) {
+		existing := container.InspectResponse{
+			ContainerJSONBase: &container.ContainerJSONBase{
+				ID:    "existing-id",
+				State: &container.State{Status: container.StateRemoving},
+			},
+			Config: &container.Config{
+				Image:  image,
+				Labels: goodLabels,
+			},
+		}
+		id, err := validateAdoption(existing, params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "being removed")
+	})
+
+	t.Run("container in running state is still adopted", func(t *testing.T) {
+		existing := container.InspectResponse{
+			ContainerJSONBase: &container.ContainerJSONBase{
+				ID:    "existing-id",
+				State: &container.State{Status: container.StateRunning},
+			},
+			Config: &container.Config{
+				Image:  image,
+				Labels: goodLabels,
+			},
+		}
+		id, err := validateAdoption(existing, params, name)
+		require.NoError(t, err)
+		assert.Equal(t, "existing-id", id)
 	})
 }
 
