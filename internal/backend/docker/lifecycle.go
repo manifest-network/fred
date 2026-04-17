@@ -1243,6 +1243,7 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 			// nil; otherwise downstream volume destroy / name re-use
 			// races against bind mounts that Docker hasn't released yet.
 			if waitErr := d.waitForContainerGone(ctx, containerID); waitErr != nil {
+				containerRemovalWaitFailuresTotal.Inc()
 				return fmt.Errorf("failed to remove container: wait after in-progress conflict failed: %w", waitErr)
 			}
 			idempotentOpsTotal.WithLabelValues("remove", "in_progress").Inc()
@@ -1270,10 +1271,15 @@ func (d *DockerClient) waitForContainerGone(ctx context.Context, containerID str
 	var lastInspectErr error
 	for {
 		_, inspectErr := d.client.ContainerInspect(ctx, containerID)
-		if inspectErr != nil && client.IsErrNotFound(inspectErr) {
-			return nil
-		}
 		if inspectErr != nil {
+			if client.IsErrNotFound(inspectErr) {
+				return nil
+			}
+			// Context errors are terminal — surface them immediately
+			// instead of burning one more poll iteration.
+			if errors.Is(inspectErr, context.Canceled) || errors.Is(inspectErr, context.DeadlineExceeded) {
+				return ctx.Err()
+			}
 			lastInspectErr = inspectErr
 		}
 		if time.Now().After(deadline) {
