@@ -206,6 +206,40 @@ func TestHandleContainerDeath_UnknownContainer(t *testing.T) {
 	b.provisionsMu.RUnlock()
 }
 
+// TestHandleContainerDeath_SkipsDeprovisioning guards the recover.go:506 status
+// guard: die events emitted by RemoveContainer during an in-flight Deprovision
+// must NOT trigger the ready→failed transition (which would send a spurious
+// failure callback and decrement the gauge twice). The `!= Ready` filter
+// already covers Deprovisioning; this test prevents a future narrowing of the
+// guard from re-introducing the bug.
+func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
+	inspectCalled := false
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			inspectCalled = true
+			return nil, nil
+		},
+	}
+
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			ContainerIDs: []string{"c1"},
+			Status:       backend.ProvisionStatusDeprovisioning,
+			FailCount:    0,
+		},
+	})
+
+	b.handleContainerDeath("c1")
+
+	assert.False(t, inspectCalled, "should short-circuit before InspectContainer when status is Deprovisioning")
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	assert.Equal(t, backend.ProvisionStatusDeprovisioning, prov.Status, "status must not change")
+	assert.Equal(t, 0, prov.FailCount, "fail count must not increment")
+	b.provisionsMu.RUnlock()
+}
+
 func TestFindLeaseByContainerID(t *testing.T) {
 	b := newBackendForTest(nil, map[string]*provision{
 		"lease-1": {

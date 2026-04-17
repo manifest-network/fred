@@ -158,6 +158,27 @@ func TestProvision_AlreadyProvisioned(t *testing.T) {
 	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
 }
 
+// TestProvision_RejectsWhileDeprovisioning guards the provision.go:49 status
+// guard: a concurrent Deprovision (which sets Status=Deprovisioning) must
+// block re-provision. The reconciler retries on the next cycle once the
+// Deprovision completes and removes the entry. Without this, a re-provision
+// races with RemoveContainer and corrupts state.
+func TestProvision_RejectsWhileDeprovisioning(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusDeprovisioning,
+		},
+	})
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	err := b.Provision(context.Background(), req)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
+}
+
 func TestProvision_ReProvisionFailed(t *testing.T) {
 	removeCalled := false
 	mock := &mockDockerClient{
