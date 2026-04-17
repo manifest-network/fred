@@ -217,21 +217,27 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		switch callback.Status {
 		case backend.CallbackStatusSuccess:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
+			slog.Info("published event for non-in-flight callback (restart/update)",
+				"lease_uuid", callback.LeaseUUID,
+				"status", callback.Status,
+			)
 		case backend.CallbackStatusFailed:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
+			slog.Info("published event for non-in-flight callback (restart/update)",
+				"lease_uuid", callback.LeaseUUID,
+				"status", callback.Status,
+			)
 		case backend.CallbackStatusDeprovisioned:
 			// No lease event: backend has already torn down the lease.
+			slog.Info("recorded non-in-flight deprovisioned callback (no lease event)",
+				"lease_uuid", callback.LeaseUUID,
+			)
 		default:
 			slog.Warn("unexpected callback status for non-in-flight lease",
 				"lease_uuid", callback.LeaseUUID,
 				"status", callback.Status,
 			)
-			return nil
 		}
-		slog.Info("published event for non-in-flight callback (restart/update)",
-			"lease_uuid", callback.LeaseUUID,
-			"status", callback.Status,
-		)
 		return nil
 	}
 
