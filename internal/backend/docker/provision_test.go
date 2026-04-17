@@ -1575,13 +1575,14 @@ func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
 		},
 	}
 
-	var callbackCount atomic.Int32
-	var lastStatus backend.CallbackStatus
+	// Buffered channel carries the callback payload from the httptest handler
+	// goroutine to the test goroutine with a defined happens-before relation.
+	// Buffer >1 catches accidental extra callbacks without blocking the handler.
+	received := make(chan backend.CallbackPayload, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p backend.CallbackPayload
 		json.NewDecoder(r.Body).Decode(&p)
-		callbackCount.Add(1)
-		lastStatus = p.Status
+		received <- p
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -1602,19 +1603,31 @@ func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
 
 	// First call: partial failure on c2. Callback fires synchronously on the
 	// success path; a partial failure returns early before reaching it, so
-	// observing 0 callbacks post-return is deterministic.
+	// the channel must be empty when Deprovision returns.
 	require.Error(t, b.Deprovision(context.Background(), "lease-1"))
-	assert.Equal(t, int32(0), callbackCount.Load(),
-		"partial failure must not fire a terminal callback")
+	select {
+	case p := <-received:
+		t.Fatalf("partial failure must not fire a terminal callback, got %+v", p)
+	default:
+	}
 
 	// Flip the switch so the second call can remove c2.
 	failStuck.Store(false)
 	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
 
-	require.Eventually(t, func() bool {
-		return callbackCount.Load() == 1
-	}, 2*time.Second, 10*time.Millisecond)
-	assert.Equal(t, backend.CallbackStatusDeprovisioned, lastStatus)
+	select {
+	case p := <-received:
+		assert.Equal(t, backend.CallbackStatusDeprovisioned, p.Status)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for terminal callback")
+	}
+
+	// No further callbacks should arrive.
+	select {
+	case p := <-received:
+		t.Fatalf("unexpected extra callback: %+v", p)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 // --- GetInfo tests ---
