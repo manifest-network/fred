@@ -39,7 +39,9 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 
 	// Atomically check-and-reserve the provision slot (fixes TOCTOU race).
 	// Allow re-provisioning if the existing provision has failed (e.g., container
-	// crashed and reconciler is retrying).
+	// crashed and reconciler is retrying). Deprovisioning, Provisioning,
+	// Restarting, Updating, and Ready are all in-flight or live states that
+	// must not be re-provisioned until they reach Failed or are removed.
 	var prevFailCount int
 	var oldContainerIDs []string
 	var oldQuantity int
@@ -609,7 +611,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 			// Send hardcoded callback message — never includes logs or dynamic data.
 			// Full diagnostics remain in prov.LastError for authenticated API access.
-			b.sendCallback(req.LeaseUUID, false, callbackErr)
+			b.sendCallback(req.LeaseUUID, backend.CallbackStatusFailed, callbackErr)
 			return
 		}
 
@@ -646,7 +648,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 
 		updateResourceMetrics(b.pool.Stats())
-		b.sendCallback(req.LeaseUUID, true, "")
+		b.sendCallback(req.LeaseUUID, backend.CallbackStatusSuccess, "")
 	}()
 
 	// Check for early cancellation (e.g., shutdown requested before we started)
@@ -875,7 +877,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 					logger.Warn("failed to cleanup volume after error", "volume_id", volumeID, "error", volErr)
 				}
 			}
-			b.sendCallback(req.LeaseUUID, false, callbackErr)
+			b.sendCallback(req.LeaseUUID, backend.CallbackStatusFailed, callbackErr)
 			return
 		}
 
@@ -908,7 +910,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		}
 
 		updateResourceMetrics(b.pool.Stats())
-		b.sendCallback(req.LeaseUUID, true, "")
+		b.sendCallback(req.LeaseUUID, backend.CallbackStatusSuccess, "")
 	}()
 
 	if ctx.Err() != nil {

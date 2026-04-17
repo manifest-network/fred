@@ -598,6 +598,7 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 // handleProvisionError handles errors from provisioning attempts during reconciliation.
 // It determines the appropriate action based on error type and lease state:
 //   - errLeaseAlreadyInFlight: skip (not a real error)
+//   - backend.ErrAlreadyProvisioned: skip (transient race with concurrent Deprovision)
 //   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
 //   - ErrValidation: reject (PENDING) or close (ACTIVE) the lease
 //   - ErrCircuitOpen: reject (PENDING) or close (ACTIVE) the lease
@@ -605,6 +606,13 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseUUID string, lease billingtypes.Lease, hadError *bool) {
 	if errors.Is(err, errLeaseAlreadyInFlight) {
 		slog.Debug("reconcile: lease already in-flight, skipping", "lease_uuid", leaseUUID)
+		return
+	}
+	if errors.Is(err, backend.ErrAlreadyProvisioned) {
+		// Benign race: backend is concurrently Ready/Provisioning/Deprovisioning. Retry next cycle.
+		slog.Debug("reconcile: backend reports already-provisioned, retry next cycle",
+			"lease_uuid", leaseUUID,
+		)
 		return
 	}
 

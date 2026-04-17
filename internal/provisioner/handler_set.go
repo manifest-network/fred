@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sync"
 	"time"
 
@@ -202,12 +203,24 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	// the ready/failed transition, but skip chain operations.
 	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
 	if !exists {
-		metrics.NonInFlightCallbacksTotal.Inc()
+		backendLabel := sanitizeBackendName(callback.Backend)
+		statusLabel := sanitizeCallbackStatus(callback.Status)
+		if backendLabel == labelBackendInvalid || statusLabel == labelStatusOther {
+			slog.Warn("sanitized callback label to bounded value",
+				"lease_uuid", callback.LeaseUUID,
+				"received_backend", callback.Backend,
+				"received_status", callback.Status,
+			)
+		}
+		metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
+
 		switch callback.Status {
 		case backend.CallbackStatusSuccess:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
 		case backend.CallbackStatusFailed:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
+		case backend.CallbackStatusDeprovisioned:
+			// No lease event: backend has already torn down the lease.
 		default:
 			slog.Warn("unexpected callback status for non-in-flight lease",
 				"lease_uuid", callback.LeaseUUID,
@@ -523,4 +536,36 @@ func (h *HandlerSet) publishLeaseEvent(leaseUUID string, status backend.Provisio
 	if err := h.deps.Publisher.Publish(TopicLeaseEvent, msg); err != nil {
 		slog.Warn("failed to publish lease event", "lease_uuid", leaseUUID, "error", err)
 	}
+}
+
+// Label sentinels for sanitized Prom label values.
+const (
+	labelBackendUnknown = "unknown"
+	labelBackendInvalid = "invalid"
+	labelStatusOther    = "other"
+)
+
+// backendNameRe matches operator-chosen backend names (e.g. "docker",
+// "docker-prod-01", "docker.us-east"). Compiled once to bound label
+// cardinality on NonInFlightCallbacksTotal.
+var backendNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// Keep in sync with CallbackStatus* constants in internal/backend/client.go.
+func sanitizeCallbackStatus(s backend.CallbackStatus) string {
+	switch s {
+	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed, backend.CallbackStatusDeprovisioned:
+		return string(s)
+	default:
+		return labelStatusOther
+	}
+}
+
+func sanitizeBackendName(name string) string {
+	if name == "" {
+		return labelBackendUnknown
+	}
+	if !backendNameRe.MatchString(name) {
+		return labelBackendInvalid
+	}
+	return name
 }

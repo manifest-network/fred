@@ -132,6 +132,7 @@ func main() {
 		backend:        mockBackend,
 		httpClient:     httpClient,
 		callbackSecret: callbackSecret,
+		name:           name,
 		callbackURLs:   make(map[string]string),
 	}
 
@@ -192,6 +193,7 @@ type MockBackendServer struct {
 	backend        *backend.MockBackend
 	httpClient     *http.Client
 	callbackSecret string // HMAC secret for signing callbacks
+	name           string // backend name, set on callback payloads for per-backend metrics
 
 	// Per-lease callback URLs to avoid race conditions with concurrent provisions
 	callbackURLs   map[string]string
@@ -443,6 +445,7 @@ func (s *MockBackendServer) handleCallback(payload backend.CallbackPayload) {
 		return
 	}
 
+	payload.Backend = s.name
 	s.sendCallback(callbackURL, payload)
 }
 

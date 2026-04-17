@@ -169,7 +169,24 @@ func TestHandleProvisionCallback_InvalidStatus(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, pub.called)
-	assertErrorBody(t, rr, "status must be 'success' or 'failed'")
+	assertErrorBody(t, rr, "status must be 'success', 'failed', or 'deprovisioned'")
+}
+
+// TestHandleProvisionCallback_AcceptsDeprovisioned verifies that the HTTP
+// validator lets the new CallbackStatusDeprovisioned reach the Watermill
+// publisher rather than returning 400. Without this, every deprovisioned
+// callback fails at the API boundary.
+func TestHandleProvisionCallback_AcceptsDeprovisioned(t *testing.T) {
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+	pub := &capturingCallbackPublisher{}
+	srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
+
+	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"deprovisioned"}`
+	rr := httptest.NewRecorder()
+	srv.handleProvisionCallback(rr, signedRequest(t, auth, body))
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, pub.called)
 }
 
 func TestHandleProvisionCallback_PublishError(t *testing.T) {

@@ -209,8 +209,9 @@ type ListProvisionsResponse struct {
 // CallbackPayload is sent by backends to fred's callback endpoint.
 type CallbackPayload struct {
 	LeaseUUID string         `json:"lease_uuid"`
-	Status    CallbackStatus `json:"status"` // "success" or "failed"
+	Status    CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
 	Error     string         `json:"error,omitempty"`
+	Backend   string         `json:"backend,omitempty"` // Backend name; empty from pre-upgrade senders.
 }
 
 // RestartRequest contains the data needed to restart a lease's containers.
@@ -248,12 +249,13 @@ type ProvisionStatus string
 
 // Provision status constants.
 const (
-	ProvisionStatusProvisioning ProvisionStatus = "provisioning"
-	ProvisionStatusReady        ProvisionStatus = "ready"
-	ProvisionStatusFailed       ProvisionStatus = "failed"
-	ProvisionStatusUnknown      ProvisionStatus = "unknown"
-	ProvisionStatusRestarting   ProvisionStatus = "restarting"
-	ProvisionStatusUpdating     ProvisionStatus = "updating"
+	ProvisionStatusProvisioning   ProvisionStatus = "provisioning"
+	ProvisionStatusReady          ProvisionStatus = "ready"
+	ProvisionStatusFailed         ProvisionStatus = "failed"
+	ProvisionStatusUnknown        ProvisionStatus = "unknown"
+	ProvisionStatusRestarting     ProvisionStatus = "restarting"
+	ProvisionStatusUpdating       ProvisionStatus = "updating"
+	ProvisionStatusDeprovisioning ProvisionStatus = "deprovisioning"
 )
 
 // CallbackStatus represents the status sent in a callback payload.
@@ -261,8 +263,9 @@ type CallbackStatus string
 
 // Callback status constants.
 const (
-	CallbackStatusSuccess CallbackStatus = "success"
-	CallbackStatusFailed  CallbackStatus = "failed"
+	CallbackStatusSuccess       CallbackStatus = "success"
+	CallbackStatusFailed        CallbackStatus = "failed"
+	CallbackStatusDeprovisioned CallbackStatus = "deprovisioned"
 )
 
 // ErrValidation is returned when a provision request fails pre-flight validation

@@ -1334,7 +1334,10 @@ func TestPublishLeaseEvent_PublishError(t *testing.T) {
 // --- Metric tests ---
 
 func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallbacks(t *testing.T) {
-	before := promtestutil.ToFloat64(metrics.NonInFlightCallbacksTotal)
+	// Counter is labeled {backend, status}; the payload below lacks a Backend
+	// field so sanitizeBackendName collapses it to "unknown".
+	labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues("unknown", "success")
+	before := promtestutil.ToFloat64(labeled)
 
 	hs := NewHandlerSet(HandlerDeps{
 		Tracker: NewInFlightTracker(),
@@ -1348,8 +1351,74 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallb
 	err := hs.HandleBackendCallback(msg)
 	assert.NoError(t, err)
 
-	after := promtestutil.ToFloat64(metrics.NonInFlightCallbacksTotal)
+	after := promtestutil.ToFloat64(labeled)
 	assert.Equal(t, 1.0, after-before, "NonInFlightCallbacksTotal should increment by 1")
+}
+
+// TestHandleBackendCallback_DeprovisionedNonInFlight verifies that the new
+// deprovisioned status increments the metric with the correct labels and
+// does NOT publish a lease event (the lease is torn down, no transition to
+// re-surface).
+func TestHandleBackendCallback_DeprovisionedNonInFlight(t *testing.T) {
+	labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues("docker", "deprovisioned")
+	before := promtestutil.ToFloat64(labeled)
+
+	pub := newMockPublisher()
+	hs := NewHandlerSet(HandlerDeps{
+		Tracker:   NewInFlightTracker(),
+		Publisher: pub,
+	})
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-1",
+		Status:    backend.CallbackStatusDeprovisioned,
+		Backend:   "docker",
+	})
+	require.NoError(t, hs.HandleBackendCallback(msg))
+
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(labeled)-before)
+
+	pub.mu.Lock()
+	msgs := pub.published[TopicLeaseEvent]
+	pub.mu.Unlock()
+	assert.Empty(t, msgs, "deprovisioned must not publish a lease event")
+}
+
+// TestHandleBackendCallback_SanitizesLabels verifies that malformed or empty
+// backend and status fields are bounded to a small set of label values,
+// preventing Prometheus cardinality blow-up from untrusted callback payloads.
+func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
+	tests := []struct {
+		name        string
+		payloadBE   string
+		payloadStat backend.CallbackStatus
+		wantBackend string
+		wantStatus  string
+	}{
+		{"empty backend routes to unknown", "", backend.CallbackStatusSuccess, "unknown", "success"},
+		{"bad-char backend routes to invalid", "bad!name", backend.CallbackStatusSuccess, "invalid", "success"},
+		{"overlong backend routes to invalid", strings.Repeat("a", 65), backend.CallbackStatusSuccess, "invalid", "success"},
+		{"unknown status routes to other", "docker", "garbage", "docker", "other"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues(tc.wantBackend, tc.wantStatus)
+			before := promtestutil.ToFloat64(labeled)
+
+			hs := NewHandlerSet(HandlerDeps{
+				Tracker:   NewInFlightTracker(),
+				Publisher: newMockPublisher(),
+			})
+			msg := newCallbackMsg(t, backend.CallbackPayload{
+				LeaseUUID: "lease-1",
+				Status:    tc.payloadStat,
+				Backend:   tc.payloadBE,
+			})
+			require.NoError(t, hs.HandleBackendCallback(msg))
+
+			assert.Equal(t, 1.0, promtestutil.ToFloat64(labeled)-before)
+		})
+	}
 }
 
 func TestHandlerSet_LeasesAwaitingGauge_MatchesMapSize(t *testing.T) {

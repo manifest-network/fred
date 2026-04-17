@@ -1435,6 +1435,167 @@ func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
 	assert.False(t, exists, "provision should be removed after max volume cleanup attempts")
 }
 
+// TestDeprovision_SendsDeprovisionedCallback verifies that a clean successful
+// Deprovision fires exactly one callback with status=deprovisioned and the
+// backend name populated. Regression test for the 34 spurious failure events
+// observed on the "Provision Rate by Outcome" dashboard.
+func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
+	var received backend.CallbackPayload
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     1,
+			ContainerIDs: []string{"c1"},
+			CallbackURL:  server.URL,
+		},
+	})
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	assert.Equal(t, "lease-1", received.LeaseUUID)
+	assert.Equal(t, backend.CallbackStatusDeprovisioned, received.Status)
+	assert.Empty(t, received.Error)
+	assert.NotEmpty(t, received.Backend, "backend name should be populated for per-backend metrics")
+}
+
+// TestDeprovision_VolumeExhaustionSendsFailedCallback verifies that the
+// max-attempts-exhausted volume cleanup path fires a failed callback with a
+// hardcoded message. Pre-existing gap: that path used to send nothing, leaving
+// Fred unaware the lease had become terminal.
+func TestDeprovision_VolumeExhaustionSendsFailedCallback(t *testing.T) {
+	var received backend.CallbackPayload
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	vm := &mockVolumeManager{
+		DestroyFn: func(ctx context.Context, id string) error {
+			return fmt.Errorf("permission denied")
+		},
+	}
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:             "lease-1",
+			Tenant:                "tenant-a",
+			Status:                backend.ProvisionStatusFailed,
+			Quantity:              1,
+			ContainerIDs:          nil,
+			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
+			CallbackURL:           server.URL,
+		},
+	})
+	b.volumes = vm
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for exhaustion callback")
+	}
+
+	assert.Equal(t, backend.CallbackStatusFailed, received.Status)
+	assert.Equal(t, "volume cleanup exhausted", received.Error)
+}
+
+// TestDeprovision_RetryAfterPartialFailureFiresOneCallback verifies that the
+// terminal callback only fires on clean completion. A first call that hits a
+// partial-container-failure path emits no callback; a successful retry emits
+// exactly one deprovisioned callback.
+func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
+	// failStuck is true during the first call (makes c2 unremovable), toggled
+	// to false before the retry so the second call succeeds.
+	var failStuck atomic.Bool
+	failStuck.Store(true)
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			if failStuck.Load() && containerID == "c2" {
+				return errors.New("permission denied")
+			}
+			return nil
+		},
+	}
+
+	var callbackCount atomic.Int32
+	var lastStatus backend.CallbackStatus
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		callbackCount.Add(1)
+		lastStatus = p.Status
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     2,
+			ContainerIDs: []string{"c1", "c2"},
+			CallbackURL:  server.URL,
+		},
+	})
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	// First call: partial failure on c2. Callback fires synchronously on the
+	// success path; a partial failure returns early before reaching it, so
+	// observing 0 callbacks post-return is deterministic.
+	require.Error(t, b.Deprovision(context.Background(), "lease-1"))
+	assert.Equal(t, int32(0), callbackCount.Load(),
+		"partial failure must not fire a terminal callback")
+
+	// Flip the switch so the second call can remove c2.
+	failStuck.Store(false)
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+
+	require.Eventually(t, func() bool {
+		return callbackCount.Load() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+	assert.Equal(t, backend.CallbackStatusDeprovisioned, lastStatus)
+}
+
 // --- GetInfo tests ---
 
 func TestGetInfo_Success(t *testing.T) {
@@ -1876,7 +2037,7 @@ func TestSendCallback_Success(t *testing.T) {
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b)
 
-	b.sendCallback("lease-1", true, "")
+	b.sendCallback("lease-1", backend.CallbackStatusSuccess, "")
 
 	assert.Equal(t, "lease-1", received.LeaseUUID)
 	assert.Equal(t, backend.CallbackStatusSuccess, received.Status)
@@ -1899,7 +2060,7 @@ func TestSendCallback_FailurePayload(t *testing.T) {
 	b.httpClient = server.Client()
 	rebuildCallbackSender(b)
 
-	b.sendCallback("lease-1", false, "image pull failed")
+	b.sendCallback("lease-1", backend.CallbackStatusFailed, "image pull failed")
 
 	assert.Equal(t, backend.CallbackStatusFailed, received.Status)
 	assert.Equal(t, "image pull failed", received.Error)
@@ -1909,7 +2070,7 @@ func TestSendCallback_NoCallbackURL(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	// No panic, no error — just a log warning
-	b.sendCallback("unknown-lease", true, "")
+	b.sendCallback("unknown-lease", backend.CallbackStatusSuccess, "")
 }
 
 func TestSendCallback_TruncatesLongError(t *testing.T) {
@@ -1929,7 +2090,7 @@ func TestSendCallback_TruncatesLongError(t *testing.T) {
 
 	// Send an error message that exceeds the on-chain rejection reason limit.
 	longError := strings.Repeat("x", callbackMaxErrorLen+100)
-	b.sendCallback("lease-1", false, longError)
+	b.sendCallback("lease-1", backend.CallbackStatusFailed, longError)
 
 	assert.LessOrEqual(t, len(received.Error), callbackMaxErrorLen,
 		"callback error should be truncated to fit on-chain limit")
@@ -1956,7 +2117,7 @@ func TestSendCallback_Retry(t *testing.T) {
 	b.httpClient = server.Client()
 	rebuildCallbackSender(b)
 
-	b.sendCallback("lease-1", true, "")
+	b.sendCallback("lease-1", backend.CallbackStatusSuccess, "")
 
 	assert.Equal(t, int32(3), attempts.Load(), "should have retried 3 times")
 }
@@ -1991,7 +2152,7 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 		b.stopCancel()
 	}()
 
-	b.sendCallback("lease-1", true, "")
+	b.sendCallback("lease-1", backend.CallbackStatusSuccess, "")
 
 	// Should have stopped after 1 attempt due to shutdown
 	assert.LessOrEqual(t, attempts.Load(), int32(2))
@@ -2534,7 +2695,7 @@ func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
 	b.callbackStore = cbStore
 	rebuildCallbackSender(b)
 
-	b.sendCallback("lease-1", true, "")
+	b.sendCallback("lease-1", backend.CallbackStatusSuccess, "")
 
 	// After successful delivery, callback should be removed from store
 	pending, err := cbStore.ListPending()
@@ -2563,7 +2724,7 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 	b.callbackStore = cbStore
 	rebuildCallbackSender(b)
 
-	b.sendCallback("lease-1", false, "container crashed")
+	b.sendCallback("lease-1", backend.CallbackStatusFailed, "container crashed")
 
 	// After failed delivery, callback should remain in store
 	pending, err := cbStore.ListPending()

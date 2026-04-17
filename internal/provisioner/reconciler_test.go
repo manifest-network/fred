@@ -198,6 +198,36 @@ func TestNewReconciler_Validation(t *testing.T) {
 	}
 }
 
+// TestHandleProvisionError_AlreadyProvisionedBenign verifies that the
+// reconciler treats backend.ErrAlreadyProvisioned as a transient benign race
+// (e.g. concurrent Deprovision in progress) rather than setting hadError and
+// logging at Error level. Without this arm, every in-flight Deprovision spams
+// Error logs and flips the reconciler cycle from "success" to "partial" in
+// the aggregate metrics.
+func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
+	mockChain := &chain.MockClient{}
+	mockBackend := &mockReconcilerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	r, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+		mockChain, noopAck, router, nil, nil,
+	)
+	require.NoError(t, err)
+
+	lease := billingtypes.Lease{Uuid: "lease-1", Tenant: "tenant-a"}
+	hadError := false
+	r.handleProvisionError(
+		context.Background(),
+		fmt.Errorf("wrapped: %w", backend.ErrAlreadyProvisioned),
+		"lease-1",
+		lease,
+		&hadError,
+	)
+	assert.False(t, hadError, "ErrAlreadyProvisioned must be treated as benign")
+}
+
 func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	// Setup: Pending lease on chain, not provisioned on backend
 	// Expected: Start provisioning

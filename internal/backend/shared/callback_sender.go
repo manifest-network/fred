@@ -81,22 +81,20 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 
 // SendCallback sends a provision result callback with HMAC signature.
 // It persists the callback before delivery and removes it on success.
-// The caller must provide the callbackURL (resolved from its own state).
-func (s *CallbackSender) SendCallback(leaseUUID, callbackURL string, success bool, errMsg string) {
+// The caller must provide the callbackURL (resolved from its own state) and
+// the backendName (so Fred can label metrics per-backend without a placement
+// lookup, which is often already deleted for intentional deprovisions).
+func (s *CallbackSender) SendCallback(leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string) {
 	if callbackURL == "" {
 		s.logger.Warn("no callback URL for lease", "lease_uuid", leaseUUID)
 		return
-	}
-
-	status := backend.CallbackStatusSuccess
-	if !success {
-		status = backend.CallbackStatusFailed
 	}
 
 	payload := backend.CallbackPayload{
 		LeaseUUID: leaseUUID,
 		Status:    status,
 		Error:     errMsg,
+		Backend:   backendName,
 	}
 
 	body, err := json.Marshal(payload)
@@ -105,12 +103,14 @@ func (s *CallbackSender) SendCallback(leaseUUID, callbackURL string, success boo
 		return
 	}
 
-	// Persist callback before attempting delivery so it survives restarts
+	// Persist callback before attempting delivery so it survives restarts.
 	if s.store != nil {
 		if storeErr := s.store.Store(CallbackEntry{
 			LeaseUUID:   leaseUUID,
 			CallbackURL: callbackURL,
-			Success:     success,
+			Success:     status == backend.CallbackStatusSuccess,
+			Status:      status,
+			Backend:     backendName,
 			Error:       errMsg,
 			CreatedAt:   time.Now(),
 		}); storeErr != nil {
@@ -222,14 +222,19 @@ func (s *CallbackSender) ReplayPendingCallbacks() {
 
 	s.logger.Info("replaying pending callbacks", "count", len(entries))
 	for _, entry := range entries {
-		status := backend.CallbackStatusSuccess
-		if !entry.Success {
-			status = backend.CallbackStatusFailed
+		// Legacy entries have empty Status; fall back to the Success bool.
+		status := entry.Status
+		if status == "" {
+			status = backend.CallbackStatusSuccess
+			if !entry.Success {
+				status = backend.CallbackStatusFailed
+			}
 		}
 		payload := backend.CallbackPayload{
 			LeaseUUID: entry.LeaseUUID,
 			Status:    status,
 			Error:     entry.Error,
+			Backend:   entry.Backend,
 		}
 		body, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
