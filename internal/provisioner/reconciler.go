@@ -726,6 +726,18 @@ func (r *Reconciler) processLease(
 		}
 
 	case lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned && provision.Status == backend.ProvisionStatusReady:
+		// Skip leases the main flow is actively processing — the success callback
+		// will acknowledge via the same batcher. Without this guard the reconciler
+		// races the callback-driven ack, wasting txs and triggering sequence churn.
+		// Stuck-in-flight safety net: TimeoutChecker rejects the lease after the
+		// configured CallbackTimeout expires if the main flow never untracks.
+		if r.tracker != nil && r.tracker.IsInFlight(leaseUUID) {
+			metrics.ReconcilerInflightSkipsTotal.Inc()
+			slog.Debug("reconcile: skipping in-flight ready lease, main flow owns ack",
+				"lease_uuid", leaseUUID,
+			)
+			break
+		}
 		// Provisioned but not acknowledged - acknowledge now
 		if err := r.acknowledgeLease(ctx, leaseUUID); err != nil {
 			slog.Error("reconcile: failed to acknowledge lease",

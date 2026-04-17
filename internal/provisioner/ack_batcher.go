@@ -3,10 +3,15 @@ package provisioner
 import (
 	"cmp"
 	"context"
+	"errors"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // Acknowledger defines the interface for acknowledging leases on chain.
@@ -282,6 +287,35 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 				"lane", laneIdx, "count", acknowledged, "tx_hashes", txHashes,
 			)
 		} else {
+			laneLabel := strconv.Itoa(laneIdx)
+			// Fee/gas errors indicate the client broadcast-retry loop exhausted
+			// its budget (e.g. hit maxGasLimit). Splitting the batch into N
+			// individual retries would hit the same wall N times and amplify the
+			// failure. Surface the error to all callers and rely on Watermill's
+			// Retry middleware (configured in newManager) for exponential-backoff
+			// redelivery — the next attempt runs on fresh account state.
+			var chainErr *chain.ChainTxError
+			if errors.As(err, &chainErr) && (chainErr.IsInsufficientFee() || chainErr.IsOutOfGas()) {
+				metrics.AckBatchFeeGasErrorsTotal.WithLabelValues(laneLabel).Inc()
+				slog.Warn("batch acknowledgment failed with fee/gas error; surfacing to callers (not individualizing)",
+					"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
+				)
+				result := ackResult{err: err}
+				for _, req := range pendingLeases {
+					select {
+					case req.resultCh <- result:
+					default:
+					}
+					for _, ch := range dupChans[req.leaseUUID] {
+						select {
+						case ch <- result:
+						default:
+						}
+					}
+				}
+				return
+			}
+			metrics.AckBatchIndividualFallbacksTotal.WithLabelValues(laneLabel).Inc()
 			slog.Warn("batch acknowledgment failed, falling back to individual acks",
 				"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
 			)

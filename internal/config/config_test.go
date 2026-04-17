@@ -161,6 +161,7 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		WebSocketURL:              "ws://localhost:26657/websocket",
 		GasLimit:                  500000,
 		GasPrice:                  25,
+		GasAdjustment:             1.2,
 		FeeDenom:                  "umfx",
 		HTTPReadTimeout:           15 * time.Second,
 		HTTPWriteTimeout:          15 * time.Second,
@@ -197,6 +198,7 @@ func TestConfig_Validate_NoBackends(t *testing.T) {
 		RateLimitBurst:            20,
 		GasLimit:                  500000,
 		GasPrice:                  25,
+		GasAdjustment:             1.2,
 		FeeDenom:                  "umfx",
 		HTTPReadTimeout:           15 * time.Second,
 		HTTPWriteTimeout:          15 * time.Second,
@@ -234,6 +236,7 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 			RateLimitBurst:            20,
 			GasLimit:                  500000,
 			GasPrice:                  25,
+			GasAdjustment:             1.2,
 			FeeDenom:                  "umfx",
 			HTTPReadTimeout:           15 * time.Second,
 			HTTPWriteTimeout:          15 * time.Second,
@@ -310,6 +313,7 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			RateLimitBurst:            20,
 			GasLimit:                  500000,
 			GasPrice:                  25,
+			GasAdjustment:             1.2,
 			FeeDenom:                  "umfx",
 			HTTPReadTimeout:           15 * time.Second,
 			HTTPWriteTimeout:          15 * time.Second,
@@ -415,6 +419,27 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			wantErr: "gas_price cannot be negative",
 		},
 		{
+			name: "gas_adjustment below 1.0",
+			modify: func(c *Config) {
+				c.GasAdjustment = 0.9
+			},
+			wantErr: "gas_adjustment must be between 1.0 and 3.0",
+		},
+		{
+			name: "gas_adjustment above 3.0",
+			modify: func(c *Config) {
+				c.GasAdjustment = 3.5
+			},
+			wantErr: "gas_adjustment must be between 1.0 and 3.0",
+		},
+		{
+			name: "gas_adjustment NaN",
+			modify: func(c *Config) {
+				c.GasAdjustment = math.NaN()
+			},
+			wantErr: "gas_adjustment must not be NaN",
+		},
+		{
 			name: "empty fee_denom",
 			modify: func(c *Config) {
 				c.FeeDenom = ""
@@ -476,6 +501,7 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			RateLimitBurst:            20,
 			GasLimit:                  500000,
 			GasPrice:                  25,
+			GasAdjustment:             1.2,
 			FeeDenom:                  "umfx",
 			HTTPReadTimeout:           15 * time.Second,
 			HTTPWriteTimeout:          15 * time.Second,
@@ -568,6 +594,7 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			RateLimitBurst:            20,
 			GasLimit:                  500000,
 			GasPrice:                  25,
+			GasAdjustment:             1.2,
 			FeeDenom:                  "umfx",
 			HTTPReadTimeout:           15 * time.Second,
 			HTTPWriteTimeout:          15 * time.Second,
@@ -708,6 +735,7 @@ backends:
 	assert.Equal(t, 10.0, cfg.RateLimitRPS)
 	assert.Equal(t, 20, cfg.RateLimitBurst)
 	assert.Equal(t, []string{"*"}, cfg.CORSOrigins)
+	assert.Equal(t, 1.2, cfg.GasAdjustment, "default gas_adjustment should match Cosmos CLI convention")
 }
 
 func TestLoad_ConfigOverrides(t *testing.T) {
@@ -796,6 +824,7 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			RateLimitBurst:            20,
 			GasLimit:                  500000,
 			GasPrice:                  25,
+			GasAdjustment:             1.2,
 			FeeDenom:                  "umfx",
 			HTTPReadTimeout:           15 * time.Second,
 			HTTPWriteTimeout:          15 * time.Second,
@@ -915,6 +944,7 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			RateLimitBurst:            20,
 			GasLimit:                  500000,
 			GasPrice:                  25,
+			GasAdjustment:             1.2,
 			FeeDenom:                  "umfx",
 			HTTPReadTimeout:           15 * time.Second,
 			HTTPWriteTimeout:          15 * time.Second,
@@ -987,6 +1017,7 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			RateLimitBurst:            20,
 			GasLimit:                  500000,
 			GasPrice:                  25,
+			GasAdjustment:             1.2,
 			FeeDenom:                  "umfx",
 			HTTPReadTimeout:           15 * time.Second,
 			HTTPWriteTimeout:          15 * time.Second,

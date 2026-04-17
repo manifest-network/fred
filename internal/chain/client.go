@@ -516,8 +516,10 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 				increased = min(increased, stdmath.MaxInt64)
 				if increased == currentGas {
 					// Already at the cap; retrying with the same gas is futile.
+					metrics.SignerOOGRetriesTotal.WithLabelValues("exhausted").Inc()
 					return backoff.Permanent(err)
 				}
+				metrics.SignerOOGRetriesTotal.WithLabelValues("retried").Inc()
 				gasLimitOverride = &increased
 			}
 		}

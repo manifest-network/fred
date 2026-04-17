@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	stdmath "math"
+	"strconv"
 
 	"cosmossdk.io/math"
 	"github.com/cosmos/cosmos-sdk/client"
@@ -32,16 +33,17 @@ const (
 
 // Signer handles transaction signing using a Cosmos keyring.
 type Signer struct {
-	keyring     keyring.Keyring
-	keyName     string
-	address     string
-	chainID     string
-	txConfig    client.TxConfig
-	cdc         codec.Codec
-	gasLimit    uint64
-	maxGasLimit uint64 // 0 = no cap; if set, caps the gas limit during out-of-gas retries
-	gasPrice    int64
-	feeDenom    string
+	keyring       keyring.Keyring
+	keyName       string
+	address       string
+	chainID       string
+	txConfig      client.TxConfig
+	cdc           codec.Codec
+	gasLimit      uint64
+	maxGasLimit   uint64         // 0 = no cap; if set, caps the gas limit during out-of-gas retries
+	gasAdjustment math.LegacyDec // multiplier applied to gasLimit at sign time; zero/nil or <=1 disables
+	gasPrice      int64
+	feeDenom      string
 }
 
 // SignerConfig holds configuration for the transaction signer.
@@ -51,7 +53,8 @@ type SignerConfig struct {
 	KeyName        string
 	ChainID        string
 	GasLimit       uint64
-	MaxGasLimit    uint64 // 0 = no cap; if set, caps the gas limit during out-of-gas retries
+	MaxGasLimit    uint64  // 0 = no cap; if set, caps the gas limit during out-of-gas retries
+	GasAdjustment  float64 // multiplier applied to GasLimit at sign time (Cosmos CLI convention); 0 or 1.0 = no adjustment
 	GasPrice       int64
 	FeeDenom       string
 	Passphrase     string // Keyring passphrase for "file" backend (read from FRED_KEYRING_PASSPHRASE env)
@@ -106,17 +109,31 @@ func newSignerFromKeyring(kr keyring.Keyring, keyName string, cfg SignerConfig, 
 		return nil, fmt.Errorf("failed to get address: %w", err)
 	}
 
+	// Convert GasAdjustment (float64) once at construction to math.LegacyDec so
+	// the signing hot path uses deterministic big-int/decimal math and needs no
+	// float→uint overflow guard. Config validation already bounds the value to
+	// [1.0, 3.0] and rejects NaN/Inf, so FormatFloat + Parse cannot fail here.
+	var gasAdjustmentDec math.LegacyDec
+	if cfg.GasAdjustment > 0 {
+		parsed, err := math.LegacyNewDecFromStr(strconv.FormatFloat(cfg.GasAdjustment, 'f', -1, 64))
+		if err != nil {
+			return nil, fmt.Errorf("parse gas_adjustment %f: %w", cfg.GasAdjustment, err)
+		}
+		gasAdjustmentDec = parsed
+	}
+
 	return &Signer{
-		keyring:     kr,
-		keyName:     keyName,
-		address:     addr.String(),
-		chainID:     cfg.ChainID,
-		txConfig:    txConfig,
-		cdc:         cdc,
-		gasLimit:    cfg.GasLimit,
-		maxGasLimit: cfg.MaxGasLimit,
-		gasPrice:    cfg.GasPrice,
-		feeDenom:    cfg.FeeDenom,
+		keyring:       kr,
+		keyName:       keyName,
+		address:       addr.String(),
+		chainID:       cfg.ChainID,
+		txConfig:      txConfig,
+		cdc:           cdc,
+		gasLimit:      cfg.GasLimit,
+		maxGasLimit:   cfg.MaxGasLimit,
+		gasAdjustment: gasAdjustmentDec,
+		gasPrice:      cfg.GasPrice,
+		feeDenom:      cfg.FeeDenom,
 	}, nil
 }
 
@@ -160,13 +177,34 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 	gasLimit := s.gasLimit
 	if gasLimitOverride != nil {
 		gasLimit = *gasLimitOverride
+	} else if !s.gasAdjustment.IsNil() && s.gasAdjustment.GT(math.LegacyOneDec()) {
+		// Apply multiplier only on the normal path. OOG retries set
+		// gasLimitOverride to a bumped value; we must not compound the
+		// multiplier on top or we'd double-adjust. maxGasLimit cap is still
+		// enforced so operators retain an upper bound.
+		// Big-int/decimal arithmetic via cosmossdk.io/math avoids the
+		// platform-dependent float→uint64 conversion semantics of a naive
+		// implementation (amd64 returns MinInt64, arm64 saturates at MaxUint64).
+		adjustedInt := s.gasAdjustment.MulInt(math.NewIntFromUint64(gasLimit)).TruncateInt()
+		if !adjustedInt.IsUint64() {
+			return nil, fmt.Errorf("gas adjustment overflow: gasLimit=%d * %s = %s exceeds uint64", gasLimit, s.gasAdjustment, adjustedInt)
+		}
+		adjusted := adjustedInt.Uint64()
+		if s.maxGasLimit > 0 && adjusted > s.maxGasLimit {
+			adjusted = s.maxGasLimit
+		}
+		gasLimit = adjusted
 	}
 	if gasLimit > uint64(stdmath.MaxInt64) {
 		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
 	}
 	txBuilder.SetGasLimit(gasLimit)
 	// Use math.Int to avoid int64 overflow for large gasLimit * gasPrice products.
-	feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Quo(math.NewInt(gasPriceDivisor))
+	// Ceiling division: the chain validates fee against ceil(gasLimit * gasPrice / 1e6);
+	// integer floor would under-pay by one base unit of fee_denom whenever the product
+	// isn't an exact multiple of gasPriceDivisor.
+	divisor := math.NewInt(gasPriceDivisor)
+	feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Add(divisor).Sub(math.OneInt()).Quo(divisor)
 	if feeInt.LT(math.NewInt(minFeeAmount)) {
 		feeInt = math.NewInt(minFeeAmount)
 	}

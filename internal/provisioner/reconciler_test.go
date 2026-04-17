@@ -279,6 +279,153 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	assert.Equal(t, "lease-1", acknowledgedLeases[0])
 }
 
+func TestReconciler_SkipsInFlightReadyLease(t *testing.T) {
+	// Setup: Pending-ready lease that the main flow is already processing
+	// (tracker.IsInFlight == true). Reconciler must NOT ack — the callback
+	// handler owns the ack. Metric must be incremented.
+	var acknowledgeCount int
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			acknowledgeCount++
+			return true, "tx-hash", nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	mockTracker := newMockInFlightTracker(nil)
+	mockTracker.TrackInFlight("lease-1", "tenant-1", nil, "test")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, ack, router, mockTracker, nil)
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal)
+	ctx := t.Context()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Zero(t, acknowledgeCount, "reconciler must not ack an in-flight lease")
+	after := promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal)
+	assert.Equal(t, 1.0, after-before, "ReconcilerInflightSkipsTotal should increment by 1")
+}
+
+func TestReconciler_AcksNotInFlightReadyLease(t *testing.T) {
+	// Setup: Pending-ready lease with a wired tracker that does NOT have it in-flight.
+	// Expected: Reconciler acks normally (no race with main flow because main flow isn't running).
+	var acknowledgeCount int
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			acknowledgeCount++
+			return true, "tx-hash", nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	mockTracker := newMockInFlightTracker(nil) // empty — lease is NOT in-flight
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, ack, router, mockTracker, nil)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, acknowledgeCount, "reconciler must ack when main flow is NOT processing the lease")
+}
+
+func TestReconciler_FreshFailedLeaseStillRejects(t *testing.T) {
+	// Setup: Pending lease with backend status = Failed, tracker has it in-flight.
+	// Expected: In-flight guard applies ONLY to ProvisionStatusReady — Failed
+	// must still reject to release the tenant's credit promptly.
+	var rejectedLeases []string
+	var mu sync.Mutex
+
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailed},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	mockTracker := newMockInFlightTracker(nil)
+	mockTracker.TrackInFlight("lease-1", "tenant-1", nil, "test")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, mockTracker, nil)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"lease-1"}, rejectedLeases,
+		"failed lease must be rejected immediately regardless of in-flight state")
+}
+
 func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 	// Setup: Active lease on chain, not provisioned on backend (anomaly)
 	// Expected: Log anomaly and attempt to provision

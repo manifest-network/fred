@@ -61,7 +61,12 @@ type Config struct {
 	GasLimit             uint64        `mapstructure:"gas_limit"`
 	MaxGasLimit          uint64        `mapstructure:"max_gas_limit"` // 0 = no cap; if set, caps the gas limit during out-of-gas retries
 	GasPrice             int64         `mapstructure:"gas_price"`
-	FeeDenom             string        `mapstructure:"fee_denom"`
+	// GasAdjustment is a multiplier applied to gas_limit when signing a tx,
+	// providing headroom above the static estimate and reducing OOG retries.
+	// Matches the Cosmos SDK CLI flag of the same name. Default: 1.2.
+	// Must satisfy 1.0 <= GasAdjustment <= 3.0 (see Validate).
+	GasAdjustment float64 `mapstructure:"gas_adjustment"`
+	FeeDenom      string  `mapstructure:"fee_denom"`
 
 	// Timeout configuration
 	HTTPReadTimeout       time.Duration `mapstructure:"http_read_timeout"`
@@ -156,8 +161,9 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
 	v.SetDefault("gas_limit", 1500000)
-	v.SetDefault("max_gas_limit", 0) // 0 = no cap; if set, caps the gas limit during out-of-gas retries
-	v.SetDefault("gas_price", 25)    // micro-units of fee_denom per gas unit; fee = gas_limit * gas_price / 1_000_000
+	v.SetDefault("max_gas_limit", 0)    // 0 = no cap; if set, caps the gas limit during out-of-gas retries
+	v.SetDefault("gas_price", 25)       // micro-units of fee_denom per gas unit; fee = ceil(gas_limit * gas_price / 1_000_000), so non-divisible products round up by one base unit
+	v.SetDefault("gas_adjustment", 1.2) // multiplier applied to gas_limit at sign time (matches Cosmos CLI default)
 	v.SetDefault("fee_denom", "umfx")
 
 	// Timeout defaults
@@ -290,6 +296,15 @@ func (c *Config) Validate() error {
 	}
 	if c.GasPrice < 0 {
 		return fmt.Errorf("gas_price cannot be negative")
+	}
+	// NaN comparisons always return false, so check it explicitly before
+	// the range check — otherwise `gas_adjustment = nan` via env var would
+	// silently pass validation and skip the adjustment branch in the signer.
+	if math.IsNaN(c.GasAdjustment) {
+		return fmt.Errorf("gas_adjustment must not be NaN")
+	}
+	if c.GasAdjustment < 1.0 || c.GasAdjustment > 3.0 {
+		return fmt.Errorf("gas_adjustment must be between 1.0 and 3.0, got %f", c.GasAdjustment)
 	}
 	if c.FeeDenom == "" {
 		return fmt.Errorf("fee_denom is required")
