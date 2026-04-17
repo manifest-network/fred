@@ -1260,8 +1260,13 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 // errors (transient daemon/API issues) don't abort the poll — the daemon
 // may recover within the window — but the most recent one is surfaced in
 // the timeout error so operators aren't left guessing what went wrong.
+// On timeout we say "not confirmed removed" rather than "still present"
+// because inspect may have failed every time; we only know we never saw
+// NotFound.
 func (d *DockerClient) waitForContainerGone(ctx context.Context, containerID string) error {
 	deadline := time.Now().Add(containerRemovalPollTimeout)
+	ticker := time.NewTicker(containerRemovalPollInterval)
+	defer ticker.Stop()
 	var lastInspectErr error
 	for {
 		_, inspectErr := d.client.ContainerInspect(ctx, containerID)
@@ -1273,14 +1278,14 @@ func (d *DockerClient) waitForContainerGone(ctx context.Context, containerID str
 		}
 		if time.Now().After(deadline) {
 			if lastInspectErr != nil {
-				return fmt.Errorf("container %s still present after %s; last inspect error: %w", containerID, containerRemovalPollTimeout, lastInspectErr)
+				return fmt.Errorf("container %s not confirmed removed after %s; last inspect error: %w", containerID, containerRemovalPollTimeout, lastInspectErr)
 			}
-			return fmt.Errorf("container %s still present after %s", containerID, containerRemovalPollTimeout)
+			return fmt.Errorf("container %s not confirmed removed after %s", containerID, containerRemovalPollTimeout)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(containerRemovalPollInterval):
+		case <-ticker.C:
 		}
 	}
 }
