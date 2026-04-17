@@ -351,11 +351,13 @@ func TestReplayPendingCallbacks_PreservesStatusAndBackend(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
-	// New-writer entry: Status and Backend present.
+	// New-writer entry: Status and Backend present. Success encodes "not failed"
+	// so a pre-Status binary rolling back replays this as 'success' rather than
+	// 'failed' (avoiding spurious dashboard failures).
 	require.NoError(t, store.Store(CallbackEntry{
 		LeaseUUID:   "lease-new",
 		CallbackURL: server.URL,
-		Success:     false, // also set, belt-and-suspenders
+		Success:     true,
 		Status:      backend.CallbackStatusDeprovisioned,
 		Backend:     "docker",
 		CreatedAt:   time.Now(),
@@ -381,6 +383,45 @@ func TestReplayPendingCallbacks_PreservesStatusAndBackend(t *testing.T) {
 	assert.Equal(t, "docker", byID["lease-new"].Backend)
 	assert.Equal(t, backend.CallbackStatusFailed, byID["lease-legacy"].Status)
 	assert.Empty(t, byID["lease-legacy"].Backend)
+}
+
+// TestSendCallback_LegacySuccessFieldEncodesNotFailed verifies that when a
+// new binary writes a deprovisioned (or success) callback, the legacy Success
+// field is true so a rollback to a pre-Status binary replays as 'success' on
+// the wire rather than 'failed', preventing the spurious failure events this
+// PR was designed to eliminate.
+func TestSendCallback_LegacySuccessFieldEncodesNotFailed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // force persistence; never delivers
+	}))
+	defer server.Close()
+
+	cases := []struct {
+		name        string
+		status      backend.CallbackStatus
+		wantSuccess bool
+	}{
+		{"success", backend.CallbackStatusSuccess, true},
+		{"failed", backend.CallbackStatusFailed, false},
+		{"deprovisioned rolls back as success", backend.CallbackStatusDeprovisioned, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "cb.db")
+			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+			require.NoError(t, err)
+			defer store.Close()
+
+			s := newTestSender(t, store, server.Client(), "secret")
+			s.SendCallback("lease-1", server.URL, "docker", tc.status, "")
+
+			pending, err := store.ListPending()
+			require.NoError(t, err)
+			require.Len(t, pending, 1)
+			assert.Equal(t, tc.wantSuccess, pending[0].Success)
+			assert.Equal(t, tc.status, pending[0].Status)
+		})
+	}
 }
 
 func TestReportDelivery_NilHook(t *testing.T) {
