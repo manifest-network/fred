@@ -1363,10 +1363,20 @@ func TestHandleBackendCallback_DeprovisionedNonInFlight(t *testing.T) {
 	labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues("docker", "deprovisioned")
 	before := promtestutil.ToFloat64(labeled)
 
+	knownBackend := &mockManagerBackend{name: "docker"}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == "docker" {
+				return knownBackend
+			}
+			return nil
+		},
+	}
 	pub := newMockPublisher()
 	hs := NewHandlerSet(HandlerDeps{
-		Tracker:   NewInFlightTracker(),
-		Publisher: pub,
+		Tracker:       NewInFlightTracker(),
+		Publisher:     pub,
+		BackendRouter: router,
 	})
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1384,10 +1394,21 @@ func TestHandleBackendCallback_DeprovisionedNonInFlight(t *testing.T) {
 	assert.Empty(t, msgs, "deprovisioned must not publish a lease event")
 }
 
-// TestHandleBackendCallback_SanitizesLabels verifies that malformed or empty
-// backend and status fields are bounded to a small set of label values,
-// preventing Prometheus cardinality blow-up from untrusted callback payloads.
+// TestHandleBackendCallback_SanitizesLabels verifies that unknown/missing
+// backend names and unknown statuses are collapsed to sentinel labels,
+// bounding Prometheus cardinality against misbehaving senders. The allowlist
+// is the set of backends known to the router.
 func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
+	knownBackend := &mockManagerBackend{name: "docker"}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == "docker" {
+				return knownBackend
+			}
+			return nil
+		},
+	}
+
 	tests := []struct {
 		name        string
 		payloadBE   string
@@ -1396,9 +1417,10 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 		wantStatus  string
 	}{
 		{"empty backend routes to unknown", "", backend.CallbackStatusSuccess, "unknown", "success"},
-		{"bad-char backend routes to invalid", "bad!name", backend.CallbackStatusSuccess, "invalid", "success"},
-		{"overlong backend routes to invalid", strings.Repeat("a", 65), backend.CallbackStatusSuccess, "invalid", "success"},
+		{"unrecognized backend routes to invalid", "not-configured", backend.CallbackStatusSuccess, "invalid", "success"},
+		{"regex-valid but unknown backend routes to invalid", "docker-prod-02", backend.CallbackStatusSuccess, "invalid", "success"},
 		{"unknown status routes to other", "docker", "garbage", "docker", "other"},
+		{"known backend preserved", "docker", backend.CallbackStatusSuccess, "docker", "success"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1406,8 +1428,9 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 			before := promtestutil.ToFloat64(labeled)
 
 			hs := NewHandlerSet(HandlerDeps{
-				Tracker:   NewInFlightTracker(),
-				Publisher: newMockPublisher(),
+				Tracker:       NewInFlightTracker(),
+				Publisher:     newMockPublisher(),
+				BackendRouter: router,
 			})
 			msg := newCallbackMsg(t, backend.CallbackPayload{
 				LeaseUUID: "lease-1",

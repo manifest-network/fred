@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"sync"
 	"time"
 
@@ -23,12 +22,13 @@ import (
 
 // HandlerDeps contains the dependencies needed by the handler set.
 type HandlerDeps struct {
-	ChainClient  ChainClient
-	Orchestrator *ProvisionOrchestrator
-	Tracker      InFlightTracker
-	Acknowledger Acknowledger
-	PayloadStore *payload.Store
-	Publisher    message.Publisher // For publishing to TopicLeaseEvent (optional)
+	ChainClient   ChainClient
+	Orchestrator  *ProvisionOrchestrator
+	Tracker       InFlightTracker
+	Acknowledger  Acknowledger
+	PayloadStore  *payload.Store
+	Publisher     message.Publisher // For publishing to TopicLeaseEvent (optional)
+	BackendRouter BackendRouter     // Used to allowlist backend names on non-in-flight callback metrics
 }
 
 // HandlerSet contains the Watermill message handlers for the provisioner.
@@ -203,7 +203,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	// the ready/failed transition, but skip chain operations.
 	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
 	if !exists {
-		backendLabel := sanitizeBackendName(callback.Backend)
+		backendLabel := h.sanitizeBackendName(callback.Backend)
 		statusLabel := sanitizeCallbackStatus(callback.Status)
 		if backendLabel == labelBackendInvalid || statusLabel == labelStatusOther {
 			slog.Warn("sanitized callback label to bounded value",
@@ -545,11 +545,6 @@ const (
 	labelStatusOther    = "other"
 )
 
-// backendNameRe matches operator-chosen backend names (e.g. "docker",
-// "docker-prod-01", "docker.us-east"). Compiled once to bound label
-// cardinality on NonInFlightCallbacksTotal.
-var backendNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
-
 // Keep in sync with CallbackStatus* constants in internal/backend/client.go.
 func sanitizeCallbackStatus(s backend.CallbackStatus) string {
 	switch s {
@@ -560,11 +555,16 @@ func sanitizeCallbackStatus(s backend.CallbackStatus) string {
 	}
 }
 
-func sanitizeBackendName(name string) string {
+// sanitizeBackendName bounds Prometheus label cardinality by collapsing any
+// name outside the configured router's allowlist to "invalid". Empty values
+// (pre-upgrade backends that don't populate CallbackPayload.Backend) map to
+// "unknown". Returning the raw name was insufficient: a misbehaving sender
+// could emit arbitrarily many distinct regex-valid values.
+func (h *HandlerSet) sanitizeBackendName(name string) string {
 	if name == "" {
 		return labelBackendUnknown
 	}
-	if !backendNameRe.MatchString(name) {
+	if h.deps.BackendRouter == nil || h.deps.BackendRouter.GetBackendByName(name) == nil {
 		return labelBackendInvalid
 	}
 	return name
