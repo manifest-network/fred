@@ -1066,6 +1066,24 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 			return resp.ID, nil
 		}
 
+		if isNameInUse(err) {
+			// Almost certainly a prior crashed attempt at the same
+			// (lease, service, instance). Adopt only if the existing
+			// container still matches our params; otherwise surface an
+			// error so the reconciler retries after the old container
+			// is actually removed.
+			existing, inspectErr := d.client.ContainerInspect(ctx, containerName)
+			if inspectErr != nil {
+				return "", fmt.Errorf("create container failed (name %q in use); inspect to check ownership: %w", containerName, inspectErr)
+			}
+			id, adoptErr := validateAdoption(existing, params, containerName)
+			if adoptErr != nil {
+				return "", adoptErr
+			}
+			idempotentOpsTotal.WithLabelValues("create", "already_exists").Inc()
+			return id, nil
+		}
+
 		if !ephemeral || !isPortBindingError(err) {
 			return "", fmt.Errorf("failed to create container: %w", err)
 		}
@@ -1149,20 +1167,141 @@ func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, ta
 	return buf.String(), nil
 }
 
-// RemoveContainer removes a container. It is idempotent — removing an
-// already-removed container returns nil.
+// isRemovalInProgress reports whether err indicates the Docker daemon is
+// already removing the container. The daemon completes the removal on its
+// own, so callers treat this as idempotent success. Docker emits this as
+// errdefs.Conflict with a stable message; we guard on both to avoid matching
+// other conflict errors (running, paused) that represent genuine failures.
+func isRemovalInProgress(err error) bool {
+	if err == nil || !errdefs.IsConflict(err) {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "removal of container") &&
+		strings.Contains(msg, "already in progress")
+}
+
+// isNameInUse reports whether err from ContainerCreate indicates the name is
+// already taken. Docker emits this as errdefs.Conflict with "is already in
+// use by container". Guarded on both for the same reasons as
+// isRemovalInProgress.
+func isNameInUse(err error) bool {
+	if err == nil || !errdefs.IsConflict(err) {
+		return false
+	}
+	return strings.Contains(err.Error(), "is already in use by container")
+}
+
+// validateAdoption decides whether an existing container (found via name
+// collision on create) is safe to adopt in place of creating a new one.
+// It returns the existing container's ID on success, or a descriptive
+// error on mismatch. The predicate is strict: the existing container
+// must be fred-managed, owned by this backend instance, carry our lease
+// UUID, match our image and fail count, and not already be dying. Any
+// difference means the caller's intent has drifted from what's running
+// (e.g. a payload mutated between attempts, or the container is already
+// on its way out), so adopting would either silently run stale
+// configuration or hand back an ID that's about to vanish.
+func validateAdoption(existing container.InspectResponse, params CreateContainerParams, containerName string) (string, error) {
+	if existing.Config == nil {
+		return "", fmt.Errorf("create container failed: name %q in use and inspect returned no config", containerName)
+	}
+	existingFailCount := existing.Config.Labels[LabelFailCount]
+	wantFailCount := strconv.Itoa(params.FailCount)
+	switch {
+	case existing.Config.Labels[LabelManaged] != "true":
+		return "", fmt.Errorf("create container failed: name %q in use by container not managed by Fred", containerName)
+	case existing.Config.Labels[LabelBackendName] != params.BackendName:
+		return "", fmt.Errorf("create container failed: name %q in use by container from backend %q, want %q", containerName, existing.Config.Labels[LabelBackendName], params.BackendName)
+	case existing.Config.Labels[LabelLeaseUUID] != params.LeaseUUID:
+		return "", fmt.Errorf("create container failed: name %q in use by container not owned by lease %s", containerName, params.LeaseUUID)
+	case existing.Config.Image != params.Manifest.Image:
+		return "", fmt.Errorf("create container failed: name %q in use by container with image %q, want %q", containerName, existing.Config.Image, params.Manifest.Image)
+	case existingFailCount != wantFailCount:
+		return "", fmt.Errorf("create container failed: name %q in use by container at fail_count=%s, want %s", containerName, existingFailCount, wantFailCount)
+	}
+	if existing.State != nil && existing.State.Status == container.StateRemoving {
+		return "", fmt.Errorf("create container failed: name %q in use by container being removed; retry after removal completes", containerName)
+	}
+	return existing.ID, nil
+}
+
+// Poll parameters for waiting on an in-progress Docker container removal.
+// 5s covers typical daemon removal latency; longer and the caller retries.
+const (
+	containerRemovalPollInterval = 200 * time.Millisecond
+	containerRemovalPollTimeout  = 5 * time.Second
+)
+
+// RemoveContainer removes a container. It is idempotent — if the container
+// is already gone or the daemon is already removing it, returns nil only
+// after the removal has actually completed, so callers can safely proceed
+// with operations that assume the container is physically gone (volume
+// destroy, name re-use).
 func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) error {
 	err := d.client.ContainerRemove(ctx, containerID, container.RemoveOptions{
 		Force: true,
 	})
 	if err != nil {
 		if client.IsErrNotFound(err) {
-			return nil // Already removed
+			idempotentOpsTotal.WithLabelValues("remove", "not_found").Inc()
+			return nil
+		}
+		if isRemovalInProgress(err) {
+			// Wait for the in-flight removal to finish before returning
+			// nil; otherwise downstream volume destroy / name re-use
+			// races against bind mounts that Docker hasn't released yet.
+			if waitErr := d.waitForContainerGone(ctx, containerID); waitErr != nil {
+				containerRemovalWaitFailuresTotal.Inc()
+				return fmt.Errorf("failed to remove container: wait after in-progress conflict failed: %w", waitErr)
+			}
+			idempotentOpsTotal.WithLabelValues("remove", "in_progress").Inc()
+			return nil
 		}
 		return fmt.Errorf("failed to remove container: %w", err)
 	}
 
 	return nil
+}
+
+// waitForContainerGone polls ContainerInspect until the container is no
+// longer found, the parent context is canceled, or containerRemovalPollTimeout
+// elapses. Returns nil once Docker reports NotFound. A derived context bounds
+// each inspect so a hung Docker API can't stretch the wait past our limit.
+// Non-NotFound inspect errors (transient daemon/API issues) don't abort the
+// poll — the daemon may recover within the window — but the most recent one
+// is surfaced in the timeout error. On timeout we say "not confirmed removed"
+// rather than "still present" because inspect may have failed every time; we
+// only know we never saw NotFound.
+func (d *DockerClient) waitForContainerGone(ctx context.Context, containerID string) error {
+	waitCtx, cancel := context.WithTimeout(ctx, containerRemovalPollTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(containerRemovalPollInterval)
+	defer ticker.Stop()
+	var lastInspectErr error
+	for {
+		_, inspectErr := d.client.ContainerInspect(waitCtx, containerID)
+		if inspectErr != nil {
+			if client.IsErrNotFound(inspectErr) {
+				return nil
+			}
+			lastInspectErr = inspectErr
+		}
+		select {
+		case <-waitCtx.Done():
+			// Parent canceled/timed out: propagate parent's error as-is.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Our derived timeout fired — container still not confirmed gone.
+			if lastInspectErr != nil {
+				return fmt.Errorf("container %s not confirmed removed after %s; last inspect error: %w", containerID, containerRemovalPollTimeout, lastInspectErr)
+			}
+			return fmt.Errorf("container %s not confirmed removed after %s", containerID, containerRemovalPollTimeout)
+		case <-ticker.C:
+		}
+	}
 }
 
 // labelMeta holds parsed metadata from container labels.

@@ -120,6 +120,30 @@ var (
 		Name:      "reconciliation_last_success_timestamp_seconds",
 		Help:      "Unix timestamp of the last successful reconciliation run",
 	})
+
+	// idempotentOpsTotal tracks Docker operations skipped because the daemon
+	// reported the work was already done. We increment this when Docker tells
+	// us the operation was already complete; the caller sees success. Spikes
+	// on remove/in_progress suggest reconciler/event-handler races; spikes on
+	// create/already_exists suggest repeated crash-replay.
+	idempotentOpsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "idempotent_ops_total",
+		Help:      "Docker operations skipped because the daemon reported the work was already done",
+	}, []string{"op", "reason"})
+
+	// containerRemovalWaitFailuresTotal counts RemoveContainer calls where
+	// the "removal in progress" wait did not confirm NotFound before the
+	// bound elapsed (timeout, context cancellation, or persistent inspect
+	// errors). These surface as errors to the caller; the counter gives
+	// operators a direct signal when the race becomes a sustained problem.
+	containerRemovalWaitFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "container_removal_wait_failures_total",
+		Help:      "Count of RemoveContainer calls where the 'in progress' wait failed before confirming removal",
+	})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
