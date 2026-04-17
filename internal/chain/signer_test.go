@@ -260,11 +260,80 @@ func TestSigner_SignTx_LargeGasFeeNoOverflow(t *testing.T) {
 	feeTx, ok := tx.(sdk.FeeTx)
 	require.True(t, ok)
 
-	// 5e18 * 2 / 1e6 = 10_000_000_000_000 (10e12)
+	// 5e18 * 2 / 1e6 = 10_000_000_000_000 (10e12) — exact multiple, ceiling == floor.
 	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(10_000_000_000_000)))
 	assert.True(t, feeTx.GetFee().Equal(expectedFee),
 		"fee must be correct even when gasLimit*gasPrice overflows int64; got %s, want %s",
 		feeTx.GetFee(), expectedFee)
+}
+
+// signTxAndDecodeFee signs a tx with the signer's current config and returns
+// the computed fee coin amount for the signer's fee denom.
+func signTxAndDecodeFee(t *testing.T, s *Signer) sdk.Coins {
+	t.Helper()
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	require.NoError(t, err)
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+	feeTx, ok := tx.(sdk.FeeTx)
+	require.True(t, ok)
+	return feeTx.GetFee()
+}
+
+func TestSigner_SignTx_CeilingFee_NonDivisible(t *testing.T) {
+	// Reproduces the prod failure: gasLimit=337479, gasPrice=25
+	// → 337479 * 25 = 8_436_975, / 1e6 = 8.436975
+	// Floor (old behaviour) = 8; chain requires ceiling = 9.
+	s := newTestSigner(t)
+	s.gasLimit = 337479
+	s.gasPrice = 25
+
+	fee := signTxAndDecodeFee(t, s)
+	expected := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(9)))
+	assert.True(t, fee.Equal(expected),
+		"ceiling fee must be 9 for non-divisible product; got %s", fee)
+}
+
+func TestSigner_SignTx_CeilingFee_ExactMultiple(t *testing.T) {
+	// gasLimit=200000, gasPrice=100 → 20_000_000 / 1e6 = 20 exactly.
+	// Ceiling must equal floor on exact multiples.
+	s := newTestSigner(t)
+	s.gasLimit = 200000
+	s.gasPrice = 100
+
+	fee := signTxAndDecodeFee(t, s)
+	expected := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(20)))
+	assert.True(t, fee.Equal(expected),
+		"ceiling must equal floor on exact multiple; got %s", fee)
+}
+
+func TestSigner_SignTx_CeilingFee_OneUnitOver(t *testing.T) {
+	// gasLimit=1000001, gasPrice=1 → 1_000_001 / 1e6 = 1.000001
+	// Ceiling bumps to 2.
+	s := newTestSigner(t)
+	s.gasLimit = 1000001
+	s.gasPrice = 1
+
+	fee := signTxAndDecodeFee(t, s)
+	expected := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(2)))
+	assert.True(t, fee.Equal(expected),
+		"ceiling must bump to 2 when product exceeds divisor by 1; got %s", fee)
+}
+
+func TestSigner_SignTx_CeilingFee_UnderDivisorHitsMin(t *testing.T) {
+	// gasLimit=10, gasPrice=1 → 10 / 1e6 = 0.00001
+	// Ceiling = 1; minFeeAmount clamp is also 1. Confirms the two paths compose.
+	s := newTestSigner(t)
+	s.gasLimit = 10
+	s.gasPrice = 1
+
+	fee := signTxAndDecodeFee(t, s)
+	expected := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(1)))
+	assert.True(t, fee.Equal(expected),
+		"fee below minFeeAmount must clamp to 1; got %s", fee)
 }
 
 func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
@@ -364,6 +433,136 @@ func TestSigner_SignTxInternal_GasLimitOverride(t *testing.T) {
 		expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(50)))
 		assert.True(t, feeTx.GetFee().Equal(expectedFee), "fee must be recalculated from overridden gas")
 	})
+}
+
+func TestSigner_SignTx_GasAdjustment_Applied(t *testing.T) {
+	// GasAdjustment=1.2 multiplies gasLimit at sign time. Both tx gas and fee
+	// scale proportionally: 200000 * 1.2 = 240000 gas; 240000 * 100 / 1e6 = 24 umfx.
+	s := newTestSigner(t)
+	s.gasAdjustment = math.LegacyMustNewDecFromStr("1.2")
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	require.NoError(t, err)
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+	feeTx, ok := tx.(sdk.FeeTx)
+	require.True(t, ok)
+
+	assert.Equal(t, uint64(240000), feeTx.GetGas(), "gas must be multiplied by adjustment")
+	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(24)))
+	assert.True(t, feeTx.GetFee().Equal(expectedFee),
+		"fee must scale with adjusted gas; got %s want %s", feeTx.GetFee(), expectedFee)
+}
+
+func TestSigner_SignTx_GasAdjustment_OverrideBypassesMultiplier(t *testing.T) {
+	// CRITICAL OOG-path correctness: when gasLimitOverride is set (by the
+	// OOG retry loop in client.go), the adjustment MUST NOT compound with
+	// the override's own 1.5× bump. Override wins verbatim.
+	s := newTestSigner(t)
+	s.gasAdjustment = math.LegacyMustNewDecFromStr("1.5")
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+
+	override := uint64(300000)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, &override)
+	require.NoError(t, err)
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+	feeTx, ok := tx.(sdk.FeeTx)
+	require.True(t, ok)
+
+	assert.Equal(t, uint64(300000), feeTx.GetGas(),
+		"override must NOT be multiplied by gasAdjustment")
+}
+
+func TestSigner_SignTx_GasAdjustment_RespectsMaxCap(t *testing.T) {
+	// With gasAdjustment raising gas past maxGasLimit, the adjusted value
+	// must be capped. Picking gasLimit=200000, adjustment=2.5 → 500000 raw,
+	// capped to maxGasLimit=300000.
+	s := newTestSigner(t)
+	s.gasAdjustment = math.LegacyMustNewDecFromStr("2.5")
+	s.maxGasLimit = 300000
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	require.NoError(t, err)
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+	feeTx, ok := tx.(sdk.FeeTx)
+	require.True(t, ok)
+
+	assert.Equal(t, uint64(300000), feeTx.GetGas(),
+		"adjusted gas must be capped at maxGasLimit")
+}
+
+func TestSigner_SignTx_GasAdjustment_RespectsMinFee(t *testing.T) {
+	// Even after adjustment the per-tx fee may round below 1; minFeeAmount
+	// clamp still applies.
+	s := newTestSigner(t)
+	s.gasLimit = 1
+	s.gasPrice = 1
+	s.gasAdjustment = math.LegacyMustNewDecFromStr("1.2") // 1 * 1.2 → 1 (truncated to uint64), fee still hits clamp
+
+	fee := signTxAndDecodeFee(t, s)
+	expected := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(1)))
+	assert.True(t, fee.Equal(expected), "fee must still clamp to minFeeAmount after adjustment; got %s", fee)
+}
+
+func TestSigner_SignTx_GasAdjustment_OverflowReturnsError(t *testing.T) {
+	// Defensive: the big-int product of gasLimit * adjustment may exceed
+	// uint64. Config validation (1.0 <= adjustment <= 3.0, gasLimit <= MaxInt64)
+	// should prevent this, but the signer must still error cleanly when called
+	// with out-of-range values rather than truncating silently.
+	s := newTestSigner(t)
+	// gasLimit * 2.0 where gasLimit is near the uint64 ceiling forces the
+	// big-int product beyond uint64 range so IsUint64() returns false.
+	s.gasLimit = 1 << 63 // 9.22e18
+	s.gasAdjustment = math.LegacyMustNewDecFromStr("3.0")
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+
+	_, err = s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	require.Error(t, err, "overflow must be detected and surface as an error")
+	assert.Contains(t, err.Error(), "gas adjustment overflow",
+		"error message must identify the overflow root cause")
+}
+
+func TestSigner_SignTx_GasAdjustment_ExactlyOneIsNoOp(t *testing.T) {
+	// Boundary: gasAdjustment == 1.0 must skip the adjustment branch entirely
+	// (the guard is `> 1.0`, not `>= 1.0`). Refactoring that guard to `>=`
+	// would silently change fee arithmetic for every deployment using 1.0.
+	s := newTestSigner(t)
+	s.gasLimit = 200000
+	s.gasPrice = 100
+	s.gasAdjustment = math.LegacyOneDec()
+
+	addr, err := sdk.AccAddressFromBech32(s.address)
+	require.NoError(t, err)
+	accountAny := newTestAccountAny(t, addr, 0, 0)
+
+	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	require.NoError(t, err)
+	tx, err := s.txConfig.TxDecoder()(txBytes)
+	require.NoError(t, err)
+	feeTx, ok := tx.(sdk.FeeTx)
+	require.True(t, ok)
+
+	assert.Equal(t, uint64(200000), feeTx.GetGas(),
+		"gasAdjustment=1.0 must leave gasLimit unchanged")
+	expectedFee := sdk.NewCoins(sdk.NewCoin("umfx", math.NewInt(20)))
+	assert.True(t, feeTx.GetFee().Equal(expectedFee),
+		"gasAdjustment=1.0 must produce the same fee as no adjustment")
 }
 
 // extractTxSequence decodes tx bytes, asserts exactly one signature, and returns its sequence.

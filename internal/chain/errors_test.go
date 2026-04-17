@@ -146,6 +146,40 @@ func TestChainTxError_IsOutOfGas(t *testing.T) {
 	}
 }
 
+func TestChainTxError_IsInsufficientFee(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *ChainTxError
+		want bool
+	}{
+		{
+			name: "insufficient fee",
+			err:  &ChainTxError{Code: 13, Codespace: "sdk", RawLog: "insufficient fee"},
+			want: true,
+		},
+		{
+			name: "adjacent lower code",
+			err:  &ChainTxError{Code: 12, Codespace: "sdk", RawLog: "other"},
+			want: false,
+		},
+		{
+			name: "adjacent higher code",
+			err:  &ChainTxError{Code: 14, Codespace: "sdk", RawLog: "other"},
+			want: false,
+		},
+		{
+			name: "wrong codespace",
+			err:  &ChainTxError{Code: 13, Codespace: "billing", RawLog: "insufficient fee"},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.err.IsInsufficientFee())
+		})
+	}
+}
+
 func TestChainTxError_ExpectedSequence(t *testing.T) {
 	tests := []struct {
 		name    string

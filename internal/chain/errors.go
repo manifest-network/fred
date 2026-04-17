@@ -53,6 +53,11 @@ func (e *ChainTxError) IsOutOfGas() bool {
 	return e.Codespace == "sdk" && e.Code == 11
 }
 
+// IsInsufficientFee returns true if this error is an insufficient-fee error (SDK code 13).
+func (e *ChainTxError) IsInsufficientFee() bool {
+	return e.Codespace == "sdk" && e.Code == 13
+}
+
 // reExpectedSeq extracts "expected N, got M" from Cosmos SDK sequence mismatch errors.
 // False positives are prevented by the IsSequenceMismatch() guard in ExpectedSequence(),
 // which requires codespace "sdk" and code 32 before the regex is applied.

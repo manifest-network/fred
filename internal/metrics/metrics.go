@@ -36,6 +36,49 @@ var (
 		Help:      "Duration of provisioning operations in seconds",
 		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 0.1s to ~7min
 	}, []string{"backend"})
+
+	// AckBatchFeeGasErrorsTotal counts ack-batch failures classified as
+	// insufficient-fee or out-of-gas that are surfaced to callers without
+	// being individualized. Sustained non-zero values indicate that the
+	// per-signer broadcast-retry loop is exhausting its gas budget (e.g.
+	// maxGasLimit too tight) or that the configured fee is insufficient.
+	AckBatchFeeGasErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "ack_batch_fee_gas_errors_total",
+		Help:      "Total ack-batch failures due to insufficient fee or out-of-gas, surfaced without individualization",
+	}, []string{"lane"})
+
+	// AckBatchIndividualFallbacksTotal counts ack-batch failures that fall
+	// through to per-lease retries (i.e. non-fee/gas errors).
+	AckBatchIndividualFallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "ack_batch_individual_fallbacks_total",
+		Help:      "Total ack-batch failures that fell back to individual per-lease retries",
+	}, []string{"lane"})
+
+	// ReconcilerInflightSkipsTotal counts reconciler decisions to skip
+	// acknowledging a ready lease because the main flow is already processing
+	// it (IsInFlight == true). A sudden spike can indicate stuck in-flight
+	// leases; cross-check against timeout-checker rejection metrics.
+	ReconcilerInflightSkipsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "reconciler_inflight_skips_total",
+		Help:      "Total ready leases the reconciler skipped because the main flow owns them",
+	})
+
+	// SignerOOGRetriesTotal counts out-of-gas retry decisions at the
+	// transaction broadcast layer. Label values: "retried" = gas was
+	// increased and the tx will be retried; "exhausted" = already at the
+	// cap, retry is futile and the error is surfaced to the caller.
+	SignerOOGRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "chain",
+		Name:      "signer_oog_retries_total",
+		Help:      "Total out-of-gas retry decisions by outcome (retried, exhausted)",
+	}, []string{"result"})
 )
 
 // Reconciliation metrics

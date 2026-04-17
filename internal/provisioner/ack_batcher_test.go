@@ -8,9 +8,13 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // mockAckChainClient implements ChainClient for ack batcher tests
@@ -184,6 +188,175 @@ func TestAckBatcher_FallsBackToIndividualOnBatchFailure(t *testing.T) {
 	defer mu.Unlock()
 
 	assert.Len(t, individualCalls, 3, "individual calls")
+}
+
+func TestAckBatcher_InsufficientFeeDoesNotIndividualize(t *testing.T) {
+	// When a batch fails with code 13 (insufficient fee), splitting into
+	// individual retries would hit the same chain-wide wall. The batcher
+	// must surface the error to ALL callers without retrying.
+	var totalCalls atomic.Int32
+
+	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-a", "lease-b", "lease-c"},
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			totalCalls.Add(1)
+			return 0, nil, &chain.ChainTxError{
+				Code:      13,
+				Codespace: "sdk",
+				RawLog:    "got: 8437umfx required: 8438umfx",
+			}
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	before := promtestutil.ToFloat64(metrics.AckBatchFeeGasErrorsTotal.WithLabelValues("0"))
+
+	var wg sync.WaitGroup
+	errs := make([]error, 3)
+	for i := range 3 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			leaseUUID := "lease-" + string(rune('a'+i))
+			_, _, errs[i] = batcher.Acknowledge(ctx, leaseUUID)
+		}(i)
+	}
+	wg.Wait()
+
+	// All callers receive the error — none succeed.
+	for i, err := range errs {
+		assert.Error(t, err, "Acknowledge[%d] must fail", i)
+		var chainErr *chain.ChainTxError
+		assert.True(t, errors.As(err, &chainErr), "err[%d] must unwrap to ChainTxError", i)
+		assert.True(t, chainErr.IsInsufficientFee(), "err[%d] must be insufficient-fee", i)
+	}
+
+	// Exactly one batch call — NO individual retries.
+	assert.Equal(t, int32(1), totalCalls.Load(),
+		"fee error must not trigger individualized retries; saw %d total chain calls", totalCalls.Load())
+
+	after := promtestutil.ToFloat64(metrics.AckBatchFeeGasErrorsTotal.WithLabelValues("0"))
+	assert.Equal(t, 1.0, after-before, "AckBatchFeeGasErrorsTotal should increment by 1")
+}
+
+func TestAckBatcher_OutOfGasDoesNotIndividualize(t *testing.T) {
+	// Mirror of the insufficient-fee test for code 11 (out-of-gas).
+	// Only the classified-error path fires; acknowledgeIndividually must NOT run.
+	var totalCalls atomic.Int32
+
+	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-a", "lease-b"},
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			totalCalls.Add(1)
+			return 0, nil, &chain.ChainTxError{
+				Code:      11,
+				Codespace: "sdk",
+				RawLog:    "out of gas in location: WriteAccessList",
+			}
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			leaseUUID := "lease-" + string(rune('a'+i))
+			_, _, errs[i] = batcher.Acknowledge(ctx, leaseUUID)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.Error(t, err, "Acknowledge[%d] must fail", i)
+		var chainErr *chain.ChainTxError
+		assert.True(t, errors.As(err, &chainErr), "err[%d] must unwrap to ChainTxError", i)
+		assert.True(t, chainErr.IsOutOfGas(), "err[%d] must be out-of-gas", i)
+	}
+
+	assert.Equal(t, int32(1), totalCalls.Load(),
+		"OOG error must not trigger individualized retries; saw %d total chain calls", totalCalls.Load())
+}
+
+func TestAckBatcher_GenericErrorStillIndividualizes(t *testing.T) {
+	// Regression guard: non-fee/gas errors must continue to fall back to
+	// per-lease retries (preserving existing behaviour for transient errors).
+	var totalCalls atomic.Int32
+	var mu sync.Mutex
+	var individualCalls []string
+
+	client := &mockAckChainClient{
+		pendingLeases: []string{"lease-a", "lease-b", "lease-c"},
+		acknowledgeFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			count := totalCalls.Add(1)
+			if count == 1 && len(leaseUUIDs) > 1 {
+				return 0, nil, errors.New("transient network blip")
+			}
+			mu.Lock()
+			individualCalls = append(individualCalls, leaseUUIDs...)
+			mu.Unlock()
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	before := promtestutil.ToFloat64(metrics.AckBatchIndividualFallbacksTotal.WithLabelValues("0"))
+
+	var wg sync.WaitGroup
+	errs := make([]error, 3)
+	results := make([]bool, 3)
+	for i := range 3 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			leaseUUID := "lease-" + string(rune('a'+i))
+			results[i], _, errs[i] = batcher.Acknowledge(ctx, leaseUUID)
+		}(i)
+	}
+	wg.Wait()
+
+	// Individual retries must have been invoked and succeeded.
+	for i, err := range errs {
+		assert.NoError(t, err, "Acknowledge[%d]", i)
+		assert.True(t, results[i], "Acknowledge[%d] acknowledged", i)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Len(t, individualCalls, 3, "all three leases must have been retried individually")
+
+	after := promtestutil.ToFloat64(metrics.AckBatchIndividualFallbacksTotal.WithLabelValues("0"))
+	assert.Equal(t, 1.0, after-before, "AckBatchIndividualFallbacksTotal should increment by 1")
 }
 
 func TestAckBatcher_FlushesOnBatchSizeReached(t *testing.T) {
