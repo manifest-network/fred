@@ -18,7 +18,7 @@ var callbackBucketName = []byte("pending_callbacks")
 // Success is retained for backwards compatibility with entries persisted by
 // binaries that predate the Status field. New writers populate Success AND
 // Status (and Backend). Readers prefer Status when non-empty and fall back to
-// Success otherwise; see callback_sender.ReplayPendingCallbacks.
+// Success otherwise; see CallbackSender.ReplayPendingCallbacks.
 type CallbackEntry struct {
 	LeaseUUID   string                 `json:"lease_uuid"`
 	CallbackURL string                 `json:"callback_url"`
