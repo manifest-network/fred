@@ -16,8 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTestDockerClient returns a DockerClient wired to the real daemon, with a
-// cleanup that removes any containers it was asked to leave behind.
+// newTestDockerClient returns a DockerClient wired to the real daemon and
+// registers test cleanup to close it. Per-container cleanup is the caller's
+// responsibility via forceRemove.
 func newTestDockerClient(t *testing.T) *DockerClient {
 	t.Helper()
 	d, err := NewDockerClient("", fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano()))

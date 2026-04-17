@@ -1243,7 +1243,7 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 			// nil; otherwise downstream volume destroy / name re-use
 			// races against bind mounts that Docker hasn't released yet.
 			if waitErr := d.waitForContainerGone(ctx, containerID); waitErr != nil {
-				return fmt.Errorf("failed to remove container: %w", err)
+				return fmt.Errorf("failed to remove container: wait after in-progress conflict failed: %w", waitErr)
 			}
 			idempotentOpsTotal.WithLabelValues("remove", "in_progress").Inc()
 			return nil
@@ -1256,14 +1256,25 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 
 // waitForContainerGone polls ContainerInspect until the container is no
 // longer found, the context is canceled, or containerRemovalPollTimeout
-// elapses. Returns nil once Docker reports NotFound.
+// elapses. Returns nil once Docker reports NotFound. Non-NotFound inspect
+// errors (transient daemon/API issues) don't abort the poll — the daemon
+// may recover within the window — but the most recent one is surfaced in
+// the timeout error so operators aren't left guessing what went wrong.
 func (d *DockerClient) waitForContainerGone(ctx context.Context, containerID string) error {
 	deadline := time.Now().Add(containerRemovalPollTimeout)
+	var lastInspectErr error
 	for {
-		if _, inspectErr := d.client.ContainerInspect(ctx, containerID); inspectErr != nil && client.IsErrNotFound(inspectErr) {
+		_, inspectErr := d.client.ContainerInspect(ctx, containerID)
+		if inspectErr != nil && client.IsErrNotFound(inspectErr) {
 			return nil
 		}
+		if inspectErr != nil {
+			lastInspectErr = inspectErr
+		}
 		if time.Now().After(deadline) {
+			if lastInspectErr != nil {
+				return fmt.Errorf("container %s still present after %s; last inspect error: %w", containerID, containerRemovalPollTimeout, lastInspectErr)
+			}
 			return fmt.Errorf("container %s still present after %s", containerID, containerRemovalPollTimeout)
 		}
 		select {
