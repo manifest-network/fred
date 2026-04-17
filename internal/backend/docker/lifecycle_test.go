@@ -2,10 +2,14 @@ package docker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -243,4 +247,159 @@ func TestResolveImageUserManifestOverride(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 999, gid)
+}
+
+func TestIsRemovalInProgress(t *testing.T) {
+	benign := errdefs.Conflict(errors.New("removal of container abc is already in progress"))
+	running := errdefs.Conflict(errors.New("You cannot remove a running container abc. Stop the container before attempting removal or force remove"))
+	plain := errors.New("removal of container x is already in progress")
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"typed benign", benign, true},
+		{"wrapped typed benign", fmt.Errorf("docker api: %w", benign), true},
+		{"running conflict", running, false},
+		{"missing type wrap", plain, false},
+		{"partial: only 'removal of container'", errdefs.Conflict(errors.New("removal of container x failed")), false},
+		{"partial: only 'already in progress'", errdefs.Conflict(errors.New("upload already in progress")), false},
+		{"unrelated error", errors.New("connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isRemovalInProgress(tc.err))
+		})
+	}
+}
+
+func TestValidateAdoption(t *testing.T) {
+	const (
+		name  = "fred-lease-abc-web-0"
+		lease = "lease-abc"
+		image = "nginx:1.25"
+	)
+	params := CreateContainerParams{
+		LeaseUUID: lease,
+		Manifest:  &DockerManifest{Image: image},
+		FailCount: 0,
+	}
+
+	mkExisting := func(labels map[string]string, img string) container.InspectResponse {
+		return container.InspectResponse{
+			ContainerJSONBase: &container.ContainerJSONBase{ID: "existing-id"},
+			Config: &container.Config{
+				Image:  img,
+				Labels: labels,
+			},
+		}
+	}
+	goodLabels := map[string]string{
+		LabelLeaseUUID: lease,
+		LabelFailCount: "0",
+	}
+
+	t.Run("happy path adopts", func(t *testing.T) {
+		id, err := validateAdoption(mkExisting(goodLabels, image), params, name)
+		require.NoError(t, err)
+		assert.Equal(t, "existing-id", id)
+	})
+
+	t.Run("nil Config is rejected", func(t *testing.T) {
+		existing := container.InspectResponse{
+			ContainerJSONBase: &container.ContainerJSONBase{ID: "existing-id"},
+			Config:            nil,
+		}
+		id, err := validateAdoption(existing, params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "inspect returned no config")
+	})
+
+	t.Run("lease UUID mismatch", func(t *testing.T) {
+		badLabels := map[string]string{
+			LabelLeaseUUID: "some-other-lease",
+			LabelFailCount: "0",
+		}
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "not owned by lease")
+	})
+
+	t.Run("missing lease label is rejected", func(t *testing.T) {
+		badLabels := map[string]string{
+			LabelFailCount: "0",
+		}
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "not owned by lease")
+	})
+
+	t.Run("image mismatch", func(t *testing.T) {
+		id, err := validateAdoption(mkExisting(goodLabels, "nginx:1.24"), params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), `image "nginx:1.24"`)
+		assert.Contains(t, err.Error(), `want "nginx:1.25"`)
+	})
+
+	t.Run("fail count mismatch", func(t *testing.T) {
+		badLabels := map[string]string{
+			LabelLeaseUUID: lease,
+			LabelFailCount: "3",
+		}
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "fail_count=3")
+		assert.Contains(t, err.Error(), "want 0")
+	})
+
+	t.Run("fail count mismatch — caller wants retry", func(t *testing.T) {
+		retryParams := params
+		retryParams.FailCount = 2
+		id, err := validateAdoption(mkExisting(goodLabels, image), retryParams, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "fail_count=0")
+		assert.Contains(t, err.Error(), "want 2")
+	})
+
+	t.Run("missing fail count label is treated as mismatch when caller has retries", func(t *testing.T) {
+		retryParams := params
+		retryParams.FailCount = 1
+		labelsNoFailCount := map[string]string{LabelLeaseUUID: lease}
+		id, err := validateAdoption(mkExisting(labelsNoFailCount, image), retryParams, name)
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "fail_count=")
+	})
+}
+
+func TestIsNameInUse(t *testing.T) {
+	nameInUse := errdefs.Conflict(errors.New(`Conflict. The container name "/fred-abc-web-0" is already in use by container "xyz"`))
+	otherConflict := errdefs.Conflict(errors.New("some other conflict"))
+	plain := errors.New("is already in use by container zzz")
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"typed name in use", nameInUse, true},
+		{"wrapped typed", fmt.Errorf("create: %w", nameInUse), true},
+		{"other conflict", otherConflict, false},
+		{"missing type wrap", plain, false},
+		{"unrelated error", errors.New("connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isNameInUse(tc.err))
+		})
+	}
 }

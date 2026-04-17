@@ -1066,6 +1066,24 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 			return resp.ID, nil
 		}
 
+		if isNameInUse(err) {
+			// Almost certainly a prior crashed attempt at the same
+			// (lease, service, instance). Adopt only if the existing
+			// container still matches our params; otherwise surface an
+			// error so the reconciler retries after the old container
+			// is actually removed.
+			existing, inspectErr := d.client.ContainerInspect(ctx, containerName)
+			if inspectErr != nil {
+				return "", fmt.Errorf("create container failed (name %q in use); inspect to check ownership: %w", containerName, inspectErr)
+			}
+			id, adoptErr := validateAdoption(existing, params, containerName)
+			if adoptErr != nil {
+				return "", adoptErr
+			}
+			idempotentOpsTotal.WithLabelValues("create", "already_exists").Inc()
+			return id, nil
+		}
+
 		if !ephemeral || !isPortBindingError(err) {
 			return "", fmt.Errorf("failed to create container: %w", err)
 		}
@@ -1149,20 +1167,111 @@ func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, ta
 	return buf.String(), nil
 }
 
-// RemoveContainer removes a container. It is idempotent — removing an
-// already-removed container returns nil.
+// isRemovalInProgress reports whether err indicates the Docker daemon is
+// already removing the container. The daemon completes the removal on its
+// own, so callers treat this as idempotent success. Docker emits this as
+// errdefs.Conflict with a stable message; we guard on both to avoid matching
+// other conflict errors (running, paused) that represent genuine failures.
+func isRemovalInProgress(err error) bool {
+	if err == nil || !errdefs.IsConflict(err) {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "removal of container") &&
+		strings.Contains(msg, "already in progress")
+}
+
+// isNameInUse reports whether err from ContainerCreate indicates the name is
+// already taken. Docker emits this as errdefs.Conflict with "is already in
+// use by container". Guarded on both for the same reasons as
+// isRemovalInProgress.
+func isNameInUse(err error) bool {
+	if err == nil || !errdefs.IsConflict(err) {
+		return false
+	}
+	return strings.Contains(err.Error(), "is already in use by container")
+}
+
+// validateAdoption decides whether an existing container (found via name
+// collision on create) is safe to adopt in place of creating a new one.
+// It returns the existing container's ID on success, or a descriptive
+// error on mismatch. The predicate is strict: the existing container
+// must carry our lease UUID, the same image, and the same fail count.
+// Any difference means the caller's intent has drifted from what's
+// actually running (e.g. a payload mutated between attempts), so
+// adopting would silently run stale configuration.
+func validateAdoption(existing container.InspectResponse, params CreateContainerParams, containerName string) (string, error) {
+	if existing.Config == nil {
+		return "", fmt.Errorf("create container failed: name %q in use and inspect returned no config", containerName)
+	}
+	existingFailCount := existing.Config.Labels[LabelFailCount]
+	wantFailCount := strconv.Itoa(params.FailCount)
+	switch {
+	case existing.Config.Labels[LabelLeaseUUID] != params.LeaseUUID:
+		return "", fmt.Errorf("create container failed: name %q in use by container not owned by lease %s", containerName, params.LeaseUUID)
+	case existing.Config.Image != params.Manifest.Image:
+		return "", fmt.Errorf("create container failed: name %q in use by container with image %q, want %q", containerName, existing.Config.Image, params.Manifest.Image)
+	case existingFailCount != wantFailCount:
+		return "", fmt.Errorf("create container failed: name %q in use by container at fail_count=%s, want %s", containerName, existingFailCount, wantFailCount)
+	}
+	return existing.ID, nil
+}
+
+// Poll parameters for waiting on an in-progress Docker container removal.
+// 5s covers typical daemon removal latency; longer and the caller retries.
+const (
+	containerRemovalPollInterval = 200 * time.Millisecond
+	containerRemovalPollTimeout  = 5 * time.Second
+)
+
+// RemoveContainer removes a container. It is idempotent — if the container
+// is already gone or the daemon is already removing it, returns nil only
+// after the removal has actually completed, so callers can safely proceed
+// with operations that assume the container is physically gone (volume
+// destroy, name re-use).
 func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) error {
 	err := d.client.ContainerRemove(ctx, containerID, container.RemoveOptions{
 		Force: true,
 	})
 	if err != nil {
 		if client.IsErrNotFound(err) {
-			return nil // Already removed
+			idempotentOpsTotal.WithLabelValues("remove", "not_found").Inc()
+			return nil
+		}
+		if isRemovalInProgress(err) {
+			// Wait for the in-flight removal to finish before returning
+			// nil; otherwise downstream volume destroy / name re-use
+			// races against bind mounts that Docker hasn't released yet.
+			if waitErr := d.waitForContainerGone(ctx, containerID); waitErr != nil {
+				return fmt.Errorf("failed to remove container: %w", err)
+			}
+			idempotentOpsTotal.WithLabelValues("remove", "in_progress").Inc()
+			return nil
 		}
 		return fmt.Errorf("failed to remove container: %w", err)
 	}
 
 	return nil
+}
+
+// waitForContainerGone polls ContainerInspect until the container is no
+// longer found, the context is canceled, or containerRemovalPollTimeout
+// elapses. Returns nil once Docker reports NotFound.
+func (d *DockerClient) waitForContainerGone(ctx context.Context, containerID string) error {
+	deadline := time.Now().Add(containerRemovalPollTimeout)
+	for {
+		if _, inspectErr := d.client.ContainerInspect(ctx, containerID); inspectErr != nil && client.IsErrNotFound(inspectErr) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("container %s still present after %s", containerID, containerRemovalPollTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(containerRemovalPollInterval):
+		}
+	}
 }
 
 // labelMeta holds parsed metadata from container labels.

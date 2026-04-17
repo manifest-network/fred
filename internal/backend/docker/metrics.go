@@ -120,6 +120,18 @@ var (
 		Name:      "reconciliation_last_success_timestamp_seconds",
 		Help:      "Unix timestamp of the last successful reconciliation run",
 	})
+
+	// idempotentOpsTotal tracks Docker operations skipped because the daemon
+	// reported the work was already done. We increment this when Docker tells
+	// us the operation was already complete; the caller sees success. Spikes
+	// on remove/in_progress suggest reconciler/event-handler races; spikes on
+	// create/already_exists suggest repeated crash-replay.
+	idempotentOpsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "idempotent_ops_total",
+		Help:      "Docker operations skipped because the daemon reported the work was already done",
+	}, []string{"op", "reason"})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
