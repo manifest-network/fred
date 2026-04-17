@@ -297,7 +297,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 			var chainErr *chain.ChainTxError
 			if errors.As(err, &chainErr) && (chainErr.IsInsufficientFee() || chainErr.IsOutOfGas()) {
 				metrics.AckBatchFeeGasErrorsTotal.WithLabelValues(laneLabel).Inc()
-				slog.Warn("batch acknowledgment failed with fee/gas error; surfacing to callers (no individualize)",
+				slog.Warn("batch acknowledgment failed with fee/gas error; surfacing to callers (not individualizing)",
 					"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
 				)
 				result := ackResult{err: err}

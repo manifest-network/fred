@@ -162,7 +162,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("grpc_tls_skip_verify", false)
 	v.SetDefault("gas_limit", 1500000)
 	v.SetDefault("max_gas_limit", 0)    // 0 = no cap; if set, caps the gas limit during out-of-gas retries
-	v.SetDefault("gas_price", 25)       // micro-units of fee_denom per gas unit; fee = gas_limit * gas_price / 1_000_000
+	v.SetDefault("gas_price", 25)       // micro-units of fee_denom per gas unit; fee = ceil(gas_limit * gas_price / 1_000_000), so non-divisible products round up by one base unit
 	v.SetDefault("gas_adjustment", 1.2) // multiplier applied to gas_limit at sign time (matches Cosmos CLI default)
 	v.SetDefault("fee_denom", "umfx")
 
