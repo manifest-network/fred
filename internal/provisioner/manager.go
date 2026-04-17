@@ -144,12 +144,13 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	tracker := NewInFlightTracker()
 	orchestrator := NewProvisionOrchestrator(cfg.ProviderUUID, cfg.CallbackBaseURL, router, tracker, cfg.PlacementStore)
 	handlers := NewHandlerSet(HandlerDeps{
-		ChainClient:  chainClient,
-		Orchestrator: orchestrator,
-		Tracker:      tracker,
-		Acknowledger: ackBatcher,
-		PayloadStore: cfg.PayloadStore,
-		Publisher:    pubSub,
+		ChainClient:   chainClient,
+		Orchestrator:  orchestrator,
+		Tracker:       tracker,
+		Acknowledger:  ackBatcher,
+		PayloadStore:  cfg.PayloadStore,
+		Publisher:     pubSub,
+		BackendRouter: router,
 	})
 	timeoutChecker := NewTimeoutChecker(TimeoutCheckerConfig{
 		Tracker:       tracker,

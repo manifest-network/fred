@@ -307,14 +307,14 @@ var (
 		Help:      "Total number of provisions that timed out waiting for backend callback",
 	})
 
-	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker.
-	// This includes expected restart/update completions as well as duplicate deliveries.
-	NonInFlightCallbacksTotal = promauto.NewCounter(prometheus.CounterOpts{
+	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker,
+	// labeled by the reporting backend and the callback status.
+	NonInFlightCallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "non_in_flight_callbacks_total",
-		Help:      "Callbacks received for leases not in the in-flight tracker (restart/update completions or duplicate delivery)",
-	})
+		Help:      "Callbacks received for leases not in the in-flight tracker (restart/update completions, late delivery, or intentional deprovision), labeled by backend and status",
+	}, []string{"backend", "status"})
 )
 
 // Signer pool metrics

@@ -7,17 +7,26 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 var callbackBucketName = []byte("pending_callbacks")
 
 // CallbackEntry represents a pending callback to be delivered.
+//
+// Success is retained for backwards compatibility with entries persisted by
+// binaries that predate the Status field. New writers populate Success AND
+// Status (and Backend). Readers prefer Status when non-empty and fall back to
+// Success otherwise; see callback_sender.ReplayPendingCallbacks.
 type CallbackEntry struct {
-	LeaseUUID   string    `json:"lease_uuid"`
-	CallbackURL string    `json:"callback_url"`
-	Success     bool      `json:"success"`
-	Error       string    `json:"error,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	LeaseUUID   string                 `json:"lease_uuid"`
+	CallbackURL string                 `json:"callback_url"`
+	Success     bool                   `json:"success"`
+	Status      backend.CallbackStatus `json:"status,omitempty"`
+	Backend     string                 `json:"backend,omitempty"`
+	Error       string                 `json:"error,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
 }
 
 // CallbackStore persists pending callbacks in bbolt so they survive restarts.

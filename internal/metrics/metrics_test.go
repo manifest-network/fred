@@ -75,7 +75,6 @@ func TestMetricsRegistered(t *testing.T) {
 		"fred_payload_stored_count",
 		"fred_payload_size_bytes",
 		"fred_payload_leases_awaiting",
-		"fred_api_non_in_flight_callbacks_total",
 		"fred_watermill_poisoned_messages_total",
 		"fred_reconciler_last_success_timestamp_seconds",
 		"fred_signer_pool_size",
@@ -140,6 +139,9 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		BackendHealthy.WithLabelValues("docker")
+	})
+	assert.NotPanics(t, func() {
+		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")
 	})
 }
 

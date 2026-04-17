@@ -228,7 +228,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 				callbackErr += "; rollback failed"
 			}
 
-			b.sendCallback(op.LeaseUUID, false, callbackErr)
+			b.sendCallback(op.LeaseUUID, backend.CallbackStatusFailed, callbackErr)
 			return
 		}
 
@@ -254,7 +254,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 			}
 		}
 
-		b.sendCallback(op.LeaseUUID, true, "")
+		b.sendCallback(op.LeaseUUID, backend.CallbackStatusSuccess, "")
 	}()
 
 	// Per-service image setup.
@@ -489,7 +489,7 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, e
 		}
 	}
 
-	b.sendCallback(leaseUUID, false, callbackMsg)
+	b.sendCallback(leaseUUID, backend.CallbackStatusFailed, callbackMsg)
 }
 
 // doReplaceContainers performs the container replacement lifecycle:
@@ -566,7 +566,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				callbackErr += "; rollback failed"
 			}
 
-			b.sendCallback(op.LeaseUUID, false, callbackErr)
+			b.sendCallback(op.LeaseUUID, backend.CallbackStatusFailed, callbackErr)
 			return
 		}
 
@@ -602,7 +602,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			}
 		}
 
-		b.sendCallback(op.LeaseUUID, true, "")
+		b.sendCallback(op.LeaseUUID, backend.CallbackStatusSuccess, "")
 	}()
 
 	// Inspect image and resolve user.

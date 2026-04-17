@@ -22,12 +22,13 @@ import (
 
 // HandlerDeps contains the dependencies needed by the handler set.
 type HandlerDeps struct {
-	ChainClient  ChainClient
-	Orchestrator *ProvisionOrchestrator
-	Tracker      InFlightTracker
-	Acknowledger Acknowledger
-	PayloadStore *payload.Store
-	Publisher    message.Publisher // For publishing to TopicLeaseEvent (optional)
+	ChainClient   ChainClient
+	Orchestrator  *ProvisionOrchestrator
+	Tracker       InFlightTracker
+	Acknowledger  Acknowledger
+	PayloadStore  *payload.Store
+	Publisher     message.Publisher // For publishing to TopicLeaseEvent (optional)
+	BackendRouter BackendRouter     // Used to allowlist backend names on non-in-flight callback metrics
 }
 
 // HandlerSet contains the Watermill message handlers for the provisioner.
@@ -202,12 +203,24 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	// the ready/failed transition, but skip chain operations.
 	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
 	if !exists {
-		metrics.NonInFlightCallbacksTotal.Inc()
+		backendLabel := h.sanitizeBackendName(callback.Backend)
+		statusLabel := sanitizeCallbackStatus(callback.Status)
+		if backendLabel == labelBackendInvalid || statusLabel == labelStatusOther {
+			slog.Warn("sanitized callback label to bounded value",
+				"lease_uuid", callback.LeaseUUID,
+				"received_backend", callback.Backend,
+				"received_status", callback.Status,
+			)
+		}
+		metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
+
 		switch callback.Status {
 		case backend.CallbackStatusSuccess:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
 		case backend.CallbackStatusFailed:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
+		case backend.CallbackStatusDeprovisioned:
+			// No lease event: backend has already torn down the lease.
 		default:
 			slog.Warn("unexpected callback status for non-in-flight lease",
 				"lease_uuid", callback.LeaseUUID,
@@ -523,4 +536,36 @@ func (h *HandlerSet) publishLeaseEvent(leaseUUID string, status backend.Provisio
 	if err := h.deps.Publisher.Publish(TopicLeaseEvent, msg); err != nil {
 		slog.Warn("failed to publish lease event", "lease_uuid", leaseUUID, "error", err)
 	}
+}
+
+// Label sentinels for sanitized Prom label values.
+const (
+	labelBackendUnknown = "unknown"
+	labelBackendInvalid = "invalid"
+	labelStatusOther    = "other"
+)
+
+// Keep in sync with CallbackStatus* constants in internal/backend/client.go.
+func sanitizeCallbackStatus(s backend.CallbackStatus) string {
+	switch s {
+	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed, backend.CallbackStatusDeprovisioned:
+		return string(s)
+	default:
+		return labelStatusOther
+	}
+}
+
+// sanitizeBackendName bounds Prometheus label cardinality by collapsing any
+// name outside the configured router's allowlist to "invalid". Empty values
+// (pre-upgrade backends that don't populate CallbackPayload.Backend) map to
+// "unknown". Returning the raw name was insufficient: a misbehaving sender
+// could emit arbitrarily many distinct regex-valid values.
+func (h *HandlerSet) sanitizeBackendName(name string) string {
+	if name == "" {
+		return labelBackendUnknown
+	}
+	if h.deps.BackendRouter == nil || h.deps.BackendRouter.GetBackendByName(name) == nil {
+		return labelBackendInvalid
+	}
+	return name
 }

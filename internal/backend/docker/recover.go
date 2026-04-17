@@ -326,7 +326,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// or dynamic data. Full diagnostics are in prov.LastError for
 	// authenticated API access.
 	for _, uuid := range failedLeases {
-		b.sendCallback(uuid, false, errMsgContainerExited)
+		b.sendCallback(uuid, backend.CallbackStatusFailed, errMsgContainerExited)
 	}
 
 	stats := b.pool.Stats()
@@ -499,7 +499,10 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	}
 
 	// Only transition ready→failed. Other states (provisioning, restarting,
-	// updating, already failed) are managed by other code paths.
+	// updating, deprovisioning, already failed) are managed by other code paths.
+	// Deprovisioning in particular: Deprovision() sets this status before
+	// calling RemoveContainer, so die events emitted during that removal land
+	// here and must be skipped.
 	// Read status under lock to avoid data race with concurrent writers.
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
@@ -567,7 +570,7 @@ func (b *Backend) handleContainerDeath(containerID string) {
 
 	// Update metrics and send callback.
 	activeProvisions.Dec()
-	b.sendCallback(leaseUUID, false, errMsgContainerExited)
+	b.sendCallback(leaseUUID, backend.CallbackStatusFailed, errMsgContainerExited)
 
 	logAttrs := []any{
 		"lease_uuid", leaseUUID,

@@ -333,8 +333,11 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if callback.Status != backend.CallbackStatusSuccess && callback.Status != backend.CallbackStatusFailed {
-		writeError(w, "status must be 'success' or 'failed'", http.StatusBadRequest)
+	switch callback.Status {
+	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed, backend.CallbackStatusDeprovisioned:
+		// ok
+	default:
+		writeError(w, "status must be 'success', 'failed', or 'deprovisioned'", http.StatusBadRequest)
 		return
 	}
 

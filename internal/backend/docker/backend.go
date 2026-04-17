@@ -540,22 +540,30 @@ func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, lo
 	return restored == len(containerIDs)
 }
 
-// sendCallback resolves the callback URL from the provisions map and delegates to callbackSender.
-func (b *Backend) sendCallback(leaseUUID string, success bool, errMsg string) {
+// sendCallback resolves the callback URL from the provisions map and delegates
+// to sendCallbackWithURL. Use this when the provision is still in the map.
+func (b *Backend) sendCallback(leaseUUID string, status backend.CallbackStatus, errMsg string) {
 	b.provisionsMu.RLock()
-	prov, ok := b.provisions[leaseUUID]
 	var callbackURL string
-	if ok {
+	if prov, ok := b.provisions[leaseUUID]; ok {
 		callbackURL = prov.CallbackURL
 	}
 	b.provisionsMu.RUnlock()
 
+	b.sendCallbackWithURL(leaseUUID, callbackURL, status, errMsg)
+}
+
+// sendCallbackWithURL dispatches a callback using a caller-provided URL,
+// bypassing the provisions map. Use when the map entry is about to be deleted
+// (or is being deleted under the write lock) and the URL has been captured
+// earlier.
+func (b *Backend) sendCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string) {
 	// Truncate error to fit the on-chain rejection reason limit.
 	if len(errMsg) > callbackMaxErrorLen {
 		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
 	}
 
-	b.callbackSender.SendCallback(leaseUUID, callbackURL, success, errMsg)
+	b.callbackSender.SendCallback(leaseUUID, callbackURL, b.Name(), status, errMsg)
 }
 
 // removeProvision removes a provision reservation and its callback URL.

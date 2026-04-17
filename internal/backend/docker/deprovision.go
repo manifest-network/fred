@@ -32,14 +32,16 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 		// Already deprovisioned - idempotent success
 		return nil
 	}
-	// Mark as failed before removing containers to prevent handleContainerDeath
+	// Mark as deprovisioning before removing containers to prevent handleContainerDeath
 	// from racing with removal. Die events emitted during RemoveContainer will
-	// see a non-Ready status and be skipped.
-	// Decrement activeProvisions immediately on Ready→Failed transition so
+	// see a non-Ready status and be skipped. The in-memory Deprovisioning marker
+	// also lets Provision's guard at provision.go:49 reject concurrent re-provision
+	// attempts during the removal window.
+	// Decrement activeProvisions immediately on Ready→Deprovisioning transition so
 	// the gauge stays accurate even if the rest of Deprovision fails partially
 	// and must be retried (at which point the provision is already Failed).
 	wasReady := prov.Status == backend.ProvisionStatusReady
-	prov.Status = backend.ProvisionStatusFailed
+	prov.Status = backend.ProvisionStatusDeprovisioning
 	if wasReady {
 		activeProvisions.Dec()
 	}
@@ -48,6 +50,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	items := append([]backend.LeaseItem(nil), prov.Items...)
 	quantity := prov.Quantity
 	tenant := prov.Tenant
+	callbackURL := prov.CallbackURL
 	b.provisionsMu.Unlock()
 
 	// Remove all containers.
@@ -175,6 +178,9 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 					"attempts", p.VolumeCleanupAttempts,
 					"errors", errors.Join(volumeErrs...),
 				)
+
+				// Volume leak: operator must clean up manually.
+				b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted")
 				return nil
 			}
 
@@ -211,5 +217,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 
 	deprovisionsTotal.Inc()
 	logger.Info("deprovisioned", "containers_removed", len(containerIDs))
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusDeprovisioned, "")
 	return nil
 }
