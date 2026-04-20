@@ -330,14 +330,21 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// and persist loop holds no lock, so a concurrent Deprovision (or Provision
 	// re-attempt, Restart) may have flipped Failed into another state.
 	// Whichever operation took over will emit its own terminal callback.
+	//
+	// Snapshot the callback URL under the same RLock as the status check, then
+	// send via sendCallbackWithURL so the send cannot race with a concurrent
+	// delete (which would yield a noisy "no callback URL" warning) or reinsert
+	// (which could route this lease's Failed send to a different URL).
 	for _, uuid := range failedLeases {
 		b.provisionsMu.RLock()
 		var curStatus backend.ProvisionStatus
+		var callbackURL string
 		var failCount int
 		present := false
 		if p, ok := b.provisions[uuid]; ok {
 			present = true
 			curStatus = p.Status
+			callbackURL = p.CallbackURL
 			failCount = p.FailCount
 		}
 		b.provisionsMu.RUnlock()
@@ -350,7 +357,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			)
 			continue
 		}
-		b.sendCallback(uuid, backend.CallbackStatusFailed, errMsgContainerExited)
+		b.sendCallbackWithURL(uuid, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
 	}
 
 	stats := b.pool.Stats()
@@ -602,12 +609,18 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	// When that happens, whichever operation took over will emit its own terminal
 	// callback; ours would be a spurious duplicate of an event Fred already knows
 	// about. Suppress but log, so operators can see the frequency.
+	//
+	// Snapshot the callback URL under the same RLock as the status check so the
+	// subsequent send cannot race with a concurrent delete (noisy "no callback
+	// URL" warn) or reinsert (routing this lease's Failed send to a different URL).
 	b.provisionsMu.RLock()
 	var curStatus backend.ProvisionStatus
+	var callbackURL string
 	present := false
 	if p, ok := b.provisions[leaseUUID]; ok {
 		present = true
 		curStatus = p.Status
+		callbackURL = p.CallbackURL
 	}
 	b.provisionsMu.RUnlock()
 	if !present || curStatus != backend.ProvisionStatusFailed {
@@ -621,7 +634,7 @@ func (b *Backend) handleContainerDeath(containerID string) {
 		return
 	}
 
-	b.sendCallback(leaseUUID, backend.CallbackStatusFailed, errMsgContainerExited)
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
 
 	logAttrs := []any{
 		"lease_uuid", leaseUUID,
