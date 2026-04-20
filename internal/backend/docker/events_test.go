@@ -240,6 +240,74 @@ func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
 	b.provisionsMu.RUnlock()
 }
 
+// TestHandleContainerDeath_SuppressesFailedCallbackWhenDeprovisionRaces is a
+// regression test for the Failed+Deprovisioned double-callback observed under
+// heavy load. handleContainerDeath flips Ready→Failed under the write lock,
+// releases it, then gathers diagnostics and persists them without the lock.
+// During that window a concurrent Deprovision can flip Failed→Deprovisioning
+// and emit its own terminal Deprovisioned callback. Without the pre-send
+// status recheck, handleContainerDeath would fire a stale duplicate Failed.
+//
+// We simulate the concurrent flip via ContainerLogsFn (invoked during diag
+// gather, after the Ready→Failed flip and before the pre-send recheck).
+func TestHandleContainerDeath_SuppressesFailedCallbackWhenDeprovisionRaces(t *testing.T) {
+	var callbackHit atomic.Bool
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var b *Backend
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			// ContainerLogs runs after the Ready→Failed flip; guarding on
+			// Status==Failed ensures the simulated Deprovision races only
+			// within the intended window, not before it.
+			b.provisionsMu.Lock()
+			if p, ok := b.provisions["lease-1"]; ok && p.Status == backend.ProvisionStatusFailed {
+				p.Status = backend.ProvisionStatusDeprovisioning
+			}
+			b.provisionsMu.Unlock()
+			return "logs", nil
+		},
+	}
+
+	b = newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ContainerIDs: []string{"c1"},
+			Status:       backend.ProvisionStatusReady,
+			CallbackURL:  callbackServer.URL,
+		},
+	})
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	defer b.stopCancel()
+
+	b.handleContainerDeath("c1")
+
+	// Bounded negative assertion: if a stray callback path ever goes async,
+	// this catches it instead of passing trivially on the immediate read.
+	require.Never(t, callbackHit.Load, 200*time.Millisecond, 20*time.Millisecond,
+		"Failed callback must not fire once Deprovision has flipped the status")
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	assert.Equal(t, backend.ProvisionStatusDeprovisioning, prov.Status, "Deprovisioning flip must be preserved")
+	assert.Equal(t, 1, prov.FailCount, "FailCount increments on the in-memory Ready→Failed transition even when the callback is suppressed")
+	// LastError must NOT be clobbered with the stale diagnostic string after the
+	// status changed — the write is gated on Status==Failed. The hook flips to
+	// Deprovisioning during the diag fetch, so the only LastError the suppressed
+	// path should have set is the initial errMsgContainerExited from the flip.
+	assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError must not be enriched after status left Failed")
+	b.provisionsMu.RUnlock()
+}
+
 func TestFindLeaseByContainerID(t *testing.T) {
 	b := newBackendForTest(nil, map[string]*provision{
 		"lease-1": {

@@ -289,18 +289,25 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 
-	// Update LastError with enriched diagnostics.
+	// Update LastError with enriched diagnostics. Writes are gated on
+	// Status==Failed so a concurrent Deprovision/Provision-re-attempt/Restart
+	// that took ownership during the diag window doesn't get its fresh
+	// LastError clobbered with this failure's data. Same principle as the
+	// suppress-callback-on-status-change loop below.
 	if len(failedDiagnostics) > 0 {
 		b.provisionsMu.Lock()
 		for uuid, diag := range failedDiagnostics {
-			if prov, ok := b.provisions[uuid]; ok {
+			if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
 				prov.LastError = errMsgContainerExited + ": " + diag
 			}
 		}
 		b.provisionsMu.Unlock()
 	}
 
-	// Snapshot diagnostics under lock, then persist outside (I/O).
+	// Snapshot diagnostics under lock, then persist outside (I/O). Same
+	// Status==Failed gate so we don't persist a snapshot that aliases the new
+	// owner's ContainerIDs (which would cause persistDiagnostics to fetch logs
+	// from containers unrelated to the original failure).
 	type diagItem struct {
 		entry        shared.DiagnosticEntry
 		containerIDs []string
@@ -309,7 +316,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	diagItems := make([]diagItem, 0, len(allFailed))
 	b.provisionsMu.RLock()
 	for _, uuid := range allFailed {
-		if prov, ok := b.provisions[uuid]; ok {
+		if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
 			diagItems = append(diagItems, diagItem{
 				entry:        diagnosticSnapshot(prov),
 				containerIDs: append([]string(nil), prov.ContainerIDs...),
@@ -325,8 +332,39 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// Send failure callbacks with hardcoded message — never includes logs
 	// or dynamic data. Full diagnostics are in prov.LastError for
 	// authenticated API access.
+	//
+	// Re-check status under RLock before each send: the preceding diag gather
+	// and persist loop holds no lock, so a concurrent Deprovision (or Provision
+	// re-attempt, Restart) may have flipped Failed into another state.
+	// Whichever operation took over will emit its own terminal callback.
+	//
+	// Snapshot the callback URL under the same RLock as the status check, then
+	// send via sendCallbackWithURL so the send cannot race with a concurrent
+	// delete (which would yield a noisy "no callback URL" warning) or reinsert
+	// (which could route this lease's Failed send to a different URL).
 	for _, uuid := range failedLeases {
-		b.sendCallback(uuid, backend.CallbackStatusFailed, errMsgContainerExited)
+		b.provisionsMu.RLock()
+		var curStatus backend.ProvisionStatus
+		var callbackURL string
+		var failCount int
+		present := false
+		if p, ok := b.provisions[uuid]; ok {
+			present = true
+			curStatus = p.Status
+			callbackURL = p.CallbackURL
+			failCount = p.FailCount
+		}
+		b.provisionsMu.RUnlock()
+		if !present || curStatus != backend.ProvisionStatusFailed {
+			b.logger.Info("suppressing Failed callback: another operation took over",
+				"lease_uuid", uuid,
+				"observed_status", curStatus,
+				"present", present,
+				"fail_count", failCount,
+			)
+			continue
+		}
+		b.sendCallbackWithURL(uuid, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
 	}
 
 	stats := b.pool.Stats()
@@ -543,13 +581,22 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	currentProv.FailCount++
 	failCount := currentProv.FailCount
 	currentProv.LastError = errMsgContainerExited
+	// Decrement the gauge under the same lock as the status flip so the
+	// Ready→Failed transition is counted exactly once even if a concurrent
+	// Deprovision preempts the callback below.
+	activeProvisions.Dec()
 	b.provisionsMu.Unlock()
 
 	// Gather diagnostics (I/O outside the lock, same pattern as recoverState).
+	// All writes below are gated on Status==Failed: if a concurrent Deprovision
+	// or Provision re-attempt has taken ownership, its fresh LastError / new
+	// ContainerIDs must not be overwritten with the old failure's data, and
+	// the diagnostic snapshot must not persist logs attributed to the new
+	// owner. Same principle as the suppress-callback-on-status-change below.
 	diag := b.containerFailureDiagnostics(ctx, containerID, info)
 	if diag != "" {
 		b.provisionsMu.Lock()
-		if p, ok := b.provisions[leaseUUID]; ok {
+		if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailed {
 			p.LastError = errMsgContainerExited + ": " + diag
 		}
 		b.provisionsMu.Unlock()
@@ -560,17 +607,48 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	var diagContainerIDs []string
 	var diagKeys map[string]string
 	b.provisionsMu.RLock()
-	if p, ok := b.provisions[leaseUUID]; ok {
+	if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailed {
 		diagSnap = diagnosticSnapshot(p)
 		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
 		diagKeys = containerLogKeys(p)
 	}
 	b.provisionsMu.RUnlock()
-	b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
+	if diagSnap.LeaseUUID != "" {
+		b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
+	}
 
-	// Update metrics and send callback.
-	activeProvisions.Dec()
-	b.sendCallback(leaseUUID, backend.CallbackStatusFailed, errMsgContainerExited)
+	// Re-check status before firing the terminal Failed callback. The diag+persist
+	// above runs without the lock, leaving a window for a concurrent Deprovision
+	// (or Provision re-attempt, Restart, etc.) to flip Failed into another state.
+	// When that happens, whichever operation took over will emit its own terminal
+	// callback; ours would be a spurious duplicate of an event Fred already knows
+	// about. Suppress but log, so operators can see the frequency.
+	//
+	// Snapshot the callback URL under the same RLock as the status check so the
+	// subsequent send cannot race with a concurrent delete (noisy "no callback
+	// URL" warn) or reinsert (routing this lease's Failed send to a different URL).
+	b.provisionsMu.RLock()
+	var curStatus backend.ProvisionStatus
+	var callbackURL string
+	present := false
+	if p, ok := b.provisions[leaseUUID]; ok {
+		present = true
+		curStatus = p.Status
+		callbackURL = p.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
+	if !present || curStatus != backend.ProvisionStatusFailed {
+		b.logger.Info("suppressing Failed callback: another operation took over",
+			"lease_uuid", leaseUUID,
+			"container_id", shortID(containerID),
+			"observed_status", curStatus,
+			"present", present,
+			"fail_count", failCount,
+		)
+		return
+	}
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
 
 	logAttrs := []any{
 		"lease_uuid", leaseUUID,
