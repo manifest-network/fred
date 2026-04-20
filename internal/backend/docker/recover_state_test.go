@@ -1299,6 +1299,7 @@ func TestRecoverState_SuppressesFailedCallbackWhenDeprovisionRaces(t *testing.T)
 	prov := b.provisions["lease-1"]
 	require.NotNil(t, prov)
 	assert.Equal(t, backend.ProvisionStatusDeprovisioning, prov.Status, "Deprovisioning flip must be preserved")
+	assert.Equal(t, 1, prov.FailCount, "FailCount must still increment on the in-memory Ready→Failed transition even when the callback is suppressed")
 	b.provisionsMu.RUnlock()
 }
 
