@@ -300,6 +300,11 @@ func TestHandleContainerDeath_SuppressesFailedCallbackWhenDeprovisionRaces(t *te
 	prov := b.provisions["lease-1"]
 	assert.Equal(t, backend.ProvisionStatusDeprovisioning, prov.Status, "Deprovisioning flip must be preserved")
 	assert.Equal(t, 1, prov.FailCount, "FailCount increments on the in-memory Ready→Failed transition even when the callback is suppressed")
+	// LastError must NOT be clobbered with the stale diagnostic string after the
+	// status changed — the write is gated on Status==Failed. The hook flips to
+	// Deprovisioning during the diag fetch, so the only LastError the suppressed
+	// path should have set is the initial errMsgContainerExited from the flip.
+	assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError must not be enriched after status left Failed")
 	b.provisionsMu.RUnlock()
 }
 

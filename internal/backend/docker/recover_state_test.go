@@ -1300,6 +1300,10 @@ func TestRecoverState_SuppressesFailedCallbackWhenDeprovisionRaces(t *testing.T)
 	require.NotNil(t, prov)
 	assert.Equal(t, backend.ProvisionStatusDeprovisioning, prov.Status, "Deprovisioning flip must be preserved")
 	assert.Equal(t, 1, prov.FailCount, "FailCount must still increment on the in-memory Ready→Failed transition even when the callback is suppressed")
+	// LastError must not be enriched with diagnostic logs after the status
+	// flipped out of Failed — the Status==Failed gate protects the new owner's
+	// state from being clobbered.
+	assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError must not be enriched after status left Failed")
 	b.provisionsMu.RUnlock()
 }
 

@@ -289,18 +289,25 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 
-	// Update LastError with enriched diagnostics.
+	// Update LastError with enriched diagnostics. Writes are gated on
+	// Status==Failed so a concurrent Deprovision/Provision-re-attempt/Restart
+	// that took ownership during the diag window doesn't get its fresh
+	// LastError clobbered with this failure's data. Same principle as the
+	// suppress-callback-on-status-change loop below.
 	if len(failedDiagnostics) > 0 {
 		b.provisionsMu.Lock()
 		for uuid, diag := range failedDiagnostics {
-			if prov, ok := b.provisions[uuid]; ok {
+			if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
 				prov.LastError = errMsgContainerExited + ": " + diag
 			}
 		}
 		b.provisionsMu.Unlock()
 	}
 
-	// Snapshot diagnostics under lock, then persist outside (I/O).
+	// Snapshot diagnostics under lock, then persist outside (I/O). Same
+	// Status==Failed gate so we don't persist a snapshot that aliases the new
+	// owner's ContainerIDs (which would cause persistDiagnostics to fetch logs
+	// from containers unrelated to the original failure).
 	type diagItem struct {
 		entry        shared.DiagnosticEntry
 		containerIDs []string
@@ -309,7 +316,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	diagItems := make([]diagItem, 0, len(allFailed))
 	b.provisionsMu.RLock()
 	for _, uuid := range allFailed {
-		if prov, ok := b.provisions[uuid]; ok {
+		if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
 			diagItems = append(diagItems, diagItem{
 				entry:        diagnosticSnapshot(prov),
 				containerIDs: append([]string(nil), prov.ContainerIDs...),
@@ -581,10 +588,15 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	b.provisionsMu.Unlock()
 
 	// Gather diagnostics (I/O outside the lock, same pattern as recoverState).
+	// All writes below are gated on Status==Failed: if a concurrent Deprovision
+	// or Provision re-attempt has taken ownership, its fresh LastError / new
+	// ContainerIDs must not be overwritten with the old failure's data, and
+	// the diagnostic snapshot must not persist logs attributed to the new
+	// owner. Same principle as the suppress-callback-on-status-change below.
 	diag := b.containerFailureDiagnostics(ctx, containerID, info)
 	if diag != "" {
 		b.provisionsMu.Lock()
-		if p, ok := b.provisions[leaseUUID]; ok {
+		if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailed {
 			p.LastError = errMsgContainerExited + ": " + diag
 		}
 		b.provisionsMu.Unlock()
@@ -595,13 +607,15 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	var diagContainerIDs []string
 	var diagKeys map[string]string
 	b.provisionsMu.RLock()
-	if p, ok := b.provisions[leaseUUID]; ok {
+	if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailed {
 		diagSnap = diagnosticSnapshot(p)
 		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
 		diagKeys = containerLogKeys(p)
 	}
 	b.provisionsMu.RUnlock()
-	b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
+	if diagSnap.LeaseUUID != "" {
+		b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
+	}
 
 	// Re-check status before firing the terminal Failed callback. The diag+persist
 	// above runs without the lock, leaving a window for a concurrent Deprovision
