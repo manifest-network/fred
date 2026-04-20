@@ -205,6 +205,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 			// Rollback: rebuild the Project from the previous StackManifest and
 			// Compose Up to restore the old containers.
 			restored := b.rollbackStackViaCompose(op)
+			var callbackURL string
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[op.LeaseUUID]; ok {
 				if restored {
@@ -219,6 +220,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 						activeProvisions.Dec()
 					}
 				}
+				callbackURL = prov.CallbackURL
 			}
 			b.provisionsMu.Unlock()
 
@@ -228,11 +230,12 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 				callbackErr += "; rollback failed"
 			}
 
-			b.sendCallback(op.LeaseUUID, backend.CallbackStatusFailed, callbackErr)
+			b.sendCallbackWithURL(op.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
 			return
 		}
 
 		// Success: update provision (Compose already replaced old containers).
+		var callbackURL string
 		b.provisionsMu.Lock()
 		if prov, ok := b.provisions[op.LeaseUUID]; ok {
 			prov.ContainerIDs = newContainerIDs
@@ -245,6 +248,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 			if op.OnSuccess != nil {
 				op.OnSuccess(prov)
 			}
+			callbackURL = prov.CallbackURL
 		}
 		b.provisionsMu.Unlock()
 
@@ -254,7 +258,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 			}
 		}
 
-		b.sendCallback(op.LeaseUUID, backend.CallbackStatusSuccess, "")
+		b.sendCallbackWithURL(op.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
 	}()
 
 	// Per-service image setup.
@@ -473,12 +477,14 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, e
 	logger.Error("preflight failed", "error", err)
 
 	var diagSnap shared.DiagnosticEntry
+	var callbackURL string
 	b.provisionsMu.Lock()
 	if prov, ok := b.provisions[leaseUUID]; ok {
 		prov.LastError = err.Error()
 		prov.FailCount++
 		prov.Status = prevStatus
 		diagSnap = diagnosticSnapshot(prov)
+		callbackURL = prov.CallbackURL
 	}
 	b.provisionsMu.Unlock()
 	b.persistDiagnostics(diagSnap, nil)
@@ -489,7 +495,7 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, callbackMsg string, e
 		}
 	}
 
-	b.sendCallback(leaseUUID, backend.CallbackStatusFailed, callbackMsg)
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, callbackMsg)
 }
 
 // doReplaceContainers performs the container replacement lifecycle:
@@ -535,6 +541,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 
 			// Rollback: restart old containers to restore service.
 			restored := !oldStopped || b.rollbackContainers(op.LeaseUUID, op.OldContainerIDs, op.Logger)
+			var callbackURL string
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[op.LeaseUUID]; ok {
 				if restored {
@@ -557,6 +564,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				if restored {
 					op.Logger.Info("rolled back to previous containers", "containers", len(op.OldContainerIDs))
 				}
+				callbackURL = prov.CallbackURL
 			}
 			b.provisionsMu.Unlock()
 
@@ -566,7 +574,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				callbackErr += "; rollback failed"
 			}
 
-			b.sendCallback(op.LeaseUUID, backend.CallbackStatusFailed, callbackErr)
+			b.sendCallbackWithURL(op.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
 			return
 		}
 
@@ -579,6 +587,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			}
 		}
 
+		var callbackURL string
 		b.provisionsMu.Lock()
 		if prov, ok := b.provisions[op.LeaseUUID]; ok {
 			prov.ContainerIDs = newContainerIDs
@@ -592,6 +601,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			if op.OnSuccess != nil {
 				op.OnSuccess(prov)
 			}
+			callbackURL = prov.CallbackURL
 		}
 		b.provisionsMu.Unlock()
 
@@ -602,7 +612,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			}
 		}
 
-		b.sendCallback(op.LeaseUUID, backend.CallbackStatusSuccess, "")
+		b.sendCallbackWithURL(op.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
 	}()
 
 	// Inspect image and resolve user.
