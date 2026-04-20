@@ -1223,6 +1223,85 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	assert.Contains(t, prov.LastError, secret)
 }
 
+// TestRecoverState_SuppressesFailedCallbackWhenDeprovisionRaces is the
+// recoverState-side parallel of TestHandleContainerDeath_SuppressesFailedCallback...
+// recoverState builds failedLeases under the write lock, releases it, gathers
+// diagnostics across the batch, then re-checks each entry's status before
+// sending Failed. If a concurrent Deprovision flips Failed→Deprovisioning in
+// that window, the Failed callback must be suppressed in favor of the
+// Deprovisioned callback that Deprovision will emit.
+func TestRecoverState_SuppressesFailedCallbackWhenDeprovisionRaces(t *testing.T) {
+	now := time.Now()
+
+	var callbackHit atomic.Bool
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	var b *Backend
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{
+					ContainerID:   "c1",
+					LeaseUUID:     "lease-1",
+					Tenant:        "tenant-a",
+					ProviderUUID:  "prov-1",
+					SKU:           "docker-small",
+					InstanceIndex: 0,
+					Image:         "nginx:latest",
+					Status:        "exited",
+					CreatedAt:     now,
+					CallbackURL:   callbackServer.URL,
+				},
+			}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			// ContainerLogs runs during the diag gather that precedes the
+			// per-lease recheck at the bottom of recoverState. Flip to
+			// Deprovisioning here to simulate a concurrent Deprovision
+			// landing in the window between the write-lock release and the
+			// per-lease RLock recheck.
+			b.provisionsMu.Lock()
+			if p, ok := b.provisions["lease-1"]; ok && p.Status == backend.ProvisionStatusFailed {
+				p.Status = backend.ProvisionStatusDeprovisioning
+			}
+			b.provisionsMu.Unlock()
+			return "logs", nil
+		},
+	}
+
+	existing := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1"},
+			CreatedAt:    now,
+			CallbackURL:  callbackServer.URL,
+		},
+	}
+	b = newBackendForTest(mock, existing)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	require.Never(t, callbackHit.Load, 200*time.Millisecond, 20*time.Millisecond,
+		"Failed callback must not fire once Deprovision has flipped the status")
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	require.NotNil(t, prov)
+	assert.Equal(t, backend.ProvisionStatusDeprovisioning, prov.Status, "Deprovisioning flip must be preserved")
+	b.provisionsMu.RUnlock()
+}
+
 func TestRecoverState_InFlightReProvisionPreservesFailCount(t *testing.T) {
 	// Regression test: recoverState must not overwrite an in-flight
 	// PROVISIONING entry with stale container labels.

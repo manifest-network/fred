@@ -325,7 +325,31 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// Send failure callbacks with hardcoded message — never includes logs
 	// or dynamic data. Full diagnostics are in prov.LastError for
 	// authenticated API access.
+	//
+	// Re-check status under RLock before each send: the preceding diag gather
+	// and persist loop holds no lock, so a concurrent Deprovision (or Provision
+	// re-attempt, Restart) may have flipped Failed into another state.
+	// Whichever operation took over will emit its own terminal callback.
 	for _, uuid := range failedLeases {
+		b.provisionsMu.RLock()
+		var curStatus backend.ProvisionStatus
+		var failCount int
+		present := false
+		if p, ok := b.provisions[uuid]; ok {
+			present = true
+			curStatus = p.Status
+			failCount = p.FailCount
+		}
+		b.provisionsMu.RUnlock()
+		if !present || curStatus != backend.ProvisionStatusFailed {
+			b.logger.Info("suppressing Failed callback: another operation took over",
+				"lease_uuid", uuid,
+				"observed_status", curStatus,
+				"present", present,
+				"fail_count", failCount,
+			)
+			continue
+		}
 		b.sendCallback(uuid, backend.CallbackStatusFailed, errMsgContainerExited)
 	}
 
@@ -543,6 +567,10 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	currentProv.FailCount++
 	failCount := currentProv.FailCount
 	currentProv.LastError = errMsgContainerExited
+	// Decrement the gauge under the same lock as the status flip so the
+	// Ready→Failed transition is counted exactly once even if a concurrent
+	// Deprovision preempts the callback below.
+	activeProvisions.Dec()
 	b.provisionsMu.Unlock()
 
 	// Gather diagnostics (I/O outside the lock, same pattern as recoverState).
@@ -568,8 +596,31 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	b.provisionsMu.RUnlock()
 	b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
 
-	// Update metrics and send callback.
-	activeProvisions.Dec()
+	// Re-check status before firing the terminal Failed callback. The diag+persist
+	// above runs without the lock, leaving a window for a concurrent Deprovision
+	// (or Provision re-attempt, Restart, etc.) to flip Failed into another state.
+	// When that happens, whichever operation took over will emit its own terminal
+	// callback; ours would be a spurious duplicate of an event Fred already knows
+	// about. Suppress but log, so operators can see the frequency.
+	b.provisionsMu.RLock()
+	var curStatus backend.ProvisionStatus
+	present := false
+	if p, ok := b.provisions[leaseUUID]; ok {
+		present = true
+		curStatus = p.Status
+	}
+	b.provisionsMu.RUnlock()
+	if !present || curStatus != backend.ProvisionStatusFailed {
+		b.logger.Info("suppressing Failed callback: another operation took over",
+			"lease_uuid", leaseUUID,
+			"container_id", shortID(containerID),
+			"observed_status", curStatus,
+			"present", present,
+			"fail_count", failCount,
+		)
+		return
+	}
+
 	b.sendCallback(leaseUUID, backend.CallbackStatusFailed, errMsgContainerExited)
 
 	logAttrs := []any{
