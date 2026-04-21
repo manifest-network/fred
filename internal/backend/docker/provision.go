@@ -359,12 +359,14 @@ func filterSubpaths(candidates, parents []string) []string {
 }
 
 // ensureNetworkConfig sets up per-tenant network isolation if enabled.
-// Returns nil config when isolation is disabled.
+// Returns nil config when isolation is disabled. Routes through
+// Backend.ensureTenantNetwork so the network cannot be removed by a
+// concurrent deprovision between here and ContainerCreate.
 func (b *Backend) ensureNetworkConfig(ctx context.Context, tenant string) (*networktypes.NetworkingConfig, error) {
 	if !b.cfg.IsNetworkIsolation() {
 		return nil, nil
 	}
-	networkID, err := b.docker.EnsureTenantNetwork(ctx, tenant)
+	networkID, err := b.ensureTenantNetwork(ctx, tenant)
 	if err != nil {
 		return nil, fmt.Errorf("tenant network setup failed: %w", err)
 	}
@@ -965,7 +967,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 	// Resolve tenant network name (not Docker network ID — Compose needs the name).
 	var networkName string
 	if b.cfg.IsNetworkIsolation() {
-		_, netErr := b.docker.EnsureTenantNetwork(ctx, req.Tenant)
+		_, netErr := b.ensureTenantNetwork(ctx, req.Tenant)
 		if netErr != nil {
 			logger.Error("failed to create tenant network", "error", netErr)
 			err = netErr

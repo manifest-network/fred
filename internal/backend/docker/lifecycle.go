@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -1574,6 +1575,54 @@ func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.
 		result = append(result, inspected)
 	}
 	return result, nil
+}
+
+// tenantNetworkMu returns the per-tenant mutex that serializes
+// EnsureTenantNetwork and RemoveTenantNetworkIfEmpty for a given tenant.
+// The mutex is created on first use and never removed.
+func (b *Backend) tenantNetworkMu(tenant string) *sync.Mutex {
+	b.tenantNetworkMusMu.Lock()
+	defer b.tenantNetworkMusMu.Unlock()
+	if b.tenantNetworkMus == nil {
+		b.tenantNetworkMus = make(map[string]*sync.Mutex)
+	}
+	mu, ok := b.tenantNetworkMus[tenant]
+	if !ok {
+		mu = &sync.Mutex{}
+		b.tenantNetworkMus[tenant] = mu
+	}
+	return mu
+}
+
+// ensureTenantNetwork wraps DockerClient.EnsureTenantNetwork with the
+// per-tenant mutex so the returned network ID cannot be removed by a
+// concurrent deprovision before the caller attaches a container to it.
+func (b *Backend) ensureTenantNetwork(ctx context.Context, tenant string) (string, error) {
+	mu := b.tenantNetworkMu(tenant)
+	mu.Lock()
+	defer mu.Unlock()
+	return b.docker.EnsureTenantNetwork(ctx, tenant)
+}
+
+// releaseTenantNetwork removes the tenant network iff no other lease in
+// b.provisions still references the tenant. The caller MUST have already
+// removed its own provision entry from b.provisions before calling this —
+// otherwise its own entry would veto removal.
+func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error {
+	mu := b.tenantNetworkMu(tenant)
+	mu.Lock()
+	defer mu.Unlock()
+
+	b.provisionsMu.RLock()
+	for _, p := range b.provisions {
+		if p.Tenant == tenant {
+			b.provisionsMu.RUnlock()
+			return nil
+		}
+	}
+	b.provisionsMu.RUnlock()
+
+	return b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
 }
 
 // buildNetworkConfig returns a NetworkingConfig that attaches to the given network,

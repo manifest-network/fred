@@ -290,7 +290,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	// Resolve tenant network name.
 	var networkName string
 	if b.cfg.IsNetworkIsolation() {
-		if _, netErr := b.docker.EnsureTenantNetwork(ctx, tenant); netErr != nil {
+		if _, netErr := b.ensureTenantNetwork(ctx, tenant); netErr != nil {
 			err = netErr
 			callbackErr = op.Operation + " failed"
 			return

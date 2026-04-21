@@ -438,6 +438,10 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 }
 
 // cleanupOrphanedNetworks removes managed networks whose tenant has no active provisions.
+// activeTenants is a cheap precheck to skip tenants obviously still in use;
+// releaseTenantNetwork re-validates against a live b.provisions scan under
+// the per-tenant mutex, so this path is safe against a Provision() arriving
+// concurrently with reconcile.
 func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map[string]bool) {
 	networks, err := b.docker.ListManagedNetworks(ctx)
 	if err != nil {
@@ -448,7 +452,7 @@ func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map
 	for _, n := range networks {
 		tenant := n.Labels[LabelTenant]
 		if tenant != "" && !activeTenants[tenant] && len(n.Containers) == 0 {
-			if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+			if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 				b.logger.Warn("failed to remove orphaned network", "network", n.Name, "error", err)
 			} else {
 				b.logger.Info("removed orphaned tenant network", "network", n.Name, "tenant", tenant)

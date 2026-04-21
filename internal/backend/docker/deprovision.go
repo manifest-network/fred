@@ -168,7 +168,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 					}
 				}
 				if b.cfg.IsNetworkIsolation() {
-					if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+					if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 						logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
 					}
 				}
@@ -208,9 +208,13 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	delete(b.provisions, leaseUUID)
 	b.provisionsMu.Unlock()
 
-	// Clean up tenant network if isolation is enabled
+	// Clean up tenant network if isolation is enabled. releaseTenantNetwork
+	// scans b.provisions under a per-tenant mutex and skips removal if any
+	// other lease still references this tenant, so a concurrent provision on
+	// the same tenant cannot have its network yanked between Ensure and
+	// ContainerCreate.
 	if b.cfg.IsNetworkIsolation() {
-		if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+		if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 			logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
 		}
 	}
