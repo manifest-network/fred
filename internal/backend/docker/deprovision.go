@@ -11,7 +11,53 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
-// Deprovision releases resources for a lease. Must be idempotent.
+// Deprovision is the public shim: it routes the request through the lease's
+// actor so that container-death and deprovision messages serialize per lease.
+// Routing forces a Ready/Failing/Failed → Deprovisioning SM transition whose
+// Failing.OnExit cancels the in-flight diag goroutine — the cc62f3b
+// structural suppression of stale Failed callbacks.
+func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
+	actor := b.actorFor(leaseUUID)
+	reply := make(chan error, 1)
+	if !actor.send(deprovisionMsg{ctx: ctx, reply: reply}) {
+		return fmt.Errorf("backend shutting down")
+	}
+	select {
+	case err := <-reply:
+		return err
+	case <-b.stopCtx.Done():
+		return fmt.Errorf("backend shutting down")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// handleDeprovision runs inside the lease actor's message handler. It fires
+// the SM transition then runs the work synchronously, returning the outcome
+// on the deprovisionMsg's reply channel.
+func (a *leaseActor) handleDeprovision(ctx context.Context) error {
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	// Attempt the SM transition. If it's not permitted, check whether the
+	// provision is already gone (idempotent success) or we're in an unexpected
+	// state (surface the error).
+	if err := a.sm.Fire(ctx, evDeprovisionRequested); err != nil {
+		a.backend.provisionsMu.RLock()
+		_, exists := a.backend.provisions[a.leaseUUID]
+		a.backend.provisionsMu.RUnlock()
+		if !exists {
+			return nil
+		}
+		a.backend.logger.Warn("deprovision transition denied by SM",
+			"lease_uuid", a.leaseUUID, "error", err)
+		// Fall through to the work anyway — the SM may not know every state
+		// (partial port). The work itself is idempotent.
+	}
+	return a.backend.doDeprovision(ctx, a.leaseUUID)
+}
+
+// doDeprovision releases resources for a lease. Must be idempotent.
 // For multi-unit leases, removes all containers.
 // Returns an error if any container removal fails for a reason other than
 // the container already being gone (which is handled idempotently by
@@ -22,7 +68,7 @@ import (
 // the failed removals. Resource pool allocations are still released (the
 // lease is being abandoned). On retry, only the stuck containers are
 // attempted.
-func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
+func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
 
 	b.provisionsMu.Lock()

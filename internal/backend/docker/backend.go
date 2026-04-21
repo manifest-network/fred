@@ -112,6 +112,11 @@ type Backend struct {
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
 	wg         sync.WaitGroup
+
+	// actors routes per-lease messages to a goroutine that serializes all
+	// state transitions for that lease. Entries are created lazily via
+	// actorFor and live until backend shutdown.
+	actors sync.Map // leaseUUID → *leaseActor
 }
 
 // provision tracks provisioned containers for a lease.
