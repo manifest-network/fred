@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"fmt"
 )
 
 type leaseMessage interface {
@@ -346,6 +347,47 @@ func (b *Backend) actorFor(leaseUUID string) *leaseActor {
 	if loaded {
 		return actual.(*leaseActor)
 	}
+	leaseActorsCreatedTotal.Inc()
 	b.wg.Go(candidate.run)
 	return candidate
+}
+
+// ActorSnapshot is a point-in-time view of one lease actor's state for
+// operator introspection. Safe to marshal to JSON for a /debug/actors
+// endpoint when integrated with the HTTP layer.
+type ActorSnapshot struct {
+	LeaseUUID  string `json:"lease_uuid"`
+	SMState    string `json:"sm_state"`    // empty if the SM has never been fired
+	InboxDepth int    `json:"inbox_depth"` // pending messages not yet processed
+	InboxCap   int    `json:"inbox_cap"`
+}
+
+// DebugActors returns a snapshot of every live lease actor. The result
+// is stable for the caller: it's a copy; the registry may grow or
+// change state after return. Intended for ops introspection during
+// incidents — pair with a /debug/actors HTTP handler that JSON-encodes
+// the return.
+func (b *Backend) DebugActors() []ActorSnapshot {
+	var snapshots []ActorSnapshot
+	b.actors.Range(func(key, value any) bool {
+		leaseUUID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		actor, ok := value.(*leaseActor)
+		if !ok {
+			return true
+		}
+		snap := ActorSnapshot{
+			LeaseUUID:  leaseUUID,
+			InboxDepth: len(actor.inbox),
+			InboxCap:   cap(actor.inbox),
+		}
+		if actor.sm != nil {
+			snap.SMState = fmt.Sprintf("%v", actor.sm.State())
+		}
+		snapshots = append(snapshots, snap)
+		return true
+	})
+	return snapshots
 }

@@ -86,6 +86,16 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	initial := readProvisionStatus(actor)
 	sm := stateless.NewStateMachine(initial)
 
+	// Count every transition for operator visibility. Runs inside Fire
+	// in the actor's goroutine, so no additional synchronization needed.
+	sm.OnTransitioned(func(_ context.Context, tr stateless.Transition) {
+		leaseSMTransitionsTotal.WithLabelValues(
+			fmt.Sprintf("%v", tr.Source),
+			fmt.Sprintf("%v", tr.Destination),
+			fmt.Sprintf("%v", tr.Trigger),
+		).Inc()
+	})
+
 	lsm := &leaseSM{actor: actor, sm: sm}
 
 	// Configure all existing states so Fire never hits an unconfigured state.

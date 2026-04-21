@@ -144,6 +144,28 @@ var (
 		Name:      "container_removal_wait_failures_total",
 		Help:      "Count of RemoveContainer calls where the 'in progress' wait failed before confirming removal",
 	})
+
+	// leaseSMTransitionsTotal counts SM transitions by (from, to, event).
+	// Spikes on specific paths surface unexpected flows — e.g., a rise in
+	// (Failing, Deprovisioning, DeprovisionRequested) indicates frequent
+	// cc62f3b-class preemption, which is interesting for load analysis.
+	leaseSMTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_sm_transitions_total",
+		Help:      "Count of lease state-machine transitions by (from_state, to_state, event)",
+	}, []string{"from", "to", "event"})
+
+	// leaseActorsCreatedTotal counts how many per-lease actors have been
+	// created for the lifetime of this backend. Under normal operation,
+	// this tracks distinct leases processed. A runaway counter (with
+	// static lease count) would signal actor-leak or churn.
+	leaseActorsCreatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actors_created_total",
+		Help:      "Cumulative number of per-lease actors created since backend start",
+	})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.

@@ -168,6 +168,53 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 		"stale Failed callback must not fire when Deprovision takes over mid-flight")
 }
 
+// TestDebugActors exercises the ops introspection path: after container
+// events land for known leases, DebugActors reports each with its SM
+// state and inbox depth. Shape-level test; the point is that this
+// never blocks, never panics, and produces JSON-encodable data.
+func TestDebugActors(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-a": {
+			LeaseUUID:    "lease-a",
+			Tenant:       "tenant-1",
+			ContainerIDs: []string{"ca"},
+			Status:       backend.ProvisionStatusReady,
+		},
+		"lease-b": {
+			LeaseUUID:    "lease-b",
+			Tenant:       "tenant-1",
+			ContainerIDs: []string{"cb"},
+			Status:       backend.ProvisionStatusReady,
+		},
+	})
+	defer b.stopCancel()
+
+	// Before any activity, no actors.
+	require.Empty(t, b.DebugActors())
+
+	// Touch one lease — actor is created.
+	b.actorFor("lease-a")
+	snaps := b.DebugActors()
+	require.Len(t, snaps, 1)
+	require.Equal(t, "lease-a", snaps[0].LeaseUUID)
+	require.Equal(t, leaseActorInboxSize, snaps[0].InboxCap)
+	// No messages sent, SM never created.
+	require.Empty(t, snaps[0].SMState)
+
+	// Touch the other — now two actors visible.
+	b.actorFor("lease-b")
+	snaps = b.DebugActors()
+	require.Len(t, snaps, 2)
+}
+
 // TestHandleContainerDeath_ShutdownDoesNotHang guards the sync shim's
 // stopCtx branch: once the backend is shutting down, the shim must return
 // promptly instead of blocking on a done channel the actor will never close.
