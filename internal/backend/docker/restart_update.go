@@ -86,15 +86,44 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		}
 	}
 
-	// Async phase
+	// Async phase: route through the actor so the SM tracks the Restarting
+	// state and so a concurrent Deprovision can cancel us mid-flight. The
+	// goroutine reads the post-defer provision.Status to fire either
+	// replaceCompletedMsg (Ready — includes successful rollback) or
+	// replaceFailedMsg (Failed).
+	actor := b.actorFor(req.LeaseUUID)
+	opCtx, opCancel := b.shutdownAwareContext()
+	if !actor.send(restartRequestedMsg{cancel: opCancel}) {
+		opCancel()
+		b.provisionsMu.Lock()
+		if p, ok := b.provisions[req.LeaseUUID]; ok {
+			p.Status = prevStatus
+			p.CallbackURL = prevCallbackURL
+		}
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("backend shutting down")
+	}
 	b.wg.Go(func() {
-		ctx, cancel := b.shutdownAwareContext()
-		defer cancel()
+		defer opCancel()
 
 		if isStack {
-			b.doRestartStack(ctx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
+			b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
 		} else {
-			b.doRestart(ctx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
+			b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
+		}
+
+		// Fire the completion event based on the final status the defer
+		// observed (success, rollback-OK, rollback-FAIL, preflight-restored).
+		b.provisionsMu.RLock()
+		var finalStatus backend.ProvisionStatus
+		if p, ok := b.provisions[req.LeaseUUID]; ok {
+			finalStatus = p.Status
+		}
+		b.provisionsMu.RUnlock()
+		if finalStatus == backend.ProvisionStatusReady {
+			actor.send(replaceCompletedMsg{})
+		} else {
+			actor.send(replaceFailedMsg{})
 		}
 	})
 
@@ -833,12 +862,35 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			}
 		}
 
-		// Async phase
+		// Async phase: stack update (same actor routing as single-manifest Update).
+		actor := b.actorFor(req.LeaseUUID)
+		opCtx, opCancel := b.shutdownAwareContext()
+		if !actor.send(updateRequestedMsg{cancel: opCancel}) {
+			opCancel()
+			b.provisionsMu.Lock()
+			if p, ok := b.provisions[req.LeaseUUID]; ok {
+				p.Status = prevStatus
+				p.CallbackURL = prevCallbackURL
+			}
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("backend shutting down")
+		}
 		b.wg.Go(func() {
-			ctx, cancel := b.shutdownAwareContext()
-			defer cancel()
+			defer opCancel()
 
-			b.doUpdateStack(ctx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
+			b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
+
+			b.provisionsMu.RLock()
+			var finalStatus backend.ProvisionStatus
+			if p, ok := b.provisions[req.LeaseUUID]; ok {
+				finalStatus = p.Status
+			}
+			b.provisionsMu.RUnlock()
+			if finalStatus == backend.ProvisionStatusReady {
+				actor.send(replaceCompletedMsg{})
+			} else {
+				actor.send(replaceFailedMsg{})
+			}
 		})
 		return nil
 	}
@@ -879,11 +931,35 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		}
 	}
 
+	// Async phase: route through the actor (same pattern as Restart).
+	actor := b.actorFor(req.LeaseUUID)
+	opCtx, opCancel := b.shutdownAwareContext()
+	if !actor.send(updateRequestedMsg{cancel: opCancel}) {
+		opCancel()
+		b.provisionsMu.Lock()
+		if p, ok := b.provisions[req.LeaseUUID]; ok {
+			p.Status = prevStatus
+			p.CallbackURL = prevCallbackURL
+		}
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("backend shutting down")
+	}
 	b.wg.Go(func() {
-		ctx, cancel := b.shutdownAwareContext()
-		defer cancel()
+		defer opCancel()
 
-		b.doUpdate(ctx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
+		b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
+
+		b.provisionsMu.RLock()
+		var finalStatus backend.ProvisionStatus
+		if p, ok := b.provisions[req.LeaseUUID]; ok {
+			finalStatus = p.Status
+		}
+		b.provisionsMu.RUnlock()
+		if finalStatus == backend.ProvisionStatusReady {
+			actor.send(replaceCompletedMsg{})
+		} else {
+			actor.send(replaceFailedMsg{})
+		}
 	})
 
 	return nil

@@ -71,6 +71,38 @@ type provisionErroredMsg struct {
 func (provisionErroredMsg) isLeaseMessage()         {}
 func (provisionErroredMsg) doneChan() chan struct{} { return nil }
 
+// restartRequestedMsg / updateRequestedMsg fire the Ready|Failed → Restarting
+// or → Updating transition and register the goroutine's cancel func so
+// preemption by Deprovision can abort the in-flight work.
+type restartRequestedMsg struct {
+	cancel context.CancelFunc
+}
+
+func (restartRequestedMsg) isLeaseMessage()         {}
+func (restartRequestedMsg) doneChan() chan struct{} { return nil }
+
+type updateRequestedMsg struct {
+	cancel context.CancelFunc
+}
+
+func (updateRequestedMsg) isLeaseMessage()         {}
+func (updateRequestedMsg) doneChan() chan struct{} { return nil }
+
+// replaceCompletedMsg / replaceFailedMsg fire the Restarting|Updating → Ready
+// or → Failed transition after the goroutine finishes. The goroutine reads
+// the final provision.Status to decide which one to send — so rollback
+// cases that restored Ready are correctly reported as Completed even
+// though the caller's err was non-nil.
+type replaceCompletedMsg struct{}
+
+func (replaceCompletedMsg) isLeaseMessage()         {}
+func (replaceCompletedMsg) doneChan() chan struct{} { return nil }
+
+type replaceFailedMsg struct{}
+
+func (replaceFailedMsg) isLeaseMessage()         {}
+func (replaceFailedMsg) doneChan() chan struct{} { return nil }
+
 // leaseActor owns all state transitions for a single lease. Messages are
 // processed serially from inbox, so handlers never race with themselves.
 type leaseActor struct {
@@ -163,6 +195,14 @@ func (a *leaseActor) handle(msg leaseMessage) {
 		a.handleProvisionCompleted()
 	case provisionErroredMsg:
 		a.handleProvisionErrored(m.callbackErr)
+	case restartRequestedMsg:
+		a.handleRestartRequested(m.cancel)
+	case updateRequestedMsg:
+		a.handleUpdateRequested(m.cancel)
+	case replaceCompletedMsg:
+		a.handleReplaceCompleted()
+	case replaceFailedMsg:
+		a.handleReplaceFailed()
 	default:
 		a.backend.logger.Warn("lease actor: unknown message type",
 			"lease_uuid", a.leaseUUID,
@@ -211,6 +251,36 @@ func (a *leaseActor) handleProvisionErrored(callbackErr string) {
 		a.sm = newLeaseSM(a)
 	}
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, callbackErr)
+}
+
+func (a *leaseActor) handleRestartRequested(cancel context.CancelFunc) {
+	a.provisionCancel = cancel
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evRestartRequested)
+}
+
+func (a *leaseActor) handleUpdateRequested(cancel context.CancelFunc) {
+	a.provisionCancel = cancel
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evUpdateRequested)
+}
+
+func (a *leaseActor) handleReplaceCompleted() {
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceCompleted)
+}
+
+func (a *leaseActor) handleReplaceFailed() {
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed)
 }
 
 // send enqueues a message. Blocks when the inbox is full (backpressure).

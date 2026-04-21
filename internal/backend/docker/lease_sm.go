@@ -27,6 +27,13 @@ const (
 	evProvisionErrored
 	evDiagGathered
 	evContainersRemoved
+	// evReplaceCompleted / evReplaceFailed represent the outcome of a
+	// Restart or Update operation. The goroutine fires these after reading
+	// the final provision.Status so the SM follows the real outcome
+	// including rollback cases (failure restored to Ready counts as
+	// "completed").
+	evReplaceCompleted
+	evReplaceFailed
 )
 
 func (e leaseEvent) String() string {
@@ -49,6 +56,10 @@ func (e leaseEvent) String() string {
 		return "DiagGathered"
 	case evContainersRemoved:
 		return "ContainersRemoved"
+	case evReplaceCompleted:
+		return "ReplaceCompleted"
+	case evReplaceFailed:
+		return "ReplaceFailed"
 	}
 	return fmt.Sprintf("leaseEvent(%d)", int(e))
 }
@@ -80,10 +91,13 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		sm.Configure(s)
 	}
 
-	// Ready: a container died (guard confirms); a deprovision arrived.
+	// Ready: a container died (guard confirms); a deprovision arrived;
+	// or the operator initiated a Restart or Update.
 	sm.Configure(backend.ProvisionStatusReady).
 		Permit(evContainerDied, backend.ProvisionStatusFailing, lsm.guardContainerActuallyDied).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
+		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
+		Permit(evRestartRequested, backend.ProvisionStatusRestarting).
+		Permit(evUpdateRequested, backend.ProvisionStatusUpdating)
 
 	// Failing: transitional. The async diag goroutine is running. Either
 	// DiagGathered arrives (→ Failed, emit terminal callback) or a
@@ -129,10 +143,25 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		Ignore(evContainerDied).
 		Ignore(evProvisionRequested)
 
+	// Restarting/Updating: same shape as Provisioning — a goroutine is
+	// doing the work; OnExit cancels it on preemption. The goroutine fires
+	// evReplaceCompleted (if provision.Status ends up Ready — includes
+	// successful rollback) or evReplaceFailed (Status=Failed). No entry
+	// action on the destinations; doReplaceContainers / doReplaceStackContainers
+	// still emit the terminal callback from their defer, so the SM just
+	// tracks state without duplicating emission.
 	sm.Configure(backend.ProvisionStatusRestarting).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
+		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
+		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
+		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
+		OnExit(lsm.onExitProvisioning).
+		Ignore(evContainerDied)
 	sm.Configure(backend.ProvisionStatusUpdating).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
+		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
+		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
+		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
+		OnExit(lsm.onExitProvisioning).
+		Ignore(evContainerDied)
 
 	// Ready.OnEntryFrom(ProvisionCompleted): emit the terminal Success callback.
 	// The provision status fields are already populated by doProvision's defer
@@ -146,13 +175,21 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		OnEntryFrom(evProvisionErrored, lsm.onEnterFailedFromProvision).
 		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning)
 
-	// Deprovisioning ignores stale provision-completion events that might
-	// fire from an async goroutine that already started but hadn't noticed
-	// cancellation. Defense-in-depth mirroring Failing's pattern.
+	// Deprovisioning ignores stale provision/replace-completion events that
+	// might fire from an async goroutine that already started but hadn't
+	// noticed cancellation. Defense-in-depth mirroring Failing's pattern.
 	sm.Configure(backend.ProvisionStatusDeprovisioning).
 		Ignore(evProvisionCompleted).
 		Ignore(evProvisionErrored).
-		Ignore(evProvisionRequested)
+		Ignore(evProvisionRequested).
+		Ignore(evReplaceCompleted).
+		Ignore(evReplaceFailed)
+
+	// Failed: can accept restart/update retry requests in addition to
+	// re-provision.
+	sm.Configure(backend.ProvisionStatusFailed).
+		Permit(evRestartRequested, backend.ProvisionStatusRestarting).
+		Permit(evUpdateRequested, backend.ProvisionStatusUpdating)
 
 	return lsm
 }
