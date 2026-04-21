@@ -409,8 +409,10 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 
 
 // onEnterFailedFromDiag runs as the Failing→Failed entry action when
-// DiagGathered fires. Flips provision.Status, applies the diag to
-// LastError, and emits the terminal Failed callback.
+// DiagGathered fires. Owns all state mutations for this transition: flips
+// Status, applies diag to LastError, persists diagnostics, emits the
+// terminal Failed callback. Running in the actor's goroutine means no
+// mutex races with the gathering goroutine (which is pure I/O now).
 func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) error {
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterFailedFromDiag: missing diag info")
@@ -424,6 +426,9 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 
 	var callbackURL string
 	var failCount int
+	var diagSnap shared.DiagnosticEntry
+	var diagContainerIDs []string
+	var diagKeys map[string]string
 	b.provisionsMu.Lock()
 	p, exists := b.provisions[leaseUUID]
 	if !exists {
@@ -436,7 +441,17 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	}
 	callbackURL = p.CallbackURL
 	failCount = p.FailCount
+	diagSnap = diagnosticSnapshot(p)
+	diagContainerIDs = append([]string(nil), p.ContainerIDs...)
+	diagKeys = containerLogKeys(p)
 	b.provisionsMu.Unlock()
+
+	// Persist diagnostics (bbolt write). Runs in the actor goroutine —
+	// briefly blocks other messages for this lease, but matches the
+	// "actor owns all state" invariant. Bbolt writes are ~ms.
+	if diagSnap.LeaseUUID != "" {
+		b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
+	}
 
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
 
@@ -472,49 +487,20 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 	return p.Status
 }
 
-// gatherDiagAsync runs in a goroutine, doing I/O-heavy diag gathering
-// outside the actor's serial execution. Fires diagGatheredMsg on success;
-// returns silently if its context has been cancelled (the Failing.OnExit
-// cancellation path). Defense-in-depth: even if the goroutine races past
-// the ctx check and fires DiagGathered, the SM will have transitioned out
-// of Failing and Ignore(DiagGathered) drops the event.
+// gatherDiagAsync runs in a goroutine, doing pure I/O: Docker log fetch.
+// All state mutations (LastError update, persist, callback) are done by
+// onEnterFailedFromDiag, which runs in the actor's goroutine after Fire
+// commits the Failing→Failed transition. This makes the goroutine a
+// cancellable worker — no provisionsMu acquisition means no ctx-to-lock
+// gap, and if the ctx is cancelled (Failing.OnExit on Deprovision
+// preemption) the goroutine simply returns. The SM's
+// Deprovisioning.Ignore(evDiagGathered) catches the race where the
+// goroutine finishes and fires just as preemption happens.
 func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *ContainerInfo) {
-	b := a.backend
-	leaseUUID := a.leaseUUID
-
-	diag := b.containerFailureDiagnostics(ctx, containerID, info)
+	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
 	if ctx.Err() != nil {
 		return
 	}
-
-	if diag != "" {
-		b.provisionsMu.Lock()
-		if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailing {
-			p.LastError = errMsgContainerExited + ": " + diag
-		}
-		b.provisionsMu.Unlock()
-	}
-	if ctx.Err() != nil {
-		return
-	}
-
-	var diagSnap shared.DiagnosticEntry
-	var diagContainerIDs []string
-	var diagKeys map[string]string
-	b.provisionsMu.RLock()
-	if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailing {
-		diagSnap = diagnosticSnapshot(p)
-		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
-		diagKeys = containerLogKeys(p)
-	}
-	b.provisionsMu.RUnlock()
-	if diagSnap.LeaseUUID != "" {
-		b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
-	}
-	if ctx.Err() != nil {
-		return
-	}
-
 	a.send(diagGatheredMsg{
 		result: diagResult{containerID: containerID, info: info, diag: diag},
 	})
