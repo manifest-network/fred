@@ -286,6 +286,60 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 4. The full provisioning flow runs again (image pull, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
 5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label. Only newly created volumes are cleaned up; reused volumes are preserved.
 
+## Lease State Machine
+
+Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state is the lease's current `Status` at actor creation — new leases start in `Provisioning`, recovered leases start in whatever state they were in.
+
+```mermaid
+stateDiagram-v2
+    Provisioning --> Ready: ProvisionCompleted
+    Provisioning --> Failed: ProvisionErrored
+    Provisioning --> Deprovisioning: DeprovisionRequested
+
+    Ready --> Failing: ContainerDied [guard]
+    Ready --> Deprovisioning: DeprovisionRequested
+    Ready --> Restarting: RestartRequested
+    Ready --> Updating: UpdateRequested
+
+    Failing --> Failed: DiagGathered
+    Failing --> Deprovisioning: DeprovisionRequested
+
+    Failed --> Provisioning: ProvisionRequested
+    Failed --> Restarting: RestartRequested
+    Failed --> Updating: UpdateRequested
+    Failed --> Deprovisioning: DeprovisionRequested
+
+    Restarting --> Ready: ReplaceCompleted
+    Restarting --> Ready: ReplaceRecovered
+    Restarting --> Failed: ReplaceFailed
+    Restarting --> Deprovisioning: DeprovisionRequested
+
+    Updating --> Ready: ReplaceCompleted
+    Updating --> Ready: ReplaceRecovered
+    Updating --> Failed: ReplaceFailed
+    Updating --> Deprovisioning: DeprovisionRequested
+
+    Deprovisioning --> [*]
+```
+
+The edges above are the complete set of allowed transitions; any event not listed against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative source is `lease_sm.go`.
+
+### Key behaviors
+
+- **`Ready → Failing` guard.** The `ContainerDied` trigger fires only if a Docker `Inspect` confirms the container actually exited. Die events can be duplicated or stale; the guard filters them.
+- **Preemption via `OnExit` cancellation.** `Failing`, `Provisioning`, `Restarting`, and `Updating` each run an async goroutine (diag gather, provision work, or container replacement). Every transition out of these states cancels the goroutine's context via the state's `OnExit` action. The goroutine's I/O respects `ctx`, returns early, and never fires its "completed" event — suppressing stale terminal callbacks when a `Deprovision` preempts.
+- **Defense-in-depth `Ignore` on `Deprovisioning`.** Cancellation is best-effort: a goroutine can race past the cancel signal and fire its completion event anyway. `Deprovisioning` ignores every such event (`DiagGathered`, `ProvisionCompleted`, `ProvisionErrored`, `ReplaceCompleted`, `ReplaceRecovered`, `ReplaceFailed`) so the race is structurally safe.
+- **One terminal callback per lease.** Callback emission lives in SM entry actions (`onEnterReadyFromProvision`, `onEnterFailedFromDiag`, `onEnterFailedFromProvision`, `onEnterReadyFromReplaceCompleted`, `onEnterReadyFromReplaceRecovered`, `onEnterFailedFromReplace`), never in goroutines. Combined with the preemption/ignore rules above, this guarantees at most one `success`/`failed`/`deprovisioned` callback per lease per terminal transition.
+- **Three `Replace*` events for two terminal states.** `ReplaceCompleted` means restart/update succeeded (→ `Ready`, Success callback). `ReplaceRecovered` means it failed but rollback restored a working lease (→ `Ready`, Failed callback with rollback suffix). `ReplaceFailed` means both the operation and the rollback failed (→ `Failed`, Failed callback).
+- **Back-pressure on burst.** A single lease with many rapid events (e.g. multi-container crash storm) fills its 16-slot inbox and then backpressures senders. Events on distinct leases are fully parallel — actors don't share inboxes.
+
+### Observability
+
+- `fred_docker_backend_lease_sm_transitions_total{from,to,event}` — every transition.
+- `fred_docker_backend_lease_actors_created_total` — cumulative actor count; should track distinct leases.
+- `fred_docker_backend_lease_actor_stuck_seconds` — age of the oldest in-flight actor handler. Alert threshold should exceed the longest legitimate operation (Deprovision can hold an actor for minutes during container/volume cleanup).
+- `fred_docker_backend_lease_actor_inbox_depth` — histogram of per-actor inbox depth; p99 near 0 is healthy.
+
 ## State Recovery
 
 On startup, at each `ReconcileInterval`, and on every reconciler cycle (via `RefreshState`), `recoverState` rebuilds in-memory state from Docker:
