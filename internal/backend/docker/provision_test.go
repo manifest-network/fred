@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -4893,4 +4894,92 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+}
+
+// TestProvision_DeprovisionWaitsForInFlightGoroutine pins the fix for
+// bug_012: when Deprovision preempts an in-flight doProvision,
+// Provisioning.OnExit must (1) cancel the goroutine's context and
+// (2) wait for the goroutine to exit before doDeprovision reads
+// ContainerIDs. Without this, the goroutine's successful creations
+// stay on the host even though the provision struct reports none.
+//
+// Unit-tests the wait mechanism directly: installs synthetic
+// provisionCancel + provisionDone on the actor, fires Deprovision,
+// verifies OnExit blocks until provisionDone closes, and verifies
+// doDeprovision then observes the "pre-published" ContainerIDs
+// (simulating the real goroutine's pre-publish step).
+func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
+	var removedMu sync.Mutex
+	var removedIDs []string
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			removedMu.Lock()
+			removedIDs = append(removedIDs, containerID)
+			removedMu.Unlock()
+			return nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusProvisioning,
+			ContainerIDs: nil,
+		},
+	})
+	defer b.stopCancel()
+
+	// Eager SM in newLeaseActor reads initial state from the provision
+	// entry's Status, so actor.sm starts in Provisioning.
+	actor := b.actorFor("lease-1")
+	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
+
+	// Install synthetic goroutine handles. These are normally written by
+	// handleProvisionRequested on the actor's own goroutine; writing them
+	// here from the test goroutine before any message is sent is safe
+	// because the actor's inbox is empty. The subsequent actor.send →
+	// actor-receive pair synchronises the writes to the actor's goroutine
+	// per Go's channel memory model.
+	var cancelCalled atomic.Bool
+	goroutineFinished := make(chan struct{})
+	actor.provisionCancel = func() { cancelCalled.Store(true) }
+	actor.provisionDone = goroutineFinished
+
+	deprovErr := make(chan error, 1)
+	go func() {
+		deprovErr <- b.Deprovision(context.Background(), "lease-1")
+	}()
+
+	// OnExit must have called provisionCancel before entering the wait.
+	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
+		"OnExit must call provisionCancel before waiting on provisionDone")
+
+	// Deprovision must be blocked on OnExit's wait — doDeprovision has
+	// not yet run (otherwise the reply would have been sent).
+	select {
+	case err := <-deprovErr:
+		t.Fatalf("Deprovision returned before provisionDone closed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Good — OnExit is correctly blocked.
+	}
+
+	// Simulate the goroutine: publish a ContainerID (as the fix does
+	// after a successful doProvision) then close done. doDeprovision
+	// must observe the published ID and call RemoveContainer.
+	b.provisionsMu.Lock()
+	b.provisions["lease-1"].ContainerIDs = []string{"published-container"}
+	b.provisionsMu.Unlock()
+	close(goroutineFinished)
+
+	select {
+	case err := <-deprovErr:
+		require.NoError(t, err, "Deprovision must succeed after provisionDone closes")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Deprovision did not complete after provisionDone closed")
+	}
+
+	removedMu.Lock()
+	defer removedMu.Unlock()
+	require.Contains(t, removedIDs, "published-container",
+		"doDeprovision must see the pre-published ContainerIDs and call RemoveContainer")
 }

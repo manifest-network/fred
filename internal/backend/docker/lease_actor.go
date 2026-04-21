@@ -48,11 +48,15 @@ func (diagGatheredMsg) isLeaseMessage()         {}
 func (diagGatheredMsg) doneChan() chan struct{} { return nil }
 
 // provisionRequestedMsg initializes the SM in Provisioning state and stores
-// the cancel func for preemption. Sent by the public Provision shim before
-// the async goroutine is spawned, so the SM is ready before any completion
-// event arrives.
+// the cancel func + done channel for preemption. Sent by the public Provision
+// shim before the async goroutine is spawned, so the SM is ready before any
+// completion event arrives. The `done` channel is closed by the goroutine on
+// exit, letting Provisioning.OnExit wait for the goroutine before the actor
+// proceeds into Deprovisioning (closing the orphan-containers race where the
+// goroutine has created containers but not yet published their IDs).
 type provisionRequestedMsg struct {
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func (provisionRequestedMsg) isLeaseMessage()         {}
@@ -151,6 +155,12 @@ type leaseActor struct {
 	// the doProvision goroutine is spawned; called by Provisioning.OnExit
 	// on DeprovisionRequested preemption.
 	provisionCancel context.CancelFunc
+	// provisionDone is closed by the doProvision goroutine on exit.
+	// Provisioning.OnExit waits on it (bounded) before returning so a
+	// preempting doDeprovision sees either pre-published ContainerIDs or
+	// the cleanup result of doProvision's defer — not an empty snapshot
+	// taken mid-flight.
+	provisionDone chan struct{}
 	// currentMessageStart is the UnixNano timestamp of the message the
 	// actor is currently processing in handle(), or 0 when idle. Used by
 	// the stuck-actor sampler to detect hung handlers. Written by the
@@ -259,7 +269,7 @@ func (a *leaseActor) handle(msg leaseMessage) {
 	case diagGatheredMsg:
 		a.handleDiagGathered(m.result)
 	case provisionRequestedMsg:
-		a.handleProvisionRequested(m.cancel)
+		a.handleProvisionRequested(m.cancel, m.done)
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
@@ -293,11 +303,13 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 }
 
 // handleProvisionRequested transitions the SM into Provisioning (or from
-// Failed on retry) and records the cancel func. Runs before the async
-// goroutine is observable in the inbox, so subsequent ProvisionCompleted /
-// ProvisionErrored messages land in a correctly-positioned SM.
-func (a *leaseActor) handleProvisionRequested(cancel context.CancelFunc) {
+// Failed on retry) and records the cancel func + done channel. Runs before
+// the async goroutine is observable in the inbox, so subsequent
+// ProvisionCompleted / ProvisionErrored messages land in a correctly-
+// positioned SM.
+func (a *leaseActor) handleProvisionRequested(cancel context.CancelFunc, done chan struct{}) {
 	a.provisionCancel = cancel
+	a.provisionDone = done
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionRequested)
 }
 

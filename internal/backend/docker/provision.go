@@ -217,12 +217,22 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// Ordering is preserved by the inbox's FIFO delivery.
 	actor := b.actorFor(req.LeaseUUID)
 	provCtx, provCancel := b.shutdownAwareContext()
-	if !actor.send(provisionRequestedMsg{cancel: provCancel}) {
+	// provisionDone is closed by the goroutine's outermost defer. The actor's
+	// Provisioning.OnExit waits on it (bounded) so a preempting Deprovision
+	// either sees pre-published ContainerIDs or post-cleanup state — never
+	// a mid-flight window where containers exist on the host but the
+	// provision struct reports none (bug_012).
+	provisionDone := make(chan struct{})
+	if !actor.send(provisionRequestedMsg{cancel: provCancel, done: provisionDone}) {
 		provCancel()
+		close(provisionDone)
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("backend shutting down")
 	}
 	b.wg.Go(func() {
+		// LIFO: provCancel runs first (notify anything on provCtx), then
+		// the done signal unblocks OnExit's wait.
+		defer close(provisionDone)
 		defer provCancel()
 
 		var callbackErr string
@@ -233,14 +243,25 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		} else {
 			callbackErr, err, result = b.doProvision(provCtx, req, manifest, profiles, logger)
 		}
+		// On success, publish ContainerIDs to the provision struct *before*
+		// sending provisionCompletedMsg. The SM's Ready entry action rewrites
+		// the same field with the same value; the early publish exists so
+		// a concurrent doDeprovision (waiting on provisionDone in OnExit)
+		// observes the IDs and removes them cleanly. On error, doProvision's
+		// own defer has already cleaned up the containers, so no pre-publish
+		// is needed.
+		if err == nil {
+			b.provisionsMu.Lock()
+			if p, ok := b.provisions[req.LeaseUUID]; ok {
+				p.ContainerIDs = result.containerIDs
+			}
+			b.provisionsMu.Unlock()
+		}
 		// A send refusal means shutdown fired between the goroutine starting
 		// and this terminal notification. The physical work succeeded (or
 		// failed with cleanup already run by the defer above), but the SM
 		// never saw the outcome. Log + count so operators can correlate
 		// stuck provision/release records with these drops.
-		// TODO(bug_012): a structural fix requires pre-publishing container
-		// IDs to the provision struct and making onExitProvisioning wait for
-		// this goroutine — deferred to a focused change.
 		var event string
 		var ok bool
 		if err != nil {

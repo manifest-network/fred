@@ -333,16 +333,46 @@ func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 }
 
 // onExitProvisioning mirrors onExitFailing for the Provision flow: cancels
-// the in-flight doProvision goroutine when we leave Provisioning. The same
-// two-layer suppression applies — cancellation is best-effort; the Ignore
-// declarations on Deprovisioning catch stale ProvisionCompleted/Errored.
+// the in-flight doProvision goroutine when we leave Provisioning, then waits
+// for it to exit. Waiting is the structural fix for bug_012 (orphan-
+// containers race): without it, a Deprovision preempting a doProvision that
+// has already returned successfully reads an empty ContainerIDs snapshot and
+// strands the newly-created containers on the host. With the wait, the
+// goroutine's defer either pre-publishes the IDs (success) or cleans up the
+// containers itself (error/cancel) before doDeprovision runs.
+//
+// Bounded by provisionExitWaitTimeout so a wedged goroutine cannot pin the
+// actor. If the timeout fires, we log and continue — doDeprovision still
+// runs idempotently; any orphans are adopted by recoverState on next start.
+//
+// Only provision sets provisionDone today. Restart/Update share this OnExit
+// handler (they target the same SM transition) but leave provisionDone nil;
+// the wait is skipped for those flows. Follow-up: plumb done channels
+// through the replace flows for the same structural guarantee.
 func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
 	if lsm.actor.provisionCancel != nil {
 		lsm.actor.provisionCancel()
 		lsm.actor.provisionCancel = nil
 	}
+	if lsm.actor.provisionDone != nil {
+		select {
+		case <-lsm.actor.provisionDone:
+		case <-time.After(provisionExitWaitTimeout):
+			lsm.actor.backend.logger.Warn("provision goroutine did not exit within wait timeout; containers may be orphaned on host (recoverState will adopt)",
+				"lease_uuid", lsm.actor.leaseUUID,
+				"timeout", provisionExitWaitTimeout,
+			)
+		}
+		lsm.actor.provisionDone = nil
+	}
 	return nil
 }
+
+// provisionExitWaitTimeout bounds how long Provisioning.OnExit blocks
+// waiting for the doProvision goroutine. Must exceed doProvision's
+// cleanup defer budget (30s container removal) plus slack for Docker
+// call cancellation to propagate.
+const provisionExitWaitTimeout = 45 * time.Second
 
 // onEnterReadyFromProvision fires when doProvision signals success. Owns
 // the Status flip, ContainerIDs/Manifest/ServiceContainers update, gauge
