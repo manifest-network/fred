@@ -282,9 +282,15 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
 
+	// No Status recheck: the SM's guard already verified Ready, and between
+	// the guard and this entry action no other path can flip Status off
+	// Ready — every writer now routes through the SM, and recoverState's
+	// Phase 2.5 changes preserve existing.Status for Ready leases. Only
+	// the existence check survives (the entry could be gone if Deprovision
+	// had completed in a prior ordering).
 	b.provisionsMu.Lock()
 	currentProv, exists := b.provisions[leaseUUID]
-	if !exists || currentProv.Status != backend.ProvisionStatusReady {
+	if !exists {
 		b.provisionsMu.Unlock()
 		return nil
 	}
