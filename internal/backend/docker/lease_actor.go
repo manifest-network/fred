@@ -104,20 +104,22 @@ func (updateRequestedMsg) doneChan() chan struct{} { return nil }
 //
 // Both replaceRecoveredMsg and replaceFailedMsg carry the callbackErr
 // string that the SM entry action emits verbatim.
-type replaceCompletedMsg struct{}
+type replaceCompletedMsg struct {
+	result replaceSuccessResult
+}
 
 func (replaceCompletedMsg) isLeaseMessage()         {}
 func (replaceCompletedMsg) doneChan() chan struct{} { return nil }
 
 type replaceRecoveredMsg struct {
-	callbackErr string
+	info replaceFailureInfo
 }
 
 func (replaceRecoveredMsg) isLeaseMessage()         {}
 func (replaceRecoveredMsg) doneChan() chan struct{} { return nil }
 
 type replaceFailedMsg struct {
-	callbackErr string
+	info replaceFailureInfo
 }
 
 func (replaceFailedMsg) isLeaseMessage()         {}
@@ -220,11 +222,11 @@ func (a *leaseActor) handle(msg leaseMessage) {
 	case updateRequestedMsg:
 		a.handleUpdateRequested(m.cancel)
 	case replaceCompletedMsg:
-		a.handleReplaceCompleted()
+		a.handleReplaceCompleted(m.result)
 	case replaceRecoveredMsg:
-		a.handleReplaceRecovered(m.callbackErr)
+		a.handleReplaceRecovered(m.info)
 	case replaceFailedMsg:
-		a.handleReplaceFailed(m.callbackErr)
+		a.handleReplaceFailed(m.info)
 	default:
 		a.backend.logger.Warn("lease actor: unknown message type",
 			"lease_uuid", a.leaseUUID,
@@ -294,25 +296,25 @@ func (a *leaseActor) handleUpdateRequested(cancel context.CancelFunc) {
 	_ = a.sm.Fire(a.backend.stopCtx, evUpdateRequested)
 }
 
-func (a *leaseActor) handleReplaceCompleted() {
+func (a *leaseActor) handleReplaceCompleted(result replaceSuccessResult) {
 	if a.sm == nil {
 		a.sm = newLeaseSM(a)
 	}
-	_ = a.sm.Fire(a.backend.stopCtx, evReplaceCompleted)
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceCompleted, result)
 }
 
-func (a *leaseActor) handleReplaceRecovered(callbackErr string) {
+func (a *leaseActor) handleReplaceRecovered(info replaceFailureInfo) {
 	if a.sm == nil {
 		a.sm = newLeaseSM(a)
 	}
-	_ = a.sm.Fire(a.backend.stopCtx, evReplaceRecovered, callbackErr)
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceRecovered, info)
 }
 
-func (a *leaseActor) handleReplaceFailed(callbackErr string) {
+func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
 	if a.sm == nil {
 		a.sm = newLeaseSM(a)
 	}
-	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed, callbackErr)
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed, info)
 }
 
 // send enqueues a message. Blocks when the inbox is full (backpressure).

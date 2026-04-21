@@ -106,51 +106,58 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	b.wg.Go(func() {
 		defer opCancel()
 
-		var callbackErr string
-		var err error
+		var result replaceResult
 		if isStack {
-			callbackErr, err = b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
+			result = b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
 		} else {
-			callbackErr, err = b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
+			result = b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
 		}
-		fireReplaceOutcome(b, actor, req.LeaseUUID, callbackErr, err)
+		fireReplaceOutcome(actor, result)
 	})
 
 	return nil
 }
 
-// fireReplaceOutcome picks the correct SM event based on (err, final Status)
-// and sends it into the actor. Shared between Restart and Update wrappers.
+// fireReplaceOutcome picks the correct SM event from a replaceResult.
+// Shared between Restart and Update wrappers.
 //
-//	err == nil                             → replaceCompletedMsg → Ready, Success callback
-//	err != nil, Status == Ready            → replaceRecoveredMsg → Ready, Failed+suffix callback
-//	err != nil, Status == Failed (or gone) → replaceFailedMsg    → Failed, Failed callback
-func fireReplaceOutcome(b *Backend, actor *leaseActor, leaseUUID, callbackErr string, err error) {
-	b.provisionsMu.RLock()
-	var finalStatus backend.ProvisionStatus
-	if p, ok := b.provisions[leaseUUID]; ok {
-		finalStatus = p.Status
-	}
-	b.provisionsMu.RUnlock()
-
+//	result.err == nil                 → replaceCompletedMsg → Ready, Success callback
+//	result.err != nil, result.restored→ replaceRecoveredMsg → Ready, Failed+suffix callback
+//	result.err != nil, !result.restored→ replaceFailedMsg   → Failed, Failed callback
+func fireReplaceOutcome(actor *leaseActor, result replaceResult) {
 	switch {
-	case err == nil:
-		actor.send(replaceCompletedMsg{})
-	case finalStatus == backend.ProvisionStatusReady:
-		actor.send(replaceRecoveredMsg{callbackErr: callbackErr})
+	case result.err == nil:
+		actor.send(replaceCompletedMsg{result: result.success})
+	case result.restored:
+		actor.send(replaceRecoveredMsg{info: result.failure})
 	default:
-		actor.send(replaceFailedMsg{callbackErr: callbackErr})
+		actor.send(replaceFailedMsg{info: result.failure})
 	}
 }
 
 // doRestart performs the actual container restart asynchronously.
-func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku string, prevStatus backend.ProvisionStatus, logger *slog.Logger) (callbackErr string, err error) {
+func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	profile, profErr := b.cfg.GetSKUProfile(sku)
 	if profErr != nil {
-		err = fmt.Errorf("SKU profile lookup failed: %w", profErr)
-		b.recordPreflightFailure(leaseUUID, err, prevStatus, logger)
-		callbackErr = "restart failed"
-		return
+		err := fmt.Errorf("SKU profile lookup failed: %w", profErr)
+		b.recordPreflightFailure(leaseUUID, err, logger)
+		// Preflight failure restored the lease to prevStatus. Treat this
+		// as a recovery (restored=true): the lease is back to its
+		// pre-operation state, so the SM goes to Ready or Failed based on
+		// prevStatus. The fireReplaceOutcome dispatcher will pick the
+		// right event.
+		return replaceResult{
+			callbackErr: "restart failed",
+			err:         err,
+			restored:    prevStatus == backend.ProvisionStatusReady,
+			failure: replaceFailureInfo{
+				prevStatus:  prevStatus,
+				operation:   "restart",
+				oldStopped:  false, // preflight never stopped containers
+				callbackErr: "restart failed",
+				lastError:   err.Error(),
+			},
+		}
 	}
 
 	return b.doReplaceContainers(ctx, replaceContainersOp{
@@ -168,7 +175,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 
 // doRestartStack performs an async stack restart: stops all service containers
 // and recreates them from the stored StackManifest.
-func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) (callbackErr string, err error) {
+func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	profiles := make(map[string]SKUProfile, len(items))
 	for _, item := range items {
 		if _, ok := profiles[item.SKU]; ok {
@@ -176,10 +183,19 @@ func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *S
 		}
 		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
 		if profErr != nil {
-			err = fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr)
-			b.recordPreflightFailure(leaseUUID, err, prevStatus, logger)
-			callbackErr = "restart failed"
-			return
+			err := fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr)
+			b.recordPreflightFailure(leaseUUID, err, logger)
+			return replaceResult{
+				callbackErr: "restart failed",
+				err:         err,
+				restored:    prevStatus == backend.ProvisionStatusReady,
+				failure: replaceFailureInfo{
+					prevStatus:  prevStatus,
+					operation:   "restart",
+					callbackErr: "restart failed",
+					lastError:   err.Error(),
+				},
+			}
 		}
 		profiles[item.SKU] = profile
 	}
@@ -217,8 +233,10 @@ type replaceStackContainersOp struct {
 // using Docker Compose. Compose handles stopping old containers and starting
 // new ones via a single Up call, with rollback via Up with the previous manifest.
 //
-// Returns (callbackErr, err) — see doReplaceContainers for the protocol.
-func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackContainersOp) (callbackErrRet string, errRet error) {
+// Returns replaceResult — see doReplaceContainers for the protocol.
+// Stack variant's OnSuccess typically sets StackManifest; this function
+// populates the replaceResult's fields for the SM entry action.
+func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackContainersOp) (resultRet replaceResult) {
 	var err error
 	var callbackErr string
 	var newContainerIDs []string
@@ -230,16 +248,6 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 		if err != nil {
 			op.Logger.Error(op.Operation+" failed (stack)", "error", err)
 
-			var diagSnap shared.DiagnosticEntry
-			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[op.LeaseUUID]; ok {
-				prov.LastError = err.Error()
-				prov.FailCount++
-				diagSnap = diagnosticSnapshot(prov)
-			}
-			b.provisionsMu.Unlock()
-			b.persistDiagnostics(diagSnap, newContainerIDs, stackContainerLogKeys(newServiceContainers))
-
 			if b.releaseStore != nil {
 				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", err.Error()); relErr != nil {
 					op.Logger.Warn("failed to update release status", "error", relErr)
@@ -249,54 +257,45 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 			// Rollback: rebuild the Project from the previous StackManifest and
 			// Compose Up to restore the old containers.
 			restored := b.rollbackStackViaCompose(op)
-			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[op.LeaseUUID]; ok {
-				if restored {
-					prov.Status = backend.ProvisionStatusReady
-					if op.Operation == "restart" {
-						prov.LastError = ""
-					}
-					op.Logger.Info("rolled back to previous containers via compose (stack)")
-				} else {
-					prov.Status = backend.ProvisionStatusFailed
-					if op.PrevStatus == backend.ProvisionStatusReady {
-						activeProvisions.Dec()
-					}
-				}
-			}
-			b.provisionsMu.Unlock()
-
 			if restored {
+				op.Logger.Info("rolled back to previous containers via compose (stack)")
 				callbackErr += "; rolled back to previous version"
 			} else {
 				callbackErr += "; rollback failed"
 			}
 
-			callbackErrRet = callbackErr
-			errRet = err
+			// Stack rollback: oldStopped is effectively true (compose down
+			// stopped everything), so the LastError-clear-on-restart rule
+			// matches the single-manifest doReplaceContainers semantics.
+			resultRet = replaceResult{
+				callbackErr: callbackErr,
+				err:         err,
+				restored:    restored,
+				failure: replaceFailureInfo{
+					prevStatus:  op.PrevStatus,
+					operation:   op.Operation,
+					oldStopped:  true,
+					callbackErr: callbackErr,
+					lastError:   err.Error(),
+					logKeys:     stackContainerLogKeys(newServiceContainers),
+				},
+			}
 			return
 		}
-
-		// Success: update provision (Compose already replaced old containers).
-		b.provisionsMu.Lock()
-		if prov, ok := b.provisions[op.LeaseUUID]; ok {
-			prov.ContainerIDs = newContainerIDs
-			prov.ServiceContainers = newServiceContainers
-			prov.Status = backend.ProvisionStatusReady
-			prov.LastError = ""
-			if op.PrevStatus == backend.ProvisionStatusFailed {
-				activeProvisions.Inc()
-			}
-			if op.OnSuccess != nil {
-				op.OnSuccess(prov)
-			}
-		}
-		b.provisionsMu.Unlock()
 
 		if b.releaseStore != nil {
 			if relErr := b.releaseStore.ActivateLatest(op.LeaseUUID); relErr != nil {
 				op.Logger.Warn("failed to update release status", "error", relErr)
 			}
+		}
+
+		resultRet = replaceResult{
+			success: replaceSuccessResult{
+				prevStatus:        op.PrevStatus,
+				containerIDs:      newContainerIDs,
+				serviceContainers: newServiceContainers,
+				onSuccess:         op.OnSuccess,
+			},
 		}
 	}()
 
@@ -513,26 +512,13 @@ type replaceContainersOp struct {
 // Because no containers were modified, the provision's status is restored to
 // prevStatus (the status before the operation began) so that the observable
 // state and activeProvisions gauge remain accurate.
-// recordPreflightFailure records a preflight failure before doReplace*
-// runs: sets LastError, increments FailCount, restores Status to prevStatus,
-// snapshots diagnostics, and marks the release failed. Callback emission is
-// NOT done here — the caller returns the on-chain callback message up to
-// the Restart/Update goroutine wrapper, which fires evReplaceRecovered
-// (if prevStatus was Ready) or evReplaceFailed (if prevStatus was Failed)
-// based on the post-call Status. The SM entry action then emits.
-func (b *Backend) recordPreflightFailure(leaseUUID string, err error, prevStatus backend.ProvisionStatus, logger *slog.Logger) {
+// recordPreflightFailure logs the preflight error and marks the release
+// as failed. Provision-state mutations (LastError, FailCount, Status,
+// persistDiagnostics) are handled by the SM entry action that fires
+// when the caller returns its replaceResult — see the preflight
+// branches of doRestart / doRestartStack / doUpdate / doUpdateStack.
+func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *slog.Logger) {
 	logger.Error("preflight failed", "error", err)
-
-	var diagSnap shared.DiagnosticEntry
-	b.provisionsMu.Lock()
-	if prov, ok := b.provisions[leaseUUID]; ok {
-		prov.LastError = err.Error()
-		prov.FailCount++
-		prov.Status = prevStatus
-		diagSnap = diagnosticSnapshot(prov)
-	}
-	b.provisionsMu.Unlock()
-	b.persistDiagnostics(diagSnap, nil)
 
 	if b.releaseStore != nil {
 		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", err.Error()); relErr != nil {
@@ -546,14 +532,21 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, err error, prevStatus
 // create and start new → verify startup.
 // Old containers are kept stopped for rollback on failure.
 //
-// Returns (callbackErr, err):
-//   - err == nil: success. callbackErr is empty.
-//   - err != nil: failure. The defer has flipped Status to either Ready
-//     (rollback restored) or Failed (rollback failed). callbackErr carries
-//     the on-chain-safe message with the appropriate suffix. The caller
-//     (goroutine wrapper) reads final Status to fire evReplaceRecovered
-//     vs evReplaceFailed.
-func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersOp) (callbackErrRet string, errRet error) {
+// Returns (callbackErr, err, successResult, failureInfo):
+//   - err == nil: success. successResult carries containerIDs + OnSuccess
+//     for the SM's Ready entry action to apply.
+//   - err != nil: failure. failureInfo carries prevStatus, operation,
+//     oldStopped, and the callbackErr/lastError strings. The goroutine
+//     wrapper reads `restored` (also in the returns) to decide between
+//     firing evReplaceRecovered (Status→Ready) or evReplaceFailed
+//     (Status→Failed); the corresponding entry action applies the
+//     mutations.
+//
+// All provision-struct mutations (Status, FailCount, LastError,
+// ContainerIDs, OnSuccess) and the persistDiagnostics call live in
+// the SM entry actions now — this function only does I/O (container
+// ops, rollback attempt, release-store updates).
+func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersOp) (resultRet replaceResult) {
 	var err error
 	var callbackErr string
 	var newContainerIDs []string
@@ -562,17 +555,6 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	defer func() {
 		if err != nil {
 			op.Logger.Error(op.Operation+" failed", "error", err)
-
-			// Snapshot diagnostics under lock, then persist outside (I/O).
-			var diagSnap shared.DiagnosticEntry
-			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[op.LeaseUUID]; ok {
-				prov.LastError = err.Error()
-				prov.FailCount++
-				diagSnap = diagnosticSnapshot(prov)
-			}
-			b.provisionsMu.Unlock()
-			b.persistDiagnostics(diagSnap, newContainerIDs)
 
 			// Mark release as failed.
 			if b.releaseStore != nil {
@@ -592,43 +574,30 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 
 			// Rollback: restart old containers to restore service.
 			restored := !oldStopped || b.rollbackContainers(op.LeaseUUID, op.OldContainerIDs, op.Logger)
-			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[op.LeaseUUID]; ok {
-				if restored {
-					prov.Status = backend.ProvisionStatusReady
-					// Restart: clear error — we're back to the exact same state.
-					// Update: keep LastError so the UI shows why the update failed.
-					if oldStopped && op.Operation == "restart" {
-						prov.LastError = ""
-					}
-				} else {
-					prov.Status = backend.ProvisionStatusFailed
-					// Adjust gauge: the provision was Ready before the
-					// operation and is now Failed with no rollback. If it
-					// was already Failed (restart-from-failed), the gauge
-					// was already decremented during the original failure.
-					if op.PrevStatus == backend.ProvisionStatusReady {
-						activeProvisions.Dec()
-					}
-				}
-				if restored {
-					op.Logger.Info("rolled back to previous containers", "containers", len(op.OldContainerIDs))
-				}
-			}
-			b.provisionsMu.Unlock()
-
 			if restored {
+				op.Logger.Info("rolled back to previous containers", "containers", len(op.OldContainerIDs))
 				callbackErr += "; rolled back to previous version"
 			} else if oldStopped {
 				callbackErr += "; rollback failed"
 			}
 
-			callbackErrRet = callbackErr
-			errRet = err
+			resultRet = replaceResult{
+				callbackErr: callbackErr,
+				err:         err,
+				restored:    restored,
+				failure: replaceFailureInfo{
+					prevStatus:  op.PrevStatus,
+					operation:   op.Operation,
+					oldStopped:  oldStopped,
+					callbackErr: callbackErr,
+					lastError:   err.Error(),
+				},
+			}
 			return
 		}
 
-		// Success: remove old containers and update provision.
+		// Success: remove old containers. Provision-struct mutations happen
+		// in onEnterReadyFromReplaceCompleted.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
 		for _, cid := range op.OldContainerIDs {
@@ -637,27 +606,19 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			}
 		}
 
-		b.provisionsMu.Lock()
-		if prov, ok := b.provisions[op.LeaseUUID]; ok {
-			prov.ContainerIDs = newContainerIDs
-			prov.Status = backend.ProvisionStatusReady
-			prov.LastError = ""
-			// Adjust gauge: the provision was Failed and is now back to
-			// Ready after a successful restart/update.
-			if op.PrevStatus == backend.ProvisionStatusFailed {
-				activeProvisions.Inc()
-			}
-			if op.OnSuccess != nil {
-				op.OnSuccess(prov)
-			}
-		}
-		b.provisionsMu.Unlock()
-
 		// Mark release as active, previous as superseded.
 		if b.releaseStore != nil {
 			if relErr := b.releaseStore.ActivateLatest(op.LeaseUUID); relErr != nil {
 				op.Logger.Warn("failed to update release status", "error", relErr)
 			}
+		}
+
+		resultRet = replaceResult{
+			success: replaceSuccessResult{
+				prevStatus:   op.PrevStatus,
+				containerIDs: newContainerIDs,
+				onSuccess:    op.OnSuccess,
+			},
 		}
 	}()
 
@@ -896,8 +857,8 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		b.wg.Go(func() {
 			defer opCancel()
 
-			callbackErr, err := b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
-			fireReplaceOutcome(b, actor, req.LeaseUUID, callbackErr, err)
+			result := b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
+			fireReplaceOutcome(actor, result)
 		})
 		return nil
 	}
@@ -954,22 +915,31 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	b.wg.Go(func() {
 		defer opCancel()
 
-		callbackErr, err := b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
-		fireReplaceOutcome(b, actor, req.LeaseUUID, callbackErr, err)
+		result := b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
+		fireReplaceOutcome(actor, result)
 	})
 
 	return nil
 }
 
 // doUpdate performs the actual container update asynchronously.
-func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *DockerManifest, profile SKUProfile, oldContainerIDs []string, prevStatus backend.ProvisionStatus, logger *slog.Logger) (callbackErr string, err error) {
+func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *DockerManifest, profile SKUProfile, oldContainerIDs []string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	// Pull new image — this is the only update-specific pre-flight step.
 	logger.Info("pulling image for update", "image", manifest.Image)
 	if pullErr := b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); pullErr != nil {
-		err = fmt.Errorf("image pull failed: %w", pullErr)
-		b.recordPreflightFailure(leaseUUID, err, prevStatus, logger)
-		callbackErr = "image pull failed"
-		return
+		err := fmt.Errorf("image pull failed: %w", pullErr)
+		b.recordPreflightFailure(leaseUUID, err, logger)
+		return replaceResult{
+			callbackErr: "image pull failed",
+			err:         err,
+			restored:    prevStatus == backend.ProvisionStatusReady,
+			failure: replaceFailureInfo{
+				prevStatus:  prevStatus,
+				operation:   "update",
+				callbackErr: "image pull failed",
+				lastError:   err.Error(),
+			},
+		}
 	}
 
 	// Read SKU and quantity from provision (may differ from old container count).
@@ -1000,7 +970,7 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 }
 
 // doUpdateStack performs the actual stack container update asynchronously.
-func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) (callbackErr string, err error) {
+func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	// Pull each unique image (deduplicated).
 	pulledImages := make(map[string]bool)
 	for svcName, svc := range stack.Services {
@@ -1009,10 +979,19 @@ func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *St
 		}
 		logger.Info("pulling image for update", "service", svcName, "image", svc.Image)
 		if pullErr := b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); pullErr != nil {
-			err = fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr)
-			b.recordPreflightFailure(leaseUUID, err, prevStatus, logger)
-			callbackErr = "image pull failed"
-			return
+			err := fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr)
+			b.recordPreflightFailure(leaseUUID, err, logger)
+			return replaceResult{
+				callbackErr: "image pull failed",
+				err:         err,
+				restored:    prevStatus == backend.ProvisionStatusReady,
+				failure: replaceFailureInfo{
+					prevStatus:  prevStatus,
+					operation:   "update",
+					callbackErr: "image pull failed",
+					lastError:   err.Error(),
+				},
+			}
 		}
 		pulledImages[svc.Image] = true
 	}

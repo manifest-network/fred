@@ -180,8 +180,8 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	// just send callbacks.
 	sm.Configure(backend.ProvisionStatusReady).
 		OnEntryFrom(evProvisionCompleted, lsm.onEnterReadyFromProvision).
-		OnEntryFrom(evReplaceCompleted, lsm.onEnterReadyFromReplace).
-		OnEntryFrom(evReplaceRecovered, lsm.onEnterFailedFromReplace)
+		OnEntryFrom(evReplaceCompleted, lsm.onEnterReadyFromReplaceCompleted).
+		OnEntryFrom(evReplaceRecovered, lsm.onEnterReadyFromReplaceRecovered)
 
 	// Failed entry actions: emit Failed from a Provision error or Replace
 	// failure. Permit(ProvisionRequested) for re-provision retries.
@@ -373,22 +373,134 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 	return nil
 }
 
-// onEnterReadyFromReplace emits the Success callback for Restart/Update
-// completion. Restart/Update's mutations are still in doReplace*'s defer
-// (2.6c will migrate them); here we just emit the callback to preserve
-// current behavior.
-func (lsm *leaseSM) onEnterReadyFromReplace(ctx context.Context, args ...any) error {
+// onEnterReadyFromReplaceCompleted fires when doReplace* signals success.
+// Owns Status flip, ContainerIDs/ServiceContainers update, optional
+// OnSuccess hook (update flow sets Manifest/StackManifest), gauge
+// increment (if prevStatus was Failed), and Success callback emission.
+func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args ...any) error {
+	if len(args) < 1 {
+		return fmt.Errorf("onEnterReadyFromReplaceCompleted: missing result")
+	}
+	result, ok := args[0].(replaceSuccessResult)
+	if !ok {
+		return fmt.Errorf("onEnterReadyFromReplaceCompleted: arg not replaceSuccessResult")
+	}
 	b := lsm.actor.backend
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
-	b.provisionsMu.RLock()
+	b.provisionsMu.Lock()
 	if p, ok := b.provisions[leaseUUID]; ok {
+		p.ContainerIDs = result.containerIDs
+		if result.serviceContainers != nil {
+			p.ServiceContainers = result.serviceContainers
+		}
+		p.Status = backend.ProvisionStatusReady
+		p.LastError = ""
+		if result.prevStatus == backend.ProvisionStatusFailed {
+			activeProvisions.Inc()
+		}
+		if result.onSuccess != nil {
+			result.onSuccess(p)
+		}
 		callbackURL = p.CallbackURL
 	}
-	b.provisionsMu.RUnlock()
+	b.provisionsMu.Unlock()
 
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+	return nil
+}
+
+// onEnterReadyFromReplaceRecovered fires when doReplace* failed but the
+// rollback restored the lease to Ready (or the preflight check failed
+// without touching containers). Status ends up Ready; LastError is set
+// to the rich failure diagnostic. For the restart-with-oldStopped case,
+// LastError is cleared because we're back to the exact same state as
+// before the restart.
+func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args ...any) error {
+	if len(args) < 1 {
+		return fmt.Errorf("onEnterReadyFromReplaceRecovered: missing info")
+	}
+	info, ok := args[0].(replaceFailureInfo)
+	if !ok {
+		return fmt.Errorf("onEnterReadyFromReplaceRecovered: arg not replaceFailureInfo")
+	}
+	b := lsm.actor.backend
+	leaseUUID := lsm.actor.leaseUUID
+
+	var callbackURL string
+	var diagSnap shared.DiagnosticEntry
+	var snapContainerIDs []string
+	b.provisionsMu.Lock()
+	if p, ok := b.provisions[leaseUUID]; ok {
+		p.LastError = info.lastError
+		p.FailCount++
+		p.Status = backend.ProvisionStatusReady
+		// Restart: if we actually stopped old containers and then restored
+		// them, we're back to the exact same state — no persistent error.
+		// Update: keep LastError so the UI shows why the update failed.
+		if info.oldStopped && info.operation == "restart" {
+			p.LastError = ""
+		}
+		diagSnap = diagnosticSnapshot(p)
+		snapContainerIDs = append([]string(nil), p.ContainerIDs...)
+		callbackURL = p.CallbackURL
+	}
+	b.provisionsMu.Unlock()
+
+	if diagSnap.LeaseUUID != "" {
+		if info.logKeys != nil {
+			b.persistDiagnostics(diagSnap, snapContainerIDs, info.logKeys)
+		} else {
+			b.persistDiagnostics(diagSnap, snapContainerIDs)
+		}
+	}
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
+	return nil
+}
+
+// onEnterFailedFromReplace fires when doReplace* failed AND rollback
+// failed (or no rollback was possible). Status ends up Failed; gauge is
+// decremented if prevStatus was Ready (the operation took a Ready lease
+// and ended it in a Failed state).
+func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) error {
+	if len(args) < 1 {
+		return fmt.Errorf("onEnterFailedFromReplace: missing info")
+	}
+	info, ok := args[0].(replaceFailureInfo)
+	if !ok {
+		return fmt.Errorf("onEnterFailedFromReplace: arg not replaceFailureInfo")
+	}
+	b := lsm.actor.backend
+	leaseUUID := lsm.actor.leaseUUID
+
+	var callbackURL string
+	var diagSnap shared.DiagnosticEntry
+	var snapContainerIDs []string
+	b.provisionsMu.Lock()
+	if p, ok := b.provisions[leaseUUID]; ok {
+		p.LastError = info.lastError
+		p.FailCount++
+		p.Status = backend.ProvisionStatusFailed
+		if info.prevStatus == backend.ProvisionStatusReady {
+			activeProvisions.Dec()
+		}
+		diagSnap = diagnosticSnapshot(p)
+		snapContainerIDs = append([]string(nil), p.ContainerIDs...)
+		callbackURL = p.CallbackURL
+	}
+	b.provisionsMu.Unlock()
+
+	if diagSnap.LeaseUUID != "" {
+		if info.logKeys != nil {
+			b.persistDiagnostics(diagSnap, snapContainerIDs, info.logKeys)
+		} else {
+			b.persistDiagnostics(diagSnap, snapContainerIDs)
+		}
+	}
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }
 
@@ -429,34 +541,6 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }
-
-// onEnterFailedFromReplace emits a Failed callback for a Restart or Update
-// that ended without completing the requested change. Used for both
-// evReplaceFailed (final Status == Failed) and evReplaceRecovered (final
-// Status == Ready via rollback or preflight restore) — the callback
-// status is always Failed; destinations differ, entry action is shared.
-func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) error {
-	if len(args) < 1 {
-		return fmt.Errorf("onEnterFailedFromReplace: missing callbackErr")
-	}
-	callbackErr, ok := args[0].(string)
-	if !ok {
-		return fmt.Errorf("onEnterFailedFromReplace: arg not string")
-	}
-	b := lsm.actor.backend
-	leaseUUID := lsm.actor.leaseUUID
-
-	var callbackURL string
-	b.provisionsMu.RLock()
-	if p, ok := b.provisions[leaseUUID]; ok {
-		callbackURL = p.CallbackURL
-	}
-	b.provisionsMu.RUnlock()
-
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
-	return nil
-}
-
 
 // onEnterFailedFromDiag runs as the Failing→Failed entry action when
 // DiagGathered fires. Owns all state mutations for this transition: flips
@@ -543,6 +627,48 @@ type provisionSuccessResult struct {
 type provisionErrorInfo struct {
 	callbackErr string
 	lastError   string
+}
+
+// replaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
+// success output into onEnterReadyFromReplace. The goroutine returns these;
+// the entry action writes them to provision under a single lock acquisition.
+// onSuccess is the optional hook supplied by the caller (update flow sets
+// Manifest/StackManifest there).
+type replaceSuccessResult struct {
+	prevStatus        backend.ProvisionStatus
+	containerIDs      []string
+	serviceContainers map[string][]string // non-nil for stack
+	onSuccess         func(*provision)
+}
+
+// replaceFailureInfo carries doReplace* failure data. Used by both
+// onEnterReadyFromReplaceRecovered (Status ends up Ready) and
+// onEnterFailedFromReplace (Status ends up Failed). The entry actions
+// set LastError, increment FailCount, persist diagnostics, and adjust
+// the activeProvisions gauge based on prevStatus.
+type replaceFailureInfo struct {
+	prevStatus  backend.ProvisionStatus
+	operation   string // "restart" or "update"
+	oldStopped  bool   // only meaningful on the recovery path (restart-with-oldStopped clears LastError)
+	callbackErr string
+	lastError   string
+	// logKeys is used for stack persistDiagnostics — empty for single-manifest.
+	logKeys map[string]string
+}
+
+// replaceResult is doReplace*'s return value bundling everything the
+// goroutine wrapper needs to fire the right SM event. The callback path
+// depends on (err, restored):
+//
+//	err == nil            → fire evReplaceCompleted with .success
+//	err != nil, restored  → fire evReplaceRecovered with .failure
+//	err != nil, !restored → fire evReplaceFailed    with .failure
+type replaceResult struct {
+	callbackErr string
+	err         error
+	restored    bool                 // only meaningful if err != nil
+	success     replaceSuccessResult // populated when err == nil
+	failure     replaceFailureInfo   // populated when err != nil
 }
 
 // readProvisionStatus snapshots provision.Status under RLock. Used on SM
