@@ -27,12 +27,21 @@ const (
 	evProvisionErrored
 	evDiagGathered
 	evContainersRemoved
-	// evReplaceCompleted / evReplaceFailed represent the outcome of a
-	// Restart or Update operation. The goroutine fires these after reading
-	// the final provision.Status so the SM follows the real outcome
-	// including rollback cases (failure restored to Ready counts as
-	// "completed").
+	// evReplaceCompleted / evReplaceRecovered / evReplaceFailed represent
+	// the outcome of a Restart or Update operation. Three events cover the
+	// four observable outcomes (success, rollback-restored, rollback-failed,
+	// preflight-restored):
+	//
+	//   err == nil                              → evReplaceCompleted → Ready
+	//   err != nil, final Status == Ready       → evReplaceRecovered → Ready
+	//   err != nil, final Status == Failed      → evReplaceFailed    → Failed
+	//
+	// evReplaceRecovered exists to distinguish "lease ended up Ready but
+	// the requested change did NOT take effect" from the normal success
+	// case — same destination (Ready), different callback (Failed with
+	// rollback suffix vs Success).
 	evReplaceCompleted
+	evReplaceRecovered
 	evReplaceFailed
 )
 
@@ -58,6 +67,8 @@ func (e leaseEvent) String() string {
 		return "ContainersRemoved"
 	case evReplaceCompleted:
 		return "ReplaceCompleted"
+	case evReplaceRecovered:
+		return "ReplaceRecovered"
 	case evReplaceFailed:
 		return "ReplaceFailed"
 	}
@@ -145,34 +156,38 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 
 	// Restarting/Updating: same shape as Provisioning — a goroutine is
 	// doing the work; OnExit cancels it on preemption. The goroutine fires
-	// evReplaceCompleted (if provision.Status ends up Ready — includes
-	// successful rollback) or evReplaceFailed (Status=Failed). No entry
-	// action on the destinations; doReplaceContainers / doReplaceStackContainers
-	// still emit the terminal callback from their defer, so the SM just
-	// tracks state without duplicating emission.
+	// evReplaceCompleted (full success), evReplaceRecovered (failure but
+	// lease ended up Ready via rollback / preflight-restored), or
+	// evReplaceFailed (ended up Failed).
 	sm.Configure(backend.ProvisionStatusRestarting).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
+		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied)
 	sm.Configure(backend.ProvisionStatusUpdating).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
+		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied)
 
-	// Ready.OnEntryFrom(ProvisionCompleted): emit the terminal Success callback.
-	// The provision status fields are already populated by doProvision's defer
-	// (guarded on Status==Provisioning); this action only sends the callback.
+	// Ready entry actions: emit Success from a Provision or Replace success,
+	// or emit Failed-with-rollback-suffix from a Replace recovery. Status
+	// and LastError were set by the underlying do* defer — entry actions
+	// just send callbacks.
 	sm.Configure(backend.ProvisionStatusReady).
-		OnEntryFrom(evProvisionCompleted, lsm.onEnterReadyFromProvision)
+		OnEntryFrom(evProvisionCompleted, lsm.onEnterReadyFromProvision).
+		OnEntryFrom(evReplaceCompleted, lsm.onEnterReadyFromProvision).
+		OnEntryFrom(evReplaceRecovered, lsm.onEnterFailedFromReplace)
 
-	// Failed.OnEntryFrom(ProvisionErrored): emit the terminal Failed callback.
-	// Plus Permit(ProvisionRequested) for re-provision retries.
+	// Failed entry actions: emit Failed from a Provision error or Replace
+	// failure. Permit(ProvisionRequested) for re-provision retries.
 	sm.Configure(backend.ProvisionStatusFailed).
 		OnEntryFrom(evProvisionErrored, lsm.onEnterFailedFromProvision).
+		OnEntryFrom(evReplaceFailed, lsm.onEnterFailedFromReplace).
 		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning)
 
 	// Deprovisioning ignores stale provision/replace-completion events that
@@ -183,6 +198,7 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		Ignore(evProvisionErrored).
 		Ignore(evProvisionRequested).
 		Ignore(evReplaceCompleted).
+		Ignore(evReplaceRecovered).
 		Ignore(evReplaceFailed)
 
 	// Failed: can accept restart/update retry requests in addition to
@@ -343,6 +359,33 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	callbackErr, ok := args[0].(string)
 	if !ok {
 		return fmt.Errorf("onEnterFailedFromProvision: arg not string")
+	}
+	b := lsm.actor.backend
+	leaseUUID := lsm.actor.leaseUUID
+
+	var callbackURL string
+	b.provisionsMu.RLock()
+	if p, ok := b.provisions[leaseUUID]; ok {
+		callbackURL = p.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
+	return nil
+}
+
+// onEnterFailedFromReplace emits a Failed callback for a Restart or Update
+// that ended without completing the requested change. Used for both
+// evReplaceFailed (final Status == Failed) and evReplaceRecovered (final
+// Status == Ready via rollback or preflight restore) — the callback
+// status is always Failed; destinations differ, entry action is shared.
+func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) error {
+	if len(args) < 1 {
+		return fmt.Errorf("onEnterFailedFromReplace: missing callbackErr")
+	}
+	callbackErr, ok := args[0].(string)
+	if !ok {
+		return fmt.Errorf("onEnterFailedFromReplace: arg not string")
 	}
 	b := lsm.actor.backend
 	leaseUUID := lsm.actor.leaseUUID

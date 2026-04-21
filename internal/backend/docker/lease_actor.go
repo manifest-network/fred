@@ -88,17 +88,31 @@ type updateRequestedMsg struct {
 func (updateRequestedMsg) isLeaseMessage()         {}
 func (updateRequestedMsg) doneChan() chan struct{} { return nil }
 
-// replaceCompletedMsg / replaceFailedMsg fire the Restarting|Updating → Ready
-// or → Failed transition after the goroutine finishes. The goroutine reads
-// the final provision.Status to decide which one to send — so rollback
-// cases that restored Ready are correctly reported as Completed even
-// though the caller's err was non-nil.
+// replaceCompletedMsg / replaceRecoveredMsg / replaceFailedMsg fire the
+// Restarting|Updating exit transition after the goroutine finishes. The
+// goroutine picks which to send based on (err == nil, final Status):
+//
+//   err == nil                → replaceCompletedMsg  → Ready (Success)
+//   err != nil, Status=Ready  → replaceRecoveredMsg  → Ready (Failed+suffix)
+//   err != nil, Status=Failed → replaceFailedMsg     → Failed (Failed)
+//
+// Both replaceRecoveredMsg and replaceFailedMsg carry the callbackErr
+// string that the SM entry action emits verbatim.
 type replaceCompletedMsg struct{}
 
 func (replaceCompletedMsg) isLeaseMessage()         {}
 func (replaceCompletedMsg) doneChan() chan struct{} { return nil }
 
-type replaceFailedMsg struct{}
+type replaceRecoveredMsg struct {
+	callbackErr string
+}
+
+func (replaceRecoveredMsg) isLeaseMessage()         {}
+func (replaceRecoveredMsg) doneChan() chan struct{} { return nil }
+
+type replaceFailedMsg struct {
+	callbackErr string
+}
 
 func (replaceFailedMsg) isLeaseMessage()         {}
 func (replaceFailedMsg) doneChan() chan struct{} { return nil }
@@ -201,8 +215,10 @@ func (a *leaseActor) handle(msg leaseMessage) {
 		a.handleUpdateRequested(m.cancel)
 	case replaceCompletedMsg:
 		a.handleReplaceCompleted()
+	case replaceRecoveredMsg:
+		a.handleReplaceRecovered(m.callbackErr)
 	case replaceFailedMsg:
-		a.handleReplaceFailed()
+		a.handleReplaceFailed(m.callbackErr)
 	default:
 		a.backend.logger.Warn("lease actor: unknown message type",
 			"lease_uuid", a.leaseUUID,
@@ -276,11 +292,18 @@ func (a *leaseActor) handleReplaceCompleted() {
 	_ = a.sm.Fire(a.backend.stopCtx, evReplaceCompleted)
 }
 
-func (a *leaseActor) handleReplaceFailed() {
+func (a *leaseActor) handleReplaceRecovered(callbackErr string) {
 	if a.sm == nil {
 		a.sm = newLeaseSM(a)
 	}
-	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed)
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceRecovered, callbackErr)
+}
+
+func (a *leaseActor) handleReplaceFailed(callbackErr string) {
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed, callbackErr)
 }
 
 // send enqueues a message. Blocks when the inbox is full (backpressure).
