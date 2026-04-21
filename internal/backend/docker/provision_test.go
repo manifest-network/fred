@@ -88,11 +88,10 @@ func rebuildCallbackSender(b *Backend) {
 // doProvision directly; tests do (to exercise specific branches without
 // the full validate-and-allocate preamble).
 //
-// The helper fires SM events synchronously (bypassing the actor inbox)
-// so tests can assert on callback state immediately after it returns —
-// matching the pre-refactor timing where doProvision's defer emitted the
-// callback inline. The actor inbox path is exercised by the public
-// Provision flow and its dedicated tests.
+// SM events fire synchronously here (bypassing the actor inbox) so tests
+// can assert on callback state immediately after it returns. The actor
+// inbox path is exercised by the public Provision flow and its dedicated
+// tests.
 func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
 	actor := b.actorFor(req.LeaseUUID)
 	if actor.sm == nil {
@@ -198,9 +197,9 @@ func TestProvision_AlreadyProvisioned(t *testing.T) {
 	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
 }
 
-// TestProvision_RejectsWhileDeprovisioning guards the provision.go:49 status
-// guard: a concurrent Deprovision (which sets Status=Deprovisioning) must
-// block re-provision. The reconciler retries on the next cycle once the
+// TestProvision_RejectsWhileDeprovisioning guards Provision's status check:
+// a concurrent Deprovision (which sets Status=Deprovisioning) must block
+// re-provision. The reconciler retries on the next cycle once the
 // Deprovision completes and removes the entry. Without this, a re-provision
 // races with RemoveContainer and corrupts state.
 func TestProvision_RejectsWhileDeprovisioning(t *testing.T) {

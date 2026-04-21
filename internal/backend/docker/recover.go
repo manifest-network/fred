@@ -535,26 +535,6 @@ func (b *Backend) containerEventLoop() {
 	}
 }
 
-// handleContainerDeath synchronously dispatches a container death to the
-// owning lease's actor and waits for processing to complete. The wait is
-// bounded by stopCtx so shutdown cannot leave callers blocked. The real
-// transition logic lives in leaseActor.handleContainerDied; this shim exists
-// so direct-call unit tests can keep their synchronous assertion style.
-func (b *Backend) handleContainerDeath(containerID string) {
-	leaseUUID, found := b.findLeaseByContainerID(containerID)
-	if !found {
-		return
-	}
-	done := make(chan struct{})
-	if !b.actorFor(leaseUUID).send(containerDiedMsg{containerID: containerID, done: done}) {
-		return
-	}
-	select {
-	case <-done:
-	case <-b.stopCtx.Done():
-	}
-}
-
 // findLeaseByContainerID returns the lease UUID and true if a provision
 // containing the given container ID is found. Returns ("", false) otherwise.
 // Called under no lock; acquires read lock internally.

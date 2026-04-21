@@ -78,14 +78,14 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// Already deprovisioned - idempotent success
 		return nil
 	}
-	// Mark as deprovisioning before removing containers to prevent handleContainerDeath
-	// from racing with removal. Die events emitted during RemoveContainer will
-	// see a non-Ready status and be skipped. The in-memory Deprovisioning marker
-	// also lets Provision's guard at provision.go:49 reject concurrent re-provision
-	// attempts during the removal window.
-	// Decrement activeProvisions immediately on Ready→Deprovisioning transition so
-	// the gauge stays accurate even if the rest of Deprovision fails partially
-	// and must be retried (at which point the provision is already Failed).
+	// Mark Deprovisioning before removing containers. The in-memory marker
+	// lets Provision's status guard reject concurrent re-provision attempts
+	// during the removal window (die events from RemoveContainer are dropped
+	// structurally by the SM's Deprovisioning.Ignore(evContainerDied)).
+	//
+	// Decrement activeProvisions on the Ready→Deprovisioning transition so
+	// the gauge stays accurate even if Deprovision fails partially and the
+	// provision ends up Failed on retry.
 	wasReady := prov.Status == backend.ProvisionStatusReady
 	prov.Status = backend.ProvisionStatusDeprovisioning
 	if wasReady {

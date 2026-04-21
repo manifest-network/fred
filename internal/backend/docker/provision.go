@@ -590,11 +590,11 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // Failed entry action uses (callbackErr, err.Error()) to populate
 // LastError and the Failed callback.
 //
-// The defer no longer touches provision.Status, FailCount, LastError,
-// ContainerIDs, or Manifest — those are owned by the SM entry actions.
-// The defer's remaining responsibilities: metrics, pool release on
-// failure, container/volume cleanup on failure, release-store updates
-// on success, stale-diagnostic removal on success.
+// The defer is responsible for side effects that don't belong to the SM:
+// duration metrics, pool release on failure, container/volume cleanup on
+// failure, release-store updates on success, and stale-diagnostic removal
+// on success. Provision struct mutations (Status, FailCount, LastError,
+// ContainerIDs, Manifest) are owned by the SM entry actions.
 func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error, resultRet provisionSuccessResult) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string

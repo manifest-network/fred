@@ -206,12 +206,11 @@ func TestHandleContainerDeath_UnknownContainer(t *testing.T) {
 	b.provisionsMu.RUnlock()
 }
 
-// TestHandleContainerDeath_SkipsDeprovisioning guards the recover.go:506 status
-// guard: die events emitted by RemoveContainer during an in-flight Deprovision
-// must NOT trigger the ready→failed transition (which would send a spurious
-// failure callback and decrement the gauge twice). The `!= Ready` filter
-// already covers Deprovisioning; this test prevents a future narrowing of the
-// guard from re-introducing the bug.
+// TestHandleContainerDeath_SkipsDeprovisioning guards the SM guard's Ready
+// check: die events emitted by RemoveContainer during an in-flight Deprovision
+// must NOT trigger the Ready→Failing transition (which would send a spurious
+// failure callback and decrement the gauge twice). guardContainerActuallyDied
+// returns false for non-Ready status, short-circuiting before InspectContainer.
 func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
 	inspectCalled := false
 	mock := &mockDockerClient{

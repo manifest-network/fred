@@ -346,8 +346,7 @@ func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
 
 // onEnterReadyFromProvision fires when doProvision signals success. Owns
 // the Status flip, ContainerIDs/Manifest/ServiceContainers update, gauge
-// increment, and Success callback emission — consolidating the mutations
-// that used to live in doProvision's defer.
+// increment, and Success callback emission.
 func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) error {
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterReadyFromProvision: missing result")

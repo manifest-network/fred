@@ -68,9 +68,9 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 // fires (Deprovisioned), never a stale Failed that Fred already knows is
 // being torn down.
 //
-// Post-refactor mechanism: handleContainerDeath transitions the SM to
-// Failing and spawns an async diag goroutine. When Deprovision arrives,
-// the Failing→Deprovisioning transition's OnExit cancels the goroutine's
+// Mechanism: handleContainerDeath transitions the SM to Failing and
+// spawns an async diag goroutine. When Deprovision arrives, the
+// Failing→Deprovisioning transition's OnExit cancels the goroutine's
 // context. The goroutine's ContainerLogs call respects ctx and returns
 // early; no DiagGathered fires; the SM never enters Failed; no Failed
 // callback is emitted. Defense-in-depth: if the goroutine races past the
