@@ -3,6 +3,8 @@ package docker
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
+	"time"
 )
 
 type leaseMessage interface {
@@ -148,6 +150,11 @@ type leaseActor struct {
 	// the doProvision goroutine is spawned; called by Provisioning.OnExit
 	// on DeprovisionRequested preemption.
 	provisionCancel context.CancelFunc
+	// currentMessageStart is the UnixNano timestamp of the message the
+	// actor is currently processing in handle(), or 0 when idle. Used by
+	// the stuck-actor sampler to detect hung handlers. Written by the
+	// actor's goroutine, read atomically by the sampler goroutine.
+	currentMessageStart atomic.Int64
 }
 
 // Bounded inbox: full inbox blocks senders so Docker event bursts cannot
@@ -200,6 +207,8 @@ func (a *leaseActor) drainInbox() {
 }
 
 func (a *leaseActor) handle(msg leaseMessage) {
+	a.currentMessageStart.Store(time.Now().UnixNano())
+	defer a.currentMessageStart.Store(0)
 	defer func() {
 		if ch := msg.doneChan(); ch != nil {
 			close(ch)
@@ -360,6 +369,54 @@ type ActorSnapshot struct {
 	SMState    string `json:"sm_state"`    // empty if the SM has never been fired
 	InboxDepth int    `json:"inbox_depth"` // pending messages not yet processed
 	InboxCap   int    `json:"inbox_cap"`
+}
+
+// actorMetricsSampleInterval paces sampleActorMetrics. Short enough for
+// the stuck-actor gauge to react within an alerting window, long enough
+// that walking the registry and sampling inbox depth stays negligible.
+const actorMetricsSampleInterval = 5 * time.Second
+
+// sampleActorMetrics walks every live actor, observing inbox depth into
+// the histogram and finding the oldest in-flight handle() start across
+// all actors for the stuck-seconds gauge. Called periodically from
+// actorMetricsSampleLoop. Safe to run concurrently with actor work:
+// inbox len() is racy-but-fine, and currentMessageStart is atomic.
+func (b *Backend) sampleActorMetrics() {
+	now := time.Now().UnixNano()
+	var oldestStart int64
+	b.actors.Range(func(_, value any) bool {
+		actor, ok := value.(*leaseActor)
+		if !ok {
+			return true
+		}
+		leaseActorInboxDepth.Observe(float64(len(actor.inbox)))
+		if start := actor.currentMessageStart.Load(); start != 0 {
+			if oldestStart == 0 || start < oldestStart {
+				oldestStart = start
+			}
+		}
+		return true
+	})
+	if oldestStart == 0 {
+		leaseActorStuckSeconds.Set(0)
+	} else {
+		leaseActorStuckSeconds.Set(float64(now-oldestStart) / float64(time.Second))
+	}
+}
+
+// actorMetricsSampleLoop runs sampleActorMetrics on a ticker until the
+// backend shuts down. Spawned once from Start() via b.wg.Go.
+func (b *Backend) actorMetricsSampleLoop() {
+	ticker := time.NewTicker(actorMetricsSampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-b.stopCtx.Done():
+			return
+		case <-ticker.C:
+			b.sampleActorMetrics()
+		}
+	}
 }
 
 // DebugActors returns a snapshot of every live lease actor. The result

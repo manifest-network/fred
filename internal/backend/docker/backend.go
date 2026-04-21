@@ -438,6 +438,10 @@ func (b *Backend) Start(ctx context.Context) error {
 	// reconcileLoop stays as safety net for missed events.
 	b.wg.Go(b.containerEventLoop)
 
+	// Sample actor inbox depth and stuck-seconds on a ticker for the
+	// fred_docker_backend_lease_actor_* observability gauges.
+	b.wg.Go(b.actorMetricsSampleLoop)
+
 	b.logger.Info("Docker backend started",
 		"host", b.cfg.DockerHost,
 		"recovered_containers", len(b.provisions),

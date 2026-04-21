@@ -166,6 +166,35 @@ var (
 		Name:      "lease_actors_created_total",
 		Help:      "Cumulative number of per-lease actors created since backend start",
 	})
+
+	// leaseActorStuckSeconds is the age, in seconds, of the oldest
+	// in-flight actor handle() call across all leases. 0 when every
+	// actor is idle (waiting on inbox).
+	//
+	// Legitimate long-running operations like Deprovision run synchronously
+	// inside the actor's handle() and can hold it for minutes (container
+	// removal, volume cleanup). Set the alerting threshold above the
+	// longest expected legitimate duration — e.g., 15 minutes — to catch
+	// real stuck actors without false positives during normal slow work.
+	leaseActorStuckSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actor_stuck_seconds",
+		Help:      "Age of the oldest in-flight actor message across all leases; 0 if all actors are idle",
+	})
+
+	// leaseActorInboxDepth is a histogram of actor inbox depths sampled
+	// periodically across all live actors. A healthy system has p99 near 0
+	// (actors keep up with their inbox). A rising p99 signals event
+	// arrival faster than processing — either workload shift or an
+	// upstream I/O slowdown pinning an actor.
+	leaseActorInboxDepth = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actor_inbox_depth",
+		Help:      "Distribution of per-actor inbox depths sampled across all live actors",
+		Buckets:   []float64{0, 1, 2, 4, 8, 12, 16}, // inbox cap is leaseActorInboxSize (16)
+	})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
