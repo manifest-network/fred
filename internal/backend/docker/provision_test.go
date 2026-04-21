@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -80,6 +81,45 @@ func rebuildCallbackSender(b *Backend) {
 		StopCtx:    b.stopCtx,
 		Backoff:    &zeroBackoff,
 	})
+}
+
+// doProvisionAndFire wraps doProvision with the SM event firing that the
+// public Provision path normally handles. Production code never calls
+// doProvision directly; tests do (to exercise specific branches without
+// the full validate-and-allocate preamble).
+//
+// The helper fires SM events synchronously (bypassing the actor inbox)
+// so tests can assert on callback state immediately after it returns —
+// matching the pre-refactor timing where doProvision's defer emitted the
+// callback inline. The actor inbox path is exercised by the public
+// Provision flow and its dedicated tests.
+func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+	actor := b.actorFor(req.LeaseUUID)
+	if actor.sm == nil {
+		actor.sm = newLeaseSM(actor)
+	}
+	_ = actor.sm.Fire(ctx, evProvisionRequested)
+	callbackErr, err := b.doProvision(ctx, req, manifest, profiles, logger)
+	if err != nil {
+		_ = actor.sm.Fire(ctx, evProvisionErrored, callbackErr)
+	} else {
+		_ = actor.sm.Fire(ctx, evProvisionCompleted)
+	}
+}
+
+// doProvisionStackAndFire is the stack-variant companion to doProvisionAndFire.
+func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+	actor := b.actorFor(req.LeaseUUID)
+	if actor.sm == nil {
+		actor.sm = newLeaseSM(actor)
+	}
+	_ = actor.sm.Fire(ctx, evProvisionRequested)
+	callbackErr, err := b.doProvisionStack(ctx, req, stack, profiles, logger)
+	if err != nil {
+		_ = actor.sm.Fire(ctx, evProvisionErrored, callbackErr)
+	} else {
+		_ = actor.sm.Fire(ctx, evProvisionCompleted)
+	}
 }
 
 // --- Provision (synchronous validation) tests ---
@@ -384,7 +424,7 @@ func TestDoProvision_MultiItem_QuantityPassesTotalNotPerItem(t *testing.T) {
 		CallbackURL: callbackServer.URL,
 		Payload:     validManifestJSON("nginx:latest"),
 	}
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Both containers must receive totalQuantity (2), not item.Quantity (1).
 	// This ensures ComputeSubdomain produces the same FQDN format on
@@ -425,7 +465,7 @@ func TestDoProvision_PullFailure(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Provision should be marked failed
 	b.provisionsMu.RLock()
@@ -496,7 +536,7 @@ func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
 		Payload:      validManifestJSON("nginx:latest"),
 	}
 
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// First container should have been cleaned up
 	assert.Contains(t, removedIDs, "container-1")
@@ -528,7 +568,7 @@ func TestDoProvision_ContextCanceled(t *testing.T) {
 	cancel() // Cancel before starting
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(ctx, req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(ctx, req, manifest, profiles, b.logger)
 
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
@@ -581,7 +621,7 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	assert.True(t, networkCreated)
 
@@ -635,7 +675,7 @@ func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
@@ -708,7 +748,7 @@ func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
 		CallbackURL:  callbackServer.URL,
 		Payload:      validManifestJSON("nginx:latest"),
 	}
-	b.doProvision(ctx, req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(ctx, req, manifest, profiles, b.logger)
 
 	// Verify: provision should be marked failed
 	b.provisionsMu.RLock()
@@ -782,7 +822,7 @@ func TestDoProvision_StatefulSKUCreatesVolume(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Verify volume was created with correct ID and size
 	assert.Equal(t, "fred-lease-1-0", createID)
@@ -857,7 +897,7 @@ func TestDoProvision_StatefulSKUMultipleVolumes(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 2048}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Single volume.Create per container (not per image VOLUME path)
 	assert.Equal(t, 1, createCalls)
@@ -914,7 +954,7 @@ func TestDoProvision_VolumeCreateFailure(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Provision should be marked failed
 	b.provisionsMu.RLock()
@@ -1002,7 +1042,7 @@ func TestDoProvision_CleanupOnlyDestroysNewVolumes(t *testing.T) {
 		CallbackURL:  callbackServer.URL,
 		Payload:      validManifestJSON("nginx:latest"),
 	}
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Destroy should only be called for the newly created volume (index 1), not the reused one (index 0)
 	assert.Equal(t, []string{"fred-lease-1-1"}, destroyedIDs,
@@ -1060,7 +1100,7 @@ func TestDoProvision_StatefulSKUNoImageVolumes(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// volumes.Create should NOT be called when image has no VOLUME paths
 	assert.False(t, createCalled, "volumes.Create should not be called when image has no VOLUME paths")
@@ -2501,7 +2541,7 @@ func TestDoProvision_LastError_ContextCanceled(t *testing.T) {
 	cancel()
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(ctx, req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(ctx, req, manifest, profiles, b.logger)
 
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
@@ -2555,7 +2595,7 @@ func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 	<-callbackReceived
 
 	b.provisionsMu.RLock()
@@ -2639,7 +2679,7 @@ func TestDoProvision_EphemeralProfileWithoutDiskMB(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 	<-callbackReceived
 
 	assert.True(t, capturedParams.ReadonlyRootfs, "ReadonlyRootfs should be true")
@@ -2700,7 +2740,7 @@ func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
 
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, manifestJSON)
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 	<-callbackReceived
 
 	// Verify the manifest tmpfs paths were passed through
@@ -3410,7 +3450,7 @@ func TestDoProvision_CallbackSanitized_ContainerExitedDuringStartup(t *testing.T
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Callback should have a hardcoded message — no secrets.
 	assert.Equal(t, "container exited during startup", callbackPayload.Error)
@@ -3478,7 +3518,7 @@ func TestDoProvision_CallbackSanitized_Unhealthy(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Callback should have a hardcoded message — no secrets.
 	assert.Equal(t, "container reported unhealthy", callbackPayload.Error)
@@ -3520,7 +3560,7 @@ func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Callback should have hardcoded message — no registry auth details.
 	assert.Equal(t, "image pull failed", callbackPayload.Error)
@@ -3806,7 +3846,7 @@ func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-chown", "tenant-a", "docker-small", 1, manifestPayload)
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Verify volume subdir is owned by UID/GID 999.
 	subdir := filepath.Join(volDir, "data")
@@ -3874,7 +3914,7 @@ func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-root", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Verify provision succeeded — ownership stays as created by MkdirAll
 	// (no chown call since UID/GID are 0).
@@ -4631,7 +4671,7 @@ func TestDoProvision_WritablePathBinds(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	assert.True(t, extractCalled, "ExtractImageContent should be called for writable paths")
 	require.NotNil(t, capturedParams.WritablePathBinds)
@@ -4704,7 +4744,7 @@ func TestDoProvision_WritablePathBinds_PartialFailure(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	// Successful path should be in binds, failed path should be omitted.
 	require.NotNil(t, capturedParams.WritablePathBinds)
@@ -4845,7 +4885,7 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}} // ephemeral
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvision(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
 
 	assert.True(t, volumeCreated, "volume should be created for ephemeral SKU with writable paths")
 	assert.Equal(t, int64(b.cfg.GetTmpfsSizeMB()), createdSizeMB, "ephemeral writable volume should use TmpfsSizeMB")

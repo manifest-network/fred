@@ -134,11 +134,16 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	sm.Configure(backend.ProvisionStatusUpdating).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
 
-	// Failed.Permit(ProvisionRequested) for re-provision retries. No entry
-	// actions for the Provision flow transitions — doProvision's defer
-	// emits callbacks directly (guarded by Status==Provisioning), since
-	// many tests call doProvision directly without going through the actor.
+	// Ready.OnEntryFrom(ProvisionCompleted): emit the terminal Success callback.
+	// The provision status fields are already populated by doProvision's defer
+	// (guarded on Status==Provisioning); this action only sends the callback.
+	sm.Configure(backend.ProvisionStatusReady).
+		OnEntryFrom(evProvisionCompleted, lsm.onEnterReadyFromProvision)
+
+	// Failed.OnEntryFrom(ProvisionErrored): emit the terminal Failed callback.
+	// Plus Permit(ProvisionRequested) for re-provision retries.
 	sm.Configure(backend.ProvisionStatusFailed).
+		OnEntryFrom(evProvisionErrored, lsm.onEnterFailedFromProvision).
 		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning)
 
 	// Deprovisioning ignores stale provision-completion events that might
@@ -267,6 +272,52 @@ func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
 		lsm.actor.provisionCancel()
 		lsm.actor.provisionCancel = nil
 	}
+	return nil
+}
+
+// onEnterReadyFromProvision emits the terminal Success callback when
+// doProvision signals successful completion. The Ready status and field
+// populations are already done by doProvision's defer (under the same
+// lock that observed Status==Provisioning); this action just reads
+// CallbackURL and sends.
+func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) error {
+	b := lsm.actor.backend
+	leaseUUID := lsm.actor.leaseUUID
+
+	var callbackURL string
+	b.provisionsMu.RLock()
+	if p, ok := b.provisions[leaseUUID]; ok {
+		callbackURL = p.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+	return nil
+}
+
+// onEnterFailedFromProvision emits the terminal Failed callback when
+// doProvision signals a failure. The callbackErr is passed via Fire args
+// so the on-chain-safe message stays attached to the event that caused
+// the transition.
+func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any) error {
+	if len(args) < 1 {
+		return fmt.Errorf("onEnterFailedFromProvision: missing callbackErr")
+	}
+	callbackErr, ok := args[0].(string)
+	if !ok {
+		return fmt.Errorf("onEnterFailedFromProvision: arg not string")
+	}
+	b := lsm.actor.backend
+	leaseUUID := lsm.actor.leaseUUID
+
+	var callbackURL string
+	b.provisionsMu.RLock()
+	if p, ok := b.provisions[leaseUUID]; ok {
+		callbackURL = p.CallbackURL
+	}
+	b.provisionsMu.RUnlock()
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
 	return nil
 }
 

@@ -607,16 +607,12 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			}
 
 			var diagSnap shared.DiagnosticEntry
-			var callbackURL string
-			var shouldEmit bool
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 				prov.Status = backend.ProvisionStatusFailed
 				prov.FailCount++
 				prov.LastError = err.Error()
 				diagSnap = diagnosticSnapshot(prov)
-				callbackURL = prov.CallbackURL
-				shouldEmit = true
 			}
 			b.provisionsMu.Unlock()
 			// Persist diagnostics outside lock — fetches container logs (I/O).
@@ -639,9 +635,6 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				}
 			}
 
-			if shouldEmit {
-				b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
-			}
 			callbackErrRet = callbackErr
 			errRet = err
 			return
@@ -649,17 +642,13 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 		// Update provision record on success (guarded).
 		provisionsTotal.WithLabelValues("success").Inc()
-		var callbackURL string
-		var shouldEmit bool
 		b.provisionsMu.Lock()
 		if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 			prov.ContainerIDs = containerIDs
 			prov.Status = backend.ProvisionStatusReady
 			prov.Manifest = manifest
 			prov.LastError = ""
-			callbackURL = prov.CallbackURL
 			activeProvisions.Inc()
-			shouldEmit = true
 		}
 		b.provisionsMu.Unlock()
 
@@ -684,9 +673,6 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 
 		updateResourceMetrics(b.pool.Stats())
-		if shouldEmit {
-			b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
-		}
 	}()
 
 	// Check for early cancellation (e.g., shutdown requested before we started)
@@ -890,16 +876,12 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 			}
 
 			var diagSnap shared.DiagnosticEntry
-			var callbackURL string
-			var shouldEmit bool
 			b.provisionsMu.Lock()
 			if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 				prov.Status = backend.ProvisionStatusFailed
 				prov.FailCount++
 				prov.LastError = err.Error()
 				diagSnap = diagnosticSnapshot(prov)
-				callbackURL = prov.CallbackURL
-				shouldEmit = true
 			}
 			b.provisionsMu.Unlock()
 			b.persistDiagnostics(diagSnap, containerIDs, stackContainerLogKeys(serviceContainers))
@@ -920,26 +902,19 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 					logger.Warn("failed to cleanup volume after error", "volume_id", volumeID, "error", volErr)
 				}
 			}
-			if shouldEmit {
-				b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
-			}
 			callbackErrRet = callbackErr
 			errRet = err
 			return
 		}
 
 		provisionsTotal.WithLabelValues("success").Inc()
-		var callbackURL string
-		var shouldEmit bool
 		b.provisionsMu.Lock()
 		if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 			prov.ContainerIDs = containerIDs
 			prov.ServiceContainers = serviceContainers
 			prov.Status = backend.ProvisionStatusReady
 			prov.LastError = ""
-			callbackURL = prov.CallbackURL
 			activeProvisions.Inc()
-			shouldEmit = true
 		}
 		b.provisionsMu.Unlock()
 
@@ -961,9 +936,6 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		}
 
 		updateResourceMetrics(b.pool.Stats())
-		if shouldEmit {
-			b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
-		}
 	}()
 
 	if ctx.Err() != nil {
