@@ -233,10 +233,29 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		} else {
 			callbackErr, err, result = b.doProvision(provCtx, req, manifest, profiles, logger)
 		}
+		// A send refusal means shutdown fired between the goroutine starting
+		// and this terminal notification. The physical work succeeded (or
+		// failed with cleanup already run by the defer above), but the SM
+		// never saw the outcome. Log + count so operators can correlate
+		// stuck provision/release records with these drops.
+		// TODO(bug_012): a structural fix requires pre-publishing container
+		// IDs to the provision struct and making onExitProvisioning wait for
+		// this goroutine — deferred to a focused change.
+		var event string
+		var ok bool
 		if err != nil {
-			actor.send(provisionErroredMsg{callbackErr: callbackErr, lastError: err.Error()})
+			event = "provision_errored"
+			ok = actor.send(provisionErroredMsg{callbackErr: callbackErr, lastError: err.Error()})
 		} else {
-			actor.send(provisionCompletedMsg{result: result})
+			event = "provision_completed"
+			ok = actor.send(provisionCompletedMsg{result: result})
+		}
+		if !ok {
+			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+			b.logger.Warn("terminal provision event dropped during shutdown",
+				"lease_uuid", req.LeaseUUID,
+				"event", event,
+			)
 		}
 	})
 

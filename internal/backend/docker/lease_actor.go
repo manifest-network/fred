@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 )
@@ -155,6 +156,13 @@ type leaseActor struct {
 	// the stuck-actor sampler to detect hung handlers. Written by the
 	// actor's goroutine, read atomically by the sampler goroutine.
 	currentMessageStart atomic.Int64
+	// terminated is set by handleDeprovision once the provision entry has
+	// been fully removed. The run loop checks it after every handle() and
+	// exits, allowing the actor's slot in b.actors to be reused by a new
+	// lease with the same UUID (a stale actor stuck in Deprovisioning
+	// would otherwise Ignore evProvisionRequested and wedge the lease).
+	// Read and written only on the actor's own goroutine — no atomic.
+	terminated bool
 }
 
 // Bounded inbox: full inbox blocks senders so Docker event bursts cannot
@@ -162,15 +170,26 @@ type leaseActor struct {
 const leaseActorInboxSize = 16
 
 func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
-	return &leaseActor{
+	a := &leaseActor{
 		leaseUUID: leaseUUID,
 		backend:   b,
 		inbox:     make(chan leaseMessage, leaseActorInboxSize),
 		done:      make(chan struct{}),
 	}
+	// Initialize the SM eagerly so that the actor's goroutine and any
+	// external reader (DebugActors over /debug/actors) see the same
+	// pointer without synchronization on a lazy-init field. Construction
+	// is cheap and safe to call from the caller's goroutine before the
+	// actor goroutine starts.
+	a.sm = newLeaseSM(a)
+	return a
 }
 
 func (a *leaseActor) run() {
+	// Always remove ourselves from the registry on exit so new Provision
+	// calls with this UUID create a fresh actor rather than reusing a
+	// shut-down one. Safe on any exit path (shutdown or terminated).
+	defer a.backend.actors.Delete(a.leaseUUID)
 	defer close(a.done)
 	defer a.drainInbox()
 	for {
@@ -180,6 +199,9 @@ func (a *leaseActor) run() {
 		// below can still process one more message; that window is not
 		// reachable from the production event loop, which exits first.
 		if a.backend.stopCtx.Err() != nil {
+			return
+		}
+		if a.terminated {
 			return
 		}
 		select {
@@ -214,6 +236,21 @@ func (a *leaseActor) handle(msg leaseMessage) {
 			close(ch)
 		}
 	}()
+	// Contain the blast radius of a handler panic to a single message:
+	// log with stack, bump a counter, and let the actor keep processing.
+	// Without this, a panic in an SM entry action or handler kills the
+	// actor goroutine, leaving the actor in b.actors with a full inbox
+	// and senders blocking forever.
+	defer func() {
+		if r := recover(); r != nil {
+			a.backend.logger.Error("lease actor panic",
+				"lease_uuid", a.leaseUUID,
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			leaseActorPanicsTotal.Inc()
+		}
+	}()
 	switch m := msg.(type) {
 	case containerDiedMsg:
 		a.handleContainerDied(m.containerID)
@@ -245,45 +282,30 @@ func (a *leaseActor) handle(msg leaseMessage) {
 }
 
 func (a *leaseActor) handleContainerDied(containerID string) {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evContainerDied, containerID)
 }
 
 func (a *leaseActor) handleDiagGathered(result diagResult) {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	// If we're no longer in Failing (e.g., Deprovision preempted), the SM's
 	// Ignore declarations on Failed/Deprovisioning drop this event; Fire
 	// returns an unhandled-trigger error we can safely discard.
 	_ = a.sm.Fire(a.backend.stopCtx, evDiagGathered, result)
 }
 
-// handleProvisionRequested initializes the SM in Provisioning (or transitions
-// from Failed on retry) and records the cancel func. Runs before the async
+// handleProvisionRequested transitions the SM into Provisioning (or from
+// Failed on retry) and records the cancel func. Runs before the async
 // goroutine is observable in the inbox, so subsequent ProvisionCompleted /
-// ProvisionErrored messages land in a correctly-initialized SM.
+// ProvisionErrored messages land in a correctly-positioned SM.
 func (a *leaseActor) handleProvisionRequested(cancel context.CancelFunc) {
 	a.provisionCancel = cancel
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionRequested)
 }
 
 func (a *leaseActor) handleProvisionCompleted(result provisionSuccessResult) {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionCompleted, result)
 }
 
 func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string) {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, provisionErrorInfo{
 		callbackErr: callbackErr,
 		lastError:   lastError,
@@ -292,38 +314,23 @@ func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string) {
 
 func (a *leaseActor) handleRestartRequested(cancel context.CancelFunc) {
 	a.provisionCancel = cancel
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evRestartRequested)
 }
 
 func (a *leaseActor) handleUpdateRequested(cancel context.CancelFunc) {
 	a.provisionCancel = cancel
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evUpdateRequested)
 }
 
 func (a *leaseActor) handleReplaceCompleted(result replaceSuccessResult) {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evReplaceCompleted, result)
 }
 
 func (a *leaseActor) handleReplaceRecovered(info replaceFailureInfo) {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evReplaceRecovered, info)
 }
 
 func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed, info)
 }
 
@@ -366,7 +373,7 @@ func (b *Backend) actorFor(leaseUUID string) *leaseActor {
 // endpoint when integrated with the HTTP layer.
 type ActorSnapshot struct {
 	LeaseUUID  string `json:"lease_uuid"`
-	SMState    string `json:"sm_state"`    // empty if the SM has never been fired
+	SMState    string `json:"sm_state"`    // current SM state
 	InboxDepth int    `json:"inbox_depth"` // pending messages not yet processed
 	InboxCap   int    `json:"inbox_cap"`
 }
@@ -437,11 +444,9 @@ func (b *Backend) DebugActors() []ActorSnapshot {
 		}
 		snap := ActorSnapshot{
 			LeaseUUID:  leaseUUID,
+			SMState:    fmt.Sprintf("%v", actor.sm.State()),
 			InboxDepth: len(actor.inbox),
 			InboxCap:   cap(actor.inbox),
-		}
-		if actor.sm != nil {
-			snap.SMState = fmt.Sprintf("%v", actor.sm.State())
 		}
 		snapshots = append(snapshots, snap)
 		return true

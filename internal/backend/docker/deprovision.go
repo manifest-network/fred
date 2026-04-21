@@ -36,9 +36,6 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 // the SM transition then runs the work synchronously, returning the outcome
 // on the deprovisionMsg's reply channel.
 func (a *leaseActor) handleDeprovision(ctx context.Context) error {
-	if a.sm == nil {
-		a.sm = newLeaseSM(a)
-	}
 	// Attempt the SM transition. If it's not permitted, check whether the
 	// provision is already gone (idempotent success) or we're in an unexpected
 	// state (surface the error).
@@ -47,6 +44,7 @@ func (a *leaseActor) handleDeprovision(ctx context.Context) error {
 		_, exists := a.backend.provisions[a.leaseUUID]
 		a.backend.provisionsMu.RUnlock()
 		if !exists {
+			a.terminated = true
 			return nil
 		}
 		a.backend.logger.Warn("deprovision transition denied by SM",
@@ -54,7 +52,17 @@ func (a *leaseActor) handleDeprovision(ctx context.Context) error {
 		// Fall through to the work anyway — the SM may not know every state
 		// (partial port). The work itself is idempotent.
 	}
-	return a.backend.doDeprovision(ctx, a.leaseUUID)
+	err := a.backend.doDeprovision(ctx, a.leaseUUID)
+	// If the provision entry was fully removed (success path), signal the
+	// run loop to exit so a subsequent re-provision with the same UUID
+	// creates a fresh actor instead of being Ignored by a stale SM.
+	a.backend.provisionsMu.RLock()
+	_, exists := a.backend.provisions[a.leaseUUID]
+	a.backend.provisionsMu.RUnlock()
+	if !exists {
+		a.terminated = true
+	}
+	return err
 }
 
 // doDeprovision releases resources for a lease. Must be idempotent.

@@ -195,6 +195,31 @@ var (
 		Help:      "Distribution of per-actor inbox depths sampled across all live actors",
 		Buckets:   []float64{0, 1, 2, 4, 8, 12, 16}, // inbox cap is leaseActorInboxSize (16)
 	})
+
+	// leaseActorPanicsTotal counts panics recovered in lease actor
+	// handlers. Any non-zero value is a bug — the actor survives the
+	// panic (blast radius contained to a single message), but the
+	// message that triggered it did not complete its transition.
+	leaseActorPanicsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actor_panics_total",
+		Help:      "Count of panics recovered in lease actor handlers (any non-zero is a bug)",
+	})
+
+	// leaseTerminalEventDroppedTotal counts terminal SM events whose
+	// actor.send() was refused because the backend was shutting down.
+	// The work has already happened on the host (container swap complete,
+	// provision succeeded, etc.) but the SM never recorded it, so the
+	// release store / provision struct may be out of sync with Docker.
+	// Recovery on next startup should re-reconcile; sustained non-zero
+	// values under clean shutdown indicate a real data-loss pattern.
+	leaseTerminalEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_terminal_event_dropped_total",
+		Help:      "Terminal SM events dropped because the actor inbox refused delivery during shutdown",
+	}, []string{"event"})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.

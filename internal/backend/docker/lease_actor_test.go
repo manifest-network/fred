@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -206,13 +207,124 @@ func TestDebugActors(t *testing.T) {
 	require.Len(t, snaps, 1)
 	require.Equal(t, "lease-a", snaps[0].LeaseUUID)
 	require.Equal(t, leaseActorInboxSize, snaps[0].InboxCap)
-	// No messages sent, SM never created.
-	require.Empty(t, snaps[0].SMState)
+	// The SM is initialized eagerly — its initial state mirrors the
+	// provision's current Status at actor creation time.
+	require.Equal(t, string(backend.ProvisionStatusReady), snaps[0].SMState)
 
 	// Touch the other — now two actors visible.
 	b.actorFor("lease-b")
 	snaps = b.DebugActors()
 	require.Len(t, snaps, 2)
+}
+
+// TestLeaseActor_EagerSMInit pins the fix for the DebugActors data race:
+// the SM must be constructed inside newLeaseActor, not lazily on first
+// handler invocation. Lazy init raced with DebugActors readers under
+// -race; the eager init makes the pointer publication synchronous with
+// the actor's exposure via b.actors.
+func TestLeaseActor_EagerSMInit(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+	})
+	defer b.stopCancel()
+
+	actor := b.actorFor("lease-1")
+	require.NotNil(t, actor.sm,
+		"sm must be initialized in newLeaseActor; lazy init races with DebugActors")
+	require.Equal(t, backend.ProvisionStatusReady, actor.sm.State(),
+		"sm initial state mirrors the provision's current Status at actor creation")
+}
+
+// TestLeaseActor_RegistryClearedAfterDeprovision pins the fix for the
+// actor-registry leak and its downstream UUID-reuse wedge: once
+// Deprovision removes the provision entry, the actor exits and removes
+// itself from b.actors. Without this, every deprovisioned lease would
+// leak a goroutine plus an SM stuck in Deprovisioning, and any
+// subsequent Provision with the same UUID would be silently Ignored by
+// that stale SM.
+func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ContainerIDs: []string{"c1"},
+			Status:       backend.ProvisionStatusReady,
+		},
+	})
+	defer b.stopCancel()
+
+	first := b.actorFor("lease-1")
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+
+	// Actor deletes itself from b.actors and closes done on exit.
+	select {
+	case <-first.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor did not exit after successful deprovision")
+	}
+	_, exists := b.actors.Load("lease-1")
+	assert.False(t, exists,
+		"b.actors must not retain a reference to a deprovisioned lease")
+
+	// A subsequent actorFor with the same UUID returns a *fresh* actor —
+	// not the terminated one — whose SM can accept evProvisionRequested.
+	second := b.actorFor("lease-1")
+	require.NotSame(t, first, second,
+		"UUID reuse after Deprovision must produce a fresh actor")
+	require.Equal(t, backend.ProvisionStatusProvisioning, second.sm.State(),
+		"fresh actor's SM starts in Provisioning (no provision entry exists)")
+}
+
+// TestLeaseActor_SurvivesHandlerPanic pins the defer-recover in handle():
+// a panic in a handler path (SM guard, entry action, or downstream I/O)
+// must be contained to a single message. Without recovery, the actor
+// goroutine dies and senders block on a full inbox forever.
+func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
+	var inspectCalls atomic.Int32
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			if inspectCalls.Add(1) == 1 {
+				panic("simulated inspect failure")
+			}
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ContainerIDs: []string{"c1"},
+			Status:       backend.ProvisionStatusReady,
+		},
+	})
+	defer b.stopCancel()
+
+	actor := b.actorFor("lease-1")
+	before := testutil.ToFloat64(leaseActorPanicsTotal)
+
+	// First send: panics inside the SM guard (InspectContainer).
+	require.True(t, actor.send(containerDiedMsg{containerID: "c1"}))
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(leaseActorPanicsTotal) > before
+	}, 2*time.Second, 10*time.Millisecond,
+		"leaseActorPanicsTotal must increment when a handler panics")
+
+	// Second send: must be processed — the actor survived the panic.
+	done := make(chan struct{})
+	require.True(t, actor.send(containerDiedMsg{containerID: "c1", done: done}))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor did not process a message after recovering from panic")
+	}
 }
 
 // TestHandleContainerDeath_ShutdownDoesNotHang guards the sync shim's

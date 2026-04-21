@@ -124,14 +124,33 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 //	result.err == nil                 → replaceCompletedMsg → Ready, Success callback
 //	result.err != nil, result.restored→ replaceRecoveredMsg → Ready, Failed+suffix callback
 //	result.err != nil, !result.restored→ replaceFailedMsg   → Failed, Failed callback
+//
+// If send is refused (backend shutting down) the event is logged and
+// counted: the goroutine has already done the physical work (container
+// swap, rollback) but the SM record for the outcome was not delivered,
+// so on next startup recoverState must re-reconcile. TODO: once shutdown
+// gains a drain phase that lets terminal events through, drop the metric
+// and treat refusal as a bug.
 func fireReplaceOutcome(actor *leaseActor, result replaceResult) {
+	var event string
+	var ok bool
 	switch {
 	case result.err == nil:
-		actor.send(replaceCompletedMsg{result: result.success})
+		event = "replace_completed"
+		ok = actor.send(replaceCompletedMsg{result: result.success})
 	case result.restored:
-		actor.send(replaceRecoveredMsg{info: result.failure})
+		event = "replace_recovered"
+		ok = actor.send(replaceRecoveredMsg{info: result.failure})
 	default:
-		actor.send(replaceFailedMsg{info: result.failure})
+		event = "replace_failed"
+		ok = actor.send(replaceFailedMsg{info: result.failure})
+	}
+	if !ok {
+		leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+		actor.backend.logger.Warn("terminal replace event dropped during shutdown",
+			"lease_uuid", actor.leaseUUID,
+			"event", event,
+		)
 	}
 }
 
