@@ -116,13 +116,38 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		Ignore(evContainerDied).
 		Ignore(evDiagGathered)
 
-	// Other states: permit DeprovisionRequested transitions.
+	// Provisioning: async goroutine is running. Exits by ProvisionCompleted
+	// (→ Ready, emit Success), ProvisionErrored (→ Failed, emit Failed), or
+	// DeprovisionRequested (→ Deprovisioning, OnExit cancels goroutine — the
+	// structural suppression for Provision+Deprovision races, analogous to
+	// Failing's mechanism).
 	sm.Configure(backend.ProvisionStatusProvisioning).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
+		Permit(evProvisionCompleted, backend.ProvisionStatusReady).
+		Permit(evProvisionErrored, backend.ProvisionStatusFailed).
+		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
+		OnExit(lsm.onExitProvisioning).
+		Ignore(evContainerDied).
+		Ignore(evProvisionRequested)
+
 	sm.Configure(backend.ProvisionStatusRestarting).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
 	sm.Configure(backend.ProvisionStatusUpdating).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
+
+	// Failed.Permit(ProvisionRequested) for re-provision retries. No entry
+	// actions for the Provision flow transitions — doProvision's defer
+	// emits callbacks directly (guarded by Status==Provisioning), since
+	// many tests call doProvision directly without going through the actor.
+	sm.Configure(backend.ProvisionStatusFailed).
+		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning)
+
+	// Deprovisioning ignores stale provision-completion events that might
+	// fire from an async goroutine that already started but hadn't noticed
+	// cancellation. Defense-in-depth mirroring Failing's pattern.
+	sm.Configure(backend.ProvisionStatusDeprovisioning).
+		Ignore(evProvisionCompleted).
+		Ignore(evProvisionErrored).
+		Ignore(evProvisionRequested)
 
 	return lsm
 }
@@ -232,6 +257,19 @@ func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 	}
 	return nil
 }
+
+// onExitProvisioning mirrors onExitFailing for the Provision flow: cancels
+// the in-flight doProvision goroutine when we leave Provisioning. The same
+// two-layer suppression applies — cancellation is best-effort; the Ignore
+// declarations on Deprovisioning catch stale ProvisionCompleted/Errored.
+func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
+	if lsm.actor.provisionCancel != nil {
+		lsm.actor.provisionCancel()
+		lsm.actor.provisionCancel = nil
+	}
+	return nil
+}
+
 
 // onEnterFailedFromDiag runs as the Failing→Failed entry action when
 // DiagGathered fires. Flips provision.Status, applies the diag to

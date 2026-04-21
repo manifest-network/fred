@@ -43,6 +43,34 @@ type diagGatheredMsg struct {
 func (diagGatheredMsg) isLeaseMessage()         {}
 func (diagGatheredMsg) doneChan() chan struct{} { return nil }
 
+// provisionRequestedMsg initializes the SM in Provisioning state and stores
+// the cancel func for preemption. Sent by the public Provision shim before
+// the async goroutine is spawned, so the SM is ready before any completion
+// event arrives.
+type provisionRequestedMsg struct {
+	cancel context.CancelFunc
+}
+
+func (provisionRequestedMsg) isLeaseMessage()         {}
+func (provisionRequestedMsg) doneChan() chan struct{} { return nil }
+
+// provisionCompletedMsg is sent by the doProvision goroutine on success.
+// Drives the Provisioning→Ready transition + Success callback.
+type provisionCompletedMsg struct{}
+
+func (provisionCompletedMsg) isLeaseMessage()         {}
+func (provisionCompletedMsg) doneChan() chan struct{} { return nil }
+
+// provisionErroredMsg is sent by the doProvision goroutine on failure.
+// callbackErr is the hardcoded on-chain-safe message; err is the rich
+// diagnostic (stashed in provision.LastError by doProvision's defer).
+type provisionErroredMsg struct {
+	callbackErr string
+}
+
+func (provisionErroredMsg) isLeaseMessage()         {}
+func (provisionErroredMsg) doneChan() chan struct{} { return nil }
+
 // leaseActor owns all state transitions for a single lease. Messages are
 // processed serially from inbox, so handlers never race with themselves.
 type leaseActor struct {
@@ -61,6 +89,10 @@ type leaseActor struct {
 	// cc62f3b structural mechanism: any transition out of Failing cancels
 	// the goroutine before any stale Failed callback can be emitted.
 	diagCancel context.CancelFunc
+	// provisionCancel mirrors diagCancel for the Provision flow. Set when
+	// the doProvision goroutine is spawned; called by Provisioning.OnExit
+	// on DeprovisionRequested preemption.
+	provisionCancel context.CancelFunc
 }
 
 // Bounded inbox: full inbox blocks senders so Docker event bursts cannot
@@ -125,6 +157,12 @@ func (a *leaseActor) handle(msg leaseMessage) {
 		m.reply <- a.handleDeprovision(m.ctx)
 	case diagGatheredMsg:
 		a.handleDiagGathered(m.result)
+	case provisionRequestedMsg:
+		a.handleProvisionRequested(m.cancel)
+	case provisionCompletedMsg:
+		a.handleProvisionCompleted()
+	case provisionErroredMsg:
+		a.handleProvisionErrored(m.callbackErr)
 	default:
 		a.backend.logger.Warn("lease actor: unknown message type",
 			"lease_uuid", a.leaseUUID,
@@ -147,6 +185,32 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 	// Ignore declarations on Failed/Deprovisioning drop this event; Fire
 	// returns an unhandled-trigger error we can safely discard.
 	_ = a.sm.Fire(a.backend.stopCtx, evDiagGathered, result)
+}
+
+// handleProvisionRequested initializes the SM in Provisioning (or transitions
+// from Failed on retry) and records the cancel func. Runs before the async
+// goroutine is observable in the inbox, so subsequent ProvisionCompleted /
+// ProvisionErrored messages land in a correctly-initialized SM.
+func (a *leaseActor) handleProvisionRequested(cancel context.CancelFunc) {
+	a.provisionCancel = cancel
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evProvisionRequested)
+}
+
+func (a *leaseActor) handleProvisionCompleted() {
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evProvisionCompleted)
+}
+
+func (a *leaseActor) handleProvisionErrored(callbackErr string) {
+	if a.sm == nil {
+		a.sm = newLeaseSM(a)
+	}
+	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, callbackErr)
 }
 
 // send enqueues a message. Blocks when the inbox is full (backpressure).

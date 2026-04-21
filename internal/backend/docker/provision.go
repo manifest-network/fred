@@ -206,17 +206,36 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	b.provisionsMu.Unlock()
 
 	// Start async provisioning with shutdown-aware context.
-	// The context cancels on either:
-	// 1. Provision timeout exceeded
-	// 2. Backend shutdown (stopCtx canceled)
+	// The cancel function is stored on the actor so Provisioning.OnExit can
+	// cancel it on DeprovisionRequested preemption — the structural
+	// cc62f3b-class suppression for the Provision flow. On completion, the
+	// goroutine fires the matching event into the actor's inbox; the SM's
+	// Ready/Failed entry actions emit the terminal callback.
+	//
+	// The provisionRequestedMsg is sent *before* the goroutine spawns so
+	// the SM reaches Provisioning before any completion event can land.
+	// Ordering is preserved by the inbox's FIFO delivery.
+	actor := b.actorFor(req.LeaseUUID)
+	provCtx, provCancel := b.shutdownAwareContext()
+	if !actor.send(provisionRequestedMsg{cancel: provCancel}) {
+		provCancel()
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("backend shutting down")
+	}
 	b.wg.Go(func() {
-		ctx, cancel := b.shutdownAwareContext()
-		defer cancel()
+		defer provCancel()
 
+		var callbackErr string
+		var err error
 		if isStack {
-			b.doProvisionStack(ctx, req, stackManifest, profiles, logger)
+			callbackErr, err = b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 		} else {
-			b.doProvision(ctx, req, manifest, profiles, logger)
+			callbackErr, err = b.doProvision(provCtx, req, manifest, profiles, logger)
+		}
+		if err != nil {
+			actor.send(provisionErroredMsg{callbackErr: callbackErr})
+		} else {
+			actor.send(provisionCompletedMsg{})
 		}
 	})
 
@@ -563,7 +582,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // doProvision performs the actual container creation asynchronously.
 // For multi-unit leases, it creates multiple containers.
 // For multi-SKU leases, each container gets the appropriate resource profile.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
@@ -571,7 +590,12 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	var callbackErr string // hardcoded message for callbacks (safe for on-chain)
 	provisionStart := time.Now()
 
-	// Single cleanup path via defer - handles both early cancellation and runtime errors
+	// Single cleanup path via defer - handles both early cancellation and runtime errors.
+	// Status flips are guarded on Status==Provisioning so a concurrent
+	// Deprovision that already transitioned the lease out of Provisioning
+	// is not clobbered. Callback emission lives in the SM entry actions
+	// (onEnterReadyFromProvision / onEnterFailedFromProvision); we only
+	// return (callbackErr, err) and let the actor fire the appropriate event.
 	defer func() {
 		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
 		if err != nil {
@@ -584,13 +608,15 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 			var diagSnap shared.DiagnosticEntry
 			var callbackURL string
+			var shouldEmit bool
 			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[req.LeaseUUID]; ok {
+			if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 				prov.Status = backend.ProvisionStatusFailed
 				prov.FailCount++
 				prov.LastError = err.Error()
 				diagSnap = diagnosticSnapshot(prov)
 				callbackURL = prov.CallbackURL
+				shouldEmit = true
 			}
 			b.provisionsMu.Unlock()
 			// Persist diagnostics outside lock — fetches container logs (I/O).
@@ -613,26 +639,27 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				}
 			}
 
-			// Send hardcoded callback message — never includes logs or dynamic data.
-			// Full diagnostics remain in prov.LastError for authenticated API access.
-			// URL was captured inside the lock block above so a concurrent
-			// Deprovision that deletes the entry can't cause a "no callback URL"
-			// warn here.
-			b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
+			if shouldEmit {
+				b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
+			}
+			callbackErrRet = callbackErr
+			errRet = err
 			return
 		}
 
-		// Update provision record on success
+		// Update provision record on success (guarded).
 		provisionsTotal.WithLabelValues("success").Inc()
-		activeProvisions.Inc()
 		var callbackURL string
+		var shouldEmit bool
 		b.provisionsMu.Lock()
-		if prov, ok := b.provisions[req.LeaseUUID]; ok {
+		if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 			prov.ContainerIDs = containerIDs
 			prov.Status = backend.ProvisionStatusReady
 			prov.Manifest = manifest
 			prov.LastError = ""
 			callbackURL = prov.CallbackURL
+			activeProvisions.Inc()
+			shouldEmit = true
 		}
 		b.provisionsMu.Unlock()
 
@@ -657,7 +684,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 
 		updateResourceMetrics(b.pool.Stats())
-		b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+		if shouldEmit {
+			b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+		}
 	}()
 
 	// Check for early cancellation (e.g., shutdown requested before we started)
@@ -832,12 +861,13 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 
 	logger.Info("all containers provisioned and verified", "count", len(containerIDs))
+	return
 }
 
 // doProvisionStack performs container creation for a stack (multi-service) lease
 // using Docker Compose. Compose handles container creation, start ordering, and
 // network attachment atomically via a single Up call.
-func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
@@ -861,13 +891,15 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 
 			var diagSnap shared.DiagnosticEntry
 			var callbackURL string
+			var shouldEmit bool
 			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[req.LeaseUUID]; ok {
+			if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 				prov.Status = backend.ProvisionStatusFailed
 				prov.FailCount++
 				prov.LastError = err.Error()
 				diagSnap = diagnosticSnapshot(prov)
 				callbackURL = prov.CallbackURL
+				shouldEmit = true
 			}
 			b.provisionsMu.Unlock()
 			b.persistDiagnostics(diagSnap, containerIDs, stackContainerLogKeys(serviceContainers))
@@ -888,20 +920,26 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 					logger.Warn("failed to cleanup volume after error", "volume_id", volumeID, "error", volErr)
 				}
 			}
-			b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
+			if shouldEmit {
+				b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
+			}
+			callbackErrRet = callbackErr
+			errRet = err
 			return
 		}
 
 		provisionsTotal.WithLabelValues("success").Inc()
-		activeProvisions.Inc()
 		var callbackURL string
+		var shouldEmit bool
 		b.provisionsMu.Lock()
-		if prov, ok := b.provisions[req.LeaseUUID]; ok {
+		if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
 			prov.ContainerIDs = containerIDs
 			prov.ServiceContainers = serviceContainers
 			prov.Status = backend.ProvisionStatusReady
 			prov.LastError = ""
 			callbackURL = prov.CallbackURL
+			activeProvisions.Inc()
+			shouldEmit = true
 		}
 		b.provisionsMu.Unlock()
 
@@ -923,7 +961,9 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		}
 
 		updateResourceMetrics(b.pool.Stats())
-		b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+		if shouldEmit {
+			b.sendCallbackWithURL(req.LeaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+		}
 	}()
 
 	if ctx.Err() != nil {
@@ -1037,6 +1077,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 	}
 
 	logger.Info("all stack containers provisioned and verified", "count", len(containerIDs), "services", len(stack.Services))
+	return
 }
 
 // mapComposeContainers maps Compose PS output to containerIDs and serviceContainers.
