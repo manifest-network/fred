@@ -3,7 +3,6 @@ package docker
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -28,6 +27,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	allocsByLease := make(map[string][]shared.ResourceAllocation)
 	recovered := make(map[string]*provision)
+	// firstExitedByLease[uuid] is the container ID of the first container we
+	// observed in an exited state for that lease. Used to fire containerDiedMsg
+	// into the actor for Ready→Failed transitions so the SM handles the
+	// callback emission via its Failing→Failed flow.
+	firstExitedByLease := make(map[string]string)
 	skippedUnknownSKU := 0
 
 	// Group containers by lease UUID
@@ -125,10 +129,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			prov.FailCount = c.FailCount
 		}
 
-		// If any container is not ready, mark the whole provision as not ready
+		// If any container is not ready, mark the whole provision as not ready.
+		// Also track the first exited container — recoverState fires
+		// containerDiedMsg with this ID for Ready→Failed transitions so the
+		// SM's Failing state handles the callback emission.
 		status := containerStatusToProvisionStatus(c.Status)
 		if status != backend.ProvisionStatusReady && prov.Status == backend.ProvisionStatusReady {
 			prov.Status = status
+		}
+		if status == backend.ProvisionStatusFailed {
+			if _, already := firstExitedByLease[c.LeaseUUID]; !already {
+				firstExitedByLease[c.LeaseUUID] = c.ContainerID
+			}
 		}
 
 		// Use instance-specific allocation ID, grouped by lease for filtering.
@@ -153,19 +165,25 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	b.provisionsMu.Lock()
 
 	// Detect ready→failed transitions: containers that were running but have since crashed.
-	// We must notify Fred so the lease doesn't remain active for a dead container.
+	// For each transition, we hand off to the SM by firing containerDiedMsg
+	// on the actor *after* the merge (see below). The SM's Ready→Failing→Failed
+	// flow gathers diagnostics via the async goroutine and emits the
+	// terminal Failed callback through Failed.OnEntryFrom(evDiagGathered).
+	//
+	// Status stays Ready in the recovered map so the actor's guard sees the
+	// pre-transition state and permits evContainerDied; FailCount and
+	// LastError are populated by the SM's Failing entry action.
 	var failedLeases []string
 	for uuid, existing := range b.provisions {
 		if existing.Status == backend.ProvisionStatusReady {
 			if rec, ok := recovered[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
-				// Carry over FailCount and increment for this failure.
-				rec.FailCount = existing.FailCount + 1
-				rec.LastError = errMsgContainerExited
+				rec.Status = backend.ProvisionStatusReady
+				rec.FailCount = existing.FailCount
+				rec.LastError = existing.LastError
 				failedLeases = append(failedLeases, uuid)
 				b.logger.Warn("container crashed after provisioning",
 					"lease_uuid", uuid,
 					"tenant", existing.Tenant,
-					"fail_count", rec.FailCount,
 				)
 			}
 		}
@@ -265,8 +283,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	activeProvisions.Set(readyCount)
 	updateResourceMetrics(b.pool.Stats())
 
-	// Gather diagnostics for failed leases (I/O outside the lock).
-	allFailed := slices.Concat(failedLeases, coldStartFailed)
+	// Gather diagnostics for cold-start failures only. Ready→Failed
+	// transitions (failedLeases) are handled by the SM's Failing state,
+	// whose OnEntry action spawns the async diag goroutine — same code
+	// path as a live container-death event.
+	allFailed := coldStartFailed
 	failedDiagnostics := make(map[string]string, len(allFailed))
 	for _, uuid := range allFailed {
 		b.provisionsMu.RLock()
@@ -331,42 +352,22 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.persistDiagnostics(item.entry, item.containerIDs, item.keys)
 	}
 
-	// Send failure callbacks with hardcoded message — never includes logs
-	// or dynamic data. Full diagnostics are in prov.LastError for
-	// authenticated API access.
-	//
-	// Re-check status under RLock before each send: the preceding diag gather
-	// and persist loop holds no lock, so a concurrent Deprovision (or Provision
-	// re-attempt, Restart) may have flipped Failed into another state.
-	// Whichever operation took over will emit its own terminal callback.
-	//
-	// Snapshot the callback URL under the same RLock as the status check, then
-	// send via sendCallbackWithURL so the send cannot race with a concurrent
-	// delete (which would yield a noisy "no callback URL" warning) or reinsert
-	// (which could route this lease's Failed send to a different URL).
+	// Hand off Ready→Failed transitions to each lease's actor. The SM's
+	// Ready→Failing→Failed flow gathers diagnostics via the async goroutine
+	// (same code path as a live container-death event) and emits the
+	// terminal Failed callback from Failed.OnEntryFrom(evDiagGathered).
+	// Callback suppression on concurrent Deprovision is handled
+	// structurally by Failing.OnExit.
 	for _, uuid := range failedLeases {
-		b.provisionsMu.RLock()
-		var curStatus backend.ProvisionStatus
-		var callbackURL string
-		var failCount int
-		present := false
-		if p, ok := b.provisions[uuid]; ok {
-			present = true
-			curStatus = p.Status
-			callbackURL = p.CallbackURL
-			failCount = p.FailCount
-		}
-		b.provisionsMu.RUnlock()
-		if !present || curStatus != backend.ProvisionStatusFailed {
-			b.logger.Info("suppressing Failed callback: another operation took over",
-				"lease_uuid", uuid,
-				"observed_status", curStatus,
-				"present", present,
-				"fail_count", failCount,
-			)
+		containerID, ok := firstExitedByLease[uuid]
+		if !ok {
+			// Shouldn't happen: if we detected a Ready→Failed transition,
+			// some container for this lease was observed as exited.
+			b.logger.Warn("ready→failed transition detected but no exited container",
+				"lease_uuid", uuid)
 			continue
 		}
-		b.sendCallbackWithURL(uuid, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
+		b.actorFor(uuid).send(containerDiedMsg{containerID: containerID})
 	}
 
 	stats := b.pool.Stats()
