@@ -510,7 +510,7 @@ Returns a single provision record. This is the primary endpoint for retrieving f
 }
 ```
 
-`status` is one of: `provisioning`, `ready`, `failed`, `unknown`, `restarting`, `updating`. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
+`status` is one of: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, `deprovisioning`. `failing` marks the brief window between container-death detection and the Failed callback being emitted; a concurrent Deprovision arriving in this window transitions the lease straight to `deprovisioning` without ever reaching `failed`, preventing a stale Failed callback. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
 
 ### `GET /provisions` (authenticated)
 
