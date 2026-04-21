@@ -99,11 +99,11 @@ func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionR
 		actor.sm = newLeaseSM(actor)
 	}
 	_ = actor.sm.Fire(ctx, evProvisionRequested)
-	callbackErr, err := b.doProvision(ctx, req, manifest, profiles, logger)
+	callbackErr, err, result := b.doProvision(ctx, req, manifest, profiles, logger)
 	if err != nil {
-		_ = actor.sm.Fire(ctx, evProvisionErrored, callbackErr)
+		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error()})
 	} else {
-		_ = actor.sm.Fire(ctx, evProvisionCompleted)
+		_ = actor.sm.Fire(ctx, evProvisionCompleted, result)
 	}
 }
 
@@ -114,11 +114,11 @@ func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.Provi
 		actor.sm = newLeaseSM(actor)
 	}
 	_ = actor.sm.Fire(ctx, evProvisionRequested)
-	callbackErr, err := b.doProvisionStack(ctx, req, stack, profiles, logger)
+	callbackErr, err, result := b.doProvisionStack(ctx, req, stack, profiles, logger)
 	if err != nil {
-		_ = actor.sm.Fire(ctx, evProvisionErrored, callbackErr)
+		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error()})
 	} else {
-		_ = actor.sm.Fire(ctx, evProvisionCompleted)
+		_ = actor.sm.Fire(ctx, evProvisionCompleted, result)
 	}
 }
 

@@ -227,15 +227,16 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 
 		var callbackErr string
 		var err error
+		var result provisionSuccessResult
 		if isStack {
-			callbackErr, err = b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
+			callbackErr, err, result = b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 		} else {
-			callbackErr, err = b.doProvision(provCtx, req, manifest, profiles, logger)
+			callbackErr, err, result = b.doProvision(provCtx, req, manifest, profiles, logger)
 		}
 		if err != nil {
-			actor.send(provisionErroredMsg{callbackErr: callbackErr})
+			actor.send(provisionErroredMsg{callbackErr: callbackErr, lastError: err.Error()})
 		} else {
-			actor.send(provisionCompletedMsg{})
+			actor.send(provisionCompletedMsg{result: result})
 		}
 	})
 
@@ -582,7 +583,19 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // doProvision performs the actual container creation asynchronously.
 // For multi-unit leases, it creates multiple containers.
 // For multi-SKU leases, each container gets the appropriate resource profile.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error) {
+//
+// Returns (callbackErr, err, result). On success, result carries the
+// populated provisionSuccessResult for the SM's Ready entry action to
+// write into the provision struct. On failure, result is zero; the SM's
+// Failed entry action uses (callbackErr, err.Error()) to populate
+// LastError and the Failed callback.
+//
+// The defer no longer touches provision.Status, FailCount, LastError,
+// ContainerIDs, or Manifest — those are owned by the SM entry actions.
+// The defer's remaining responsibilities: metrics, pool release on
+// failure, container/volume cleanup on failure, release-store updates
+// on success, stale-diagnostic removal on success.
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error, resultRet provisionSuccessResult) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
@@ -590,12 +603,6 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	var callbackErr string // hardcoded message for callbacks (safe for on-chain)
 	provisionStart := time.Now()
 
-	// Single cleanup path via defer - handles both early cancellation and runtime errors.
-	// Status flips are guarded on Status==Provisioning so a concurrent
-	// Deprovision that already transitioned the lease out of Provisioning
-	// is not clobbered. Callback emission lives in the SM entry actions
-	// (onEnterReadyFromProvision / onEnterFailedFromProvision); we only
-	// return (callbackErr, err) and let the actor fire the appropriate event.
 	defer func() {
 		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
 		if err != nil {
@@ -605,18 +612,6 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			for i := range totalQuantity {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}
-
-			var diagSnap shared.DiagnosticEntry
-			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
-				prov.Status = backend.ProvisionStatusFailed
-				prov.FailCount++
-				prov.LastError = err.Error()
-				diagSnap = diagnosticSnapshot(prov)
-			}
-			b.provisionsMu.Unlock()
-			// Persist diagnostics outside lock — fetches container logs (I/O).
-			b.persistDiagnostics(diagSnap, containerIDs)
 
 			// Clean up any containers that were created.
 			// Use a fresh context since the original may be canceled.
@@ -640,19 +635,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			return
 		}
 
-		// Update provision record on success (guarded).
+		// Success: metrics + persistent stores (release history, clear stale
+		// diagnostics). Provision-struct mutations are owned by the SM
+		// entry action — see onEnterReadyFromProvision.
 		provisionsTotal.WithLabelValues("success").Inc()
-		b.provisionsMu.Lock()
-		if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
-			prov.ContainerIDs = containerIDs
-			prov.Status = backend.ProvisionStatusReady
-			prov.Manifest = manifest
-			prov.LastError = ""
-			activeProvisions.Inc()
-		}
-		b.provisionsMu.Unlock()
 
-		// Record initial release
 		if b.releaseStore != nil {
 			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 				Manifest:  req.Payload,
@@ -664,8 +651,6 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			}
 		}
 
-		// Remove any stale diagnostic entry from a previous failure
-		// (e.g., re-provision after a crash).
 		if b.diagnosticsStore != nil {
 			if delErr := b.diagnosticsStore.Delete(req.LeaseUUID); delErr != nil {
 				b.logger.Warn("failed to remove stale diagnostic entry", "lease", req.LeaseUUID, "error", delErr)
@@ -673,6 +658,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 
 		updateResourceMetrics(b.pool.Stats())
+
+		resultRet = provisionSuccessResult{
+			containerIDs: containerIDs,
+			manifest:     manifest,
+		}
 	}()
 
 	// Check for early cancellation (e.g., shutdown requested before we started)
@@ -853,7 +843,10 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 // doProvisionStack performs container creation for a stack (multi-service) lease
 // using Docker Compose. Compose handles container creation, start ordering, and
 // network attachment atomically via a single Up call.
-func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error) {
+//
+// See doProvision for the (callbackErr, err, result) return contract.
+// Stack-specific result fields are stackManifest + serviceContainers.
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error, resultRet provisionSuccessResult) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
@@ -874,17 +867,6 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
 				}
 			}
-
-			var diagSnap shared.DiagnosticEntry
-			b.provisionsMu.Lock()
-			if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
-				prov.Status = backend.ProvisionStatusFailed
-				prov.FailCount++
-				prov.LastError = err.Error()
-				diagSnap = diagnosticSnapshot(prov)
-			}
-			b.provisionsMu.Unlock()
-			b.persistDiagnostics(diagSnap, containerIDs, stackContainerLogKeys(serviceContainers))
 
 			// Clean up via Compose Down (removes all project containers).
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -908,15 +890,6 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		}
 
 		provisionsTotal.WithLabelValues("success").Inc()
-		b.provisionsMu.Lock()
-		if prov, ok := b.provisions[req.LeaseUUID]; ok && prov.Status == backend.ProvisionStatusProvisioning {
-			prov.ContainerIDs = containerIDs
-			prov.ServiceContainers = serviceContainers
-			prov.Status = backend.ProvisionStatusReady
-			prov.LastError = ""
-			activeProvisions.Inc()
-		}
-		b.provisionsMu.Unlock()
 
 		if b.releaseStore != nil {
 			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
@@ -936,6 +909,12 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 		}
 
 		updateResourceMetrics(b.pool.Stats())
+
+		resultRet = provisionSuccessResult{
+			containerIDs:      containerIDs,
+			stackManifest:     stack,
+			serviceContainers: serviceContainers,
+		}
 	}()
 
 	if ctx.Err() != nil {

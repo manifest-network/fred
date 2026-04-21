@@ -55,17 +55,23 @@ func (provisionRequestedMsg) isLeaseMessage()         {}
 func (provisionRequestedMsg) doneChan() chan struct{} { return nil }
 
 // provisionCompletedMsg is sent by the doProvision goroutine on success.
-// Drives the Provisioning→Ready transition + Success callback.
-type provisionCompletedMsg struct{}
+// Drives the Provisioning→Ready transition. Carries the result data
+// (containerIDs, manifest, stackManifest, serviceContainers) that the
+// Ready entry action writes into the provision struct.
+type provisionCompletedMsg struct {
+	result provisionSuccessResult
+}
 
 func (provisionCompletedMsg) isLeaseMessage()         {}
 func (provisionCompletedMsg) doneChan() chan struct{} { return nil }
 
 // provisionErroredMsg is sent by the doProvision goroutine on failure.
-// callbackErr is the hardcoded on-chain-safe message; err is the rich
-// diagnostic (stashed in provision.LastError by doProvision's defer).
+// callbackErr is the hardcoded on-chain-safe message; lastError is the
+// full diagnostic string (from err.Error()) that the Failed entry
+// action writes into provision.LastError.
 type provisionErroredMsg struct {
 	callbackErr string
+	lastError   string
 }
 
 func (provisionErroredMsg) isLeaseMessage()         {}
@@ -206,9 +212,9 @@ func (a *leaseActor) handle(msg leaseMessage) {
 	case provisionRequestedMsg:
 		a.handleProvisionRequested(m.cancel)
 	case provisionCompletedMsg:
-		a.handleProvisionCompleted()
+		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
-		a.handleProvisionErrored(m.callbackErr)
+		a.handleProvisionErrored(m.callbackErr, m.lastError)
 	case restartRequestedMsg:
 		a.handleRestartRequested(m.cancel)
 	case updateRequestedMsg:
@@ -255,18 +261,21 @@ func (a *leaseActor) handleProvisionRequested(cancel context.CancelFunc) {
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionRequested)
 }
 
-func (a *leaseActor) handleProvisionCompleted() {
+func (a *leaseActor) handleProvisionCompleted(result provisionSuccessResult) {
 	if a.sm == nil {
 		a.sm = newLeaseSM(a)
 	}
-	_ = a.sm.Fire(a.backend.stopCtx, evProvisionCompleted)
+	_ = a.sm.Fire(a.backend.stopCtx, evProvisionCompleted, result)
 }
 
-func (a *leaseActor) handleProvisionErrored(callbackErr string) {
+func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string) {
 	if a.sm == nil {
 		a.sm = newLeaseSM(a)
 	}
-	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, callbackErr)
+	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, provisionErrorInfo{
+		callbackErr: callbackErr,
+		lastError:   lastError,
+	})
 }
 
 func (a *leaseActor) handleRestartRequested(cancel context.CancelFunc) {

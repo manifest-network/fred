@@ -180,7 +180,7 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	// just send callbacks.
 	sm.Configure(backend.ProvisionStatusReady).
 		OnEntryFrom(evProvisionCompleted, lsm.onEnterReadyFromProvision).
-		OnEntryFrom(evReplaceCompleted, lsm.onEnterReadyFromProvision).
+		OnEntryFrom(evReplaceCompleted, lsm.onEnterReadyFromReplace).
 		OnEntryFrom(evReplaceRecovered, lsm.onEnterFailedFromReplace)
 
 	// Failed entry actions: emit Failed from a Provision error or Replace
@@ -334,12 +334,50 @@ func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
 	return nil
 }
 
-// onEnterReadyFromProvision emits the terminal Success callback when
-// doProvision signals successful completion. The Ready status and field
-// populations are already done by doProvision's defer (under the same
-// lock that observed Status==Provisioning); this action just reads
-// CallbackURL and sends.
+// onEnterReadyFromProvision fires when doProvision signals success. Owns
+// the Status flip, ContainerIDs/Manifest/ServiceContainers update, gauge
+// increment, and Success callback emission — consolidating the mutations
+// that used to live in doProvision's defer.
 func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) error {
+	if len(args) < 1 {
+		return fmt.Errorf("onEnterReadyFromProvision: missing result")
+	}
+	result, ok := args[0].(provisionSuccessResult)
+	if !ok {
+		return fmt.Errorf("onEnterReadyFromProvision: arg not provisionSuccessResult")
+	}
+	b := lsm.actor.backend
+	leaseUUID := lsm.actor.leaseUUID
+
+	var callbackURL string
+	b.provisionsMu.Lock()
+	if p, ok := b.provisions[leaseUUID]; ok {
+		p.Status = backend.ProvisionStatusReady
+		p.ContainerIDs = result.containerIDs
+		p.LastError = ""
+		if result.manifest != nil {
+			p.Manifest = result.manifest
+		}
+		if result.stackManifest != nil {
+			p.StackManifest = result.stackManifest
+		}
+		if result.serviceContainers != nil {
+			p.ServiceContainers = result.serviceContainers
+		}
+		activeProvisions.Inc()
+		callbackURL = p.CallbackURL
+	}
+	b.provisionsMu.Unlock()
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+	return nil
+}
+
+// onEnterReadyFromReplace emits the Success callback for Restart/Update
+// completion. Restart/Update's mutations are still in doReplace*'s defer
+// (2.6c will migrate them); here we just emit the callback to preserve
+// current behavior.
+func (lsm *leaseSM) onEnterReadyFromReplace(ctx context.Context, args ...any) error {
 	b := lsm.actor.backend
 	leaseUUID := lsm.actor.leaseUUID
 
@@ -354,29 +392,41 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 	return nil
 }
 
-// onEnterFailedFromProvision emits the terminal Failed callback when
-// doProvision signals a failure. The callbackErr is passed via Fire args
-// so the on-chain-safe message stays attached to the event that caused
-// the transition.
+// onEnterFailedFromProvision fires when doProvision signals a failure.
+// Owns Status flip, FailCount++, LastError update, persistDiagnostics,
+// and the Failed callback. Cleanup (container/volume removal) still
+// runs in the goroutine's defer — it's I/O that shouldn't block the
+// actor.
 func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any) error {
 	if len(args) < 1 {
-		return fmt.Errorf("onEnterFailedFromProvision: missing callbackErr")
+		return fmt.Errorf("onEnterFailedFromProvision: missing error info")
 	}
-	callbackErr, ok := args[0].(string)
+	info, ok := args[0].(provisionErrorInfo)
 	if !ok {
-		return fmt.Errorf("onEnterFailedFromProvision: arg not string")
+		return fmt.Errorf("onEnterFailedFromProvision: arg not provisionErrorInfo")
 	}
 	b := lsm.actor.backend
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
-	b.provisionsMu.RLock()
+	var diagSnap shared.DiagnosticEntry
+	var snapContainerIDs []string
+	b.provisionsMu.Lock()
 	if p, ok := b.provisions[leaseUUID]; ok {
+		p.Status = backend.ProvisionStatusFailed
+		p.FailCount++
+		p.LastError = info.lastError
+		diagSnap = diagnosticSnapshot(p)
+		snapContainerIDs = append([]string(nil), p.ContainerIDs...)
 		callbackURL = p.CallbackURL
 	}
-	b.provisionsMu.RUnlock()
+	b.provisionsMu.Unlock()
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, callbackErr)
+	if diagSnap.LeaseUUID != "" {
+		b.persistDiagnostics(diagSnap, snapContainerIDs)
+	}
+
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }
 
@@ -473,6 +523,26 @@ type diagResult struct {
 	containerID string
 	info        *ContainerInfo
 	diag        string
+}
+
+// provisionSuccessResult carries doProvision / doProvisionStack output
+// into Ready.OnEntryFrom(evProvisionCompleted) via Fire args. Manifest
+// and StackManifest are mutually exclusive — single-manifest provisions
+// populate Manifest; stacks populate StackManifest + ServiceContainers.
+type provisionSuccessResult struct {
+	containerIDs      []string
+	manifest          *DockerManifest
+	stackManifest     *StackManifest
+	serviceContainers map[string][]string
+}
+
+// provisionErrorInfo carries doProvision failure data into
+// Failed.OnEntryFrom(evProvisionErrored). callbackErr is the on-chain-safe
+// hardcoded message; lastError is the full diagnostic string stashed in
+// provision.LastError for authenticated API access.
+type provisionErrorInfo struct {
+	callbackErr string
+	lastError   string
 }
 
 // readProvisionStatus snapshots provision.Status under RLock. Used on SM
