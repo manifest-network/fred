@@ -514,6 +514,40 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, 2, prov.FailCount)
 	})
 
+	t.Run("failing provision without containers normalized to failed", func(t *testing.T) {
+		// Failing is a transient SM state. If a crash (or external container
+		// removal) leaves a provision stuck in Failing without containers in
+		// Docker, recoverState must normalize to Failed so Provision/Restart/
+		// Update retries (which require Status == Failed) can proceed —
+		// otherwise the lease is wedged.
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return nil, nil
+			},
+		}
+		existing := map[string]*provision{
+			"lease-1": {
+				LeaseUUID: "lease-1",
+				Tenant:    "tenant-a",
+				Status:    backend.ProvisionStatusFailing,
+				FailCount: 1,
+				LastError: errMsgContainerExited,
+				CreatedAt: now,
+			},
+		}
+		b := newBackendForTest(mock, existing)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
+			"Failing must be normalized to Failed on recovery to unblock retries")
+		assert.Equal(t, 1, prov.FailCount, "FailCount preserved across normalization")
+		assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError preserved")
+	})
+
 	t.Run("ready provision without containers dropped", func(t *testing.T) {
 		mock := &mockDockerClient{
 			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {

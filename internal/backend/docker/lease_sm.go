@@ -318,12 +318,17 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	activeProvisions.Dec()
 	b.provisionsMu.Unlock()
 
-	// Spawn the async diag gather. Its context is derived from backend's
-	// stopCtx so shutdown cancels; locally scoped so Failing.OnExit can
-	// cancel on preemption. Tracked by workersWg so Failing.OnExit (or
-	// the actor's exit-path waitForWorkers) blocks until the goroutine
-	// has returned and its terminal sendTerminal has landed.
-	diagCtx, diagCancel := context.WithCancel(b.stopCtx)
+	// Spawn the async diag gather. Its context is derived from
+	// context.Background() with a bounded timeout — NOT from stopCtx —
+	// so a backend shutdown doesn't cancel diag prematurely and leave
+	// the SM wedged in Failing. gatherDiagAsync's ctx.Err check is now
+	// driven only by the timeout (diagnosticsGatherTimeout) or by
+	// Failing.OnExit calling diagCancel on DeprovisionRequested
+	// preemption. Shutdown will still complete promptly because the
+	// actor's waitForWorkers has its own 45s bound, after which the
+	// diag goroutine becomes an orphan that finishes (or gets killed
+	// with the process) on its own schedule.
+	diagCtx, diagCancel := context.WithTimeout(context.Background(), diagnosticsGatherTimeout)
 	lsm.actor.diagCancel = diagCancel
 	lsm.actor.workersWg.Add(1)
 	b.wg.Go(func() {
@@ -332,6 +337,14 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	})
 	return nil
 }
+
+// diagnosticsGatherTimeout bounds the async diag goroutine's lifetime
+// independently of backend shutdown. Must be short enough that a wedged
+// Docker daemon doesn't leak goroutines indefinitely; long enough that
+// normal log fetches complete. The actor's waitForWorkers bound is 45s;
+// keep this comfortably below so diag can finish and sendTerminal before
+// the actor's shutdown-drain gives up on it.
+const diagnosticsGatherTimeout = 30 * time.Second
 
 // onExitFailing cancels the in-flight diag goroutine whenever we leave
 // Failing — whether by DiagGathered (normal) or DeprovisionRequested

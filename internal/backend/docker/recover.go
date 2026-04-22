@@ -232,12 +232,23 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
 			// In-flight operation that hasn't produced containers yet — preserve it.
 			recovered[uuid] = existing
-		case backend.ProvisionStatusFailing, backend.ProvisionStatusFailed:
-			// Failed (or actively failing) provision whose containers have been
-			// cleaned up. Preserve so fred's reconciler can see the failure and
-			// its FailCount. Failing is treated like Failed for recovery: the
-			// container is dead, FailCount has been incremented, any in-flight
-			// diag goroutine was lost at crash time.
+		case backend.ProvisionStatusFailing:
+			// Failing is a transient state between container-death detection
+			// and the diag goroutine firing DiagGathered. A crash (or external
+			// container removal while Failing) can preserve Failing in memory
+			// without the transition to Failed completing. Normalize to
+			// Failed so Provision/Restart/Update retry paths (which require
+			// Status == Failed) can proceed — the container is dead,
+			// FailCount has been incremented, LastError was set by
+			// onEnterFailing. Any diag that was in-flight is lost; the
+			// normalized Failed callback is not re-emitted (the lease is
+			// recoverable via retry from the caller).
+			existing.Status = backend.ProvisionStatusFailed
+			recovered[uuid] = existing
+		case backend.ProvisionStatusFailed:
+			// Failed provision whose containers have been cleaned up.
+			// Preserve so fred's reconciler can see the failure and its
+			// FailCount.
 			recovered[uuid] = existing
 		}
 	}
