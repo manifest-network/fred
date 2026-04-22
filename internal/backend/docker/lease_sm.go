@@ -175,14 +175,22 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
-		Ignore(evContainerDied)
+		Ignore(evContainerDied).
+		// Ignore evRestartRequested: Backend.Restart's sync phase sets
+		// prov.Status to Restarting BEFORE the msg reaches the actor,
+		// so newLeaseSM initializes the SM in Restarting. The event
+		// arrives to a state already matching the target — treat as a
+		// no-op rather than an unhandled trigger error. Same pattern
+		// as Provisioning.Ignore(evProvisionRequested).
+		Ignore(evRestartRequested)
 	sm.Configure(backend.ProvisionStatusUpdating).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
-		Ignore(evContainerDied)
+		Ignore(evContainerDied).
+		Ignore(evUpdateRequested) // See Restarting.Ignore comment above.
 
 	// Ready entry actions: emit Success from a Provision or Replace success,
 	// or emit Failed-with-rollback-suffix from a Replace recovery. Status
