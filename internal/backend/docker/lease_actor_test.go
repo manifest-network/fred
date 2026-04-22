@@ -423,6 +423,80 @@ func TestLeaseActor_SendRefusesAfterActorExit(t *testing.T) {
 	assert.False(t, ok, "send must refuse once the actor has exited")
 }
 
+// TestRouteToLease_DropsOnFullInbox pins the non-blocking-under-mutex
+// contract of routeToLease. When an actor's inbox is saturated, the
+// non-blocking send in routeToLease returns false — the registry mutex
+// is never held across a slow channel send, so a wedged actor cannot
+// stall the event loop or other routing callers. Combined with the
+// dieEventDroppedTotal metric wiring, this turns "one wedged actor
+// stalls all lease event delivery" into "one wedged actor loses its
+// own die events (reconciler re-detects)".
+func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	defer b.stopCancel()
+
+	// Install an actor directly without starting its run loop, so its
+	// inbox is never drained and we can fill it to capacity.
+	actor := newLeaseActor(b, "lease-1")
+	b.actorsMu.Lock()
+	b.actors["lease-1"] = actor
+	b.actorsMu.Unlock()
+
+	// Fill inbox to capacity.
+	for i := 0; i < leaseActorInboxSize; i++ {
+		ok := b.routeToLease("lease-1", containerDiedMsg{containerID: "c1"})
+		require.True(t, ok, "message %d should enqueue", i)
+	}
+
+	// Inbox is full → routeToLease must refuse without blocking.
+	done := make(chan bool, 1)
+	go func() {
+		done <- b.routeToLease("lease-1", containerDiedMsg{containerID: "overflow"})
+	}()
+	select {
+	case ok := <-done:
+		assert.False(t, ok, "routeToLease must refuse when inbox is full")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("routeToLease blocked on full inbox — must be non-blocking")
+	}
+}
+
+// TestLeaseActor_ProvisionRequestedSMRejection pins the accept/reject
+// ack contract: when the actor's SM refuses to transition (e.g., the
+// provisionRequestedMsg arrives while the SM is in a state that doesn't
+// Permit evProvisionRequested), the actor must ack with a non-nil error
+// and MUST NOT spawn the work goroutine. This is the structural
+// guarantee that Backend.Provision never spawns work behind a rejected
+// SM transition.
+func TestLeaseActor_ProvisionRequestedSMRejection(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		// Ready state does NOT Permit evProvisionRequested — SM rejects.
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+	})
+	defer b.stopCancel()
+
+	// Warm the actor so its SM is in Ready.
+	require.Equal(t, backend.ProvisionStatusReady, b.actorFor("lease-1").sm.State())
+
+	ack := make(chan error, 1)
+	ok := b.routeToLease("lease-1", provisionRequestedMsg{
+		cancel: func() {},
+		work: func() (string, provisionSuccessResult, error) {
+			t.Fatal("work closure must not run when SM rejects the transition")
+			return "", provisionSuccessResult{}, nil
+		},
+		ack: ack,
+	})
+	require.True(t, ok, "routeToLease itself must succeed; rejection is at SM-fire time")
+
+	select {
+	case err := <-ack:
+		require.Error(t, err, "SM rejection must surface as a non-nil ack error")
+	case <-time.After(2 * time.Second):
+		t.Fatal("ack never arrived from rejected provisionRequestedMsg")
+	}
+}
+
 // TestLeaseActor_RegistryDeletedBeforeDoneClose guards the defer order in
 // run(): b.actors.Delete must fire BEFORE close(a.done) so that a
 // concurrent actorFor() call racing with the actor's termination creates
