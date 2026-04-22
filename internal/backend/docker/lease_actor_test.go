@@ -284,6 +284,158 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 		"fresh actor's SM starts in Provisioning (no provision entry exists)")
 }
 
+// TestLeaseActor_StatusMatchesSMState is the cross-cutting consistency
+// test for the "prov.Status == actor.sm.State()" contract. prov.Status
+// is set in multiple places (sync-phase of Provision/Restart/Update,
+// SM entry actions, recoverState's Failing→Failed normalization), and
+// we want drift between the two to fail loudly rather than produce
+// subtle bugs later.
+//
+// Walks a lease through a realistic lifecycle and asserts the contract
+// at every observable point: initial Provisioning, successful → Ready,
+// container-death → Failed, retry → Provisioning → Ready, Deprovision
+// → actor exit.
+func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
+	assertStatusMatchesSM := func(t *testing.T, b *Backend, leaseUUID, context string) {
+		t.Helper()
+		b.actorsMu.Lock()
+		actor, ok := b.actors[leaseUUID]
+		b.actorsMu.Unlock()
+		if !ok {
+			return // actor terminated — no SM to compare
+		}
+		b.provisionsMu.RLock()
+		prov, provExists := b.provisions[leaseUUID]
+		var status backend.ProvisionStatus
+		if provExists {
+			status = prov.Status
+		}
+		b.provisionsMu.RUnlock()
+		if !provExists {
+			return // no provision — no contract to enforce
+		}
+		smState := actor.sm.State()
+		assert.Equal(t, status, smState,
+			"%s: prov.Status (%s) must match actor.sm.State() (%s)",
+			context, status, smState)
+	}
+
+	var callbackReceived atomic.Int32
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackReceived.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	defer b.stopCancel()
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+
+	// (1) Provision: sync phase writes Status=Provisioning and creates
+	// the actor; the actor's SM starts in Provisioning reading that
+	// very Status. Contract: match.
+	require.NoError(t, b.Provision(context.Background(), req))
+
+	// Wait for success callback.
+	require.Eventually(t, func() bool { return callbackReceived.Load() >= 1 },
+		3*time.Second, 20*time.Millisecond)
+
+	// (2) After success: SM has transitioned to Ready; onEnterReadyFromProvision
+	// wrote Status=Ready. Contract: match.
+	assertStatusMatchesSM(t, b, "lease-1", "after successful provision")
+
+	// (3) Container-death → Failing → Failed (via the synchronous test
+	// shim that waits for the diag goroutine's DiagGathered to process).
+	mock.InspectContainerFn = func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+		return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+	}
+	b.handleContainerDeath("c1")
+
+	// Wait for Failed callback.
+	require.Eventually(t, func() bool { return callbackReceived.Load() >= 2 },
+		3*time.Second, 20*time.Millisecond)
+	b.provisionsMu.RLock()
+	require.Equal(t, backend.ProvisionStatusFailed, b.provisions["lease-1"].Status)
+	b.provisionsMu.RUnlock()
+	assertStatusMatchesSM(t, b, "lease-1", "after container death → Failed")
+
+	// (4) Deprovision the failed lease → actor exits; registry drops it;
+	// no contract to enforce post-exit (assertStatusMatchesSM handles).
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	b.provisionsMu.RLock()
+	_, stillExists := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	require.False(t, stillExists, "provision entry must be gone after Deprovision")
+	assertStatusMatchesSM(t, b, "lease-1", "after deprovision")
+}
+
+// TestLeaseActor_FailingWedgeRecovery pins the Failing-retry invariant
+// I added after self-review: if an actor's SM is stuck in Failing
+// (e.g., the diag goroutine never fired DiagGathered because Docker's
+// log endpoint hung and the 30s timeout elapsed, OR recoverState
+// normalized prov.Status to Failed while leaving an in-memory actor's
+// SM in Failing), a caller's retry must still make progress.
+//
+// Scenario: actor's SM is in Failing. prov.Status was normalized to
+// Failed by recoverState. Backend.Provision accepts the retry (Status
+// == Failed). The actor receives evProvisionRequested in Failing —
+// the SM's new Permit(evProvisionRequested, Provisioning) transitions
+// instead of returning an unhandled-trigger error. Lease is no longer
+// wedged.
+func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailing},
+	})
+	defer b.stopCancel()
+
+	// Warm the actor so its SM is in Failing.
+	actor := b.actorFor("lease-1")
+	require.Equal(t, backend.ProvisionStatusFailing, actor.sm.State())
+
+	// Route a provisionRequestedMsg — the Failing→Provisioning Permit
+	// should accept it.
+	ack := make(chan error, 1)
+	ok := b.routeToLease("lease-1", provisionRequestedMsg{
+		cancel: func() {},
+		work: func() (string, provisionSuccessResult, map[string]string, error) {
+			return "", provisionSuccessResult{}, nil, nil
+		},
+		ack: ack,
+	})
+	require.True(t, ok)
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "Failing must Permit evProvisionRequested so stuck leases can recover")
+	case <-time.After(2 * time.Second):
+		t.Fatal("ack never arrived")
+	}
+}
+
 // TestLeaseActor_SurvivesHandlerPanic pins the defer-recover in handle():
 // a panic in a handler path (SM guard, entry action, or downstream I/O)
 // must be contained to a single message. Without recovery, the actor

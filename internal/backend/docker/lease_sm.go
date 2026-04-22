@@ -133,6 +133,17 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		OnExit(lsm.onExitFailing).
 		Permit(evDiagGathered, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
+		// Accept retry events from Failing the same way Failed does.
+		// recoverState normalizes Failing→Failed on recovery, but if the
+		// runtime reconcile path normalizes while an actor's SM is still
+		// in Failing (e.g., a wedged diag goroutine never fires
+		// DiagGathered), a subsequent Provision retry would hit an
+		// unhandled trigger. Allowing the retry from Failing removes the
+		// wedge; Failing.OnExit cancels the stale diag goroutine on the
+		// way out via diagCancel + waitForWorkers.
+		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning).
+		Permit(evRestartRequested, backend.ProvisionStatusRestarting).
+		Permit(evUpdateRequested, backend.ProvisionStatusUpdating).
 		Ignore(evContainerDied)
 
 	// Failed: terminal callback already emitted on entry from DiagGathered.
