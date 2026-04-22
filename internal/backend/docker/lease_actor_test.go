@@ -3,8 +3,10 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -405,6 +407,205 @@ func TestLeaseActor_SendTerminalRefusesAfterActorExit(t *testing.T) {
 
 	ok := actor.sendTerminal(provisionCompletedMsg{})
 	assert.False(t, ok, "sendTerminal must refuse once the actor has exited")
+}
+
+// TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine mirrors the
+// Provision variant of the bug_012 test for the Restart flow: when
+// Deprovision preempts an in-flight restart, Restarting.OnExit must
+// cancel the work goroutine and wait on workDone before doDeprovision
+// reads ContainerIDs. Guards against future refactors that move the
+// replace spawn sites without plumbing the done channel.
+//
+// The Update flow uses the exact same SM transition and OnExit handler,
+// so this single test covers both — the behaviour is identical.
+func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
+	var removedMu sync.Mutex
+	var removedIDs []string
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			removedMu.Lock()
+			removedIDs = append(removedIDs, containerID)
+			removedMu.Unlock()
+			return nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusRestarting,
+			ContainerIDs: []string{"old-container"},
+		},
+	})
+	defer b.stopCancel()
+
+	actor := b.actorFor("lease-1")
+	require.Equal(t, backend.ProvisionStatusRestarting, actor.sm.State())
+
+	// Same synthetic-goroutine pattern as the Provision variant.
+	var cancelCalled atomic.Bool
+	goroutineFinished := make(chan struct{})
+	actor.workCancel = func() { cancelCalled.Store(true) }
+	actor.workDone = goroutineFinished
+
+	deprovErr := make(chan error, 1)
+	go func() {
+		deprovErr <- b.Deprovision(context.Background(), "lease-1")
+	}()
+
+	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
+		"OnExit must call workCancel before waiting on workDone (Restart path)")
+
+	select {
+	case err := <-deprovErr:
+		t.Fatalf("Deprovision returned before workDone closed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Simulate the replace goroutine publishing new containerIDs (as
+	// fireReplaceOutcome does today) and closing done.
+	b.provisionsMu.Lock()
+	b.provisions["lease-1"].ContainerIDs = []string{"new-container"}
+	b.provisionsMu.Unlock()
+	close(goroutineFinished)
+
+	select {
+	case err := <-deprovErr:
+		require.NoError(t, err, "Deprovision must succeed after workDone closes")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Deprovision did not complete after workDone closed")
+	}
+
+	removedMu.Lock()
+	defer removedMu.Unlock()
+	require.Contains(t, removedIDs, "new-container",
+		"doDeprovision must see the new containerIDs published before fireReplaceOutcome")
+}
+
+// TestLeaseActor_DiagGathered_ShutdownDrain exercises the drain-on-shutdown
+// path for a lease in the Failing state: stopCtx fires with a diagGatheredMsg
+// freshly queued in the inbox, and the actor must process it (transitioning
+// Failing→Failed) before exiting. Pre-fix: the actor would exit on
+// stopCtx.Done and the diag message would be discarded by drainInbox
+// without handling, leaving Status stuck at Failing.
+//
+// Asserts on the SM-observable outcome (Status flip) rather than HTTP
+// callback delivery — the callbackSender uses stopCtx and legitimately
+// cannot reach an external HTTP endpoint during shutdown (the callback
+// is persisted to the bbolt store for replay on next start instead).
+func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ContainerIDs: []string{"c1"},
+			Status:       backend.ProvisionStatusFailing,
+		},
+	})
+
+	actor := b.actorFor("lease-1")
+	require.Equal(t, backend.ProvisionStatusFailing, actor.sm.State())
+
+	// Queue a diagGatheredMsg, then fire shutdown. Whatever the inbox
+	// select picks next (msg or stopCtx.Done), drainOnShutdown must
+	// process the queued message before the actor exits.
+	ok := actor.sendTerminal(diagGatheredMsg{
+		result: diagResult{
+			containerID: "c1",
+			info:        &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1},
+			diag:        "synthetic diag",
+		},
+	})
+	require.True(t, ok, "sendTerminal must enqueue while the actor is alive")
+	b.stopCancel()
+
+	select {
+	case <-actor.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("actor did not exit after shutdown drain")
+	}
+
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	prov := b.provisions["lease-1"]
+	require.NotNil(t, prov)
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
+		"drained diagGatheredMsg must transition SM Failing→Failed")
+}
+
+// TestBackend_ShutdownDrainsAllActors stresses the drain-on-shutdown path
+// at backend scale: many leases in mixed SM states, all draining
+// concurrently on stopCtx. Asserts every actor exits and the registry is
+// empty — no leaked goroutines, no actors stuck in their select loops.
+func TestBackend_ShutdownDrainsAllActors(t *testing.T) {
+	const n = 20
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+	}
+
+	provs := make(map[string]*provision, n)
+	for i := 0; i < n; i++ {
+		leaseUUID := fmt.Sprintf("lease-%d", i)
+		// Alternate between Ready, Provisioning, Restarting, Updating
+		// to exercise different SM configurations through drain.
+		var status backend.ProvisionStatus
+		switch i % 4 {
+		case 0:
+			status = backend.ProvisionStatusReady
+		case 1:
+			status = backend.ProvisionStatusProvisioning
+		case 2:
+			status = backend.ProvisionStatusRestarting
+		default:
+			status = backend.ProvisionStatusUpdating
+		}
+		provs[leaseUUID] = &provision{
+			LeaseUUID:    leaseUUID,
+			Tenant:       "tenant-a",
+			Status:       status,
+			ContainerIDs: []string{fmt.Sprintf("c-%d", i)},
+		}
+	}
+
+	b := newBackendForTest(mock, provs)
+
+	// Warm up every actor so they're all running goroutines when
+	// shutdown fires.
+	for uuid := range provs {
+		b.actorFor(uuid)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.stopCancel()
+		b.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("backend did not drain and exit within 10s — actors likely stuck")
+	}
+
+	// Every actor's run loop deletes itself from b.actors on exit.
+	var remaining int
+	b.actors.Range(func(key, value any) bool {
+		remaining++
+		return true
+	})
+	assert.Equal(t, 0, remaining, "b.actors must be empty after full shutdown drain")
 }
 
 // TestHandleContainerDeath_ShutdownDoesNotHang guards the sync shim's

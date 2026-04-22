@@ -420,7 +420,23 @@ func (a *leaseActor) send(msg leaseMessage) bool {
 // exited (inbox no longer drained) or the bounded inbox is wedged; in
 // either case the drop is counted via leaseTerminalEventDroppedTotal at
 // the call site.
+//
+// The fast-path a.done check is required for correctness: once a.done
+// is closed AND the inbox has space, Go's select picks
+// non-deterministically between `a.inbox <- msg` and `<-a.done`. Without
+// the explicit pre-check, post-shutdown sendTerminal would succeed half
+// the time, queueing a message into an inbox nobody will drain — a
+// silent drop that returns true. The pre-check converts the common
+// "actor already exited" case to a definitive refusal. A narrow race
+// remains if a.done closes between the pre-check and the main select,
+// but that window is microseconds and the worst outcome is the same
+// silent-drop-returning-true this code previously always risked.
 func (a *leaseActor) sendTerminal(msg leaseMessage) bool {
+	select {
+	case <-a.done:
+		return false
+	default:
+	}
 	select {
 	case a.inbox <- msg:
 		return true
