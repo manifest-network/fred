@@ -249,8 +249,8 @@ type ProvisionStatus string
 
 // Provision status constants.
 const (
-	ProvisionStatusProvisioning   ProvisionStatus = "provisioning"
-	ProvisionStatusReady          ProvisionStatus = "ready"
+	ProvisionStatusProvisioning ProvisionStatus = "provisioning"
+	ProvisionStatusReady        ProvisionStatus = "ready"
 	// ProvisionStatusFailing marks the window between a container's death
 	// being detected and the terminal Failed callback being emitted. A
 	// Deprovision request arriving in this window transitions the lease

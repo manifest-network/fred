@@ -241,9 +241,9 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		var err error
 		var result provisionSuccessResult
 		if isStack {
-			callbackErr, err, result = b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
+			callbackErr, result, err = b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 		} else {
-			callbackErr, err, result = b.doProvision(provCtx, req, manifest, profiles, logger)
+			callbackErr, result, err = b.doProvision(provCtx, req, manifest, profiles, logger)
 		}
 		// On success, publish ContainerIDs to the provision struct *before*
 		// sending provisionCompletedMsg. The SM's Ready entry action rewrites
@@ -626,7 +626,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // For multi-unit leases, it creates multiple containers.
 // For multi-SKU leases, each container gets the appropriate resource profile.
 //
-// Returns (callbackErr, err, result). On success, result carries the
+// Returns (callbackErr, result, err). On success, result carries the
 // populated provisionSuccessResult for the SM's Ready entry action to
 // write into the provision struct. On failure, result is zero; the SM's
 // Failed entry action uses (callbackErr, err.Error()) to populate
@@ -637,7 +637,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // failure, release-store updates on success, and stale-diagnostic removal
 // on success. Provision struct mutations (Status, FailCount, LastError,
 // ContainerIDs, Manifest) are owned by the SM entry actions.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error, resultRet provisionSuccessResult) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, errRet error) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
@@ -886,9 +886,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 // using Docker Compose. Compose handles container creation, start ordering, and
 // network attachment atomically via a single Up call.
 //
-// See doProvision for the (callbackErr, err, result) return contract.
+// See doProvision for the (callbackErr, result, err) return contract.
 // Stack-specific result fields are stackManifest + serviceContainers.
-func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, errRet error, resultRet provisionSuccessResult) {
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error

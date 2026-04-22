@@ -110,9 +110,9 @@ func (updateRequestedMsg) doneChan() chan struct{} { return nil }
 // Restarting|Updating exit transition after the goroutine finishes. The
 // goroutine picks which to send based on (err == nil, final Status):
 //
-//   err == nil                → replaceCompletedMsg  → Ready (Success)
-//   err != nil, Status=Ready  → replaceRecoveredMsg  → Ready (Failed+suffix)
-//   err != nil, Status=Failed → replaceFailedMsg     → Failed (Failed)
+//	err == nil                → replaceCompletedMsg  → Ready (Success)
+//	err != nil, Status=Ready  → replaceRecoveredMsg  → Ready (Failed+suffix)
+//	err != nil, Status=Failed → replaceFailedMsg     → Failed (Failed)
 //
 // Both replaceRecoveredMsg and replaceFailedMsg carry the callbackErr
 // string that the SM entry action emits verbatim.
@@ -436,7 +436,7 @@ func (a *leaseActor) send(msg leaseMessage) bool {
 
 // hasExited reports whether the actor's run loop has returned (a.done
 // closed). Used by sendTerminal to make the "actor-already-exited" case
-// a definitive refusal rather than a select-randomised 50/50 between
+// a definitive refusal rather than a select-randomized 50/50 between
 // queueing into an inbox nobody will drain and the closed-done arm.
 func (a *leaseActor) hasExited() bool {
 	select {

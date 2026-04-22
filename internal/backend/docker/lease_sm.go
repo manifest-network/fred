@@ -123,7 +123,7 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	// Failing: transitional. The async diag goroutine is running. Either
 	// DiagGathered arrives (→ Failed, emit terminal callback) or a
 	// DeprovisionRequested preempts (→ Deprovisioning, no callback). On any
-	// exit the goroutine's context is cancelled — the structural cc62f3b
+	// exit the goroutine's context is canceled — the structural cc62f3b
 	// mechanism. Subsequent ContainerDied/DiagGathered events after we've
 	// moved past Failing are Ignore'd so the race between cancellation
 	// signal and an in-flight goroutine firing DiagGathered can't resurrect
@@ -145,7 +145,7 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		Ignore(evDiagGathered)
 
 	// Deprovisioning: work runs in actor.handleDeprovision after Fire returns.
-	// Ignore die events and any stale DiagGathered from a cancelled-too-late
+	// Ignore die events and any stale DiagGathered from a canceled-too-late
 	// async goroutine.
 	sm.Configure(backend.ProvisionStatusDeprovisioning).
 		Ignore(evContainerDied).
@@ -743,7 +743,7 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 // onEnterFailedFromDiag, which runs in the actor's goroutine after Fire
 // commits the Failing→Failed transition. This makes the goroutine a
 // cancellable worker — no provisionsMu acquisition means no ctx-to-lock
-// gap, and if the ctx is cancelled (Failing.OnExit on Deprovision
+// gap, and if the ctx is canceled (Failing.OnExit on Deprovision
 // preemption) the goroutine simply returns. The SM's
 // Deprovisioning.Ignore(evDiagGathered) catches the race where the
 // goroutine finishes and fires just as preemption happens.

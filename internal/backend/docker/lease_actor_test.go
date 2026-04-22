@@ -103,7 +103,7 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
 		},
-		// Mirror the production Docker client: block until ctx is cancelled
+		// Mirror the production Docker client: block until ctx is canceled
 		// or a signal (none here) fires. Cancellation unblocks the goroutine
 		// — that's what the Failing.OnExit path triggers.
 		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
