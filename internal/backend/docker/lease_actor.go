@@ -411,6 +411,19 @@ func (a *leaseActor) send(msg leaseMessage) bool {
 	}
 }
 
+// hasExited reports whether the actor's run loop has returned (a.done
+// closed). Used by sendTerminal to make the "actor-already-exited" case
+// a definitive refusal rather than a select-randomised 50/50 between
+// queueing into an inbox nobody will drain and the closed-done arm.
+func (a *leaseActor) hasExited() bool {
+	select {
+	case <-a.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // sendTerminal enqueues a terminal SM event from an in-flight work
 // goroutine. Bypasses the stopCtx refusal that send() applies because the
 // goroutine has already done its physical work (containers created,
@@ -421,21 +434,17 @@ func (a *leaseActor) send(msg leaseMessage) bool {
 // either case the drop is counted via leaseTerminalEventDroppedTotal at
 // the call site.
 //
-// The fast-path a.done check is required for correctness: once a.done
-// is closed AND the inbox has space, Go's select picks
-// non-deterministically between `a.inbox <- msg` and `<-a.done`. Without
-// the explicit pre-check, post-shutdown sendTerminal would succeed half
-// the time, queueing a message into an inbox nobody will drain — a
-// silent drop that returns true. The pre-check converts the common
-// "actor already exited" case to a definitive refusal. A narrow race
-// remains if a.done closes between the pre-check and the main select,
-// but that window is microseconds and the worst outcome is the same
-// silent-drop-returning-true this code previously always risked.
+// The hasExited fast-path is required for correctness: once a.done is
+// closed AND the inbox has space, Go's select picks non-deterministically
+// between `a.inbox <- msg` and `<-a.done`. Without the pre-check,
+// post-shutdown sendTerminal would succeed half the time, queueing into
+// an inbox nobody will drain — a silent drop returning true. A narrow
+// race remains if a.done closes *between* hasExited and the select, but
+// that window is microseconds, and within that window the message is
+// still caught by drainOnShutdown's final inbox pass.
 func (a *leaseActor) sendTerminal(msg leaseMessage) bool {
-	select {
-	case <-a.done:
+	if a.hasExited() {
 		return false
-	default:
 	}
 	select {
 	case a.inbox <- msg:
