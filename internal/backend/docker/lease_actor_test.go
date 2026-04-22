@@ -66,10 +66,10 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 }
 
 // TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback pins the
-// cc62f3b invariant structurally: when a container-death event and a
-// Deprovision call race on the same lease, exactly ONE terminal callback
-// fires (Deprovisioned), never a stale Failed that Fred already knows is
-// being torn down.
+// stale-Failed-callback invariant structurally: when a container-death
+// event and a Deprovision call race on the same lease, exactly ONE
+// terminal callback fires (Deprovisioned), never a stale Failed that
+// Fred already knows is being torn down.
 //
 // Mechanism: handleContainerDeath transitions the SM to Failing and
 // spawns an async diag goroutine. When Deprovision arrives, the
@@ -219,11 +219,11 @@ func TestDebugActors(t *testing.T) {
 	require.Len(t, snaps, 2)
 }
 
-// TestLeaseActor_EagerSMInit pins the fix for the DebugActors data race:
-// the SM must be constructed inside newLeaseActor, not lazily on first
-// handler invocation. Lazy init raced with DebugActors readers under
-// -race; the eager init makes the pointer publication synchronous with
-// the actor's exposure via b.actors.
+// TestLeaseActor_EagerSMInit pins the eager-SM-init invariant needed by
+// DebugActors: the SM must be constructed inside newLeaseActor, not
+// lazily on first handler invocation. Lazy init would race with
+// DebugActors readers under -race; eager init makes the pointer
+// publication synchronous with the actor's exposure via b.actors.
 func TestLeaseActor_EagerSMInit(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
@@ -237,13 +237,13 @@ func TestLeaseActor_EagerSMInit(t *testing.T) {
 		"sm initial state mirrors the provision's current Status at actor creation")
 }
 
-// TestLeaseActor_RegistryClearedAfterDeprovision pins the fix for the
-// actor-registry leak and its downstream UUID-reuse wedge: once
-// Deprovision removes the provision entry, the actor exits and removes
-// itself from b.actors. Without this, every deprovisioned lease would
-// leak a goroutine plus an SM stuck in Deprovisioning, and any
-// subsequent Provision with the same UUID would be silently Ignored by
-// that stale SM.
+// TestLeaseActor_RegistryClearedAfterDeprovision pins the
+// registry-cleanup and UUID-reuse invariants: once Deprovision removes
+// the provision entry, the actor exits and removes itself from
+// b.actors. Without this, every deprovisioned lease would leak a
+// goroutine plus an SM stuck in Deprovisioning, and any subsequent
+// Provision with the same UUID would be silently Ignored by that
+// stale SM.
 func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
@@ -286,10 +286,10 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 
 // TestLeaseActor_StatusMatchesSMState is the cross-cutting consistency
 // test for the "prov.Status == actor.sm.State()" contract. prov.Status
-// is set in multiple places (sync-phase of Provision/Restart/Update,
-// SM entry actions, recoverState's Failing→Failed normalization), and
-// we want drift between the two to fail loudly rather than produce
-// subtle bugs later.
+// is set in multiple places (the synchronous section of
+// Provision/Restart/Update, SM entry actions, recoverState's
+// Failing→Failed normalization), and we want drift between the two to
+// fail loudly rather than produce subtle bugs later.
 //
 // Walks a lease through a realistic lifecycle and asserts the contract
 // at every observable point: initial Provisioning, successful → Ready,
@@ -356,9 +356,9 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
 	req.CallbackURL = callbackServer.URL
 
-	// (1) Provision: sync phase writes Status=Provisioning and creates
-	// the actor; the actor's SM starts in Provisioning reading that
-	// very Status. Contract: match.
+	// (1) Provision: the synchronous section writes Status=Provisioning
+	// and creates the actor; the actor's SM starts in Provisioning
+	// reading that very Status. Contract: match.
 	require.NoError(t, b.Provision(context.Background(), req))
 
 	// Wait for success callback.
@@ -483,12 +483,13 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 	}
 }
 
-// TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural fix
-// for bug_004: when stopCtx fires with an in-flight work goroutine, the
-// actor must (1) wait for the goroutine to complete (via workersWg),
-// (2) drain the inbox so the terminal SM event is processed via handle(),
-// and only then exit. The pre-fix behavior dropped the event at the
-// send-check because the actor had already exited on stopCtx.
+// TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural
+// invariant for terminal-event delivery during shutdown: when stopCtx
+// fires with an in-flight work goroutine, the actor must (1) wait for
+// the goroutine to complete (via workersWg), (2) drain the inbox so the
+// terminal SM event is processed via handle(), and only then exit.
+// Without the drain, the event would be dropped at the send-check
+// because the actor had already exited on stopCtx.
 func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, map[string]*provision{
@@ -744,12 +745,12 @@ func TestLeaseActor_RegistryDeletedBeforeDoneClose(t *testing.T) {
 		"fresh actorFor after Deprovision+done must not return the exiting actor — Delete must fire before close(done)")
 }
 
-// TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine mirrors the
-// Provision variant of the bug_012 test for the Restart flow: when
-// Deprovision preempts an in-flight restart, Restarting.OnExit must
-// cancel the work goroutine and wait on workDone before doDeprovision
-// reads ContainerIDs. Guards against future refactors that move the
-// replace spawn sites without plumbing the done channel.
+// TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine pins the
+// orphan-containers invariant for the Restart flow: when Deprovision
+// preempts an in-flight restart, Restarting.OnExit must cancel the
+// work goroutine and wait on workDone before doDeprovision reads
+// ContainerIDs. Guards against future refactors that move the replace
+// spawn sites without plumbing the done channel.
 //
 // The Update flow uses the exact same SM transition and OnExit handler,
 // so this single test covers both — the behaviour is identical.

@@ -205,11 +205,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	}
 	b.provisionsMu.Unlock()
 
-	// Async phase: hand off to the lease actor. The actor fires the SM
-	// transition, acks accept/reject, and spawns the worker goroutine
-	// internally (tracked by its workersWg) so orphan-worker races are
-	// impossible by construction — the actor cannot exit until the worker
-	// has delivered its terminal SM event.
+	// Hand off to the lease actor. The actor fires the SM transition,
+	// acks accept/reject, and spawns the worker goroutine internally
+	// (tracked by its workersWg) so orphan-worker races are impossible
+	// by construction — the actor cannot exit until the worker has
+	// delivered its terminal SM event.
 	provCtx, provCancel := b.shutdownAwareContext()
 	work := func() (string, provisionSuccessResult, map[string]string, error) {
 		if isStack {
@@ -621,7 +621,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 			// Capture logs from the failed containers BEFORE removal —
 			// once RemoveContainer runs, Docker returns "no such container"
-			// and the diagnostic logs are gone (Copilot PR-80 #2).
+			// and the diagnostic logs are gone.
 			logsRet = b.captureContainerLogs(containerIDs, nil)
 
 			// Clean up any containers that were created.

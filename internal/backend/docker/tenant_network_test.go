@@ -157,17 +157,17 @@ func TestTenantNetwork_DifferentTenantsRunInParallel(t *testing.T) {
 		"different tenants should run in parallel; got max_in_flight=%d", maxInFlight.Load())
 }
 
-// TestTenantNetwork_RaceScenario reproduces the exact production race:
-// lease A deprovisions while lease B provisions on the same tenant.
-// Before the fix, B's network could be removed by A between Ensure and
-// ContainerCreate. After the fix, A observes B's entry in b.provisions
-// and skips removal.
+// TestTenantNetwork_RaceScenario pins the tenant-network removal
+// invariant: when lease A deprovisions while lease B provisions on
+// the same tenant, A must observe B's entry in b.provisions and skip
+// network removal, so B's ContainerCreate doesn't fail on a missing
+// network between Ensure and Create.
 func TestTenantNetwork_RaceScenario(t *testing.T) {
 	var removeCalled atomic.Bool
 	mock := &mockDockerClient{
 		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			// Simulate the window between Ensure and ContainerCreate
-			// during which the race used to fire.
+			// Widen the window between Ensure and ContainerCreate so
+			// a concurrent Deprovision can race through the removal path.
 			time.Sleep(5 * time.Millisecond)
 			return "net-id", nil
 		},

@@ -1559,9 +1559,9 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 }
 
 // TestDeprovision_VolumeExhaustionSendsFailedCallback verifies that the
-// max-attempts-exhausted volume cleanup path fires a failed callback with a
-// hardcoded message. Pre-existing gap: that path used to send nothing, leaving
-// Fred unaware the lease had become terminal.
+// max-attempts-exhausted volume cleanup path fires a failed callback with
+// a hardcoded message — without it, Fred would be unaware that the lease
+// had become terminal.
 func TestDeprovision_VolumeExhaustionSendsFailedCallback(t *testing.T) {
 	var received backend.CallbackPayload
 	callbackDone := make(chan struct{}, 1)
@@ -3687,11 +3687,11 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 // defer removes them. The persisted diagnostic entry should contain
 // the captured logs.
 //
-// Pre-refactor, the SM's onEnterFailedFromProvision called
-// persistDiagnostics which tried to re-fetch from prov.ContainerIDs —
-// but that field was empty (pre-publish only on success) and the
-// containers were gone anyway, so the persisted entry had no Logs.
-// The fix threads pre-captured logs through provisionErrorInfo.
+// Without the pre-capture, onEnterFailedFromProvision would try to
+// re-fetch logs from prov.ContainerIDs — but that field is empty on
+// the failure path (pre-publish only happens on success) and the
+// containers are gone anyway. Pre-captured logs are threaded through
+// provisionErrorInfo so the diagnostic entry actually contains them.
 func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "diag_logs.db")
 	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})
@@ -4993,12 +4993,13 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 }
 
-// TestProvision_DeprovisionWaitsForInFlightGoroutine pins the fix for
-// bug_012: when Deprovision preempts an in-flight doProvision,
-// Provisioning.OnExit must (1) cancel the goroutine's context and
-// (2) wait for the goroutine to exit before doDeprovision reads
-// ContainerIDs. Without this, the goroutine's successful creations
-// stay on the host even though the provision struct reports none.
+// TestProvision_DeprovisionWaitsForInFlightGoroutine pins the
+// orphan-containers invariant: when Deprovision preempts an in-flight
+// doProvision, Provisioning.OnExit must (1) cancel the goroutine's
+// context and (2) wait for the goroutine to exit before doDeprovision
+// reads ContainerIDs. Without this, the goroutine's successful
+// creations stay on the host even though the provision struct reports
+// none.
 //
 // Unit-tests the wait mechanism directly: installs synthetic
 // workCancel + workDone on the actor, fires Deprovision,

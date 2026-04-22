@@ -148,7 +148,8 @@ var (
 	// leaseSMTransitionsTotal counts SM transitions by (from, to, event).
 	// Spikes on specific paths surface unexpected flows — e.g., a rise in
 	// (Failing, Deprovisioning, DeprovisionRequested) indicates frequent
-	// cc62f3b-class preemption, which is interesting for load analysis.
+	// Deprovision-preempts-Failing preemption, which is interesting for
+	// load analysis.
 	leaseSMTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,

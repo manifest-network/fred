@@ -239,14 +239,14 @@ func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
 	b.provisionsMu.RUnlock()
 }
 
-// The cc62f3b regression case is now covered structurally by
+// The stale-Failed-callback regression case is covered structurally by
 // TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback in
 // lease_actor_test.go. That test exercises a real Deprovision call racing
 // a container death; the SM's Failing.OnExit cancellation makes a stale
-// Failed callback impossible by construction. The earlier simulated-race
-// test (which mutated provision.Status directly to fake a Deprovision) is
-// obsolete: the SM is now authoritative, so a direct status mutation no
-// longer triggers the suppression mechanism.
+// Failed callback impossible by construction. Simulated-race tests that
+// mutated provision.Status directly to fake a Deprovision are obsolete:
+// the SM is authoritative, so a direct status mutation no longer
+// triggers the suppression mechanism.
 
 func TestFindLeaseByContainerID(t *testing.T) {
 	b := newBackendForTest(nil, map[string]*provision{

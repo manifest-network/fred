@@ -189,9 +189,9 @@ type leaseActor struct {
 	// field concurrently.
 	pendingDeathInfo *ContainerInfo
 	// diagCancel is set when entering Failing (spawning the async diag
-	// goroutine) and called by Failing.OnExit to signal cancellation. The
-	// cc62f3b structural mechanism: any transition out of Failing cancels
-	// the goroutine before any stale Failed callback can be emitted.
+	// goroutine) and called by Failing.OnExit to signal cancellation. Any
+	// transition out of Failing cancels the goroutine before a stale Failed
+	// callback can be emitted.
 	diagCancel context.CancelFunc
 	// workCancel is set when a Provision/Restart/Update worker is spawned
 	// from handleProvisionRequested / handleRestartRequested /
@@ -415,7 +415,8 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 		callbackErr, result, failureLogs, err := work()
 		if err == nil {
 			// Pre-publish so a concurrent Deprovision-preempt reading
-			// prov.ContainerIDs sees the new IDs (bug_012).
+			// prov.ContainerIDs sees the new IDs and can tear them down
+			// rather than leaving orphans.
 			a.backend.provisionsMu.Lock()
 			if p, ok := a.backend.provisions[a.leaseUUID]; ok {
 				p.ContainerIDs = result.containerIDs
@@ -534,9 +535,9 @@ func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
 // send enqueues a message. Blocks when the inbox is full (backpressure).
 // Returns false if the backend is shutting down OR the actor has exited.
 //
-// Test-only since Phase 1: production code uses b.routeToLease(uuid, msg)
-// which never exposes an actor pointer to the caller. This method is
-// retained for test code that needs synthetic direct-send scenarios.
+// Test-only: production code uses b.routeToLease(uuid, msg) which never
+// exposes an actor pointer to the caller. This method is retained for
+// test code that needs synthetic direct-send scenarios.
 //
 // For TERMINAL events delivered by in-flight work goroutines — whose
 // physical work has already happened on the host and MUST be recorded

@@ -14,8 +14,8 @@ import (
 // Deprovision is the public shim: it routes the request through the lease's
 // actor so that container-death and deprovision messages serialize per lease.
 // Routing forces a Ready/Failing/Failed → Deprovisioning SM transition whose
-// Failing.OnExit cancels the in-flight diag goroutine — the cc62f3b
-// structural suppression of stale Failed callbacks.
+// Failing.OnExit cancels the in-flight diag goroutine — the structural
+// suppression of stale Failed callbacks.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	reply := make(chan error, 1)
 	if err := b.routeToLeaseBlocking(ctx, leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}); err != nil {

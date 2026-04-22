@@ -111,7 +111,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		}
 	}
 
-	// Async phase: hand off to the lease actor. Actor fires the Restarting
+	// Hand off to the lease actor. Actor fires the Restarting
 	// transition, acks, and spawns the replace worker (tracked by
 	// workersWg). See handleRestartRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
@@ -270,10 +270,10 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 			}
 
 			// Capture logs from the FAILED new containers BEFORE the
-			// rollback tears them down (Copilot PR-80 #1). Without this,
-			// the persisted diagnostic entry would record empty logs
-			// because the containers are gone by the time the SM entry
-			// action runs persistDiagnostics.
+			// rollback tears them down. Without this, the persisted
+			// diagnostic entry would record empty logs because the
+			// containers are gone by the time the SM entry action runs
+			// persistDiagnostics.
 			failureLogs := b.captureContainerLogs(newContainerIDs, stackContainerLogKeys(newServiceContainers))
 
 			// Rollback: rebuild the Project from the previous StackManifest and
@@ -581,9 +581,8 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			}
 
 			// Capture logs from the failed new containers BEFORE the
-			// cleanup loop removes them (Copilot PR-80 #1). Index-based
-			// keys (nil keys map → "0", "1", ...) for the single-
-			// manifest case.
+			// cleanup loop removes them. Index-based keys (nil keys
+			// map → "0", "1", ...) for the single-manifest case.
 			failureLogs := b.captureContainerLogs(newContainerIDs, nil)
 
 			// Clean up failed new containers.
@@ -865,7 +864,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			}
 		}
 
-		// Async phase: hand off to the actor. See handleUpdateRequested /
+		// Hand off to the actor. See handleUpdateRequested /
 		// spawnReplaceWorker.
 		opCtx, opCancel := b.shutdownAwareContext()
 		work := func() replaceResult {
@@ -933,7 +932,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		}
 	}
 
-	// Async phase: hand off to the actor. See handleUpdateRequested /
+	// Hand off to the actor. See handleUpdateRequested /
 	// spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() replaceResult {

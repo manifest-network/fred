@@ -123,21 +123,20 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	// Failing: transitional. The async diag goroutine is running. Either
 	// DiagGathered arrives (→ Failed, emit terminal callback) or a
 	// DeprovisionRequested preempts (→ Deprovisioning, no callback). On any
-	// exit the goroutine's context is canceled — the structural cc62f3b
-	// mechanism. Subsequent ContainerDied/DiagGathered events after we've
-	// moved past Failing are Ignore'd so the race between cancellation
-	// signal and an in-flight goroutine firing DiagGathered can't resurrect
-	// a stale Failed callback.
+	// exit the goroutine's context is canceled — this is the structural
+	// suppression that prevents a stale Failed callback from being emitted
+	// after the lease has moved on. Subsequent ContainerDied/DiagGathered
+	// events after we've moved past Failing are Ignore'd so the race between
+	// cancellation signal and an in-flight goroutine firing DiagGathered
+	// can't resurrect a stale Failed callback.
 	sm.Configure(backend.ProvisionStatusFailing).
 		OnEntryFrom(evContainerDied, lsm.onEnterFailing).
 		OnExit(lsm.onExitFailing).
 		Permit(evDiagGathered, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
-		// Accept retry events from Failing the same way Failed does.
-		// recoverState normalizes Failing→Failed on recovery, but if the
-		// runtime reconcile path normalizes while an actor's SM is still
-		// in Failing (e.g., a wedged diag goroutine never fires
-		// DiagGathered), a subsequent Provision retry would hit an
+		// Accept retry events from Failing the same way Failed does. If a
+		// diag goroutine is wedged and never fires DiagGathered, a
+		// subsequent Provision/Restart/Update retry would otherwise hit an
 		// unhandled trigger. Allowing the retry from Failing removes the
 		// wedge; Failing.OnExit cancels the stale diag goroutine on the
 		// way out via diagCancel + waitForWorkers.
@@ -166,7 +165,7 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	// (→ Ready, emit Success), ProvisionErrored (→ Failed, emit Failed), or
 	// DeprovisionRequested (→ Deprovisioning, OnExit cancels goroutine — the
 	// structural suppression for Provision+Deprovision races, analogous to
-	// Failing's mechanism).
+	// Failing's cancel-on-exit mechanism).
 	sm.Configure(backend.ProvisionStatusProvisioning).
 		Permit(evProvisionCompleted, backend.ProvisionStatusReady).
 		Permit(evProvisionErrored, backend.ProvisionStatusFailed).
@@ -187,8 +186,8 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied).
-		// Ignore evRestartRequested: Backend.Restart's sync phase sets
-		// prov.Status to Restarting BEFORE the msg reaches the actor,
+		// Ignore evRestartRequested: Backend.Restart's synchronous section
+		// sets prov.Status to Restarting BEFORE the msg reaches the actor,
 		// so newLeaseSM initializes the SM in Restarting. The event
 		// arrives to a state already matching the target — treat as a
 		// no-op rather than an unhandled trigger error. Same pattern
@@ -298,7 +297,8 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 
 // onEnterFailing runs as the Ready→Failing entry action. Flips provision
 // fields under lock and spawns the async diag goroutine whose context
-// cancellation is the cc62f3b suppression mechanism.
+// cancellation is the structural suppression mechanism for stale
+// Failed callbacks.
 func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterFailing: missing containerID")
@@ -313,10 +313,10 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 
 	// No Status recheck: the SM's guard already verified Ready, and between
 	// the guard and this entry action no other path can flip Status off
-	// Ready — every writer now routes through the SM, and recoverState's
-	// Phase 2.5 changes preserve existing.Status for Ready leases. Only
-	// the existence check survives (the entry could be gone if Deprovision
-	// had completed in a prior ordering).
+	// Ready — every writer routes through the SM, and recoverState
+	// preserves existing.Status for Ready leases. Only the existence
+	// check survives (the entry could be gone if Deprovision had
+	// completed in a prior ordering).
 	b.provisionsMu.Lock()
 	currentProv, exists := b.provisions[leaseUUID]
 	if !exists {
@@ -359,11 +359,11 @@ const diagnosticsGatherTimeout = 30 * time.Second
 
 // onExitFailing cancels the in-flight diag goroutine whenever we leave
 // Failing — whether by DiagGathered (normal) or DeprovisionRequested
-// (preemption) — then waits via workersWg. Three-layer cc62f3b
-// suppression: cancel signal (happy path), workersWg.Wait (prevents
-// post-OnExit race where the goroutine is mid-sendTerminal), and the
-// Ignore declarations on Failed/Deprovisioning (backstop for trigger
-// reordering). Bounded by workExitWaitTimeout via waitForWorkers.
+// (preemption) — then waits via workersWg. Three-layer suppression of
+// stale Failed callbacks: cancel signal (happy path), workersWg.Wait
+// (prevents post-OnExit race where the goroutine is mid-sendTerminal),
+// and the Ignore declarations on Failed/Deprovisioning (backstop for
+// trigger reordering). Bounded by workExitWaitTimeout via waitForWorkers.
 func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 	if lsm.actor.diagCancel != nil {
 		lsm.actor.diagCancel()
@@ -375,7 +375,7 @@ func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 
 // onExitProvisioning is the analog for Provision/Restart/Update. Same
 // structural invariant as onExitFailing: cancel then wait via workersWg.
-// Closes the orphan-containers race (bug_012) — the goroutine's
+// Closes the orphan-containers race — the goroutine's
 // pre-publish-then-sendTerminal sequence is observable to the preempting
 // doDeprovision, and the wait prevents an orphan container set from being
 // stranded when the handler is still in flight.
@@ -507,7 +507,8 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 
 	if diagSnap.LeaseUUID != "" {
 		// Use logs captured by doReplace*'s defer BEFORE rollback tore
-		// the failed containers down (Copilot PR-80 #1).
+		// the failed containers down — post-cleanup log fetches would
+		// hit already-deleted containers and record an empty entry.
 		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
 	}
 
@@ -547,7 +548,8 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 
 	if diagSnap.LeaseUUID != "" {
 		// Use logs captured by doReplace*'s defer BEFORE rollback tore
-		// the failed containers down (Copilot PR-80 #1).
+		// the failed containers down — post-cleanup log fetches would
+		// hit already-deleted containers and record an empty entry.
 		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
 	}
 
@@ -587,8 +589,7 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 		// Use the logs captured by doProvision's cleanup defer (before the
 		// failed containers were removed). If the worker didn't capture
 		// any (e.g., failure before any containers were created), the
-		// entry is persisted without logs — same as the pre-refactor
-		// behavior for that case.
+		// entry is persisted without logs.
 		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
 	}
 

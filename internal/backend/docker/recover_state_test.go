@@ -1306,11 +1306,12 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	assert.Contains(t, prov.LastError, secret)
 }
 
-// The recoverState-side cc62f3b simulation is obsolete: recoverState now
-// hands Ready→Failed transitions off to the lease's actor via containerDiedMsg,
-// and the SM's Failing.OnExit cancellation is the structural suppression of
-// stale Failed callbacks on Deprovision preemption. The real-Deprovision
-// test TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback
+// Simulated-race tests on the recoverState path are obsolete: recoverState
+// hands Ready→Failed transitions off to the lease's actor via
+// containerDiedMsg, and the SM's Failing.OnExit cancellation is the
+// structural suppression of stale Failed callbacks on Deprovision
+// preemption. The real-Deprovision test
+// TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback
 // (lease_actor_test.go) covers the invariant end-to-end.
 
 func TestRecoverState_InFlightReProvisionPreservesFailCount(t *testing.T) {

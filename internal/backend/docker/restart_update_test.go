@@ -60,7 +60,7 @@ func TestRestart_AllowedFromFailed(t *testing.T) {
 		},
 	}
 
-	// Block the async phase so we can observe the Restarting state.
+	// Block the replace worker so we can observe the Restarting state.
 	stopStarted := make(chan struct{})
 	stopRelease := make(chan struct{})
 	mock := &mockDockerClient{
@@ -162,7 +162,7 @@ func TestRestart_SetsRestartingStatus(t *testing.T) {
 		},
 	}
 
-	// Block the async phase so we can observe the Restarting state.
+	// Block the replace worker so we can observe the Restarting state.
 	stopStarted := make(chan struct{})
 	stopRelease := make(chan struct{})
 	mock := &mockDockerClient{
@@ -1724,8 +1724,8 @@ func TestConcurrentRestartAndUpdate_OnlyOneSucceeds(t *testing.T) {
 		},
 	}
 
-	// Block StopContainer so the first caller holds the async phase long enough
-	// for the second to attempt its call.
+	// Block StopContainer so the first caller holds the replace worker long
+	// enough for the second to attempt its call.
 	stopStarted := make(chan struct{}, 2)
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
