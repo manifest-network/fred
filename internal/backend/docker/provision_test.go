@@ -3681,6 +3681,89 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 }
 
+// TestProvision_FailurePersistsContainerLogs pins the log-capture
+// invariant: when doProvision fails AFTER creating containers, the
+// worker must fetch logs from those containers BEFORE the cleanup
+// defer removes them. The persisted diagnostic entry should contain
+// the captured logs.
+//
+// Pre-refactor, the SM's onEnterFailedFromProvision called
+// persistDiagnostics which tried to re-fetch from prov.ContainerIDs —
+// but that field was empty (pre-publish only on success) and the
+// containers were gone anyway, so the persisted entry had no Logs.
+// The fix threads pre-captured logs through provisionErrorInfo.
+func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "diag_logs.db")
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer diagStore.Close()
+
+	var callbackReceived atomic.Bool
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackReceived.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	// Mock: PullImage/Create/Start succeed, Inspect returns exited so
+	// waitForHealthy treats the container as crashed. Cleanup removes
+	// the containers. The test's ContainerLogsFn must return the
+	// simulated output — captureContainerLogs calls it BEFORE cleanup.
+	logsFetched := 0
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return fmt.Sprintf("container-%d", params.InstanceIndex), nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			logsFetched++
+			return "boot error on " + containerID, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.diagnosticsStore = diagStore
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-logs",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      validManifestJSON("nginx:latest"),
+	}
+
+	require.NoError(t, b.Provision(context.Background(), req))
+	require.Eventually(t, callbackReceived.Load, 5*time.Second, 50*time.Millisecond)
+
+	// Logs must have been fetched BEFORE cleanup — at least one call
+	// per failed container via captureContainerLogs (verifyStartup may
+	// add one extra for the LastError diagnostic string).
+	assert.GreaterOrEqual(t, logsFetched, 2, "captureContainerLogs must fetch logs from the failed containers")
+
+	entry, err := diagStore.Get("lease-logs")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	require.NotEmpty(t, entry.Logs, "persisted diagnostic must contain the pre-captured logs")
+	// Index-based keys for single-manifest provisions.
+	assert.Contains(t, entry.Logs["0"], "boot error on container-0")
+	assert.Contains(t, entry.Logs["1"], "boot error on container-1")
+}
+
 func TestGetLogs_FallsBackToDiagnosticsStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "diag_logs.db")
 	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{DBPath: dbPath})

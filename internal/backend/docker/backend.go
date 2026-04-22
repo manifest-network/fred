@@ -230,6 +230,14 @@ func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
 // returns "no such container" and the logs are lost. Optional
 // containerKeys map overrides the default index-based log key (e.g.,
 // "web/0" for stack services).
+//
+// Uses context.Background() with a 30s timeout rather than deriving
+// from stopCtx, so log capture still succeeds during shutdown (the
+// whole point is diagnostic durability). Consequence: shutdown can be
+// delayed up to 30s per worker in the pathological case of a wedged
+// Docker log endpoint. This fits within the actor's workExitWaitTimeout
+// (45s) so actors still exit cleanly, but operators should be aware
+// the budget exists.
 func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[string]string) map[string]string {
 	if len(containerIDs) == 0 {
 		return nil

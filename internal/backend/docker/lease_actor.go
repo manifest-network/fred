@@ -254,14 +254,16 @@ func (a *leaseActor) run() {
 	//      arrive have already landed in a.inbox.
 	//   2. removeFromRegistry runs SECOND — concurrent routeToLease calls
 	//      immediately create a fresh actor under actorsMu.
-	//   3. close(a.done) runs THIRD — hasExited becomes true; any
-	//      sendTerminal that raced past a waitForWorkers timeout refuses
-	//      deterministically (normal operation never reaches this).
-	//   4. drainInbox runs LAST — processes every message in the inbox via
+	//   3. drainInbox runs THIRD — processes every message in the inbox via
 	//      handle(), so terminal events from workers actually drive their
 	//      SM transitions before the actor is gone.
-	defer a.drainInbox()
+	//   4. close(a.done) runs LAST — makes actor.done a clean "fully
+	//      quiesced" signal. Any waiter on a.done is guaranteed every
+	//      queued message has been handled and every SM transition
+	//      committed. hasExited becomes true here too; any stale
+	//      sendTerminal after this point refuses deterministically.
 	defer close(a.done)
+	defer a.drainInbox()
 	defer a.removeFromRegistry()
 	defer a.waitForWorkers()
 	for {
@@ -666,7 +668,18 @@ func (b *Backend) routeToLease(leaseUUID string, msg leaseMessage) bool {
 // routeToLeaseRetryInterval while the inbox is full — a few ms of
 // latency is acceptable for API calls; the alternative is turning
 // backpressure into a 5xx.
+//
+// The up-front ctx / stopCtx check guarantees we don't enqueue a
+// message the caller is about to abandon: without it, the first
+// routeToLease could succeed and start async work while the caller
+// returns ctx.Err() having seen nothing.
 func (b *Backend) routeToLeaseBlocking(ctx context.Context, leaseUUID string, msg leaseMessage) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if b.stopCtx.Err() != nil {
+		return fmt.Errorf("backend shutting down")
+	}
 	for {
 		if b.routeToLease(leaseUUID, msg) {
 			return nil

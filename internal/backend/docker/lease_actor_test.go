@@ -461,6 +461,66 @@ func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
 	}
 }
 
+// TestRouteToLeaseBlocking_RetriesOnFullInbox pins the
+// backpressure-retry contract: when the target actor's inbox is full,
+// routeToLeaseBlocking polls at routeToLeaseRetryInterval and succeeds
+// once space appears. Replaces the old "full inbox → spurious backend
+// shutting down error" behavior.
+func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	defer b.stopCancel()
+
+	// Install an actor directly with an unstarted run loop so its
+	// inbox doesn't drain. Fill to capacity.
+	actor := newLeaseActor(b, "lease-1")
+	b.actorsMu.Lock()
+	b.actors["lease-1"] = actor
+	b.actorsMu.Unlock()
+	for i := 0; i < leaseActorInboxSize; i++ {
+		require.True(t, b.routeToLease("lease-1", containerDiedMsg{containerID: "cN"}))
+	}
+
+	// routeToLeaseBlocking should not return false immediately — it
+	// must retry while inbox is full. Drain one slot after ~30ms so
+	// retry finds space and the call returns nil.
+	start := time.Now()
+	drained := make(chan struct{})
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		<-actor.inbox // free one slot
+		close(drained)
+	}()
+
+	err := b.routeToLeaseBlocking(context.Background(), "lease-1", containerDiedMsg{containerID: "c-retry"})
+	<-drained
+	require.NoError(t, err, "routeToLeaseBlocking must succeed once slot frees")
+	assert.GreaterOrEqual(t, time.Since(start), 30*time.Millisecond,
+		"should have waited for inbox space rather than returning immediately")
+}
+
+// TestRouteToLeaseBlocking_ReturnsCtxErr pins the ctx-cancel contract:
+// if the caller's ctx is cancelled (at entry or during retry),
+// routeToLeaseBlocking must return ctx.Err() without enqueueing.
+func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	defer b.stopCancel()
+
+	// Install a saturated actor.
+	actor := newLeaseActor(b, "lease-1")
+	b.actorsMu.Lock()
+	b.actors["lease-1"] = actor
+	b.actorsMu.Unlock()
+	for i := 0; i < leaseActorInboxSize; i++ {
+		require.True(t, b.routeToLease("lease-1", containerDiedMsg{}))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := b.routeToLeaseBlocking(ctx, "lease-1", containerDiedMsg{containerID: "c-timeout"})
+	assert.ErrorIs(t, err, context.DeadlineExceeded,
+		"routeToLeaseBlocking must surface ctx.Err() when caller's ctx expires while inbox is wedged")
+}
+
 // TestLeaseActor_ProvisionRequestedSMRejection pins the accept/reject
 // ack contract: when the actor's SM refuses to transition (e.g., the
 // provisionRequestedMsg arrives while the SM is in a state that doesn't
