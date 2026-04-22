@@ -409,6 +409,57 @@ func TestLeaseActor_SendTerminalRefusesAfterActorExit(t *testing.T) {
 	assert.False(t, ok, "sendTerminal must refuse once the actor has exited")
 }
 
+// TestLeaseActor_SendRefusesAfterActorExit mirrors the sendTerminal test
+// for the non-terminal send path. Before the defer-reorder fix, post-exit
+// send() could queue a message into an inbox nobody would drain because
+// the hasExited check didn't exist on this path.
+func TestLeaseActor_SendRefusesAfterActorExit(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+
+	actor := b.actorFor("lease-gone")
+	b.stopCancel()
+	<-actor.done
+
+	ok := actor.send(containerDiedMsg{containerID: "c1"})
+	assert.False(t, ok, "send must refuse once the actor has exited")
+}
+
+// TestLeaseActor_RegistryDeletedBeforeDoneClose guards the defer order in
+// run(): b.actors.Delete must fire BEFORE close(a.done) so that a
+// concurrent actorFor() call racing with the actor's termination creates
+// a fresh actor rather than reusing the exiting one. Without this order,
+// the window between "run returns" and "Delete executes" would let a
+// caller grab the stale actor, send into its inbox, and have the message
+// silently drained instead of handled — the orphan-containers scenario
+// flagged by remote review finding #1.
+func TestLeaseActor_RegistryDeletedBeforeDoneClose(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ContainerIDs: []string{"c1"},
+			Status:       backend.ProvisionStatusReady,
+		},
+	})
+	defer b.stopCancel()
+
+	first := b.actorFor("lease-1")
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	<-first.done
+
+	// By the time done is closed, Delete must have already run — so
+	// actorFor returns a fresh actor, not the exiting one.
+	second := b.actorFor("lease-1")
+	require.NotSame(t, first, second,
+		"fresh actorFor after Deprovision+done must not return the exiting actor — Delete must fire before close(done)")
+}
+
 // TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine mirrors the
 // Provision variant of the bug_012 test for the Restart flow: when
 // Deprovision preempts an in-flight restart, Restarting.OnExit must

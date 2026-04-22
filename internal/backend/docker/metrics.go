@@ -220,6 +220,19 @@ var (
 		Name:      "lease_terminal_event_dropped_total",
 		Help:      "Terminal SM events dropped because the actor inbox refused delivery during shutdown",
 	}, []string{"event"})
+
+	// dieEventDroppedTotal counts container-death signals whose actor.send
+	// was refused — either because the backend is shutting down, the actor
+	// has already exited (Delete race), or the inbox was wedged. The
+	// reconciler re-detects missed deaths within its cycle (default 5m), so
+	// these drops are not data loss; the counter gives operators a signal
+	// when the realtime event path is degraded.
+	dieEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "die_event_dropped_total",
+		Help:      "Container-death signals dropped at the actor inbox; reconciler re-detects on next cycle",
+	}, []string{"source"})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.

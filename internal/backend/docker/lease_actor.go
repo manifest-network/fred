@@ -209,12 +209,18 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 }
 
 func (a *leaseActor) run() {
-	// Always remove ourselves from the registry on exit so new Provision
-	// calls with this UUID create a fresh actor rather than reusing a
-	// shut-down one. Safe on any exit path (shutdown or terminated).
-	defer a.backend.actors.Delete(a.leaseUUID)
-	defer close(a.done)
+	// Defer ordering is deliberate (LIFO executes in reverse of declaration):
+	//   1. Delete runs FIRST — concurrent actorFor calls immediately start
+	//      creating a fresh actor instead of reusing this exiting one.
+	//   2. close(a.done) runs SECOND — from here on, send/sendTerminal see
+	//      hasExited==true and refuse deterministically via their pre-check.
+	//   3. drainInbox runs LAST — catches any message that raced into the
+	//      inbox between Delete and close(a.done). Content is dropped (we
+	//      can't handle it; run has returned), but doneChans are closed so
+	//      synchronous callers don't hang.
 	defer a.drainInbox()
+	defer close(a.done)
+	defer a.backend.actors.Delete(a.leaseUUID)
 	for {
 		if a.terminated {
 			return
@@ -410,7 +416,7 @@ func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
 }
 
 // send enqueues a message. Blocks when the inbox is full (backpressure).
-// Returns false if the backend is shutting down.
+// Returns false if the backend is shutting down OR the actor has exited.
 //
 // Use this for NEW work originating from external API paths (Provision,
 // Deprovision, Restart, Update, containerEventLoop). On shutdown these
@@ -419,15 +425,20 @@ func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
 // For TERMINAL events delivered by in-flight work goroutines — whose
 // physical work has already happened on the host and MUST be recorded by
 // the SM — use sendTerminal instead.
+//
+// The hasExited pre-check + a.done select arm give the same deterministic
+// refusal semantics as sendTerminal: if the actor has exited (run loop
+// returned, b.actors.Delete fired), subsequent sends through a
+// still-referenced actor pointer refuse rather than queue into an inbox
+// nobody will drain.
 func (a *leaseActor) send(msg leaseMessage) bool {
-	// If shutdown already happened, refuse before the select — otherwise
-	// Go's random choice between a ready stopCtx and a free inbox slot could
-	// still queue a message post-shutdown.
-	if a.backend.stopCtx.Err() != nil {
+	if a.backend.stopCtx.Err() != nil || a.hasExited() {
 		return false
 	}
 	select {
 	case <-a.backend.stopCtx.Done():
+		return false
+	case <-a.done:
 		return false
 	case a.inbox <- msg:
 		return true

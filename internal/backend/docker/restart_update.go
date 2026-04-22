@@ -103,6 +103,15 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 			p.CallbackURL = prevCallbackURL
 		}
 		b.provisionsMu.Unlock()
+		// Mark the just-Append'd release failed so it doesn't linger as
+		// "deploying" after shutdown. recoverState filters by
+		// LatestActive and wouldn't load it anyway, but we don't want
+		// the store to accumulate zombie records.
+		if b.releaseStore != nil {
+			if relErr := b.releaseStore.UpdateLatestStatus(req.LeaseUUID, "failed", "backend shutting down"); relErr != nil {
+				logger.Warn("failed to roll back release on send refusal", "error", relErr)
+			}
+		}
 		return fmt.Errorf("backend shutting down")
 	}
 	b.wg.Go(func() {
@@ -896,6 +905,11 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 				p.CallbackURL = prevCallbackURL
 			}
 			b.provisionsMu.Unlock()
+			if b.releaseStore != nil {
+				if relErr := b.releaseStore.UpdateLatestStatus(req.LeaseUUID, "failed", "backend shutting down"); relErr != nil {
+					logger.Warn("failed to roll back release on send refusal", "error", relErr)
+				}
+			}
 			return fmt.Errorf("backend shutting down")
 		}
 		b.wg.Go(func() {
@@ -957,6 +971,11 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			p.CallbackURL = prevCallbackURL
 		}
 		b.provisionsMu.Unlock()
+		if b.releaseStore != nil {
+			if relErr := b.releaseStore.UpdateLatestStatus(req.LeaseUUID, "failed", "backend shutting down"); relErr != nil {
+				logger.Warn("failed to roll back release on send refusal", "error", relErr)
+			}
+		}
 		return fmt.Errorf("backend shutting down")
 	}
 	b.wg.Go(func() {
