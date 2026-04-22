@@ -14,10 +14,12 @@ import (
 
 // restartRollback undoes the synchronous Status/CallbackURL mutation that
 // Restart/Update made before handing off to the actor, and marks the
-// just-Append'd release "failed" so it doesn't linger as "deploying" in
-// the store. Called from every send-refusal / ack-error / ctx-cancel
-// branch in the three replace-starting paths.
-func (b *Backend) restartRollback(leaseUUID string, prevStatus backend.ProvisionStatus, prevCallbackURL string, logger *slog.Logger) {
+// just-Append'd release "failed" with the supplied cause so the release
+// history records why the handoff did not complete. Called from every
+// send-refusal / ack-error / ctx-cancel branch in the three replace-
+// starting paths — the cause differentiates shutdown, caller ctx cancel,
+// and SM rejection.
+func (b *Backend) restartRollback(leaseUUID string, prevStatus backend.ProvisionStatus, prevCallbackURL string, cause error, logger *slog.Logger) {
 	b.provisionsMu.Lock()
 	if p, ok := b.provisions[leaseUUID]; ok {
 		p.Status = prevStatus
@@ -25,7 +27,11 @@ func (b *Backend) restartRollback(leaseUUID string, prevStatus backend.Provision
 	}
 	b.provisionsMu.Unlock()
 	if b.releaseStore != nil {
-		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", "backend shutting down"); relErr != nil {
+		msg := "rollback"
+		if cause != nil {
+			msg = cause.Error()
+		}
+		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", msg); relErr != nil {
 			logger.Warn("failed to roll back release on send refusal", "error", relErr)
 		}
 	}
@@ -116,26 +122,27 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		return b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
-	if !b.routeToLease(req.LeaseUUID, restartRequestedMsg{cancel: opCancel, work: work, ack: ack}) {
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, restartRequestedMsg{cancel: opCancel, work: work, ack: ack}); routeErr != nil {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
-		return fmt.Errorf("backend shutting down")
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
+		return routeErr
 	}
 	select {
 	case err := <-ack:
 		if err != nil {
 			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 			return err
 		}
 	case <-ctx.Done():
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, ctx.Err(), logger)
 		return ctx.Err()
 	case <-b.stopCtx.Done():
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
-		return fmt.Errorf("backend shutting down")
+		err := fmt.Errorf("backend shutting down")
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
+		return err
 	}
 	return nil
 }
@@ -262,6 +269,13 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 				}
 			}
 
+			// Capture logs from the FAILED new containers BEFORE the
+			// rollback tears them down (Copilot PR-80 #1). Without this,
+			// the persisted diagnostic entry would record empty logs
+			// because the containers are gone by the time the SM entry
+			// action runs persistDiagnostics.
+			failureLogs := b.captureContainerLogs(newContainerIDs, stackContainerLogKeys(newServiceContainers))
+
 			// Rollback: rebuild the Project from the previous StackManifest and
 			// Compose Up to restore the old containers.
 			restored := b.rollbackStackViaCompose(op)
@@ -285,7 +299,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 					oldStopped:  true,
 					callbackErr: callbackErr,
 					lastError:   err.Error(),
-					logKeys:     stackContainerLogKeys(newServiceContainers),
+					logs:        failureLogs,
 				},
 			}
 			return
@@ -514,17 +528,12 @@ type replaceContainersOp struct {
 	OnSuccess func(prov *provision)
 }
 
-// recordPreflightFailure handles errors that occur before any containers are modified
-// (e.g., profile lookup, image pull). It records LastError, persists diagnostics,
-// updates release status, and sends a failure callback with callbackMsg.
-// Because no containers were modified, the provision's status is restored to
-// prevStatus (the status before the operation began) so that the observable
-// state and activeProvisions gauge remain accurate.
-// recordPreflightFailure logs the preflight error and marks the release
-// as failed. Provision-state mutations (LastError, FailCount, Status,
-// persistDiagnostics) are handled by the SM entry action that fires
-// when the caller returns its replaceResult — see the preflight
-// branches of doRestart / doRestartStack / doUpdate / doUpdateStack.
+// recordPreflightFailure logs the preflight error (e.g., profile lookup,
+// image pull) and marks the latest release as failed. Provision-state
+// mutations (LastError, FailCount, Status, persistDiagnostics) are
+// handled by the SM entry action that fires when the caller returns its
+// replaceResult — see the preflight branches of doRestart / doRestartStack
+// / doUpdate / doUpdateStack.
 func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *slog.Logger) {
 	logger.Error("preflight failed", "error", err)
 
@@ -571,6 +580,12 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				}
 			}
 
+			// Capture logs from the failed new containers BEFORE the
+			// cleanup loop removes them (Copilot PR-80 #1). Index-based
+			// keys (nil keys map → "0", "1", ...) for the single-
+			// manifest case.
+			failureLogs := b.captureContainerLogs(newContainerIDs, nil)
+
 			// Clean up failed new containers.
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
@@ -599,6 +614,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 					oldStopped:  oldStopped,
 					callbackErr: callbackErr,
 					lastError:   err.Error(),
+					logs:        failureLogs,
 				},
 			}
 			return
@@ -856,26 +872,27 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			return b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
 		}
 		ack := make(chan error, 1)
-		if !b.routeToLease(req.LeaseUUID, updateRequestedMsg{cancel: opCancel, work: work, ack: ack}) {
+		if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, updateRequestedMsg{cancel: opCancel, work: work, ack: ack}); routeErr != nil {
 			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
-			return fmt.Errorf("backend shutting down")
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
+			return routeErr
 		}
 		select {
 		case err := <-ack:
 			if err != nil {
 				opCancel()
-				b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+				b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 				return err
 			}
 		case <-ctx.Done():
 			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, ctx.Err(), logger)
 			return ctx.Err()
 		case <-b.stopCtx.Done():
 			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
-			return fmt.Errorf("backend shutting down")
+			err := fmt.Errorf("backend shutting down")
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
+			return err
 		}
 		return nil
 	}
@@ -923,26 +940,27 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
-	if !b.routeToLease(req.LeaseUUID, updateRequestedMsg{cancel: opCancel, work: work, ack: ack}) {
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, updateRequestedMsg{cancel: opCancel, work: work, ack: ack}); routeErr != nil {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
-		return fmt.Errorf("backend shutting down")
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
+		return routeErr
 	}
 	select {
 	case err := <-ack:
 		if err != nil {
 			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 			return err
 		}
 	case <-ctx.Done():
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, ctx.Err(), logger)
 		return ctx.Err()
 	case <-b.stopCtx.Done():
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
-		return fmt.Errorf("backend shutting down")
+		err := fmt.Errorf("backend shutting down")
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
+		return err
 	}
 	return nil
 }

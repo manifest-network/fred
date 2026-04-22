@@ -99,9 +99,9 @@ func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionR
 		actor.sm = newLeaseSM(actor)
 	}
 	_ = actor.sm.Fire(ctx, evProvisionRequested)
-	callbackErr, result, err := b.doProvision(ctx, req, manifest, profiles, logger)
+	callbackErr, result, logs, err := b.doProvision(ctx, req, manifest, profiles, logger)
 	if err != nil {
-		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error()})
+		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error(), logs: logs})
 	} else {
 		_ = actor.sm.Fire(ctx, evProvisionCompleted, result)
 	}
@@ -114,9 +114,9 @@ func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.Provi
 		actor.sm = newLeaseSM(actor)
 	}
 	_ = actor.sm.Fire(ctx, evProvisionRequested)
-	callbackErr, result, err := b.doProvisionStack(ctx, req, stack, profiles, logger)
+	callbackErr, result, logs, err := b.doProvisionStack(ctx, req, stack, profiles, logger)
 	if err != nil {
-		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error()})
+		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error(), logs: logs})
 	} else {
 		_ = actor.sm.Fire(ctx, evProvisionCompleted, result)
 	}
@@ -511,6 +511,12 @@ func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
 			removedIDs = append(removedIDs, containerID)
 			return nil
 		},
+		// doProvision's failure defer now captures logs from the created
+		// containers BEFORE RemoveContainer tears them down, so the mock
+		// needs to answer ContainerLogs.
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
+		},
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
@@ -714,6 +720,10 @@ func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			removedIDs = append(removedIDs, containerID)
 			return nil
+		},
+		// doProvision's failure defer captures logs before cleanup.
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
 		},
 	}
 
@@ -1016,6 +1026,10 @@ func TestDoProvision_CleanupOnlyDestroysNewVolumes(t *testing.T) {
 		},
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
+		},
+		// doProvision's failure defer captures logs before cleanup.
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			return "", nil
 		},
 	}
 

@@ -211,21 +211,21 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// impossible by construction — the actor cannot exit until the worker
 	// has delivered its terminal SM event.
 	provCtx, provCancel := b.shutdownAwareContext()
-	work := func() (string, provisionSuccessResult, error) {
+	work := func() (string, provisionSuccessResult, map[string]string, error) {
 		if isStack {
 			return b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 		}
 		return b.doProvision(provCtx, req, manifest, profiles, logger)
 	}
 	ack := make(chan error, 1)
-	if !b.routeToLease(req.LeaseUUID, provisionRequestedMsg{
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, provisionRequestedMsg{
 		cancel: provCancel,
 		work:   work,
 		ack:    ack,
-	}) {
+	}); routeErr != nil {
 		provCancel()
 		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("backend shutting down")
+		return routeErr
 	}
 	// Wait for the actor to fire evProvisionRequested on its SM. If the
 	// SM rejects (shouldn't happen given the synchronous validation
@@ -601,7 +601,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // failure, release-store updates on success, and stale-diagnostic removal
 // on success. Provision struct mutations (Status, FailCount, LastError,
 // ContainerIDs, Manifest) are owned by the SM entry actions.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, errRet error) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
@@ -618,6 +618,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			for i := range totalQuantity {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}
+
+			// Capture logs from the failed containers BEFORE removal —
+			// once RemoveContainer runs, Docker returns "no such container"
+			// and the diagnostic logs are gone (Copilot PR-80 #2).
+			logsRet = b.captureContainerLogs(containerIDs, nil)
 
 			// Clean up any containers that were created.
 			// Use a fresh context since the original may be canceled.
@@ -850,9 +855,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 // using Docker Compose. Compose handles container creation, start ordering, and
 // network attachment atomically via a single Up call.
 //
-// See doProvision for the (callbackErr, result, err) return contract.
+// See doProvision for the (callbackErr, result, logs, err) return contract.
 // Stack-specific result fields are stackManifest + serviceContainers.
-func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, errRet error) {
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
@@ -873,6 +878,12 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
 				}
 			}
+
+			// Capture logs from the failed containers BEFORE removal —
+			// see doProvision's equivalent comment. For stacks we also
+			// pass the service-name map so the persisted keys are
+			// "web/0"-style rather than raw indices.
+			logsRet = b.captureContainerLogs(containerIDs, stackContainerLogKeys(serviceContainers))
 
 			// Clean up via Compose Down (removes all project containers).
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -18,8 +18,8 @@ import (
 // structural suppression of stale Failed callbacks.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	reply := make(chan error, 1)
-	if !b.routeToLease(leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}) {
-		return fmt.Errorf("backend shutting down")
+	if err := b.routeToLeaseBlocking(ctx, leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}); err != nil {
+		return err
 	}
 	select {
 	case err := <-reply:

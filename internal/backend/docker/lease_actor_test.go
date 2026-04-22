@@ -481,9 +481,9 @@ func TestLeaseActor_ProvisionRequestedSMRejection(t *testing.T) {
 	ack := make(chan error, 1)
 	ok := b.routeToLease("lease-1", provisionRequestedMsg{
 		cancel: func() {},
-		work: func() (string, provisionSuccessResult, error) {
+		work: func() (string, provisionSuccessResult, map[string]string, error) {
 			t.Fatal("work closure must not run when SM rejects the transition")
-			return "", provisionSuccessResult{}, nil
+			return "", provisionSuccessResult{}, nil, nil
 		},
 		ack: ack,
 	})

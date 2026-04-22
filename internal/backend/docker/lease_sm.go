@@ -478,7 +478,6 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	var snapContainerIDs []string
 	b.provisionsMu.Lock()
 	if p, ok := b.provisions[leaseUUID]; ok {
 		p.LastError = info.lastError
@@ -491,17 +490,14 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 			p.LastError = ""
 		}
 		diagSnap = diagnosticSnapshot(p)
-		snapContainerIDs = append([]string(nil), p.ContainerIDs...)
 		callbackURL = p.CallbackURL
 	}
 	b.provisionsMu.Unlock()
 
 	if diagSnap.LeaseUUID != "" {
-		if info.logKeys != nil {
-			b.persistDiagnostics(diagSnap, snapContainerIDs, info.logKeys)
-		} else {
-			b.persistDiagnostics(diagSnap, snapContainerIDs)
-		}
+		// Use logs captured by doReplace*'s defer BEFORE rollback tore
+		// the failed containers down (Copilot PR-80 #1).
+		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
 	}
 
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
@@ -525,7 +521,6 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	var snapContainerIDs []string
 	b.provisionsMu.Lock()
 	if p, ok := b.provisions[leaseUUID]; ok {
 		p.LastError = info.lastError
@@ -535,17 +530,14 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 			activeProvisions.Dec()
 		}
 		diagSnap = diagnosticSnapshot(p)
-		snapContainerIDs = append([]string(nil), p.ContainerIDs...)
 		callbackURL = p.CallbackURL
 	}
 	b.provisionsMu.Unlock()
 
 	if diagSnap.LeaseUUID != "" {
-		if info.logKeys != nil {
-			b.persistDiagnostics(diagSnap, snapContainerIDs, info.logKeys)
-		} else {
-			b.persistDiagnostics(diagSnap, snapContainerIDs)
-		}
+		// Use logs captured by doReplace*'s defer BEFORE rollback tore
+		// the failed containers down (Copilot PR-80 #1).
+		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
 	}
 
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
@@ -570,20 +562,23 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	var snapContainerIDs []string
 	b.provisionsMu.Lock()
 	if p, ok := b.provisions[leaseUUID]; ok {
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
 		diagSnap = diagnosticSnapshot(p)
-		snapContainerIDs = append([]string(nil), p.ContainerIDs...)
 		callbackURL = p.CallbackURL
 	}
 	b.provisionsMu.Unlock()
 
 	if diagSnap.LeaseUUID != "" {
-		b.persistDiagnostics(diagSnap, snapContainerIDs)
+		// Use the logs captured by doProvision's cleanup defer (before the
+		// failed containers were removed). If the worker didn't capture
+		// any (e.g., failure before any containers were created), the
+		// entry is persisted without logs — same as the pre-refactor
+		// behavior for that case.
+		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
 	}
 
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
@@ -671,10 +666,15 @@ type provisionSuccessResult struct {
 // provisionErrorInfo carries doProvision failure data into
 // Failed.OnEntryFrom(evProvisionErrored). callbackErr is the on-chain-safe
 // hardcoded message; lastError is the full diagnostic string stashed in
-// provision.LastError for authenticated API access.
+// provision.LastError for authenticated API access. logs is the
+// pre-captured log map (fetched by doProvision BEFORE its cleanup defer
+// removed the failed containers) — if nil, onEnterFailedFromProvision
+// falls back to attempting a post-hoc fetch, which will typically find
+// the containers gone and record an empty entry.
 type provisionErrorInfo struct {
 	callbackErr string
 	lastError   string
+	logs        map[string]string
 }
 
 // replaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
@@ -700,8 +700,12 @@ type replaceFailureInfo struct {
 	oldStopped  bool   // only meaningful on the recovery path (restart-with-oldStopped clears LastError)
 	callbackErr string
 	lastError   string
-	// logKeys is used for stack persistDiagnostics — empty for single-manifest.
-	logKeys map[string]string
+	// logs is the pre-captured container-log map from the NEW (failed)
+	// containers. Populated by doReplace*'s defer BEFORE rollback tears
+	// those containers down — persistDiagnostics would otherwise find
+	// them gone and record an empty entry. For stacks, keys are
+	// "serviceName/instanceIndex"; for single-container, raw indices.
+	logs map[string]string
 }
 
 // replaceResult is doReplace*'s return value bundling everything the

@@ -223,6 +223,41 @@ func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
 	}
 }
 
+// captureContainerLogs fetches logs from the given containerIDs for
+// diagnostics persistence. Must be called WHILE the containers still
+// exist — failure-path workers (doProvision, doReplace*) must call this
+// BEFORE their cleanup defer removes the containers, otherwise Docker
+// returns "no such container" and the logs are lost. Optional
+// containerKeys map overrides the default index-based log key (e.g.,
+// "web/0" for stack services).
+func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[string]string) map[string]string {
+	if len(containerIDs) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	logs := make(map[string]string, len(containerIDs))
+	for i, cid := range containerIDs {
+		logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
+		if err != nil {
+			b.logger.Debug("failed to fetch container logs for diagnostics persistence",
+				"container_id", shortID(cid), "error", err)
+			continue
+		}
+		key := fmt.Sprintf("%d", i)
+		if containerKeys != nil {
+			if k, ok := containerKeys[cid]; ok {
+				key = k
+			}
+		}
+		logs[key] = logOutput
+	}
+	if len(logs) == 0 {
+		return nil
+	}
+	return logs
+}
+
 // persistDiagnostics saves failure diagnostics and container logs to the
 // diagnostics store. It performs I/O (container log fetching, bbolt write)
 // and must NOT be called while holding provisionsMu.
@@ -233,38 +268,30 @@ func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs 
 	if b.diagnosticsStore == nil {
 		return
 	}
-
 	var keys map[string]string
 	if len(containerKeys) > 0 {
 		keys = containerKeys[0]
 	}
-
-	// Fetch logs from containers that still exist.
-	if len(containerIDs) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		logs := make(map[string]string, len(containerIDs))
-		for i, cid := range containerIDs {
-			logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
-			if err != nil {
-				b.logger.Debug("failed to fetch container logs for diagnostics persistence",
-					"container_id", shortID(cid), "error", err)
-				continue
-			}
-			key := fmt.Sprintf("%d", i)
-			if keys != nil {
-				if k, ok := keys[cid]; ok {
-					key = k
-				}
-			}
-			logs[key] = logOutput
-		}
-		if len(logs) > 0 {
-			entry.Logs = logs
-		}
+	if logs := b.captureContainerLogs(containerIDs, keys); logs != nil {
+		entry.Logs = logs
 	}
+	if err := b.diagnosticsStore.Store(entry); err != nil {
+		b.logger.Warn("failed to persist failure diagnostics",
+			"lease_uuid", entry.LeaseUUID, "error", err)
+	}
+}
 
+// persistDiagnosticsWithLogs saves pre-captured logs to the diagnostics
+// store. Used by failure-path workers that capture logs before cleanup
+// (when the containers are about to be removed). The entry's Logs field
+// is set from the supplied map, bypassing the re-fetch path.
+func (b *Backend) persistDiagnosticsWithLogs(entry shared.DiagnosticEntry, logs map[string]string) {
+	if b.diagnosticsStore == nil {
+		return
+	}
+	if len(logs) > 0 {
+		entry.Logs = logs
+	}
 	if err := b.diagnosticsStore.Store(entry); err != nil {
 		b.logger.Warn("failed to persist failure diagnostics",
 			"lease_uuid", entry.LeaseUUID, "error", err)

@@ -57,7 +57,7 @@ func (diagGatheredMsg) doneChan() chan struct{} { return nil }
 // it knows whether the SM accepted the transition before returning.
 type provisionRequestedMsg struct {
 	cancel context.CancelFunc
-	work   func() (callbackErr string, result provisionSuccessResult, err error)
+	work   func() (callbackErr string, result provisionSuccessResult, failureLogs map[string]string, err error)
 	ack    chan error
 }
 
@@ -78,10 +78,15 @@ func (provisionCompletedMsg) doneChan() chan struct{} { return nil }
 // provisionErroredMsg is sent by the doProvision goroutine on failure.
 // callbackErr is the hardcoded on-chain-safe message; lastError is the
 // full diagnostic string (from err.Error()) that the Failed entry
-// action writes into provision.LastError.
+// action writes into provision.LastError. logs is the pre-captured
+// container-log map (fetched BEFORE the cleanup defer removed the
+// failed containers) so persistDiagnostics doesn't attempt to re-fetch
+// from already-deleted containers — see doProvision's captureContainerLogs
+// call.
 type provisionErroredMsg struct {
 	callbackErr string
 	lastError   string
+	logs        map[string]string
 }
 
 func (provisionErroredMsg) isLeaseMessage()         {}
@@ -352,7 +357,7 @@ func (a *leaseActor) handle(msg leaseMessage) {
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
-		a.handleProvisionErrored(m.callbackErr, m.lastError)
+		a.handleProvisionErrored(m.callbackErr, m.lastError, m.logs)
 	case replaceCompletedMsg:
 		a.handleReplaceCompleted(m.result)
 	case replaceRecoveredMsg:
@@ -397,12 +402,15 @@ func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 // the work closure), pre-publishes container IDs on success so a preempting
 // Deprovision sees them under lock, and sends the terminal SM event via
 // sendTerminal. Tracked by workersWg so the actor waits for this worker
-// before exit.
-func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessResult, error)) {
+// before exit. On failure, the worker captures container logs BEFORE
+// cleanup (see doProvision's defer) so the persisted diagnostic entry
+// contains useful debugging output even though the failed containers
+// have been removed.
+func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessResult, map[string]string, error)) {
 	a.workersWg.Add(1)
 	a.backend.wg.Go(func() {
 		defer a.workersWg.Done()
-		callbackErr, result, err := work()
+		callbackErr, result, failureLogs, err := work()
 		if err == nil {
 			// Pre-publish so a concurrent Deprovision-preempt reading
 			// prov.ContainerIDs sees the new IDs (bug_012).
@@ -416,7 +424,11 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 		var event string
 		if err != nil {
 			event = "provision_errored"
-			ok = a.sendTerminal(provisionErroredMsg{callbackErr: callbackErr, lastError: err.Error()})
+			ok = a.sendTerminal(provisionErroredMsg{
+				callbackErr: callbackErr,
+				lastError:   err.Error(),
+				logs:        failureLogs,
+			})
 		} else {
 			event = "provision_completed"
 			ok = a.sendTerminal(provisionCompletedMsg{result: result})
@@ -435,10 +447,11 @@ func (a *leaseActor) handleProvisionCompleted(result provisionSuccessResult) {
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionCompleted, result)
 }
 
-func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string) {
+func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string, logs map[string]string) {
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, provisionErrorInfo{
 		callbackErr: callbackErr,
 		lastError:   lastError,
+		logs:        logs,
 	})
 }
 
@@ -626,9 +639,10 @@ func (b *Backend) actorForLocked(leaseUUID string) *leaseActor {
 //
 // Returns false if the backend is shutting down OR the inbox is full (the
 // enqueue is non-blocking to avoid holding the registry mutex across a
-// potentially-slow channel send). Callers that need blocking semantics can
-// wrap in a retry loop; fire-and-forget callers (containerEventLoop,
-// reconcile) should treat refusal as "reconciler will re-detect".
+// potentially-slow channel send). Fire-and-forget callers
+// (containerEventLoop, reconcile) treat refusal as "reconciler will
+// re-detect". Caller-facing API paths that need backpressure-retry
+// semantics should use routeToLeaseBlocking instead.
 func (b *Backend) routeToLease(leaseUUID string, msg leaseMessage) bool {
 	b.actorsMu.Lock()
 	defer b.actorsMu.Unlock()
@@ -643,6 +657,38 @@ func (b *Backend) routeToLease(leaseUUID string, msg leaseMessage) bool {
 		return false
 	}
 }
+
+// routeToLeaseBlocking wraps routeToLease with ctx-bounded retry so
+// caller-facing API paths (Provision, Deprovision, Restart, Update)
+// don't spuriously fail on transient inbox saturation. Returns nil on
+// successful enqueue, ctx.Err() on caller cancellation, or a "backend
+// shutting down" error when stopCtx fires. Polls on
+// routeToLeaseRetryInterval while the inbox is full — a few ms of
+// latency is acceptable for API calls; the alternative is turning
+// backpressure into a 5xx.
+func (b *Backend) routeToLeaseBlocking(ctx context.Context, leaseUUID string, msg leaseMessage) error {
+	for {
+		if b.routeToLease(leaseUUID, msg) {
+			return nil
+		}
+		if b.stopCtx.Err() != nil {
+			return fmt.Errorf("backend shutting down")
+		}
+		select {
+		case <-b.stopCtx.Done():
+			return fmt.Errorf("backend shutting down")
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(routeToLeaseRetryInterval):
+		}
+	}
+}
+
+// routeToLeaseRetryInterval is the poll interval for routeToLeaseBlocking
+// when the target inbox is momentarily full. Short enough that API-call
+// latency from backpressure is negligible in normal operation (inbox
+// rarely fills); long enough to avoid hot-spinning a contended actor.
+const routeToLeaseRetryInterval = 10 * time.Millisecond
 
 // ActorSnapshot is a point-in-time view of one lease actor's state for
 // operator introspection. Safe to marshal to JSON for a /debug/actors
