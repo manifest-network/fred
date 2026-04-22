@@ -367,7 +367,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				"lease_uuid", uuid)
 			continue
 		}
-		if !b.actorFor(uuid).send(containerDiedMsg{containerID: containerID}) {
+		if !b.routeToLease(uuid, containerDiedMsg{containerID: containerID}) {
 			dieEventDroppedTotal.WithLabelValues("reconcile").Inc()
 			b.logger.Warn("die event dropped during reconcile dispatch; reconciler will re-detect",
 				"lease_uuid", uuid, "container_id", shortID(containerID))
@@ -518,7 +518,7 @@ func (b *Backend) containerEventLoop() {
 				}
 				if event.Action == "die" {
 					if leaseUUID, found := b.findLeaseByContainerID(event.ContainerID); found {
-						if !b.actorFor(leaseUUID).send(containerDiedMsg{containerID: event.ContainerID}) {
+						if !b.routeToLease(leaseUUID, containerDiedMsg{containerID: event.ContainerID}) {
 							dieEventDroppedTotal.WithLabelValues("event_loop").Inc()
 							b.logger.Warn("die event dropped at event loop dispatch; reconciler will re-detect",
 								"lease_uuid", leaseUUID, "container_id", shortID(event.ContainerID))

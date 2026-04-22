@@ -115,8 +115,13 @@ type Backend struct {
 
 	// actors routes per-lease messages to a goroutine that serializes all
 	// state transitions for that lease. Entries are created lazily via
-	// actorFor and live until backend shutdown.
-	actors sync.Map // leaseUUID → *leaseActor
+	// routeToLease and live until the actor's run loop exits (which also
+	// deletes the entry under actorsMu). Guarded by actorsMu so registry
+	// membership and actor lifecycle are atomic with respect to each
+	// other — eliminating the stale-pointer / orphan-worker race class
+	// the prior sync.Map design allowed.
+	actorsMu sync.Mutex
+	actors   map[string]*leaseActor // leaseUUID → *leaseActor
 }
 
 // provision tracks provisioned containers for a lease.
@@ -377,6 +382,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		logger:           logger.With("backend", cfg.Name),
 		provisions:       make(map[string]*provision),
 		tenantNetworkMus: make(map[string]*sync.Mutex),
+		actors:           make(map[string]*leaseActor),
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,

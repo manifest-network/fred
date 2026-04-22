@@ -220,7 +220,7 @@ func (a *leaseActor) run() {
 	//      synchronous callers don't hang.
 	defer a.drainInbox()
 	defer close(a.done)
-	defer a.backend.actors.Delete(a.leaseUUID)
+	defer a.removeFromRegistry()
 	for {
 		if a.terminated {
 			return
@@ -495,21 +495,69 @@ func (a *leaseActor) sendTerminal(msg leaseMessage) bool {
 // enough that a wedged actor doesn't pin the goroutine indefinitely.
 const terminalSendTimeout = 10 * time.Second
 
-// actorFor returns the lease actor for leaseUUID, creating and starting it on
-// first access. Concurrent callers see the same actor; the losing goroutine
-// discards its allocation.
-func (b *Backend) actorFor(leaseUUID string) *leaseActor {
-	if existing, ok := b.actors.Load(leaseUUID); ok {
-		return existing.(*leaseActor)
+// removeFromRegistry deletes this actor from b.actors under actorsMu.
+// CompareAndDelete semantics: only deletes if the registered entry is
+// THIS actor, so a fresh actor stored for the same UUID after our exit
+// started isn't clobbered. Used as a deferred action on actor exit.
+func (a *leaseActor) removeFromRegistry() {
+	a.backend.actorsMu.Lock()
+	defer a.backend.actorsMu.Unlock()
+	if reg, ok := a.backend.actors[a.leaseUUID]; ok && reg == a {
+		delete(a.backend.actors, a.leaseUUID)
+	}
+}
+
+// actorForLocked returns the lease actor for leaseUUID, creating + starting
+// one on first access. Caller MUST hold b.actorsMu. The whole point of the
+// registry mutex: resolve-or-create and any subsequent state change (enqueue,
+// exit) serialize through the same lock.
+func (b *Backend) actorForLocked(leaseUUID string) *leaseActor {
+	if existing, ok := b.actors[leaseUUID]; ok {
+		return existing
 	}
 	candidate := newLeaseActor(b, leaseUUID)
-	actual, loaded := b.actors.LoadOrStore(leaseUUID, candidate)
-	if loaded {
-		return actual.(*leaseActor)
-	}
+	b.actors[leaseUUID] = candidate
 	leaseActorsCreatedTotal.Inc()
 	b.wg.Go(candidate.run)
 	return candidate
+}
+
+// routeToLease is the ONLY way external code delivers a message to a lease's
+// actor. It resolves-or-creates the actor AND enqueues atomically under
+// actorsMu — so the stale-pointer race class (caller retained an actor
+// reference while the actor was terminating) cannot occur by construction:
+// callers never hold a *leaseActor pointer.
+//
+// Returns false if the backend is shutting down OR the inbox is full (the
+// enqueue is non-blocking to avoid holding the registry mutex across a
+// potentially-slow channel send). Callers that need blocking semantics can
+// wrap in a retry loop; fire-and-forget callers (containerEventLoop,
+// reconcile) should treat refusal as "reconciler will re-detect".
+func (b *Backend) routeToLease(leaseUUID string, msg leaseMessage) bool {
+	b.actorsMu.Lock()
+	defer b.actorsMu.Unlock()
+	if b.stopCtx.Err() != nil {
+		return false
+	}
+	actor := b.actorForLocked(leaseUUID)
+	select {
+	case actor.inbox <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+// actorFor is the legacy entry point retained for internal use during the
+// registry-mutex migration. New code should use routeToLease. Callers must
+// treat the returned pointer as ephemeral — it is only safe to use within
+// the current goroutine-step.
+//
+// TODO(phase2): delete once all external call sites use routeToLease.
+func (b *Backend) actorFor(leaseUUID string) *leaseActor {
+	b.actorsMu.Lock()
+	defer b.actorsMu.Unlock()
+	return b.actorForLocked(leaseUUID)
 }
 
 // ActorSnapshot is a point-in-time view of one lease actor's state for
@@ -530,24 +578,30 @@ const actorMetricsSampleInterval = 5 * time.Second
 // sampleActorMetrics walks every live actor, observing inbox depth into
 // the histogram and finding the oldest in-flight handle() start across
 // all actors for the stuck-seconds gauge. Called periodically from
-// actorMetricsSampleLoop. Safe to run concurrently with actor work:
-// inbox len() is racy-but-fine, and currentMessageStart is atomic.
+// actorMetricsSampleLoop.
+//
+// Holds actorsMu only long enough to snapshot the actor list, then observes
+// outside the lock. inbox len() and currentMessageStart are both safe to
+// read concurrently with actor work (inbox len is racy-but-fine; atomic
+// load for currentMessageStart).
 func (b *Backend) sampleActorMetrics() {
 	now := time.Now().UnixNano()
+	b.actorsMu.Lock()
+	actors := make([]*leaseActor, 0, len(b.actors))
+	for _, actor := range b.actors {
+		actors = append(actors, actor)
+	}
+	b.actorsMu.Unlock()
+
 	var oldestStart int64
-	b.actors.Range(func(_, value any) bool {
-		actor, ok := value.(*leaseActor)
-		if !ok {
-			return true
-		}
+	for _, actor := range actors {
 		leaseActorInboxDepth.Observe(float64(len(actor.inbox)))
 		if start := actor.currentMessageStart.Load(); start != 0 {
 			if oldestStart == 0 || start < oldestStart {
 				oldestStart = start
 			}
 		}
-		return true
-	})
+	}
 	if oldestStart == 0 {
 		leaseActorStuckSeconds.Set(0)
 	} else {
@@ -576,24 +630,21 @@ func (b *Backend) actorMetricsSampleLoop() {
 // incidents — pair with a /debug/actors HTTP handler that JSON-encodes
 // the return.
 func (b *Backend) DebugActors() []ActorSnapshot {
-	var snapshots []ActorSnapshot
-	b.actors.Range(func(key, value any) bool {
-		leaseUUID, ok := key.(string)
-		if !ok {
-			return true
-		}
-		actor, ok := value.(*leaseActor)
-		if !ok {
-			return true
-		}
-		snap := ActorSnapshot{
+	b.actorsMu.Lock()
+	actors := make(map[string]*leaseActor, len(b.actors))
+	for uuid, actor := range b.actors {
+		actors[uuid] = actor
+	}
+	b.actorsMu.Unlock()
+
+	snapshots := make([]ActorSnapshot, 0, len(actors))
+	for leaseUUID, actor := range actors {
+		snapshots = append(snapshots, ActorSnapshot{
 			LeaseUUID:  leaseUUID,
 			SMState:    fmt.Sprintf("%v", actor.sm.State()),
 			InboxDepth: len(actor.inbox),
 			InboxCap:   cap(actor.inbox),
-		}
-		snapshots = append(snapshots, snap)
-		return true
-	})
+		})
+	}
 	return snapshots
 }

@@ -17,9 +17,8 @@ import (
 // Failing.OnExit cancels the in-flight diag goroutine — the cc62f3b
 // structural suppression of stale Failed callbacks.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
-	actor := b.actorFor(leaseUUID)
 	reply := make(chan error, 1)
-	if !actor.send(deprovisionMsg{ctx: ctx, reply: reply}) {
+	if !b.routeToLease(leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}) {
 		return fmt.Errorf("backend shutting down")
 	}
 	select {

@@ -269,7 +269,9 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("actor did not exit after successful deprovision")
 	}
-	_, exists := b.actors.Load("lease-1")
+	b.actorsMu.Lock()
+	_, exists := b.actors["lease-1"]
+	b.actorsMu.Unlock()
 	assert.False(t, exists,
 		"b.actors must not retain a reference to a deprovisioned lease")
 
@@ -689,11 +691,9 @@ func TestBackend_ShutdownDrainsAllActors(t *testing.T) {
 	}
 
 	// Every actor's run loop deletes itself from b.actors on exit.
-	var remaining int
-	b.actors.Range(func(key, value any) bool {
-		remaining++
-		return true
-	})
+	b.actorsMu.Lock()
+	remaining := len(b.actors)
+	b.actorsMu.Unlock()
 	assert.Equal(t, 0, remaining, "b.actors must be empty after full shutdown drain")
 }
 

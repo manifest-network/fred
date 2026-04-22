@@ -285,6 +285,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		volumes:    &noopVolumeManager{},
 		logger:     slog.Default(),
 		provisions: provs,
+		actors:     make(map[string]*leaseActor),
 		stopCtx:    stopCtx,
 		stopCancel: stopCancel,
 	}
