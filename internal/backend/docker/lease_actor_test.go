@@ -482,6 +482,44 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 		"doDeprovision must see the new containerIDs published before fireReplaceOutcome")
 }
 
+// TestLeaseActor_DrainWaitsForDiagDone pins the structural fix for the
+// diag-shutdown race: drainOnShutdown must wait on a.diagDone before
+// exiting, regardless of which SM state the actor is in. Without the
+// wait, a diag goroutine mid-execution when shutdown fires could have
+// its sendTerminal land after drainOnShutdown returned — the message
+// would queue into the inbox but be silently dropped by drainInbox
+// because the actor is already tearing down.
+//
+// Installs a synthetic diagDone (the actor believes a diag goroutine is
+// in flight), fires shutdown, verifies the actor does not exit until
+// diagDone is closed.
+func TestLeaseActor_DrainWaitsForDiagDone(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailing},
+	})
+
+	actor := b.actorFor("lease-1")
+	diagHeld := make(chan struct{})
+	actor.diagDone = diagHeld
+
+	b.stopCancel()
+
+	// Actor must block in drainOnShutdown waiting on diagDone.
+	select {
+	case <-actor.done:
+		t.Fatal("actor exited before diagDone was closed — drainOnShutdown did not wait")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Close diagDone. Actor must now exit cleanly.
+	close(diagHeld)
+	select {
+	case <-actor.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor did not exit after diagDone was closed")
+	}
+}
+
 // TestLeaseActor_DiagGathered_ShutdownDrain exercises the drain-on-shutdown
 // path for a lease in the Failing state: stopCtx fires with a diagGatheredMsg
 // freshly queued in the inbox, and the actor must process it (transitioning

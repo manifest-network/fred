@@ -312,22 +312,39 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 
 	// Spawn the async diag gather. Its context is derived from backend's
 	// stopCtx so shutdown cancels; locally scoped so Failing.OnExit can
-	// cancel on preemption.
+	// cancel on preemption. diagDone is closed by the goroutine's defer
+	// on exit so Failing.OnExit / drainOnShutdown can wait for it.
 	diagCtx, diagCancel := context.WithCancel(b.stopCtx)
 	lsm.actor.diagCancel = diagCancel
+	lsm.actor.diagDone = make(chan struct{})
 	go lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
 	return nil
 }
 
 // onExitFailing cancels the in-flight diag goroutine whenever we leave
 // Failing — whether by DiagGathered (normal) or DeprovisionRequested
-// (preemption). Cancellation is the happy-path suppression; the Ignore
-// declarations on Failed/Deprovisioning handle the race where the
-// goroutine already fired DiagGathered before the cancel signal propagated.
+// (preemption) — then waits for the goroutine to exit. The cc62f3b
+// mechanism combines three layers: the cancel signal (happy-path
+// suppression), the wait (prevents a post-OnExit race where the
+// goroutine is still mid-sendTerminal and would otherwise land after
+// this function returned), and the Ignore declarations on Failed /
+// Deprovisioning (backstop for trigger reordering). Bounded by
+// workExitWaitTimeout so a wedged goroutine cannot pin the actor.
 func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 	if lsm.actor.diagCancel != nil {
 		lsm.actor.diagCancel()
 		lsm.actor.diagCancel = nil
+	}
+	if lsm.actor.diagDone != nil {
+		select {
+		case <-lsm.actor.diagDone:
+		case <-time.After(workExitWaitTimeout):
+			lsm.actor.backend.logger.Warn("diag goroutine did not exit within wait timeout",
+				"lease_uuid", lsm.actor.leaseUUID,
+				"timeout", workExitWaitTimeout,
+			)
+		}
+		lsm.actor.diagDone = nil
 	}
 	return nil
 }
@@ -734,7 +751,13 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 // Uses sendTerminal so shutdown doesn't strand a completed diag fetch:
 // the Failed callback is a terminal SM outcome, and the actor's drain
 // on shutdown waits for the inbox to process it before exiting.
+//
+// Closes a.diagDone in its outermost defer so Failing.OnExit and
+// drainOnShutdown can wait for this goroutine to finish before the
+// actor proceeds — closing the race where sendTerminal would otherwise
+// land after the actor had already exited.
 func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *ContainerInfo) {
+	defer close(a.diagDone)
 	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
 	if ctx.Err() != nil {
 		return

@@ -155,6 +155,12 @@ type leaseActor struct {
 	// cc62f3b structural mechanism: any transition out of Failing cancels
 	// the goroutine before any stale Failed callback can be emitted.
 	diagCancel context.CancelFunc
+	// diagDone is closed by gatherDiagAsync's defer on exit. Failing.OnExit
+	// and the actor's run loop (drainOnShutdown) wait on it to make sure
+	// the goroutine has finished before the actor proceeds — closing the
+	// narrow shutdown race where diag's sendTerminal would otherwise land
+	// after drainOnShutdown had already exited.
+	diagDone chan struct{}
 	// workCancel mirrors diagCancel for the Provision/Restart/Update flows.
 	// Set when the work goroutine is spawned; called by
 	// Provisioning/Restarting/Updating.OnExit on DeprovisionRequested
@@ -230,22 +236,20 @@ func (a *leaseActor) run() {
 	}
 }
 
-// drainOnShutdown waits for the in-flight work goroutine to deliver its
-// terminal SM event, then processes any queued messages so the SM records
-// every observable outcome before the actor exits. Bounded so a wedged
-// goroutine can't block shutdown indefinitely.
+// drainOnShutdown waits for the in-flight async work (provision/restart/
+// update goroutine OR diag goroutine) to deliver its terminal SM event,
+// then processes any queued messages so the SM records every observable
+// outcome before the actor exits. Bounded so a wedged goroutine can't
+// block shutdown indefinitely.
+//
+// At most one of workDone / diagDone is non-nil at a time (they
+// correspond to mutually-exclusive SM states), but the code checks both
+// defensively so a future state-machine addition doesn't silently skip a
+// wait.
 func (a *leaseActor) drainOnShutdown() {
-	if a.workDone != nil {
-		select {
-		case <-a.workDone:
-		case <-time.After(workExitWaitTimeout):
-			a.backend.logger.Warn("actor shutdown drain: work goroutine did not exit within timeout",
-				"lease_uuid", a.leaseUUID,
-				"timeout", workExitWaitTimeout,
-			)
-		}
-	}
-	// Drain whatever landed in the inbox — typically the work goroutine's
+	a.waitForAsync(a.workDone, "work")
+	a.waitForAsync(a.diagDone, "diag")
+	// Drain whatever landed in the inbox — typically the goroutine's
 	// terminal SM event, plus any messages queued between stopCtx firing
 	// and drain beginning.
 	for {
@@ -258,6 +262,25 @@ func (a *leaseActor) drainOnShutdown() {
 		default:
 			return
 		}
+	}
+}
+
+// waitForAsync blocks on a per-goroutine done channel (nil is a no-op),
+// bounded by workExitWaitTimeout. Shared by drainOnShutdown so both the
+// work-goroutine and diag-goroutine waits use identical semantics and
+// logging.
+func (a *leaseActor) waitForAsync(done <-chan struct{}, kind string) {
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(workExitWaitTimeout):
+		a.backend.logger.Warn("actor shutdown drain: async goroutine did not exit within timeout",
+			"lease_uuid", a.leaseUUID,
+			"kind", kind,
+			"timeout", workExitWaitTimeout,
+		)
 	}
 }
 
