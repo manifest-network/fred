@@ -12,6 +12,25 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
+// restartRollback undoes the synchronous Status/CallbackURL mutation that
+// Restart/Update made before handing off to the actor, and marks the
+// just-Append'd release "failed" so it doesn't linger as "deploying" in
+// the store. Called from every send-refusal / ack-error / ctx-cancel
+// branch in the three replace-starting paths.
+func (b *Backend) restartRollback(leaseUUID string, prevStatus backend.ProvisionStatus, prevCallbackURL string, logger *slog.Logger) {
+	b.provisionsMu.Lock()
+	if p, ok := b.provisions[leaseUUID]; ok {
+		p.Status = prevStatus
+		p.CallbackURL = prevCallbackURL
+	}
+	b.provisionsMu.Unlock()
+	if b.releaseStore != nil {
+		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", "backend shutting down"); relErr != nil {
+			logger.Warn("failed to roll back release on send refusal", "error", relErr)
+		}
+	}
+}
+
 // Restart restarts containers for a lease without changing the manifest.
 // State machine: Ready|Failed → Restarting → Ready|Failed
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
@@ -86,105 +105,43 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		}
 	}
 
-	// Async phase: route through the actor so the SM tracks the Restarting
-	// state and so a concurrent Deprovision can cancel us mid-flight. The
-	// goroutine reads the post-defer provision.Status to fire either
-	// replaceCompletedMsg (Ready — includes successful rollback) or
-	// replaceFailedMsg (Failed).
-	actor := b.actorFor(req.LeaseUUID)
+	// Async phase: hand off to the lease actor. Actor fires the Restarting
+	// transition, acks, and spawns the replace worker (tracked by
+	// workersWg). See handleRestartRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
-	workDone := make(chan struct{})
-	if !actor.send(restartRequestedMsg{cancel: opCancel, done: workDone}) {
+	work := func() replaceResult {
+		if isStack {
+			return b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
+		}
+		return b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
+	}
+	ack := make(chan error, 1)
+	if !b.routeToLease(req.LeaseUUID, restartRequestedMsg{cancel: opCancel, work: work, ack: ack}) {
 		opCancel()
-		close(workDone)
-		b.provisionsMu.Lock()
-		if p, ok := b.provisions[req.LeaseUUID]; ok {
-			p.Status = prevStatus
-			p.CallbackURL = prevCallbackURL
-		}
-		b.provisionsMu.Unlock()
-		// Mark the just-Append'd release failed so it doesn't linger as
-		// "deploying" after shutdown. recoverState filters by
-		// LatestActive and wouldn't load it anyway, but we don't want
-		// the store to accumulate zombie records.
-		if b.releaseStore != nil {
-			if relErr := b.releaseStore.UpdateLatestStatus(req.LeaseUUID, "failed", "backend shutting down"); relErr != nil {
-				logger.Warn("failed to roll back release on send refusal", "error", relErr)
-			}
-		}
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
 		return fmt.Errorf("backend shutting down")
 	}
-	b.wg.Go(func() {
-		// LIFO: opCancel first (notify opCtx consumers), then close
-		// workDone to unblock Restarting.OnExit's wait.
-		defer close(workDone)
-		defer opCancel()
-
-		var result replaceResult
-		if isStack {
-			result = b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
-		} else {
-			result = b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
+	select {
+	case err := <-ack:
+		if err != nil {
+			opCancel()
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+			return err
 		}
-		fireReplaceOutcome(actor, result)
-	})
-
+	case <-ctx.Done():
+		opCancel()
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+		return ctx.Err()
+	case <-b.stopCtx.Done():
+		opCancel()
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+		return fmt.Errorf("backend shutting down")
+	}
 	return nil
 }
 
-// fireReplaceOutcome picks the correct SM event from a replaceResult.
-// Shared between Restart and Update wrappers.
-//
-//	result.err == nil                 → replaceCompletedMsg → Ready, Success callback
-//	result.err != nil, result.restored→ replaceRecoveredMsg → Ready, Failed+suffix callback
-//	result.err != nil, !result.restored→ replaceFailedMsg   → Failed, Failed callback
-//
-// On success, publishes the new ContainerIDs/ServiceContainers to the
-// provision struct *before* the terminal send. This mirrors the Provision
-// pre-publish (bug_012): if Deprovision preempts between here and the SM
-// entry action, the stale-old-IDs window would otherwise orphan the newly
-// created containers. Recovery/failure paths leave ContainerIDs untouched
-// (old containers are still referenced, or the entry action will write
-// whatever the failure path produced).
-//
-// Uses sendTerminal so the SM records the outcome even during shutdown —
-// the actor's run loop drains the inbox before exit. A refused send at
-// this point means the actor has fully exited or the inbox is wedged;
-// both are pathological and counted for ops visibility.
-func fireReplaceOutcome(actor *leaseActor, result replaceResult) {
-	if result.err == nil {
-		b := actor.backend
-		b.provisionsMu.Lock()
-		if p, ok := b.provisions[actor.leaseUUID]; ok {
-			p.ContainerIDs = result.success.containerIDs
-			if result.success.serviceContainers != nil {
-				p.ServiceContainers = result.success.serviceContainers
-			}
-		}
-		b.provisionsMu.Unlock()
-	}
-
-	var event string
-	var ok bool
-	switch {
-	case result.err == nil:
-		event = "replace_completed"
-		ok = actor.sendTerminal(replaceCompletedMsg{result: result.success})
-	case result.restored:
-		event = "replace_recovered"
-		ok = actor.sendTerminal(replaceRecoveredMsg{info: result.failure})
-	default:
-		event = "replace_failed"
-		ok = actor.sendTerminal(replaceFailedMsg{info: result.failure})
-	}
-	if !ok {
-		leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
-		actor.backend.logger.Warn("terminal replace event dropped (actor exited or inbox wedged)",
-			"lease_uuid", actor.leaseUUID,
-			"event", event,
-		)
-	}
-}
+// (fireReplaceOutcome was moved into leaseActor.spawnReplaceWorker so the
+// worker goroutine is owned by the actor via workersWg — see lease_actor.go.)
 
 // doRestart performs the actual container restart asynchronously.
 func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
@@ -892,33 +849,34 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			}
 		}
 
-		// Async phase: stack update (same actor routing as single-manifest Update).
-		actor := b.actorFor(req.LeaseUUID)
+		// Async phase: hand off to the actor. See handleUpdateRequested /
+		// spawnReplaceWorker.
 		opCtx, opCancel := b.shutdownAwareContext()
-		workDone := make(chan struct{})
-		if !actor.send(updateRequestedMsg{cancel: opCancel, done: workDone}) {
+		work := func() replaceResult {
+			return b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
+		}
+		ack := make(chan error, 1)
+		if !b.routeToLease(req.LeaseUUID, updateRequestedMsg{cancel: opCancel, work: work, ack: ack}) {
 			opCancel()
-			close(workDone)
-			b.provisionsMu.Lock()
-			if p, ok := b.provisions[req.LeaseUUID]; ok {
-				p.Status = prevStatus
-				p.CallbackURL = prevCallbackURL
-			}
-			b.provisionsMu.Unlock()
-			if b.releaseStore != nil {
-				if relErr := b.releaseStore.UpdateLatestStatus(req.LeaseUUID, "failed", "backend shutting down"); relErr != nil {
-					logger.Warn("failed to roll back release on send refusal", "error", relErr)
-				}
-			}
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
 			return fmt.Errorf("backend shutting down")
 		}
-		b.wg.Go(func() {
-			defer close(workDone)
-			defer opCancel()
-
-			result := b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
-			fireReplaceOutcome(actor, result)
-		})
+		select {
+		case err := <-ack:
+			if err != nil {
+				opCancel()
+				b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+				return err
+			}
+		case <-ctx.Done():
+			opCancel()
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+			return ctx.Err()
+		case <-b.stopCtx.Done():
+			opCancel()
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+			return fmt.Errorf("backend shutting down")
+		}
 		return nil
 	}
 
@@ -958,34 +916,34 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		}
 	}
 
-	// Async phase: route through the actor (same pattern as Restart).
-	actor := b.actorFor(req.LeaseUUID)
+	// Async phase: hand off to the actor. See handleUpdateRequested /
+	// spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
-	workDone := make(chan struct{})
-	if !actor.send(updateRequestedMsg{cancel: opCancel, done: workDone}) {
+	work := func() replaceResult {
+		return b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
+	}
+	ack := make(chan error, 1)
+	if !b.routeToLease(req.LeaseUUID, updateRequestedMsg{cancel: opCancel, work: work, ack: ack}) {
 		opCancel()
-		close(workDone)
-		b.provisionsMu.Lock()
-		if p, ok := b.provisions[req.LeaseUUID]; ok {
-			p.Status = prevStatus
-			p.CallbackURL = prevCallbackURL
-		}
-		b.provisionsMu.Unlock()
-		if b.releaseStore != nil {
-			if relErr := b.releaseStore.UpdateLatestStatus(req.LeaseUUID, "failed", "backend shutting down"); relErr != nil {
-				logger.Warn("failed to roll back release on send refusal", "error", relErr)
-			}
-		}
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
 		return fmt.Errorf("backend shutting down")
 	}
-	b.wg.Go(func() {
-		defer close(workDone)
-		defer opCancel()
-
-		result := b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
-		fireReplaceOutcome(actor, result)
-	})
-
+	select {
+	case err := <-ack:
+		if err != nil {
+			opCancel()
+			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+			return err
+		}
+	case <-ctx.Done():
+		opCancel()
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+		return ctx.Err()
+	case <-b.stopCtx.Done():
+		opCancel()
+		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, logger)
+		return fmt.Errorf("backend shutting down")
+	}
 	return nil
 }
 

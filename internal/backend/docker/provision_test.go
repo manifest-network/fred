@@ -4934,48 +4934,46 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	actor := b.actorFor("lease-1")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
 
-	// Install synthetic goroutine handles. These are normally written by
-	// handleProvisionRequested on the actor's own goroutine; writing them
-	// here from the test goroutine before any message is sent is safe
-	// because the actor's inbox is empty. The subsequent actor.send →
-	// actor-receive pair synchronises the writes to the actor's goroutine
-	// per Go's channel memory model.
+	// Simulate an in-flight provision worker via workersWg. The actor's
+	// onExitProvisioning will call workCancel then waitForWorkers.
 	var cancelCalled atomic.Bool
-	goroutineFinished := make(chan struct{})
+	workerRelease := make(chan struct{})
 	actor.workCancel = func() { cancelCalled.Store(true) }
-	actor.workDone = goroutineFinished
+	actor.workersWg.Add(1)
+	go func() {
+		<-workerRelease
+		// Simulate the worker's pre-publish step before Done.
+		b.provisionsMu.Lock()
+		b.provisions["lease-1"].ContainerIDs = []string{"published-container"}
+		b.provisionsMu.Unlock()
+		actor.workersWg.Done()
+	}()
 
 	deprovErr := make(chan error, 1)
 	go func() {
 		deprovErr <- b.Deprovision(context.Background(), "lease-1")
 	}()
 
-	// OnExit must have called workCancel before entering the wait.
+	// onExitProvisioning must call workCancel before entering the wait.
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
-		"OnExit must call workCancel before waiting on workDone")
+		"OnExit must call workCancel before waitForWorkers")
 
-	// Deprovision must be blocked on OnExit's wait — doDeprovision has
-	// not yet run (otherwise the reply would have been sent).
+	// Deprovision must be blocked in waitForWorkers.
 	select {
 	case err := <-deprovErr:
-		t.Fatalf("Deprovision returned before workDone closed: %v", err)
+		t.Fatalf("Deprovision returned before worker finished: %v", err)
 	case <-time.After(100 * time.Millisecond):
-		// Good — OnExit is correctly blocked.
 	}
 
-	// Simulate the goroutine: publish a ContainerID (as the fix does
-	// after a successful doProvision) then close done. doDeprovision
-	// must observe the published ID and call RemoveContainer.
-	b.provisionsMu.Lock()
-	b.provisions["lease-1"].ContainerIDs = []string{"published-container"}
-	b.provisionsMu.Unlock()
-	close(goroutineFinished)
+	// Release the worker → wg.Done → waitForWorkers unblocks → doDeprovision
+	// runs and reads the pre-published ContainerIDs.
+	close(workerRelease)
 
 	select {
 	case err := <-deprovErr:
-		require.NoError(t, err, "Deprovision must succeed after workDone closes")
+		require.NoError(t, err, "Deprovision must succeed after worker completes")
 	case <-time.After(3 * time.Second):
-		t.Fatal("Deprovision did not complete after workDone closed")
+		t.Fatal("Deprovision did not complete after worker finished")
 	}
 
 	removedMu.Lock()

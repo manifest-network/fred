@@ -333,11 +333,10 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 
 // TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural fix
 // for bug_004: when stopCtx fires with an in-flight work goroutine, the
-// actor must (1) wait for the goroutine to close workDone, (2) drain the
-// inbox so the terminal SM event is processed, and only then exit. The
-// pre-fix behavior dropped the event at the send-check because the actor
-// had already exited on stopCtx, leaving the release store / callback
-// record out of sync with the physical host.
+// actor must (1) wait for the goroutine to complete (via workersWg),
+// (2) drain the inbox so the terminal SM event is processed via handle(),
+// and only then exit. The pre-fix behavior dropped the event at the
+// send-check because the actor had already exited on stopCtx.
 func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, map[string]*provision{
@@ -352,20 +351,17 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 	actor := b.actorFor("lease-1")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
 
-	// Install synthetic work-goroutine handles on the actor (same
-	// mechanism the real provision.go goroutine uses).
-	workDone := make(chan struct{})
-	actor.workCancel = func() {}
-	actor.workDone = workDone
+	// Simulate an in-flight worker via workersWg. The actor's exit-path
+	// waitForWorkers defer will block until we Done().
+	actor.workersWg.Add(1)
 
-	// Fire shutdown BEFORE the goroutine has finished. The actor should
-	// not exit yet — it has to wait for workDone + drain the inbox.
+	// Fire shutdown BEFORE the worker completes. The actor's run loop
+	// returns immediately but waitForWorkers must block.
 	b.stopCancel()
 
-	// Simulate the work goroutine: send its terminal event via
-	// sendTerminal (which must not be refused on shutdown), then close
-	// workDone. The actor should then drain the inbox and process the
-	// event, flipping Status to Ready.
+	// Simulate the worker: send terminal event, then Done(). The actor
+	// should then drain the inbox (via handle()) and process the event,
+	// flipping Status to Ready.
 	go func() {
 		ok := actor.sendTerminal(provisionCompletedMsg{
 			result: provisionSuccessResult{
@@ -373,7 +369,7 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 			},
 		})
 		require.True(t, ok, "sendTerminal must not refuse during shutdown drain")
-		close(workDone)
+		actor.workersWg.Done()
 	}()
 
 	// The actor must exit cleanly, and the provision must be Ready.
@@ -495,11 +491,20 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	actor := b.actorFor("lease-1")
 	require.Equal(t, backend.ProvisionStatusRestarting, actor.sm.State())
 
-	// Same synthetic-goroutine pattern as the Provision variant.
+	// Simulate an in-flight replace worker via workersWg + cancel func.
 	var cancelCalled atomic.Bool
-	goroutineFinished := make(chan struct{})
+	workerRelease := make(chan struct{})
 	actor.workCancel = func() { cancelCalled.Store(true) }
-	actor.workDone = goroutineFinished
+	actor.workersWg.Add(1)
+	go func() {
+		<-workerRelease
+		// Publish new container IDs before Done — mirrors the real
+		// replace worker's pre-publish step.
+		b.provisionsMu.Lock()
+		b.provisions["lease-1"].ContainerIDs = []string{"new-container"}
+		b.provisionsMu.Unlock()
+		actor.workersWg.Done()
+	}()
 
 	deprovErr := make(chan error, 1)
 	go func() {
@@ -507,69 +512,62 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	}()
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
-		"OnExit must call workCancel before waiting on workDone (Restart path)")
+		"OnExit must call workCancel before waiting for the worker (Restart path)")
 
 	select {
 	case err := <-deprovErr:
-		t.Fatalf("Deprovision returned before workDone closed: %v", err)
+		t.Fatalf("Deprovision returned before worker finished: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Simulate the replace goroutine publishing new containerIDs (as
-	// fireReplaceOutcome does today) and closing done.
-	b.provisionsMu.Lock()
-	b.provisions["lease-1"].ContainerIDs = []string{"new-container"}
-	b.provisionsMu.Unlock()
-	close(goroutineFinished)
+	// Release the worker → wg.Done → onExitProvisioning unblocks →
+	// doDeprovision runs.
+	close(workerRelease)
 
 	select {
 	case err := <-deprovErr:
-		require.NoError(t, err, "Deprovision must succeed after workDone closes")
+		require.NoError(t, err, "Deprovision must succeed after worker completes")
 	case <-time.After(3 * time.Second):
-		t.Fatal("Deprovision did not complete after workDone closed")
+		t.Fatal("Deprovision did not complete after worker finished")
 	}
 
 	removedMu.Lock()
 	defer removedMu.Unlock()
 	require.Contains(t, removedIDs, "new-container",
-		"doDeprovision must see the new containerIDs published before fireReplaceOutcome")
+		"doDeprovision must see the new containerIDs published by the replace worker")
 }
 
-// TestLeaseActor_DrainWaitsForDiagDone pins the structural fix for the
-// diag-shutdown race: drainOnShutdown must wait on a.diagDone before
-// exiting, regardless of which SM state the actor is in. Without the
-// wait, a diag goroutine mid-execution when shutdown fires could have
-// its sendTerminal land after drainOnShutdown returned — the message
-// would queue into the inbox but be silently dropped by drainInbox
-// because the actor is already tearing down.
+// TestLeaseActor_ExitWaitsForWorkers pins the structural fix for the
+// shutdown-drain race: the actor's exit-path waitForWorkers defer must
+// block until every worker goroutine (provision/restart/update/diag)
+// has returned. Without it, a worker's sendTerminal could land after
+// the actor's drainInbox had already run, dropping the terminal event.
 //
-// Installs a synthetic diagDone (the actor believes a diag goroutine is
-// in flight), fires shutdown, verifies the actor does not exit until
-// diagDone is closed.
-func TestLeaseActor_DrainWaitsForDiagDone(t *testing.T) {
+// Installs a synthetic worker via workersWg.Add(1), fires shutdown,
+// verifies the actor does not exit until the worker Done()s.
+func TestLeaseActor_ExitWaitsForWorkers(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailing},
 	})
 
 	actor := b.actorFor("lease-1")
-	diagHeld := make(chan struct{})
-	actor.diagDone = diagHeld
+	actor.workersWg.Add(1)
 
 	b.stopCancel()
 
-	// Actor must block in drainOnShutdown waiting on diagDone.
+	// Actor must block in waitForWorkers until we Done().
 	select {
 	case <-actor.done:
-		t.Fatal("actor exited before diagDone was closed — drainOnShutdown did not wait")
+		t.Fatal("actor exited before worker Done() — waitForWorkers did not block")
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	// Close diagDone. Actor must now exit cleanly.
-	close(diagHeld)
+	// Mark worker complete. Actor must now exit cleanly.
+	actor.workersWg.Done()
 	select {
 	case <-actor.done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("actor did not exit after diagDone was closed")
+		t.Fatal("actor did not exit after worker Done()")
 	}
 }
 

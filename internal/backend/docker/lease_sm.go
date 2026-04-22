@@ -312,75 +312,47 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 
 	// Spawn the async diag gather. Its context is derived from backend's
 	// stopCtx so shutdown cancels; locally scoped so Failing.OnExit can
-	// cancel on preemption. diagDone is closed by the goroutine's defer
-	// on exit so Failing.OnExit / drainOnShutdown can wait for it.
+	// cancel on preemption. Tracked by workersWg so Failing.OnExit (or
+	// the actor's exit-path waitForWorkers) blocks until the goroutine
+	// has returned and its terminal sendTerminal has landed.
 	diagCtx, diagCancel := context.WithCancel(b.stopCtx)
 	lsm.actor.diagCancel = diagCancel
-	lsm.actor.diagDone = make(chan struct{})
-	go lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
+	lsm.actor.workersWg.Add(1)
+	b.wg.Go(func() {
+		defer lsm.actor.workersWg.Done()
+		lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
+	})
 	return nil
 }
 
 // onExitFailing cancels the in-flight diag goroutine whenever we leave
 // Failing — whether by DiagGathered (normal) or DeprovisionRequested
-// (preemption) — then waits for the goroutine to exit. The cc62f3b
-// mechanism combines three layers: the cancel signal (happy-path
-// suppression), the wait (prevents a post-OnExit race where the
-// goroutine is still mid-sendTerminal and would otherwise land after
-// this function returned), and the Ignore declarations on Failed /
-// Deprovisioning (backstop for trigger reordering). Bounded by
-// workExitWaitTimeout so a wedged goroutine cannot pin the actor.
+// (preemption) — then waits via workersWg. Three-layer cc62f3b
+// suppression: cancel signal (happy path), workersWg.Wait (prevents
+// post-OnExit race where the goroutine is mid-sendTerminal), and the
+// Ignore declarations on Failed/Deprovisioning (backstop for trigger
+// reordering). Bounded by workExitWaitTimeout via waitForWorkers.
 func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 	if lsm.actor.diagCancel != nil {
 		lsm.actor.diagCancel()
 		lsm.actor.diagCancel = nil
 	}
-	if lsm.actor.diagDone != nil {
-		select {
-		case <-lsm.actor.diagDone:
-		case <-time.After(workExitWaitTimeout):
-			lsm.actor.backend.logger.Warn("diag goroutine did not exit within wait timeout",
-				"lease_uuid", lsm.actor.leaseUUID,
-				"timeout", workExitWaitTimeout,
-			)
-		}
-		lsm.actor.diagDone = nil
-	}
+	lsm.actor.waitForWorkers()
 	return nil
 }
 
-// onExitProvisioning mirrors onExitFailing for the Provision, Restart, and
-// Update flows: cancels the in-flight work goroutine when we leave the
-// corresponding state, then waits for it to exit. Shared across the three
-// states — they all have a single "work goroutine" tracked via
-// a.workCancel + a.workDone.
-//
-// Waiting is the structural fix for bug_012 (orphan-containers race):
-// without it, a Deprovision preempting a goroutine that has already
-// returned successfully reads an empty/stale ContainerIDs snapshot and
-// strands the created/swapped containers on the host. With the wait, the
-// goroutine's defer either pre-publishes the IDs (success) or cleans up the
-// containers itself (error/cancel) before doDeprovision runs.
-//
-// Bounded by workExitWaitTimeout so a wedged goroutine cannot pin the
-// actor. If the timeout fires, we log and continue — doDeprovision still
-// runs idempotently; any orphans are adopted by recoverState on next start.
+// onExitProvisioning is the analog for Provision/Restart/Update. Same
+// structural invariant as onExitFailing: cancel then wait via workersWg.
+// Closes the orphan-containers race (bug_012) — the goroutine's
+// pre-publish-then-sendTerminal sequence is observable to the preempting
+// doDeprovision, and the wait prevents an orphan container set from being
+// stranded when the handler is still in flight.
 func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
 	if lsm.actor.workCancel != nil {
 		lsm.actor.workCancel()
 		lsm.actor.workCancel = nil
 	}
-	if lsm.actor.workDone != nil {
-		select {
-		case <-lsm.actor.workDone:
-		case <-time.After(workExitWaitTimeout):
-			lsm.actor.backend.logger.Warn("work goroutine did not exit within wait timeout; containers may be orphaned on host (recoverState will adopt)",
-				"lease_uuid", lsm.actor.leaseUUID,
-				"timeout", workExitWaitTimeout,
-			)
-		}
-		lsm.actor.workDone = nil
-	}
+	lsm.actor.waitForWorkers()
 	return nil
 }
 
@@ -738,26 +710,16 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 	return p.Status
 }
 
-// gatherDiagAsync runs in a goroutine, doing pure I/O: Docker log fetch.
-// All state mutations (LastError update, persist, callback) are done by
-// onEnterFailedFromDiag, which runs in the actor's goroutine after Fire
-// commits the Failing→Failed transition. This makes the goroutine a
-// cancellable worker — no provisionsMu acquisition means no ctx-to-lock
-// gap, and if the ctx is canceled (Failing.OnExit on Deprovision
-// preemption) the goroutine simply returns. The SM's
-// Deprovisioning.Ignore(evDiagGathered) catches the race where the
-// goroutine finishes and fires just as preemption happens.
+// gatherDiagAsync runs in a goroutine (spawned by onEnterFailing), doing
+// pure I/O: Docker log fetch. All state mutations (LastError update,
+// persist, callback) are done by onEnterFailedFromDiag, which runs in
+// the actor's goroutine after Fire commits the Failing→Failed transition.
 //
-// Uses sendTerminal so shutdown doesn't strand a completed diag fetch:
-// the Failed callback is a terminal SM outcome, and the actor's drain
-// on shutdown waits for the inbox to process it before exiting.
-//
-// Closes a.diagDone in its outermost defer so Failing.OnExit and
-// drainOnShutdown can wait for this goroutine to finish before the
-// actor proceeds — closing the race where sendTerminal would otherwise
-// land after the actor had already exited.
+// Tracked by workersWg at the spawn site (onEnterFailing), so
+// Failing.OnExit's waitForWorkers blocks until this goroutine has
+// returned — sendTerminal is guaranteed to land before the actor
+// proceeds past the transition.
 func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *ContainerInfo) {
-	defer close(a.diagDone)
 	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
 	if ctx.Err() != nil {
 		return

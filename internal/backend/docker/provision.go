@@ -205,83 +205,47 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	}
 	b.provisionsMu.Unlock()
 
-	// Start async provisioning with shutdown-aware context.
-	// The cancel function is stored on the actor so Provisioning.OnExit can
-	// cancel it on DeprovisionRequested preemption — the structural
-	// cc62f3b-class suppression for the Provision flow. On completion, the
-	// goroutine fires the matching event into the actor's inbox; the SM's
-	// Ready/Failed entry actions emit the terminal callback.
-	//
-	// The provisionRequestedMsg is sent *before* the goroutine spawns so
-	// the SM reaches Provisioning before any completion event can land.
-	// Ordering is preserved by the inbox's FIFO delivery.
-	actor := b.actorFor(req.LeaseUUID)
+	// Async phase: hand off to the lease actor. The actor fires the SM
+	// transition, acks accept/reject, and spawns the worker goroutine
+	// internally (tracked by its workersWg) so orphan-worker races are
+	// impossible by construction — the actor cannot exit until the worker
+	// has delivered its terminal SM event.
 	provCtx, provCancel := b.shutdownAwareContext()
-	// workDone is closed by the goroutine's outermost defer. The actor's
-	// Provisioning.OnExit waits on it (bounded) so a preempting Deprovision
-	// either sees pre-published ContainerIDs or post-cleanup state — never
-	// a mid-flight window where containers exist on the host but the
-	// provision struct reports none (bug_012). The actor's run loop also
-	// waits on it during shutdown so the terminal SM event lands before
-	// the actor exits (bug_004).
-	workDone := make(chan struct{})
-	if !actor.send(provisionRequestedMsg{cancel: provCancel, done: workDone}) {
+	work := func() (string, provisionSuccessResult, error) {
+		if isStack {
+			return b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
+		}
+		return b.doProvision(provCtx, req, manifest, profiles, logger)
+	}
+	ack := make(chan error, 1)
+	if !b.routeToLease(req.LeaseUUID, provisionRequestedMsg{
+		cancel: provCancel,
+		work:   work,
+		ack:    ack,
+	}) {
 		provCancel()
-		close(workDone)
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("backend shutting down")
 	}
-	b.wg.Go(func() {
-		// LIFO: provCancel runs first (notify anything on provCtx), then
-		// the done signal unblocks OnExit's wait.
-		defer close(workDone)
-		defer provCancel()
-
-		var callbackErr string
-		var err error
-		var result provisionSuccessResult
-		if isStack {
-			callbackErr, result, err = b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
-		} else {
-			callbackErr, result, err = b.doProvision(provCtx, req, manifest, profiles, logger)
-		}
-		// On success, publish ContainerIDs to the provision struct *before*
-		// sending provisionCompletedMsg. The SM's Ready entry action rewrites
-		// the same field with the same value; the early publish exists so
-		// a concurrent doDeprovision (waiting on workDone in OnExit)
-		// observes the IDs and removes them cleanly. On error, doProvision's
-		// own defer has already cleaned up the containers, so no pre-publish
-		// is needed.
-		if err == nil {
-			b.provisionsMu.Lock()
-			if p, ok := b.provisions[req.LeaseUUID]; ok {
-				p.ContainerIDs = result.containerIDs
-			}
-			b.provisionsMu.Unlock()
-		}
-		// sendTerminal bypasses the stopCtx refusal so the SM records the
-		// outcome even during shutdown — the actor's run loop drains the
-		// inbox before exit. A refusal at this point means the actor has
-		// fully exited OR the inbox is wedged past the send timeout; both
-		// are pathological, counted for ops visibility.
-		var event string
-		var ok bool
+	// Wait for the actor to fire evProvisionRequested on its SM. If the
+	// SM rejects (shouldn't happen given the synchronous validation
+	// above, but defensive), roll back the provision entry and surface.
+	select {
+	case err := <-ack:
 		if err != nil {
-			event = "provision_errored"
-			ok = actor.sendTerminal(provisionErroredMsg{callbackErr: callbackErr, lastError: err.Error()})
-		} else {
-			event = "provision_completed"
-			ok = actor.sendTerminal(provisionCompletedMsg{result: result})
+			provCancel()
+			b.removeProvision(req.LeaseUUID)
+			return err
 		}
-		if !ok {
-			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
-			b.logger.Warn("terminal provision event dropped (actor exited or inbox wedged)",
-				"lease_uuid", req.LeaseUUID,
-				"event", event,
-			)
-		}
-	})
-
+	case <-ctx.Done():
+		provCancel()
+		b.removeProvision(req.LeaseUUID)
+		return ctx.Err()
+	case <-b.stopCtx.Done():
+		provCancel()
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("backend shutting down")
+	}
 	return nil
 }
 
