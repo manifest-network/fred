@@ -130,11 +130,31 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 //	result.err != nil, result.restored→ replaceRecoveredMsg → Ready, Failed+suffix callback
 //	result.err != nil, !result.restored→ replaceFailedMsg   → Failed, Failed callback
 //
+// On success, publishes the new ContainerIDs/ServiceContainers to the
+// provision struct *before* the terminal send. This mirrors the Provision
+// pre-publish (bug_012): if Deprovision preempts between here and the SM
+// entry action, the stale-old-IDs window would otherwise orphan the newly
+// created containers. Recovery/failure paths leave ContainerIDs untouched
+// (old containers are still referenced, or the entry action will write
+// whatever the failure path produced).
+//
 // Uses sendTerminal so the SM records the outcome even during shutdown —
 // the actor's run loop drains the inbox before exit. A refused send at
 // this point means the actor has fully exited or the inbox is wedged;
 // both are pathological and counted for ops visibility.
 func fireReplaceOutcome(actor *leaseActor, result replaceResult) {
+	if result.err == nil {
+		b := actor.backend
+		b.provisionsMu.Lock()
+		if p, ok := b.provisions[actor.leaseUUID]; ok {
+			p.ContainerIDs = result.success.containerIDs
+			if result.success.serviceContainers != nil {
+				p.ServiceContainers = result.success.serviceContainers
+			}
+		}
+		b.provisionsMu.Unlock()
+	}
+
 	var event string
 	var ok bool
 	switch {
