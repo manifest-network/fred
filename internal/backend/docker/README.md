@@ -288,6 +288,13 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 
 ## Lease State Machine
 
+**One concept: the lease actor is the scope of atomicity for its messages and its workers.** Everything else falls out of that invariant:
+
+- **Registry atomicity** — the actor registry (`b.actors`) is guarded by a mutex; `routeToLease(uuid, msg)` resolves-or-creates AND enqueues under that mutex, so callers never hold a `*leaseActor` pointer. Stale-pointer races are unreachable by construction.
+- **Worker ownership** — every worker goroutine (provision, restart, update, diag) is spawned by the actor and tracked by its per-actor `workersWg`. The actor's exit defers wait on `workersWg` BEFORE registry-delete / `done`-close / drain — the actor cannot exit while a worker is in flight, so orphan-worker races are eliminated.
+- **Drain-with-handle** — on exit, any message in the inbox is processed via `handle()` (not just closed-and-dropped). Terminal events delivered during the shutdown window still drive their SM transition. Silent drops are gone.
+- **Non-blocking routing** — `routeToLease` uses a non-blocking inbox send under the registry mutex. A wedged actor cannot stall the event loop; full-inbox refusals increment `die_event_dropped_total` and the reconciler re-detects within its cycle.
+
 Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state is the lease's current `Status` at actor creation — new leases start in `Provisioning`, recovered leases start in whatever state they were in.
 
 ```mermaid
@@ -327,18 +334,21 @@ The edges above are the complete set of allowed transitions; any event not liste
 ### Key behaviors
 
 - **`Ready → Failing` guard.** The `ContainerDied` trigger fires only if a Docker `Inspect` confirms the container actually exited. Die events can be duplicated or stale; the guard filters them.
-- **Preemption via `OnExit` cancellation.** `Failing`, `Provisioning`, `Restarting`, and `Updating` each run an async goroutine (diag gather, provision work, or container replacement). Every transition out of these states cancels the goroutine's context via the state's `OnExit` action. The goroutine's I/O respects `ctx`, returns early, and never fires its "completed" event — suppressing stale terminal callbacks when a `Deprovision` preempts.
+- **Preemption via `OnExit` cancellation + `workersWg.Wait`.** `Failing`, `Provisioning`, `Restarting`, and `Updating` each own one async worker goroutine (diag gather, provision, or replace). Every transition out of these states calls the worker's `CancelFunc` via `OnExit`, then `a.waitForWorkers()` blocks on the per-actor `workersWg` until the goroutine has returned and its terminal `sendTerminal` has landed in the inbox. A preempting `Deprovision` observes post-cleanup state deterministically — no orphan-container race.
 - **Defense-in-depth `Ignore` on `Deprovisioning`.** Cancellation is best-effort: a goroutine can race past the cancel signal and fire its completion event anyway. `Deprovisioning` ignores every such event (`DiagGathered`, `ProvisionCompleted`, `ProvisionErrored`, `ReplaceCompleted`, `ReplaceRecovered`, `ReplaceFailed`) so the race is structurally safe.
 - **One terminal callback per lease.** Callback emission lives in SM entry actions (`onEnterReadyFromProvision`, `onEnterFailedFromDiag`, `onEnterFailedFromProvision`, `onEnterReadyFromReplaceCompleted`, `onEnterReadyFromReplaceRecovered`, `onEnterFailedFromReplace`), never in goroutines. Combined with the preemption/ignore rules above, this guarantees at most one `success`/`failed`/`deprovisioned` callback per lease per terminal transition.
 - **Three `Replace*` events for two terminal states.** `ReplaceCompleted` means restart/update succeeded (→ `Ready`, Success callback). `ReplaceRecovered` means it failed but rollback restored a working lease (→ `Ready`, Failed callback with rollback suffix). `ReplaceFailed` means both the operation and the rollback failed (→ `Failed`, Failed callback).
-- **Back-pressure on burst.** A single lease with many rapid events (e.g. multi-container crash storm) fills its 16-slot inbox and then backpressures senders. Events on distinct leases are fully parallel — actors don't share inboxes.
+- **Non-blocking routing, reconciler backstop.** `routeToLease` is non-blocking: a full inbox returns false rather than blocking the caller. `containerEventLoop` and the reconcile die-event dispatch treat refusal as "reconciler will re-detect within its cycle" and increment `die_event_dropped_total`. One wedged actor can no longer stall die-event delivery for other leases.
 
 ### Observability
 
 - `fred_docker_backend_lease_sm_transitions_total{from,to,event}` — every transition.
-- `fred_docker_backend_lease_actors_created_total` — cumulative actor count; should track distinct leases.
+- `fred_docker_backend_lease_actors_created_total` — cumulative actor count; should track distinct leases (recycled UUIDs after Deprovision produce a fresh actor, so this counter grows faster than the live-actor count).
 - `fred_docker_backend_lease_actor_stuck_seconds` — age of the oldest in-flight actor handler. Alert threshold should exceed the longest legitimate operation (Deprovision can hold an actor for minutes during container/volume cleanup).
 - `fred_docker_backend_lease_actor_inbox_depth` — histogram of per-actor inbox depth; p99 near 0 is healthy.
+- `fred_docker_backend_lease_actor_panics_total` — counts panics recovered inside actor handlers. Any non-zero is a bug; the actor survives and keeps processing, but the message that panicked did not drive its transition.
+- `fred_docker_backend_lease_terminal_event_dropped_total{event}` — worker terminal sends refused because the actor had exited (pathological `waitForWorkers` timeout). Should be zero in normal operation.
+- `fred_docker_backend_die_event_dropped_total{source}` — container-death events refused because the actor's inbox was full or the backend was shutting down. `source` is `event_loop` or `reconcile`. Not data loss — the reconciler re-detects — but a sustained non-zero value flags a wedged actor or chronic burst.
 
 ## State Recovery
 

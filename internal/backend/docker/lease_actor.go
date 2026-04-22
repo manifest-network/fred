@@ -140,8 +140,38 @@ type replaceFailedMsg struct {
 func (replaceFailedMsg) isLeaseMessage()         {}
 func (replaceFailedMsg) doneChan() chan struct{} { return nil }
 
-// leaseActor owns all state transitions for a single lease. Messages are
-// processed serially from inbox, so handlers never race with themselves.
+// leaseActor owns all state transitions and async work for a single lease.
+//
+// One concept: the actor is the scope of atomicity for its messages and
+// its workers. Everything else falls out of that:
+//
+//   - Registry atomicity — b.actors is guarded by actorsMu.
+//     routeToLease() resolves-or-creates AND enqueues under the mutex;
+//     removeFromRegistry (on actor exit) deletes under the same mutex.
+//     External callers never hold a *leaseActor pointer, so stale-
+//     pointer races are unreachable by construction.
+//
+//   - Worker ownership — every worker goroutine (provision, restart,
+//     update, diag) is spawned by the actor (via spawnProvisionWorker /
+//     spawnReplaceWorker / onEnterFailing's goroutine) and tracked by
+//     workersWg. The actor's exit defers waitForWorkers BEFORE
+//     registry-delete / close(done) / drainInbox — the actor cannot
+//     exit while a worker is in flight. Workers always have a live
+//     actor to sendTerminal to, so orphan-worker races are eliminated.
+//
+//   - Drain-with-handle — the drainInbox defer calls handle() on every
+//     queued message, so a worker's terminal sendTerminal that landed
+//     while the actor was waiting for workers still drives its SM
+//     transition. Silent drops are gone.
+//
+//   - Non-blocking routing — routeToLease does a non-blocking send
+//     under the registry mutex. A wedged actor cannot stall the
+//     event-loop or other routing callers; refusals are counted in
+//     die_event_dropped_total and the reconciler re-detects.
+//
+// Messages are processed serially from inbox, so handlers never race
+// with themselves. SM transitions are synchronous inside handle() —
+// Fire dispatches OnExit / OnEntry in the actor's own goroutine.
 type leaseActor struct {
 	leaseUUID string
 	backend   *Backend
