@@ -86,10 +86,13 @@ func (provisionErroredMsg) isLeaseMessage()         {}
 func (provisionErroredMsg) doneChan() chan struct{} { return nil }
 
 // restartRequestedMsg / updateRequestedMsg fire the Ready|Failed → Restarting
-// or → Updating transition and register the goroutine's cancel func so
-// preemption by Deprovision can abort the in-flight work.
+// or → Updating transition and register the goroutine's cancel func + done
+// channel. The done channel is closed by the goroutine's outermost defer;
+// Restarting/Updating.OnExit waits on it so a preempting Deprovision observes
+// a post-cleanup container set, not a mid-flight window.
 type restartRequestedMsg struct {
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func (restartRequestedMsg) isLeaseMessage()         {}
@@ -97,6 +100,7 @@ func (restartRequestedMsg) doneChan() chan struct{} { return nil }
 
 type updateRequestedMsg struct {
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func (updateRequestedMsg) isLeaseMessage()         {}
@@ -151,16 +155,19 @@ type leaseActor struct {
 	// cc62f3b structural mechanism: any transition out of Failing cancels
 	// the goroutine before any stale Failed callback can be emitted.
 	diagCancel context.CancelFunc
-	// provisionCancel mirrors diagCancel for the Provision flow. Set when
-	// the doProvision goroutine is spawned; called by Provisioning.OnExit
-	// on DeprovisionRequested preemption.
-	provisionCancel context.CancelFunc
-	// provisionDone is closed by the doProvision goroutine on exit.
-	// Provisioning.OnExit waits on it (bounded) before returning so a
-	// preempting doDeprovision sees either pre-published ContainerIDs or
-	// the cleanup result of doProvision's defer — not an empty snapshot
-	// taken mid-flight.
-	provisionDone chan struct{}
+	// workCancel mirrors diagCancel for the Provision/Restart/Update flows.
+	// Set when the work goroutine is spawned; called by
+	// Provisioning/Restarting/Updating.OnExit on DeprovisionRequested
+	// preemption.
+	workCancel context.CancelFunc
+	// workDone is closed by the in-flight work goroutine (provision,
+	// restart, or update) on exit. Provisioning/Restarting/Updating.OnExit
+	// waits on it (bounded) before returning so a preempting doDeprovision
+	// sees either pre-published ContainerIDs or the cleanup result of the
+	// goroutine's defer — not an empty snapshot taken mid-flight. Also
+	// used by the actor's run() loop on shutdown to let the in-flight
+	// goroutine deliver its terminal SM event before the actor exits.
+	workDone chan struct{}
 	// currentMessageStart is the UnixNano timestamp of the message the
 	// actor is currently processing in handle(), or 0 when idle. Used by
 	// the stuck-actor sampler to detect hung handlers. Written by the
@@ -203,22 +210,53 @@ func (a *leaseActor) run() {
 	defer close(a.done)
 	defer a.drainInbox()
 	for {
-		// If shutdown fired before this iteration, exit before Go's select
-		// has a chance to pick a ready inbox over a ready stopCtx (select
-		// randomises among ready cases). Shutdown racing *inside* the select
-		// below can still process one more message; that window is not
-		// reachable from the production event loop, which exits first.
-		if a.backend.stopCtx.Err() != nil {
-			return
-		}
 		if a.terminated {
 			return
 		}
+		// On shutdown, the actor does NOT exit immediately. It first waits
+		// for any in-flight work goroutine (provision/restart/update) to
+		// finish and drains the inbox so the SM records terminal outcomes
+		// before the actor is torn down. This closes the bug_004 window
+		// where a successful goroutine delivered its terminal event to an
+		// actor that had already exited on stopCtx, leaving releaseStore /
+		// callback state out of sync with the physical host.
 		select {
-		case <-a.backend.stopCtx.Done():
-			return
 		case msg := <-a.inbox:
 			a.handle(msg)
+		case <-a.backend.stopCtx.Done():
+			a.drainOnShutdown()
+			return
+		}
+	}
+}
+
+// drainOnShutdown waits for the in-flight work goroutine to deliver its
+// terminal SM event, then processes any queued messages so the SM records
+// every observable outcome before the actor exits. Bounded so a wedged
+// goroutine can't block shutdown indefinitely.
+func (a *leaseActor) drainOnShutdown() {
+	if a.workDone != nil {
+		select {
+		case <-a.workDone:
+		case <-time.After(workExitWaitTimeout):
+			a.backend.logger.Warn("actor shutdown drain: work goroutine did not exit within timeout",
+				"lease_uuid", a.leaseUUID,
+				"timeout", workExitWaitTimeout,
+			)
+		}
+	}
+	// Drain whatever landed in the inbox — typically the work goroutine's
+	// terminal SM event, plus any messages queued between stopCtx firing
+	// and drain beginning.
+	for {
+		select {
+		case msg := <-a.inbox:
+			a.handle(msg)
+			if a.terminated {
+				return
+			}
+		default:
+			return
 		}
 	}
 }
@@ -270,14 +308,14 @@ func (a *leaseActor) handle(msg leaseMessage) {
 		a.handleDiagGathered(m.result)
 	case provisionRequestedMsg:
 		a.handleProvisionRequested(m.cancel, m.done)
+	case restartRequestedMsg:
+		a.handleRestartRequested(m.cancel, m.done)
+	case updateRequestedMsg:
+		a.handleUpdateRequested(m.cancel, m.done)
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
 		a.handleProvisionErrored(m.callbackErr, m.lastError)
-	case restartRequestedMsg:
-		a.handleRestartRequested(m.cancel)
-	case updateRequestedMsg:
-		a.handleUpdateRequested(m.cancel)
 	case replaceCompletedMsg:
 		a.handleReplaceCompleted(m.result)
 	case replaceRecoveredMsg:
@@ -308,8 +346,8 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 // ProvisionCompleted / ProvisionErrored messages land in a correctly-
 // positioned SM.
 func (a *leaseActor) handleProvisionRequested(cancel context.CancelFunc, done chan struct{}) {
-	a.provisionCancel = cancel
-	a.provisionDone = done
+	a.workCancel = cancel
+	a.workDone = done
 	_ = a.sm.Fire(a.backend.stopCtx, evProvisionRequested)
 }
 
@@ -324,13 +362,15 @@ func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string) {
 	})
 }
 
-func (a *leaseActor) handleRestartRequested(cancel context.CancelFunc) {
-	a.provisionCancel = cancel
+func (a *leaseActor) handleRestartRequested(cancel context.CancelFunc, done chan struct{}) {
+	a.workCancel = cancel
+	a.workDone = done
 	_ = a.sm.Fire(a.backend.stopCtx, evRestartRequested)
 }
 
-func (a *leaseActor) handleUpdateRequested(cancel context.CancelFunc) {
-	a.provisionCancel = cancel
+func (a *leaseActor) handleUpdateRequested(cancel context.CancelFunc, done chan struct{}) {
+	a.workCancel = cancel
+	a.workDone = done
 	_ = a.sm.Fire(a.backend.stopCtx, evUpdateRequested)
 }
 
@@ -348,6 +388,14 @@ func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
 
 // send enqueues a message. Blocks when the inbox is full (backpressure).
 // Returns false if the backend is shutting down.
+//
+// Use this for NEW work originating from external API paths (Provision,
+// Deprovision, Restart, Update, containerEventLoop). On shutdown these
+// paths should refuse new requests; the false return is the signal.
+//
+// For TERMINAL events delivered by in-flight work goroutines — whose
+// physical work has already happened on the host and MUST be recorded by
+// the SM — use sendTerminal instead.
 func (a *leaseActor) send(msg leaseMessage) bool {
 	// If shutdown already happened, refuse before the select — otherwise
 	// Go's random choice between a ready stopCtx and a free inbox slot could
@@ -362,6 +410,31 @@ func (a *leaseActor) send(msg leaseMessage) bool {
 		return true
 	}
 }
+
+// sendTerminal enqueues a terminal SM event from an in-flight work
+// goroutine. Bypasses the stopCtx refusal that send() applies because the
+// goroutine has already done its physical work (containers created,
+// swapped, removed) — the SM must record the outcome even during
+// shutdown to keep releaseStore / in-memory state / the callback record
+// consistent with the host. Returns false only if the actor has fully
+// exited (inbox no longer drained) or the bounded inbox is wedged; in
+// either case the drop is counted via leaseTerminalEventDroppedTotal at
+// the call site.
+func (a *leaseActor) sendTerminal(msg leaseMessage) bool {
+	select {
+	case a.inbox <- msg:
+		return true
+	case <-a.done:
+		return false
+	case <-time.After(terminalSendTimeout):
+		return false
+	}
+}
+
+// terminalSendTimeout bounds how long a terminal send will wait for inbox
+// space. Long enough for the actor to drain typical backlogs, short
+// enough that a wedged actor doesn't pin the goroutine indefinitely.
+const terminalSendTimeout = 10 * time.Second
 
 // actorFor returns the lease actor for leaseUUID, creating and starting it on
 // first access. Concurrent callers see the same actor; the losing goroutine

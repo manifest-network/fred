@@ -217,22 +217,24 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// Ordering is preserved by the inbox's FIFO delivery.
 	actor := b.actorFor(req.LeaseUUID)
 	provCtx, provCancel := b.shutdownAwareContext()
-	// provisionDone is closed by the goroutine's outermost defer. The actor's
+	// workDone is closed by the goroutine's outermost defer. The actor's
 	// Provisioning.OnExit waits on it (bounded) so a preempting Deprovision
 	// either sees pre-published ContainerIDs or post-cleanup state — never
 	// a mid-flight window where containers exist on the host but the
-	// provision struct reports none (bug_012).
-	provisionDone := make(chan struct{})
-	if !actor.send(provisionRequestedMsg{cancel: provCancel, done: provisionDone}) {
+	// provision struct reports none (bug_012). The actor's run loop also
+	// waits on it during shutdown so the terminal SM event lands before
+	// the actor exits (bug_004).
+	workDone := make(chan struct{})
+	if !actor.send(provisionRequestedMsg{cancel: provCancel, done: workDone}) {
 		provCancel()
-		close(provisionDone)
+		close(workDone)
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("backend shutting down")
 	}
 	b.wg.Go(func() {
 		// LIFO: provCancel runs first (notify anything on provCtx), then
 		// the done signal unblocks OnExit's wait.
-		defer close(provisionDone)
+		defer close(workDone)
 		defer provCancel()
 
 		var callbackErr string
@@ -246,7 +248,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		// On success, publish ContainerIDs to the provision struct *before*
 		// sending provisionCompletedMsg. The SM's Ready entry action rewrites
 		// the same field with the same value; the early publish exists so
-		// a concurrent doDeprovision (waiting on provisionDone in OnExit)
+		// a concurrent doDeprovision (waiting on workDone in OnExit)
 		// observes the IDs and removes them cleanly. On error, doProvision's
 		// own defer has already cleaned up the containers, so no pre-publish
 		// is needed.
@@ -257,23 +259,23 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			}
 			b.provisionsMu.Unlock()
 		}
-		// A send refusal means shutdown fired between the goroutine starting
-		// and this terminal notification. The physical work succeeded (or
-		// failed with cleanup already run by the defer above), but the SM
-		// never saw the outcome. Log + count so operators can correlate
-		// stuck provision/release records with these drops.
+		// sendTerminal bypasses the stopCtx refusal so the SM records the
+		// outcome even during shutdown — the actor's run loop drains the
+		// inbox before exit. A refusal at this point means the actor has
+		// fully exited OR the inbox is wedged past the send timeout; both
+		// are pathological, counted for ops visibility.
 		var event string
 		var ok bool
 		if err != nil {
 			event = "provision_errored"
-			ok = actor.send(provisionErroredMsg{callbackErr: callbackErr, lastError: err.Error()})
+			ok = actor.sendTerminal(provisionErroredMsg{callbackErr: callbackErr, lastError: err.Error()})
 		} else {
 			event = "provision_completed"
-			ok = actor.send(provisionCompletedMsg{result: result})
+			ok = actor.sendTerminal(provisionCompletedMsg{result: result})
 		}
 		if !ok {
 			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
-			b.logger.Warn("terminal provision event dropped during shutdown",
+			b.logger.Warn("terminal provision event dropped (actor exited or inbox wedged)",
 				"lease_uuid", req.LeaseUUID,
 				"event", event,
 			)

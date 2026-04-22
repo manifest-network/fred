@@ -93,8 +93,10 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	// replaceFailedMsg (Failed).
 	actor := b.actorFor(req.LeaseUUID)
 	opCtx, opCancel := b.shutdownAwareContext()
-	if !actor.send(restartRequestedMsg{cancel: opCancel}) {
+	workDone := make(chan struct{})
+	if !actor.send(restartRequestedMsg{cancel: opCancel, done: workDone}) {
 		opCancel()
+		close(workDone)
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[req.LeaseUUID]; ok {
 			p.Status = prevStatus
@@ -104,6 +106,9 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		return fmt.Errorf("backend shutting down")
 	}
 	b.wg.Go(func() {
+		// LIFO: opCancel first (notify opCtx consumers), then close
+		// workDone to unblock Restarting.OnExit's wait.
+		defer close(workDone)
 		defer opCancel()
 
 		var result replaceResult
@@ -125,29 +130,27 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 //	result.err != nil, result.restored→ replaceRecoveredMsg → Ready, Failed+suffix callback
 //	result.err != nil, !result.restored→ replaceFailedMsg   → Failed, Failed callback
 //
-// If send is refused (backend shutting down) the event is logged and
-// counted: the goroutine has already done the physical work (container
-// swap, rollback) but the SM record for the outcome was not delivered,
-// so on next startup recoverState must re-reconcile. TODO: once shutdown
-// gains a drain phase that lets terminal events through, drop the metric
-// and treat refusal as a bug.
+// Uses sendTerminal so the SM records the outcome even during shutdown —
+// the actor's run loop drains the inbox before exit. A refused send at
+// this point means the actor has fully exited or the inbox is wedged;
+// both are pathological and counted for ops visibility.
 func fireReplaceOutcome(actor *leaseActor, result replaceResult) {
 	var event string
 	var ok bool
 	switch {
 	case result.err == nil:
 		event = "replace_completed"
-		ok = actor.send(replaceCompletedMsg{result: result.success})
+		ok = actor.sendTerminal(replaceCompletedMsg{result: result.success})
 	case result.restored:
 		event = "replace_recovered"
-		ok = actor.send(replaceRecoveredMsg{info: result.failure})
+		ok = actor.sendTerminal(replaceRecoveredMsg{info: result.failure})
 	default:
 		event = "replace_failed"
-		ok = actor.send(replaceFailedMsg{info: result.failure})
+		ok = actor.sendTerminal(replaceFailedMsg{info: result.failure})
 	}
 	if !ok {
 		leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
-		actor.backend.logger.Warn("terminal replace event dropped during shutdown",
+		actor.backend.logger.Warn("terminal replace event dropped (actor exited or inbox wedged)",
 			"lease_uuid", actor.leaseUUID,
 			"event", event,
 		)
@@ -863,8 +866,10 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		// Async phase: stack update (same actor routing as single-manifest Update).
 		actor := b.actorFor(req.LeaseUUID)
 		opCtx, opCancel := b.shutdownAwareContext()
-		if !actor.send(updateRequestedMsg{cancel: opCancel}) {
+		workDone := make(chan struct{})
+		if !actor.send(updateRequestedMsg{cancel: opCancel, done: workDone}) {
 			opCancel()
+			close(workDone)
 			b.provisionsMu.Lock()
 			if p, ok := b.provisions[req.LeaseUUID]; ok {
 				p.Status = prevStatus
@@ -874,6 +879,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			return fmt.Errorf("backend shutting down")
 		}
 		b.wg.Go(func() {
+			defer close(workDone)
 			defer opCancel()
 
 			result := b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
@@ -921,8 +927,10 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	// Async phase: route through the actor (same pattern as Restart).
 	actor := b.actorFor(req.LeaseUUID)
 	opCtx, opCancel := b.shutdownAwareContext()
-	if !actor.send(updateRequestedMsg{cancel: opCancel}) {
+	workDone := make(chan struct{})
+	if !actor.send(updateRequestedMsg{cancel: opCancel, done: workDone}) {
 		opCancel()
+		close(workDone)
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[req.LeaseUUID]; ok {
 			p.Status = prevStatus
@@ -932,6 +940,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return fmt.Errorf("backend shutting down")
 	}
 	b.wg.Go(func() {
+		defer close(workDone)
 		defer opCancel()
 
 		result := b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)

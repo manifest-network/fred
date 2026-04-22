@@ -327,6 +327,86 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 	}
 }
 
+// TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural fix
+// for bug_004: when stopCtx fires with an in-flight work goroutine, the
+// actor must (1) wait for the goroutine to close workDone, (2) drain the
+// inbox so the terminal SM event is processed, and only then exit. The
+// pre-fix behavior dropped the event at the send-check because the actor
+// had already exited on stopCtx, leaving the release store / callback
+// record out of sync with the physical host.
+func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusProvisioning,
+			ContainerIDs: nil,
+		},
+	})
+
+	actor := b.actorFor("lease-1")
+	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
+
+	// Install synthetic work-goroutine handles on the actor (same
+	// mechanism the real provision.go goroutine uses).
+	workDone := make(chan struct{})
+	actor.workCancel = func() {}
+	actor.workDone = workDone
+
+	// Fire shutdown BEFORE the goroutine has finished. The actor should
+	// not exit yet — it has to wait for workDone + drain the inbox.
+	b.stopCancel()
+
+	// Simulate the work goroutine: send its terminal event via
+	// sendTerminal (which must not be refused on shutdown), then close
+	// workDone. The actor should then drain the inbox and process the
+	// event, flipping Status to Ready.
+	go func() {
+		ok := actor.sendTerminal(provisionCompletedMsg{
+			result: provisionSuccessResult{
+				containerIDs: []string{"c1"},
+			},
+		})
+		require.True(t, ok, "sendTerminal must not refuse during shutdown drain")
+		close(workDone)
+	}()
+
+	// The actor must exit cleanly, and the provision must be Ready.
+	select {
+	case <-actor.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("actor did not exit after shutdown drain")
+	}
+
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	prov := b.provisions["lease-1"]
+	require.NotNil(t, prov)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,
+		"terminal provisionCompletedMsg sent during shutdown must have been drained and processed")
+	assert.Equal(t, []string{"c1"}, prov.ContainerIDs,
+		"ContainerIDs must reflect the SM entry action running on the drained event")
+}
+
+// TestLeaseActor_SendTerminalRefusesAfterActorExit guards the sendTerminal
+// contract: once the actor has fully exited (a.done closed), sendTerminal
+// must return false rather than block forever on a channel nobody will
+// drain. This lets call sites count + log the dropped event instead of
+// wedging the goroutine.
+func TestLeaseActor_SendTerminalRefusesAfterActorExit(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+
+	actor := b.actorFor("lease-gone")
+	// Force the actor to exit by shutting down and waiting for it.
+	b.stopCancel()
+	<-actor.done
+
+	ok := actor.sendTerminal(provisionCompletedMsg{})
+	assert.False(t, ok, "sendTerminal must refuse once the actor has exited")
+}
+
 // TestHandleContainerDeath_ShutdownDoesNotHang guards the sync shim's
 // stopCtx branch: once the backend is shutting down, the shim must return
 // promptly instead of blocking on a done channel the actor will never close.

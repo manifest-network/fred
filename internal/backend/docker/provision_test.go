@@ -4904,8 +4904,8 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 // stay on the host even though the provision struct reports none.
 //
 // Unit-tests the wait mechanism directly: installs synthetic
-// provisionCancel + provisionDone on the actor, fires Deprovision,
-// verifies OnExit blocks until provisionDone closes, and verifies
+// workCancel + workDone on the actor, fires Deprovision,
+// verifies OnExit blocks until workDone closes, and verifies
 // doDeprovision then observes the "pre-published" ContainerIDs
 // (simulating the real goroutine's pre-publish step).
 func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
@@ -4942,23 +4942,23 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	// per Go's channel memory model.
 	var cancelCalled atomic.Bool
 	goroutineFinished := make(chan struct{})
-	actor.provisionCancel = func() { cancelCalled.Store(true) }
-	actor.provisionDone = goroutineFinished
+	actor.workCancel = func() { cancelCalled.Store(true) }
+	actor.workDone = goroutineFinished
 
 	deprovErr := make(chan error, 1)
 	go func() {
 		deprovErr <- b.Deprovision(context.Background(), "lease-1")
 	}()
 
-	// OnExit must have called provisionCancel before entering the wait.
+	// OnExit must have called workCancel before entering the wait.
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
-		"OnExit must call provisionCancel before waiting on provisionDone")
+		"OnExit must call workCancel before waiting on workDone")
 
 	// Deprovision must be blocked on OnExit's wait — doDeprovision has
 	// not yet run (otherwise the reply would have been sent).
 	select {
 	case err := <-deprovErr:
-		t.Fatalf("Deprovision returned before provisionDone closed: %v", err)
+		t.Fatalf("Deprovision returned before workDone closed: %v", err)
 	case <-time.After(100 * time.Millisecond):
 		// Good — OnExit is correctly blocked.
 	}
@@ -4973,9 +4973,9 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 
 	select {
 	case err := <-deprovErr:
-		require.NoError(t, err, "Deprovision must succeed after provisionDone closes")
+		require.NoError(t, err, "Deprovision must succeed after workDone closes")
 	case <-time.After(3 * time.Second):
-		t.Fatal("Deprovision did not complete after provisionDone closed")
+		t.Fatal("Deprovision did not complete after workDone closed")
 	}
 
 	removedMu.Lock()
