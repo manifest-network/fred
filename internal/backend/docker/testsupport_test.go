@@ -1,5 +1,17 @@
 package docker
 
+// actorFor resolves the lease actor for leaseUUID, creating and starting
+// one if absent. Test-only since Phase 2: production code uses
+// routeToLease to deliver messages without ever exposing an actor
+// pointer to the caller. Tests retain direct access for synthetic
+// scenario setup (installing workersWg entries, poking SM state,
+// asserting invariants) that can't go through the message path.
+func (b *Backend) actorFor(leaseUUID string) *leaseActor {
+	b.actorsMu.Lock()
+	defer b.actorsMu.Unlock()
+	return b.actorForLocked(leaseUUID)
+}
+
 // handleContainerDeath synchronously dispatches a container death to the
 // owning lease's actor and waits for processing to complete. Exists as a
 // test helper so direct-call unit tests can keep their synchronous

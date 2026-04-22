@@ -219,8 +219,9 @@ func (a *leaseActor) run() {
 	//      arrive have already landed in a.inbox.
 	//   2. removeFromRegistry runs SECOND — concurrent routeToLease calls
 	//      immediately create a fresh actor under actorsMu.
-	//   3. close(a.done) runs THIRD — hasExited becomes true; any stale
-	//      send/sendTerminal references deterministically refuse.
+	//   3. close(a.done) runs THIRD — hasExited becomes true; any
+	//      sendTerminal that raced past a waitForWorkers timeout refuses
+	//      deterministically (normal operation never reaches this).
 	//   4. drainInbox runs LAST — processes every message in the inbox via
 	//      handle(), so terminal events from workers actually drive their
 	//      SM transitions before the actor is gone.
@@ -488,19 +489,13 @@ func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
 // send enqueues a message. Blocks when the inbox is full (backpressure).
 // Returns false if the backend is shutting down OR the actor has exited.
 //
-// Use this for NEW work originating from external API paths (Provision,
-// Deprovision, Restart, Update, containerEventLoop). On shutdown these
-// paths should refuse new requests; the false return is the signal.
+// Test-only since Phase 1: production code uses b.routeToLease(uuid, msg)
+// which never exposes an actor pointer to the caller. This method is
+// retained for test code that needs synthetic direct-send scenarios.
 //
 // For TERMINAL events delivered by in-flight work goroutines — whose
-// physical work has already happened on the host and MUST be recorded by
-// the SM — use sendTerminal instead.
-//
-// The hasExited pre-check + a.done select arm give the same deterministic
-// refusal semantics as sendTerminal: if the actor has exited (run loop
-// returned, b.actors.Delete fired), subsequent sends through a
-// still-referenced actor pointer refuse rather than queue into an inbox
-// nobody will drain.
+// physical work has already happened on the host and MUST be recorded
+// by the SM even during shutdown — use sendTerminal instead.
 func (a *leaseActor) send(msg leaseMessage) bool {
 	if a.backend.stopCtx.Err() != nil || a.hasExited() {
 		return false
@@ -538,14 +533,15 @@ func (a *leaseActor) hasExited() bool {
 // either case the drop is counted via leaseTerminalEventDroppedTotal at
 // the call site.
 //
-// The hasExited fast-path is required for correctness: once a.done is
-// closed AND the inbox has space, Go's select picks non-deterministically
-// between `a.inbox <- msg` and `<-a.done`. Without the pre-check,
-// post-shutdown sendTerminal would succeed half the time, queueing into
-// an inbox nobody will drain — a silent drop returning true. A narrow
-// race remains if a.done closes *between* hasExited and the select, but
-// that window is microseconds, and within that window the message is
-// still caught by drainOnShutdown's final inbox pass.
+// The hasExited fast-path is required for correctness in the edge case
+// where waitForWorkers has timed out (wedged worker, 45s elapsed): the
+// actor proceeded to exit with the worker still running, and the late
+// sendTerminal must refuse deterministically rather than queue into an
+// inbox nobody will drain. Without the pre-check, Go's select would
+// pick non-deterministically between `a.inbox <- msg` and `<-a.done`.
+// In normal operation workersWg.Wait ensures sendTerminal always runs
+// with the actor alive, so the check is effectively a defense against
+// the timeout edge case.
 func (a *leaseActor) sendTerminal(msg leaseMessage) bool {
 	if a.hasExited() {
 		return false
@@ -616,18 +612,6 @@ func (b *Backend) routeToLease(leaseUUID string, msg leaseMessage) bool {
 	default:
 		return false
 	}
-}
-
-// actorFor is the legacy entry point retained for internal use during the
-// registry-mutex migration. New code should use routeToLease. Callers must
-// treat the returned pointer as ephemeral — it is only safe to use within
-// the current goroutine-step.
-//
-// TODO(phase2): delete once all external call sites use routeToLease.
-func (b *Backend) actorFor(leaseUUID string) *leaseActor {
-	b.actorsMu.Lock()
-	defer b.actorsMu.Unlock()
-	return b.actorForLocked(leaseUUID)
 }
 
 // ActorSnapshot is a point-in-time view of one lease actor's state for
