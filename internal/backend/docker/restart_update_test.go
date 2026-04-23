@@ -60,7 +60,7 @@ func TestRestart_AllowedFromFailed(t *testing.T) {
 		},
 	}
 
-	// Block the async phase so we can observe the Restarting state.
+	// Block the replace worker so we can observe the Restarting state.
 	stopStarted := make(chan struct{})
 	stopRelease := make(chan struct{})
 	mock := &mockDockerClient{
@@ -162,7 +162,7 @@ func TestRestart_SetsRestartingStatus(t *testing.T) {
 		},
 	}
 
-	// Block the async phase so we can observe the Restarting state.
+	// Block the replace worker so we can observe the Restarting state.
 	stopStarted := make(chan struct{})
 	stopRelease := make(chan struct{})
 	mock := &mockDockerClient{
@@ -874,9 +874,16 @@ func TestUpdate_Failure_ImagePullFails(t *testing.T) {
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
-	// Preflight failures restore prevStatus since no containers were modified —
-	// old containers are still running and serving traffic.
-	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+	// Update preflight failure forces Status=Failed regardless of the
+	// old containers still running. The user's desired state (the new
+	// image) was not achieved, so the lease is semantically Failed
+	// until the user retries. The operator sees a clear "deployment
+	// failed" signal via Status + LastError + CallbackStatusFailed
+	// rather than a misleading Status=Ready with an error stashed in
+	// LastError. (Distinct from Restart preflight, which keeps
+	// prevStatus because the operation's goal is independent of the
+	// operator's intent being achievable.)
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 	assert.Equal(t, 1, prov.FailCount)
 	assert.Contains(t, prov.LastError, "registry unreachable")
 }
@@ -1724,8 +1731,8 @@ func TestConcurrentRestartAndUpdate_OnlyOneSucceeds(t *testing.T) {
 		},
 	}
 
-	// Block StopContainer so the first caller holds the async phase long enough
-	// for the second to attempt its call.
+	// Block StopContainer so the first caller holds the replace worker long
+	// enough for the second to attempt its call.
 	stopStarted := make(chan struct{}, 2)
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
@@ -2080,7 +2087,7 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 // TestUpdate_ActiveProvisionsGauge verifies that the activeProvisions gauge
 // is adjusted correctly when an update image pull fails (preflight failure).
 func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
-	t.Run("image pull failure from Ready keeps gauge unchanged", func(t *testing.T) {
+	t.Run("image pull failure from Ready decrements gauge (Ready→Failed)", func(t *testing.T) {
 		activeProvisions.Set(5)
 
 		mock := &mockDockerClient{
@@ -2131,12 +2138,14 @@ func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
 		lastError := b.provisions["lease-1"].LastError
 		b.provisionsMu.RUnlock()
 
-		// Preflight failures restore prevStatus since no containers were
-		// modified — old containers are still running and serving traffic.
-		assert.Equal(t, backend.ProvisionStatusReady, status)
+		// Update preflight failure forces Status=Failed (desired state
+		// not achieved). The Ready→Failed transition decrements the
+		// activeProvisions gauge to match — the lease is no longer
+		// counted as a successful active provision.
+		assert.Equal(t, backend.ProvisionStatusFailed, status)
 		assert.Contains(t, lastError, "image pull failed")
-		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
-			"gauge must not change when preflight fails and old containers are still running")
+		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
+			"gauge must decrement on Ready→Failed update preflight failure")
 	})
 
 	t.Run("image pull failure from Failed does not decrement gauge", func(t *testing.T) {

@@ -248,9 +248,16 @@ var ErrAlreadyProvisioned = errors.New("lease already provisioned")
 type ProvisionStatus string
 
 // Provision status constants.
+//
+// ProvisionStatusFailing marks the window between a container's death being
+// detected and the terminal Failed callback being emitted. A Deprovision
+// request arriving in this window transitions the lease straight to
+// Deprovisioning without ever reaching Failed — preventing a stale Failed
+// callback under concurrent ownership transfer.
 const (
 	ProvisionStatusProvisioning   ProvisionStatus = "provisioning"
 	ProvisionStatusReady          ProvisionStatus = "ready"
+	ProvisionStatusFailing        ProvisionStatus = "failing"
 	ProvisionStatusFailed         ProvisionStatus = "failed"
 	ProvisionStatusUnknown        ProvisionStatus = "unknown"
 	ProvisionStatusRestarting     ProvisionStatus = "restarting"

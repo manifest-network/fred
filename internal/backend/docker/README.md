@@ -286,6 +286,70 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 4. The full provisioning flow runs again (image pull, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
 5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label. Only newly created volumes are cleaned up; reused volumes are preserved.
 
+## Lease State Machine
+
+**One concept: the lease actor is the scope of atomicity for its messages and its workers.** Everything else falls out of that invariant:
+
+- **Registry atomicity** — the actor registry (`b.actors`) is guarded by a mutex; `routeToLease(uuid, msg)` resolves-or-creates AND enqueues under that mutex, so callers never hold a `*leaseActor` pointer. Stale-pointer races are unreachable by construction.
+- **Worker ownership** — every worker goroutine (provision, restart, update, diag) is spawned by the actor and tracked by its per-actor `workers` barrier (a channel-signaled reference counter; see `work_barrier.go`). The actor's exit path selects on `workers.Zero()` BEFORE registry-delete / `done`-close / drain — the actor cannot exit while a worker is in flight, so orphan-worker races are eliminated. The barrier's channel-based wait means `waitForWorkers` spawns no helper goroutine, so a wedged worker adds no leaked waiter on top of itself.
+- **Drain-with-handle** — on exit, any message in the inbox is processed via `handle()` (not just closed-and-dropped). Terminal events delivered during the shutdown window still drive their SM transition. Silent drops are gone.
+- **Non-blocking routing** — `routeToLease` uses a non-blocking inbox send under the registry mutex. A wedged actor cannot stall the event loop; full-inbox refusals increment `die_event_dropped_total` and the reconciler re-detects within its cycle.
+
+Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state is the lease's current `Status` at actor creation — new leases start in `Provisioning`, recovered leases start in whatever state they were in.
+
+```mermaid
+stateDiagram-v2
+    Provisioning --> Ready: ProvisionCompleted
+    Provisioning --> Failed: ProvisionErrored
+    Provisioning --> Deprovisioning: DeprovisionRequested
+
+    Ready --> Failing: ContainerDied [guard]
+    Ready --> Deprovisioning: DeprovisionRequested
+    Ready --> Restarting: RestartRequested
+    Ready --> Updating: UpdateRequested
+
+    Failing --> Failed: DiagGathered
+    Failing --> Deprovisioning: DeprovisionRequested
+
+    Failed --> Provisioning: ProvisionRequested
+    Failed --> Restarting: RestartRequested
+    Failed --> Updating: UpdateRequested
+    Failed --> Deprovisioning: DeprovisionRequested
+
+    Restarting --> Ready: ReplaceCompleted
+    Restarting --> Ready: ReplaceRecovered
+    Restarting --> Failed: ReplaceFailed
+    Restarting --> Deprovisioning: DeprovisionRequested
+
+    Updating --> Ready: ReplaceCompleted
+    Updating --> Ready: ReplaceRecovered
+    Updating --> Failed: ReplaceFailed
+    Updating --> Deprovisioning: DeprovisionRequested
+
+    Deprovisioning --> [*]
+```
+
+The edges above are the complete set of allowed transitions; any event not listed against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative source is `lease_sm.go`.
+
+### Key behaviors
+
+- **`Ready → Failing` guard.** The `ContainerDied` trigger fires only if a Docker `Inspect` confirms the container actually exited. Die events can be duplicated or stale; the guard filters them.
+- **Preemption via `OnExit` cancellation + `workers.Zero()`.** `Failing`, `Provisioning`, `Restarting`, and `Updating` each own one async worker goroutine (diag gather, provision, or replace). Every transition out of these states calls the worker's `CancelFunc` via `OnExit`, then `a.waitForWorkers()` selects on the per-actor `workers.Zero()` channel until the goroutine has returned and its terminal `sendTerminal` has landed in the inbox. A preempting `Deprovision` observes post-cleanup state deterministically — no orphan-container race.
+- **Defense-in-depth `Ignore` on `Deprovisioning`.** Cancellation is best-effort: a goroutine can race past the cancel signal and fire its completion event anyway. `Deprovisioning` ignores every such event (`DiagGathered`, `ProvisionCompleted`, `ProvisionErrored`, `ReplaceCompleted`, `ReplaceRecovered`, `ReplaceFailed`) so the race is structurally safe.
+- **One terminal callback per lease.** Callback emission lives in SM entry actions (`onEnterReadyFromProvision`, `onEnterFailedFromDiag`, `onEnterFailedFromProvision`, `onEnterReadyFromReplaceCompleted`, `onEnterReadyFromReplaceRecovered`, `onEnterFailedFromReplace`), never in goroutines. Combined with the preemption/ignore rules above, this guarantees at most one `success`/`failed`/`deprovisioned` callback per lease per terminal transition.
+- **Three `Replace*` events for two terminal states.** `ReplaceCompleted` means restart/update succeeded (→ `Ready`, Success callback). `ReplaceRecovered` means it failed but rollback restored a working lease (→ `Ready`, Failed callback with rollback suffix). `ReplaceFailed` means both the operation and the rollback failed (→ `Failed`, Failed callback).
+- **Non-blocking routing, reconciler backstop.** `routeToLease` is non-blocking: a full inbox returns false rather than blocking the caller. `containerEventLoop` and the reconcile die-event dispatch treat refusal as "reconciler will re-detect within its cycle" and increment `die_event_dropped_total`. One wedged actor can no longer stall die-event delivery for other leases.
+
+### Observability
+
+- `fred_docker_backend_lease_sm_transitions_total{from,to,event}` — every transition.
+- `fred_docker_backend_lease_actors_created_total` — cumulative actor count; should track distinct leases (recycled UUIDs after Deprovision produce a fresh actor, so this counter grows faster than the live-actor count).
+- `fred_docker_backend_lease_actor_stuck_seconds` — age of the oldest in-flight actor handler. Alert threshold should exceed the longest legitimate operation (Deprovision can hold an actor for minutes during container/volume cleanup).
+- `fred_docker_backend_lease_actor_inbox_depth` — histogram of per-actor inbox depth; p99 near 0 is healthy.
+- `fred_docker_backend_lease_actor_panics_total` — counts panics recovered inside actor handlers. Any non-zero is a bug; the actor survives and keeps processing, but the message that panicked did not drive its transition.
+- `fred_docker_backend_lease_terminal_event_dropped_total{event}` — worker terminal sends refused because the actor had exited (pathological `waitForWorkers` timeout). Should be zero in normal operation.
+- `fred_docker_backend_die_event_dropped_total{source}` — container-death events refused because the actor's inbox was full or the backend was shutting down. `source` is `event_loop` or `reconcile`. Not data loss — the reconciler re-detects — but a sustained non-zero value flags a wedged actor or chronic burst.
+
 ## State Recovery
 
 On startup, at each `ReconcileInterval`, and on every reconciler cycle (via `RefreshState`), `recoverState` rebuilds in-memory state from Docker:
@@ -510,7 +574,7 @@ Returns a single provision record. This is the primary endpoint for retrieving f
 }
 ```
 
-`status` is one of: `provisioning`, `ready`, `failed`, `unknown`, `restarting`, `updating`. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
+`status` is one of: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, `deprovisioning`. `failing` marks the brief window between container-death detection and the Failed callback being emitted; a concurrent Deprovision arriving in this window transitions the lease straight to `deprovisioning` without ever reaching `failed`, preventing a stale Failed callback. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
 
 ### `GET /provisions` (authenticated)
 

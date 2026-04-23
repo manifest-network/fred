@@ -13,8 +13,11 @@ import (
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/bech32"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // mockChainClient implements ChainClient interface for testing.
@@ -781,4 +784,67 @@ func TestWithdrawScheduler_EstimateDepletionTime_HighPrecision(t *testing.T) {
 				"estimated remaining = %v, want between %v and %v", remaining, tt.minRemaining, tt.maxRemaining)
 		})
 	}
+}
+
+// TestTriggerWithdraw_PanicDoesNotCrashFred pins the panic-recovery
+// invariant for the TriggerWithdraw-spawned goroutine. A panic inside
+// a chain RPC (here, WithdrawByProvider) must be recovered instead of
+// propagating up and killing the fred process. Subsequent triggers
+// must still work.
+func TestTriggerWithdraw_PanicDoesNotCrashFred(t *testing.T) {
+	var callCount atomic.Int32
+	client := &mockChainClient{
+		// Report a non-zero withdrawable so withdraw() proceeds past
+		// the "nothing to withdraw" short-circuit and reaches the
+		// panicking WithdrawByProvider call.
+		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+			return sdktypes.NewCoins(sdktypes.NewCoin("utoken", sdkmath.NewInt(100))), nil
+		},
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
+			count := callCount.Add(1)
+			if count == 1 {
+				panic("synthetic chain client panic")
+			}
+			return "tx-hash", nil
+		},
+	}
+
+	scheduler := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID: "test-provider",
+		Interval:     time.Hour, // long so only triggers fire
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start must be running for TriggerWithdraw to spawn goroutines.
+	startDone := make(chan struct{})
+	go func() {
+		_ = scheduler.Start(ctx)
+		close(startDone)
+	}()
+	t.Cleanup(func() {
+		scheduler.Stop()
+		<-startDone
+	})
+
+	before := promtestutil.ToFloat64(metrics.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler"))
+
+	// First trigger — will panic inside WithdrawByProvider. Must not
+	// crash fred. The spawned goroutine recovers, logs, bumps metric.
+	scheduler.TriggerWithdraw()
+
+	require.Eventually(t, func() bool {
+		return promtestutil.ToFloat64(metrics.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler")) == before+1
+	}, 2*time.Second, 10*time.Millisecond,
+		"GoroutinePanicsTotal{withdraw_scheduler} must increment after panic recovery")
+
+	// Second trigger — must still work. The scheduler itself isn't
+	// poisoned by the recovered panic.
+	scheduler.TriggerWithdraw()
+
+	require.Eventually(t, func() bool {
+		return callCount.Load() >= 2
+	}, 2*time.Second, 10*time.Millisecond,
+		"second TriggerWithdraw must proceed to WithdrawByProvider — scheduler must still be functional")
 }

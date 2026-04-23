@@ -11,7 +11,53 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
-// Deprovision releases resources for a lease. Must be idempotent.
+// Deprovision is the public shim: it routes the request through the lease's
+// actor so that container-death and deprovision messages serialize per lease.
+// Routing forces a Ready/Failing/Failed → Deprovisioning SM transition whose
+// Failing.OnExit cancels the in-flight diag goroutine — the structural
+// suppression of stale Failed callbacks.
+func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
+	reply := make(chan error, 1)
+	if err := b.routeToLeaseBlocking(ctx, leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}); err != nil {
+		return err
+	}
+	return b.waitForReply(ctx, reply)
+}
+
+// handleDeprovision runs inside the lease actor's message handler. It fires
+// the SM transition then runs the work synchronously, returning the outcome
+// on the deprovisionMsg's reply channel.
+func (a *leaseActor) handleDeprovision(ctx context.Context) error {
+	// Attempt the SM transition. If it's not permitted, check whether the
+	// provision is already gone (idempotent success) or we're in an unexpected
+	// state (surface the error).
+	if err := a.sm.Fire(ctx, evDeprovisionRequested); err != nil {
+		a.backend.provisionsMu.RLock()
+		_, exists := a.backend.provisions[a.leaseUUID]
+		a.backend.provisionsMu.RUnlock()
+		if !exists {
+			a.terminated = true
+			return nil
+		}
+		a.backend.logger.Warn("deprovision transition denied by SM",
+			"lease_uuid", a.leaseUUID, "error", err)
+		// Fall through to the work anyway — the SM may not know every state
+		// (partial port). The work itself is idempotent.
+	}
+	err := a.backend.doDeprovision(ctx, a.leaseUUID)
+	// If the provision entry was fully removed (success path), signal the
+	// run loop to exit so a subsequent re-provision with the same UUID
+	// creates a fresh actor instead of being Ignored by a stale SM.
+	a.backend.provisionsMu.RLock()
+	_, exists := a.backend.provisions[a.leaseUUID]
+	a.backend.provisionsMu.RUnlock()
+	if !exists {
+		a.terminated = true
+	}
+	return err
+}
+
+// doDeprovision releases resources for a lease. Must be idempotent.
 // For multi-unit leases, removes all containers.
 // Returns an error if any container removal fails for a reason other than
 // the container already being gone (which is handled idempotently by
@@ -22,7 +68,7 @@ import (
 // the failed removals. Resource pool allocations are still released (the
 // lease is being abandoned). On retry, only the stuck containers are
 // attempted.
-func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
+func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
 
 	b.provisionsMu.Lock()
@@ -32,14 +78,14 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 		// Already deprovisioned - idempotent success
 		return nil
 	}
-	// Mark as deprovisioning before removing containers to prevent handleContainerDeath
-	// from racing with removal. Die events emitted during RemoveContainer will
-	// see a non-Ready status and be skipped. The in-memory Deprovisioning marker
-	// also lets Provision's guard at provision.go:49 reject concurrent re-provision
-	// attempts during the removal window.
-	// Decrement activeProvisions immediately on Ready→Deprovisioning transition so
-	// the gauge stays accurate even if the rest of Deprovision fails partially
-	// and must be retried (at which point the provision is already Failed).
+	// Mark Deprovisioning before removing containers. The in-memory marker
+	// lets Provision's status guard reject concurrent re-provision attempts
+	// during the removal window (die events from RemoveContainer are dropped
+	// structurally by the SM's Deprovisioning.Ignore(evContainerDied)).
+	//
+	// Decrement activeProvisions on the Ready→Deprovisioning transition so
+	// the gauge stays accurate even if Deprovision fails partially and the
+	// provision ends up Failed on retry.
 	wasReady := prov.Status == backend.ProvisionStatusReady
 	prov.Status = backend.ProvisionStatusDeprovisioning
 	if wasReady {
@@ -168,7 +214,7 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 					}
 				}
 				if b.cfg.IsNetworkIsolation() {
-					if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+					if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 						logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
 					}
 				}
@@ -208,9 +254,13 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	delete(b.provisions, leaseUUID)
 	b.provisionsMu.Unlock()
 
-	// Clean up tenant network if isolation is enabled
+	// Clean up tenant network if isolation is enabled. releaseTenantNetwork
+	// scans b.provisions under a per-tenant mutex and skips removal if any
+	// other lease still references this tenant, so a concurrent provision on
+	// the same tenant cannot have its network yanked between Ensure and
+	// ContainerCreate.
 	if b.cfg.IsNetworkIsolation() {
-		if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+		if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 			logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
 		}
 	}

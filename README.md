@@ -455,7 +455,7 @@ Returns provision diagnostics for a lease, including status, error details, and 
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, `failed`, `restarting`, `updating`, or `unknown`
+- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, or `unknown`. `failing` is a transient state between container-death detection and the Failed callback; `deprovisioning` covers the container-removal window
 - `fail_count` - Number of provision attempts that failed
 - `last_error` - Detailed error message (only present on failure)
 

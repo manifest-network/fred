@@ -4,7 +4,9 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -179,6 +181,34 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 	var pending []ackRequest
 	timer := time.NewTimer(l.batchInterval)
 	defer timer.Stop()
+
+	// Panic recovery: chain RPC calls (GetPendingLeases, AcknowledgeLeases)
+	// route through cosmos SDK marshaling/unmarshaling, which uses
+	// reflection and has historically been a source of panics on
+	// malformed server responses. Recover any panic here so one bad
+	// response does NOT crash fred. We fail all pending requests with
+	// an error (so callers get unblocked) and exit the lane — other
+	// lanes continue serving via Acknowledge's round-robin fallback.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("ack batcher lane panic — recovering to keep fred alive",
+				"lane", laneIdx,
+				"pending_count", len(pending),
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			metrics.GoroutinePanicsTotal.WithLabelValues("ack_batcher").Inc()
+			// Unblock any pending callers with an error; otherwise they'd
+			// hang forever waiting on their resultCh.
+			panicErr := fmt.Errorf("ack batcher lane %d panicked: %v", laneIdx, r)
+			for _, req := range pending {
+				select {
+				case req.resultCh <- ackResult{err: panicErr}:
+				default:
+				}
+			}
+		}
+	}()
 
 	flush := func() {
 		if len(pending) == 0 {

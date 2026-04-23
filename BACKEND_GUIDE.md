@@ -200,10 +200,12 @@ List all currently provisioned resources. Used by Fred for reconciliation.
 **Status Values:**
 - `provisioning` - Resource is being created
 - `ready` - Resource is available
+- `failing` - Container death detected; Failed callback pending (transient, brief)
 - `failed` - Provisioning failed
 - `unknown` - Status could not be determined
 - `restarting` - Containers are being restarted
 - `updating` - New manifest is being deployed
+- `deprovisioning` - Containers are being removed
 
 ### GET /provisions/{lease_uuid}
 

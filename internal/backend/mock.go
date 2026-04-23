@@ -31,7 +31,7 @@ type mockProvision struct {
 	Tenant       string
 	SKU          string
 	Quantity     int             // Number of units provisioned
-	Status       ProvisionStatus // "provisioning", "ready", "failed"
+	Status       ProvisionStatus // see ProvisionStatus* constants
 	CreatedAt    time.Time
 	Payload      []byte
 	PayloadHash  string

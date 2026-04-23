@@ -69,6 +69,40 @@ var (
 		Help:      "Total ready leases the reconciler skipped because the main flow owns them",
 	})
 
+	// ReconcilerPanicsTotal counts panics recovered inside reconciler
+	// per-unit goroutines (per-lease, per-orphan, per-backend-fetch). The
+	// recover exists specifically to prevent one bad lease/orphan/backend
+	// from crashing the fred process. Any non-zero value is a latent bug
+	// to fix at its source — not business-as-usual. Label values:
+	// "process_lease", "process_orphan", "fetch_provisions".
+	ReconcilerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "reconciler_panics_total",
+		Help:      "Panics recovered in reconciler per-unit goroutines, by stage",
+	}, []string{"stage"})
+
+	// CleanupPanicsTotal counts panics recovered inside background
+	// cleanup loops (token tracker, callback store, diagnostics store,
+	// etc.) driven by util.StartCleanupLoop. Any non-zero value is a
+	// latent bug in the cleanup function. Labeled by component.
+	CleanupPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "background",
+		Name:      "cleanup_panics_total",
+		Help:      "Panics recovered in background cleanup loops, by component",
+	}, []string{"component"})
+
+	// GoroutinePanicsTotal is the catch-all for long-lived background
+	// goroutines that add their own recover() (payload store writer,
+	// ack batcher lanes, etc.). Labeled by component for correlation.
+	GoroutinePanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "background",
+		Name:      "goroutine_panics_total",
+		Help:      "Panics recovered in long-lived background goroutines, by component",
+	}, []string{"component"})
+
 	// SignerOOGRetriesTotal counts out-of-gas retry decisions at the
 	// transaction broadcast layer. Label values: "retried" = gas was
 	// increased and the tx will be retried; "exhausted" = already at the

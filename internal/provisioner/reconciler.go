@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -240,6 +241,21 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		provision, isProvisioned := allProvisions[leaseUUID]
 
 		g.Go(func() error {
+			// Recover any panic inside processLease so ONE bad lease
+			// doesn't crash fred. Log with full context, bump the
+			// panic metric, count this lease as errored, and move on.
+			// The next reconcile cycle will retry.
+			defer func() {
+				if rec := recover(); rec != nil {
+					slog.Error("reconciler processLease panic — recovering to keep fred alive",
+						"lease_uuid", leaseUUID,
+						"panic", rec,
+						"stack", string(debug.Stack()),
+					)
+					metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease").Inc()
+					leaseErrors.Add(1)
+				}
+			}()
 			r.processLease(gctx, leaseUUID, lease, provision, isProvisioned,
 				&provisioned, &acknowledged, &anomalies, &leaseErrors)
 			return nil // Don't fail fast - continue processing other leases
@@ -271,6 +287,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 	for leaseUUID, provision := range allProvisions {
 		og.Go(func() error {
+			// Recover any panic inside processOrphan. Same rationale as
+			// the processLease recover above.
+			defer func() {
+				if rec := recover(); rec != nil {
+					slog.Error("reconciler processOrphan panic — recovering to keep fred alive",
+						"lease_uuid", leaseUUID,
+						"panic", rec,
+						"stack", string(debug.Stack()),
+					)
+					metrics.ReconcilerPanicsTotal.WithLabelValues("process_orphan").Inc()
+					leaseErrors.Add(1)
+				}
+			}()
 			r.processOrphan(ogctx, leaseUUID, provision, &orphans, &leaseErrors)
 			return nil // Don't fail fast - continue processing other orphans
 		})
@@ -547,8 +576,33 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 	allProvisions := make(map[string]backend.ProvisionInfo)
 	var fetchErrors []error
 
+	var panicErrs []error
 	for _, b := range backends {
-		g.Go(func() error {
+		g.Go(func() (goErr error) {
+			// Recover any panic from backend.RefreshState / ListProvisions
+			// (or the HTTP/JSON path that implements them). We do NOT
+			// surface as an errgroup error — returning non-nil from the
+			// g.Go closure would trigger errgroup's fail-fast behavior
+			// and cancel sibling backend fetches via gctx. Instead, we
+			// append to panicErrs (protected by mu) which the caller
+			// checks after g.Wait() and treats as a fetch failure on
+			// par with a normal ListProvisions error. This mirrors the
+			// behavior of the regular error path below (return nil
+			// after recording into fetchErrors).
+			defer func() {
+				if rec := recover(); rec != nil {
+					slog.Error("reconciler fetch panic — recovering to keep fred alive",
+						"backend", b.Name(),
+						"panic", rec,
+						"stack", string(debug.Stack()),
+					)
+					metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions").Inc()
+					mu.Lock()
+					panicErrs = append(panicErrs, fmt.Errorf("backend %s panic: %v", b.Name(), rec))
+					mu.Unlock()
+					goErr = nil // Don't cancel siblings via errgroup; error surfaces via panicErrs.
+				}
+			}()
 			// Ensure backend state is fresh before reading provisions.
 			if err := b.RefreshState(gctx); err != nil {
 				slog.Warn("failed to refresh backend state",
@@ -586,6 +640,14 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	// Aggregate panicErrs into fetchErrors so a backend that panicked
+	// is treated the same as a backend that errored: reconciliation
+	// aborts rather than proceeding with partial data (which would
+	// misidentify real provisions as orphans and deprovision them).
+	if len(panicErrs) > 0 {
+		fetchErrors = append(fetchErrors, panicErrs...)
 	}
 
 	if len(fetchErrors) > 0 {

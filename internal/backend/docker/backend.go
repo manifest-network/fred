@@ -17,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // dockerClient abstracts the Docker API surface used by Backend,
@@ -65,6 +66,26 @@ type Backend struct {
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
 
+	// tenantNetworkStripes serializes EnsureTenantNetwork and
+	// RemoveTenantNetworkIfEmpty per tenant. Tenant networks are shared
+	// across every lease for that tenant, so a concurrent provision of
+	// lease B and deprovision of lease A on the same tenant can otherwise
+	// race: A's removal lands between B's ensure and B's ContainerCreate,
+	// and B fails with "network not found". Per-tenant serialization plus
+	// scanning b.provisions before removing keeps the decision and Docker
+	// call atomic per tenant.
+	//
+	// Striped lock (fixed-size array, tenant → hash-modulo slot) rather
+	// than a map[tenant]*Mutex to keep memory bounded — tenants are
+	// Cosmos addresses that can be created by anyone with gas, and a
+	// map would grow without bound. With tenantNetworkStripeCount slots,
+	// two tenants share a stripe with probability 1/N; the only effect
+	// of a collision is minor serialization between unrelated tenants'
+	// network ops, which are infrequent (once per provision / deprovision).
+	//
+	// Lock ordering: stripe mutex -> provisionsMu (RLock).
+	tenantNetworkStripes [tenantNetworkStripeCount]sync.Mutex
+
 	// recoverMu serializes recoverState calls. The reconcile loop and
 	// external RefreshState (called by Fred's reconciler) both invoke
 	// recoverState. Without serialization, concurrent calls can detect
@@ -98,6 +119,16 @@ type Backend struct {
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
 	wg         sync.WaitGroup
+
+	// actors routes per-lease messages to a goroutine that serializes all
+	// state transitions for that lease. Entries are created lazily via
+	// routeToLease and live until the actor's run loop exits (which also
+	// deletes the entry under actorsMu). Guarded by actorsMu so registry
+	// membership and actor lifecycle are atomic with respect to each
+	// other — eliminating the stale-pointer / orphan-worker race class
+	// the prior sync.Map design allowed.
+	actorsMu sync.Mutex
+	actors   map[string]*leaseActor // leaseUUID → *leaseActor
 }
 
 // provision tracks provisioned containers for a lease.
@@ -157,6 +188,13 @@ const (
 	// errMsgContainerExited is the base error message for containers that
 	// exit unexpectedly, used by recoverState and failure callbacks.
 	errMsgContainerExited = "container exited unexpectedly"
+
+	// errMsgInternal is the hardcoded on-chain-safe callback message used
+	// when a worker goroutine panics. Full diagnostics (panic value,
+	// stack) go to provision.LastError and the structured log; the
+	// callback message itself stays generic so we don't leak internals
+	// on-chain.
+	errMsgInternal = "internal error"
 )
 
 // containerFailureDiagnostics builds a diagnostic string from a failed
@@ -199,6 +237,50 @@ func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
 	}
 }
 
+// captureContainerLogs fetches logs from the given containerIDs for
+// diagnostics persistence. Must be called WHILE the containers still
+// exist — failure-path workers (doProvision, doReplace*) must call this
+// BEFORE their cleanup defer removes the containers, otherwise Docker
+// returns "no such container" and the logs are lost. Optional
+// containerKeys map overrides the default index-based log key (e.g.,
+// "web/0" for stack services).
+//
+// Uses context.Background() with a 30s timeout rather than deriving
+// from stopCtx, so log capture still succeeds during shutdown (the
+// whole point is diagnostic durability). Consequence: shutdown can be
+// delayed up to 30s per worker in the pathological case of a wedged
+// Docker log endpoint. Combined with the sequential 30s cleanup budget
+// that follows in the failure defer, this fits within the actor's
+// workExitWaitTimeout so actors still exit cleanly — but operators
+// should be aware the budget exists.
+func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[string]string) map[string]string {
+	if len(containerIDs) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	logs := make(map[string]string, len(containerIDs))
+	for i, cid := range containerIDs {
+		logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
+		if err != nil {
+			b.logger.Debug("failed to fetch container logs for diagnostics persistence",
+				"container_id", shortID(cid), "error", err)
+			continue
+		}
+		key := fmt.Sprintf("%d", i)
+		if containerKeys != nil {
+			if k, ok := containerKeys[cid]; ok {
+				key = k
+			}
+		}
+		logs[key] = logOutput
+	}
+	if len(logs) == 0 {
+		return nil
+	}
+	return logs
+}
+
 // persistDiagnostics saves failure diagnostics and container logs to the
 // diagnostics store. It performs I/O (container log fetching, bbolt write)
 // and must NOT be called while holding provisionsMu.
@@ -209,38 +291,45 @@ func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs 
 	if b.diagnosticsStore == nil {
 		return
 	}
-
+	// Guard against zero-value entries reaching the store: callers that
+	// build diagSnap conditionally (e.g., deprovision.go's `if p, ok :=
+	// b.provisions[leaseUUID]; ok { diagSnap = ... }`) can fall through
+	// with entry.LeaseUUID == "" if the provision entry is missing. In
+	// practice the invariants prevent this today, but guarding here
+	// matches the lease_sm.go call sites' own "if diagSnap.LeaseUUID
+	// != ''" checks and keeps an empty-key record out of the store if
+	// a future refactor weakens the invariant.
+	if entry.LeaseUUID == "" {
+		return
+	}
 	var keys map[string]string
 	if len(containerKeys) > 0 {
 		keys = containerKeys[0]
 	}
-
-	// Fetch logs from containers that still exist.
-	if len(containerIDs) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		logs := make(map[string]string, len(containerIDs))
-		for i, cid := range containerIDs {
-			logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
-			if err != nil {
-				b.logger.Debug("failed to fetch container logs for diagnostics persistence",
-					"container_id", shortID(cid), "error", err)
-				continue
-			}
-			key := fmt.Sprintf("%d", i)
-			if keys != nil {
-				if k, ok := keys[cid]; ok {
-					key = k
-				}
-			}
-			logs[key] = logOutput
-		}
-		if len(logs) > 0 {
-			entry.Logs = logs
-		}
+	if logs := b.captureContainerLogs(containerIDs, keys); logs != nil {
+		entry.Logs = logs
 	}
+	if err := b.diagnosticsStore.Store(entry); err != nil {
+		b.logger.Warn("failed to persist failure diagnostics",
+			"lease_uuid", entry.LeaseUUID, "error", err)
+	}
+}
 
+// persistDiagnosticsWithLogs saves pre-captured logs to the diagnostics
+// store. Used by failure-path workers that capture logs before cleanup
+// (when the containers are about to be removed). The entry's Logs field
+// is set from the supplied map, bypassing the re-fetch path.
+func (b *Backend) persistDiagnosticsWithLogs(entry shared.DiagnosticEntry, logs map[string]string) {
+	if b.diagnosticsStore == nil {
+		return
+	}
+	// See persistDiagnostics for rationale — skip zero-value entries.
+	if entry.LeaseUUID == "" {
+		return
+	}
+	if len(logs) > 0 {
+		entry.Logs = logs
+	}
 	if err := b.diagnosticsStore.Store(entry); err != nil {
 		b.logger.Warn("failed to persist failure diagnostics",
 			"lease_uuid", entry.LeaseUUID, "error", err)
@@ -307,16 +396,18 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	}
 
 	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: cfg.CallbackDBPath,
-		MaxAge: cfg.CallbackMaxAge,
+		DBPath:         cfg.CallbackDBPath,
+		MaxAge:         cfg.CallbackMaxAge,
+		OnCleanupPanic: func(any) { metrics.CleanupPanicsTotal.WithLabelValues("callback").Inc() },
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open callback store: %w", err)
 	}
 
 	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
-		DBPath: cfg.DiagnosticsDBPath,
-		MaxAge: cfg.DiagnosticsMaxAge,
+		DBPath:         cfg.DiagnosticsDBPath,
+		MaxAge:         cfg.DiagnosticsMaxAge,
+		OnCleanupPanic: func(any) { metrics.CleanupPanicsTotal.WithLabelValues("diagnostics").Inc() },
 	})
 	if err != nil {
 		_ = cbStore.Close()
@@ -324,8 +415,9 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	}
 
 	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: cfg.ReleasesDBPath,
-		MaxAge: cfg.ReleasesMaxAge,
+		DBPath:         cfg.ReleasesDBPath,
+		MaxAge:         cfg.ReleasesMaxAge,
+		OnCleanupPanic: func(any) { metrics.CleanupPanicsTotal.WithLabelValues("releases").Inc() },
 	})
 	if err != nil {
 		_ = cbStore.Close()
@@ -357,10 +449,13 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
 		provisions:       make(map[string]*provision),
+		actors:           make(map[string]*leaseActor),
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,
 		httpClient:       httpClient,
+		// tenantNetworkStripes is a fixed-size array embedded in Backend;
+		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
@@ -417,6 +512,10 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Start real-time container event listener for instant crash detection.
 	// reconcileLoop stays as safety net for missed events.
 	b.wg.Go(b.containerEventLoop)
+
+	// Sample actor inbox depth and stuck-seconds on a ticker for the
+	// fred_docker_backend_lease_actor_* observability gauges.
+	b.wg.Go(b.actorMetricsSampleLoop)
 
 	b.logger.Info("Docker backend started",
 		"host", b.cfg.DockerHost,

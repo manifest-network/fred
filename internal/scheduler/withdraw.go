@@ -5,11 +5,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 const (
@@ -135,8 +138,22 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 		return
 	}
 
-	// Track the goroutine for graceful shutdown (using WaitGroup.Go for Go 1.25+)
-	s.wg.Go(func() { s.withdrawAndCheckCredits(ctx) })
+	// Track the goroutine for graceful shutdown (using WaitGroup.Go for Go 1.25+).
+	// Panic recovery: withdrawAndCheckCredits invokes chain RPCs (cosmos
+	// SDK marshaling). A panic there would otherwise crash fred. Log +
+	// metric and exit; the next TriggerWithdraw or interval tick retries.
+	s.wg.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("withdrawal scheduler panic — recovering to keep fred alive",
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				metrics.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler").Inc()
+			}
+		}()
+		s.withdrawAndCheckCredits(ctx)
+	})
 }
 
 // Stop cancels the scheduler's internal context, stopping all operations.

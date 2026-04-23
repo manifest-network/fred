@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -179,7 +180,12 @@ func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string
 	if m.ContainerLogsFn != nil {
 		return m.ContainerLogsFn(ctx, containerID, tail)
 	}
-	panic("unexpected call to ContainerLogs")
+	// Default: return "not found". The production failure-path code
+	// (doProvision/doReplace* captureContainerLogs) routinely calls
+	// ContainerLogs on containers that may be in the process of being
+	// removed; panicking here forces every failure-path test to set a
+	// stub. Match Docker's real behavior on removed containers instead.
+	return "", fmt.Errorf("no such container: %s", shortID(containerID))
 }
 
 func (m *mockDockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
@@ -284,6 +290,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		volumes:    &noopVolumeManager{},
 		logger:     slog.Default(),
 		provisions: provs,
+		actors:     make(map[string]*leaseActor),
 		stopCtx:    stopCtx,
 		stopCancel: stopCancel,
 	}
@@ -512,6 +519,40 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, 2, prov.FailCount)
 	})
 
+	t.Run("failing provision without containers normalized to failed", func(t *testing.T) {
+		// Failing is a transient SM state. If a crash (or external container
+		// removal) leaves a provision stuck in Failing without containers in
+		// Docker, recoverState must normalize to Failed so Provision/Restart/
+		// Update retries (which require Status == Failed) can proceed —
+		// otherwise the lease is wedged.
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return nil, nil
+			},
+		}
+		existing := map[string]*provision{
+			"lease-1": {
+				LeaseUUID: "lease-1",
+				Tenant:    "tenant-a",
+				Status:    backend.ProvisionStatusFailing,
+				FailCount: 1,
+				LastError: errMsgContainerExited,
+				CreatedAt: now,
+			},
+		}
+		b := newBackendForTest(mock, existing)
+
+		err := b.recoverState(context.Background())
+		require.NoError(t, err)
+
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
+			"Failing must be normalized to Failed on recovery to unblock retries")
+		assert.Equal(t, 1, prov.FailCount, "FailCount preserved across normalization")
+		assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError preserved")
+	})
+
 	t.Run("ready provision without containers dropped", func(t *testing.T) {
 		mock := &mockDockerClient{
 			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
@@ -699,7 +740,22 @@ func TestRecoverState(t *testing.T) {
 		err := b.recoverState(context.Background())
 		require.NoError(t, err)
 
+		// recoverState now hands off the transition to the lease's actor;
+		// the SM's Failing → Failed flow gathers diagnostics via an async
+		// goroutine. Poll until the expected terminal state lands.
+		require.Eventually(t, func() bool {
+			b.provisionsMu.RLock()
+			defer b.provisionsMu.RUnlock()
+			prov := b.provisions["lease-1"]
+			return prov != nil && prov.Status == backend.ProvisionStatusFailed &&
+				prov.FailCount == 1 &&
+				strings.Contains(prov.LastError, "exit_code=137") &&
+				strings.Contains(prov.LastError, "oom_killed=true")
+		}, 2*time.Second, 10*time.Millisecond)
+
+		b.provisionsMu.RLock()
 		prov := b.provisions["lease-1"]
+		b.provisionsMu.RUnlock()
 		require.NotNil(t, prov)
 		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 		assert.Equal(t, 1, prov.FailCount)
@@ -1141,6 +1197,13 @@ func TestRecoverState_PersistsDiagnostics(t *testing.T) {
 	err = b.recoverState(context.Background())
 	require.NoError(t, err)
 
+	// The SM's Failing → Failed flow runs asynchronously after recoverState
+	// hands off the transition. Poll for the diagnostics entry to land.
+	require.Eventually(t, func() bool {
+		entry, _ := diagStore.Get("lease-1")
+		return entry != nil && entry.FailCount == 1 && entry.Logs != nil
+	}, 2*time.Second, 10*time.Millisecond, "diagnostics should eventually be persisted")
+
 	// Verify diagnostics were persisted.
 	entry, err := diagStore.Get("lease-1")
 	require.NoError(t, err)
@@ -1161,12 +1224,23 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	secret := "AWS_SECRET_KEY=wJalrXUtnFEMI"
 	now := time.Now()
 
+	var payloadMu sync.Mutex
 	var callbackPayload backend.CallbackPayload
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		payloadMu.Lock()
+		callbackPayload = p
+		payloadMu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer callbackServer.Close()
+
+	readPayload := func() backend.CallbackPayload {
+		payloadMu.Lock()
+		defer payloadMu.Unlock()
+		return callbackPayload
+	}
 
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
@@ -1211,101 +1285,34 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	err := b.recoverState(context.Background())
 	require.NoError(t, err)
 
+	// Callback is now emitted by the SM's Failed.OnEntryFrom(evDiagGathered)
+	// entry action after the Failing goroutine completes. Poll for it.
+	require.Eventually(t, func() bool {
+		return readPayload().Error == errMsgContainerExited
+	}, 2*time.Second, 10*time.Millisecond, "Failed callback should eventually arrive")
+
 	// Callback should have hardcoded message only — no secrets.
-	assert.Equal(t, errMsgContainerExited, callbackPayload.Error)
-	assert.NotContains(t, callbackPayload.Error, secret)
-	assert.NotContains(t, callbackPayload.Error, "exit_code")
+	payload := readPayload()
+	assert.Equal(t, errMsgContainerExited, payload.Error)
+	assert.NotContains(t, payload.Error, secret)
+	assert.NotContains(t, payload.Error, "exit_code")
 
 	// LastError should contain full diagnostics.
+	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
 	require.NotNil(t, prov)
 	assert.Contains(t, prov.LastError, "exit_code=1")
 	assert.Contains(t, prov.LastError, secret)
 }
 
-// TestRecoverState_SuppressesFailedCallbackWhenDeprovisionRaces is the
-// recoverState-side parallel of TestHandleContainerDeath_SuppressesFailedCallback...
-// recoverState builds failedLeases under the write lock, releases it, gathers
-// diagnostics across the batch, then re-checks each entry's status before
-// sending Failed. If a concurrent Deprovision flips Failed→Deprovisioning in
-// that window, the Failed callback must be suppressed in favor of the
-// Deprovisioned callback that Deprovision will emit.
-func TestRecoverState_SuppressesFailedCallbackWhenDeprovisionRaces(t *testing.T) {
-	now := time.Now()
-
-	var callbackHit atomic.Bool
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callbackHit.Store(true)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	var b *Backend
-	mock := &mockDockerClient{
-		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{
-				{
-					ContainerID:   "c1",
-					LeaseUUID:     "lease-1",
-					Tenant:        "tenant-a",
-					ProviderUUID:  "prov-1",
-					SKU:           "docker-small",
-					InstanceIndex: 0,
-					Image:         "nginx:latest",
-					Status:        "exited",
-					CreatedAt:     now,
-					CallbackURL:   callbackServer.URL,
-				},
-			}, nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
-		},
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			// ContainerLogs runs during the diag gather that precedes the
-			// per-lease recheck at the bottom of recoverState. Flip to
-			// Deprovisioning here to simulate a concurrent Deprovision
-			// landing in the window between the write-lock release and the
-			// per-lease RLock recheck.
-			b.provisionsMu.Lock()
-			if p, ok := b.provisions["lease-1"]; ok && p.Status == backend.ProvisionStatusFailed {
-				p.Status = backend.ProvisionStatusDeprovisioning
-			}
-			b.provisionsMu.Unlock()
-			return "logs", nil
-		},
-	}
-
-	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1"},
-			CreatedAt:    now,
-			CallbackURL:  callbackServer.URL,
-		},
-	}
-	b = newBackendForTest(mock, existing)
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
-
-	require.NoError(t, b.recoverState(context.Background()))
-
-	require.Never(t, callbackHit.Load, 200*time.Millisecond, 20*time.Millisecond,
-		"Failed callback must not fire once Deprovision has flipped the status")
-
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	require.NotNil(t, prov)
-	assert.Equal(t, backend.ProvisionStatusDeprovisioning, prov.Status, "Deprovisioning flip must be preserved")
-	assert.Equal(t, 1, prov.FailCount, "FailCount must still increment on the in-memory Ready→Failed transition even when the callback is suppressed")
-	// LastError must not be enriched with diagnostic logs after the status
-	// flipped out of Failed — the Status==Failed gate protects the new owner's
-	// state from being clobbered.
-	assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError must not be enriched after status left Failed")
-	b.provisionsMu.RUnlock()
-}
+// Simulated-race tests on the recoverState path are obsolete: recoverState
+// hands Ready→Failed transitions off to the lease's actor via
+// containerDiedMsg, and the SM's Failing.OnExit cancellation is the
+// structural suppression of stale Failed callbacks on Deprovision
+// preemption. The real-Deprovision test
+// TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback
+// (lease_actor_test.go) covers the invariant end-to-end.
 
 func TestRecoverState_InFlightReProvisionPreservesFailCount(t *testing.T) {
 	// Regression test: recoverState must not overwrite an in-flight

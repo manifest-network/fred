@@ -9,12 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -1574,6 +1576,55 @@ func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.
 		result = append(result, inspected)
 	}
 	return result, nil
+}
+
+// tenantNetworkStripeCount is the number of per-tenant stripe mutexes.
+// Tenants hash into this fixed-size array; two tenants share a stripe
+// with probability 1/tenantNetworkStripeCount. Chosen to keep collision
+// probability negligible for realistic tenant counts while keeping
+// memory bounded (256 * ~24 bytes = ~6 KB, constant).
+const tenantNetworkStripeCount = 256
+
+// tenantNetworkMu returns the stripe mutex that serializes
+// EnsureTenantNetwork and RemoveTenantNetworkIfEmpty for a given
+// tenant. FNV-1a hash → modulo gives an even distribution; two
+// unrelated tenants colliding just serialize their (infrequent)
+// network ops with each other, which is benign.
+func (b *Backend) tenantNetworkMu(tenant string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(tenant))
+	return &b.tenantNetworkStripes[h.Sum32()%tenantNetworkStripeCount]
+}
+
+// ensureTenantNetwork wraps DockerClient.EnsureTenantNetwork with the
+// per-tenant mutex so the returned network ID cannot be removed by a
+// concurrent deprovision before the caller attaches a container to it.
+func (b *Backend) ensureTenantNetwork(ctx context.Context, tenant string) (string, error) {
+	mu := b.tenantNetworkMu(tenant)
+	mu.Lock()
+	defer mu.Unlock()
+	return b.docker.EnsureTenantNetwork(ctx, tenant)
+}
+
+// releaseTenantNetwork removes the tenant network iff no other lease in
+// b.provisions still references the tenant. The caller MUST have already
+// removed its own provision entry from b.provisions before calling this —
+// otherwise its own entry would veto removal.
+func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error {
+	mu := b.tenantNetworkMu(tenant)
+	mu.Lock()
+	defer mu.Unlock()
+
+	b.provisionsMu.RLock()
+	for _, p := range b.provisions {
+		if p.Tenant == tenant {
+			b.provisionsMu.RUnlock()
+			return nil
+		}
+	}
+	b.provisionsMu.RUnlock()
+
+	return b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
 }
 
 // buildNetworkConfig returns a NetworkingConfig that attaches to the given network,

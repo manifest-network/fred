@@ -920,3 +920,58 @@ func TestAckBatcher_MultiLane_AllLanesStopped(t *testing.T) {
 		t.Fatal("Acknowledge blocked after all lanes stopped")
 	}
 }
+
+// TestAckBatcher_PanicInFlushDoesNotCrashFred pins the panic-recovery
+// invariant for the lane goroutine. A panic inside GetPendingLeases
+// (simulating a cosmos SDK marshaling panic on a malformed chain
+// response) must be recovered, the pending Acknowledge caller must
+// unblock with an error (not hang on resultCh), and fred must keep
+// running. The lane itself exits; other lanes (round-robin fallback)
+// continue serving.
+func TestAckBatcher_PanicInFlushDoesNotCrashFred(t *testing.T) {
+	client := &mockAckChainClient{
+		getPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			panic("synthetic chain client panic")
+		},
+	}
+
+	// Single lane so the panic fully exits that lane and we can verify
+	// the pending caller is unblocked by the recover's resultCh-send —
+	// not by a round-robin fallback.
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 20 * time.Millisecond,
+		BatchSize:     10,
+		LaneCount:     1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	before := promtestutil.ToFloat64(metrics.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
+
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	// Issue an Acknowledge; flush will panic, recover must deliver an
+	// error on resultCh so this call returns instead of hanging.
+	done := make(chan struct{})
+	var ackErr error
+	go func() {
+		defer close(done)
+		_, _, ackErr = batcher.Acknowledge(ctx, "lease-1")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Acknowledge hung after flush panic — recover must unblock the caller")
+	}
+
+	assert.Error(t, ackErr,
+		"caller must receive an error from the panicked flush, not success")
+
+	after := promtestutil.ToFloat64(metrics.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
+	assert.Equal(t, before+1, after,
+		"GoroutinePanicsTotal{ack_batcher} must increment by 1")
+}

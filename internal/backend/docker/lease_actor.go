@@ -1,0 +1,1109 @@
+package docker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/manifest-network/fred/internal/backend"
+)
+
+// errActorTerminated is returned on the ack/reply channel when a
+// caller-facing request (Provision/Restart/Update) arrives at an actor
+// that has already terminated via handleDeprovision but whose
+// removeFromRegistry defer hasn't yet fired. The caller (Backend.X)
+// rolls back its pre-routing state via its error path (e.g.,
+// removeProvision); a subsequent retry resolves-or-creates a fresh
+// actor through actorForLocked. Without this check, such messages
+// would hit SM.Ignore in Deprovisioning state and Fire would return
+// nil — the handler would then ack success and spawn a worker under
+// a terminated actor, wedging the lease.
+var errActorTerminated = errors.New("lease actor terminated; retry will create a fresh actor")
+
+type leaseMessage interface {
+	isLeaseMessage()
+	// doneChan returns the channel to close when processing finishes, or nil
+	// for fire-and-forget messages. Lifting this out of the handler dispatch
+	// lets shutdown drain pending messages without a per-type switch.
+	doneChan() chan struct{}
+	// onPanic is called by the actor's recover when a message's handler
+	// panics. Messages with reply/ack channels must non-blocking-send an
+	// error here so their caller (Backend.Deprovision / Provision /
+	// Restart / Update blocking on the channel) unblocks instead of
+	// hanging until ctx cancellation. Messages without a caller to
+	// unblock implement this as a no-op.
+	onPanic(err error)
+}
+
+// containerDiedMsg signals a container belonging to this lease has died.
+// If done is non-nil, the actor closes it after the message is processed,
+// letting synchronous callers block until completion.
+type containerDiedMsg struct {
+	containerID string
+	done        chan struct{}
+}
+
+func (containerDiedMsg) isLeaseMessage()           {}
+func (m containerDiedMsg) doneChan() chan struct{} { return m.done }
+
+// onPanic is a no-op: the caller (if any) unblocks via the done
+// channel which is closed by handle()'s defer regardless of panic.
+func (containerDiedMsg) onPanic(error) {}
+
+// deprovisionMsg requests that the actor run the Deprovision flow. The
+// reply channel receives the outcome; doneChan is always nil because
+// callers block on reply instead.
+type deprovisionMsg struct {
+	ctx   context.Context
+	reply chan error
+}
+
+func (deprovisionMsg) isLeaseMessage()         {}
+func (deprovisionMsg) doneChan() chan struct{} { return nil }
+func (m deprovisionMsg) onPanic(err error) {
+	// Non-blocking send: reply is buffered-1, caller receives at most
+	// once. On recover, make sure the caller gets something.
+	select {
+	case m.reply <- err:
+	default:
+	}
+}
+
+// diagGatheredMsg is sent by the async diag goroutine when it finishes.
+// Carries the gather output into the Failing→Failed transition.
+type diagGatheredMsg struct {
+	result diagResult
+}
+
+func (diagGatheredMsg) isLeaseMessage()         {}
+func (diagGatheredMsg) doneChan() chan struct{} { return nil }
+func (diagGatheredMsg) onPanic(error)           {} // no caller to unblock
+
+// provisionRequestedMsg asks the actor to drive a provision flow. Carries
+// the cancel func (stored on the actor so Provisioning.OnExit can preempt)
+// and a `work` closure containing everything doProvision / doProvisionStack
+// needs — the actor doesn't need to know the arg shapes. After firing the SM
+// transition, the actor sends the Fire result on `ack` and spawns a worker
+// (tracked by workers) to run `work`. Backend.Provision blocks on `ack` so
+// it knows whether the SM accepted the transition before returning.
+type provisionRequestedMsg struct {
+	cancel context.CancelFunc
+	work   func() (callbackErr string, result provisionSuccessResult, failureLogs map[string]string, err error)
+	ack    chan error
+}
+
+func (provisionRequestedMsg) isLeaseMessage()         {}
+func (provisionRequestedMsg) doneChan() chan struct{} { return nil }
+func (m provisionRequestedMsg) onPanic(err error) {
+	select {
+	case m.ack <- err:
+	default:
+	}
+}
+
+// provisionCompletedMsg is sent by the doProvision goroutine on success.
+// Drives the Provisioning→Ready transition. Carries the result data
+// (containerIDs, manifest, stackManifest, serviceContainers) that the
+// Ready entry action writes into the provision struct.
+type provisionCompletedMsg struct {
+	result provisionSuccessResult
+}
+
+func (provisionCompletedMsg) isLeaseMessage()         {}
+func (provisionCompletedMsg) doneChan() chan struct{} { return nil }
+func (provisionCompletedMsg) onPanic(error)           {} // no caller to unblock
+
+// provisionErroredMsg is sent by the doProvision goroutine on failure.
+// callbackErr is the hardcoded on-chain-safe message; lastError is the
+// full diagnostic string (from err.Error()) that the Failed entry
+// action writes into provision.LastError. logs is the pre-captured
+// container-log map (fetched BEFORE the cleanup defer removed the
+// failed containers) so persistDiagnostics doesn't attempt to re-fetch
+// from already-deleted containers — see doProvision's captureContainerLogs
+// call.
+type provisionErroredMsg struct {
+	callbackErr string
+	lastError   string
+	logs        map[string]string
+}
+
+func (provisionErroredMsg) isLeaseMessage()         {}
+func (provisionErroredMsg) doneChan() chan struct{} { return nil }
+func (provisionErroredMsg) onPanic(error)           {} // no caller to unblock
+
+// restartRequestedMsg / updateRequestedMsg carry a cancel func + work
+// closure + ack chan, analogous to provisionRequestedMsg. The work closure
+// returns a replaceResult consumed by the actor to pick the right terminal
+// SM event (completed / recovered / failed).
+type restartRequestedMsg struct {
+	cancel context.CancelFunc
+	work   func() replaceResult
+	ack    chan error
+}
+
+func (restartRequestedMsg) isLeaseMessage()         {}
+func (restartRequestedMsg) doneChan() chan struct{} { return nil }
+func (m restartRequestedMsg) onPanic(err error) {
+	select {
+	case m.ack <- err:
+	default:
+	}
+}
+
+type updateRequestedMsg struct {
+	cancel context.CancelFunc
+	work   func() replaceResult
+	ack    chan error
+}
+
+func (updateRequestedMsg) isLeaseMessage()         {}
+func (updateRequestedMsg) doneChan() chan struct{} { return nil }
+func (m updateRequestedMsg) onPanic(err error) {
+	select {
+	case m.ack <- err:
+	default:
+	}
+}
+
+// replaceCompletedMsg / replaceRecoveredMsg / replaceFailedMsg fire the
+// Restarting|Updating exit transition after the goroutine finishes. The
+// goroutine picks which to send based on (err == nil, final Status):
+//
+//	err == nil                → replaceCompletedMsg  → Ready (Success)
+//	err != nil, Status=Ready  → replaceRecoveredMsg  → Ready (Failed+suffix)
+//	err != nil, Status=Failed → replaceFailedMsg     → Failed (Failed)
+//
+// Both replaceRecoveredMsg and replaceFailedMsg carry the callbackErr
+// string that the SM entry action emits verbatim.
+type replaceCompletedMsg struct {
+	result replaceSuccessResult
+}
+
+func (replaceCompletedMsg) isLeaseMessage()         {}
+func (replaceCompletedMsg) doneChan() chan struct{} { return nil }
+func (replaceCompletedMsg) onPanic(error)           {} // no caller to unblock
+
+type replaceRecoveredMsg struct {
+	info replaceFailureInfo
+}
+
+func (replaceRecoveredMsg) isLeaseMessage()         {}
+func (replaceRecoveredMsg) doneChan() chan struct{} { return nil }
+func (replaceRecoveredMsg) onPanic(error)           {} // no caller to unblock
+
+type replaceFailedMsg struct {
+	info replaceFailureInfo
+}
+
+func (replaceFailedMsg) isLeaseMessage()         {}
+func (replaceFailedMsg) doneChan() chan struct{} { return nil }
+func (replaceFailedMsg) onPanic(error)           {} // no caller to unblock
+
+// leaseActor owns all state transitions and async work for a single lease.
+//
+// One concept: the actor is the scope of atomicity for its messages and
+// its workers. Everything else falls out of that:
+//
+//   - Registry atomicity — b.actors is guarded by actorsMu.
+//     routeToLease() resolves-or-creates AND enqueues under the mutex;
+//     removeFromRegistry (on actor exit) deletes under the same mutex.
+//     External callers never hold a *leaseActor pointer, so stale-
+//     pointer races are unreachable by construction.
+//
+//   - Worker ownership — every worker goroutine (provision, restart,
+//     update, diag) is spawned by the actor (via spawnProvisionWorker /
+//     spawnReplaceWorker / onEnterFailing's goroutine) and tracked by
+//     workers. The actor's exit defers waitForWorkers BEFORE
+//     registry-delete / close(done) / drainInbox — under normal
+//     operation the actor does not exit while a worker is in flight.
+//     The wait is bounded by workExitWaitTimeout to avoid pinning on
+//     a wedged worker; in that pathological case the worker becomes
+//     a zombie that recoverState reconciles on next start.
+//
+//   - Drain-with-handle — the drainInbox defer calls handle() on every
+//     queued message, so a worker's terminal sendTerminal that landed
+//     while the actor was waiting for workers still drives its SM
+//     transition. Silent drops are gone.
+//
+//   - Non-blocking routing — routeToLease does a non-blocking send
+//     under the registry mutex. A wedged actor cannot stall the
+//     event-loop or other routing callers; refusals are counted in
+//     die_event_dropped_total and the reconciler re-detects.
+//
+// Messages are processed serially from inbox, so handlers never race
+// with themselves. SM transitions are synchronous inside handle() —
+// Fire dispatches OnExit / OnEntry in the actor's own goroutine.
+type leaseActor struct {
+	leaseUUID string
+	backend   *Backend
+	inbox     chan leaseMessage
+	done      chan struct{}
+	sm        *leaseSM
+	// pendingDeathInfo carries the Docker Inspect result from the SM's guard
+	// into the onEnterFailing action. Single-field handoff works because the
+	// actor processes messages serially; no two messages read/write this
+	// field concurrently.
+	pendingDeathInfo *ContainerInfo
+	// diagCancel is set when entering Failing (spawning the async diag
+	// goroutine) and called by Failing.OnExit to signal cancellation. Any
+	// transition out of Failing cancels the goroutine before a stale Failed
+	// callback can be emitted.
+	diagCancel context.CancelFunc
+	// workCancel is set when a Provision/Restart/Update worker is spawned
+	// from handleProvisionRequested / handleRestartRequested /
+	// handleUpdateRequested, and called by Provisioning/Restarting/
+	// Updating.OnExit on DeprovisionRequested preemption.
+	workCancel context.CancelFunc
+	// workers tracks every worker goroutine spawned by this actor
+	// (provision, restart, update, diag). The actor's run-loop exit path
+	// waits on workers.Zero() BEFORE the registry-delete / close-done /
+	// drainInbox defers, so in normal operation every worker's terminal
+	// sendTerminal has landed and been handled before the actor is torn
+	// down. The wait is bounded by workExitWaitTimeout to avoid pinning
+	// on a truly wedged worker; on that timeout the actor proceeds with
+	// teardown and the worker becomes a zombie (recoverState reconciles
+	// on next start). Same barrier is used by onExit* to wait for the
+	// active worker when the SM is transitioning out of a work-owning
+	// state (Deprovision preempt).
+	//
+	// The SM enforces at-most-one-worker-at-a-time across the work-owning
+	// states, so workers.Zero effectively waits for "the one worker
+	// currently running"; the count happens to always be 0 or 1.
+	workers *workBarrier
+	// currentMessageStart is the UnixNano timestamp of the message the
+	// actor is currently processing in handle(), or 0 when idle. Used by
+	// the stuck-actor sampler to detect hung handlers. Written by the
+	// actor's goroutine, read atomically by the sampler goroutine.
+	currentMessageStart atomic.Int64
+	// terminated is set by handleDeprovision once the provision entry has
+	// been fully removed. The run loop checks it after every handle() and
+	// exits, allowing the actor's slot in b.actors to be reused by a new
+	// lease with the same UUID (a stale actor stuck in Deprovisioning
+	// would otherwise Ignore evProvisionRequested and wedge the lease).
+	// Read and written only on the actor's own goroutine — no atomic.
+	terminated bool
+	// exiting is closed by the actor's exit sequence just before
+	// drainInbox runs, and observed by sendTerminal to reject late
+	// worker sends that would otherwise land in the inbox during the
+	// tiny window between drainInbox completing and close(a.done)
+	// executing. Without this signal, a late orphan worker's
+	// sendTerminal (which can happen if waitForWorkers timed out)
+	// would see hasExited() == false (done not yet closed), succeed
+	// into the now-unmonitored inbox, and silently drop — under-
+	// counting leaseTerminalEventDroppedTotal.
+	//
+	// Closed-channel pattern chosen over atomic.Bool so the gate
+	// composes directly with sendTerminal's select, mirroring how
+	// `done` works and the broader Go idiom for one-shot broadcast
+	// signals (see context.Done()). exitingOnce wraps the close so
+	// tests can force the signal without panicking the production
+	// defer that also closes it on run() exit.
+	exiting     chan struct{}
+	exitingOnce sync.Once
+}
+
+// Bounded inbox: full inbox blocks senders so Docker event bursts cannot
+// grow memory without bound.
+const leaseActorInboxSize = 16
+
+func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
+	a := &leaseActor{
+		leaseUUID: leaseUUID,
+		backend:   b,
+		inbox:     make(chan leaseMessage, leaseActorInboxSize),
+		done:      make(chan struct{}),
+		exiting:   make(chan struct{}),
+		workers:   newWorkBarrier(),
+	}
+	// Initialize the SM eagerly so that the actor's goroutine and any
+	// external reader (DebugActors over /debug/actors) see the same
+	// pointer without synchronization on a lazy-init field. Construction
+	// is cheap and safe to call from the caller's goroutine before the
+	// actor goroutine starts.
+	a.sm = newLeaseSM(a)
+	return a
+}
+
+func (a *leaseActor) run() {
+	// Defer ordering is deliberate (LIFO executes in reverse of declaration):
+	//   1. waitForWorkers runs FIRST — waits (bounded by
+	//      workExitWaitTimeout) for every in-flight worker
+	//      (provision/restart/update/diag) goroutine to return. Workers
+	//      deliver their terminal SM event via sendTerminal BEFORE
+	//      returning, so under normal operation all terminal messages
+	//      that will arrive have landed in a.inbox by the time this
+	//      unblocks. On timeout the worker becomes a zombie and its
+	//      terminal event (if ever sent) is refused by the `exiting`
+	//      check in sendTerminal.
+	//   2. removeFromRegistry runs SECOND — concurrent routeToLease calls
+	//      immediately create a fresh actor under actorsMu.
+	//   3. close(a.exiting) runs THIRD — from here on any late worker
+	//      call to sendTerminal refuses deterministically and the drop
+	//      is correctly counted. Closes the narrow post-drain /
+	//      pre-done window where a send could otherwise succeed silently.
+	//   4. drainInbox runs FOURTH — processes every message in the inbox
+	//      via handle(), so terminal events from workers actually drive
+	//      their SM transitions before the actor is gone.
+	//   5. close(a.done) runs LAST — makes actor.done a clean "fully
+	//      quiesced" signal: every queued message has been handled and
+	//      every SM transition committed (modulo the worker-timeout
+	//      edge case above). hasExited becomes true here too.
+	defer close(a.done)
+	defer a.drainInbox()
+	defer a.closeExiting()
+	defer a.removeFromRegistry()
+	defer a.waitForWorkers()
+	for {
+		if a.terminated {
+			return
+		}
+		select {
+		case msg := <-a.inbox:
+			a.handle(msg)
+		case <-a.backend.stopCtx.Done():
+			// Shutdown: exit the main loop. The deferred waitForWorkers +
+			// drainInbox guarantee in-flight workers finish and their
+			// terminal events get handled before the actor is torn down.
+			return
+		}
+	}
+}
+
+// waitForWorkers blocks until every worker goroutine this actor has
+// spawned has returned. Bounded by workExitWaitTimeout so a wedged
+// worker (Docker daemon hang with ctx ignored) can't pin the actor.
+// If the timeout fires we log and continue — the wedged worker itself
+// becomes a zombie goroutine; recoverState reconciles state on next
+// start. workBarrier's Zero() is a real channel, so the select here
+// spawns no helper goroutine: even under timeout, this function leaks
+// nothing on top of whatever the wedged worker itself has already
+// leaked.
+func (a *leaseActor) waitForWorkers() {
+	select {
+	case <-a.workers.Zero():
+	case <-time.After(workExitWaitTimeout):
+		a.backend.logger.Warn("actor waitForWorkers: worker did not exit within timeout",
+			"lease_uuid", a.leaseUUID,
+			"timeout", workExitWaitTimeout,
+		)
+	}
+}
+
+// drainInbox processes every message queued in the inbox via handle().
+// Called as the final defer in run(), after waitForWorkers has ensured no
+// more messages will arrive. handle() is safe to call post-main-loop —
+// the SM is still alive, Ignore declarations catch events that arrive in
+// the wrong state, and every msg.doneChan() gets closed so synchronous
+// callers unblock.
+func (a *leaseActor) drainInbox() {
+	for {
+		select {
+		case msg := <-a.inbox:
+			a.handle(msg)
+		default:
+			return
+		}
+	}
+}
+
+func (a *leaseActor) handle(msg leaseMessage) {
+	a.currentMessageStart.Store(time.Now().UnixNano())
+	defer a.currentMessageStart.Store(0)
+	defer func() {
+		if ch := msg.doneChan(); ch != nil {
+			close(ch)
+		}
+	}()
+	// Contain the blast radius of a handler panic to a single message:
+	// log with stack, bump a counter, and let the actor keep processing.
+	// Without this, a panic in an SM entry action or handler kills the
+	// actor goroutine, leaving the actor in b.actors with a full inbox
+	// and senders blocking forever.
+	defer func() {
+		if r := recover(); r != nil {
+			a.backend.logger.Error("lease actor panic",
+				"lease_uuid", a.leaseUUID,
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			leaseActorPanicsTotal.Inc()
+			// Unblock any caller waiting on this message's reply/ack
+			// channel. Without this, a panic in a handler leaves
+			// Backend.Deprovision / Provision / Restart / Update
+			// stuck on their select{} until ctx/stopCtx cancels —
+			// effectively an API hang per bad message.
+			msg.onPanic(fmt.Errorf("handler panic: %v", r))
+		}
+	}()
+	switch m := msg.(type) {
+	case containerDiedMsg:
+		a.handleContainerDied(m.containerID)
+	case deprovisionMsg:
+		m.reply <- a.handleDeprovision(m.ctx)
+	case diagGatheredMsg:
+		a.handleDiagGathered(m.result)
+	case provisionRequestedMsg:
+		a.handleProvisionRequested(m)
+	case restartRequestedMsg:
+		a.handleRestartRequested(m)
+	case updateRequestedMsg:
+		a.handleUpdateRequested(m)
+	case provisionCompletedMsg:
+		a.handleProvisionCompleted(m.result)
+	case provisionErroredMsg:
+		a.handleProvisionErrored(m.callbackErr, m.lastError, m.logs)
+	case replaceCompletedMsg:
+		a.handleReplaceCompleted(m.result)
+	case replaceRecoveredMsg:
+		a.handleReplaceRecovered(m.info)
+	case replaceFailedMsg:
+		a.handleReplaceFailed(m.info)
+	default:
+		a.backend.logger.Warn("lease actor: unknown message type",
+			"lease_uuid", a.leaseUUID,
+		)
+	}
+}
+
+func (a *leaseActor) handleContainerDied(containerID string) {
+	_ = a.sm.Fire(a.backend.stopCtx, evContainerDied, containerID)
+}
+
+func (a *leaseActor) handleDiagGathered(result diagResult) {
+	// If we're no longer in Failing (e.g., Deprovision preempted), the SM's
+	// Ignore declarations on Failed/Deprovisioning drop this event; Fire
+	// returns an unhandled-trigger error we can safely discard.
+	_ = a.sm.Fire(a.backend.stopCtx, evDiagGathered, result)
+}
+
+// fireAndVerify fires an SM event and verifies the transition landed in
+// the expected destination state. This is the ONLY way caller-facing
+// handlers should commit an SM transition — the raw sm.Fire call is
+// unsafe because stateless returns nil both on Permit (SM transitioned)
+// and Ignore (SM deliberately did nothing), so a naive
+// `if err := sm.Fire(...); err != nil` lets Ignore paths masquerade as
+// success. That trap bit handleProvisionRequested on the
+// partial-Deprovision lifecycle (Deprovisioning.Ignore(evProvisionRequested)
+// → Fire returns nil → worker spawned against an SM still in
+// Deprovisioning → terminal provisionCompletedMsg also Ignored →
+// lease wedges with live containers, no Success callback).
+//
+// Returns nil iff the SM is in wantState after Fire; otherwise returns
+// the Fire error (unhandled trigger) OR an errFireIgnored wrapping the
+// actual state (Ignore-returns-nil).
+func (a *leaseActor) fireAndVerify(ev leaseEvent, wantState backend.ProvisionStatus) error {
+	if err := a.sm.Fire(a.backend.stopCtx, ev); err != nil {
+		return err
+	}
+	if state := a.sm.State(); state != wantState {
+		return fmt.Errorf("%v not accepted by SM from state %v", ev, state)
+	}
+	return nil
+}
+
+// handleProvisionRequested transitions the SM into Provisioning (or from
+// Failed on retry), acks the caller, and spawns the work goroutine.
+// Spawning inside the actor (rather than in Backend.Provision) means the
+// worker is tracked by workers and, under normal operation, the actor
+// waits for the worker's terminal sendTerminal to land and be handled
+// before exit (bounded by workExitWaitTimeout to avoid pinning on a
+// truly wedged worker). The orphan-worker race class is eliminated
+// under that happy-path wait; pathological timeouts leave a zombie
+// worker that recoverState reconciles on next start.
+func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
+	if a.terminated {
+		// Actor has already completed Deprovision but not yet been
+		// removed from the registry (defer ordering). Reject so the
+		// caller rolls back and retries — a fresh actor will be
+		// created on the next routeToLease.
+		msg.ack <- errActorTerminated
+		return
+	}
+	a.workCancel = msg.cancel
+	if err := a.fireAndVerify(evProvisionRequested, backend.ProvisionStatusProvisioning); err != nil {
+		msg.ack <- err
+		return
+	}
+	msg.ack <- nil
+	a.spawnProvisionWorker(msg.work)
+}
+
+// spawnProvisionWorker runs doProvision (or doProvisionStack, supplied as
+// the work closure), pre-publishes container IDs on success so a preempting
+// Deprovision sees them under lock, and sends the terminal SM event via
+// sendTerminal. Tracked by workers so the actor waits for this worker
+// before exit. On failure, the worker captures container logs BEFORE
+// cleanup (see doProvision's defer) so the persisted diagnostic entry
+// contains useful debugging output even though the failed containers
+// have been removed.
+func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessResult, map[string]string, error)) {
+	a.workers.Add()
+	a.backend.wg.Go(func() {
+		// Exactly one sendTerminal call site (the middle defer), driven
+		// by terminalMsg. Defer ordering (LIFO):
+		//   1. recover (innermost, runs FIRST on panic) — may override
+		//      terminalMsg to a panic-error variant.
+		//   2. sendTerminal (middle, always runs) — fires whatever
+		//      terminalMsg was set to.
+		//   3. workers.Done (outermost, runs LAST) — releases the
+		//      barrier after sendTerminal has landed the event.
+		// This structure guarantees at-most-one terminal per worker and
+		// eliminates both the double-send race and any possibility of a
+		// wedged SM if a panic occurs before the normal path sets the
+		// message.
+		var terminalMsg leaseMessage
+		var event string
+		defer a.workers.Done()
+		defer func() {
+			if terminalMsg == nil {
+				// Defensive: should not occur if the normal path runs
+				// to completion. If it does, treat as an error so the
+				// SM reaches Failed rather than wedging.
+				terminalMsg = provisionErroredMsg{
+					callbackErr: errMsgInternal,
+					lastError:   "provision worker exited without setting terminal event",
+				}
+				event = "provision_no_result"
+			}
+			if !a.sendTerminal(terminalMsg) {
+				leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+				a.backend.logger.Warn("terminal provision event dropped (actor exited or inbox wedged)",
+					"lease_uuid", a.leaseUUID,
+					"event", event,
+				)
+			}
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				a.backend.logger.Error("provision worker panic — recovering to keep fred alive",
+					"lease_uuid", a.leaseUUID,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				leaseWorkerPanicsTotal.WithLabelValues("provision").Inc()
+				// Override any terminalMsg set by the normal path —
+				// the panic means the post-set work did not complete.
+				terminalMsg = provisionErroredMsg{
+					callbackErr: errMsgInternal,
+					lastError:   fmt.Sprintf("worker panic: %v", r),
+				}
+				event = "provision_panic"
+			}
+		}()
+		callbackErr, result, failureLogs, err := work()
+		if err == nil {
+			// Pre-publish so a concurrent Deprovision-preempt reading
+			// prov.ContainerIDs sees the new IDs and can tear them down
+			// rather than leaving orphans.
+			a.backend.provisionsMu.Lock()
+			if p, ok := a.backend.provisions[a.leaseUUID]; ok {
+				p.ContainerIDs = result.containerIDs
+			}
+			a.backend.provisionsMu.Unlock()
+			terminalMsg = provisionCompletedMsg{result: result}
+			event = "provision_completed"
+		} else {
+			terminalMsg = provisionErroredMsg{
+				callbackErr: callbackErr,
+				lastError:   err.Error(),
+				logs:        failureLogs,
+			}
+			event = "provision_errored"
+		}
+	})
+}
+
+func (a *leaseActor) handleProvisionCompleted(result provisionSuccessResult) {
+	_ = a.sm.Fire(a.backend.stopCtx, evProvisionCompleted, result)
+}
+
+func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string, logs map[string]string) {
+	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, provisionErrorInfo{
+		callbackErr: callbackErr,
+		lastError:   lastError,
+		logs:        logs,
+	})
+}
+
+func (a *leaseActor) handleRestartRequested(msg restartRequestedMsg) {
+	if a.terminated {
+		msg.ack <- errActorTerminated
+		return
+	}
+	a.workCancel = msg.cancel
+	if err := a.fireAndVerify(evRestartRequested, backend.ProvisionStatusRestarting); err != nil {
+		msg.ack <- err
+		return
+	}
+	msg.ack <- nil
+	a.spawnReplaceWorker(msg.work)
+}
+
+func (a *leaseActor) handleUpdateRequested(msg updateRequestedMsg) {
+	if a.terminated {
+		msg.ack <- errActorTerminated
+		return
+	}
+	a.workCancel = msg.cancel
+	if err := a.fireAndVerify(evUpdateRequested, backend.ProvisionStatusUpdating); err != nil {
+		msg.ack <- err
+		return
+	}
+	msg.ack <- nil
+	a.spawnReplaceWorker(msg.work)
+}
+
+// spawnReplaceWorker runs a replace operation (restart or update) and
+// dispatches the correct terminal SM event based on (err, restored).
+// Pre-publishes new ContainerIDs / ServiceContainers on success so a
+// preempting Deprovision reading prov observes the new set under lock.
+func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
+	a.workers.Add()
+	a.backend.wg.Go(func() {
+		// Same defer structure as spawnProvisionWorker — see that
+		// function for the rationale. One sendTerminal call site in
+		// the middle defer; normal path and panic recover both write
+		// to terminalMsg.
+		var terminalMsg leaseMessage
+		var event string
+		defer a.workers.Done()
+		defer func() {
+			if terminalMsg == nil {
+				terminalMsg = replaceFailedMsg{info: replaceFailureInfo{
+					callbackErr: errMsgInternal,
+					lastError:   "replace worker exited without setting terminal event",
+				}}
+				event = "replace_no_result"
+			}
+			if !a.sendTerminal(terminalMsg) {
+				leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+				a.backend.logger.Warn("terminal replace event dropped (actor exited or inbox wedged)",
+					"lease_uuid", a.leaseUUID,
+					"event", event,
+				)
+			}
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				a.backend.logger.Error("replace worker panic — recovering to keep fred alive",
+					"lease_uuid", a.leaseUUID,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				leaseWorkerPanicsTotal.WithLabelValues("replace").Inc()
+				terminalMsg = replaceFailedMsg{info: replaceFailureInfo{
+					callbackErr: errMsgInternal,
+					lastError:   fmt.Sprintf("worker panic: %v", r),
+				}}
+				event = "replace_panic"
+			}
+		}()
+		result := work()
+		if result.err == nil {
+			a.backend.provisionsMu.Lock()
+			if p, ok := a.backend.provisions[a.leaseUUID]; ok {
+				p.ContainerIDs = result.success.containerIDs
+				if result.success.serviceContainers != nil {
+					p.ServiceContainers = result.success.serviceContainers
+				}
+			}
+			a.backend.provisionsMu.Unlock()
+		}
+		switch {
+		case result.err == nil:
+			terminalMsg = replaceCompletedMsg{result: result.success}
+			event = "replace_completed"
+		case result.restored:
+			terminalMsg = replaceRecoveredMsg{info: result.failure}
+			event = "replace_recovered"
+		default:
+			terminalMsg = replaceFailedMsg{info: result.failure}
+			event = "replace_failed"
+		}
+	})
+}
+
+func (a *leaseActor) handleReplaceCompleted(result replaceSuccessResult) {
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceCompleted, result)
+}
+
+func (a *leaseActor) handleReplaceRecovered(info replaceFailureInfo) {
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceRecovered, info)
+}
+
+func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
+	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed, info)
+}
+
+// send enqueues a message. Blocks when the inbox is full (backpressure).
+// Returns false if the backend is shutting down OR the actor has exited.
+//
+// Test-only: production code uses b.routeToLease(uuid, msg) which never
+// exposes an actor pointer to the caller. This method is retained for
+// test code that needs synthetic direct-send scenarios.
+//
+// For TERMINAL events delivered by in-flight work goroutines — whose
+// physical work has already happened on the host and MUST be recorded
+// by the SM even during shutdown — use sendTerminal instead.
+func (a *leaseActor) send(msg leaseMessage) bool {
+	if a.backend.stopCtx.Err() != nil || a.hasExited() {
+		return false
+	}
+	select {
+	case <-a.backend.stopCtx.Done():
+		return false
+	case <-a.done:
+		return false
+	case a.inbox <- msg:
+		return true
+	}
+}
+
+// hasExited reports whether the actor's run loop has returned (a.done
+// closed). Used by sendTerminal to make the "actor-already-exited" case
+// a definitive refusal rather than a select-randomized 50/50 between
+// queueing into an inbox nobody will drain and the closed-done arm.
+func (a *leaseActor) hasExited() bool {
+	select {
+	case <-a.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// sendTerminal enqueues a terminal SM event from an in-flight work
+// goroutine. Bypasses the stopCtx refusal that send() applies because the
+// goroutine has already done its physical work (containers created,
+// swapped, removed) — the SM must record the outcome even during
+// shutdown to keep releaseStore / in-memory state / the callback record
+// consistent with the host. Returns false only if the actor has fully
+// exited (inbox no longer drained), the exiting channel is closed
+// (actor is in its exit sequence, past drainInbox), or the bounded
+// inbox is wedged; in either case the drop is counted via
+// leaseTerminalEventDroppedTotal at the call site.
+//
+// Two refusal gates on the fast path:
+//   - hasExited(): a.done closed. Actor is fully torn down.
+//   - isExiting(): a.exiting closed just before drainInbox runs.
+//     Covers the narrow post-drain / pre-done window where a late
+//     worker could otherwise successfully enqueue into an inbox that
+//     no goroutine will drain, silently losing the event. Both
+//     channels also appear as select arms below so the main wait
+//     composes correctly, and a post-send non-blocking re-check
+//     guarantees the metric reflects reality when a late close
+//     races with a successful enqueue.
+//
+// In normal operation (waitForWorkers returns cleanly) workers finish
+// before any exit-path defers run, so these gates are pure defense
+// against the waitForWorkers-timeout edge case.
+func (a *leaseActor) sendTerminal(msg leaseMessage) bool {
+	if a.hasExited() || a.isExiting() {
+		return false
+	}
+	select {
+	case a.inbox <- msg:
+		// Re-check: exiting may have been closed between the pre-check
+		// and this send. Report as dropped so the metric is accurate.
+		// The message will rot in the inbox but no one relies on it.
+		if a.isExiting() {
+			return false
+		}
+		return true
+	case <-a.done:
+		return false
+	case <-a.exiting:
+		return false
+	case <-time.After(terminalSendTimeout):
+		return false
+	}
+}
+
+// isExiting reports whether the actor has closed its `exiting` channel,
+// i.e. the exit sequence is past the point where new terminal sends
+// can still be drained. Symmetric with hasExited() but for the
+// earlier gate.
+func (a *leaseActor) isExiting() bool {
+	select {
+	case <-a.exiting:
+		return true
+	default:
+		return false
+	}
+}
+
+// closeExiting closes the exiting channel exactly once, even across
+// retries (production's exit defer + any test-driven close). Using
+// sync.Once keeps the close idempotent without a select-default
+// double-check idiom that would itself race under concurrent callers.
+func (a *leaseActor) closeExiting() {
+	a.exitingOnce.Do(func() { close(a.exiting) })
+}
+
+// terminalSendTimeout bounds how long a terminal send will wait for inbox
+// space. Long enough for the actor to drain typical backlogs, short
+// enough that a wedged actor doesn't pin the goroutine indefinitely.
+const terminalSendTimeout = 10 * time.Second
+
+// removeFromRegistry deletes this actor from b.actors under actorsMu.
+// CompareAndDelete semantics: only deletes if the registered entry is
+// THIS actor, so a fresh actor stored for the same UUID after our exit
+// started isn't clobbered. Used as a deferred action on actor exit.
+func (a *leaseActor) removeFromRegistry() {
+	a.backend.actorsMu.Lock()
+	defer a.backend.actorsMu.Unlock()
+	if reg, ok := a.backend.actors[a.leaseUUID]; ok && reg == a {
+		delete(a.backend.actors, a.leaseUUID)
+	}
+}
+
+// actorForLocked returns the lease actor for leaseUUID, creating + starting
+// one on first access. Caller MUST hold b.actorsMu. The whole point of the
+// registry mutex: resolve-or-create and any subsequent state change (enqueue,
+// exit) serialize through the same lock.
+func (b *Backend) actorForLocked(leaseUUID string) *leaseActor {
+	if existing, ok := b.actors[leaseUUID]; ok {
+		return existing
+	}
+	candidate := newLeaseActor(b, leaseUUID)
+	b.actors[leaseUUID] = candidate
+	leaseActorsCreatedTotal.Inc()
+	b.wg.Go(candidate.run)
+	return candidate
+}
+
+// routeToLease is the ONLY way external code delivers a message to a lease's
+// actor. It resolves-or-creates the actor AND enqueues atomically under
+// actorsMu — so the stale-pointer race class (caller retained an actor
+// reference while the actor was terminating) cannot occur by construction:
+// callers never hold a *leaseActor pointer.
+//
+// Returns false if the backend is shutting down OR the inbox is full (the
+// enqueue is non-blocking to avoid holding the registry mutex across a
+// potentially-slow channel send). Fire-and-forget callers
+// (containerEventLoop, reconcile) treat refusal as "reconciler will
+// re-detect". Caller-facing API paths that need backpressure-retry
+// semantics should use routeToLeaseBlocking instead.
+func (b *Backend) routeToLease(leaseUUID string, msg leaseMessage) bool {
+	b.actorsMu.Lock()
+	defer b.actorsMu.Unlock()
+	if b.stopCtx.Err() != nil {
+		return false
+	}
+	actor := b.actorForLocked(leaseUUID)
+	select {
+	case actor.inbox <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+// routeToLeaseBlocking wraps routeToLease with ctx-bounded retry so
+// caller-facing API paths (Provision, Deprovision, Restart, Update)
+// don't spuriously fail on transient inbox saturation. Returns nil on
+// successful enqueue, ctx.Err() on caller cancellation, or a "backend
+// shutting down" error when stopCtx fires. Polls on
+// routeToLeaseRetryInterval while the inbox is full — a few ms of
+// latency is acceptable for API calls; the alternative is turning
+// backpressure into a 5xx.
+//
+// The up-front ctx / stopCtx check guarantees we don't enqueue a
+// message the caller is about to abandon: without it, the first
+// routeToLease could succeed and start async work while the caller
+// returns ctx.Err() having seen nothing.
+func (b *Backend) routeToLeaseBlocking(ctx context.Context, leaseUUID string, msg leaseMessage) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if b.stopCtx.Err() != nil {
+		return fmt.Errorf("backend shutting down")
+	}
+	for {
+		if b.routeToLease(leaseUUID, msg) {
+			return nil
+		}
+		if b.stopCtx.Err() != nil {
+			return fmt.Errorf("backend shutting down")
+		}
+		select {
+		case <-b.stopCtx.Done():
+			return fmt.Errorf("backend shutting down")
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(routeToLeaseRetryInterval):
+		}
+	}
+}
+
+// routeToLeaseRetryInterval is the poll interval for routeToLeaseBlocking
+// when the target inbox is momentarily full. Short enough that API-call
+// latency from backpressure is negligible in normal operation (inbox
+// rarely fills); long enough to avoid hot-spinning a contended actor.
+const routeToLeaseRetryInterval = 10 * time.Millisecond
+
+// ackOrAbort waits for the actor's ack on a caller-facing request
+// (Provision / Restart / Update). Returns (true, nil) if the actor
+// acked success, (false, err) if the actor rejected or if we abandoned.
+//
+// Race fix: Go's select picks pseudo-randomly when multiple arms are
+// ready. A naive `select { case err := <-ack: ... case <-ctx.Done():
+// rollback ... }` can take the cancellation arm even though the actor
+// already acked — resulting in a rollback while the actor proceeds to
+// spawn a worker against the rolled-back state. Here we do a final
+// non-blocking read of ack after observing cancellation; if the actor
+// already committed, we honor its decision and skip the rollback.
+//
+// The caller is responsible for the rollback (removeProvision /
+// restartRollback / etc.) when accepted=false, since the compensating
+// action varies per site.
+func (b *Backend) ackOrAbort(ctx context.Context, ack <-chan error) (accepted bool, err error) {
+	select {
+	case ackErr := <-ack:
+		if ackErr != nil {
+			return false, ackErr
+		}
+		return true, nil
+	case <-ctx.Done():
+	case <-b.stopCtx.Done():
+	}
+	// Cancellation fired. Final non-blocking check: if the actor acked
+	// at the same instant, honor its decision instead of rolling back.
+	select {
+	case ackErr := <-ack:
+		if ackErr != nil {
+			return false, ackErr
+		}
+		return true, nil
+	default:
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return false, fmt.Errorf("backend shutting down")
+}
+
+// waitForReply waits for an actor's reply channel on a caller-facing
+// request whose semantics are "run the work, return the outcome"
+// (e.g., Deprovision). This is the ONLY supported way to block on a
+// lease actor's reply — the naive
+// `select { case err := <-reply: ... case <-ctx.Done(): return ctx.Err() }`
+// is unsafe because Go's select is pseudo-randomized when multiple
+// arms are ready, so a caller ctx cancel racing the actor's committed
+// outcome can return ctx.Err() for an operation that fully succeeded.
+// (Same race class as ackOrAbort handles for Provision/Restart/Update.)
+//
+// Semantics differ from ackOrAbort: here the actor's reply IS the
+// outcome of the work (it runs synchronously inside the handler), so
+// there's no "accepted vs err" distinction — callers get the outcome
+// or a cancellation error.
+func (b *Backend) waitForReply(ctx context.Context, reply <-chan error) error {
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+	case <-b.stopCtx.Done():
+	}
+	select {
+	case err := <-reply:
+		return err
+	default:
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("backend shutting down")
+}
+
+// ActorSnapshot is a point-in-time view of one lease actor's state for
+// operator introspection. Safe to marshal to JSON for a /debug/actors
+// endpoint when integrated with the HTTP layer.
+type ActorSnapshot struct {
+	LeaseUUID  string `json:"lease_uuid"`
+	SMState    string `json:"sm_state"`    // current SM state
+	InboxDepth int    `json:"inbox_depth"` // pending messages not yet processed
+	InboxCap   int    `json:"inbox_cap"`
+}
+
+// actorMetricsSampleInterval paces sampleActorMetrics. Short enough for
+// the stuck-actor gauge to react within an alerting window, long enough
+// that walking the registry and sampling inbox depth stays negligible.
+const actorMetricsSampleInterval = 5 * time.Second
+
+// sampleActorMetrics walks every live actor, observing inbox depth into
+// the histogram and finding the oldest in-flight handle() start across
+// all actors for the stuck-seconds gauge. Called periodically from
+// actorMetricsSampleLoop.
+//
+// Holds actorsMu only long enough to snapshot the actor list, then observes
+// outside the lock. inbox len() and currentMessageStart are both safe to
+// read concurrently with actor work (inbox len is racy-but-fine; atomic
+// load for currentMessageStart).
+func (b *Backend) sampleActorMetrics() {
+	now := time.Now().UnixNano()
+	b.actorsMu.Lock()
+	actors := make([]*leaseActor, 0, len(b.actors))
+	for _, actor := range b.actors {
+		actors = append(actors, actor)
+	}
+	b.actorsMu.Unlock()
+
+	var oldestStart int64
+	for _, actor := range actors {
+		leaseActorInboxDepth.Observe(float64(len(actor.inbox)))
+		if start := actor.currentMessageStart.Load(); start != 0 {
+			if oldestStart == 0 || start < oldestStart {
+				oldestStart = start
+			}
+		}
+	}
+	if oldestStart == 0 {
+		leaseActorStuckSeconds.Set(0)
+	} else {
+		leaseActorStuckSeconds.Set(float64(now-oldestStart) / float64(time.Second))
+	}
+}
+
+// actorMetricsSampleLoop runs sampleActorMetrics on a ticker until the
+// backend shuts down. Spawned once from Start() via b.wg.Go.
+func (b *Backend) actorMetricsSampleLoop() {
+	ticker := time.NewTicker(actorMetricsSampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-b.stopCtx.Done():
+			return
+		case <-ticker.C:
+			b.sampleActorMetrics()
+		}
+	}
+}
+
+// DebugActors returns a snapshot of every live lease actor. The result
+// is stable for the caller: it's a copy; the registry may grow or
+// change state after return. Intended for ops introspection during
+// incidents — pair with a /debug/actors HTTP handler that JSON-encodes
+// the return.
+func (b *Backend) DebugActors() []ActorSnapshot {
+	b.actorsMu.Lock()
+	actors := make(map[string]*leaseActor, len(b.actors))
+	for uuid, actor := range b.actors {
+		actors[uuid] = actor
+	}
+	b.actorsMu.Unlock()
+
+	snapshots := make([]ActorSnapshot, 0, len(actors))
+	for leaseUUID, actor := range actors {
+		snapshots = append(snapshots, ActorSnapshot{
+			LeaseUUID:  leaseUUID,
+			SMState:    fmt.Sprintf("%v", actor.sm.State()),
+			InboxDepth: len(actor.inbox),
+			InboxCap:   cap(actor.inbox),
+		})
+	}
+	return snapshots
+}

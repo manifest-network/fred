@@ -6,6 +6,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/util"
 )
 
 var diagnosticsBucketName = []byte("failure_diagnostics")
@@ -29,9 +31,10 @@ type DiagnosticsStore struct {
 
 // DiagnosticsStoreConfig configures the diagnostics store.
 type DiagnosticsStoreConfig struct {
-	DBPath          string        // Path to bbolt database file
-	MaxAge          time.Duration // Max age before entries are cleaned up (0 = no expiry)
-	CleanupInterval time.Duration // How often to run cleanup (defaults to MaxAge)
+	DBPath          string            // Path to bbolt database file
+	MaxAge          time.Duration     // Max age before entries are cleaned up (0 = no expiry)
+	CleanupInterval time.Duration     // How often to run cleanup (defaults to MaxAge)
+	OnCleanupPanic  util.PanicHandler // Optional: invoked on cleanup-loop panic.
 }
 
 // NewDiagnosticsStore opens or creates a bbolt database for diagnostics persistence.
@@ -51,7 +54,7 @@ func NewDiagnosticsStore(cfg DiagnosticsStoreConfig) (*DiagnosticsStore, error) 
 	s := &DiagnosticsStore{boltStore: base}
 
 	if cfg.MaxAge > 0 {
-		base.startCleanup("diagnostics", cfg.CleanupInterval, s.RemoveOlderThan)
+		base.startCleanup("diagnostics", cfg.CleanupInterval, s.RemoveOlderThan, cfg.OnCleanupPanic)
 	}
 
 	return s, nil

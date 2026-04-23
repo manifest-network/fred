@@ -3,7 +3,6 @@ package docker
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -28,6 +27,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	allocsByLease := make(map[string][]shared.ResourceAllocation)
 	recovered := make(map[string]*provision)
+	// firstExitedByLease[uuid] is the container ID of the first container we
+	// observed in an exited state for that lease. Used to fire containerDiedMsg
+	// into the actor for Ready→Failed transitions so the SM handles the
+	// callback emission via its Failing→Failed flow.
+	firstExitedByLease := make(map[string]string)
 	skippedUnknownSKU := 0
 
 	// Group containers by lease UUID
@@ -125,10 +129,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			prov.FailCount = c.FailCount
 		}
 
-		// If any container is not ready, mark the whole provision as not ready
+		// If any container is not ready, mark the whole provision as not ready.
+		// Also track the first exited container — recoverState fires
+		// containerDiedMsg with this ID for Ready→Failed transitions so the
+		// SM's Failing state handles the callback emission.
 		status := containerStatusToProvisionStatus(c.Status)
 		if status != backend.ProvisionStatusReady && prov.Status == backend.ProvisionStatusReady {
 			prov.Status = status
+		}
+		if status == backend.ProvisionStatusFailed {
+			if _, already := firstExitedByLease[c.LeaseUUID]; !already {
+				firstExitedByLease[c.LeaseUUID] = c.ContainerID
+			}
 		}
 
 		// Use instance-specific allocation ID, grouped by lease for filtering.
@@ -153,19 +165,25 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	b.provisionsMu.Lock()
 
 	// Detect ready→failed transitions: containers that were running but have since crashed.
-	// We must notify Fred so the lease doesn't remain active for a dead container.
+	// For each transition, we hand off to the SM by firing containerDiedMsg
+	// on the actor *after* the merge (see below). The SM's Ready→Failing→Failed
+	// flow gathers diagnostics via the async goroutine and emits the
+	// terminal Failed callback through Failed.OnEntryFrom(evDiagGathered).
+	//
+	// Status stays Ready in the recovered map so the actor's guard sees the
+	// pre-transition state and permits evContainerDied; FailCount and
+	// LastError are populated by the SM's Failing entry action.
 	var failedLeases []string
 	for uuid, existing := range b.provisions {
 		if existing.Status == backend.ProvisionStatusReady {
 			if rec, ok := recovered[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
-				// Carry over FailCount and increment for this failure.
-				rec.FailCount = existing.FailCount + 1
-				rec.LastError = errMsgContainerExited
+				rec.Status = backend.ProvisionStatusReady
+				rec.FailCount = existing.FailCount
+				rec.LastError = existing.LastError
 				failedLeases = append(failedLeases, uuid)
 				b.logger.Warn("container crashed after provisioning",
 					"lease_uuid", uuid,
 					"tenant", existing.Tenant,
-					"fail_count", rec.FailCount,
 				)
 			}
 		}
@@ -214,10 +232,23 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
 			// In-flight operation that hasn't produced containers yet — preserve it.
 			recovered[uuid] = existing
+		case backend.ProvisionStatusFailing:
+			// Failing is a transient state between container-death detection
+			// and the diag goroutine firing DiagGathered. A crash (or external
+			// container removal while Failing) can preserve Failing in memory
+			// without the transition to Failed completing. Normalize to
+			// Failed so Provision/Restart/Update retry paths (which require
+			// Status == Failed) can proceed — the container is dead,
+			// FailCount has been incremented, LastError was set by
+			// onEnterFailing. Any diag that was in-flight is lost; the
+			// normalized Failed callback is not re-emitted (the lease is
+			// recoverable via retry from the caller).
+			existing.Status = backend.ProvisionStatusFailed
+			recovered[uuid] = existing
 		case backend.ProvisionStatusFailed:
-			// Failed provision whose containers have been cleaned up (e.g., after
-			// a failed re-provision attempt). Preserve so fred's reconciler can
-			// see the failure and its FailCount for retry/close decisions.
+			// Failed provision whose containers have been cleaned up.
+			// Preserve so fred's reconciler can see the failure and its
+			// FailCount.
 			recovered[uuid] = existing
 		}
 	}
@@ -263,8 +294,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	activeProvisions.Set(readyCount)
 	updateResourceMetrics(b.pool.Stats())
 
-	// Gather diagnostics for failed leases (I/O outside the lock).
-	allFailed := slices.Concat(failedLeases, coldStartFailed)
+	// Gather diagnostics for cold-start failures only. Ready→Failed
+	// transitions (failedLeases) are handled by the SM's Failing state,
+	// whose OnEntry action spawns the async diag goroutine — same code
+	// path as a live container-death event.
+	allFailed := coldStartFailed
 	failedDiagnostics := make(map[string]string, len(allFailed))
 	for _, uuid := range allFailed {
 		b.provisionsMu.RLock()
@@ -329,42 +363,26 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.persistDiagnostics(item.entry, item.containerIDs, item.keys)
 	}
 
-	// Send failure callbacks with hardcoded message — never includes logs
-	// or dynamic data. Full diagnostics are in prov.LastError for
-	// authenticated API access.
-	//
-	// Re-check status under RLock before each send: the preceding diag gather
-	// and persist loop holds no lock, so a concurrent Deprovision (or Provision
-	// re-attempt, Restart) may have flipped Failed into another state.
-	// Whichever operation took over will emit its own terminal callback.
-	//
-	// Snapshot the callback URL under the same RLock as the status check, then
-	// send via sendCallbackWithURL so the send cannot race with a concurrent
-	// delete (which would yield a noisy "no callback URL" warning) or reinsert
-	// (which could route this lease's Failed send to a different URL).
+	// Hand off Ready→Failed transitions to each lease's actor. The SM's
+	// Ready→Failing→Failed flow gathers diagnostics via the async goroutine
+	// (same code path as a live container-death event) and emits the
+	// terminal Failed callback from Failed.OnEntryFrom(evDiagGathered).
+	// Callback suppression on concurrent Deprovision is handled
+	// structurally by Failing.OnExit.
 	for _, uuid := range failedLeases {
-		b.provisionsMu.RLock()
-		var curStatus backend.ProvisionStatus
-		var callbackURL string
-		var failCount int
-		present := false
-		if p, ok := b.provisions[uuid]; ok {
-			present = true
-			curStatus = p.Status
-			callbackURL = p.CallbackURL
-			failCount = p.FailCount
-		}
-		b.provisionsMu.RUnlock()
-		if !present || curStatus != backend.ProvisionStatusFailed {
-			b.logger.Info("suppressing Failed callback: another operation took over",
-				"lease_uuid", uuid,
-				"observed_status", curStatus,
-				"present", present,
-				"fail_count", failCount,
-			)
+		containerID, ok := firstExitedByLease[uuid]
+		if !ok {
+			// Shouldn't happen: if we detected a Ready→Failed transition,
+			// some container for this lease was observed as exited.
+			b.logger.Warn("ready→failed transition detected but no exited container",
+				"lease_uuid", uuid)
 			continue
 		}
-		b.sendCallbackWithURL(uuid, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
+		if !b.routeToLease(uuid, containerDiedMsg{containerID: containerID}) {
+			dieEventDroppedTotal.WithLabelValues("reconcile").Inc()
+			b.logger.Warn("die event dropped during reconcile dispatch; reconciler will re-detect",
+				"lease_uuid", uuid, "container_id", shortID(containerID))
+		}
 	}
 
 	stats := b.pool.Stats()
@@ -438,6 +456,10 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 }
 
 // cleanupOrphanedNetworks removes managed networks whose tenant has no active provisions.
+// activeTenants is a cheap precheck to skip tenants obviously still in use;
+// releaseTenantNetwork re-validates against a live b.provisions scan under
+// the per-tenant mutex, so this path is safe against a Provision() arriving
+// concurrently with reconcile.
 func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map[string]bool) {
 	networks, err := b.docker.ListManagedNetworks(ctx)
 	if err != nil {
@@ -448,7 +470,7 @@ func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map
 	for _, n := range networks {
 		tenant := n.Labels[LabelTenant]
 		if tenant != "" && !activeTenants[tenant] && len(n.Containers) == 0 {
-			if err := b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant); err != nil {
+			if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 				b.logger.Warn("failed to remove orphaned network", "network", n.Name, "error", err)
 			} else {
 				b.logger.Info("removed orphaned tenant network", "network", n.Name, "tenant", tenant)
@@ -506,7 +528,13 @@ func (b *Backend) containerEventLoop() {
 					break consume
 				}
 				if event.Action == "die" {
-					b.handleContainerDeath(event.ContainerID)
+					if leaseUUID, found := b.findLeaseByContainerID(event.ContainerID); found {
+						if !b.routeToLease(leaseUUID, containerDiedMsg{containerID: event.ContainerID}) {
+							dieEventDroppedTotal.WithLabelValues("event_loop").Inc()
+							b.logger.Warn("die event dropped at event loop dispatch; reconciler will re-detect",
+								"lease_uuid", leaseUUID, "container_id", shortID(event.ContainerID))
+						}
+					}
 				}
 			case err, ok := <-errCh:
 				if !ok {
@@ -524,141 +552,6 @@ func (b *Backend) containerEventLoop() {
 		case <-time.After(time.Second):
 		}
 	}
-}
-
-// handleContainerDeath processes a single container death event. If the
-// container belongs to a lease in Ready status, it transitions the lease to
-// Failed and sends a callback — the same transition that recoverState
-// performs, but for a single container in real time.
-func (b *Backend) handleContainerDeath(containerID string) {
-	leaseUUID, found := b.findLeaseByContainerID(containerID)
-	if !found {
-		return
-	}
-
-	// Only transition ready→failed. Other states (provisioning, restarting,
-	// updating, deprovisioning, already failed) are managed by other code paths.
-	// Deprovisioning in particular: Deprovision() sets this status before
-	// calling RemoveContainer, so die events emitted during that removal land
-	// here and must be skipped.
-	// Read status under lock to avoid data race with concurrent writers.
-	b.provisionsMu.RLock()
-	prov, exists := b.provisions[leaseUUID]
-	if !exists || prov.Status != backend.ProvisionStatusReady {
-		b.provisionsMu.RUnlock()
-		return
-	}
-	b.provisionsMu.RUnlock()
-
-	// Defensive: verify the container is actually dead via inspect.
-	// Docker events can be duplicated or arrive out of order.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	info, err := b.docker.InspectContainer(ctx, containerID)
-	if err != nil {
-		b.logger.Warn("failed to inspect container after die event",
-			"container_id", shortID(containerID),
-			"lease_uuid", leaseUUID,
-			"error", err,
-		)
-		return
-	}
-	if containerStatusToProvisionStatus(info.Status) != backend.ProvisionStatusFailed {
-		return // Container restarted or state changed before we got here
-	}
-
-	// Transition to failed under write lock.
-	b.provisionsMu.Lock()
-	// Re-check status under write lock to avoid racing with recoverState or
-	// another die event for a multi-container lease.
-	currentProv, exists := b.provisions[leaseUUID]
-	if !exists || currentProv.Status != backend.ProvisionStatusReady {
-		b.provisionsMu.Unlock()
-		return
-	}
-	currentProv.Status = backend.ProvisionStatusFailed
-	currentProv.FailCount++
-	failCount := currentProv.FailCount
-	currentProv.LastError = errMsgContainerExited
-	// Decrement the gauge under the same lock as the status flip so the
-	// Ready→Failed transition is counted exactly once even if a concurrent
-	// Deprovision preempts the callback below.
-	activeProvisions.Dec()
-	b.provisionsMu.Unlock()
-
-	// Gather diagnostics (I/O outside the lock, same pattern as recoverState).
-	// All writes below are gated on Status==Failed: if a concurrent Deprovision
-	// or Provision re-attempt has taken ownership, its fresh LastError / new
-	// ContainerIDs must not be overwritten with the old failure's data, and
-	// the diagnostic snapshot must not persist logs attributed to the new
-	// owner. Same principle as the suppress-callback-on-status-change below.
-	diag := b.containerFailureDiagnostics(ctx, containerID, info)
-	if diag != "" {
-		b.provisionsMu.Lock()
-		if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailed {
-			p.LastError = errMsgContainerExited + ": " + diag
-		}
-		b.provisionsMu.Unlock()
-	}
-
-	// Persist diagnostics (snapshot under lock, I/O outside).
-	var diagSnap shared.DiagnosticEntry
-	var diagContainerIDs []string
-	var diagKeys map[string]string
-	b.provisionsMu.RLock()
-	if p, ok := b.provisions[leaseUUID]; ok && p.Status == backend.ProvisionStatusFailed {
-		diagSnap = diagnosticSnapshot(p)
-		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
-		diagKeys = containerLogKeys(p)
-	}
-	b.provisionsMu.RUnlock()
-	if diagSnap.LeaseUUID != "" {
-		b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
-	}
-
-	// Re-check status before firing the terminal Failed callback. The diag+persist
-	// above runs without the lock, leaving a window for a concurrent Deprovision
-	// (or Provision re-attempt, Restart, etc.) to flip Failed into another state.
-	// When that happens, whichever operation took over will emit its own terminal
-	// callback; ours would be a spurious duplicate of an event Fred already knows
-	// about. Suppress but log, so operators can see the frequency.
-	//
-	// Snapshot the callback URL under the same RLock as the status check so the
-	// subsequent send cannot race with a concurrent delete (noisy "no callback
-	// URL" warn) or reinsert (routing this lease's Failed send to a different URL).
-	b.provisionsMu.RLock()
-	var curStatus backend.ProvisionStatus
-	var callbackURL string
-	present := false
-	if p, ok := b.provisions[leaseUUID]; ok {
-		present = true
-		curStatus = p.Status
-		callbackURL = p.CallbackURL
-	}
-	b.provisionsMu.RUnlock()
-	if !present || curStatus != backend.ProvisionStatusFailed {
-		b.logger.Info("suppressing Failed callback: another operation took over",
-			"lease_uuid", leaseUUID,
-			"container_id", shortID(containerID),
-			"observed_status", curStatus,
-			"present", present,
-			"fail_count", failCount,
-		)
-		return
-	}
-
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
-
-	logAttrs := []any{
-		"lease_uuid", leaseUUID,
-		"container_id", shortID(containerID),
-		"fail_count", failCount,
-	}
-	if info.ServiceName != "" {
-		logAttrs = append(logAttrs, "service_name", info.ServiceName)
-	}
-	b.logger.Warn("container death detected via events API", logAttrs...)
 }
 
 // findLeaseByContainerID returns the lease UUID and true if a provision

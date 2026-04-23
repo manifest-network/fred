@@ -19,6 +19,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/manifest-network/manifest-ledger v0.0.1
 	github.com/prometheus/client_golang v1.23.0
+	github.com/qmuntal/stateless v1.8.0
 	github.com/rs/cors v1.11.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/sony/gobreaker v1.0.0

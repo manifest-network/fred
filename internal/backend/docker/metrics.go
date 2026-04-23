@@ -144,6 +144,123 @@ var (
 		Name:      "container_removal_wait_failures_total",
 		Help:      "Count of RemoveContainer calls where the 'in progress' wait failed before confirming removal",
 	})
+
+	// leaseSMTransitionsTotal counts SM transitions by (from, to, event).
+	// Spikes on specific paths surface unexpected flows — e.g., a rise in
+	// (Failing, Deprovisioning, DeprovisionRequested) indicates frequent
+	// Deprovision-preempts-Failing preemption, which is interesting for
+	// load analysis.
+	leaseSMTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_sm_transitions_total",
+		Help:      "Count of lease state-machine transitions by (from_state, to_state, event)",
+	}, []string{"from", "to", "event"})
+
+	// leaseActorsCreatedTotal counts how many per-lease actors have been
+	// created for the lifetime of this backend. Under normal operation,
+	// this tracks distinct leases processed. A runaway counter (with
+	// static lease count) would signal actor-leak or churn.
+	leaseActorsCreatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actors_created_total",
+		Help:      "Cumulative number of per-lease actors created since backend start",
+	})
+
+	// leaseActorStuckSeconds is the age, in seconds, of the oldest
+	// in-flight actor handle() call across all leases. 0 when every
+	// actor is idle (waiting on inbox).
+	//
+	// Legitimate long-running operations like Deprovision run synchronously
+	// inside the actor's handle() and can hold it for minutes (container
+	// removal, volume cleanup). Set the alerting threshold above the
+	// longest expected legitimate duration — e.g., 15 minutes — to catch
+	// real stuck actors without false positives during normal slow work.
+	leaseActorStuckSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actor_stuck_seconds",
+		Help:      "Age of the oldest in-flight actor message across all leases; 0 if all actors are idle",
+	})
+
+	// leaseActorInboxDepth is a histogram of actor inbox depths sampled
+	// periodically across all live actors. A healthy system has p99 near 0
+	// (actors keep up with their inbox). A rising p99 signals event
+	// arrival faster than processing — either workload shift or an
+	// upstream I/O slowdown pinning an actor.
+	leaseActorInboxDepth = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actor_inbox_depth",
+		Help:      "Distribution of per-actor inbox depths sampled across all live actors",
+		Buckets:   []float64{0, 1, 2, 4, 8, 12, 16}, // inbox cap is leaseActorInboxSize (16)
+	})
+
+	// leaseActorPanicsTotal counts panics recovered in lease actor
+	// handlers. Any non-zero value is a bug — the actor survives the
+	// panic (blast radius contained to a single message), but the
+	// message that triggered it did not complete its transition.
+	leaseActorPanicsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_actor_panics_total",
+		Help:      "Count of panics recovered in lease actor handlers (any non-zero is a bug)",
+	})
+
+	// leaseTerminalEventDroppedTotal counts terminal SM events whose
+	// actor.send() was refused because the backend was shutting down.
+	// The work has already happened on the host (container swap complete,
+	// provision succeeded, etc.) but the SM never recorded it, so the
+	// release store / provision struct may be out of sync with Docker.
+	// Recovery on next startup should re-reconcile; sustained non-zero
+	// values under clean shutdown indicate a real data-loss pattern.
+	leaseTerminalEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_terminal_event_dropped_total",
+		Help:      "Terminal SM events dropped because the actor inbox refused delivery during shutdown",
+	}, []string{"event"})
+
+	// dieEventDroppedTotal counts container-death signals whose actor.send
+	// was refused — either because the backend is shutting down, the actor
+	// has already exited (Delete race), or the inbox was wedged. The
+	// reconciler re-detects missed deaths within its cycle (default 5m), so
+	// these drops are not data loss; the counter gives operators a signal
+	// when the realtime event path is degraded.
+	dieEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "die_event_dropped_total",
+		Help:      "Container-death signals dropped at the actor inbox; reconciler re-detects on next cycle",
+	}, []string{"source"})
+
+	// leaseFailingRaceSkippedTotal counts onEnterFailing invocations that
+	// bailed because another caller (Restart/Update) flipped prov.Status
+	// off Ready between the SM guard and this entry action. Non-zero
+	// values indicate the Ready-vs-Restart race is being hit in practice;
+	// a sustained rate suggests the synchronous Status flip in
+	// Backend.Restart/Update should be moved into the actor.
+	leaseFailingRaceSkippedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_failing_race_skipped_total",
+		Help:      "onEnterFailing bails due to concurrent Restart/Update flipping prov.Status off Ready",
+	})
+
+	// leaseWorkerPanicsTotal counts panics recovered in lease worker
+	// goroutines (provision, replace, diag), labeled by worker type.
+	// Workers are Docker-interaction code that is NOT expected to panic;
+	// any non-zero value indicates a latent bug. The recover keeps the
+	// process alive and drives the SM to a terminal Failed state so the
+	// lease doesn't wedge — but the real fix is always to eliminate the
+	// panic at its source.
+	leaseWorkerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_worker_panics_total",
+		Help:      "Panics recovered in lease worker goroutines, by worker type",
+	}, []string{"worker_type"})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.

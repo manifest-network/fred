@@ -27,15 +27,16 @@ var noopAck = &mockAcknowledger{}
 
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
-	mu               sync.Mutex
-	name             string
-	provisions       []backend.ProvisionInfo
-	provisionCalls   []backend.ProvisionRequest
-	deprovisionCalls []string
-	provisionErr     error
-	deprovisionErr   error
-	listErr          error
-	refreshErr       error
+	mu                  sync.Mutex
+	name                string
+	provisions          []backend.ProvisionInfo
+	provisionCalls      []backend.ProvisionRequest
+	deprovisionCalls    []string
+	listProvisionsCalls int
+	provisionErr        error
+	deprovisionErr      error
+	listErr             error
+	refreshErr          error
 }
 
 func (m *mockReconcilerBackend) Name() string {
@@ -70,6 +71,7 @@ func (m *mockReconcilerBackend) Deprovision(ctx context.Context, leaseUUID strin
 func (m *mockReconcilerBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.listProvisionsCalls++
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
@@ -3169,4 +3171,147 @@ func TestReconciler_ReconcileAll_PartialFailureDoesNotUpdateTimestamp(t *testing
 
 	after := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
 	assert.Equal(t, before, after, "ReconcilerLastSuccessTimestamp should NOT be updated on partial failure")
+}
+
+// panickingBackend wraps mockReconcilerBackend to inject a panic into
+// RefreshState for panic-recovery regression tests. Used only by the
+// tests below.
+type panickingBackend struct {
+	*mockReconcilerBackend
+	panicOnRefresh bool
+}
+
+func (p *panickingBackend) RefreshState(ctx context.Context) error {
+	if p.panicOnRefresh {
+		panic("synthetic RefreshState panic")
+	}
+	return p.mockReconcilerBackend.RefreshState(ctx)
+}
+
+// TestReconciler_FetchPanicDoesNotCrashFred pins the invariant that a
+// panic inside a per-backend fetch goroutine (fetchAllProvisions) is
+// recovered instead of propagating up and killing the fred process.
+// Asserts: ReconcilerPanicsTotal{stage="fetch_provisions"} increments,
+// reconcile returns an error, and other backends are unaffected.
+func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+	}
+
+	goodBackend := &mockReconcilerBackend{name: "good"}
+	badBackend := &panickingBackend{
+		mockReconcilerBackend: &mockReconcilerBackend{name: "bad"},
+		panicOnRefresh:        true,
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: goodBackend, IsDefault: true},
+			{Backend: badBackend},
+		},
+	})
+
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			return true, "tx", nil
+		},
+	}
+	mockTracker := newMockInFlightTracker(nil)
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, ack, router, mockTracker, nil)
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions"))
+
+	// Must not crash fred. Must return an error (aborted reconcile).
+	reconcileErr := reconciler.ReconcileAll(t.Context())
+	assert.Error(t, reconcileErr, "reconcile must abort when a backend fetch panics")
+
+	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions"))
+	assert.Equal(t, before+1, after,
+		"ReconcilerPanicsTotal{fetch_provisions} must increment by 1")
+
+	// The healthy sibling backend must still have been queried despite
+	// the bad one panicking — errgroup concurrency means the panic in
+	// one task does not short-circuit the others (panicErrs is collected
+	// AFTER g.Wait returns).
+	goodBackend.mu.Lock()
+	goodListCalls := goodBackend.listProvisionsCalls
+	goodBackend.mu.Unlock()
+	assert.GreaterOrEqual(t, goodListCalls, 1,
+		"healthy backend's ListProvisions must have been called despite sibling panic")
+}
+
+// TestReconciler_ProcessLeasePanicDoesNotCrashFred: a panic inside
+// processLease (via the tracker's HasPayload call) must be recovered,
+// counted, and NOT crash fred. Other leases in the same reconcile
+// cycle must still be processed.
+func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
+	mockChain := &chain.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			// Two leases: one triggers a panic (has MetaHash → calls HasPayload),
+			// one proceeds normally (no MetaHash → skips tracker).
+			return []billingtypes.Lease{
+				{Uuid: "lease-panic", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING, MetaHash: []byte{0x01, 0x02}},
+				{Uuid: "lease-ok", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+	}
+
+	mockBackend := &mockReconcilerBackend{name: "test"}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			return true, "tx", nil
+		},
+	}
+
+	mockTracker := newMockInFlightTracker(nil)
+	mockTracker.hasPayloadFunc = func(leaseUUID string) (bool, error) {
+		if leaseUUID == "lease-panic" {
+			panic("synthetic HasPayload panic")
+		}
+		return false, nil
+	}
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, ack, router, mockTracker, nil)
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease"))
+
+	// Must not crash fred.
+	_ = reconciler.ReconcileAll(t.Context())
+
+	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease"))
+	assert.Equal(t, before+1, after,
+		"ReconcilerPanicsTotal{process_lease} must increment by 1")
+
+	// The lease without MetaHash should have been provisioned normally —
+	// one panicking lease must not block processing of sibling leases.
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	var okLeaseProvisioned bool
+	for _, call := range mockBackend.provisionCalls {
+		if call.LeaseUUID == "lease-ok" {
+			okLeaseProvisioned = true
+		}
+	}
+	assert.True(t, okLeaseProvisioned,
+		"the non-panicking lease must still be processed; one bad lease must not block others")
 }
