@@ -113,7 +113,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 
 	// Hand off to the lease actor. Actor fires the Restarting
 	// transition, acks, and spawns the replace worker (tracked by
-	// workersWg). See handleRestartRequested / spawnReplaceWorker.
+	// workers barrier). See handleRestartRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() replaceResult {
 		if isStack {
@@ -148,7 +148,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 }
 
 // (fireReplaceOutcome was moved into leaseActor.spawnReplaceWorker so the
-// worker goroutine is owned by the actor via workersWg — see lease_actor.go.)
+// worker goroutine is owned by the actor via workers barrier — see lease_actor.go.)
 
 // doRestart performs the actual container restart asynchronously.
 func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {

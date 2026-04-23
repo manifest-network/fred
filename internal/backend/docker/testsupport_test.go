@@ -4,7 +4,7 @@ package docker
 // one if absent. Test-only: production code uses routeToLease to deliver
 // messages without ever exposing an actor pointer to the caller. Tests
 // retain direct access for synthetic scenario setup (installing
-// workersWg entries, poking SM state, asserting invariants) that can't
+// workers entries, poking SM state, asserting invariants) that can't
 // go through the message path.
 func (b *Backend) actorFor(leaseUUID string) *leaseActor {
 	b.actorsMu.Lock()

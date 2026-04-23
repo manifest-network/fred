@@ -207,9 +207,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 
 	// Hand off to the lease actor. The actor fires the SM transition,
 	// acks accept/reject, and spawns the worker goroutine internally
-	// (tracked by its workersWg) so orphan-worker races are impossible
-	// by construction — the actor cannot exit until the worker has
-	// delivered its terminal SM event.
+	// (tracked by its workers barrier), so the actor's exit defers wait
+	// on the worker's terminal sendTerminal before tearing the actor
+	// down. The wait is bounded by workExitWaitTimeout; a truly wedged
+	// worker is left as a zombie and recoverState reconciles on next
+	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
 	work := func() (string, provisionSuccessResult, map[string]string, error) {
 		if isStack {

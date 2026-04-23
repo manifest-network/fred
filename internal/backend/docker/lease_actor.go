@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -53,7 +52,7 @@ func (diagGatheredMsg) doneChan() chan struct{} { return nil }
 // and a `work` closure containing everything doProvision / doProvisionStack
 // needs — the actor doesn't need to know the arg shapes. After firing the SM
 // transition, the actor sends the Fire result on `ack` and spawns a worker
-// (tracked by workersWg) to run `work`. Backend.Provision blocks on `ack` so
+// (tracked by workers) to run `work`. Backend.Provision blocks on `ack` so
 // it knows whether the SM accepted the transition before returning.
 type provisionRequestedMsg struct {
 	cancel context.CancelFunc
@@ -159,10 +158,12 @@ func (replaceFailedMsg) doneChan() chan struct{} { return nil }
 //   - Worker ownership — every worker goroutine (provision, restart,
 //     update, diag) is spawned by the actor (via spawnProvisionWorker /
 //     spawnReplaceWorker / onEnterFailing's goroutine) and tracked by
-//     workersWg. The actor's exit defers waitForWorkers BEFORE
-//     registry-delete / close(done) / drainInbox — the actor cannot
-//     exit while a worker is in flight. Workers always have a live
-//     actor to sendTerminal to, so orphan-worker races are eliminated.
+//     workers. The actor's exit defers waitForWorkers BEFORE
+//     registry-delete / close(done) / drainInbox — under normal
+//     operation the actor does not exit while a worker is in flight.
+//     The wait is bounded by workExitWaitTimeout to avoid pinning on
+//     a wedged worker; in that pathological case the worker becomes
+//     a zombie that recoverState reconciles on next start.
 //
 //   - Drain-with-handle — the drainInbox defer calls handle() on every
 //     queued message, so a worker's terminal sendTerminal that landed
@@ -198,19 +199,22 @@ type leaseActor struct {
 	// handleUpdateRequested, and called by Provisioning/Restarting/
 	// Updating.OnExit on DeprovisionRequested preemption.
 	workCancel context.CancelFunc
-	// workersWg tracks every worker goroutine spawned by this actor
+	// workers tracks every worker goroutine spawned by this actor
 	// (provision, restart, update, diag). The actor's run-loop exit path
-	// waits on workersWg BEFORE the registry-delete / close-done /
-	// drainInbox defers — structurally guaranteeing that every worker's
-	// terminal sendTerminal has landed and been handled before the actor
-	// is torn down. Same wg is used by onExit* to wait for the active
-	// worker when the SM is transitioning out of a work-owning state
-	// (Deprovision preempt).
+	// waits on workers.Zero() BEFORE the registry-delete / close-done /
+	// drainInbox defers, so in normal operation every worker's terminal
+	// sendTerminal has landed and been handled before the actor is torn
+	// down. The wait is bounded by workExitWaitTimeout to avoid pinning
+	// on a truly wedged worker; on that timeout the actor proceeds with
+	// teardown and the worker becomes a zombie (recoverState reconciles
+	// on next start). Same barrier is used by onExit* to wait for the
+	// active worker when the SM is transitioning out of a work-owning
+	// state (Deprovision preempt).
 	//
 	// The SM enforces at-most-one-worker-at-a-time across the work-owning
-	// states, so workersWg.Wait effectively waits for "the one worker
+	// states, so workers.Zero effectively waits for "the one worker
 	// currently running"; the count happens to always be 0 or 1.
-	workersWg sync.WaitGroup
+	workers *workBarrier
 	// currentMessageStart is the UnixNano timestamp of the message the
 	// actor is currently processing in handle(), or 0 when idle. Used by
 	// the stuck-actor sampler to detect hung handlers. Written by the
@@ -235,6 +239,7 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 		backend:   b,
 		inbox:     make(chan leaseMessage, leaseActorInboxSize),
 		done:      make(chan struct{}),
+		workers:   newWorkBarrier(),
 	}
 	// Initialize the SM eagerly so that the actor's goroutine and any
 	// external reader (DebugActors over /debug/actors) see the same
@@ -247,20 +252,24 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 
 func (a *leaseActor) run() {
 	// Defer ordering is deliberate (LIFO executes in reverse of declaration):
-	//   1. waitForWorkers runs FIRST — blocks until every in-flight worker
-	//      (provision/restart/update/diag) goroutine has returned. Workers
-	//      deliver their terminal SM event via sendTerminal BEFORE returning,
-	//      so by the time this unblocks, all terminal messages that WILL
-	//      arrive have already landed in a.inbox.
+	//   1. waitForWorkers runs FIRST — waits (bounded by
+	//      workExitWaitTimeout) for every in-flight worker
+	//      (provision/restart/update/diag) goroutine to return. Workers
+	//      deliver their terminal SM event via sendTerminal BEFORE
+	//      returning, so under normal operation all terminal messages
+	//      that will arrive have landed in a.inbox by the time this
+	//      unblocks. On timeout the worker becomes a zombie and its
+	//      terminal event (if ever sent) is refused by hasExited — see
+	//      sendTerminal.
 	//   2. removeFromRegistry runs SECOND — concurrent routeToLease calls
 	//      immediately create a fresh actor under actorsMu.
 	//   3. drainInbox runs THIRD — processes every message in the inbox via
 	//      handle(), so terminal events from workers actually drive their
 	//      SM transitions before the actor is gone.
 	//   4. close(a.done) runs LAST — makes actor.done a clean "fully
-	//      quiesced" signal. Any waiter on a.done is guaranteed every
-	//      queued message has been handled and every SM transition
-	//      committed. hasExited becomes true here too; any stale
+	//      quiesced" signal: every queued message has been handled and
+	//      every SM transition committed (modulo the worker-timeout
+	//      edge case above). hasExited becomes true here too; any stale
 	//      sendTerminal after this point refuses deterministically.
 	defer close(a.done)
 	defer a.drainInbox()
@@ -285,16 +294,15 @@ func (a *leaseActor) run() {
 // waitForWorkers blocks until every worker goroutine this actor has
 // spawned has returned. Bounded by workExitWaitTimeout so a wedged
 // worker (Docker daemon hang with ctx ignored) can't pin the actor.
-// If the timeout fires we log and continue — worker becomes a zombie
-// goroutine; recoverState reconciles state on next start.
+// If the timeout fires we log and continue — the wedged worker itself
+// becomes a zombie goroutine; recoverState reconciles state on next
+// start. workBarrier's Zero() is a real channel, so the select here
+// spawns no helper goroutine: even under timeout, this function leaks
+// nothing on top of whatever the wedged worker itself has already
+// leaked.
 func (a *leaseActor) waitForWorkers() {
-	done := make(chan struct{})
-	go func() {
-		a.workersWg.Wait()
-		close(done)
-	}()
 	select {
-	case <-done:
+	case <-a.workers.Zero():
 	case <-time.After(workExitWaitTimeout):
 		a.backend.logger.Warn("actor waitForWorkers: worker did not exit within timeout",
 			"lease_uuid", a.leaseUUID,
@@ -387,9 +395,12 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 // handleProvisionRequested transitions the SM into Provisioning (or from
 // Failed on retry), acks the caller, and spawns the work goroutine.
 // Spawning inside the actor (rather than in Backend.Provision) means the
-// worker is tracked by workersWg and the actor cannot exit until the
-// worker's terminal sendTerminal has landed and been handled — the
-// orphan-worker race class is eliminated by construction.
+// worker is tracked by workers and, under normal operation, the actor
+// waits for the worker's terminal sendTerminal to land and be handled
+// before exit (bounded by workExitWaitTimeout to avoid pinning on a
+// truly wedged worker). The orphan-worker race class is eliminated
+// under that happy-path wait; pathological timeouts leave a zombie
+// worker that recoverState reconciles on next start.
 func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 	a.workCancel = msg.cancel
 	if err := a.sm.Fire(a.backend.stopCtx, evProvisionRequested); err != nil {
@@ -403,15 +414,15 @@ func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 // spawnProvisionWorker runs doProvision (or doProvisionStack, supplied as
 // the work closure), pre-publishes container IDs on success so a preempting
 // Deprovision sees them under lock, and sends the terminal SM event via
-// sendTerminal. Tracked by workersWg so the actor waits for this worker
+// sendTerminal. Tracked by workers so the actor waits for this worker
 // before exit. On failure, the worker captures container logs BEFORE
 // cleanup (see doProvision's defer) so the persisted diagnostic entry
 // contains useful debugging output even though the failed containers
 // have been removed.
 func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessResult, map[string]string, error)) {
-	a.workersWg.Add(1)
+	a.workers.Add()
 	a.backend.wg.Go(func() {
-		defer a.workersWg.Done()
+		defer a.workers.Done()
 		callbackErr, result, failureLogs, err := work()
 		if err == nil {
 			// Pre-publish so a concurrent Deprovision-preempt reading
@@ -483,9 +494,9 @@ func (a *leaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 // Pre-publishes new ContainerIDs / ServiceContainers on success so a
 // preempting Deprovision reading prov observes the new set under lock.
 func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
-	a.workersWg.Add(1)
+	a.workers.Add()
 	a.backend.wg.Go(func() {
-		defer a.workersWg.Done()
+		defer a.workers.Done()
 		result := work()
 		if result.err == nil {
 			a.backend.provisionsMu.Lock()
@@ -585,7 +596,7 @@ func (a *leaseActor) hasExited() bool {
 // sendTerminal must refuse deterministically rather than queue into an
 // inbox nobody will drain. Without the pre-check, Go's select would
 // pick non-deterministically between `a.inbox <- msg` and `<-a.done`.
-// In normal operation workersWg.Wait ensures sendTerminal always runs
+// In normal operation workers.Zero ensures sendTerminal always runs
 // with the actor alive, so the check is effectively a defense against
 // the timeout edge case.
 func (a *leaseActor) sendTerminal(msg leaseMessage) bool {

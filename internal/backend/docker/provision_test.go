@@ -5032,19 +5032,19 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	actor := b.actorFor("lease-1")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
 
-	// Simulate an in-flight provision worker via workersWg. The actor's
+	// Simulate an in-flight provision worker via workers. The actor's
 	// onExitProvisioning will call workCancel then waitForWorkers.
 	var cancelCalled atomic.Bool
 	workerRelease := make(chan struct{})
 	actor.workCancel = func() { cancelCalled.Store(true) }
-	actor.workersWg.Add(1)
+	actor.workers.Add()
 	go func() {
 		<-workerRelease
 		// Simulate the worker's pre-publish step before Done.
 		b.provisionsMu.Lock()
 		b.provisions["lease-1"].ContainerIDs = []string{"published-container"}
 		b.provisionsMu.Unlock()
-		actor.workersWg.Done()
+		actor.workers.Done()
 	}()
 
 	deprovErr := make(chan error, 1)

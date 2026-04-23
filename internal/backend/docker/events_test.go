@@ -245,8 +245,9 @@ func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
 // a container death; the SM's Failing.OnExit cancellation makes a stale
 // Failed callback impossible by construction. Simulated-race tests that
 // mutated provision.Status directly to fake a Deprovision are obsolete:
-// the SM is authoritative, so a direct status mutation no longer
-// triggers the suppression mechanism.
+// the suppression mechanism is driven by SM transitions (Failing.OnExit
+// cancels the diag goroutine), not by prov.Status changes, so a direct
+// status mutation bypasses it entirely.
 
 func TestFindLeaseByContainerID(t *testing.T) {
 	b := newBackendForTest(nil, map[string]*provision{

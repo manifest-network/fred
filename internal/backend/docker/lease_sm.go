@@ -311,16 +311,32 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
 
-	// No Status recheck: the SM's guard already verified Ready, and between
-	// the guard and this entry action no other path can flip Status off
-	// Ready — every writer routes through the SM, and recoverState
-	// preserves existing.Status for Ready leases. Only the existence
-	// check survives (the entry could be gone if Deprovision had
-	// completed in a prior ordering).
+	// Re-check Status under the write lock. Backend.Restart and
+	// Backend.Update flip prov.Status synchronously outside the actor
+	// before routing their message (restart_update.go), so a Restart
+	// can slip in between the SM guard's RLock-release (after the
+	// 10s InspectContainer) and this entry action's Lock-acquire.
+	// If Status is no longer Ready, skip all side effects — the operator
+	// has taken over, the queued restart/update message will drive the
+	// actual transition, and bumping FailCount / decrementing
+	// activeProvisions here would double-count.
+	//
+	// NOTE: the SM has already committed to Failing by the time this
+	// runs, so bailing here creates transient drift (SM=Failing,
+	// prov.Status=Restarting). The drift resolves on the next message —
+	// Failing.Permit(evRestartRequested/Update/Provision) moves the SM
+	// to the state prov.Status already reflects. Failing.Ignore on
+	// ContainerDied/DiagGathered prevents stray events from doing
+	// anything during the drift window.
 	b.provisionsMu.Lock()
 	currentProv, exists := b.provisions[leaseUUID]
 	if !exists {
 		b.provisionsMu.Unlock()
+		return nil
+	}
+	if currentProv.Status != backend.ProvisionStatusReady {
+		b.provisionsMu.Unlock()
+		leaseFailingRaceSkippedTotal.Inc()
 		return nil
 	}
 	currentProv.Status = backend.ProvisionStatusFailing
@@ -336,14 +352,14 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	// driven only by the timeout (diagnosticsGatherTimeout) or by
 	// Failing.OnExit calling diagCancel on DeprovisionRequested
 	// preemption. Shutdown will still complete promptly because the
-	// actor's waitForWorkers has its own 45s bound, after which the
-	// diag goroutine becomes an orphan that finishes (or gets killed
-	// with the process) on its own schedule.
+	// actor's waitForWorkers is bounded by workExitWaitTimeout, after
+	// which the diag goroutine becomes an orphan that finishes (or gets
+	// killed with the process) on its own schedule.
 	diagCtx, diagCancel := context.WithTimeout(context.Background(), diagnosticsGatherTimeout)
 	lsm.actor.diagCancel = diagCancel
-	lsm.actor.workersWg.Add(1)
+	lsm.actor.workers.Add()
 	b.wg.Go(func() {
-		defer lsm.actor.workersWg.Done()
+		defer lsm.actor.workers.Done()
 		lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
 	})
 	return nil
@@ -352,15 +368,15 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 // diagnosticsGatherTimeout bounds the async diag goroutine's lifetime
 // independently of backend shutdown. Must be short enough that a wedged
 // Docker daemon doesn't leak goroutines indefinitely; long enough that
-// normal log fetches complete. The actor's waitForWorkers bound is 45s;
-// keep this comfortably below so diag can finish and sendTerminal before
-// the actor's shutdown-drain gives up on it.
+// normal log fetches complete. Keep this comfortably below
+// workExitWaitTimeout so diag can finish and sendTerminal before the
+// actor's shutdown-drain gives up on it.
 const diagnosticsGatherTimeout = 30 * time.Second
 
 // onExitFailing cancels the in-flight diag goroutine whenever we leave
 // Failing — whether by DiagGathered (normal) or DeprovisionRequested
-// (preemption) — then waits via workersWg. Three-layer suppression of
-// stale Failed callbacks: cancel signal (happy path), workersWg.Wait
+// (preemption) — then waits via workers. Three-layer suppression of
+// stale Failed callbacks: cancel signal (happy path), workers.Zero wait
 // (prevents post-OnExit race where the goroutine is mid-sendTerminal),
 // and the Ignore declarations on Failed/Deprovisioning (backstop for
 // trigger reordering). Bounded by workExitWaitTimeout via waitForWorkers.
@@ -374,7 +390,7 @@ func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 }
 
 // onExitProvisioning is the analog for Provision/Restart/Update. Same
-// structural invariant as onExitFailing: cancel then wait via workersWg.
+// structural invariant as onExitFailing: cancel then wait via workers.
 // Closes the orphan-containers race — the goroutine's
 // pre-publish-then-sendTerminal sequence is observable to the preempting
 // doDeprovision, and the wait prevents an orphan container set from being
@@ -756,10 +772,12 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 // persist, callback) are done by onEnterFailedFromDiag, which runs in
 // the actor's goroutine after Fire commits the Failing→Failed transition.
 //
-// Tracked by workersWg at the spawn site (onEnterFailing), so
-// Failing.OnExit's waitForWorkers blocks until this goroutine has
-// returned — sendTerminal is guaranteed to land before the actor
-// proceeds past the transition.
+// Tracked by workers at the spawn site (onEnterFailing), so
+// Failing.OnExit's waitForWorkers blocks (up to workExitWaitTimeout)
+// until this goroutine has returned. Under normal operation that means
+// sendTerminal lands before the actor proceeds past the transition;
+// on timeout the SM proceeds and a late sendTerminal is refused by the
+// Deprovisioning.Ignore backstop.
 func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *ContainerInfo) {
 	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
 	if ctx.Err() != nil {

@@ -486,7 +486,7 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 // TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural
 // invariant for terminal-event delivery during shutdown: when stopCtx
 // fires with an in-flight work goroutine, the actor must (1) wait for
-// the goroutine to complete (via workersWg), (2) drain the inbox so the
+// the goroutine to complete (via workers.Zero), (2) drain the inbox so the
 // terminal SM event is processed via handle(), and only then exit.
 // Without the drain, the event would be dropped at the send-check
 // because the actor had already exited on stopCtx.
@@ -504,9 +504,9 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 	actor := b.actorFor("lease-1")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
 
-	// Simulate an in-flight worker via workersWg. The actor's exit-path
+	// Simulate an in-flight worker via workers.Add. The actor's exit-path
 	// waitForWorkers defer will block until we Done().
-	actor.workersWg.Add(1)
+	actor.workers.Add()
 
 	// Fire shutdown BEFORE the worker completes. The actor's run loop
 	// returns immediately but waitForWorkers must block.
@@ -522,7 +522,7 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 			},
 		})
 		require.True(t, ok, "sendTerminal must not refuse during shutdown drain")
-		actor.workersWg.Done()
+		actor.workers.Done()
 	}()
 
 	// The actor must exit cleanly, and the provision must be Ready.
@@ -778,11 +778,11 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	actor := b.actorFor("lease-1")
 	require.Equal(t, backend.ProvisionStatusRestarting, actor.sm.State())
 
-	// Simulate an in-flight replace worker via workersWg + cancel func.
+	// Simulate an in-flight replace worker via workers.Add + cancel func.
 	var cancelCalled atomic.Bool
 	workerRelease := make(chan struct{})
 	actor.workCancel = func() { cancelCalled.Store(true) }
-	actor.workersWg.Add(1)
+	actor.workers.Add()
 	go func() {
 		<-workerRelease
 		// Publish new container IDs before Done — mirrors the real
@@ -790,7 +790,7 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 		b.provisionsMu.Lock()
 		b.provisions["lease-1"].ContainerIDs = []string{"new-container"}
 		b.provisionsMu.Unlock()
-		actor.workersWg.Done()
+		actor.workers.Done()
 	}()
 
 	deprovErr := make(chan error, 1)
@@ -830,7 +830,7 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 // has returned. Without it, a worker's sendTerminal could land after
 // the actor's drainInbox had already run, dropping the terminal event.
 //
-// Installs a synthetic worker via workersWg.Add(1), fires shutdown,
+// Installs a synthetic worker via workers.Add, fires shutdown,
 // verifies the actor does not exit until the worker Done()s.
 func TestLeaseActor_ExitWaitsForWorkers(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
@@ -838,7 +838,7 @@ func TestLeaseActor_ExitWaitsForWorkers(t *testing.T) {
 	})
 
 	actor := b.actorFor("lease-1")
-	actor.workersWg.Add(1)
+	actor.workers.Add()
 
 	b.stopCancel()
 
@@ -850,7 +850,7 @@ func TestLeaseActor_ExitWaitsForWorkers(t *testing.T) {
 	}
 
 	// Mark worker complete. Actor must now exit cleanly.
-	actor.workersWg.Done()
+	actor.workers.Done()
 	select {
 	case <-actor.done:
 	case <-time.After(2 * time.Second):
@@ -1009,4 +1009,107 @@ func TestHandleContainerDeath_ShutdownDoesNotHang(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("handleContainerDeath did not return within 500ms after shutdown")
 	}
+}
+
+// TestOnEnterFailing_RaceWithConcurrentStatusFlip pins the fix for the
+// Restart-races-ContainerDeath race. Backend.Restart flips prov.Status
+// synchronously outside the actor before routing its message, so a
+// Restart can sneak in between the SM guard's RLock-release (after the
+// slow InspectContainer) and onEnterFailing's Lock-acquire. Without
+// the recheck, onEnterFailing would overwrite Status=Restarting with
+// Failing, bump FailCount, and decrement activeProvisions — all
+// spurious. With the recheck, onEnterFailing bails on Status != Ready
+// and the metric records the skip.
+//
+// The test blocks InspectContainer to pin down the exact race window,
+// then simulates Restart's sync phase by flipping Status under the
+// lock while the guard is still waiting.
+func TestOnEnterFailing_RaceWithConcurrentStatusFlip(t *testing.T) {
+	inspectCalled := make(chan struct{})
+	releaseInspect := make(chan struct{})
+
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			close(inspectCalled)
+			<-releaseInspect
+			return &ContainerInfo{
+				ContainerID: containerID,
+				Status:      "exited",
+				ExitCode:    1,
+			}, nil
+		},
+	}
+
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1"},
+			FailCount:    0,
+		},
+	})
+	defer b.stopCancel()
+
+	activeBefore := testutil.ToFloat64(activeProvisions)
+	skippedBefore := testutil.ToFloat64(leaseFailingRaceSkippedTotal)
+
+	// Trigger the die event in a goroutine; it will block inside the
+	// guard's InspectContainer call until we release it.
+	deathDone := make(chan struct{})
+	go func() {
+		b.handleContainerDeath("c1")
+		close(deathDone)
+	}()
+
+	// Wait for the guard to reach InspectContainer — now the race window
+	// between the guard's RLock-release and onEnterFailing's Lock-acquire
+	// is open.
+	select {
+	case <-inspectCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard did not call InspectContainer")
+	}
+
+	// Simulate Backend.Restart's synchronous Status flip. The actor
+	// has not yet entered onEnterFailing (it's blocked on InspectContainer).
+	b.provisionsMu.Lock()
+	b.provisions["lease-1"].Status = backend.ProvisionStatusRestarting
+	b.provisionsMu.Unlock()
+
+	// Release InspectContainer. Guard returns true (the die event is
+	// real), SM commits Ready→Failing, onEnterFailing runs. It must see
+	// Status=Restarting and bail.
+	close(releaseInspect)
+
+	select {
+	case <-deathDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleContainerDeath did not complete")
+	}
+
+	// Invariants after the race: prov.Status stayed Restarting,
+	// FailCount unchanged, LastError empty, activeProvisions unchanged,
+	// and the skip counter bumped.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	status := prov.Status
+	failCount := prov.FailCount
+	lastError := prov.LastError
+	b.provisionsMu.RUnlock()
+
+	assert.Equal(t, backend.ProvisionStatusRestarting, status,
+		"onEnterFailing must NOT overwrite Status=Restarting with Failing")
+	assert.Equal(t, 0, failCount,
+		"onEnterFailing must NOT bump FailCount after bailing on the race")
+	assert.Empty(t, lastError,
+		"onEnterFailing must NOT set LastError after bailing on the race")
+
+	activeAfter := testutil.ToFloat64(activeProvisions)
+	assert.Equal(t, activeBefore, activeAfter,
+		"activeProvisions must not be decremented when onEnterFailing bails")
+
+	skippedAfter := testutil.ToFloat64(leaseFailingRaceSkippedTotal)
+	assert.Equal(t, skippedBefore+1, skippedAfter,
+		"leaseFailingRaceSkippedTotal must increment by exactly 1")
 }

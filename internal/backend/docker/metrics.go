@@ -234,6 +234,19 @@ var (
 		Name:      "die_event_dropped_total",
 		Help:      "Container-death signals dropped at the actor inbox; reconciler re-detects on next cycle",
 	}, []string{"source"})
+
+	// leaseFailingRaceSkippedTotal counts onEnterFailing invocations that
+	// bailed because another caller (Restart/Update) flipped prov.Status
+	// off Ready between the SM guard and this entry action. Non-zero
+	// values indicate the Ready-vs-Restart race is being hit in practice;
+	// a sustained rate suggests the synchronous Status flip in
+	// Backend.Restart/Update should be moved into the actor.
+	leaseFailingRaceSkippedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_failing_race_skipped_total",
+		Help:      "onEnterFailing bails due to concurrent Restart/Update flipping prov.Status off Ready",
+	})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
