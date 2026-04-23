@@ -971,10 +971,17 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 	if pullErr := b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); pullErr != nil {
 		err := fmt.Errorf("image pull failed: %w", pullErr)
 		b.recordPreflightFailure(leaseUUID, err, logger)
+		// Update preflight failure: force Status=Failed unconditionally
+		// even though the old containers are still running. The user's
+		// desired state (the new image) was not achieved; the lease is
+		// semantically Failed until the user retries with a good image.
+		// This differs from Restart preflight, where Status stays at
+		// prevStatus because the operation's goal (a fresh containerstart with the SAME image) is independent of whether the
+		// operator's intent-to-update was achievable.
 		return replaceResult{
 			callbackErr: "image pull failed",
 			err:         err,
-			restored:    prevStatus == backend.ProvisionStatusReady,
+			restored:    false,
 			failure: replaceFailureInfo{
 				prevStatus:  prevStatus,
 				operation:   "update",
@@ -1023,10 +1030,13 @@ func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *St
 		if pullErr := b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); pullErr != nil {
 			err := fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr)
 			b.recordPreflightFailure(leaseUUID, err, logger)
+			// Same semantics as single-manifest update preflight: force
+			// Status=Failed unconditionally since the user's desired
+			// state (the new image set) was not achieved.
 			return replaceResult{
 				callbackErr: "image pull failed",
 				err:         err,
-				restored:    prevStatus == backend.ProvisionStatusReady,
+				restored:    false,
 				failure: replaceFailureInfo{
 					prevStatus:  prevStatus,
 					operation:   "update",
