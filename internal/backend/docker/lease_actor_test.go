@@ -1242,3 +1242,58 @@ func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
 	assert.Equal(t, panicsBefore+1, panicsAfter,
 		"lease_worker_panics_total{worker_type=diag} must increment by 1")
 }
+
+// TestHandlerPanic_UnblocksReplyChannel pins the invariant that a panic
+// inside the actor's message-handler dispatch does NOT leave the caller
+// blocked on their reply/ack channel forever. Before the onPanic hook
+// existed, a panic in handleDeprovision would skip `m.reply <- err`
+// and Backend.Deprovision would hang on its select until ctx/stopCtx
+// cancelled — effectively an API hang per bad message.
+//
+// This test installs a panicking handler at the Fire-time entry action
+// (onEnterDeprovisioning doesn't exist, so we inject via the SM guard
+// for evContainerDied — but that has no reply). The cleanest proof is
+// to synthesize a deprovisionMsg directly and drive the actor, making
+// the handler panic and asserting the reply channel receives an error.
+func TestHandlerPanic_UnblocksReplyChannel(t *testing.T) {
+	// A mock whose InspectContainer panics — handleDeprovision calls
+	// doDeprovision which reads ContainerIDs and calls RemoveContainer;
+	// panicking RemoveContainer causes the handler to panic after the
+	// actor has entered its SM transition to Deprovisioning.
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			panic("synthetic handler panic")
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1"},
+		},
+	})
+	defer b.stopCancel()
+
+	panicsBefore := testutil.ToFloat64(leaseActorPanicsTotal)
+
+	// Deprovision must return within a short window — not hang on the
+	// reply channel waiting for a message that will never arrive.
+	done := make(chan error, 1)
+	go func() {
+		done <- b.Deprovision(context.Background(), "lease-1")
+	}()
+
+	select {
+	case err := <-done:
+		// Panic recovered; reply channel received the panic-error.
+		// Any error value is fine; what matters is NOT hanging.
+		_ = err
+	case <-time.After(3 * time.Second):
+		t.Fatal("Backend.Deprovision hung after handler panic — onPanic hook did not unblock the reply channel")
+	}
+
+	panicsAfter := testutil.ToFloat64(leaseActorPanicsTotal)
+	assert.Greater(t, panicsAfter, panicsBefore,
+		"leaseActorPanicsTotal must increment for handler panic")
+}

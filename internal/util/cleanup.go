@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
@@ -18,15 +19,32 @@ type CleanupPanicHandler func(component string, recovered any)
 
 // cleanupPanicHandler is the process-wide handler invoked when
 // StartCleanupLoop recovers a panic. nil means no-op (log only).
-// Set once during process init via SetCleanupPanicHandler.
-var cleanupPanicHandler CleanupPanicHandler
+// Guarded by cleanupPanicHandlerMu because reads happen from every
+// cleanup-loop goroutine while writes come from init-time (or tests).
+// Formally a data race without synchronization even if the write
+// happens before any loops start — Go's memory model requires
+// explicit sync before concurrent reads.
+var (
+	cleanupPanicHandlerMu sync.RWMutex
+	cleanupPanicHandler   CleanupPanicHandler
+)
 
 // SetCleanupPanicHandler installs a process-wide handler that fires
 // every time StartCleanupLoop recovers a panic in a cleanup function.
 // Typically used to bump a Prometheus counter. Safe to leave nil for
 // tests; logs still emit regardless.
 func SetCleanupPanicHandler(h CleanupPanicHandler) {
+	cleanupPanicHandlerMu.Lock()
+	defer cleanupPanicHandlerMu.Unlock()
 	cleanupPanicHandler = h
+}
+
+// loadCleanupPanicHandler returns the currently installed handler (or
+// nil) under RLock. Called from every cleanup-loop panic path.
+func loadCleanupPanicHandler() CleanupPanicHandler {
+	cleanupPanicHandlerMu.RLock()
+	defer cleanupPanicHandlerMu.RUnlock()
+	return cleanupPanicHandler
 }
 
 // StartCleanupLoop runs a cleanup function periodically until the context is canceled.
@@ -56,8 +74,17 @@ func StartCleanupLoop(ctx context.Context, interval time.Duration, cleanup Clean
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				if cleanupPanicHandler != nil {
-					cleanupPanicHandler(component, r)
+				if h := loadCleanupPanicHandler(); h != nil {
+					// Shield the loop from a buggy handler. If the
+					// installed hook (e.g., a user-provided metrics
+					// callback) panics, a plain call here would
+					// escape the outer recover and crash the
+					// goroutine. Swallow silently — the original
+					// panic is already logged above.
+					func() {
+						defer func() { _ = recover() }()
+						h(component, r)
+					}()
 				}
 			}
 		}()

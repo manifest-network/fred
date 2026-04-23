@@ -580,10 +580,15 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 	for _, b := range backends {
 		g.Go(func() (goErr error) {
 			// Recover any panic from backend.RefreshState / ListProvisions
-			// (or the HTTP/JSON path that implements them). Surface as
-			// an errgroup error so Wait() returns non-nil — the caller
-			// propagates this to the reconcile cycle, same as a normal
-			// backend failure.
+			// (or the HTTP/JSON path that implements them). We do NOT
+			// surface as an errgroup error — returning non-nil from the
+			// g.Go closure would trigger errgroup's fail-fast behavior
+			// and cancel sibling backend fetches via gctx. Instead, we
+			// append to panicErrs (protected by mu) which the caller
+			// checks after g.Wait() and treats as a fetch failure on
+			// par with a normal ListProvisions error. This mirrors the
+			// behavior of the regular error path below (return nil
+			// after recording into fetchErrors).
 			defer func() {
 				if rec := recover(); rec != nil {
 					slog.Error("reconciler fetch panic — recovering to keep fred alive",
@@ -595,7 +600,7 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 					mu.Lock()
 					panicErrs = append(panicErrs, fmt.Errorf("backend %s panic: %v", b.Name(), rec))
 					mu.Unlock()
-					goErr = nil // Don't cancel sibling fetches; error is surfaced via panicErrs.
+					goErr = nil // Don't cancel siblings via errgroup; error surfaces via panicErrs.
 				}
 			}()
 			// Ensure backend state is fresh before reading provisions.

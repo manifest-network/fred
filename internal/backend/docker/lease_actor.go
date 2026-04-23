@@ -14,6 +14,13 @@ type leaseMessage interface {
 	// for fire-and-forget messages. Lifting this out of the handler dispatch
 	// lets shutdown drain pending messages without a per-type switch.
 	doneChan() chan struct{}
+	// onPanic is called by the actor's recover when a message's handler
+	// panics. Messages with reply/ack channels must non-blocking-send an
+	// error here so their caller (Backend.Deprovision / Provision /
+	// Restart / Update blocking on the channel) unblocks instead of
+	// hanging until ctx cancellation. Messages without a caller to
+	// unblock implement this as a no-op.
+	onPanic(err error)
 }
 
 // containerDiedMsg signals a container belonging to this lease has died.
@@ -27,6 +34,10 @@ type containerDiedMsg struct {
 func (containerDiedMsg) isLeaseMessage()           {}
 func (m containerDiedMsg) doneChan() chan struct{} { return m.done }
 
+// onPanic is a no-op: the caller (if any) unblocks via the done
+// channel which is closed by handle()'s defer regardless of panic.
+func (containerDiedMsg) onPanic(error) {}
+
 // deprovisionMsg requests that the actor run the Deprovision flow. The
 // reply channel receives the outcome; doneChan is always nil because
 // callers block on reply instead.
@@ -37,6 +48,14 @@ type deprovisionMsg struct {
 
 func (deprovisionMsg) isLeaseMessage()         {}
 func (deprovisionMsg) doneChan() chan struct{} { return nil }
+func (m deprovisionMsg) onPanic(err error) {
+	// Non-blocking send: reply is buffered-1, caller receives at most
+	// once. On recover, make sure the caller gets something.
+	select {
+	case m.reply <- err:
+	default:
+	}
+}
 
 // diagGatheredMsg is sent by the async diag goroutine when it finishes.
 // Carries the gather output into the Failing→Failed transition.
@@ -46,6 +65,7 @@ type diagGatheredMsg struct {
 
 func (diagGatheredMsg) isLeaseMessage()         {}
 func (diagGatheredMsg) doneChan() chan struct{} { return nil }
+func (diagGatheredMsg) onPanic(error)           {} // no caller to unblock
 
 // provisionRequestedMsg asks the actor to drive a provision flow. Carries
 // the cancel func (stored on the actor so Provisioning.OnExit can preempt)
@@ -62,6 +82,12 @@ type provisionRequestedMsg struct {
 
 func (provisionRequestedMsg) isLeaseMessage()         {}
 func (provisionRequestedMsg) doneChan() chan struct{} { return nil }
+func (m provisionRequestedMsg) onPanic(err error) {
+	select {
+	case m.ack <- err:
+	default:
+	}
+}
 
 // provisionCompletedMsg is sent by the doProvision goroutine on success.
 // Drives the Provisioning→Ready transition. Carries the result data
@@ -73,6 +99,7 @@ type provisionCompletedMsg struct {
 
 func (provisionCompletedMsg) isLeaseMessage()         {}
 func (provisionCompletedMsg) doneChan() chan struct{} { return nil }
+func (provisionCompletedMsg) onPanic(error)           {} // no caller to unblock
 
 // provisionErroredMsg is sent by the doProvision goroutine on failure.
 // callbackErr is the hardcoded on-chain-safe message; lastError is the
@@ -90,6 +117,7 @@ type provisionErroredMsg struct {
 
 func (provisionErroredMsg) isLeaseMessage()         {}
 func (provisionErroredMsg) doneChan() chan struct{} { return nil }
+func (provisionErroredMsg) onPanic(error)           {} // no caller to unblock
 
 // restartRequestedMsg / updateRequestedMsg carry a cancel func + work
 // closure + ack chan, analogous to provisionRequestedMsg. The work closure
@@ -103,6 +131,12 @@ type restartRequestedMsg struct {
 
 func (restartRequestedMsg) isLeaseMessage()         {}
 func (restartRequestedMsg) doneChan() chan struct{} { return nil }
+func (m restartRequestedMsg) onPanic(err error) {
+	select {
+	case m.ack <- err:
+	default:
+	}
+}
 
 type updateRequestedMsg struct {
 	cancel context.CancelFunc
@@ -112,6 +146,12 @@ type updateRequestedMsg struct {
 
 func (updateRequestedMsg) isLeaseMessage()         {}
 func (updateRequestedMsg) doneChan() chan struct{} { return nil }
+func (m updateRequestedMsg) onPanic(err error) {
+	select {
+	case m.ack <- err:
+	default:
+	}
+}
 
 // replaceCompletedMsg / replaceRecoveredMsg / replaceFailedMsg fire the
 // Restarting|Updating exit transition after the goroutine finishes. The
@@ -129,6 +169,7 @@ type replaceCompletedMsg struct {
 
 func (replaceCompletedMsg) isLeaseMessage()         {}
 func (replaceCompletedMsg) doneChan() chan struct{} { return nil }
+func (replaceCompletedMsg) onPanic(error)           {} // no caller to unblock
 
 type replaceRecoveredMsg struct {
 	info replaceFailureInfo
@@ -136,6 +177,7 @@ type replaceRecoveredMsg struct {
 
 func (replaceRecoveredMsg) isLeaseMessage()         {}
 func (replaceRecoveredMsg) doneChan() chan struct{} { return nil }
+func (replaceRecoveredMsg) onPanic(error)           {} // no caller to unblock
 
 type replaceFailedMsg struct {
 	info replaceFailureInfo
@@ -143,6 +185,7 @@ type replaceFailedMsg struct {
 
 func (replaceFailedMsg) isLeaseMessage()         {}
 func (replaceFailedMsg) doneChan() chan struct{} { return nil }
+func (replaceFailedMsg) onPanic(error)           {} // no caller to unblock
 
 // leaseActor owns all state transitions and async work for a single lease.
 //
@@ -349,6 +392,12 @@ func (a *leaseActor) handle(msg leaseMessage) {
 				"stack", string(debug.Stack()),
 			)
 			leaseActorPanicsTotal.Inc()
+			// Unblock any caller waiting on this message's reply/ack
+			// channel. Without this, a panic in a handler leaves
+			// Backend.Deprovision / Provision / Restart / Update
+			// stuck on their select{} until ctx/stopCtx cancels —
+			// effectively an API hang per bad message.
+			msg.onPanic(fmt.Errorf("handler panic: %v", r))
 		}
 	}()
 	switch m := msg.(type) {
