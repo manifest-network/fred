@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -283,17 +284,24 @@ type leaseActor struct {
 	// would otherwise Ignore evProvisionRequested and wedge the lease).
 	// Read and written only on the actor's own goroutine — no atomic.
 	terminated bool
-	// terminalSendsClosed is set by the actor's exit sequence just before
-	// drainInbox runs, and checked by sendTerminal to reject late worker
-	// sends that would otherwise land in the inbox during the tiny
-	// window between drainInbox completing and close(a.done) executing.
-	// Without this flag, a late orphan worker's sendTerminal (which can
-	// happen if waitForWorkers timed out) would see hasExited() == false
-	// (done not yet closed), succeed into the now-unmonitored inbox, and
-	// silently drop — under-counting leaseTerminalEventDroppedTotal.
-	// Atomic because the reader (sendTerminal) runs in a worker
-	// goroutine, distinct from the actor goroutine that sets it.
-	terminalSendsClosed atomic.Bool
+	// exiting is closed by the actor's exit sequence just before
+	// drainInbox runs, and observed by sendTerminal to reject late
+	// worker sends that would otherwise land in the inbox during the
+	// tiny window between drainInbox completing and close(a.done)
+	// executing. Without this signal, a late orphan worker's
+	// sendTerminal (which can happen if waitForWorkers timed out)
+	// would see hasExited() == false (done not yet closed), succeed
+	// into the now-unmonitored inbox, and silently drop — under-
+	// counting leaseTerminalEventDroppedTotal.
+	//
+	// Closed-channel pattern chosen over atomic.Bool so the gate
+	// composes directly with sendTerminal's select, mirroring how
+	// `done` works and the broader Go idiom for one-shot broadcast
+	// signals (see context.Done()). exitingOnce wraps the close so
+	// tests can force the signal without panicking the production
+	// defer that also closes it on run() exit.
+	exiting     chan struct{}
+	exitingOnce sync.Once
 }
 
 // Bounded inbox: full inbox blocks senders so Docker event bursts cannot
@@ -306,6 +314,7 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 		backend:   b,
 		inbox:     make(chan leaseMessage, leaseActorInboxSize),
 		done:      make(chan struct{}),
+		exiting:   make(chan struct{}),
 		workers:   newWorkBarrier(),
 	}
 	// Initialize the SM eagerly so that the actor's goroutine and any
@@ -326,13 +335,13 @@ func (a *leaseActor) run() {
 	//      returning, so under normal operation all terminal messages
 	//      that will arrive have landed in a.inbox by the time this
 	//      unblocks. On timeout the worker becomes a zombie and its
-	//      terminal event (if ever sent) is refused by the
-	//      terminalSendsClosed check in sendTerminal.
+	//      terminal event (if ever sent) is refused by the `exiting`
+	//      check in sendTerminal.
 	//   2. removeFromRegistry runs SECOND — concurrent routeToLease calls
 	//      immediately create a fresh actor under actorsMu.
-	//   3. terminalSendsClosed.Store(true) runs THIRD — from here on any
-	//      late worker call to sendTerminal refuses deterministically and
-	//      the drop is correctly counted. Closes the narrow post-drain /
+	//   3. close(a.exiting) runs THIRD — from here on any late worker
+	//      call to sendTerminal refuses deterministically and the drop
+	//      is correctly counted. Closes the narrow post-drain /
 	//      pre-done window where a send could otherwise succeed silently.
 	//   4. drainInbox runs FOURTH — processes every message in the inbox
 	//      via handle(), so terminal events from workers actually drive
@@ -343,7 +352,7 @@ func (a *leaseActor) run() {
 	//      edge case above). hasExited becomes true here too.
 	defer close(a.done)
 	defer a.drainInbox()
-	defer a.terminalSendsClosed.Store(true)
+	defer a.closeExiting()
 	defer a.removeFromRegistry()
 	defer a.waitForWorkers()
 	for {
@@ -761,43 +770,66 @@ func (a *leaseActor) hasExited() bool {
 // swapped, removed) — the SM must record the outcome even during
 // shutdown to keep releaseStore / in-memory state / the callback record
 // consistent with the host. Returns false only if the actor has fully
-// exited (inbox no longer drained), the terminalSendsClosed flag is
-// set (actor is in its exit sequence, past drainInbox), or the bounded
+// exited (inbox no longer drained), the exiting channel is closed
+// (actor is in its exit sequence, past drainInbox), or the bounded
 // inbox is wedged; in either case the drop is counted via
 // leaseTerminalEventDroppedTotal at the call site.
 //
 // Two refusal gates on the fast path:
 //   - hasExited(): a.done closed. Actor is fully torn down.
-//   - terminalSendsClosed: set just before drainInbox runs. Covers
-//     the narrow post-drain / pre-done window where a late worker
-//     could otherwise successfully enqueue into an inbox that no
-//     goroutine will drain, silently losing the event. Checked both
-//     before the select and after a successful send, since the flag
-//     can be set between the two (and we want the metric to reflect
-//     reality even if the message is now sitting in a soon-to-be-
-//     unread inbox).
+//   - isExiting(): a.exiting closed just before drainInbox runs.
+//     Covers the narrow post-drain / pre-done window where a late
+//     worker could otherwise successfully enqueue into an inbox that
+//     no goroutine will drain, silently losing the event. Both
+//     channels also appear as select arms below so the main wait
+//     composes correctly, and a post-send non-blocking re-check
+//     guarantees the metric reflects reality when a late close
+//     races with a successful enqueue.
 //
 // In normal operation (waitForWorkers returns cleanly) workers finish
 // before any exit-path defers run, so these gates are pure defense
 // against the waitForWorkers-timeout edge case.
 func (a *leaseActor) sendTerminal(msg leaseMessage) bool {
-	if a.hasExited() || a.terminalSendsClosed.Load() {
+	if a.hasExited() || a.isExiting() {
 		return false
 	}
 	select {
 	case a.inbox <- msg:
-		// Re-check: the flag may have been set between the pre-check
+		// Re-check: exiting may have been closed between the pre-check
 		// and this send. Report as dropped so the metric is accurate.
 		// The message will rot in the inbox but no one relies on it.
-		if a.terminalSendsClosed.Load() {
+		if a.isExiting() {
 			return false
 		}
 		return true
 	case <-a.done:
 		return false
+	case <-a.exiting:
+		return false
 	case <-time.After(terminalSendTimeout):
 		return false
 	}
+}
+
+// isExiting reports whether the actor has closed its `exiting` channel,
+// i.e. the exit sequence is past the point where new terminal sends
+// can still be drained. Symmetric with hasExited() but for the
+// earlier gate.
+func (a *leaseActor) isExiting() bool {
+	select {
+	case <-a.exiting:
+		return true
+	default:
+		return false
+	}
+}
+
+// closeExiting closes the exiting channel exactly once, even across
+// retries (production's exit defer + any test-driven close). Using
+// sync.Once keeps the close idempotent without a select-default
+// double-check idiom that would itself race under concurrent callers.
+func (a *leaseActor) closeExiting() {
+	a.exitingOnce.Do(func() { close(a.exiting) })
 }
 
 // terminalSendTimeout bounds how long a terminal send will wait for inbox

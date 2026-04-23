@@ -1605,30 +1605,32 @@ func TestConcurrentProvisionDeprovision_Stress(t *testing.T) {
 	}
 }
 
-// TestSendTerminal_RejectsAfterTerminalSendsClosed pins the fix for the
-// post-drain / pre-done window. Without the terminalSendsClosed flag, a
-// late worker sendTerminal in that window would succeed and the message
-// would rot in an unread inbox. With the flag, sendTerminal rejects
-// (returns false) and the caller can correctly count the drop.
+// TestSendTerminal_RejectsAfterExitingClosed pins the fix for the
+// post-drain / pre-done window. Without the exiting signal, a late
+// worker sendTerminal in that window would succeed and the message
+// would rot in an unread inbox. With exiting closed, sendTerminal
+// rejects (returns false) and the caller can correctly count the drop.
 //
 // We can't easily reproduce the real waitForWorkers-timeout scenario
 // without wedging a worker for 75s, so we exercise the refusal directly:
-// set terminalSendsClosed, then call sendTerminal, assert false.
-func TestSendTerminal_RejectsAfterTerminalSendsClosed(t *testing.T) {
+// close exiting, then call sendTerminal, assert false. The closeExiting
+// helper is idempotent (sync.Once) so the production exit defer running
+// later on b.stopCancel() will not double-close.
+func TestSendTerminal_RejectsAfterExitingClosed(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	defer b.stopCancel()
 	actor := b.actorFor("lease-1")
 
-	// Actor is still running; a.done is NOT closed. Before the flag is
-	// set, sendTerminal accepts.
+	// Actor is still running; a.done is NOT closed. Before exiting is
+	// closed, sendTerminal accepts.
 	require.True(t, actor.sendTerminal(provisionCompletedMsg{}),
 		"baseline: sendTerminal should succeed on a live actor")
 
-	// Simulate the exit-sequence defer that sets this flag just before
-	// drainInbox runs. After this, sendTerminal must reject.
-	actor.terminalSendsClosed.Store(true)
+	// Simulate the exit-sequence defer that closes this channel just
+	// before drainInbox runs. After this, sendTerminal must reject.
+	actor.closeExiting()
 
 	rejected := !actor.sendTerminal(provisionCompletedMsg{})
 	assert.True(t, rejected,
-		"sendTerminal must reject when terminalSendsClosed is set — otherwise a post-drain send would rot in the inbox")
+		"sendTerminal must reject once exiting is closed — otherwise a post-drain send would rot in the inbox")
 }
