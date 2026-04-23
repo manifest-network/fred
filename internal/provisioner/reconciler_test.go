@@ -27,16 +27,16 @@ var noopAck = &mockAcknowledger{}
 
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
-	mu                    sync.Mutex
-	name                  string
-	provisions            []backend.ProvisionInfo
-	provisionCalls        []backend.ProvisionRequest
-	deprovisionCalls      []string
-	listProvisionsCalls   int
-	provisionErr          error
-	deprovisionErr        error
-	listErr               error
-	refreshErr            error
+	mu                  sync.Mutex
+	name                string
+	provisions          []backend.ProvisionInfo
+	provisionCalls      []backend.ProvisionRequest
+	deprovisionCalls    []string
+	listProvisionsCalls int
+	provisionErr        error
+	deprovisionErr      error
+	listErr             error
+	refreshErr          error
 }
 
 func (m *mockReconcilerBackend) Name() string {

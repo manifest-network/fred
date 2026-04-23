@@ -826,7 +826,7 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 	}()
 	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
 	if ctx.Err() != nil {
-		// Cancelled (Deprovision preempt / shutdown). Suppress the
+		// Canceled (Deprovision preempt / shutdown). Suppress the
 		// terminal: the SM has already left Failing, a DiagGathered
 		// event would hit Deprovisioning.Ignore anyway.
 		suppress = true

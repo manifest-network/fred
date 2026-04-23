@@ -39,6 +39,36 @@ func (b *Backend) restartRollback(leaseUUID string, prevStatus backend.Provision
 
 // Restart restarts containers for a lease without changing the manifest.
 // State machine: Ready|Failed → Restarting → Ready|Failed
+//
+// ARCHITECTURAL SEAM — intentional. This function writes prov.Status to
+// Restarting synchronously under provisionsMu BEFORE routing to the
+// lease actor. Most Status writes live inside the actor's goroutine
+// (SM entry/exit actions and doDeprovision); Restart and Update are
+// the two places where a Status write happens outside the actor.
+//
+// Why the seam exists:
+//   - Fast-fail semantics: concurrent Restart calls (or a Restart racing
+//     a Container-died transition to Failing) get ErrInvalidState
+//     immediately under the mutex, not after an inbox round-trip.
+//   - The invariant "Restart() returns => prov.Status == Restarting"
+//     is depended on by the HTTP handler's event-broker publish
+//     (api/handlers.go: RestartLease). A caller observing the lease
+//     state after Restart() returns sees Restarting atomically.
+//
+// Compensation: the narrow race between the SM guard's RLock-release
+// and onEnterFailing's Lock-acquire (a Restart can slip in during the
+// guard's 10s InspectContainer) is handled by an explicit Status
+// recheck in onEnterFailing (lease_sm.go) that bails on !Ready and
+// bumps lease_failing_race_skipped_total.
+//
+// To close the seam: move the Status write + SM fire into the actor's
+// handleRestartRequested, ensuring the actor writes Status BEFORE
+// acking so the contract above is preserved. Expected to eliminate
+// the recheck/metric but not the other edge-case rules (Failing.Permit
+// retries, Deprovisioning.Ignore, restored:false on Update preflight)
+// which exist for independent reasons. Don't refactor without an
+// operational trigger — the metric climbing in production, a new bug,
+// or a broader rewrite of the Restart/Update path.
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
 
@@ -771,6 +801,14 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 
 // Update deploys a new manifest for a lease, replacing containers.
 // State machine: Ready|Failed → Updating → Ready|Failed
+//
+// ARCHITECTURAL SEAM — see the extended comment on Backend.Restart for
+// the rationale. Like Restart, Update writes prov.Status to Updating
+// synchronously under provisionsMu BEFORE routing to the lease actor,
+// for fast-fail semantics and the "Update() returns => Status is
+// Updating" contract. Compensated by onEnterFailing's Status recheck
+// (lease_sm.go) + lease_failing_race_skipped_total metric. Don't
+// refactor without an operational trigger.
 func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
 
