@@ -480,6 +480,31 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 	_ = a.sm.Fire(a.backend.stopCtx, evDiagGathered, result)
 }
 
+// fireAndVerify fires an SM event and verifies the transition landed in
+// the expected destination state. This is the ONLY way caller-facing
+// handlers should commit an SM transition — the raw sm.Fire call is
+// unsafe because stateless returns nil both on Permit (SM transitioned)
+// and Ignore (SM deliberately did nothing), so a naive
+// `if err := sm.Fire(...); err != nil` lets Ignore paths masquerade as
+// success. That trap bit handleProvisionRequested on the
+// partial-Deprovision lifecycle (Deprovisioning.Ignore(evProvisionRequested)
+// → Fire returns nil → worker spawned against an SM still in
+// Deprovisioning → terminal provisionCompletedMsg also Ignored →
+// lease wedges with live containers, no Success callback).
+//
+// Returns nil iff the SM is in wantState after Fire; otherwise returns
+// the Fire error (unhandled trigger) OR an errFireIgnored wrapping the
+// actual state (Ignore-returns-nil).
+func (a *leaseActor) fireAndVerify(ev leaseEvent, wantState backend.ProvisionStatus) error {
+	if err := a.sm.Fire(a.backend.stopCtx, ev); err != nil {
+		return err
+	}
+	if state := a.sm.State(); state != wantState {
+		return fmt.Errorf("%v not accepted by SM from state %v", ev, state)
+	}
+	return nil
+}
+
 // handleProvisionRequested transitions the SM into Provisioning (or from
 // Failed on retry), acks the caller, and spawns the work goroutine.
 // Spawning inside the actor (rather than in Backend.Provision) means the
@@ -489,46 +514,18 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 // truly wedged worker). The orphan-worker race class is eliminated
 // under that happy-path wait; pathological timeouts leave a zombie
 // worker that recoverState reconciles on next start.
-//
-// Fire-returns-nil-is-success caveat: Fire returns nil on both Permit
-// (SM transitioned) and Ignore (SM deliberately did nothing). The
-// terminated check below handles one known Ignore-returns-nil trap
-// (Deprovisioning.Ignore(evProvisionRequested) in the lifecycle race).
-// The other Ignore that returns nil — Provisioning.Ignore — is the
-// happy path for newly-created actors whose SM initializes to
-// Provisioning from prov.Status. When adding any new Ignore rule,
-// audit whether a caller of an error-checked Fire could land in the
-// Ignoring state and interpret nil-success as "SM transitioned."
 func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 	if a.terminated {
 		// Actor has already completed Deprovision but not yet been
 		// removed from the registry (defer ordering). Reject so the
 		// caller rolls back and retries — a fresh actor will be
-		// created on the next routeToLease. Without this check, the
-		// SM's Deprovisioning.Ignore(evProvisionRequested) would make
-		// Fire return nil, leading us to ack success and spawn a
-		// worker under a terminated actor.
+		// created on the next routeToLease.
 		msg.ack <- errActorTerminated
 		return
 	}
 	a.workCancel = msg.cancel
-	if err := a.sm.Fire(a.backend.stopCtx, evProvisionRequested); err != nil {
+	if err := a.fireAndVerify(evProvisionRequested, backend.ProvisionStatusProvisioning); err != nil {
 		msg.ack <- err
-		return
-	}
-	// Post-Fire state check: catches the Fire-returns-nil-on-Ignore trap
-	// for ANY state that silently swallows evProvisionRequested.
-	// Deprovisioning.Ignore(evProvisionRequested) fires on retry against
-	// an actor whose Deprovision partially failed (entry preserved,
-	// terminated=false, SM still in Deprovisioning); without this check
-	// we'd ack success and spawn a worker that creates real containers
-	// whose terminal provisionCompletedMsg would then also be Ignored,
-	// wedging the lease with live containers and no Success callback.
-	// Provisioning.Ignore is the happy-path Ignore for newly-created
-	// actors (SM initialized to Provisioning from prov.Status) — state
-	// is already Provisioning, so the check passes.
-	if state := a.sm.State(); state != backend.ProvisionStatusProvisioning {
-		msg.ack <- fmt.Errorf("provision request not accepted by SM from state %v", state)
 		return
 	}
 	msg.ack <- nil
@@ -634,21 +631,12 @@ func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string, logs 
 
 func (a *leaseActor) handleRestartRequested(msg restartRequestedMsg) {
 	if a.terminated {
-		// See handleProvisionRequested for rationale.
 		msg.ack <- errActorTerminated
 		return
 	}
 	a.workCancel = msg.cancel
-	if err := a.sm.Fire(a.backend.stopCtx, evRestartRequested); err != nil {
+	if err := a.fireAndVerify(evRestartRequested, backend.ProvisionStatusRestarting); err != nil {
 		msg.ack <- err
-		return
-	}
-	// Defense-in-depth against the Fire-returns-nil-on-Ignore trap. No
-	// state currently Ignores evRestartRequested (Deprovisioning returns
-	// an unhandled-trigger error), but if one is ever added the check
-	// catches it before we spawn a worker under a non-Restarting SM.
-	if state := a.sm.State(); state != backend.ProvisionStatusRestarting {
-		msg.ack <- fmt.Errorf("restart request not accepted by SM from state %v", state)
 		return
 	}
 	msg.ack <- nil
@@ -657,19 +645,12 @@ func (a *leaseActor) handleRestartRequested(msg restartRequestedMsg) {
 
 func (a *leaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 	if a.terminated {
-		// See handleProvisionRequested for rationale.
 		msg.ack <- errActorTerminated
 		return
 	}
 	a.workCancel = msg.cancel
-	if err := a.sm.Fire(a.backend.stopCtx, evUpdateRequested); err != nil {
+	if err := a.fireAndVerify(evUpdateRequested, backend.ProvisionStatusUpdating); err != nil {
 		msg.ack <- err
-		return
-	}
-	// Defense-in-depth against the Fire-returns-nil-on-Ignore trap.
-	// See handleRestartRequested.
-	if state := a.sm.State(); state != backend.ProvisionStatusUpdating {
-		msg.ack <- fmt.Errorf("update request not accepted by SM from state %v", state)
 		return
 	}
 	msg.ack <- nil
@@ -1004,6 +985,38 @@ func (b *Backend) ackOrAbort(ctx context.Context, ack <-chan error) (accepted bo
 		return false, ctx.Err()
 	}
 	return false, fmt.Errorf("backend shutting down")
+}
+
+// waitForReply waits for an actor's reply channel on a caller-facing
+// request whose semantics are "run the work, return the outcome"
+// (e.g., Deprovision). This is the ONLY supported way to block on a
+// lease actor's reply — the naive
+// `select { case err := <-reply: ... case <-ctx.Done(): return ctx.Err() }`
+// is unsafe because Go's select is pseudo-randomized when multiple
+// arms are ready, so a caller ctx cancel racing the actor's committed
+// outcome can return ctx.Err() for an operation that fully succeeded.
+// (Same race class as ackOrAbort handles for Provision/Restart/Update.)
+//
+// Semantics differ from ackOrAbort: here the actor's reply IS the
+// outcome of the work (it runs synchronously inside the handler), so
+// there's no "accepted vs err" distinction — callers get the outcome
+// or a cancellation error.
+func (b *Backend) waitForReply(ctx context.Context, reply <-chan error) error {
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+	case <-b.stopCtx.Done():
+	}
+	select {
+	case err := <-reply:
+		return err
+	default:
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("backend shutting down")
 }
 
 // ActorSnapshot is a point-in-time view of one lease actor's state for
