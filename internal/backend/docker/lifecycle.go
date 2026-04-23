@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
@@ -1577,21 +1578,22 @@ func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.
 	return result, nil
 }
 
-// tenantNetworkMu returns the per-tenant mutex that serializes
-// EnsureTenantNetwork and RemoveTenantNetworkIfEmpty for a given tenant.
-// The mutex is created on first use and never removed.
+// tenantNetworkStripeCount is the number of per-tenant stripe mutexes.
+// Tenants hash into this fixed-size array; two tenants share a stripe
+// with probability 1/tenantNetworkStripeCount. Chosen to keep collision
+// probability negligible for realistic tenant counts while keeping
+// memory bounded (256 * ~24 bytes = ~6 KB, constant).
+const tenantNetworkStripeCount = 256
+
+// tenantNetworkMu returns the stripe mutex that serializes
+// EnsureTenantNetwork and RemoveTenantNetworkIfEmpty for a given
+// tenant. FNV-1a hash → modulo gives an even distribution; two
+// unrelated tenants colliding just serialize their (infrequent)
+// network ops with each other, which is benign.
 func (b *Backend) tenantNetworkMu(tenant string) *sync.Mutex {
-	b.tenantNetworkMusMu.Lock()
-	defer b.tenantNetworkMusMu.Unlock()
-	if b.tenantNetworkMus == nil {
-		b.tenantNetworkMus = make(map[string]*sync.Mutex)
-	}
-	mu, ok := b.tenantNetworkMus[tenant]
-	if !ok {
-		mu = &sync.Mutex{}
-		b.tenantNetworkMus[tenant] = mu
-	}
-	return mu
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(tenant))
+	return &b.tenantNetworkStripes[h.Sum32()%tenantNetworkStripeCount]
 }
 
 // ensureTenantNetwork wraps DockerClient.EnsureTenantNetwork with the

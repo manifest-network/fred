@@ -157,20 +157,9 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
 		return routeErr
 	}
-	select {
-	case err := <-ack:
-		if err != nil {
-			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
-			return err
-		}
-	case <-ctx.Done():
+	// See ackOrAbort's comment for the ctx-vs-ack race rationale.
+	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, ctx.Err(), logger)
-		return ctx.Err()
-	case <-b.stopCtx.Done():
-		opCancel()
-		err := fmt.Errorf("backend shutting down")
 		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 		return err
 	}
@@ -914,20 +903,9 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
 			return routeErr
 		}
-		select {
-		case err := <-ack:
-			if err != nil {
-				opCancel()
-				b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
-				return err
-			}
-		case <-ctx.Done():
+		// See ackOrAbort's comment for the ctx-vs-ack race rationale.
+		if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, ctx.Err(), logger)
-			return ctx.Err()
-		case <-b.stopCtx.Done():
-			opCancel()
-			err := fmt.Errorf("backend shutting down")
 			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 			return err
 		}
@@ -982,20 +960,9 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
 		return routeErr
 	}
-	select {
-	case err := <-ack:
-		if err != nil {
-			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
-			return err
-		}
-	case <-ctx.Done():
+	// See ackOrAbort's comment for the ctx-vs-ack race rationale.
+	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, ctx.Err(), logger)
-		return ctx.Err()
-	case <-b.stopCtx.Done():
-		opCancel()
-		err := fmt.Errorf("backend shutting down")
 		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 		return err
 	}

@@ -66,19 +66,25 @@ type Backend struct {
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
 
-	// tenantNetworkMus serializes EnsureTenantNetwork and
+	// tenantNetworkStripes serializes EnsureTenantNetwork and
 	// RemoveTenantNetworkIfEmpty per tenant. Tenant networks are shared
 	// across every lease for that tenant, so a concurrent provision of
 	// lease B and deprovision of lease A on the same tenant can otherwise
 	// race: A's removal lands between B's ensure and B's ContainerCreate,
 	// and B fails with "network not found". Per-tenant serialization plus
 	// scanning b.provisions before removing keeps the decision and Docker
-	// call atomic per tenant. Different tenants never block each other.
-	// Mutexes are created lazily and never removed (one *sync.Mutex per
-	// unique tenant is ~24 bytes; tenants recycle slowly). Lock ordering:
-	// tenantNetworkMu -> provisionsMu (RLock).
-	tenantNetworkMus   map[string]*sync.Mutex
-	tenantNetworkMusMu sync.Mutex
+	// call atomic per tenant.
+	//
+	// Striped lock (fixed-size array, tenant → hash-modulo slot) rather
+	// than a map[tenant]*Mutex to keep memory bounded — tenants are
+	// Cosmos addresses that can be created by anyone with gas, and a
+	// map would grow without bound. With tenantNetworkStripeCount slots,
+	// two tenants share a stripe with probability 1/N; the only effect
+	// of a collision is minor serialization between unrelated tenants'
+	// network ops, which are infrequent (once per provision / deprovision).
+	//
+	// Lock ordering: stripe mutex -> provisionsMu (RLock).
+	tenantNetworkStripes [tenantNetworkStripeCount]sync.Mutex
 
 	// recoverMu serializes recoverState calls. The reconcile loop and
 	// external RefreshState (called by Fred's reconciler) both invoke
@@ -428,12 +434,13 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
 		provisions:       make(map[string]*provision),
-		tenantNetworkMus: make(map[string]*sync.Mutex),
 		actors:           make(map[string]*leaseActor),
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,
 		httpClient:       httpClient,
+		// tenantNetworkStripes is a fixed-size array embedded in Backend;
+		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())

@@ -232,21 +232,15 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// Wait for the actor to fire evProvisionRequested on its SM. If the
 	// SM rejects (shouldn't happen given the synchronous validation
 	// above, but defensive), roll back the provision entry and surface.
-	select {
-	case err := <-ack:
-		if err != nil {
-			provCancel()
-			b.removeProvision(req.LeaseUUID)
-			return err
-		}
-	case <-ctx.Done():
+	// ackOrAbort handles the race where ctx/stopCtx cancel at the same
+	// instant as the actor's ack — it checks ack one more time before
+	// giving up, so we don't roll back while the actor is already
+	// committing (which would otherwise leave worker-created containers
+	// orphaned with no provision entry).
+	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 		provCancel()
 		b.removeProvision(req.LeaseUUID)
-		return ctx.Err()
-	case <-b.stopCtx.Done():
-		provCancel()
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("backend shutting down")
+		return err
 	}
 	return nil
 }

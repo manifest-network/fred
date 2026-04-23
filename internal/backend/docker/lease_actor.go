@@ -875,6 +875,47 @@ func (b *Backend) routeToLeaseBlocking(ctx context.Context, leaseUUID string, ms
 // rarely fills); long enough to avoid hot-spinning a contended actor.
 const routeToLeaseRetryInterval = 10 * time.Millisecond
 
+// ackOrAbort waits for the actor's ack on a caller-facing request
+// (Provision / Restart / Update). Returns (true, nil) if the actor
+// acked success, (false, err) if the actor rejected or if we abandoned.
+//
+// Race fix: Go's select picks pseudo-randomly when multiple arms are
+// ready. A naive `select { case err := <-ack: ... case <-ctx.Done():
+// rollback ... }` can take the cancellation arm even though the actor
+// already acked — resulting in a rollback while the actor proceeds to
+// spawn a worker against the rolled-back state. Here we do a final
+// non-blocking read of ack after observing cancellation; if the actor
+// already committed, we honor its decision and skip the rollback.
+//
+// The caller is responsible for the rollback (removeProvision /
+// restartRollback / etc.) when accepted=false, since the compensating
+// action varies per site.
+func (b *Backend) ackOrAbort(ctx context.Context, ack <-chan error) (accepted bool, err error) {
+	select {
+	case ackErr := <-ack:
+		if ackErr != nil {
+			return false, ackErr
+		}
+		return true, nil
+	case <-ctx.Done():
+	case <-b.stopCtx.Done():
+	}
+	// Cancellation fired. Final non-blocking check: if the actor acked
+	// at the same instant, honor its decision instead of rolling back.
+	select {
+	case ackErr := <-ack:
+		if ackErr != nil {
+			return false, ackErr
+		}
+		return true, nil
+	default:
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return false, fmt.Errorf("backend shutting down")
+}
+
 // ActorSnapshot is a point-in-time view of one lease actor's state for
 // operator introspection. Safe to marshal to JSON for a /debug/actors
 // endpoint when integrated with the HTTP layer.

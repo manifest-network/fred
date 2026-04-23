@@ -24,8 +24,9 @@ type PanicHandler func(recovered any)
 // component label and invokes onPanic (if non-nil) for metric bumping.
 // The loop continues on the next tick regardless.
 //
-// onPanic is expected to be in-tree code (e.g., a metrics increment);
-// a panic inside onPanic itself would propagate. Pass nil to skip.
+// The "cleanup loop keeps fred alive" invariant is unconditional:
+// a panic inside onPanic itself is also recovered (and logged), so a
+// buggy observability hook can't take down the loop goroutine.
 //
 // Example usage:
 //
@@ -45,7 +46,23 @@ func StartCleanupLoop(ctx context.Context, interval time.Duration, cleanup Clean
 					"stack", string(debug.Stack()),
 				)
 				if onPanic != nil {
-					onPanic(r)
+					// Nested recover: a panic inside the observability
+					// hook must not escape and crash the process. The
+					// outer recover above has already consumed the
+					// original panic, so any further panic in onPanic
+					// would otherwise propagate unconstrained.
+					func() {
+						defer func() {
+							if r2 := recover(); r2 != nil {
+								slog.Error("cleanup panic handler itself panicked",
+									"component", component,
+									"panic", r2,
+									"stack", string(debug.Stack()),
+								)
+							}
+						}()
+						onPanic(r)
+					}()
 				}
 			}
 		}()

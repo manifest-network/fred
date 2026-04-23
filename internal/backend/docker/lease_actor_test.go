@@ -1412,3 +1412,65 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 			"terminated actor must NOT spawn a replace worker for Update")
 	})
 }
+
+// TestAckOrAbort_HonorsAckEvenWhenCtxCanceled pins the ctx-vs-ack race
+// fix. Go's select picks pseudo-randomly when multiple arms are ready,
+// so a naive select on {ack, ctx.Done, stopCtx.Done} can take the
+// cancellation arm even though the actor has acked — leading the caller
+// to roll back while the actor proceeds.
+//
+// We can't deterministically schedule the race in a unit test, but we
+// can verify the post-cancel non-blocking ack read: pre-cancel the ctx
+// AND pre-ack, then call ackOrAbort and assert it returns (true, nil)
+// instead of ctx.Err.
+func TestAckOrAbort_HonorsAckEvenWhenCtxCanceled(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	defer b.stopCancel()
+
+	t.Run("ack_success_beats_ctx_cancel", func(t *testing.T) {
+		ack := make(chan error, 1)
+		ack <- nil // actor "acked" success
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // caller "gave up"
+
+		accepted, err := b.ackOrAbort(ctx, ack)
+		assert.True(t, accepted, "ackOrAbort must honor pre-queued ack even when ctx is already canceled")
+		assert.NoError(t, err)
+	})
+
+	t.Run("ack_error_beats_ctx_cancel", func(t *testing.T) {
+		ack := make(chan error, 1)
+		synthErr := fmt.Errorf("synthetic ack error")
+		ack <- synthErr
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		accepted, err := b.ackOrAbort(ctx, ack)
+		assert.False(t, accepted)
+		assert.ErrorIs(t, err, synthErr,
+			"ackOrAbort must surface actor-rejected error, not ctx.Err")
+	})
+
+	t.Run("no_ack_ctx_canceled", func(t *testing.T) {
+		ack := make(chan error, 1)
+		// no pre-ack
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		accepted, err := b.ackOrAbort(ctx, ack)
+		assert.False(t, accepted)
+		assert.ErrorIs(t, err, context.Canceled,
+			"with no ack and canceled ctx, ackOrAbort must return ctx.Err")
+	})
+
+	t.Run("no_ack_stop_ctx", func(t *testing.T) {
+		ack := make(chan error, 1)
+		ctx := context.Background() // caller ctx fine
+		b.stopCancel()              // backend shutting down
+
+		accepted, err := b.ackOrAbort(ctx, ack)
+		assert.False(t, accepted)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "backend shutting down")
+	})
+}
