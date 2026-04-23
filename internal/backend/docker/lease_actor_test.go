@@ -1297,3 +1297,118 @@ func TestHandlerPanic_UnblocksReplyChannel(t *testing.T) {
 	assert.Greater(t, panicsAfter, panicsBefore,
 		"leaseActorPanicsTotal must increment for handler panic")
 }
+
+// TestTerminatedActor_RejectsCallerFacingRequests pins the fix for the
+// lifecycle race between handleDeprovision setting a.terminated=true
+// and the actor's deferred removeFromRegistry() actually running.
+//
+// Scenario: a Backend.Provision (or Restart/Update) routes a message
+// after Deprovision has removed the provision entry but before the
+// actor has been removed from b.actors. Without the terminated check,
+// the handler fires evProvisionRequested into the SM — which is in
+// Deprovisioning state — and Deprovisioning.Ignore(evProvisionRequested)
+// causes Fire to return nil. The handler interprets that as "SM
+// accepted the transition," acks success, and spawns a worker under
+// a terminated actor. Containers get created, no callback fires,
+// lease is wedged.
+//
+// With the fix, the handler checks a.terminated first and returns
+// errActorTerminated on ack. The caller (Backend.X) rolls back via
+// removeProvision; a retry resolves-or-creates a fresh actor.
+func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Tenant:    "tenant-a",
+			Status:    backend.ProvisionStatusDeprovisioning,
+		},
+	})
+
+	actor := b.actorFor("lease-1")
+
+	// Shut the actor's run goroutine down first so the test goroutine
+	// is the sole reader/writer of actor.terminated and of the SM.
+	// In production, these handlers run in the actor's own goroutine
+	// after handleDeprovision has set terminated=true and the main
+	// loop is draining the inbox via the run-exit defers.
+	b.stopCancel()
+	select {
+	case <-actor.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor did not exit after stopCancel")
+	}
+	actor.terminated = true // simulate post-handleDeprovision state
+
+	t.Run("Provision", func(t *testing.T) {
+		var workerSpawned atomic.Bool
+		msg := provisionRequestedMsg{
+			cancel: func() {},
+			work: func() (string, provisionSuccessResult, map[string]string, error) {
+				workerSpawned.Store(true)
+				return "", provisionSuccessResult{}, nil, nil
+			},
+			ack: make(chan error, 1),
+		}
+		actor.handleProvisionRequested(msg)
+
+		select {
+		case err := <-msg.ack:
+			assert.ErrorIs(t, err, errActorTerminated,
+				"terminated actor must reject Provision with errActorTerminated")
+		case <-time.After(time.Second):
+			t.Fatal("ack channel never received a value — handler did not unblock caller")
+		}
+		// Give any stray goroutine time to fire before we assert.
+		time.Sleep(20 * time.Millisecond)
+		assert.False(t, workerSpawned.Load(),
+			"terminated actor must NOT spawn a provision worker")
+	})
+
+	t.Run("Restart", func(t *testing.T) {
+		var workerSpawned atomic.Bool
+		msg := restartRequestedMsg{
+			cancel: func() {},
+			work: func() replaceResult {
+				workerSpawned.Store(true)
+				return replaceResult{}
+			},
+			ack: make(chan error, 1),
+		}
+		actor.handleRestartRequested(msg)
+
+		select {
+		case err := <-msg.ack:
+			assert.ErrorIs(t, err, errActorTerminated,
+				"terminated actor must reject Restart with errActorTerminated")
+		case <-time.After(time.Second):
+			t.Fatal("ack channel never received a value")
+		}
+		time.Sleep(20 * time.Millisecond)
+		assert.False(t, workerSpawned.Load(),
+			"terminated actor must NOT spawn a replace worker for Restart")
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		var workerSpawned atomic.Bool
+		msg := updateRequestedMsg{
+			cancel: func() {},
+			work: func() replaceResult {
+				workerSpawned.Store(true)
+				return replaceResult{}
+			},
+			ack: make(chan error, 1),
+		}
+		actor.handleUpdateRequested(msg)
+
+		select {
+		case err := <-msg.ack:
+			assert.ErrorIs(t, err, errActorTerminated,
+				"terminated actor must reject Update with errActorTerminated")
+		case <-time.After(time.Second):
+			t.Fatal("ack channel never received a value")
+		}
+		time.Sleep(20 * time.Millisecond)
+		assert.False(t, workerSpawned.Load(),
+			"terminated actor must NOT spawn a replace worker for Update")
+	})
+}

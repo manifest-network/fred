@@ -2,11 +2,24 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
 )
+
+// errActorTerminated is returned on the ack/reply channel when a
+// caller-facing request (Provision/Restart/Update) arrives at an actor
+// that has already terminated via handleDeprovision but whose
+// removeFromRegistry defer hasn't yet fired. The caller (Backend.X)
+// rolls back its pre-routing state via its error path (e.g.,
+// removeProvision); a subsequent retry resolves-or-creates a fresh
+// actor through actorForLocked. Without this check, such messages
+// would hit SM.Ignore in Deprovisioning state and Fire would return
+// nil — the handler would then ack success and spawn a worker under
+// a terminated actor, wedging the lease.
+var errActorTerminated = errors.New("lease actor terminated; retry will create a fresh actor")
 
 type leaseMessage interface {
 	isLeaseMessage()
@@ -451,6 +464,17 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 // under that happy-path wait; pathological timeouts leave a zombie
 // worker that recoverState reconciles on next start.
 func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
+	if a.terminated {
+		// Actor has already completed Deprovision but not yet been
+		// removed from the registry (defer ordering). Reject so the
+		// caller rolls back and retries — a fresh actor will be
+		// created on the next routeToLease. Without this check, the
+		// SM's Deprovisioning.Ignore(evProvisionRequested) would make
+		// Fire return nil, leading us to ack success and spawn a
+		// worker under a terminated actor.
+		msg.ack <- errActorTerminated
+		return
+	}
 	a.workCancel = msg.cancel
 	if err := a.sm.Fire(a.backend.stopCtx, evProvisionRequested); err != nil {
 		msg.ack <- err
@@ -558,6 +582,11 @@ func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string, logs 
 }
 
 func (a *leaseActor) handleRestartRequested(msg restartRequestedMsg) {
+	if a.terminated {
+		// See handleProvisionRequested for rationale.
+		msg.ack <- errActorTerminated
+		return
+	}
 	a.workCancel = msg.cancel
 	if err := a.sm.Fire(a.backend.stopCtx, evRestartRequested); err != nil {
 		msg.ack <- err
@@ -568,6 +597,11 @@ func (a *leaseActor) handleRestartRequested(msg restartRequestedMsg) {
 }
 
 func (a *leaseActor) handleUpdateRequested(msg updateRequestedMsg) {
+	if a.terminated {
+		// See handleProvisionRequested for rationale.
+		msg.ack <- errActorTerminated
+		return
+	}
 	a.workCancel = msg.cancel
 	if err := a.sm.Fire(a.backend.stopCtx, evUpdateRequested); err != nil {
 		msg.ack <- err
