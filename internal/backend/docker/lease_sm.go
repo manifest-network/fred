@@ -780,7 +780,31 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 // on timeout the SM proceeds and a late sendTerminal is refused by the
 // Deprovisioning.Ignore backstop.
 func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *ContainerInfo) {
-	terminalSent := false
+	// Same single-send defer pattern as spawnProvisionWorker /
+	// spawnReplaceWorker (see lease_actor.go). One sendTerminal site;
+	// the recover overrides terminalMsg on panic, the normal path
+	// sets it on completion. ctx-cancel is special: we suppress the
+	// send entirely (the Deprovisioning.Ignore path handles that case).
+	var terminalMsg leaseMessage
+	var event = "diag_gathered"
+	var suppress bool
+	defer func() {
+		if suppress {
+			return
+		}
+		if terminalMsg == nil {
+			terminalMsg = diagGatheredMsg{
+				result: diagResult{containerID: containerID, info: info, diag: ""},
+			}
+			event = "diag_no_result"
+		}
+		if !a.sendTerminal(terminalMsg) {
+			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+			a.backend.logger.Warn("terminal diag event dropped (actor exited or inbox wedged)",
+				"lease_uuid", a.leaseUUID,
+			)
+		}
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			a.backend.logger.Error("diag worker panic — recovering to keep fred alive",
@@ -790,33 +814,25 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 				"stack", string(debug.Stack()),
 			)
 			leaseWorkerPanicsTotal.WithLabelValues("diag").Inc()
-			if !terminalSent {
-				// Drive Failing→Failed with empty diag so the SM isn't
-				// wedged in Failing waiting for a terminal that won't
-				// otherwise arrive.
-				if !a.sendTerminal(diagGatheredMsg{
-					result: diagResult{containerID: containerID, info: info, diag: ""},
-				}) {
-					leaseTerminalEventDroppedTotal.WithLabelValues("diag_panic").Inc()
-				}
+			// Drive Failing→Failed via an empty diagGatheredMsg —
+			// Deprovisioning.Ignore still covers the case where the
+			// SM has already moved past Failing.
+			terminalMsg = diagGatheredMsg{
+				result: diagResult{containerID: containerID, info: info, diag: ""},
 			}
+			event = "diag_panic"
+			suppress = false
 		}
 	}()
 	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
 	if ctx.Err() != nil {
-		// Cancelled (Deprovision preempt / shutdown). Skip the terminal
-		// event so Deprovisioning.Ignore doesn't need to fire — and
-		// flip terminalSent so the recover doesn't send either.
-		terminalSent = true
+		// Cancelled (Deprovision preempt / shutdown). Suppress the
+		// terminal: the SM has already left Failing, a DiagGathered
+		// event would hit Deprovisioning.Ignore anyway.
+		suppress = true
 		return
 	}
-	if !a.sendTerminal(diagGatheredMsg{
+	terminalMsg = diagGatheredMsg{
 		result: diagResult{containerID: containerID, info: info, diag: diag},
-	}) {
-		leaseTerminalEventDroppedTotal.WithLabelValues("diag_gathered").Inc()
-		a.backend.logger.Warn("terminal diag event dropped (actor exited or inbox wedged)",
-			"lease_uuid", a.leaseUUID,
-		)
 	}
-	terminalSent = true
 }
