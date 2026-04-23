@@ -590,11 +590,14 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // For multi-unit leases, it creates multiple containers.
 // For multi-SKU leases, each container gets the appropriate resource profile.
 //
-// Returns (callbackErr, result, err). On success, result carries the
-// populated provisionSuccessResult for the SM's Ready entry action to
-// write into the provision struct. On failure, result is zero; the SM's
-// Failed entry action uses (callbackErr, err.Error()) to populate
-// LastError and the Failed callback.
+// Returns (callbackErr, result, logs, err). On success, result carries
+// the populated provisionSuccessResult for the SM's Ready entry action
+// to write into the provision struct; logs is nil. On failure, result
+// is zero and logs is the pre-captured container-log map (fetched by
+// the failure defer BEFORE cleanup removes the containers) — the SM's
+// Failed entry action threads both (callbackErr, err.Error()) and logs
+// through to LastError, persistDiagnosticsWithLogs, and the Failed
+// callback.
 //
 // The defer is responsible for side effects that don't belong to the SM:
 // duration metrics, pool release on failure, container/volume cleanup on

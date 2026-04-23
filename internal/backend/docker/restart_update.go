@@ -32,7 +32,7 @@ func (b *Backend) restartRollback(leaseUUID string, prevStatus backend.Provision
 			msg = cause.Error()
 		}
 		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", msg); relErr != nil {
-			logger.Warn("failed to roll back release on send refusal", "error", relErr)
+			logger.Warn("failed to update release status during rollback", "error", relErr, "rollback_cause", msg)
 		}
 	}
 }

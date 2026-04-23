@@ -680,9 +680,10 @@ type provisionSuccessResult struct {
 // hardcoded message; lastError is the full diagnostic string stashed in
 // provision.LastError for authenticated API access. logs is the
 // pre-captured log map (fetched by doProvision BEFORE its cleanup defer
-// removed the failed containers) — if nil, onEnterFailedFromProvision
-// falls back to attempting a post-hoc fetch, which will typically find
-// the containers gone and record an empty entry.
+// removed the failed containers). If nil (e.g., failure before any
+// containers were created), onEnterFailedFromProvision persists the
+// diagnostic entry without container logs — it does not re-fetch, since
+// the containers are gone by the time the SM entry action runs.
 type provisionErrorInfo struct {
 	callbackErr string
 	lastError   string
