@@ -1474,3 +1474,133 @@ func TestAckOrAbort_HonorsAckEvenWhenCtxCanceled(t *testing.T) {
 		assert.Contains(t, err.Error(), "backend shutting down")
 	})
 }
+
+// TestConcurrentProvisionDeprovision_Stress is an adversarial concurrency
+// test that hammers Backend.Provision and Backend.Deprovision on a small
+// pool of lease UUIDs with many goroutines. Together with -race, this
+// surfaces lifecycle/ack/terminated-actor bugs that point-tests miss:
+//
+//   - Provision racing an in-flight Deprovision on the same UUID.
+//   - Lifecycle race (actor terminated, not yet removed from registry).
+//   - ack-vs-ctx.Done race (if the ctx-timeout loop fires).
+//   - Concurrent cross-UUID operations stressing the registry mutex.
+//
+// We don't assert on individual operation outcomes (concurrent
+// Provision/Deprovision on the same UUID is expected to produce errors
+// like ErrAlreadyProvisioned or errActorTerminated). We assert on the
+// invariants that MUST hold:
+//
+//   - No races detected (enforced by -race).
+//   - No goroutine deadlocks (test completes within timeout).
+//   - No orphaned actor goroutines after teardown (enforced by b.wg.Wait).
+//   - No panic that escapes recover.
+//
+// Skipped under -short since it runs for a few seconds and saturates CPU.
+func TestConcurrentProvisionDeprovision_Stress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test — not run under -short")
+	}
+
+	const (
+		numWorkers = 16
+		numUUIDs   = 8
+		testDur    = 2 * time.Second
+	)
+
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "c-" + params.LeaseUUID + "-" + fmt.Sprint(params.InstanceIndex), nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	// Callback endpoint: swallow all callbacks silently — we're only
+	// interested in races, not delivery correctness.
+	callbackSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackSrv.Close()
+
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.httpClient = callbackSrv.Client()
+	b.cfg.StartupVerifyDuration = 1 * time.Millisecond // fast
+	rebuildCallbackSender(b)
+
+	uuids := make([]string, numUUIDs)
+	for i := range uuids {
+		uuids[i] = fmt.Sprintf("stress-%d", i)
+	}
+
+	deadline := time.Now().Add(testDur)
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
+			defer wg.Done()
+			// Distinct seed per worker so they hit different interleavings.
+			next := uint32(workerID*17 + 1)
+			for time.Now().Before(deadline) {
+				// xorshift — fast, deterministic per worker, no mutex.
+				next ^= next << 13
+				next ^= next >> 17
+				next ^= next << 5
+				uuid := uuids[int(next)%numUUIDs]
+
+				// Mix of operations: provision, deprovision, redundant
+				// provision, redundant deprovision. Errors are expected
+				// and ignored — the point is exercise, not correctness.
+				switch int(next>>1) % 4 {
+				case 0, 1:
+					_ = b.Provision(context.Background(), newProvisionRequest(
+						uuid, "tenant-a", "docker-small", 1,
+						validManifestJSON("busybox:latest"),
+					))
+				case 2, 3:
+					_ = b.Deprovision(context.Background(), uuid)
+				}
+			}
+		}(w)
+	}
+
+	// Wait for workers to finish with a hard upper bound so a stuck
+	// goroutine fails the test instead of hanging forever.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(testDur + 30*time.Second):
+		t.Fatal("stress workers did not exit — possible deadlock")
+	}
+
+	// Clean up any remaining leases so the actor-exit defers run and
+	// we can detect orphan goroutines.
+	for _, uuid := range uuids {
+		_ = b.Deprovision(context.Background(), uuid)
+	}
+
+	// Shutdown. b.stopCancel + b.wg.Wait inside the test cleanup
+	// ensures all spawned actor goroutines exit; if one is leaked,
+	// the test would hang here (caught by go test's own timeout).
+	b.stopCancel()
+	done = make(chan struct{})
+	go func() { b.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("backend wg.Wait did not complete — orphan goroutines")
+	}
+}
