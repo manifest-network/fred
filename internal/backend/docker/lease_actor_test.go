@@ -1604,3 +1604,31 @@ func TestConcurrentProvisionDeprovision_Stress(t *testing.T) {
 		t.Fatal("backend wg.Wait did not complete — orphan goroutines")
 	}
 }
+
+// TestSendTerminal_RejectsAfterTerminalSendsClosed pins the fix for the
+// post-drain / pre-done window. Without the terminalSendsClosed flag, a
+// late worker sendTerminal in that window would succeed and the message
+// would rot in an unread inbox. With the flag, sendTerminal rejects
+// (returns false) and the caller can correctly count the drop.
+//
+// We can't easily reproduce the real waitForWorkers-timeout scenario
+// without wedging a worker for 75s, so we exercise the refusal directly:
+// set terminalSendsClosed, then call sendTerminal, assert false.
+func TestSendTerminal_RejectsAfterTerminalSendsClosed(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	defer b.stopCancel()
+	actor := b.actorFor("lease-1")
+
+	// Actor is still running; a.done is NOT closed. Before the flag is
+	// set, sendTerminal accepts.
+	require.True(t, actor.sendTerminal(provisionCompletedMsg{}),
+		"baseline: sendTerminal should succeed on a live actor")
+
+	// Simulate the exit-sequence defer that sets this flag just before
+	// drainInbox runs. After this, sendTerminal must reject.
+	actor.terminalSendsClosed.Store(true)
+
+	rejected := !actor.sendTerminal(provisionCompletedMsg{})
+	assert.True(t, rejected,
+		"sendTerminal must reject when terminalSendsClosed is set — otherwise a post-drain send would rot in the inbox")
+}
