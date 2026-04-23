@@ -27,15 +27,16 @@ var noopAck = &mockAcknowledger{}
 
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
-	mu               sync.Mutex
-	name             string
-	provisions       []backend.ProvisionInfo
-	provisionCalls   []backend.ProvisionRequest
-	deprovisionCalls []string
-	provisionErr     error
-	deprovisionErr   error
-	listErr          error
-	refreshErr       error
+	mu                    sync.Mutex
+	name                  string
+	provisions            []backend.ProvisionInfo
+	provisionCalls        []backend.ProvisionRequest
+	deprovisionCalls      []string
+	listProvisionsCalls   int
+	provisionErr          error
+	deprovisionErr        error
+	listErr               error
+	refreshErr            error
 }
 
 func (m *mockReconcilerBackend) Name() string {
@@ -70,6 +71,7 @@ func (m *mockReconcilerBackend) Deprovision(ctx context.Context, leaseUUID strin
 func (m *mockReconcilerBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.listProvisionsCalls++
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
@@ -3234,6 +3236,16 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions"))
 	assert.Equal(t, before+1, after,
 		"ReconcilerPanicsTotal{fetch_provisions} must increment by 1")
+
+	// The healthy sibling backend must still have been queried despite
+	// the bad one panicking — errgroup concurrency means the panic in
+	// one task does not short-circuit the others (panicErrs is collected
+	// AFTER g.Wait returns).
+	goodBackend.mu.Lock()
+	goodListCalls := goodBackend.listProvisionsCalls
+	goodBackend.mu.Unlock()
+	assert.GreaterOrEqual(t, goodListCalls, 1,
+		"healthy backend's ListProvisions must have been called despite sibling panic")
 }
 
 // TestReconciler_ProcessLeasePanicDoesNotCrashFred: a panic inside
@@ -3255,14 +3267,7 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 		},
 	}
 
-	var provisionCalls int
-	var mu sync.Mutex
-	mockBackend := &mockReconcilerBackend{
-		name: "test",
-		provisionErr: nil,
-	}
-	// Intercept Provision to count how many leases reached it.
-	// (mockReconcilerBackend records provision calls; we use that.)
+	mockBackend := &mockReconcilerBackend{name: "test"}
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -3297,10 +3302,8 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 	assert.Equal(t, before+1, after,
 		"ReconcilerPanicsTotal{process_lease} must increment by 1")
 
-	// The lease without MetaHash should have been provisioned normally.
-	mu.Lock()
-	_ = provisionCalls
-	mu.Unlock()
+	// The lease without MetaHash should have been provisioned normally —
+	// one panicking lease must not block processing of sibling leases.
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
 	var okLeaseProvisioned bool

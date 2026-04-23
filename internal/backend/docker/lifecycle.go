@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -1671,21 +1670,6 @@ func (d *DockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEve
 	go func() {
 		defer close(out)
 		defer close(errCh)
-		// Recover any panic from the Docker SDK event stream (e.g., a
-		// malformed Docker-daemon response causing an SDK-internal panic)
-		// so one bad event does NOT crash the docker-backend process.
-		// Log with stack, bump the panic metric; the close(out)/close(errCh)
-		// defers tell the consumer the stream ended, which matches the
-		// behavior of a clean EOF.
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("docker event stream panic — recovering to keep docker-backend alive",
-					"panic", r,
-					"stack", string(debug.Stack()),
-				)
-				leaseWorkerPanicsTotal.WithLabelValues("docker_events").Inc()
-			}
-		}()
 
 		for {
 			select {
