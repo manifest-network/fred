@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // errActorTerminated is returned on the ack/reply channel when a
@@ -514,6 +516,21 @@ func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 		msg.ack <- err
 		return
 	}
+	// Post-Fire state check: catches the Fire-returns-nil-on-Ignore trap
+	// for ANY state that silently swallows evProvisionRequested.
+	// Deprovisioning.Ignore(evProvisionRequested) fires on retry against
+	// an actor whose Deprovision partially failed (entry preserved,
+	// terminated=false, SM still in Deprovisioning); without this check
+	// we'd ack success and spawn a worker that creates real containers
+	// whose terminal provisionCompletedMsg would then also be Ignored,
+	// wedging the lease with live containers and no Success callback.
+	// Provisioning.Ignore is the happy-path Ignore for newly-created
+	// actors (SM initialized to Provisioning from prov.Status) — state
+	// is already Provisioning, so the check passes.
+	if state := a.sm.State(); state != backend.ProvisionStatusProvisioning {
+		msg.ack <- fmt.Errorf("provision request not accepted by SM from state %v", state)
+		return
+	}
 	msg.ack <- nil
 	a.spawnProvisionWorker(msg.work)
 }
@@ -626,6 +643,14 @@ func (a *leaseActor) handleRestartRequested(msg restartRequestedMsg) {
 		msg.ack <- err
 		return
 	}
+	// Defense-in-depth against the Fire-returns-nil-on-Ignore trap. No
+	// state currently Ignores evRestartRequested (Deprovisioning returns
+	// an unhandled-trigger error), but if one is ever added the check
+	// catches it before we spawn a worker under a non-Restarting SM.
+	if state := a.sm.State(); state != backend.ProvisionStatusRestarting {
+		msg.ack <- fmt.Errorf("restart request not accepted by SM from state %v", state)
+		return
+	}
 	msg.ack <- nil
 	a.spawnReplaceWorker(msg.work)
 }
@@ -639,6 +664,12 @@ func (a *leaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 	a.workCancel = msg.cancel
 	if err := a.sm.Fire(a.backend.stopCtx, evUpdateRequested); err != nil {
 		msg.ack <- err
+		return
+	}
+	// Defense-in-depth against the Fire-returns-nil-on-Ignore trap.
+	// See handleRestartRequested.
+	if state := a.sm.State(); state != backend.ProvisionStatusUpdating {
+		msg.ack <- fmt.Errorf("update request not accepted by SM from state %v", state)
 		return
 	}
 	msg.ack <- nil

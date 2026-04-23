@@ -226,6 +226,9 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		ack:    ack,
 	}); routeErr != nil {
 		provCancel()
+		for _, id := range allocatedIDs {
+			b.pool.Release(id)
+		}
 		b.removeProvision(req.LeaseUUID)
 		return routeErr
 	}
@@ -237,8 +240,19 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// giving up, so we don't roll back while the actor is already
 	// committing (which would otherwise leave worker-created containers
 	// orphaned with no provision entry).
+	//
+	// Pool allocations MUST be released on rollback (mirroring the
+	// mid-allocation failure paths above). doProvision's failure defer
+	// only runs if the worker actually runs; if the actor never accepts
+	// the message (route/ack failure), the worker is never spawned and
+	// these allocations would otherwise leak — a subsequent retry would
+	// then find the per-instance IDs still allocated in the pool and
+	// fail TryAllocate with "already allocated", wedging the lease.
 	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 		provCancel()
+		for _, id := range allocatedIDs {
+			b.pool.Release(id)
+		}
 		b.removeProvision(req.LeaseUUID)
 		return err
 	}

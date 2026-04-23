@@ -21,14 +21,29 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	if err := b.routeToLeaseBlocking(ctx, leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}); err != nil {
 		return err
 	}
+	// Mirror ackOrAbort's pattern (see lease_actor.go): Go's select
+	// picks pseudo-randomly when multiple arms are ready, so a caller
+	// ctx cancel racing the actor's reply can cause us to return
+	// ctx.Err() even when doDeprovision has already fully committed
+	// (containers removed, callback sent, entry deleted). After
+	// observing cancellation, do a non-blocking re-read of reply; if
+	// the actor acked, honor its decision instead of returning a
+	// misleading error.
 	select {
 	case err := <-reply:
 		return err
 	case <-b.stopCtx.Done():
-		return fmt.Errorf("backend shutting down")
 	case <-ctx.Done():
+	}
+	select {
+	case err := <-reply:
+		return err
+	default:
+	}
+	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	return fmt.Errorf("backend shutting down")
 }
 
 // handleDeprovision runs inside the lease actor's message handler. It fires

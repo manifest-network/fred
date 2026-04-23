@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"time"
@@ -825,10 +826,18 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 		}
 	}()
 	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
-	if ctx.Err() != nil {
-		// Canceled (Deprovision preempt / shutdown). Suppress the
-		// terminal: the SM has already left Failing, a DiagGathered
-		// event would hit Deprovisioning.Ignore anyway.
+	// Distinguish the two cancellation causes:
+	//   - context.Canceled: diagCancel() fired from Failing.OnExit (preempt
+	//     by Deprovision/Restart/Update). SM has left Failing; any
+	//     diagGatheredMsg would hit Deprovisioning.Ignore anyway, so
+	//     suppress to avoid a spurious sendTerminal.
+	//   - context.DeadlineExceeded: the 30s diagnosticsGatherTimeout
+	//     elapsed without any preempt. SM is still in Failing, and
+	//     nothing else will drive Failing→Failed. We MUST send the
+	//     diagGatheredMsg (containerFailureDiagnostics always returns at
+	//     least "exit_code=N") so the SM transitions and the Failed
+	//     callback fires; otherwise the lease wedges indefinitely.
+	if errors.Is(ctx.Err(), context.Canceled) {
 		suppress = true
 		return
 	}

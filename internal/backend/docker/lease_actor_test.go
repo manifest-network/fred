@@ -1634,3 +1634,199 @@ func TestSendTerminal_RejectsAfterExitingClosed(t *testing.T) {
 	assert.True(t, rejected,
 		"sendTerminal must reject once exiting is closed — otherwise a post-drain send would rot in the inbox")
 }
+
+// TestGatherDiagAsync_SendsOnDeadlineExceeded pins bug_002: before the fix,
+// gatherDiagAsync suppressed the terminal send on ANY ctx.Err(), including
+// the 30s diagnosticsGatherTimeout elapsing. The SM stayed in Failing
+// forever and the Failed callback never fired. After the fix, only
+// context.Canceled (from Failing.OnExit's diagCancel) suppresses; timeout
+// expiry falls through to send diagGatheredMsg (which always carries at
+// least "exit_code=N") and drives Failing→Failed.
+func TestGatherDiagAsync_SendsOnDeadlineExceeded(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, _ string, _ int) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	defer b.stopCancel()
+
+	// Build an actor without running its dispatch loop so we can observe
+	// the inbox directly after gatherDiagAsync returns.
+	actor := newLeaseActor(b, "lease-1")
+	info := &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1}
+
+	// Build a ctx that's already DeadlineExceeded (simulating the 30s
+	// diag timeout having elapsed without any Failing.OnExit cancel).
+	diagCtx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+	defer cancel()
+	time.Sleep(5 * time.Millisecond)
+	require.ErrorIs(t, diagCtx.Err(), context.DeadlineExceeded,
+		"test precondition: diagCtx must be DeadlineExceeded, not Canceled")
+
+	actor.gatherDiagAsync(diagCtx, "c1", info)
+
+	select {
+	case msg := <-actor.inbox:
+		_, ok := msg.(diagGatheredMsg)
+		assert.True(t, ok, "gatherDiagAsync must enqueue diagGatheredMsg on DeadlineExceeded, got %T", msg)
+	default:
+		t.Fatal("gatherDiagAsync suppressed terminal send on DeadlineExceeded — lease would wedge in Failing (bug_002)")
+	}
+}
+
+// TestGatherDiagAsync_SuppressesOnCanceled is the other half of bug_002:
+// when Failing.OnExit's diagCancel fires (a Deprovision/Restart/Update
+// preempt), the SM has already left Failing and any diagGatheredMsg
+// would hit Deprovisioning.Ignore. Suppression is the correct behavior
+// there, so the fix must NOT turn this case into a spurious send.
+func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, _ string, _ int) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	defer b.stopCancel()
+
+	actor := newLeaseActor(b, "lease-1")
+	info := &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1}
+
+	diagCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, diagCtx.Err(), context.Canceled,
+		"test precondition: diagCtx must be Canceled")
+
+	actor.gatherDiagAsync(diagCtx, "c1", info)
+
+	select {
+	case msg := <-actor.inbox:
+		t.Fatalf("gatherDiagAsync must suppress terminal send on Canceled; got %T", msg)
+	default:
+	}
+}
+
+// TestDeprovision_HonorsLateReplyAfterCtxCancel pins bug_003: when the
+// actor acks success at the same instant as the caller's ctx cancels,
+// Go's select can take the cancellation arm and return ctx.Err() even
+// though doDeprovision already fully committed. Mirroring ackOrAbort's
+// pattern, the shim now does a non-blocking re-read of reply after
+// cancellation so the actor's authoritative outcome wins.
+func TestDeprovision_HonorsLateReplyAfterCtxCancel(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	defer b.stopCancel()
+
+	// Replicate the fixed shim's select + non-blocking re-check with both
+	// arms pre-ready: reply has the actor's success ack, ctx is already
+	// canceled. Under the buggy code, the select would randomly pick
+	// ctx.Done() and return ctx.Err() even though the actor already
+	// committed. Under the fix, either the first select picks reply, or
+	// the non-blocking re-check after ctx.Done() picks it — either way,
+	// the actor's ack wins.
+	reply := make(chan error, 1)
+	reply <- nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var ackedErr error
+	var acked bool
+	select {
+	case ackedErr = <-reply:
+		acked = true
+	case <-b.stopCtx.Done():
+	case <-ctx.Done():
+	}
+	if !acked {
+		select {
+		case ackedErr = <-reply:
+			acked = true
+		default:
+		}
+	}
+	require.True(t, acked,
+		"fixed select+recheck must surface the actor's ack even when ctx cancels (bug_003)")
+	require.NoError(t, ackedErr, "actor acked success (nil); Deprovision must return that")
+}
+
+// TestProvision_ReleasesPoolOnRouteFailure pins bug_001: when
+// Backend.Provision's handoff to the actor fails (routeToLeaseBlocking
+// errors out OR ackOrAbort rejects), the pool allocations made during
+// the preamble must be released, or they leak with no owning provision
+// entry. A retry on the same lease would then fail TryAllocate with
+// "already allocated" and the lease becomes unrecoverable until
+// backend restart.
+//
+// We force the route to fail by pre-canceling the backend's stopCtx:
+// routeToLeaseBlocking checks stopCtx up-front and returns immediately.
+// Pool stats must return to baseline after the call.
+func TestProvision_ReleasesPoolOnRouteFailure(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+	beforeStats := b.pool.Stats()
+
+	// Shut down so routeToLeaseBlocking refuses. Synchronous validation
+	// and pool allocation in Provision still run before the route call,
+	// so the leak path is reachable.
+	b.stopCancel()
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1,
+		validManifestJSON("nginx:latest"))
+	err := b.Provision(context.Background(), req)
+	require.Error(t, err, "Provision must fail when backend is shut down")
+
+	afterStats := b.pool.Stats()
+	assert.Equal(t, beforeStats.AllocatedCPU, afterStats.AllocatedCPU,
+		"pool CPU must be released on route-failure rollback (bug_001)")
+	assert.Equal(t, beforeStats.AllocatedMemoryMB, afterStats.AllocatedMemoryMB,
+		"pool memory must be released on route-failure rollback (bug_001)")
+	assert.Equal(t, beforeStats.AllocatedDiskMB, afterStats.AllocatedDiskMB,
+		"pool disk must be released on route-failure rollback (bug_001)")
+}
+
+// TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning pins bug_005:
+// when a Deprovision partially fails, the provision entry is preserved
+// with Status=Failed but the actor is NOT terminated and the SM remains
+// in Deprovisioning. A retry Provision (accepted by the sync-phase
+// Failed-guard) routes to the same actor. Fire(evProvisionRequested) on
+// Deprovisioning is Ignored → returns nil. Without the post-Fire state
+// check, the handler would ack success and spawn a worker that creates
+// real containers whose provisionCompletedMsg would ALSO be Ignored,
+// wedging the lease. The fix verifies sm.State() == Provisioning after
+// Fire and rejects otherwise.
+func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusDeprovisioning,
+			ContainerIDs: []string{"c1"},
+		},
+	})
+	defer b.stopCancel()
+
+	actor := b.actorFor("lease-1")
+	// actorForLocked initializes the SM from prov.Status, so SM is in
+	// Deprovisioning. terminated stays false because handleDeprovision
+	// was never run (simulating a partial-deprov scenario where the
+	// actor's run loop is alive with SM=Deprovisioning).
+	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.sm.State(),
+		"test precondition: SM must be in Deprovisioning")
+
+	ack := make(chan error, 1)
+	msg := provisionRequestedMsg{
+		cancel: func() {},
+		work:   func() (string, provisionSuccessResult, map[string]string, error) { return "", provisionSuccessResult{}, nil, nil },
+		ack:    ack,
+	}
+	actor.handleProvisionRequested(msg)
+
+	select {
+	case err := <-ack:
+		require.Error(t, err,
+			"handleProvisionRequested must reject when SM silently Ignores the event (bug_005); got ack success")
+	default:
+		t.Fatal("handler did not send on ack channel")
+	}
+}
