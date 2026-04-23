@@ -1817,8 +1817,10 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	ack := make(chan error, 1)
 	msg := provisionRequestedMsg{
 		cancel: func() {},
-		work:   func() (string, provisionSuccessResult, map[string]string, error) { return "", provisionSuccessResult{}, nil, nil },
-		ack:    ack,
+		work: func() (string, provisionSuccessResult, map[string]string, error) {
+			return "", provisionSuccessResult{}, nil, nil
+		},
+		ack: ack,
 	}
 	actor.handleProvisionRequested(msg)
 
