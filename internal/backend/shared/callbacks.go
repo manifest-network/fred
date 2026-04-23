@@ -9,6 +9,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 var callbackBucketName = []byte("pending_callbacks")
@@ -36,9 +37,10 @@ type CallbackStore struct {
 
 // CallbackStoreConfig configures the callback store.
 type CallbackStoreConfig struct {
-	DBPath          string        // Path to bbolt database file
-	MaxAge          time.Duration // Max age before entries are cleaned up (0 = no expiry)
-	CleanupInterval time.Duration // How often to run cleanup (defaults to MaxAge)
+	DBPath          string            // Path to bbolt database file
+	MaxAge          time.Duration     // Max age before entries are cleaned up (0 = no expiry)
+	CleanupInterval time.Duration     // How often to run cleanup (defaults to MaxAge)
+	OnCleanupPanic  util.PanicHandler // Optional: invoked on cleanup-loop panic (e.g., bump a metric)
 }
 
 // NewCallbackStore opens or creates a bbolt database for callback persistence.
@@ -58,7 +60,7 @@ func NewCallbackStore(cfg CallbackStoreConfig) (*CallbackStore, error) {
 	s := &CallbackStore{boltStore: base}
 
 	if cfg.MaxAge > 0 {
-		base.startCleanup("callback", cfg.CleanupInterval, s.RemoveOlderThan)
+		base.startCleanup("callback", cfg.CleanupInterval, s.RemoveOlderThan, cfg.OnCleanupPanic)
 	}
 
 	return s, nil

@@ -3,6 +3,7 @@ package util
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestStartCleanupLoop(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 
-		go StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "test")
+		go StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "test", nil)
 
 		// Wait for at least 2 cleanup runs
 		time.Sleep(35 * time.Millisecond)
@@ -44,7 +45,7 @@ func TestStartCleanupLoop(t *testing.T) {
 
 		done := make(chan struct{})
 		go func() {
-			StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "test")
+			StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "test", nil)
 			close(done)
 		}()
 
@@ -73,7 +74,7 @@ func TestStartCleanupLoop(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		go StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "test")
+		go StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "test", nil)
 
 		// Wait for multiple cleanup runs despite errors
 		time.Sleep(35 * time.Millisecond)
@@ -92,7 +93,7 @@ func TestStartCleanupLoop(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 
-		go StartCleanupLoop(ctx, 50*time.Millisecond, cleanup, "test")
+		go StartCleanupLoop(ctx, 50*time.Millisecond, cleanup, "test", nil)
 
 		// Wait less than one interval
 		time.Sleep(30 * time.Millisecond)
@@ -105,17 +106,16 @@ func TestStartCleanupLoop(t *testing.T) {
 	t.Run("panic_in_cleanup_does_not_crash_loop", func(t *testing.T) {
 		// Pin the invariant that one panicking cleanup iteration does
 		// NOT crash fred. The loop must continue running and call
-		// cleanup again on the next tick. The process-wide handler
-		// must fire with the right component name.
+		// cleanup again on the next tick. The injected onPanic handler
+		// must fire with the recovered panic value.
 		var callCount atomic.Int32
 		var handlerFired atomic.Int32
-		var handlerComponent atomic.Value
+		var handlerPanicVal atomic.Value
 
-		SetCleanupPanicHandler(func(component string, _ any) {
+		onPanic := func(r any) {
 			handlerFired.Add(1)
-			handlerComponent.Store(component)
-		})
-		defer SetCleanupPanicHandler(nil)
+			handlerPanicVal.Store(fmt.Sprint(r))
+		}
 
 		cleanup := func() error {
 			callCount.Add(1)
@@ -130,7 +130,7 @@ func TestStartCleanupLoop(t *testing.T) {
 
 		done := make(chan struct{})
 		go func() {
-			StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "unit_test")
+			StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "unit_test", onPanic)
 			close(done)
 		}()
 
@@ -147,8 +147,8 @@ func TestStartCleanupLoop(t *testing.T) {
 		}
 
 		assert.Equal(t, int32(1), handlerFired.Load(),
-			"cleanup panic handler must fire exactly once")
-		assert.Equal(t, "unit_test", handlerComponent.Load(),
-			"handler must receive the component name")
+			"onPanic must fire exactly once")
+		assert.Equal(t, "synthetic cleanup panic", handlerPanicVal.Load(),
+			"handler must receive the recovered panic value")
 	})
 }

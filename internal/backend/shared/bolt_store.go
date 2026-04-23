@@ -72,7 +72,11 @@ func openBoltStore(cfg boltStoreConfig) (*boltStore, error) {
 
 // startCleanup runs an initial cleanup and starts a background loop.
 // removeExpired is the store-specific function that deletes old entries.
-func (s *boltStore) startCleanup(label string, cleanupInterval time.Duration, removeExpired func(time.Duration) (int, error)) {
+// onPanic (may be nil) is invoked if a cleanup iteration panics; callers
+// typically inject a metrics-increment closure here. Kept as a parameter
+// rather than a package import so internal/backend/shared stays free of
+// the internal/metrics dependency.
+func (s *boltStore) startCleanup(label string, cleanupInterval time.Duration, removeExpired func(time.Duration) (int, error), onPanic util.PanicHandler) {
 	// Initial cleanup to clear stale entries from a previous run.
 	if removed, err := removeExpired(s.maxAge); err != nil {
 		slog.Warn("initial "+label+" cleanup failed", "error", err)
@@ -94,7 +98,7 @@ func (s *boltStore) startCleanup(label string, cleanupInterval time.Duration, re
 				slog.Debug("cleaned up expired "+label, "count", removed)
 			}
 			return nil
-		}, label)
+		}, label, onPanic)
 	})
 }
 

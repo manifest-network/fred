@@ -11,6 +11,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -190,7 +191,9 @@ func (t *TokenTracker) Close() error {
 // cleanupLoop periodically removes expired tokens.
 // Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
 func (t *TokenTracker) cleanupLoop(ctx context.Context) {
-	util.StartCleanupLoop(ctx, t.cleanupInterval, t.cleanup, "token")
+	util.StartCleanupLoop(ctx, t.cleanupInterval, t.cleanup, "token",
+		func(any) { metrics.CleanupPanicsTotal.WithLabelValues("token").Inc() },
+	)
 }
 
 // cleanup removes expired tokens from the database.

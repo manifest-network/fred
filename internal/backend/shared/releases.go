@@ -7,6 +7,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/util"
 )
 
 var releasesBucketName = []byte("releases")
@@ -31,6 +33,7 @@ type ReleaseStoreConfig struct {
 	DBPath          string
 	MaxAge          time.Duration
 	CleanupInterval time.Duration
+	OnCleanupPanic  util.PanicHandler // Optional: invoked on cleanup-loop panic.
 }
 
 // NewReleaseStore opens or creates a bbolt database for release persistence.
@@ -48,7 +51,7 @@ func NewReleaseStore(cfg ReleaseStoreConfig) (*ReleaseStore, error) {
 	s := &ReleaseStore{boltStore: base}
 
 	if cfg.MaxAge > 0 {
-		base.startCleanup("releases", cfg.CleanupInterval, s.RemoveOlderThan)
+		base.startCleanup("releases", cfg.CleanupInterval, s.RemoveOlderThan, cfg.OnCleanupPanic)
 	}
 
 	return s, nil
