@@ -463,6 +463,16 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 // truly wedged worker). The orphan-worker race class is eliminated
 // under that happy-path wait; pathological timeouts leave a zombie
 // worker that recoverState reconciles on next start.
+//
+// Fire-returns-nil-is-success caveat: Fire returns nil on both Permit
+// (SM transitioned) and Ignore (SM deliberately did nothing). The
+// terminated check below handles one known Ignore-returns-nil trap
+// (Deprovisioning.Ignore(evProvisionRequested) in the lifecycle race).
+// The other Ignore that returns nil — Provisioning.Ignore — is the
+// happy path for newly-created actors whose SM initializes to
+// Provisioning from prov.Status. When adding any new Ignore rule,
+// audit whether a caller of an error-checked Fire could land in the
+// Ignoring state and interpret nil-success as "SM transitioned."
 func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 	if a.terminated {
 		// Actor has already completed Deprovision but not yet been
