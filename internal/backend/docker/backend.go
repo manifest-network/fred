@@ -291,6 +291,17 @@ func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs 
 	if b.diagnosticsStore == nil {
 		return
 	}
+	// Guard against zero-value entries reaching the store: callers that
+	// build diagSnap conditionally (e.g., deprovision.go's `if p, ok :=
+	// b.provisions[leaseUUID]; ok { diagSnap = ... }`) can fall through
+	// with entry.LeaseUUID == "" if the provision entry is missing. In
+	// practice the invariants prevent this today, but guarding here
+	// matches the lease_sm.go call sites' own "if diagSnap.LeaseUUID
+	// != ''" checks and keeps an empty-key record out of the store if
+	// a future refactor weakens the invariant.
+	if entry.LeaseUUID == "" {
+		return
+	}
 	var keys map[string]string
 	if len(containerKeys) > 0 {
 		keys = containerKeys[0]
@@ -310,6 +321,10 @@ func (b *Backend) persistDiagnostics(entry shared.DiagnosticEntry, containerIDs 
 // is set from the supplied map, bypassing the re-fetch path.
 func (b *Backend) persistDiagnosticsWithLogs(entry shared.DiagnosticEntry, logs map[string]string) {
 	if b.diagnosticsStore == nil {
+		return
+	}
+	// See persistDiagnostics for rationale — skip zero-value entries.
+	if entry.LeaseUUID == "" {
 		return
 	}
 	if len(logs) > 0 {
