@@ -981,7 +981,8 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 		// desired state (the new image) was not achieved; the lease is
 		// semantically Failed until the user retries with a good image.
 		// This differs from Restart preflight, where Status stays at
-		// prevStatus because the operation's goal (a fresh containerstart with the SAME image) is independent of whether the
+		// prevStatus because the operation's goal (a fresh container
+		// start with the SAME image) is independent of whether the
 		// operator's intent-to-update was achievable.
 		return replaceResult{
 			callbackErr: "image pull failed",
