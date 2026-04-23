@@ -389,10 +389,13 @@ func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
 }
 
 // workExitWaitTimeout bounds how long Provisioning/Restarting/Updating.OnExit
-// blocks waiting for the work goroutine to finish. Must exceed the
-// goroutine's cleanup defer budget (30s container removal) plus slack for
-// Docker call cancellation to propagate.
-const workExitWaitTimeout = 45 * time.Second
+// blocks waiting for the work goroutine to finish. Must exceed the worker's
+// worst-case failure-path cleanup budget: up to 30s to capture container
+// logs plus up to 30s for container removal / rollback (the two phases run
+// sequentially in the failure defer), with additional slack for Docker
+// call cancellation to propagate. Under-budgeting here lets the actor exit
+// while work is still in flight, which can drop the terminal SM event.
+const workExitWaitTimeout = 75 * time.Second
 
 // onEnterReadyFromProvision fires when doProvision signals success. Owns
 // the Status flip, ContainerIDs/Manifest/ServiceContainers update, gauge

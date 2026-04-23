@@ -235,9 +235,10 @@ func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
 // from stopCtx, so log capture still succeeds during shutdown (the
 // whole point is diagnostic durability). Consequence: shutdown can be
 // delayed up to 30s per worker in the pathological case of a wedged
-// Docker log endpoint. This fits within the actor's workExitWaitTimeout
-// (45s) so actors still exit cleanly, but operators should be aware
-// the budget exists.
+// Docker log endpoint. Combined with the sequential 30s cleanup budget
+// that follows in the failure defer, this fits within the actor's
+// workExitWaitTimeout so actors still exit cleanly — but operators
+// should be aware the budget exists.
 func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[string]string) map[string]string {
 	if len(containerIDs) == 0 {
 		return nil
