@@ -49,6 +49,13 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	cfg.StartupVerifyDuration = 1 * time.Second
 	cfg.ReconcileInterval = 1 * time.Hour // disable during tests
 	cfg.ProvisionTimeout = 2 * time.Minute
+	// Integration tests use `sleep` as PID 1, which does not install a
+	// SIGTERM handler. Docker's default 30s grace period is pure wasted
+	// wall time per container — multiply that across 50+ integration
+	// tests and we blow the -timeout 15m budget. Shorten to 1s so Docker
+	// goes straight to SIGKILL; production default (30s in DefaultConfig)
+	// is unchanged.
+	cfg.ContainerStopTimeout = 1 * time.Second
 	// Isolate DB stores per test to avoid replaying stale callbacks from previous runs.
 	tmpDir := t.TempDir()
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
