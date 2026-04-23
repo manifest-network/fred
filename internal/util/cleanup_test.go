@@ -101,4 +101,54 @@ func TestStartCleanupLoop(t *testing.T) {
 		count := callCount.Load()
 		assert.Equal(t, int32(0), count, "cleanup called %d times before interval elapsed, want 0", count)
 	})
+
+	t.Run("panic_in_cleanup_does_not_crash_loop", func(t *testing.T) {
+		// Pin the invariant that one panicking cleanup iteration does
+		// NOT crash fred. The loop must continue running and call
+		// cleanup again on the next tick. The process-wide handler
+		// must fire with the right component name.
+		var callCount atomic.Int32
+		var handlerFired atomic.Int32
+		var handlerComponent atomic.Value
+
+		SetCleanupPanicHandler(func(component string, _ any) {
+			handlerFired.Add(1)
+			handlerComponent.Store(component)
+		})
+		defer SetCleanupPanicHandler(nil)
+
+		cleanup := func() error {
+			callCount.Add(1)
+			if callCount.Load() == 1 {
+				panic("synthetic cleanup panic")
+			}
+			return nil
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() {
+			StartCleanupLoop(ctx, 10*time.Millisecond, cleanup, "unit_test")
+			close(done)
+		}()
+
+		require.Eventually(t, func() bool {
+			return callCount.Load() >= 2
+		}, time.Second, 10*time.Millisecond,
+			"cleanup must be called again after a panicking iteration (loop must not die)")
+
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+			require.Fail(t, "StartCleanupLoop did not exit cleanly after panic recovery")
+		}
+
+		assert.Equal(t, int32(1), handlerFired.Load(),
+			"cleanup panic handler must fire exactly once")
+		assert.Equal(t, "unit_test", handlerComponent.Load(),
+			"handler must receive the component name")
+	})
 }

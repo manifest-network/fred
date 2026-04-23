@@ -25,6 +25,7 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/scheduler"
+	"github.com/manifest-network/fred/internal/util"
 	"github.com/manifest-network/fred/internal/watcher"
 )
 
@@ -114,6 +115,13 @@ func run(cmd *cobra.Command, args []string) error {
 		"chain_id", cfg.ChainID,
 		"log_level", cfg.LogLevel,
 	)
+
+	// Wire the shared util/cleanup panic handler to the metrics layer so
+	// recovered cleanup panics bump Prometheus counters. Done here in
+	// main to keep internal/util free of the metrics dependency.
+	util.SetCleanupPanicHandler(func(component string, _ any) {
+		metrics.CleanupPanicsTotal.WithLabelValues(component).Inc()
+	})
 
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())

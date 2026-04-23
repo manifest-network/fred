@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -139,8 +140,27 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 		closeOnce:     &sync.Once{},
 	}
 
-	// Start the batching writer goroutine (using WaitGroup.Go for Go 1.25+)
-	s.wg.Go(func() { s.writerLoop(ctx) })
+	// Start the batching writer goroutine (using WaitGroup.Go for Go 1.25+).
+	// Wrap with recover so a panic in writerLoop (e.g., bbolt returning
+	// a nil bucket after corruption) doesn't crash fred. On panic, cancel
+	// the store's ctx so Store/Pop/Delete callers fail fast with
+	// ctx.Err() instead of hanging forever on a now-dead writeCh reader.
+	s.wg.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("payload writer panic — closing store to keep fred alive",
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				metrics.GoroutinePanicsTotal.WithLabelValues("payload_writer").Inc()
+				// Cancel the store's ctx; subsequent Store/Pop/Delete
+				// calls observe ctx.Done() and return errors rather
+				// than blocking on the now-defunct writeCh.
+				s.cancel()
+			}
+		}()
+		s.writerLoop(ctx)
+	})
 
 	// Initialize the stored count metric based on current database state
 	metrics.PayloadStoredCount.Set(float64(s.Count()))
