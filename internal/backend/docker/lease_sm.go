@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/qmuntal/stateless"
@@ -779,8 +780,34 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 // on timeout the SM proceeds and a late sendTerminal is refused by the
 // Deprovisioning.Ignore backstop.
 func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *ContainerInfo) {
+	terminalSent := false
+	defer func() {
+		if r := recover(); r != nil {
+			a.backend.logger.Error("diag worker panic — recovering to keep fred alive",
+				"lease_uuid", a.leaseUUID,
+				"container_id", shortID(containerID),
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			leaseWorkerPanicsTotal.WithLabelValues("diag").Inc()
+			if !terminalSent {
+				// Drive Failing→Failed with empty diag so the SM isn't
+				// wedged in Failing waiting for a terminal that won't
+				// otherwise arrive.
+				if !a.sendTerminal(diagGatheredMsg{
+					result: diagResult{containerID: containerID, info: info, diag: ""},
+				}) {
+					leaseTerminalEventDroppedTotal.WithLabelValues("diag_panic").Inc()
+				}
+			}
+		}
+	}()
 	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
 	if ctx.Err() != nil {
+		// Cancelled (Deprovision preempt / shutdown). Skip the terminal
+		// event so Deprovisioning.Ignore doesn't need to fire — and
+		// flip terminalSent so the recover doesn't send either.
+		terminalSent = true
 		return
 	}
 	if !a.sendTerminal(diagGatheredMsg{
@@ -791,4 +818,5 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 			"lease_uuid", a.leaseUUID,
 		)
 	}
+	terminalSent = true
 }

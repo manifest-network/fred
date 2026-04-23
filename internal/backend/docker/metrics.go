@@ -247,6 +247,20 @@ var (
 		Name:      "lease_failing_race_skipped_total",
 		Help:      "onEnterFailing bails due to concurrent Restart/Update flipping prov.Status off Ready",
 	})
+
+	// leaseWorkerPanicsTotal counts panics recovered in lease worker
+	// goroutines (provision, replace, diag), labeled by worker type.
+	// Workers are Docker-interaction code that is NOT expected to panic;
+	// any non-zero value indicates a latent bug. The recover keeps the
+	// process alive and drives the SM to a terminal Failed state so the
+	// lease doesn't wedge — but the real fix is always to eliminate the
+	// panic at its source.
+	leaseWorkerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_worker_panics_total",
+		Help:      "Panics recovered in lease worker goroutines, by worker type",
+	}, []string{"worker_type"})
 )
 
 // updateResourceMetrics updates the resource allocation ratio gauges.

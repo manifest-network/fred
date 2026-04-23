@@ -181,6 +181,13 @@ const (
 	// errMsgContainerExited is the base error message for containers that
 	// exit unexpectedly, used by recoverState and failure callbacks.
 	errMsgContainerExited = "container exited unexpectedly"
+
+	// errMsgInternal is the hardcoded on-chain-safe callback message used
+	// when a worker goroutine panics. Full diagnostics (panic value,
+	// stack) go to provision.LastError and the structured log; the
+	// callback message itself stays generic so we don't leak internals
+	// on-chain.
+	errMsgInternal = "internal error"
 )
 
 // containerFailureDiagnostics builds a diagnostic string from a failed

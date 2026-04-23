@@ -1113,3 +1113,132 @@ func TestOnEnterFailing_RaceWithConcurrentStatusFlip(t *testing.T) {
 	assert.Equal(t, skippedBefore+1, skippedAfter,
 		"leaseFailingRaceSkippedTotal must increment by exactly 1")
 }
+
+// TestSpawnProvisionWorker_PanicRecovery pins the invariant that a
+// panic in the provision worker does NOT crash fred: the recover logs
+// the panic with stack, bumps lease_worker_panics_total{worker_type=
+// "provision"}, drives the SM to Failed, and lets the actor keep
+// serving other messages. Without this recovery an unrecovered panic
+// would take down the entire fred binary (Go's panic semantics).
+func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Tenant:    "tenant-a",
+			Status:    backend.ProvisionStatusProvisioning,
+		},
+	})
+	defer b.stopCancel()
+
+	actor := b.actorFor("lease-1")
+	panicsBefore := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("provision"))
+
+	// Inject a worker that panics instead of doing real work. The
+	// recover must catch the panic, bump the metric, and fire a
+	// provisionErrored terminal so the SM transitions to Failed.
+	actor.spawnProvisionWorker(func() (string, provisionSuccessResult, map[string]string, error) {
+		panic("synthetic provision panic")
+	})
+
+	// SM must reach Failed within a short window — proves the recover
+	// fired the terminal event and the actor processed it.
+	require.Eventually(t, func() bool {
+		return actor.sm.State() == backend.ProvisionStatusFailed
+	}, 2*time.Second, 10*time.Millisecond,
+		"SM must transition to Failed after worker panic recovery")
+
+	panicsAfter := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("provision"))
+	assert.Equal(t, panicsBefore+1, panicsAfter,
+		"lease_worker_panics_total{worker_type=provision} must increment by 1")
+
+	// Actor is still alive and responsive — send a container-death
+	// event and verify it gets handled (the run loop didn't die).
+	done := make(chan struct{})
+	require.True(t, actor.send(containerDiedMsg{containerID: "nonexistent", done: done}))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor stopped processing after worker panic — fred would have crashed")
+	}
+}
+
+// TestSpawnReplaceWorker_PanicRecovery: same invariant for the
+// restart/update worker path.
+func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Tenant:    "tenant-a",
+			Status:    backend.ProvisionStatusRestarting,
+		},
+	})
+	defer b.stopCancel()
+
+	actor := b.actorFor("lease-1")
+	panicsBefore := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("replace"))
+
+	actor.spawnReplaceWorker(func() replaceResult {
+		panic("synthetic replace panic")
+	})
+
+	require.Eventually(t, func() bool {
+		return actor.sm.State() == backend.ProvisionStatusFailed
+	}, 2*time.Second, 10*time.Millisecond,
+		"SM must transition to Failed after replace worker panic recovery")
+
+	panicsAfter := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("replace"))
+	assert.Equal(t, panicsBefore+1, panicsAfter,
+		"lease_worker_panics_total{worker_type=replace} must increment by 1")
+
+	done := make(chan struct{})
+	require.True(t, actor.send(containerDiedMsg{containerID: "nonexistent", done: done}))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor stopped processing after replace worker panic")
+	}
+}
+
+// TestGatherDiagAsync_PanicRecovery: the diag worker (spawned from
+// Failing.OnEntry) must also recover. A panic in containerFailureDiagnostics
+// used to crash fred; now it bumps the metric and drives Failing→Failed
+// with empty diag so the lease isn't wedged in Failing.
+func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
+			panic("synthetic diag panic")
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusFailing,
+			ContainerIDs: []string{"c1"},
+		},
+	})
+	defer b.stopCancel()
+
+	actor := b.actorFor("lease-1")
+	panicsBefore := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("diag"))
+
+	// Drive Failing.OnEntry by invoking gatherDiagAsync directly with a
+	// cancellable context matching what onEnterFailing would set up.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actor.workers.Add()
+	go func() {
+		defer actor.workers.Done()
+		actor.gatherDiagAsync(ctx, "c1", &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1})
+	}()
+
+	// SM must reach Failed once the panic recovery fires diagGatheredMsg.
+	require.Eventually(t, func() bool {
+		return actor.sm.State() == backend.ProvisionStatusFailed
+	}, 2*time.Second, 10*time.Millisecond,
+		"SM must transition Failing→Failed after diag worker panic recovery")
+
+	panicsAfter := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("diag"))
+	assert.Equal(t, panicsBefore+1, panicsAfter,
+		"lease_worker_panics_total{worker_type=diag} must increment by 1")
+}

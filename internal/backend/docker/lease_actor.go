@@ -422,7 +422,34 @@ func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessResult, map[string]string, error)) {
 	a.workers.Add()
 	a.backend.wg.Go(func() {
+		// terminalSent guards the panic recover from double-firing a
+		// terminal event after the normal path has already sent one.
+		terminalSent := false
+		// Outermost defer: releases the workers barrier regardless of
+		// panic / early return. Must run AFTER the panic recover (below)
+		// so the recover's sendTerminal has an open inbox to write to.
 		defer a.workers.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				a.backend.logger.Error("provision worker panic — recovering to keep fred alive",
+					"lease_uuid", a.leaseUUID,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				leaseWorkerPanicsTotal.WithLabelValues("provision").Inc()
+				if !terminalSent {
+					// Drive the SM to Failed so the lease doesn't wedge
+					// in Provisioning forever waiting for a terminal
+					// event we'll never otherwise send.
+					if !a.sendTerminal(provisionErroredMsg{
+						callbackErr: errMsgInternal,
+						lastError:   fmt.Sprintf("worker panic: %v", r),
+					}) {
+						leaseTerminalEventDroppedTotal.WithLabelValues("provision_panic").Inc()
+					}
+				}
+			}
+		}()
 		callbackErr, result, failureLogs, err := work()
 		if err == nil {
 			// Pre-publish so a concurrent Deprovision-preempt reading
@@ -447,6 +474,7 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 			event = "provision_completed"
 			ok = a.sendTerminal(provisionCompletedMsg{result: result})
 		}
+		terminalSent = true
 		if !ok {
 			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
 			a.backend.logger.Warn("terminal provision event dropped (actor exited or inbox wedged)",
@@ -496,7 +524,27 @@ func (a *leaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 	a.workers.Add()
 	a.backend.wg.Go(func() {
+		terminalSent := false
 		defer a.workers.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				a.backend.logger.Error("replace worker panic — recovering to keep fred alive",
+					"lease_uuid", a.leaseUUID,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				leaseWorkerPanicsTotal.WithLabelValues("replace").Inc()
+				if !terminalSent {
+					// Drive the SM to Failed; operator/reconciler can retry.
+					if !a.sendTerminal(replaceFailedMsg{info: replaceFailureInfo{
+						callbackErr: errMsgInternal,
+						lastError:   fmt.Sprintf("worker panic: %v", r),
+					}}) {
+						leaseTerminalEventDroppedTotal.WithLabelValues("replace_panic").Inc()
+					}
+				}
+			}
+		}()
 		result := work()
 		if result.err == nil {
 			a.backend.provisionsMu.Lock()
@@ -521,6 +569,7 @@ func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 			event = "replace_failed"
 			ok = a.sendTerminal(replaceFailedMsg{info: result.failure})
 		}
+		terminalSent = true
 		if !ok {
 			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
 			a.backend.logger.Warn("terminal replace event dropped (actor exited or inbox wedged)",
