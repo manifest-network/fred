@@ -140,8 +140,9 @@ go test -v -run "StressTest|SustainedLoad|HighConcurrency|Latency" ./internal/pr
 # Run specific stress test
 go test -v -run TestManager_StressTest_100K ./internal/provisioner/ -timeout 5m
 
-# Run 1M event test
-go test -v -run TestManager_StressTest_1M ./internal/provisioner/ -timeout 15m
+# Run 500K / 1M event tests (gated by STRESS_TEST_LARGE=1; otherwise t.Skip)
+STRESS_TEST_LARGE=1 go test -v -run TestManager_StressTest_500K ./internal/provisioner/ -timeout 10m
+STRESS_TEST_LARGE=1 go test -v -run TestManager_StressTest_1M   ./internal/provisioner/ -timeout 15m
 ```
 
 ### Watermill Benchmarks
@@ -162,8 +163,8 @@ go test -bench=. ./internal/provisioner/payload/ -run=^$ -bench=PayloadStore
 
 | File | Description |
 |------|-------------|
-| `internal/provisioner/manager_bench_test.go` | Watermill and Manager benchmarks |
-| `internal/provisioner/manager_stress_test.go` | Stress tests (10K-1M events) |
+| `internal/provisioner/manager_bench_test.go` | Watermill pub/sub benchmarks |
+| `internal/provisioner/manager_stress_test.go` | Stress tests (10K-1M events) and `BenchmarkManager_EndToEnd` |
 | `internal/provisioner/payload/store_bench_test.go` | PayloadStore benchmarks |
 | `internal/api/token_tracker_bench_test.go` | Token tracker benchmarks |
 | `internal/backend/router_bench_test.go` | Backend router benchmarks |

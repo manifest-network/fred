@@ -246,7 +246,7 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 			return result, nil
 		}
 
-		// Legacy logs: key by instance index ("0", "1", ...).
+		// Non-stack logs: key by instance index ("0", "1", ...).
 		result := make(map[string]string, len(containerIDs))
 		for i, containerID := range containerIDs {
 			logs, err := b.docker.ContainerLogs(ctx, containerID, tail)

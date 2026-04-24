@@ -149,7 +149,10 @@ func CreateSignBytes(message []byte, signer string) []byte {
 		Sequence: "0",
 	}
 
-	// JSON serialize - Go's json.Marshal produces sorted keys for structs
+	// Canonical output depends on SignDoc field declaration order matching the
+	// ADR-036 spec (alphabetical). Go's json.Marshal emits struct fields in
+	// declaration order, not sorted — reordering fields here would silently
+	// break wallet verification.
 	signBytes, err := json.Marshal(signDoc)
 	if err != nil {
 		return nil

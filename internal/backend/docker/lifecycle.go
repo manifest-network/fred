@@ -67,7 +67,7 @@ type ContainerInfo struct {
 	Tenant        string
 	ProviderUUID  string
 	SKU           string
-	ServiceName   string // Stack service name (empty for legacy single-container leases)
+	ServiceName   string // Stack service name (empty for single-container leases)
 	InstanceIndex int
 	FailCount     int
 	CallbackURL   string
@@ -784,7 +784,7 @@ type CreateContainerParams struct {
 	Tenant        string
 	ProviderUUID  string
 	SKU           string
-	ServiceName   string // Stack service name (empty for legacy)
+	ServiceName   string // Stack service name (empty for single-container leases)
 	Manifest      *DockerManifest
 	Profile       SKUProfile
 	InstanceIndex int // For multi-unit leases (0-based index)
@@ -1034,7 +1034,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		}
 	}
 
-	// Generate container name: stack uses service name, legacy uses instance index only.
+	// Generate container name: stack uses service name, single-container uses instance index only.
 	var containerName string
 	if params.ServiceName != "" {
 		containerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, params.ServiceName, params.InstanceIndex)
@@ -1268,8 +1268,9 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 
 // waitForContainerGone polls ContainerInspect until the container is no
 // longer found, the parent context is canceled, or containerRemovalPollTimeout
-// elapses. Returns nil once Docker reports NotFound. A derived context bounds
-// each inspect so a hung Docker API can't stretch the wait past our limit.
+// elapses. Returns nil once Docker reports NotFound. A single derived
+// context bounds the entire wait loop (every inspect shares it) so a hung
+// Docker API can't stretch the wait past our limit.
 // Non-NotFound inspect errors (transient daemon/API issues) don't abort the
 // poll — the daemon may recover within the window — but the most recent one
 // is surfaced in the timeout error. On timeout we say "not confirmed removed"
@@ -1651,7 +1652,7 @@ const (
 )
 
 // ContainerEvents subscribes to Docker container lifecycle events, filtering
-// for "die" events on containers managed by fred (label managed-by=fred).
+// for "die" events on containers managed by fred (label fred.managed=true).
 // Returns a channel of ContainerEvent and a channel of errors. Both channels
 // are closed when the context is canceled or the Docker event stream closes.
 func (d *DockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error) {

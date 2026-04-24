@@ -37,10 +37,10 @@ type ChainClient interface {
 
 // tenantState tracks a tenant's balance history for burn rate calculation.
 //
-// Note: The current implementation assumes a single denomination for credit.
-// While the data structures support multiple denoms, the burn rate calculation
-// treats each denom independently and finds the earliest depletion time.
-// Multi-denom support with proportional burn rates is not implemented.
+// Note: Multi-denom credit is supported by computing a per-denom burn rate
+// and taking the earliest depletion time across denoms. Proportional burn
+// rates (e.g. fixed ratios across denominations under load) are not modeled —
+// each denom is treated as draining independently.
 type tenantState struct {
 	lastBalance     sdktypes.Coins
 	lastCheckTime   time.Time

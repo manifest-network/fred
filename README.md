@@ -202,12 +202,17 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `chain_id` | Chain identifier | `manifest-1` |
 | `grpc_endpoint` | Chain gRPC endpoint | `localhost:9090` |
 | `websocket_url` | CometBFT WebSocket URL | `ws://localhost:26657/websocket` |
+| `grpc_tls_enabled` | Enable TLS for gRPC to the chain | `false` |
+| `grpc_tls_ca_file` | Custom CA certificate file for gRPC TLS | `""` (system CAs) |
+| `grpc_tls_skip_verify` | Skip gRPC TLS certificate verification (development only) | `false` |
 | `provider_uuid` | Your registered provider UUID | (required) |
 | `provider_address` | Provider management address | (required) |
 | `keyring_backend` | Keyring backend (file, os, test) | `file` |
 | `keyring_dir` | Directory containing keyring | (required) |
 | `key_name` | Key name for signing transactions | (required) |
 | `api_listen_addr` | API server listen address | `:8080` |
+| `tls_cert_file` | TLS certificate file (PEM). Must be set with `tls_key_file` or neither. | `""` |
+| `tls_key_file` | TLS private key file (PEM). | `""` |
 | `withdraw_interval` | How often to withdraw funds | `1h` |
 | `bech32_prefix` | Address prefix for validation | `manifest` |
 | `rate_limit_rps` | Global API rate limit (requests/second) | `10` |
@@ -215,6 +220,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `tenant_rate_limit_rps` | Per-tenant rate limit (requests/second) | `5` |
 | `tenant_rate_limit_burst` | Per-tenant burst size | `10` |
 | `trusted_proxies` | CIDR blocks of trusted proxies for X-Forwarded-For | `[]` |
+| `cors_origins` | Allowed CORS origins for browser clients. `["*"]` allows all; `[]` disables CORS. | `["*"]` |
 | `backends` | List of backend configurations | (required) |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
 | `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
@@ -243,8 +249,14 @@ These options have sensible defaults but can be tuned for specific environments:
 | `query_page_limit` | Page size for chain queries | `100` |
 | `max_withdraw_iterations` | Max iterations for withdrawal batching | `100` |
 | `gas_limit` | Gas limit for transactions | `1500000` |
-| `gas_price` | Gas price (in smallest denom) | `25` |
+| `gas_adjustment` | Multiplier applied to `gas_limit` at sign time. Matches the Cosmos CLI flag. Range: 1.0–3.0. | `1.2` |
+| `max_gas_limit` | Caps gas during out-of-gas retries (1.5× per retry, compounding). `0` = uncapped. Must be ≥ `gas_limit` when set. | `0` |
+| `gas_price` | Gas price (micro-units of `fee_denom` per gas unit; fee = ceil(gas_limit × gas_price / 1_000_000)) | `25` |
 | `fee_denom` | Fee denomination | `umfx` |
+| `sub_signer_count` | Number of authz sub-signers for parallel tx signing. `0` = single-signer mode. | `0` |
+| `sub_signer_min_balance` | Minimum balance before a sub-signer is topped up. | `10000000umfx` |
+| `sub_signer_top_up_amount` | Amount transferred per top-up. | `50000000umfx` |
+| `sub_signer_fund_check_interval` | How often balances are checked. | `1h` |
 | `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |
 | `credit_check_retry_interval` | Retry interval after credit check errors | `30s` |
 | `shutdown_timeout` | Maximum time for graceful shutdown (drain + cleanup) | `30s` |
@@ -300,6 +312,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 |--------|------|------|-------|
 | `GET` | `/health` | None | Chain connectivity, backend health, DB health |
 | `GET` | `/metrics` | None | Prometheus metrics |
+| `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Used by the manifest-admin SPA. |
 | `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
 
 See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
@@ -669,7 +682,7 @@ Called by backends to report provisioning status. Requires HMAC-SHA256 authentic
 }
 ```
 
-Status must be either `"success"` or `"failed"`.
+Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third is used by backends that perform autonomous deprovisioning, e.g. after a failed provision rollback).
 
 **Response Codes:**
 - `200 OK` - Callback processed successfully (or already processed)
@@ -1065,7 +1078,7 @@ cmd/
 ├── providerd/          # Main daemon entry point
 ├── mock-backend/       # Mock backend for testing
 ├── docker-backend/     # Docker container backend
-└── loadtest/           # Load testing tool
+└── loadtest/           # Load testing tool (not built by `make all`; `go build ./cmd/loadtest`)
 
 internal/
 ├── adr036/             # ADR-036 signature verification
@@ -1076,8 +1089,10 @@ internal/
 │   ├── client.go       # HTTP client for backends (with circuit breaker)
 │   ├── router.go       # SKU-based routing
 │   ├── mock.go         # In-memory mock for unit tests
-│   └── docker/         # Docker container backend implementation
+│   ├── shared/         # Cross-backend primitives (callback sender, bbolt store, registry, diagnostics)
+│   └── docker/         # Docker container backend implementation (actor-per-lease)
 ├── chain/              # gRPC client, WebSocket subscriber, signer
+│   └── chaintest/      # Test-only mock chain client (not imported by providerd)
 ├── config/             # Configuration loading and validation
 ├── metrics/            # Prometheus metrics definitions
 ├── provisioner/        # Provision lifecycle management
@@ -1086,8 +1101,8 @@ internal/
 │   ├── handlers.go     # Shared handler logic and lease item extraction
 │   ├── handler_set.go  # Watermill message handlers
 │   ├── reconciler.go   # Level-triggered state reconciliation
-│   ├── tracker.go      # InFlightTracker interface definitions
-│   ├── inflight.go     # In-flight tracking implementation
+│   ├── tracker.go      # InFlightTracker interface + DefaultInFlightTracker implementation
+│   ├── inflight.go     # Manager delegation methods to the tracker
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
 │   ├── payload/        # Temporary payload storage (bbolt)

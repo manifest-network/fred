@@ -3,7 +3,6 @@ package watcher
 import (
 	"context"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -35,96 +34,6 @@ func TestNew(t *testing.T) {
 	require.NotNil(t, w, "New() returned nil")
 	assert.Equal(t, providerUUID, w.providerUUID)
 	assert.NotNil(t, w.tenantLeaseCounts, "tenantLeaseCounts map is nil")
-}
-
-func TestAddActiveTenant(t *testing.T) {
-	w := &Watcher{
-		tenantLeaseCounts: make(map[string]int),
-	}
-
-	tenant := "manifest1abc"
-	w.addActiveTenant(tenant)
-
-	w.mu.Lock()
-	count := w.tenantLeaseCounts[tenant]
-	w.mu.Unlock()
-
-	assert.Equal(t, 1, count, "addActiveTenant() count mismatch")
-
-	// Add same tenant again - count should increment
-	w.addActiveTenant(tenant)
-
-	w.mu.Lock()
-	count = w.tenantLeaseCounts[tenant]
-	w.mu.Unlock()
-
-	assert.Equal(t, 2, count, "addActiveTenant() second call count mismatch")
-}
-
-func TestAddActiveTenant_Empty(t *testing.T) {
-	w := &Watcher{
-		tenantLeaseCounts: make(map[string]int),
-	}
-
-	// Empty tenant should be ignored
-	w.addActiveTenant("")
-
-	w.mu.Lock()
-	count := len(w.tenantLeaseCounts)
-	w.mu.Unlock()
-
-	assert.Equal(t, 0, count, "addActiveTenant(\"\") should not add empty tenant")
-}
-
-func TestAddActiveTenant_ThreadSafe(t *testing.T) {
-	w := &Watcher{
-		tenantLeaseCounts: make(map[string]int),
-	}
-
-	var wg sync.WaitGroup
-	tenants := []string{
-		"manifest1tenant1",
-		"manifest1tenant2",
-		"manifest1tenant3",
-	}
-
-	for _, tenant := range tenants {
-		wg.Go(func() {
-			w.addActiveTenant(tenant)
-		})
-	}
-
-	wg.Wait()
-
-	w.mu.Lock()
-	count := len(w.tenantLeaseCounts)
-	w.mu.Unlock()
-
-	assert.Equal(t, len(tenants), count)
-}
-
-func TestHandleEvent_LeaseAcknowledged(t *testing.T) {
-	providerUUID := testutil.ValidUUID1
-	w := &Watcher{
-		providerUUID:      providerUUID,
-		tenantLeaseCounts: make(map[string]int),
-	}
-
-	tenant := "manifest1tenant"
-	event := chain.LeaseEvent{
-		Type:         chain.LeaseAcknowledged,
-		LeaseUUID:    testutil.ValidUUID2,
-		Tenant:       tenant,
-		ProviderUUID: providerUUID, // Our provider
-	}
-
-	w.handleEvent(event)
-
-	w.mu.Lock()
-	count := w.tenantLeaseCounts[tenant]
-	w.mu.Unlock()
-
-	assert.Equal(t, 1, count)
 }
 
 func TestHandleEvent_LeaseAutoClosed_CrossProvider(t *testing.T) {
@@ -239,6 +148,7 @@ func TestHandleEvent_UnhandledEventTypes(t *testing.T) {
 	// These event types should be silently ignored (no panic)
 	eventTypes := []chain.LeaseEventType{
 		chain.LeaseCreated,
+		chain.LeaseAcknowledged,
 		chain.LeaseRejected,
 	}
 
@@ -253,27 +163,17 @@ func TestHandleEvent_UnhandledEventTypes(t *testing.T) {
 }
 
 func TestRemoveActiveTenant(t *testing.T) {
-	w := &Watcher{
-		tenantLeaseCounts: make(map[string]int),
-	}
-
 	tenant := "manifest1abc"
 
-	// Add tenant with 2 leases
-	w.addActiveTenant(tenant)
-	w.addActiveTenant(tenant)
-
-	w.mu.Lock()
-	count := w.tenantLeaseCounts[tenant]
-	w.mu.Unlock()
-
-	assert.Equal(t, 2, count, "initial count mismatch")
+	w := &Watcher{
+		tenantLeaseCounts: map[string]int{tenant: 2},
+	}
 
 	// Remove one lease
 	w.removeActiveTenant(tenant)
 
 	w.mu.Lock()
-	count = w.tenantLeaseCounts[tenant]
+	count := w.tenantLeaseCounts[tenant]
 	w.mu.Unlock()
 
 	assert.Equal(t, 1, count, "after first remove count mismatch")

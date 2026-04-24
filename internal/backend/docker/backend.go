@@ -140,7 +140,7 @@ type provision struct {
 	SKU                   string
 	ContainerIDs          []string // Multiple containers for multi-unit leases
 	Image                 string
-	Manifest              *DockerManifest // Stored for restart/update operations (legacy)
+	Manifest              *DockerManifest // Single-manifest leases (mutually exclusive with StackManifest); persisted for restart/update.
 	Status                backend.ProvisionStatus
 	Quantity              int // Expected number of containers
 	CreatedAt             time.Time

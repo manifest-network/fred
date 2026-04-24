@@ -465,17 +465,25 @@ tx_poll_interval: "500ms"
 # If exceeded, the transaction is considered failed (may still confirm later).
 tx_timeout: "30s"
 
-# Gas limit for transactions.
-# Higher values allow more complex transactions but cost more on failure.
-# On out-of-gas errors, Fred automatically retries with 1.5x gas (compounding per retry).
+# Gas limit for transactions. This is the static estimate before gas_adjustment
+# is applied at sign time; the actual gas signed for is
+# floor(gas_limit * gas_adjustment) (truncation, not ceiling). On out-of-gas
+# errors at broadcast time, Fred additionally retries with 1.5x of the previous
+# attempt's gas (compounding), bounded by max_gas_limit if set.
 gas_limit: 1500000
+
+# Multiplier applied to gas_limit at sign time (matches the --gas-adjustment
+# CLI flag pattern from Cosmos SDK tooling). Provides headroom above the
+# static estimate and reduces out-of-gas retries in practice. Range: 1.0–3.0.
+# Default: 1.2.
+gas_adjustment: 1.2
 
 # Maximum gas limit for out-of-gas retries. Set to 0 for no cap.
 # If set, must be >= gas_limit. Prevents runaway gas costs during retries.
 # max_gas_limit: 5000000
 
 # Gas price in micro-units of the fee denomination per gas unit.
-# Total fee = gas_limit * gas_price / 1_000_000. Higher prices = faster inclusion.
+# Total fee = ceil(gas_limit * gas_price / 1_000_000). Higher prices = faster inclusion.
 gas_price: 25
 
 # Fee denomination for transaction fees.

@@ -220,7 +220,8 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		case backend.CallbackStatusFailed:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
 		case backend.CallbackStatusDeprovisioned:
-			// No lease event: backend has already torn down the lease.
+			// No lease event, no chain action: the backend tore down a lease
+			// that was not in-flight here. Chain state is unchanged.
 		default:
 			slog.Warn("unexpected callback status for non-in-flight lease",
 				"lease_uuid", callback.LeaseUUID,
@@ -288,7 +289,9 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		// Payload is intentionally NOT deleted here. The lease is now ACTIVE
 		// but the container could crash later, requiring re-provisioning with
 		// the same manifest. Payload cleanup happens when the lease is closed
-		// (HandleLeaseClosed) or rejected (failure callback above).
+		// (HandleLeaseClosed) or when the PENDING-failure path below rejects
+		// the lease and deletes the payload. ACTIVE re-provision failures
+		// also keep the payload — the reconciler may retry from it.
 
 		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
 
@@ -451,10 +454,12 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	}
 
 	// Get the payload from the store WITHOUT removing it yet.
-	// We only delete after Provision() succeeds to allow retries.
-	// Note: Payload is NOT deleted here. It will be deleted by HandleBackendCallback
-	// after the backend reports success or failure. This ensures the payload remains
-	// available for retry if the backend fails or crashes before sending a callback.
+	// Payload deletion happens later: when the lease is closed
+	// (HandleLeaseClosed) or when a PENDING-failure callback rejects the
+	// lease. Successful and ACTIVE-re-provision-failure paths intentionally
+	// keep the payload so a subsequent re-provision can reuse the same
+	// manifest. This also ensures the payload remains available for retry
+	// if the backend fails or crashes before sending a callback.
 	payloadData, err := h.deps.PayloadStore.Get(event.LeaseUUID)
 	if err != nil {
 		slog.Error("failed to read payload from store",

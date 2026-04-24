@@ -166,8 +166,8 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	return nil
 }
 
-// (fireReplaceOutcome was moved into leaseActor.spawnReplaceWorker so the
-// worker goroutine is owned by the actor via workers barrier — see lease_actor.go.)
+// (Outcome dispatch lives in leaseActor.spawnReplaceWorker so the worker
+// goroutine is owned by the actor via workers barrier — see lease_actor.go.)
 
 // doRestart performs the actual container restart asynchronously.
 func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
@@ -305,9 +305,10 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 				callbackErr += "; rollback failed"
 			}
 
-			// Stack rollback: oldStopped is effectively true (compose down
-			// stopped everything), so the LastError-clear-on-restart rule
-			// matches the single-manifest doReplaceContainers semantics.
+			// Stack rollback: oldStopped is effectively true — compose.Up
+			// with ForceRecreate replaces every container in the project, so
+			// the LastError-clear-on-restart rule matches the single-manifest
+			// doReplaceContainers semantics.
 			resultRet = replaceResult{
 				callbackErr: callbackErr,
 				err:         err,
@@ -568,15 +569,19 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *sl
 // create and start new → verify startup.
 // Old containers are kept stopped for rollback on failure.
 //
-// Returns (callbackErr, err, successResult, failureInfo):
-//   - err == nil: success. successResult carries containerIDs + OnSuccess
-//     for the SM's Ready entry action to apply.
-//   - err != nil: failure. failureInfo carries prevStatus, operation,
-//     oldStopped, and the callbackErr/lastError strings. The goroutine
-//     wrapper reads `restored` (also in the returns) to decide between
-//     firing evReplaceRecovered (Status→Ready) or evReplaceFailed
-//     (Status→Failed); the corresponding entry action applies the
-//     mutations.
+// Returns a replaceResult (see lease_sm.go) carrying:
+//   - err: non-nil on failure
+//   - callbackErr: hardcoded on-chain-safe error string (failure path)
+//   - restored: true if rollback succeeded (only meaningful when err != nil)
+//   - success: containerIDs + OnSuccess populated when err == nil; the SM's
+//     Ready entry action applies them
+//   - failure: prevStatus, operation, oldStopped, callbackErr, lastError
+//     populated when err != nil
+//
+// The goroutine wrapper picks the SM event from (err == nil, restored):
+//   - err == nil               → evReplaceCompleted (Status → Ready)
+//   - err != nil && restored   → evReplaceRecovered (Status → Ready, Failed callback)
+//   - err != nil && !restored  → evReplaceFailed    (Status → Failed)
 //
 // All provision-struct mutations (Status, FailCount, LastError,
 // ContainerIDs, OnSuccess) and the persistDiagnostics call live in
@@ -912,7 +917,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return nil
 	}
 
-	// Legacy single-manifest path.
+	// Single-manifest path.
 	if imgErr := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); imgErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrValidation, imgErr)

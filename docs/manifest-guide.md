@@ -115,6 +115,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `host_port` | integer | No | `0` | Fixed host port (0 = auto-assign). Range: 0–65535. |
+| `ingress` | boolean | No | `false` | Mark this port as the preferred ingress route. TCP only; at most one port per manifest may set this. Overrides the default `80 > 8080 > lowest TCP` preference. |
 
 ### HealthCheckConfig Fields
 
@@ -250,7 +251,7 @@ Rules:
 
 ### Tmpfs Mounts
 
-Containers run with a read-only root filesystem. `/tmp` and `/run` are mounted as tmpfs automatically. Use the `tmpfs` field for additional writable directories.
+Containers run with a read-only root filesystem by default (operator-configurable via the docker-backend `container_readonly_rootfs` setting). `/tmp` and `/run` are mounted as tmpfs automatically. Use the `tmpfs` field for additional writable directories.
 
 **Rules:**
 - Maximum **4** additional mounts.

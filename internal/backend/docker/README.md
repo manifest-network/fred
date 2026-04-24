@@ -94,7 +94,7 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | ImagePullTimeout | `image_pull_timeout` | duration | `5m` | Timeout for pulling images |
 | ContainerCreateTimeout | `container_create_timeout` | duration | `30s` | Timeout for creating containers |
 | ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers |
-| ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation. Setting to `0` uses the default (10m) via `cmp.Or` |
+| ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation. Validated as positive — must be `> 0`. |
 | ReconcileInterval | `reconcile_interval` | duration | `5m` | How often to reconcile state with Docker |
 | StartupVerifyDuration | `startup_verify_duration` | duration | `5s` | Grace period after start before verifying containers are still running |
 | ContainerStopTimeout | `container_stop_timeout` | duration | `30s` | Grace period before SIGKILL when stopping containers |
@@ -152,7 +152,7 @@ When any SKU profile has `disk_mb > 0`, the backend manages quota-enforced host 
 | `> 0` (stateful) | Quota-enforced host directory created per container | Bind-mounted from host directory |
 | `0` (ephemeral) | No host directory | Overridden with tmpfs (prevents anonymous volumes) |
 
-All containers always have a readonly root filesystem. Stateful containers write to bind-mounted volumes; ephemeral containers write to tmpfs.
+All containers have a readonly root filesystem by default (configurable via `container_readonly_rootfs`). Stateful containers write to bind-mounted volumes; ephemeral containers write to tmpfs.
 
 **Example stateful SKU:**
 

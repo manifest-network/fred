@@ -40,7 +40,7 @@
 // The PayloadStore provides temporary storage for tenant deployment payloads:
 //   - Stores payloads uploaded via API until provisioning starts
 //   - Uses write batching for efficiency under load
-//   - Automatic TTL-based cleanup
+//   - Reconciler-driven cleanup when leases are no longer active
 //   - Survives restarts (persistent bbolt storage)
 //
 // # Crash Recovery

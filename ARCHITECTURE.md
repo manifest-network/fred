@@ -147,7 +147,7 @@ Manager (coordinator)
 ├── ChainClient          interface → chain.Client (backed by SignerPool)
 │   └── SignerPool       primary + N sub-signers for authz parallel signing
 ├── BackendRouter        interface → *backend.Router (passed to Orchestrator)
-├── InFlightTracker      interface → inFlightMap (sync.RWMutex-protected map)
+├── InFlightTracker      interface → DefaultInFlightTracker (sync.RWMutex-protected map)
 ├── PlacementStore       interface → placement.Store (bbolt + cache, optional)
 ├── Orchestrator         struct    → uses BackendRouter + InFlightTracker + PlacementStore
 ├── HandlerSet           struct    → uses Orchestrator + Tracker + AckBatcher
@@ -354,6 +354,90 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
 - `ErrInsufficientResources` (HTTP 503 from Provision) — backend at capacity, not unhealthy
 
 This ensures that expected business conditions don't trip the circuit breaker and block backend operations.
+
+### Lease Actor Model (Docker backend)
+
+The Docker backend replaces lock-heavy mutation of shared provision state with a **single-writer actor per lease**. Each active lease owns a dedicated goroutine — a `leaseActor` — that serializes all state-mutating operations for that lease. This is the central concurrency primitive of the Docker backend.
+
+**Structure:**
+
+```go
+type leaseActor struct {
+    leaseUUID string
+    sm        *leaseSM                 // stateless.StateMachine wrapper
+    inbox     chan leaseMessage        // buffered — caller enqueues, actor dequeues
+    ...
+}
+
+type leaseMessage interface {
+    isLeaseMessage()
+    doneChan() chan struct{}          // closed after message is processed
+    onPanic(err error)                 // unblocks caller if a handler panics
+}
+```
+
+Messages are value types. The full set: `containerDiedMsg`, `deprovisionMsg`, `diagGatheredMsg`, `provisionRequestedMsg`, `provisionCompletedMsg`, `provisionErroredMsg`, `restartRequestedMsg`, `updateRequestedMsg`, `replaceCompletedMsg`, `replaceRecoveredMsg`, `replaceFailedMsg`. Each implements `leaseMessage`.
+
+Synchronous callers signal back through one of two channels:
+- **`reply chan error`** (deprovisionMsg only) — receives the operation outcome.
+- **`ack chan error`** (provisionRequested / restartRequested / updateRequested) — one-shot accept/reject. The actor sends `Fire`'s result so the caller knows whether the SM accepted the transition before returning; the actual work then runs asynchronously and reports back via the corresponding completed/errored/replace-outcome message.
+
+Fire-and-forget messages (containerDied, diagGathered, the three terminal "completed/errored/replace-outcome" messages) use neither channel.
+
+**State machine:**
+
+Built on [`qmuntal/stateless`](https://github.com/qmuntal/stateless), states come from `backend.ProvisionStatus`. All eight statuses are configured (`Provisioning, Ready, Failing, Failed, Restarting, Updating, Deprovisioning, Unknown`) so `Fire` never hits an unconfigured state; `Unknown` exists as a safety state and is not part of normal flow.
+
+```
+           ┌──────────────────┐
+           │   Provisioning   │ ──evProvisionCompleted──► Ready
+           └──────────────────┘ ──evProvisionErrored────► Failed
+                   │                   ──evDeprovisionRequested──► Deprovisioning
+                   ▼
+  Ready ──evContainerDied[guard]──► Failing ──evDiagGathered──► Failed
+    │                                 │
+    ├──evRestartRequested──► Restarting ──evReplaceCompleted──► Ready
+    │                               ├──evReplaceRecovered──► Ready
+    │                               └──evReplaceFailed────► Failed
+    ├──evUpdateRequested──► Updating (same shape as Restarting)
+    └──evDeprovisionRequested──► Deprovisioning ──evContainersRemoved──► (actor exits)
+
+  Failed  ──evProvisionRequested──► Provisioning   (retry from Failed)
+  Failed  ──evRestartRequested────► Restarting     (Restart over a Failed lease)
+  Failed  ──evUpdateRequested─────► Updating       (Update over a Failed lease)
+  Failing ──evProvisionRequested──► Provisioning   (retry from Failing; OnExit
+  Failing ──evRestartRequested────► Restarting     cancels the diag goroutine,
+  Failing ──evUpdateRequested─────► Updating       removing the wedge)
+```
+
+All states are configured up front with explicit `Permit`/`Ignore`/`OnEntry`/`OnExit` rules. Triggers that don't match a permit become **explicit Ignore** (no-op, no error) rather than unhandled-trigger errors.
+
+**Cancel-on-exit for stale callbacks:**
+
+`Failing`, `Provisioning`, `Restarting`, and `Updating` each run an async goroutine (diagnostics gathering, container provisioning, or atomic replace). On `OnExit`, the actor cancels the goroutine's context and waits for it to finish. This is the **structural suppression** that prevents a stale `Failed` or `Success` callback from being emitted after the lease has moved on (see `onExitFailing`, `onExitProvisioning`).
+
+**Why this shape:**
+
+- **No held locks during slow I/O** — all Docker calls happen outside any shared mutex; linearization is enforced by the inbox.
+- **Deterministic preemption** — a `Deprovision` that arrives mid-provisioning cancels the in-flight work via `OnExit` and transitions cleanly to `Deprovisioning`.
+- **Blast-radius-contained panics** — each message is wrapped in `recover()`. The actor survives, other leases are unaffected, and the panicking caller is unblocked via `onPanic`.
+- **Observable transitions** — every SM transition is counted in `lease_sm_transitions_total{source,destination,trigger}`.
+
+**Registry & lifecycle:**
+
+- `Backend.actors` is a `map[leaseUUID]*leaseActor`; `actorForLocked` resolves-or-creates under a short mutex.
+- An actor self-removes from the registry after `Deprovisioning` completes (via a deferred `removeFromRegistry`).
+- `errActorTerminated` is returned when a new message arrives at an actor whose `Deprovisioning` has just completed but whose registry cleanup hasn't yet fired — the caller rolls back and retries, getting a fresh actor.
+
+**Inbox delivery and backpressure:**
+
+The inbox is buffered. Three distinct delivery paths cover the cases that actually arise:
+
+- **`routeToLease`** — production fast path for fire-and-forget messages from container-event and reconcile sites. Resolves-or-creates the actor and enqueues atomically under the registry mutex; the enqueue itself is non-blocking (no timeout — full inbox = immediate refusal). Refusals are counted in `die_event_dropped_total`. The reconciler re-detects any missed transition on its next cycle, so drops degrade the realtime event path but do not lose data.
+- **`routeToLeaseBlocking`** — wraps `routeToLease` with ctx-bounded retry for caller-facing API paths (Provision/Deprovision/Restart/Update) that need backpressure-with-retry rather than fast refusal.
+- **`sendTerminal`** — used by in-flight worker goroutines to deliver terminal SM events whose physical work has already happened on the host (containers swapped, removed, etc.). Bounded by `terminalSendTimeout` (10s) and refuses on `hasExited`, `isExiting`, or send timeout. Refusals are counted in `lease_terminal_event_dropped_total`; recovery falls to the next reconcile cycle.
+
+A bare `send()` method exists for tests only — production code never holds an actor pointer directly.
 
 ## Data Flow
 
