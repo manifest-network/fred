@@ -322,7 +322,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 			// its budget (e.g. hit maxGasLimit). Splitting the batch into N
 			// individual retries would hit the same wall N times and amplify the
 			// failure. Surface the error to all callers and rely on Watermill's
-			// Retry middleware (configured in newManager) for exponential-backoff
+			// Retry middleware (configured in NewManager) for exponential-backoff
 			// redelivery — the next attempt runs on fresh account state.
 			var chainErr *chain.ChainTxError
 			if errors.As(err, &chainErr) && (chainErr.IsInsufficientFee() || chainErr.IsOutOfGas()) {

@@ -29,8 +29,36 @@
 //   - Backend names must be unique
 //   - Callback secret must be at least 32 characters
 //   - TLS cert and key must both be specified or neither
+//   - gas_adjustment must be in [1.0, 3.0]; max_gas_limit, if set, must be ≥ gas_limit
 //
 // The daemon will fail to start with a clear error message if validation fails.
+//
+// # Production Mode
+//
+// Setting production_mode=true tightens startup checks beyond basic validation:
+//
+//   - token_tracker_db_path must be configured (replay protection cannot be
+//     silently disabled)
+//   - grpc_tls_skip_verify must be false when grpc_tls_enabled is true
+//   - callback_base_url and backend URLs are run through an SSRF check that
+//     rejects IP literals for loopback, link-local, and unspecified addresses
+//     as well as the hostname "localhost"
+//
+// # CORS
+//
+// cors_origins defaults to ["*"]. This is safe because cookie-bearing
+// credentials are disabled on the API — tenants must send their bearer token
+// in the Authorization header, so there is no ambient-authority risk from
+// allowing all origins. Set an explicit list to restrict, or set an empty
+// list to disable CORS middleware entirely.
+//
+// # Parallel Signing
+//
+// sub_signer_count > 0 enables authz-based parallel signing for lease
+// acknowledgments. Each sub-signer holds a granted authz authorization and
+// gets topped up from the primary key on its own schedule (see
+// sub_signer_min_balance, sub_signer_top_up_amount,
+// sub_signer_fund_check_interval).
 //
 // # Backend Configuration
 //

@@ -1185,7 +1185,7 @@ func (h *Handlers) StreamLeaseEvents(w http.ResponseWriter, r *http.Request) {
 
 	leaseUUID := r.PathValue("lease_uuid")
 
-	// Token promotion and stripping is handled by wsTokenPromoter middleware.
+	// Token promotion and stripping is handled by WSTokenPromoter middleware.
 
 	// Authenticate BEFORE upgrading so auth failures return normal HTTP errors.
 	_, statusCode, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)

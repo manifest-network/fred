@@ -127,10 +127,12 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, ackn
 // |-------------|---------------|--------|
 // | PENDING     | Not provisioned | Start provisioning |
 // | PENDING     | Provisioning (in progress) | Nothing (wait for callback) |
+// | PENDING     | Provisioned + ready (in-flight) | Skip; main flow owns the ack |
 // | PENDING     | Provisioned + ready | Acknowledge lease |
-// | PENDING     | Provisioned + failed | Log warning (wait for expiry) |
-// | ACTIVE      | Provisioned | Nothing (healthy) |
-// | ACTIVE      | Not provisioned | Anomaly: Log + provision |
+// | PENDING     | Provisioned + failed | Reject lease on chain |
+// | ACTIVE      | Provisioned + ready | Nothing (healthy) |
+// | ACTIVE      | Provisioned + failed | Re-provision (close after max attempts) |
+// | ACTIVE      | Not provisioned | Anomaly: re-provision with payload |
 // | Not found   | Provisioned | Orphan: Deprovision |
 func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// Use atomic flag to prevent concurrent reconciliation without blocking.
@@ -460,9 +462,13 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		return err
 	}
 
-	// Note: Payload is NOT deleted here. It will be deleted by handleBackendCallback
-	// after the backend reports success or failure. This ensures the payload remains
-	// available for retry if the backend fails or crashes before sending a callback.
+	// Note: Payload is NOT deleted here. Cleanup happens later — when the
+	// lease closes (HandleLeaseClosed) or when a PENDING-failure callback
+	// rejects the lease and deletes the payload. Success and ACTIVE-failure
+	// paths intentionally retain the payload so a subsequent re-provision
+	// can reuse the same manifest. This also ensures the payload remains
+	// available for retry if the backend fails or crashes before sending
+	// a callback.
 
 	// Record placement so read operations can find this lease's backend
 	if r.placementStore != nil {

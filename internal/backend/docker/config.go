@@ -96,9 +96,9 @@ type Config struct {
 
 	// NetworkIsolation enables per-tenant Docker network isolation.
 	// When true, each tenant's containers are placed in a separate bridge network.
-	// Provides inter-tenant isolation; containers retain outbound internet access
-	// because Docker's Internal flag prevents port publishing (moby#36174).
-	// Defaults to true.
+	// Provides inter-tenant isolation. The network is created with Internal:false
+	// — required for port publishing (moby#36174) — so containers retain outbound
+	// internet access as a side effect. Defaults to true.
 	NetworkIsolation *bool `yaml:"network_isolation"`
 
 	// ContainerReadonlyRootfs sets the container's root filesystem to read-only.

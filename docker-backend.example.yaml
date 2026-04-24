@@ -6,6 +6,9 @@
 # local resource profiles. Without this mapping, provisioning will fail with
 # "unknown SKU" errors.
 
+# Log verbosity. Valid values: debug, info, warn, error. Default: info.
+# log_level: "info"
+
 # Backend name (used in Fred configuration)
 name: docker
 
@@ -109,8 +112,10 @@ allowed_registries:
 # =============================================================================
 # Settings for callbacks to Fred reporting provisioning results.
 
-# HMAC secret for signing callbacks to Fred (minimum 32 characters)
-# Generate with: openssl rand -hex 32
+# HMAC secret for signing callbacks to Fred (minimum 32 characters).
+# REQUIRED — docker-backend refuses to start without this. Generate with:
+#   openssl rand -hex 32
+# Must match callback_secret configured on the Fred side.
 # callback_secret: ""
 
 # Skip TLS certificate verification for callbacks (development only!)
@@ -164,7 +169,8 @@ releases_max_age: 2160h
 # External host address for port mappings.
 # This is the address tenants will use to connect to containers.
 # Must be a valid hostname or IP address (not a URL).
-# IMPORTANT: Replace with your server's public IP or hostname.
+# REQUIRED — docker-backend refuses to start with an empty value.
+# Replace with your server's public IP or hostname.
 host_address: ""
 
 # IP address to bind container ports to. Use "127.0.0.1" to restrict

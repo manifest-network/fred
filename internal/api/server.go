@@ -251,7 +251,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 
 	// Apply global middleware. Each wrapper becomes the new outermost layer,
 	// so the last-applied middleware runs first. Execution order:
-	// cors → securityHeaders → rateLimiter → maxBody → logging → mux → [per-route timeout] → handler
+	// (cors, when enabled) → securityHeaders → rateLimiter → maxBody → logging → mux → [per-route timeout] → handler
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	handler = maxBodySizeMiddleware(maxBodySize)(handler)

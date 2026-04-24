@@ -17,8 +17,13 @@
 // public key, and a signature over the message. The server validates:
 //   - The signature matches the message content
 //   - The public key derives to the tenant address
-//   - The timestamp is within 30 seconds (prevents replay)
-//   - The token hasn't been used before (replay protection via TokenTracker)
+//   - The timestamp is at most 30 seconds in the past and at most 10 seconds
+//     in the future (clock-skew tolerance)
+//   - Replay protection (TokenTracker): required for connection, restart, and
+//     update — where a replayed token would re-leak sensitive data or re-run a
+//     mutating operation. Idempotent reads (status, provision, logs, releases,
+//     events) skip this check. The data upload endpoint skips it too and
+//     relies on its own idempotency (409 on a duplicate upload for the lease).
 //
 // The token tracker uses fail-closed semantics: if the database is unavailable,
 // requests are rejected with 503 Service Unavailable rather than proceeding
@@ -38,16 +43,17 @@
 //
 // # Endpoints
 //
-//	GET  /health                          - Health check with chain connectivity
-//	GET  /metrics                         - Prometheus metrics
-//	GET  /v1/leases/{uuid}/connection     - Get connection details (authenticated)
-//	GET  /v1/leases/{uuid}/status         - Get provisioning status (authenticated)
-//	GET  /v1/leases/{uuid}/provision      - Get provision diagnostics (authenticated)
-//	GET  /v1/leases/{uuid}/logs           - Get container logs (authenticated)
-//	GET  /v1/leases/{uuid}/releases       - Get release history (authenticated)
-//	GET  /v1/leases/{uuid}/events         - Stream lease events via WebSocket (authenticated)
-//	POST /v1/leases/{uuid}/data           - Upload deployment payload (authenticated)
-//	POST /v1/leases/{uuid}/restart        - Restart a provisioned lease (authenticated)
-//	POST /v1/leases/{uuid}/update         - Update a provisioned lease (authenticated)
-//	POST /callbacks/provision             - Backend provisioning callback (HMAC auth)
+//	GET  /health                                - Health check with chain connectivity
+//	GET  /metrics                               - Prometheus metrics
+//	GET  /workloads?lease_uuid=<u>...           - Bulk workload metadata lookup (unauthenticated)
+//	GET  /v1/leases/{lease_uuid}/connection     - Get connection details (authenticated)
+//	GET  /v1/leases/{lease_uuid}/status         - Get provisioning status (authenticated)
+//	GET  /v1/leases/{lease_uuid}/provision      - Get provision diagnostics (authenticated)
+//	GET  /v1/leases/{lease_uuid}/logs           - Get container logs (authenticated)
+//	GET  /v1/leases/{lease_uuid}/releases       - Get release history (authenticated)
+//	GET  /v1/leases/{lease_uuid}/events         - Stream lease events via WebSocket (authenticated)
+//	POST /v1/leases/{lease_uuid}/data           - Upload deployment payload (authenticated)
+//	POST /v1/leases/{lease_uuid}/restart        - Restart a provisioned lease (authenticated)
+//	POST /v1/leases/{lease_uuid}/update         - Update a provisioned lease (authenticated)
+//	POST /callbacks/provision                   - Backend provisioning callback (HMAC auth)
 package api

@@ -19,8 +19,10 @@ type ChainClient interface {
 }
 
 // Watcher monitors lease events for cross-provider credit depletion detection.
-// It tracks active tenants and triggers withdrawals when another provider's
-// withdrawal causes a tenant's credit to be depleted.
+// When another provider's withdrawal causes credit exhaustion on a tenant we
+// share, Watcher triggers our own withdrawal. The tenant set is seeded from
+// the chain at startup and decremented as our leases close/expire/auto-close;
+// new leases acknowledged post-startup are picked up on the next restart.
 type Watcher struct {
 	client          ChainClient
 	eventSubscriber *chain.EventSubscriber
@@ -108,14 +110,6 @@ func (w *Watcher) handleEvent(event chain.LeaseEvent) {
 	)
 
 	switch event.Type {
-	case chain.LeaseAcknowledged:
-		// Track active tenants for cross-provider credit monitoring
-		// Only track leases for our provider
-		if event.ProviderUUID == w.providerUUID {
-			w.addActiveTenant(event.Tenant)
-			slog.Info("lease acknowledged", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant)
-		}
-
 	case chain.LeaseClosed, chain.LeaseExpired:
 		// Decrement lease count when our leases close or expire
 		if event.ProviderUUID == w.providerUUID {
@@ -134,16 +128,6 @@ func (w *Watcher) handleEvent(event chain.LeaseEvent) {
 			w.handleCrossProviderAutoClose(event.Tenant, event.ProviderUUID)
 		}
 	}
-}
-
-// addActiveTenant increments the lease count for a tenant.
-func (w *Watcher) addActiveTenant(tenant string) {
-	if tenant == "" {
-		return
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.tenantLeaseCounts[tenant]++
 }
 
 // removeActiveTenant decrements the lease count for a tenant.

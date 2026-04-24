@@ -106,8 +106,8 @@ func (s *CallbackSender) SendCallback(leaseUUID, callbackURL, backendName string
 	// Persist callback before attempting delivery so it survives restarts.
 	// Success encodes "not failed" rather than "is success" so a rollback to a
 	// pre-Status binary replays a deprovisioned entry as 'success' (benign on
-	// dashboards) instead of 'failed' (which would re-introduce the spurious
-	// failure events this PR eliminates).
+	// dashboards) instead of 'failed' (which would re-introduce spurious
+	// failure events that the CallbackStatusDeprovisioned distinction eliminates).
 	if s.store != nil {
 		if storeErr := s.store.Store(CallbackEntry{
 			LeaseUUID:   leaseUUID,

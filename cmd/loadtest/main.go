@@ -543,8 +543,15 @@ func (lt *LoadTester) RunMixedTest() *Results {
 }
 
 // generateAuthToken creates a test auth token using the pre-generated key pair.
-// Note: These tokens will be rejected by fred (invalid on-chain identity).
-// For realistic testing, you need real keys and proper ADR-036 signing.
+// Note: these tokens will be rejected by fred. Three reasons: (1) the public
+// key is not a real on-chain identity; (2) the signed message uses the payload
+// endpoint's sign-data format ("manifest lease data %s %s %d") — the
+// connection endpoint expects a different format (see auth/format.go), so
+// even substituting real keys would still fail signature verification on
+// connection tests without also changing the message construction; and (3)
+// the signature is ed25519, but fred's tokenValidator only accepts secp256k1
+// ADR-036 signatures (token_validator.go), so the loadtest would also need
+// to swap signing curves.
 func (lt *LoadTester) generateAuthToken(leaseUUID, metaHash string) string {
 	timestamp := time.Now().Unix()
 	tenant := "manifest1loadtest" + leaseUUID[:8]

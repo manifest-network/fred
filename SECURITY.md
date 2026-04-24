@@ -68,7 +68,7 @@ header := fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
 
 ### Backend Authentication (HMAC-SHA256)
 
-Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all operational endpoints (`/provision`, `/deprovision`, `/info`, `/logs`, `/provisions`, `/restart`, `/update`, `/releases`). Health, stats, and metrics endpoints are unauthenticated.
+Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all operational endpoints: `POST /provision`, `POST /deprovision`, `POST /restart`, `POST /update`, `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /releases/{lease_uuid}`. Health and metrics endpoints are unauthenticated.
 
 **Implementation:** `cmd/docker-backend/main.go` (auth middleware), `internal/hmacauth/`
 

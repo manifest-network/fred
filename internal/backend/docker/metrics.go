@@ -208,31 +208,34 @@ var (
 		Help:      "Count of panics recovered in lease actor handlers (any non-zero is a bug)",
 	})
 
-	// leaseTerminalEventDroppedTotal counts terminal SM events whose
-	// actor.send() was refused because the backend was shutting down.
-	// The work has already happened on the host (container swap complete,
-	// provision succeeded, etc.) but the SM never recorded it, so the
-	// release store / provision struct may be out of sync with Docker.
-	// Recovery on next startup should re-reconcile; sustained non-zero
-	// values under clean shutdown indicate a real data-loss pattern.
+	// leaseTerminalEventDroppedTotal counts terminal SM events that sendTerminal
+	// refused to deliver. Delivery is refused on three distinct conditions:
+	// the actor has exited (hasExited), the actor is mid-exit past the
+	// drainInbox point (isExiting), or the inbox is wedged (the buffered send
+	// times out after terminalSendTimeout). The work has already happened on
+	// the host (container swap complete, provision succeeded, etc.) but the SM
+	// never recorded it, so the release store / provision struct may be out of
+	// sync with Docker. Recovery on next startup should re-reconcile; sustained
+	// non-zero values under clean shutdown indicate a real data-loss pattern.
 	leaseTerminalEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "lease_terminal_event_dropped_total",
-		Help:      "Terminal SM events dropped because the actor inbox refused delivery during shutdown",
+		Help:      "Terminal SM events sendTerminal refused to deliver (actor exited, mid-exit, or inbox wedged via send timeout)",
 	}, []string{"event"})
 
-	// dieEventDroppedTotal counts container-death signals whose actor.send
-	// was refused — either because the backend is shutting down, the actor
-	// has already exited (Delete race), or the inbox was wedged. The
-	// reconciler re-detects missed deaths within its cycle (default 5m), so
-	// these drops are not data loss; the counter gives operators a signal
-	// when the realtime event path is degraded.
+	// dieEventDroppedTotal counts container-death signals routeToLease refused
+	// to deliver to the lease actor. Refusal happens when stopCtx has been
+	// canceled (backend shutting down) or the inbox is full and the
+	// non-blocking send gives up. The reconciler re-detects missed deaths on
+	// its next cycle (default 5m), so drops degrade the realtime event path
+	// but do not cause data loss; the counter lets operators spot when that
+	// path is degraded.
 	dieEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "die_event_dropped_total",
-		Help:      "Container-death signals dropped at the actor inbox; reconciler re-detects on next cycle",
+		Help:      "Container-death signals routeToLease could not deliver (stopCtx canceled or inbox full); reconciler re-detects on next cycle",
 	}, []string{"source"})
 
 	// leaseFailingRaceSkippedTotal counts onEnterFailing invocations that

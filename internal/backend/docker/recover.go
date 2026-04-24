@@ -76,15 +76,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if b.releaseStore != nil {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
 					// Use ParsePayload to auto-detect single vs stack manifest.
-					legacyM, stackM, payloadErr := ParsePayload(rel.Manifest)
+					singleM, stackM, payloadErr := ParsePayload(rel.Manifest)
 					switch {
 					case payloadErr != nil:
 						b.logger.Warn("failed to parse recovered manifest",
 							"lease_uuid", c.LeaseUUID, "error", payloadErr)
 					case stackM != nil:
 						prov.StackManifest = stackM
-					case legacyM != nil:
-						prov.Manifest = legacyM
+					case singleM != nil:
+						prov.Manifest = singleM
 					}
 				}
 			}

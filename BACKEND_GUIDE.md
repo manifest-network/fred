@@ -224,7 +224,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, `failed`, `unknown`, `restarting`, or `updating`
+- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`
 - `fail_count` - Number of provision failures
 - `last_error` - Full diagnostic error message (exit codes, OOM, truncated logs)
 
@@ -412,7 +412,7 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 **Note:** The timestamp must be the current Unix time when sending the request. Callbacks with timestamps older than 5 minutes or more than 1 minute in the future are rejected.
 
 **Fields:**
-- `status`: Either `"success"` or `"failed"`
+- `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Use `"deprovisioned"` when the backend has autonomously torn down a lease (e.g. after a failed provision rollback) so Fred records the lease as deprovisioned without firing failure-callback side effects.
 - `error`: Error message if status is `"failed"`, empty otherwise
 
 ### HMAC Signature with Replay Protection

@@ -82,7 +82,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 				}
 			}
 		} else {
-			// Legacy: release index-based allocation IDs.
+			// Non-stack: release index-based allocation IDs.
 			for i := range oldQuantity {
 				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
 			}

@@ -4,8 +4,10 @@
 //
 // The Client provides gRPC-based access to chain queries and transactions:
 //
-//   - Query leases by UUID, provider, or state
-//   - Submit transactions (acknowledge, reject leases)
+//   - Query leases by UUID, provider, or state; query credit accounts and
+//     provider withdrawable balances
+//   - Submit transactions: acknowledge / reject / close leases, withdraw
+//     funds by provider
 //   - Wait for transaction confirmation with retry logic
 //   - Ping for health checks
 //
@@ -17,8 +19,6 @@
 // real-time lease events:
 //
 //   - lease_created: New lease for this provider
-//   - lease_acknowledged: Lease was acknowledged
-//   - lease_rejected: Lease was rejected
 //   - lease_closed: Lease was closed by tenant
 //   - lease_expired: Lease expired (time limit)
 //   - lease_auto_closed: Lease auto-closed due to credit exhaustion
