@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 )
 
 // mockBenchBackend implements backend.Backend for benchmarks.
@@ -185,7 +186,7 @@ func TestManager_HighThroughput(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         uuid,
@@ -279,7 +280,7 @@ func TestManager_BurstTraffic(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         uuid,

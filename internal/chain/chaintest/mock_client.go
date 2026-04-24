@@ -1,4 +1,8 @@
-package chain
+// Package chaintest provides test doubles for the chain package.
+//
+// This package lives outside of internal/chain so the production build does
+// not link mock implementations into providerd.
+package chaintest
 
 import (
 	"context"

@@ -18,7 +18,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
@@ -59,7 +59,7 @@ type reconcilerTestEnv struct {
 	backend      *Backend
 	reconciler   *provisioner.Reconciler
 	tracker      *testReconcilerTracker
-	chainClient  *chain.MockClient
+	chainClient  *chaintest.MockClient
 	callbackCh   <-chan backend.CallbackPayload
 	callbackURL  string
 	providerUUID string
@@ -67,7 +67,7 @@ type reconcilerTestEnv struct {
 
 // testReconcilerSetup creates a full-stack test environment:
 // real docker backend + reconciler + mock chain + tracker + payload store.
-func testReconcilerSetup(t *testing.T, chainClient *chain.MockClient) *reconcilerTestEnv {
+func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient) *reconcilerTestEnv {
 	t.Helper()
 
 	callbackServer, callbackCh := startCallbackServer(t)
@@ -164,7 +164,7 @@ func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
 	var mu sync.Mutex
 	leaseState := billingtypes.LEASE_STATE_PENDING
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -278,7 +278,7 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 	leaseState := billingtypes.LEASE_STATE_PENDING
 	var closedLeases []string
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -392,7 +392,7 @@ func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
 	leaseVisible := true
 	var deprovisionedViaChain bool
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -482,7 +482,7 @@ func TestIntegration_Reconciler_MultiContainer_PartialKill_Recovers(t *testing.T
 	var mu sync.Mutex
 	leaseState := billingtypes.LEASE_STATE_PENDING
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -597,7 +597,7 @@ func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
 	var acknowledgedLeases []string
 
 	// Chain always returns PENDING (simulating missed ack)
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			lease := makeLease(leaseUUID, tenant, providerUUID, sku, 1, hash[:])
 			lease.State = billingtypes.LEASE_STATE_PENDING
@@ -674,7 +674,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	var mu sync.Mutex
 	leaseState := billingtypes.LEASE_STATE_PENDING
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			mu.Lock()
 			defer mu.Unlock()
