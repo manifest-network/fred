@@ -207,7 +207,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 // Error logs and flips the reconciler cycle from "success" to "partial" in
 // the aggregate metrics.
 func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -3194,7 +3194,7 @@ func (p *panickingBackend) RefreshState(ctx context.Context) error {
 // Asserts: ReconcilerPanicsTotal{stage="fetch_provisions"} increments,
 // reconcile returns an error, and other backends are unaffected.
 func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return nil, nil
 		},
@@ -3253,7 +3253,7 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 // counted, and NOT crash fred. Other leases in the same reconcile
 // cycle must still be processed.
 func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Two leases: one triggers a panic (has MetaHash → calls HasPayload),
 			// one proceeds normally (no MetaHash → skips tracker).
