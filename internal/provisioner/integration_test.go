@@ -15,12 +15,13 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // startTestManager creates a Manager with the given mocks, starts it, and
 // registers cleanup. Returns the running manager.
-func startTestManager(t *testing.T, cfg ManagerConfig, mockBackend *mockManagerBackend, mockChain *chain.MockClient) *Manager {
+func startTestManager(t *testing.T, cfg ManagerConfig, mockBackend *mockManagerBackend, mockChain *chaintest.MockClient) *Manager {
 	t.Helper()
 
 	router, err := backend.NewRouter(backend.RouterConfig{
@@ -62,14 +63,14 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 	mockBackend.provisionErr = nil
 
 	ackCh := make(chan []string, 1)
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
-			return chain.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
+			return chaintest.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
 				billingtypes.LEASE_STATE_PENDING, skuUUID), nil
 		},
 		GetPendingLeasesFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
-				*chain.NewMockLeaseWithSKU(leaseUUID, tenant, providerUUID,
+				*chaintest.NewMockLeaseWithSKU(leaseUUID, tenant, providerUUID,
 					billingtypes.LEASE_STATE_PENDING, skuUUID),
 			}, nil
 		},
@@ -147,9 +148,9 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 
 	rejectCh := make(chan []string, 1)
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
-			return chain.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
+			return chaintest.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
 				billingtypes.LEASE_STATE_PENDING, skuUUID), nil
 		},
 		RejectLeasesFunc: func(_ context.Context, uuids []string, reason string) (uint64, []string, error) {
@@ -215,14 +216,14 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 
 	ackCh := make(chan []string, 1)
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
-			return chain.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
+			return chaintest.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
 				billingtypes.LEASE_STATE_ACTIVE, skuUUID), nil
 		},
 		GetPendingLeasesFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
-				*chain.NewMockLeaseWithSKU(leaseUUID, tenant, providerUUID,
+				*chaintest.NewMockLeaseWithSKU(leaseUUID, tenant, providerUUID,
 					billingtypes.LEASE_STATE_PENDING, skuUUID),
 			}, nil
 		},
@@ -242,7 +243,7 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 	// First, simulate a successful provision+ack cycle so the lease is "active".
 	// We use GetLease returning PENDING for the initial create flow.
 	mockChain.GetLeaseFunc = func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
-		return chain.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
+		return chaintest.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
 			billingtypes.LEASE_STATE_PENDING, skuUUID), nil
 	}
 
@@ -278,7 +279,7 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 
 	// Now switch GetLease to return ACTIVE for the close handler's lookup.
 	mockChain.GetLeaseFunc = func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
-		return chain.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
+		return chaintest.NewMockLeaseWithSKU(uuid, tenant, providerUUID,
 			billingtypes.LEASE_STATE_ACTIVE, skuUUID), nil
 	}
 
@@ -315,7 +316,7 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 
 	mockBackend := &mockManagerBackend{name: "test"}
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         uuid,

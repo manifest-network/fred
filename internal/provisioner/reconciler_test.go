@@ -16,7 +16,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
@@ -123,7 +123,7 @@ func (m *mockReconcilerBackend) GetReleases(ctx context.Context, leaseUUID strin
 }
 
 func TestNewReconciler_Validation(t *testing.T) {
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -207,7 +207,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 // Error logs and flips the reconciler cycle from "success" to "partial" in
 // the aggregate metrics.
 func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -233,7 +233,7 @@ func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
 func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	// Setup: Pending lease on chain, not provisioned on backend
 	// Expected: Start provisioning
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -270,7 +270,7 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	var acknowledgedLeases []string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -318,7 +318,7 @@ func TestReconciler_SkipsInFlightReadyLease(t *testing.T) {
 	var acknowledgeCount int
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -369,7 +369,7 @@ func TestReconciler_AcksNotInFlightReadyLease(t *testing.T) {
 	var acknowledgeCount int
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -417,7 +417,7 @@ func TestReconciler_FreshFailedLeaseStillRejects(t *testing.T) {
 	var rejectedLeases []string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -461,7 +461,7 @@ func TestReconciler_FreshFailedLeaseStillRejects(t *testing.T) {
 func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 	// Setup: Active lease on chain, not provisioned on backend (anomaly)
 	// Expected: Log anomaly and attempt to provision
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -497,7 +497,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	var acknowledgeCount int
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -547,7 +547,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 	// Setup: No lease on chain, but provisioned on backend (orphan)
 	// Expected: Deprovision the orphan
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		// No leases - default funcs return empty slices
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -585,13 +585,13 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		setup   func() *chain.MockClient
+		setup   func() *chaintest.MockClient
 		wantErr string
 	}{
 		{
 			name: "get pending error",
-			setup: func() *chain.MockClient {
-				return &chain.MockClient{
+			setup: func() *chaintest.MockClient {
+				return &chaintest.MockClient{
 					GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 						return nil, errors.New("chain unavailable")
 					},
@@ -601,8 +601,8 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 		},
 		{
 			name: "get active error",
-			setup: func() *chain.MockClient {
-				return &chain.MockClient{
+			setup: func() *chaintest.MockClient {
+				return &chaintest.MockClient{
 					GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 						return nil, errors.New("chain unavailable")
 					},
@@ -632,7 +632,7 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 
 func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 	// Test that ReconcileAll respects context cancellation
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -660,7 +660,7 @@ func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 
 func TestReconciler_Start_ContextCancellation(t *testing.T) {
 	// Test that Start respects context cancellation
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -695,7 +695,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 }
 
 func TestReconciler_DefaultInterval(t *testing.T) {
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -715,7 +715,7 @@ func TestReconciler_DefaultInterval(t *testing.T) {
 
 func TestReconciler_RunOnce(t *testing.T) {
 	// Verify RunOnce calls ReconcileAll
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -747,7 +747,7 @@ func TestReconciler_RunOnce(t *testing.T) {
 
 func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 	// Test that reconciler skips leases that are already being provisioned
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -766,7 +766,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 	manager, _ := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, router, &chain.MockClient{})
+	}, router, &chaintest.MockClient{})
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
@@ -786,7 +786,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 
 func TestReconciler_MultipleBackends(t *testing.T) {
 	// Test reconciliation with multiple backends
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	backend1 := &mockReconcilerBackend{
 		name: "backend1",
@@ -836,7 +836,7 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 	var acknowledgeCount int
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -890,7 +890,7 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 	var rejectedReason string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -946,7 +946,7 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 	// Test that acknowledge failure is logged but doesn't stop reconciliation
 	acknowledgeErr := errors.New("chain unavailable")
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -987,7 +987,7 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 	// Test that deprovision failure during orphan cleanup is logged but continues
 	deprovisionErr := errors.New("backend unavailable")
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		// No leases - both provisions are orphans
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -1025,7 +1025,7 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 	// Test that reconciler does NOT deprovision orphans belonging to other providers.
 	// This is critical when multiple providers share the same backend.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		// No leases for our provider
 	}
 	mockBackend := &mockReconcilerBackend{
@@ -1076,7 +1076,7 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	const leaseUUID = "race-test-lease"
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: leaseUUID, Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -1096,7 +1096,7 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
-	}, router, &chain.MockClient{})
+	}, router, &chaintest.MockClient{})
 	require.NoError(t, err)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
@@ -1173,7 +1173,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	reconcileStarted := make(chan struct{})
 	reconcileCanContinue := make(chan struct{})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Signal that reconciliation has started
 			close(reconcileStarted)
@@ -1234,7 +1234,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 	var mu sync.Mutex
 	ctx, cancel := context.WithCancel(context.Background())
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -1290,7 +1290,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 	var deprovisionCount int
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		// No leases - all provisions are orphans
 	}
 
@@ -1404,7 +1404,7 @@ func (m *mockCancellingBackend) GetReleases(ctx context.Context, leaseUUID strin
 
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				// GPU lease should go to gpu-backend
@@ -1480,7 +1480,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 
 func TestReconciler_MaxWorkers_Default(t *testing.T) {
 	// Test that default MaxWorkers is applied
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -1499,7 +1499,7 @@ func TestReconciler_MaxWorkers_Default(t *testing.T) {
 
 func TestReconciler_MaxWorkers_Custom(t *testing.T) {
 	// Test that custom MaxWorkers is respected
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -1525,7 +1525,7 @@ func TestReconciler_ParallelProcessing(t *testing.T) {
 		totalProcessed int
 	)
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Create enough leases to test parallelism
 			leases := make([]billingtypes.Lease, 20)
@@ -1597,7 +1597,7 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 		totalProcessed int
 	)
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		// No leases - all provisions are orphans
 	}
 
@@ -1667,7 +1667,7 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 		fetchCount     int
 	)
 
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	// Create multiple backends that track concurrent fetches
 	backend1 := &mockConcurrencyBackend{
@@ -1954,7 +1954,7 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	// Verify all payloads are stored
 	require.Equal(t, 3, payloadStore.Count())
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				// Pending lease without payload (no MetaHash) - will be provisioned without payload
@@ -2014,7 +2014,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	var closedReason string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -2072,7 +2072,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 	// Setup: Active lease on chain, failed provision with FailCount < maxReprovisionAttempts
 	// Expected: Attempt re-provisioning (not close)
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -2117,7 +2117,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	// Create mock chain client that returns one pending lease.
 	// Add a delay to ensure reconciliation takes some time, which allows us to
 	// verify that concurrent calls are properly serialized by the atomic flag.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Small delay to ensure concurrent ReconcileAll calls overlap.
 			// Without this, the first call would complete before others even start,
@@ -2199,7 +2199,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	var rejectedReason string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -2246,7 +2246,7 @@ func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
 	var rejectedReason string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -2304,7 +2304,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	payloadHash := sha256.Sum256(payloadData)
 	payloadStore.Store("lease-1", payloadData)
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{
@@ -2358,7 +2358,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 	var closedReason string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -2405,7 +2405,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 	var closedReason string
 	var mu sync.Mutex
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -2457,7 +2457,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
 	// Setup: Two backends each with provisions. Placement store should be
 	// synced with SetBatch from actual backend state.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -2505,7 +2505,7 @@ func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
 
 func TestReconciler_ReconcileAll_StartProvisioning_RecordsPlacement(t *testing.T) {
 	// Setup: Pending lease, not provisioned. After provisioning, placement should be recorded.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -2537,7 +2537,7 @@ func TestReconciler_ReconcileAll_StartProvisioning_RecordsPlacement(t *testing.T
 
 func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
 	// Setup: Pending lease with failed provision. After rejection, placement should be deleted.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -2574,7 +2574,7 @@ func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
 
 func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.T) {
 	// Setup: No lease on chain, provisioned on backend (orphan). Placement should be cleaned up.
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	mb := &mockReconcilerBackend{
 		name: "test",
 		provisions: []backend.ProvisionInfo{
@@ -2602,7 +2602,7 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 
 func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	// Setup: Active lease, failed provision exhausted retries. After close, placement cleaned up.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -2648,7 +2648,7 @@ func TestReconciler_ReconcileAll_ListProvisionError_AbortsReconciliation(t *test
 	// When ListProvisions fails on any backend, ReconcileAll should abort entirely.
 	// Partial data would cause the reconciler to misidentify running containers
 	// as orphans and deprovision them.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		// Return an active lease so that a false orphan would be detected
 		// if we proceeded with partial data.
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
@@ -2693,7 +2693,7 @@ func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Closes(t *testi
 
 	payloadHash := sha256.Sum256([]byte("some manifest"))
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{
@@ -2769,7 +2769,7 @@ func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.
 
 	payloadHash := sha256.Sum256([]byte("future manifest"))
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{
@@ -2838,7 +2838,7 @@ func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *te
 	payloadData := []byte("original manifest payload")
 	wrongHash := sha256.Sum256([]byte("different payload entirely"))
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{
@@ -2908,7 +2908,7 @@ func TestReconciler_ReconcileAll_PayloadStoreGetError_TransientError(t *testing.
 	payloadData := []byte("test manifest")
 	payloadHash := sha256.Sum256(payloadData)
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{
@@ -2971,7 +2971,7 @@ func TestReconciler_ReconcileAll_RefreshStateError_ContinuesWithStaleData(t *tes
 	// When RefreshState returns an error, reconciliation should continue
 	// using stale data rather than aborting. Stale state may be slightly
 	// out of date but is far better than no reconciliation at all.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -3015,7 +3015,7 @@ func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
 
 	payloadHash := sha256.Sum256([]byte("some manifest"))
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{
@@ -3067,7 +3067,7 @@ func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
 }
 
 func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return nil, nil
 		},
@@ -3100,7 +3100,7 @@ func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
 }
 
 func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-cap", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
@@ -3138,7 +3138,7 @@ func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
 func TestReconciler_ReconcileAll_PartialFailureDoesNotUpdateTimestamp(t *testing.T) {
 	// When a lease errors during provisioning the outcome is "partial",
 	// and ReconcilerLastSuccessTimestamp must NOT be updated.
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-fail", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
@@ -3194,7 +3194,7 @@ func (p *panickingBackend) RefreshState(ctx context.Context) error {
 // Asserts: ReconcilerPanicsTotal{stage="fetch_provisions"} increments,
 // reconcile returns an error, and other backends are unaffected.
 func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return nil, nil
 		},
@@ -3253,7 +3253,7 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 // counted, and NOT crash fred. Other leases in the same reconcile
 // cycle must still be processed.
 func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Two leases: one triggers a panic (has MetaHash → calls HasPayload),
 			// one proceeds normally (no MetaHash → skips tracker).

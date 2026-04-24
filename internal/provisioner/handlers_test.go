@@ -17,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
@@ -63,7 +64,7 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -101,7 +102,7 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, nil // Lease not found
 		},
@@ -130,7 +131,7 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	chainErr := errors.New("chain unavailable")
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, chainErr
 		},
@@ -164,7 +165,7 @@ func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
 		},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -217,7 +218,7 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 	})
 
 	// Not in-flight, lease NOT on chain -> deprovision on all backends
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, nil // Lease not found
 		},
@@ -263,7 +264,7 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 	})
 
 	// Not in-flight, lease NOT on chain -> fallback to all backends, all fail
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, nil
 		},
@@ -290,7 +291,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	tempDir := t.TempDir()
 	payloadStore, err := payload.NewStore(payload.StoreConfig{
@@ -330,7 +331,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	rejected := false
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,

@@ -21,6 +21,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
@@ -101,7 +102,7 @@ func (m *mockPlacementStore) Close() error   { return nil }
 
 // newTestHandlerSet creates a HandlerSet with mocked dependencies for testing.
 func newTestHandlerSet(
-	chainClient *chain.MockClient,
+	chainClient *chaintest.MockClient,
 	mb *mockManagerBackend,
 	ack *mockAcknowledger,
 	payloadStore *payload.Store,
@@ -143,7 +144,7 @@ func newTestHandlerSet(
 
 func TestHandlerSet_HandleLeaseCreated_Success(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -174,7 +175,7 @@ func TestHandlerSet_HandleLeaseCreated_Success(t *testing.T) {
 
 func TestHandlerSet_HandleLeaseCreated_WithMetaHash_SkipsProvisioning(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -204,7 +205,7 @@ func TestHandlerSet_HandleLeaseCreated_WithMetaHash_SkipsProvisioning(t *testing
 }
 
 func TestHandlerSet_HandleLeaseCreated_LeaseNotFound(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, nil
 		},
@@ -221,7 +222,7 @@ func TestHandlerSet_HandleLeaseCreated_LeaseNotFound(t *testing.T) {
 }
 
 func TestHandlerSet_HandleLeaseCreated_ChainError(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, errors.New("chain unavailable")
 		},
@@ -244,7 +245,7 @@ func TestHandlerSet_HandleLeaseCreated_ValidationError_PublishesFailedEvent(t *t
 		provisionErr: fmt.Errorf("%w: %w: bad-sku", backend.ErrValidation, backend.ErrUnknownSKU),
 	}
 	rejectCalled := false
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -290,7 +291,7 @@ func TestHandlerSet_HandleLeaseCreated_ValidationError_PublishesFailedEvent(t *t
 
 func TestHandlerSet_HandleLeaseClosed_Success(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:  leaseUUID,
@@ -317,7 +318,7 @@ func TestHandlerSet_HandleLeaseClosed_Success(t *testing.T) {
 
 func TestHandlerSet_HandleLeaseClosed_CleansUpPayload(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	tempDir := t.TempDir()
 	ps, err := payload.NewStore(payload.StoreConfig{
@@ -343,7 +344,7 @@ func TestHandlerSet_HandleLeaseClosed_CleansUpPayload(t *testing.T) {
 
 func TestHandlerSet_HandleLeaseExpired_DelegatesToClosed(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
@@ -368,7 +369,7 @@ func TestHandlerSet_HandleBackendCallback_Success(t *testing.T) {
 		},
 	}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
@@ -392,7 +393,7 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError(t *testing.T)
 		},
 	}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
@@ -415,7 +416,7 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError_PublishesRead
 		},
 	}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
 	hs.deps.Publisher = pub
@@ -448,7 +449,7 @@ func TestHandlerSet_HandleBackendCallback_Success_TransientAckError(t *testing.T
 		},
 	}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
@@ -470,7 +471,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_PendingLease(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
 	rejectCalled := false
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:  leaseUUID,
@@ -503,7 +504,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_PendingLease(t *testing.T) {
 func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:  leaseUUID,
@@ -531,7 +532,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease(t *testing.T) {
 func TestHandlerSet_HandleBackendCallback_Failed_RejectFails(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:  leaseUUID,
@@ -563,7 +564,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_EmptyReason(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
 	var receivedReason string
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:  leaseUUID,
@@ -593,7 +594,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_EmptyReason(t *testing.T) {
 func TestHandlerSet_HandleBackendCallback_UnknownLease(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	hs, _ := newTestHandlerSet(mockChain, mb, ack, nil)
 
@@ -671,7 +672,7 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 func TestHandlerSet_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
@@ -692,7 +693,7 @@ func TestHandlerSet_HandleBackendCallback_UnknownStatus(t *testing.T) {
 
 func TestHandlerSet_HandlePayloadReceived_Success(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -737,7 +738,7 @@ func TestHandlerSet_HandlePayloadReceived_Success(t *testing.T) {
 func TestHandlerSet_HandlePayloadReceived_Success_PublishesProvisioningEvent(t *testing.T) {
 	pub := newMockPublisher()
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -784,7 +785,7 @@ func TestHandlerSet_HandlePayloadReceived_Success_PublishesProvisioningEvent(t *
 }
 
 func TestHandlerSet_HandlePayloadReceived_NilPayloadStore(t *testing.T) {
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
 
 	msg := newPayloadEventMsg(t, payload.Event{
@@ -796,7 +797,7 @@ func TestHandlerSet_HandlePayloadReceived_NilPayloadStore(t *testing.T) {
 }
 
 func TestHandlerSet_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, nil
 		},
@@ -824,7 +825,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 }
 
 func TestHandlerSet_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:  leaseUUID,
@@ -855,7 +856,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 }
 
 func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, errors.New("chain error")
 		},
@@ -886,7 +887,7 @@ func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
 
 func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 	rejected := false
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -934,7 +935,7 @@ func TestHandlerSet_HandlePayloadReceived_ValidationError_PublishesFailedEvent(t
 		provisionErr: fmt.Errorf("%w: %w: evil.io/malware", backend.ErrValidation, backend.ErrImageNotAllowed),
 	}
 	rejectCalled := false
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -1051,7 +1052,7 @@ func TestHandlerSet_HandleBackendCallback_LongReasonTruncated(t *testing.T) {
 	ack := &mockAcknowledger{}
 	mb := &mockManagerBackend{name: "test-backend"}
 	var receivedReason string
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:  leaseUUID,
@@ -1114,7 +1115,7 @@ type placementTestFixture struct {
 }
 
 // newPlacementTestFixture creates a HandlerSet wired with a mockPlacementStore.
-func newPlacementTestFixture(chainClient *chain.MockClient, ack *mockAcknowledger) placementTestFixture {
+func newPlacementTestFixture(chainClient *chaintest.MockClient, ack *mockAcknowledger) placementTestFixture {
 	mb := &mockManagerBackend{name: "test-backend"}
 	ps := &mockPlacementStore{}
 	tracker := NewInFlightTracker()
@@ -1139,7 +1140,7 @@ func newPlacementTestFixture(chainClient *chain.MockClient, ack *mockAcknowledge
 }
 
 func TestHandlerSet_HandleBackendCallback_Failed_PendingLease_CleansUpPlacement(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{Uuid: leaseUUID, State: billingtypes.LEASE_STATE_PENDING}, nil
 		},
@@ -1165,7 +1166,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_PendingLease_CleansUpPlacement(
 }
 
 func TestHandlerSet_HandleBackendCallback_Failed_RejectFails_PreservesPlacement(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{Uuid: leaseUUID, State: billingtypes.LEASE_STATE_PENDING}, nil
 		},
@@ -1193,7 +1194,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_RejectFails_PreservesPlacement(
 }
 
 func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease_PreservesPlacement(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{Uuid: leaseUUID, State: billingtypes.LEASE_STATE_ACTIVE}, nil
 		},
@@ -1218,7 +1219,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease_PreservesPlacement(
 }
 
 func TestHandlerSet_HandleBackendCallback_Success_PreservesPlacement(t *testing.T) {
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 	ack := &mockAcknowledger{
 		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
 			return true, "tx-abc", nil
@@ -1446,7 +1447,7 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 
 func TestHandlerSet_LeasesAwaitingGauge_MatchesMapSize(t *testing.T) {
 	// Two leases with MetaHash → both should be awaiting payload
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -1502,7 +1503,7 @@ func TestHandlerSet_LeasesAwaitingGauge_MatchesMapSize(t *testing.T) {
 }
 
 func TestHandlerSet_LeasesAwaitingGauge_DuplicateLeaseCreatedDoesNotDrift(t *testing.T) {
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,
@@ -1556,7 +1557,7 @@ func TestHandlerSet_LeasesAwaitingGauge_PayloadReceivedDecrementsGauge(t *testin
 	require.True(t, ok, "failed to store payload for test")
 
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,

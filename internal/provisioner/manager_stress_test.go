@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 )
 
 // suppressLogs replaces the default logger with a no-op logger for the duration of the test.
@@ -93,7 +94,7 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
 			getLeaseCount.Add(1)
 			return &billingtypes.Lease{
@@ -227,7 +228,7 @@ func TestManager_SustainedLoad(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         uuid,
@@ -373,7 +374,7 @@ func TestManager_WithBackendLatency(t *testing.T) {
 				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 			})
 
-			mockChain := &chain.MockClient{
+			mockChain := &chaintest.MockClient{
 				GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
 					return &billingtypes.Lease{
 						Uuid:         uuid,
@@ -506,7 +507,7 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         uuid,
@@ -654,7 +655,7 @@ func BenchmarkManager_EndToEnd(b *testing.B) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         uuid,

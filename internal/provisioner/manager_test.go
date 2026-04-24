@@ -20,6 +20,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
@@ -110,7 +111,7 @@ func TestNewManager_Validation(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	tests := []struct {
 		name        string
@@ -174,7 +175,7 @@ func TestManager_InFlightTracking(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -218,7 +219,7 @@ func TestManager_TryTrackInFlight(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -255,7 +256,7 @@ func TestManager_TryTrackInFlight_RaceCondition(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -311,7 +312,7 @@ func TestManager_PopInFlight(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -345,7 +346,7 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         leaseUUID,
@@ -397,7 +398,7 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         leaseUUID,
@@ -437,7 +438,7 @@ func TestManager_HandleLeaseCreated_MalformedMessage(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -463,7 +464,7 @@ func TestManager_HandleLeaseClosed(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -500,7 +501,7 @@ func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -528,7 +529,7 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Return lease-1 as pending so ack batcher attempts acknowledgment
 			return []billingtypes.Lease{
@@ -577,7 +578,7 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -608,7 +609,7 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -636,7 +637,7 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Return lease-1 as pending so ack batcher attempts acknowledgment
 			return []billingtypes.Lease{
@@ -684,7 +685,7 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Return lease-1 as pending so ack batcher attempts acknowledgment
 			// (simulates race condition where state changes between check and ack)
@@ -772,7 +773,7 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -804,7 +805,7 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -846,7 +847,7 @@ func TestManager_PublishCallback(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -869,7 +870,7 @@ func TestManager_HandleLeaseExpired(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -911,7 +912,7 @@ func TestManager_StartAndClose(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -957,7 +958,7 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -998,7 +999,7 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 		},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			// Return lease with GPU SKU
 			return &billingtypes.Lease{
@@ -1062,7 +1063,7 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -1113,7 +1114,7 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -1197,7 +1198,7 @@ func TestManager_GetInFlightLeases(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -1235,7 +1236,7 @@ func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -1253,7 +1254,7 @@ func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -1282,7 +1283,7 @@ func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -1308,7 +1309,7 @@ func TestManager_WaitForDrain_ContextCancelled(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -1341,7 +1342,7 @@ func TestManager_InFlightCount(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -1414,7 +1415,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:         leaseUUID,
@@ -1485,7 +1486,7 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	// Create manager WITHOUT payload store
 	manager, err := NewManager(ManagerConfig{
@@ -1518,7 +1519,7 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{}
+	mockChain := &chaintest.MockClient{}
 
 	tempDir := t.TempDir()
 	payloadStore, _ := payload.NewStore(payload.StoreConfig{
@@ -1551,7 +1552,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, nil // Lease not found
 		},
@@ -1601,7 +1602,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -1657,7 +1658,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	chainErr := errors.New("chain unavailable")
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return nil, chainErr
 		},
@@ -1695,7 +1696,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -1751,7 +1752,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -1801,7 +1802,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -1860,7 +1861,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 		},
 	})
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -1932,7 +1933,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 	var rejectedLeases []string
 	var rejectReason string
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -2033,7 +2034,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 
 	t.Run("handles_chain_reject_error", func(t *testing.T) {
 		// Create manager with failing chain client
-		failingChain := &chain.MockClient{
+		failingChain := &chaintest.MockClient{
 			RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 				return 0, nil, errors.New("chain unavailable")
 			},
@@ -2074,7 +2075,7 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	var mu sync.Mutex
 	var rejectedLeases []string
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -2138,7 +2139,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	testPayload := []byte(`{"image": "nginx:alpine"}`)
 	testPayloadHash := hashPayload(testPayload)
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -2227,7 +2228,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	testPayload := []byte(`{"image": "nginx:alpine"}`)
 	testPayloadHash := hashPayload(testPayload)
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -2304,7 +2305,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	testPayload := []byte(`{"image": "nginx:alpine"}`)
 	testPayloadHash := hashPayload(testPayload)
 
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:   leaseUUID,
@@ -2386,7 +2387,7 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	})
 
 	var ackCalled atomic.Bool
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			// Return the test lease as pending so the batcher will call AcknowledgeLeases
 			return []billingtypes.Lease{
@@ -2489,7 +2490,7 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING},
@@ -2575,7 +2576,7 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 	})
 
 	var callCount atomic.Int32
-	mockChain := &chain.MockClient{
+	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			callCount.Add(1)
 			// Always fail to trigger retries
