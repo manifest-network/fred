@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -281,6 +282,103 @@ func TestRestart_PassesValidation(t *testing.T) {
 	w := httptest.NewRecorder()
 	// Passes validation, panics on nil backend.
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
+}
+
+// --- ReconcileCustomDomain handler tests ---
+
+func TestReconcileCustomDomain_RequiresAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", strings.NewReader(`{"lease_uuid":"lease-1"}`))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "missing signature")
+}
+
+func TestReconcileCustomDomain_MissingLeaseUUID(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "lease_uuid is required")
+}
+
+func TestReconcileCustomDomain_InvalidJSON(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`not json`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid request body")
+}
+
+func TestReconcileCustomDomain_DispatchesToBackendAndReturns204(t *testing.T) {
+	// End-to-end happy path through the handler: signed request with a valid
+	// body reaches the backend and the handler returns 204 No Content. Use a
+	// recording mockBackend so we can verify the dispatched arguments.
+	var (
+		mu              sync.Mutex
+		seenLeaseUUID   string
+		seenItems       []backend.LeaseItem
+		invocationCount int
+	)
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			mu.Lock()
+			defer mu.Unlock()
+			invocationCount++
+			seenLeaseUUID = leaseUUID
+			seenItems = append([]backend.LeaseItem(nil), items...)
+			return nil
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1","items":[{"sku":"docker-small","quantity":1,"service_name":"web","custom_domain":"foo.example.com"}]}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNoContent, w.Code)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, invocationCount, "backend.ReconcileCustomDomain should be called exactly once")
+	assert.Equal(t, "lease-1", seenLeaseUUID)
+	require.Len(t, seenItems, 1)
+	assert.Equal(t, "web", seenItems[0].ServiceName)
+	assert.Equal(t, "foo.example.com", seenItems[0].CustomDomain)
+}
+
+func TestReconcileCustomDomain_BackendErrorReturns500(t *testing.T) {
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			return assert.AnError
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1"}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 // --- Update handler tests ---

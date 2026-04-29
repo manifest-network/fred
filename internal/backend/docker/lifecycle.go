@@ -907,40 +907,15 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 	}
 
 	// Inject ingress labels for auto-discovery routing.
-	if params.Ingress.Enabled {
-		if port, ok := SelectIngressPort(params.Manifest.Ports); ok {
-			subdomain := ComputeSubdomain(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
-			fqdn := ComputeFQDN(subdomain, params.Ingress.WildcardDomain)
-			routerName := RouterName(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
-			for k, v := range TraefikLabels(params.Ingress, params.NetworkName, routerName, fqdn, port) {
-				labels[k] = v
-			}
-			labels[LabelFQDN] = fqdn
-
-			// Secondary router for tenant-supplied custom domain (if any).
-			// Skip-and-log on validation failure so primary keeps working.
-			if params.CustomDomain != "" {
-				if err := validateCustomDomain(params.CustomDomain, params.Ingress.WildcardDomain); err != nil {
-					slog.Error("skipping custom-domain router (validation failed)",
-						"lease_uuid", params.LeaseUUID,
-						"service_name", params.ServiceName,
-						"custom_domain", params.CustomDomain,
-						"error", err)
-				} else {
-					customRouterName := CustomDomainRouterName(params.LeaseUUID, params.ServiceName)
-					for k, v := range TraefikCustomDomainLabels(params.Ingress, customRouterName, params.CustomDomain, port) {
-						labels[k] = v
-					}
-					labels[LabelCustomDomain] = params.CustomDomain
-				}
-			}
-		} else if params.CustomDomain != "" {
-			slog.Warn("custom_domain set on item with no routable HTTP port; skipping",
-				"lease_uuid", params.LeaseUUID,
-				"service_name", params.ServiceName,
-				"custom_domain", params.CustomDomain)
-		}
-	}
+	applyIngressLabels(labels, ingressLabelParams{
+		LeaseUUID:    params.LeaseUUID,
+		ServiceName:  params.ServiceName,
+		Instance:     params.InstanceIndex,
+		Quantity:     params.Quantity,
+		Ingress:      params.Ingress,
+		NetworkName:  params.NetworkName,
+		CustomDomain: params.CustomDomain,
+	}, params.Manifest.Ports)
 
 	// Build environment variables
 	var env []string

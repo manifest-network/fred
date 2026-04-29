@@ -956,6 +956,104 @@ func TestHTTPClient_Restart_WithHMAC(t *testing.T) {
 	assert.NoError(t, err, "HMAC signature should verify successfully")
 }
 
+func TestHTTPClient_ReconcileCustomDomain(t *testing.T) {
+	var receivedReq ReconcileCustomDomainRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/reconcile_custom_domain" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&receivedReq); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-reconcile",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	items := []LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "foo.example.com"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+	}
+	err := client.ReconcileCustomDomain(context.Background(), "lease-1", items)
+	require.NoError(t, err)
+	assert.Equal(t, "lease-1", receivedReq.LeaseUUID)
+	require.Len(t, receivedReq.Items, 2)
+	assert.Equal(t, "web", receivedReq.Items[0].ServiceName)
+	assert.Equal(t, "foo.example.com", receivedReq.Items[0].CustomDomain)
+	assert.Equal(t, "db", receivedReq.Items[1].ServiceName)
+	assert.Equal(t, "", receivedReq.Items[1].CustomDomain)
+}
+
+func TestHTTPClient_ReconcileCustomDomain_AcceptsAccepted(t *testing.T) {
+	// Server may return 202 Accepted as well as 204 No Content; client
+	// must accept both.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-reconcile-202",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	require.NoError(t, client.ReconcileCustomDomain(context.Background(), "lease-1", nil))
+}
+
+func TestHTTPClient_ReconcileCustomDomain_ServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-reconcile-500",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.ReconcileCustomDomain(context.Background(), "lease-1", nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "500")
+}
+
+func TestHTTPClient_ReconcileCustomDomain_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-reconcile"
+
+	var capturedSig string
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-reconcile",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	require.NoError(t, client.ReconcileCustomDomain(context.Background(), "lease-1", []LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "foo.example.com"},
+	}))
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
+	require.NoError(t, hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute))
+}
+
 func TestHTTPClient_Update(t *testing.T) {
 	var receivedReq UpdateRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

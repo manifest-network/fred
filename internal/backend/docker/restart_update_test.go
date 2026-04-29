@@ -292,6 +292,129 @@ func TestRestart_Success(t *testing.T) {
 	assert.Equal(t, []string{"new-c1"}, prov.ContainerIDs)
 }
 
+func TestRestart_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
+	// Legacy single-item Restart must read prov.Items[0].CustomDomain and
+	// thread it through replaceContainersOp → CreateContainerParams so the
+	// secondary router survives across Restart cycles. Without the
+	// propagation, a Restart on a Ready provision would silently drop the
+	// custom-domain router on the new container.
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     manifest,
+			ContainerIDs: []string{"old-c1"},
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
+			},
+			Quantity: 1,
+		},
+	}
+
+	var capturedCustomDomain string
+	mock := &mockDockerClient{
+		StopContainerFn:   func(ctx context.Context, id string, t time.Duration) error { return nil },
+		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
+		CreateContainerFn: func(ctx context.Context, p CreateContainerParams, t time.Duration) (string, error) {
+			capturedCustomDomain = p.CustomDomain
+			return "new-c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, id string, t time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	}))
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+
+	assert.Equal(t, "foo.example.com", capturedCustomDomain,
+		"Restart must thread prov.Items[0].CustomDomain into CreateContainerParams")
+}
+
+func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
+	// Backwards compat: provisions recovered before this feature shipped
+	// may have prov.Items unset (legacy pre-CustomDomain state). Restart
+	// must treat that as "no custom domain" without panicking.
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Manifest:     manifest,
+			ContainerIDs: []string{"old-c1"},
+			Items:        nil, // pre-feature recovered provision
+			Quantity:     1,
+		},
+	}
+
+	var capturedCustomDomain string
+	mock := &mockDockerClient{
+		StopContainerFn:   func(ctx context.Context, id string, t time.Duration) error { return nil },
+		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
+		CreateContainerFn: func(ctx context.Context, p CreateContainerParams, t time.Duration) (string, error) {
+			capturedCustomDomain = p.CustomDomain
+			return "new-c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, id string, t time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	}))
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+
+	assert.Equal(t, "", capturedCustomDomain)
+}
+
 func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 	manifest := &DockerManifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
@@ -675,6 +798,68 @@ func TestUpdate_AllowedFromReady(t *testing.T) {
 	assert.Equal(t, "nginx:1.26", prov.Image)
 	assert.Equal(t, []string{"new-c1"}, prov.ContainerIDs)
 	assert.NotNil(t, prov.Manifest)
+}
+
+func TestUpdate_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
+	// Update is the manifest-replace path; like Restart, it must thread
+	// prov.Items[0].CustomDomain through to the new container so the
+	// secondary router survives a manifest update without requiring a
+	// separate reconcile.
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"old-c1"},
+			Quantity:     1,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
+			},
+		},
+	}
+
+	var capturedCustomDomain string
+	mock := &mockDockerClient{
+		PullImageFn:        func(ctx context.Context, image string, t time.Duration) error { return nil },
+		RemoveContainerFn:  func(ctx context.Context, id string) error { return nil },
+		CreateContainerFn: func(ctx context.Context, p CreateContainerParams, t time.Duration) (string, error) {
+			capturedCustomDomain = p.CustomDomain
+			return "new-c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, id string, t time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		close(callbackReceived)
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+		Payload:     validManifestJSON("nginx:1.26"),
+	}))
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+
+	assert.Equal(t, "foo.example.com", capturedCustomDomain,
+		"Update must thread prov.Items[0].CustomDomain into CreateContainerParams")
 }
 
 func TestUpdate_AllowedFromFailed(t *testing.T) {

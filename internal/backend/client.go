@@ -108,7 +108,7 @@ type LeaseItem struct {
 	// When non-empty (and the service has a routable HTTP port), the backend
 	// emits a secondary Traefik router on the item's container(s) routing
 	// Host(<CustomDomain>) to the same loadbalancer service. Validated on-chain
-	// in MsgSetLeaseItemCustomDomain; Fred re-runs cheap defense-in-depth checks
+	// in MsgSetItemCustomDomain; Fred re-runs cheap defense-in-depth checks
 	// before applying labels.
 	CustomDomain string `json:"custom_domain,omitempty"`
 }

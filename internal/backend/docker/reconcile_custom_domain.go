@@ -62,7 +62,7 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		if prov.Items[idx].CustomDomain == chainItem.CustomDomain {
 			continue
 		}
-		// Defense-in-depth: chain validates on MsgSetLeaseItemCustomDomain,
+		// Defense-in-depth: chain validates on MsgSetItemCustomDomain,
 		// but we re-run the same check here so a malformed value (e.g. set
 		// before this validation existed, or via a future chain bug) cannot
 		// leak into Traefik labels. Empty domain (clear) bypasses the FQDN

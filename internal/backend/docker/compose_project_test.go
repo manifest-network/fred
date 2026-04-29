@@ -882,7 +882,7 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 			Ports: map[string]PortConfig{"80/tcp": {}},
 		}
 		// Subdomain of the wildcard — chain would reject this on
-		// MsgSetLeaseItemCustomDomain, but Fred validates defense-in-depth.
+		// MsgSetItemCustomDomain, but Fred validates defense-in-depth.
 		params.Items[0].CustomDomain = "evil." + ingress.WildcardDomain
 		params.Ingress = ingress
 

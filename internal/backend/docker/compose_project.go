@@ -2,7 +2,6 @@ package docker
 
 import (
 	"fmt"
-	"log/slog"
 	"maps"
 	"slices"
 	"strconv"
@@ -399,42 +398,15 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 	}
 
 	// Inject ingress labels for auto-discovery routing.
-	if p.Ingress.Enabled {
-		if port, ok := SelectIngressPort(p.Manifest.Ports); ok {
-			subdomain := ComputeSubdomain(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
-			fqdn := ComputeFQDN(subdomain, p.Ingress.WildcardDomain)
-			routerName := RouterName(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
-			for k, v := range TraefikLabels(p.Ingress, p.NetworkName, routerName, fqdn, port) {
-				labels[k] = v
-			}
-			labels[LabelFQDN] = fqdn
-
-			// Secondary router for tenant-supplied custom domain (if any).
-			// Per-service (not per-instance): all instance containers of a
-			// service emit byte-identical secondary labels so Traefik
-			// aggregates them into one router + one service with N backends.
-			if p.CustomDomain != "" {
-				if err := validateCustomDomain(p.CustomDomain, p.Ingress.WildcardDomain); err != nil {
-					slog.Error("skipping custom-domain router (validation failed)",
-						"lease_uuid", p.LeaseUUID,
-						"service_name", p.ServiceName,
-						"custom_domain", p.CustomDomain,
-						"error", err)
-				} else {
-					customRouterName := CustomDomainRouterName(p.LeaseUUID, p.ServiceName)
-					for k, v := range TraefikCustomDomainLabels(p.Ingress, customRouterName, p.CustomDomain, port) {
-						labels[k] = v
-					}
-					labels[LabelCustomDomain] = p.CustomDomain
-				}
-			}
-		} else if p.CustomDomain != "" {
-			slog.Warn("custom_domain set on item with no routable HTTP port; skipping",
-				"lease_uuid", p.LeaseUUID,
-				"service_name", p.ServiceName,
-				"custom_domain", p.CustomDomain)
-		}
-	}
+	applyIngressLabels(labels, ingressLabelParams{
+		LeaseUUID:    p.LeaseUUID,
+		ServiceName:  p.ServiceName,
+		Instance:     p.Instance,
+		Quantity:     p.Quantity,
+		Ingress:      p.Ingress,
+		NetworkName:  p.NetworkName,
+		CustomDomain: p.CustomDomain,
+	}, p.Manifest.Ports)
 
 	svc.Labels = labels
 

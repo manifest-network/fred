@@ -2,7 +2,12 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -140,6 +145,235 @@ func TestReconcileCustomDomain_UnknownServiceNameSkipped(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain)
+}
+
+// reconcileHarness wires up a Backend with a mock Docker client and a
+// callback server so a redeploy triggered by ReconcileCustomDomain can be
+// observed end-to-end. Returns the callback received once the worker
+// finishes (success or failure), plus the captured CreateContainer params.
+type reconcileHarness struct {
+	b               *Backend
+	server          *httptest.Server
+	callbackPayload backend.CallbackPayload
+	callbackDone    chan struct{}
+	createParamsMu  sync.Mutex
+	createParams    []CreateContainerParams
+}
+
+func newReconcileHarness(t *testing.T, prov *provision) *reconcileHarness {
+	t.Helper()
+
+	h := &reconcileHarness{
+		callbackDone: make(chan struct{}),
+	}
+
+	mock := &mockDockerClient{
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			h.createParamsMu.Lock()
+			h.createParams = append(h.createParams, params)
+			h.createParamsMu.Unlock()
+			return "new-c1", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	h.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&h.callbackPayload)
+		w.WriteHeader(http.StatusOK)
+		// Tolerate multiple callbacks (success after restart is one;
+		// failure path may also fire). Close once.
+		select {
+		case <-h.callbackDone:
+		default:
+			close(h.callbackDone)
+		}
+	}))
+	t.Cleanup(h.server.Close)
+
+	prov.CallbackURL = h.server.URL
+	provisions := map[string]*provision{prov.LeaseUUID: prov}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.httpClient = h.server.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.Ingress = IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "barney0.manifest0.net",
+		Entrypoint:     "websecure",
+	}
+	h.b = b
+	return h
+}
+
+func (h *reconcileHarness) waitForCallback(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.callbackDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for restart callback")
+	}
+}
+
+func (h *reconcileHarness) lastCreateParams(t *testing.T) CreateContainerParams {
+	t.Helper()
+	h.createParamsMu.Lock()
+	defer h.createParamsMu.Unlock()
+	require.NotEmpty(t, h.createParams, "CreateContainer was not called")
+	return h.createParams[len(h.createParams)-1]
+}
+
+func TestReconcileCustomDomain_Set(t *testing.T) {
+	// Empty → "foo.example.com": worker must rebuild containers with the
+	// new CustomDomain on CreateContainerParams; in-memory state must
+	// reflect the new value after success.
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	prov := &provision{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		SKU:          "docker-small",
+		Status:       backend.ProvisionStatusReady,
+		Manifest:     manifest,
+		ContainerIDs: []string{"old-c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: ""},
+		},
+		Quantity: 1,
+	}
+	h := newReconcileHarness(t, prov)
+
+	err := h.b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
+	})
+	require.NoError(t, err)
+
+	h.waitForCallback(t)
+	assert.Equal(t, backend.CallbackStatusSuccess, h.callbackPayload.Status)
+	assert.Equal(t, "foo.example.com", h.lastCreateParams(t).CustomDomain,
+		"CreateContainer must receive the new CustomDomain so secondary labels are emitted")
+
+	h.b.provisionsMu.RLock()
+	got := h.b.provisions["lease-1"].Items[0].CustomDomain
+	h.b.provisionsMu.RUnlock()
+	assert.Equal(t, "foo.example.com", got, "in-memory CustomDomain must reflect the applied value")
+}
+
+func TestReconcileCustomDomain_Cleared(t *testing.T) {
+	// "foo.example.com" → "": worker must rebuild containers with no
+	// secondary router; in-memory CustomDomain reverts to "".
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	prov := &provision{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		SKU:          "docker-small",
+		Status:       backend.ProvisionStatusReady,
+		Manifest:     manifest,
+		ContainerIDs: []string{"old-c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
+		},
+		Quantity: 1,
+	}
+	h := newReconcileHarness(t, prov)
+
+	err := h.b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: ""},
+	})
+	require.NoError(t, err)
+
+	h.waitForCallback(t)
+	assert.Equal(t, backend.CallbackStatusSuccess, h.callbackPayload.Status)
+	assert.Equal(t, "", h.lastCreateParams(t).CustomDomain,
+		"CreateContainer must receive the cleared CustomDomain so the secondary router is dropped")
+
+	h.b.provisionsMu.RLock()
+	got := h.b.provisions["lease-1"].Items[0].CustomDomain
+	h.b.provisionsMu.RUnlock()
+	assert.Equal(t, "", got)
+}
+
+func TestReconcileCustomDomain_Changed(t *testing.T) {
+	// "foo.example.com" → "bar.example.com".
+	manifest := &DockerManifest{Image: "nginx:latest"}
+	prov := &provision{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		SKU:          "docker-small",
+		Status:       backend.ProvisionStatusReady,
+		Manifest:     manifest,
+		ContainerIDs: []string{"old-c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
+		},
+		Quantity: 1,
+	}
+	h := newReconcileHarness(t, prov)
+
+	err := h.b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "bar.example.com"},
+	})
+	require.NoError(t, err)
+
+	h.waitForCallback(t)
+	assert.Equal(t, backend.CallbackStatusSuccess, h.callbackPayload.Status)
+	assert.Equal(t, "bar.example.com", h.lastCreateParams(t).CustomDomain)
+
+	h.b.provisionsMu.RLock()
+	got := h.b.provisions["lease-1"].Items[0].CustomDomain
+	h.b.provisionsMu.RUnlock()
+	assert.Equal(t, "bar.example.com", got)
+}
+
+func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
+	// Restart() returns a synchronous error (here: no stored manifest →
+	// ErrInvalidState). ReconcileCustomDomain must roll back the in-memory
+	// CustomDomain so the next reconciler tick retries cleanly.
+	prov := &provision{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		SKU:          "docker-small",
+		Status:       backend.ProvisionStatusReady,
+		Manifest:     nil, // no manifest → Restart() returns ErrInvalidState
+		StackManifest: nil,
+		ContainerIDs: []string{"old-c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "old.example.com"},
+		},
+		Quantity: 1,
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "barney0.manifest0.net",
+		Entrypoint:     "websecure",
+	}
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.Error(t, err, "ReconcileCustomDomain must surface synchronous Restart errors")
+	assert.ErrorIs(t, err, backend.ErrInvalidState)
+
+	b.provisionsMu.RLock()
+	got := b.provisions["lease-1"].Items[0].CustomDomain
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "old.example.com", got,
+		"in-memory CustomDomain must roll back to the pre-call value when Restart fails synchronously")
 }
 
 func TestReconcileCustomDomain_LegacyEmptyServiceName(t *testing.T) {

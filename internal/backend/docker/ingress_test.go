@@ -377,6 +377,147 @@ func TestValidateCustomDomain(t *testing.T) {
 	})
 }
 
+func TestApplyIngressLabels(t *testing.T) {
+	cfg := IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "barney0.manifest0.net",
+		Entrypoint:     "websecure",
+	}
+	httpPorts := map[string]PortConfig{"80/tcp": {}}
+
+	t.Run("disabled ingress emits nothing", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "web",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      IngressConfig{Enabled: false},
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "foo.example.com",
+		}, httpPorts)
+		assert.Empty(t, labels)
+	})
+
+	t.Run("no routable port + no custom_domain emits nothing", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:   "lease-1",
+			ServiceName: "redis",
+			Instance:    0,
+			Quantity:    1,
+			Ingress:     cfg,
+			NetworkName: "fred-tenant-abc",
+		}, map[string]PortConfig{}) // no ports
+		assert.Empty(t, labels)
+	})
+
+	t.Run("no routable port + custom_domain skips both with warn", func(t *testing.T) {
+		// Regression: a tenant who set custom_domain on a TCP-only / no-HTTP
+		// service must not see Fred emit a secondary router that would
+		// reference a non-existent port. Primary is also absent (no port).
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "redis",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      cfg,
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "foo.example.com",
+		}, map[string]PortConfig{}) // no ports
+		assert.Empty(t, labels)
+	})
+
+	t.Run("primary only when CustomDomain empty", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:   "lease-1",
+			ServiceName: "web",
+			Instance:    0,
+			Quantity:    1,
+			Ingress:     cfg,
+			NetworkName: "fred-tenant-abc",
+		}, httpPorts)
+
+		assert.Equal(t, "true", labels["traefik.enable"])
+		assert.NotEmpty(t, labels[LabelFQDN])
+		assert.NotContains(t, labels, LabelCustomDomain)
+
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		assert.NotContains(t, labels, "traefik.http.routers."+customRouter+".rule")
+	})
+
+	t.Run("primary + secondary when CustomDomain valid", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "web",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      cfg,
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "foo.example.com",
+		}, httpPorts)
+
+		// Primary present.
+		primaryRouter := RouterName("lease-1", "web", 0, 1)
+		assert.Equal(t, "true", labels["traefik.http.routers."+primaryRouter+".tls"])
+		// Secondary present.
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		assert.Equal(t, "Host(`foo.example.com`)", labels["traefik.http.routers."+customRouter+".rule"])
+		assert.Equal(t, "foo.example.com", labels[LabelCustomDomain])
+	})
+
+	t.Run("invalid CustomDomain skips secondary, primary kept", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "web",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      cfg,
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "evil." + cfg.WildcardDomain, // subdomain of provider's wildcard
+		}, httpPorts)
+
+		// Primary kept.
+		primaryRouter := RouterName("lease-1", "web", 0, 1)
+		assert.Equal(t, "true", labels["traefik.http.routers."+primaryRouter+".tls"])
+		// Secondary absent.
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		assert.NotContains(t, labels, "traefik.http.routers."+customRouter+".rule")
+		assert.NotContains(t, labels, LabelCustomDomain)
+	})
+
+	t.Run("multi-instance shared secondary name across instance indices", func(t *testing.T) {
+		// Sanity check the load-balancing contract: the helper produces
+		// the same secondary router/service name for every instance index
+		// of the same (lease, service). Compose path tests assert this
+		// end-to-end; this verifies the helper's invariant directly.
+		var l0, l1, l2 map[string]string
+		for i, dst := range []*map[string]string{&l0, &l1, &l2} {
+			labels := map[string]string{}
+			applyIngressLabels(labels, ingressLabelParams{
+				LeaseUUID:    "lease-1",
+				ServiceName:  "web",
+				Instance:     i,
+				Quantity:     3,
+				Ingress:      cfg,
+				NetworkName:  "fred-tenant-abc",
+				CustomDomain: "foo.example.com",
+			}, httpPorts)
+			*dst = labels
+		}
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		ruleKey := "traefik.http.routers." + customRouter + ".rule"
+		assert.Equal(t, l0[ruleKey], l1[ruleKey])
+		assert.Equal(t, l1[ruleKey], l2[ruleKey])
+		// Primary differs per instance.
+		assert.NotEqual(t, l0[LabelFQDN], l1[LabelFQDN])
+	})
+}
+
 func TestIngressConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name    string
