@@ -106,23 +106,53 @@ func TestReconcileCustomDomain_InvalidDomainSkipsThatItem(t *testing.T) {
 	}
 
 	// "evil.barney0.manifest0.net" is a subdomain of the wildcard — chain
-	// would have rejected it; Fred's defense-in-depth check must too.
-	// "good.example.com" is fine and would normally trigger Restart, but
-	// since this is a unit test without the restart plumbing, we expect
-	// the call to either succeed (Restart accepted) or fail downstream.
-	// Here we only assert the post-condition on the BAD item: it stayed
-	// at its original empty value because validation rejected it before
-	// any in-memory mutation.
-	_ = b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+	// would have rejected it; Fred's defense-in-depth check must too. The
+	// "admin" item is left unchanged ("" → "") so it's a no-op too. With
+	// both items short-circuited, pending stays empty and the method must
+	// return nil — assert that contract here so a future regression that
+	// returns an error from the no-pending path gets caught.
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
 		{SKU: "docker-small", ServiceName: "web", CustomDomain: "evil.barney0.manifest0.net"},
 		{SKU: "docker-small", ServiceName: "admin", CustomDomain: ""}, // unchanged: also no-op
 	})
+	require.NoError(t, err, "validation-rejected items must be skipped without failing the whole reconcile")
 
 	// Bad item not mutated.
 	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain,
 		"validation-rejected item must not have its CustomDomain mutated in memory")
 	// Other unchanged item also untouched.
 	assert.Equal(t, "", b.provisions["lease-1"].Items[1].CustomDomain)
+}
+
+func TestReconcileCustomDomain_IngressDisabledIsNoOp(t *testing.T) {
+	// When the backend is configured with ingress disabled, applyIngressLabels
+	// emits no Traefik labels at all — a Restart triggered for custom-domain
+	// drift would recreate containers without LabelCustomDomain, and the next
+	// recoverState tick would rebuild prov.Items[].CustomDomain back to "" from
+	// the unlabeled containers. That puts the reconciler into a permanent
+	// restart loop against the chain's non-empty value, which a tenant could
+	// trigger by setting a custom_domain on a provider that runs ingress-less.
+	// The fix: short-circuit the reconcile when ingress is disabled.
+	provisions := map[string]*provision{
+		"lease-1": {
+			LeaseUUID: "lease-1",
+			Status:    backend.ProvisionStatusReady,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", ServiceName: "web", CustomDomain: ""},
+			},
+		},
+	}
+	b := newBackendForTest(&mockDockerClient{}, provisions)
+	b.cfg.Ingress = IngressConfig{Enabled: false}
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "web", CustomDomain: "foo.example.com"},
+	})
+	require.NoError(t, err)
+
+	// In-memory state unchanged — no Restart triggered, no mutation.
+	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain,
+		"ingress-disabled backend must not mutate prov.Items in memory")
 }
 
 func TestReconcileCustomDomain_UnknownServiceNameSkipped(t *testing.T) {

@@ -18,7 +18,18 @@ import (
 // Any other state (Provisioning, Restarting, Updating, Failing, Failed,
 // Deprovisioning, Unknown) is treated as "not the right time": skip without
 // error and let the periodic reconciler call back when the provision settles.
+//
+// No-op when this backend is configured with ingress disabled. Without
+// ingress, applyIngressLabels emits no Traefik labels (primary or secondary)
+// at all, so a Restart triggered for custom-domain drift would recreate the
+// containers with no LabelCustomDomain — and the next recoverState tick
+// would rebuild prov.Items[].CustomDomain back to "" from the unlabeled
+// containers, putting the reconciler into a permanent restart loop against
+// the chain's non-empty value. Returning early here avoids the loop.
 func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	if !b.cfg.Ingress.Enabled {
+		return nil
+	}
 	b.provisionsMu.Lock()
 	prov, ok := b.provisions[leaseUUID]
 	if !ok {
