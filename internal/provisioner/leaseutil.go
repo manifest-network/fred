@@ -92,9 +92,10 @@ func ExtractLeaseItems(lease *billingtypes.Lease) []backend.LeaseItem {
 	items := make([]backend.LeaseItem, len(lease.Items))
 	for i, item := range lease.Items {
 		items[i] = backend.LeaseItem{
-			SKU:         item.SkuUuid,
-			Quantity:    int(item.Quantity),
-			ServiceName: item.ServiceName,
+			SKU:          item.SkuUuid,
+			Quantity:     int(item.Quantity),
+			ServiceName:  item.ServiceName,
+			CustomDomain: item.CustomDomain,
 		}
 	}
 	return items

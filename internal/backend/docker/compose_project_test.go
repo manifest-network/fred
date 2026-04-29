@@ -771,4 +771,173 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 		assert.Empty(t, svc.Labels["traefik.enable"])
 		assert.Empty(t, svc.Labels[LabelFQDN])
 	})
+
+	t.Run("custom_domain emits secondary router on single-instance service", func(t *testing.T) {
+		params := baseProjectParams()
+		params.Stack.Services["web"] = &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{"80/tcp": {}},
+		}
+		params.Items[0].CustomDomain = "foo.example.com"
+		params.Ingress = ingress
+
+		project := buildComposeProject(params)
+		svc := project.Services["web"]
+
+		// Primary still present.
+		primaryRouter := RouterName(params.LeaseUUID, "web", 0, 1)
+		assert.Equal(t, "true", svc.Labels["traefik.http.routers."+primaryRouter+".tls"])
+
+		// Secondary present, with the per-service router name and a -svc service.
+		customRouter := CustomDomainRouterName(params.LeaseUUID, "web")
+		assert.Equal(t, "Host(`foo.example.com`)", svc.Labels["traefik.http.routers."+customRouter+".rule"])
+		assert.Equal(t, "http01", svc.Labels["traefik.http.routers."+customRouter+".tls.certresolver"])
+		assert.Equal(t, customRouter+"-svc", svc.Labels["traefik.http.routers."+customRouter+".service"])
+		assert.Equal(t, "80", svc.Labels["traefik.http.services."+customRouter+"-svc.loadbalancer.server.port"])
+		assert.Equal(t, "foo.example.com", svc.Labels[LabelCustomDomain])
+	})
+
+	t.Run("multi-instance emits byte-identical secondary labels", func(t *testing.T) {
+		params := baseProjectParams()
+		params.Stack.Services["web"] = &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{"80/tcp": {}},
+		}
+		params.Items[0].Quantity = 3
+		params.Items[0].CustomDomain = "foo.example.com"
+		params.Ingress = ingress
+
+		project := buildComposeProject(params)
+
+		// Compose service names are svcName-{i} when quantity > 1.
+		require.Contains(t, project.Services, "web-0")
+		require.Contains(t, project.Services, "web-1")
+		require.Contains(t, project.Services, "web-2")
+
+		customRouter := CustomDomainRouterName(params.LeaseUUID, "web")
+		secondaryKeys := []string{
+			"traefik.http.routers." + customRouter + ".rule",
+			"traefik.http.routers." + customRouter + ".entrypoints",
+			"traefik.http.routers." + customRouter + ".tls",
+			"traefik.http.routers." + customRouter + ".tls.certresolver",
+			"traefik.http.routers." + customRouter + ".middlewares",
+			"traefik.http.routers." + customRouter + ".service",
+			"traefik.http.services." + customRouter + "-svc.loadbalancer.server.port",
+		}
+
+		// Load-balancing contract: every instance container must carry the
+		// same secondary labels with the same values so Traefik aggregates
+		// them into one router + one service with N backends.
+		ref := project.Services["web-0"].Labels
+		for _, name := range []string{"web-0", "web-1", "web-2"} {
+			labels := project.Services[name].Labels
+			for _, k := range secondaryKeys {
+				assert.Equal(t, ref[k], labels[k], "secondary label %q must be byte-identical on every instance (got difference on %s)", k, name)
+				assert.NotEmpty(t, labels[k], "secondary label %q must be set on %s", k, name)
+			}
+			assert.Equal(t, "foo.example.com", labels[LabelCustomDomain])
+		}
+
+		// Primary routers are per-instance; each instance has its own.
+		for i, name := range []string{"web-0", "web-1", "web-2"} {
+			labels := project.Services[name].Labels
+			primaryRouter := RouterName(params.LeaseUUID, "web", i, 3)
+			assert.Equal(t, "true", labels["traefik.http.routers."+primaryRouter+".tls"])
+		}
+	})
+
+	t.Run("multi-service stack emits secondary only on the item that owns it", func(t *testing.T) {
+		params := baseProjectParams()
+		params.Stack = &StackManifest{
+			Services: map[string]*DockerManifest{
+				"frontend": {Image: "nginx:latest", Ports: map[string]PortConfig{"80/tcp": {}}},
+				"db":       {Image: "postgres:15", Ports: map[string]PortConfig{"80/tcp": {}}}, // give a routable HTTP port to isolate "no custom_domain on this item"
+			},
+		}
+		params.Items = []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "frontend", CustomDomain: "myblog.com"},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		}
+		params.ImageSetups = map[string]*imageSetup{"frontend": {}, "db": {}}
+		params.Ingress = ingress
+
+		project := buildComposeProject(params)
+
+		feLabels := project.Services["frontend"].Labels
+		dbLabels := project.Services["db"].Labels
+
+		assert.Equal(t, "myblog.com", feLabels[LabelCustomDomain])
+		assert.Empty(t, dbLabels[LabelCustomDomain])
+
+		feRouter := CustomDomainRouterName(params.LeaseUUID, "frontend")
+		dbRouter := CustomDomainRouterName(params.LeaseUUID, "db")
+		assert.Equal(t, "Host(`myblog.com`)", feLabels["traefik.http.routers."+feRouter+".rule"])
+		assert.NotContains(t, dbLabels, "traefik.http.routers."+dbRouter+".rule")
+	})
+
+	t.Run("invalid custom_domain skips secondary, primary keeps working", func(t *testing.T) {
+		params := baseProjectParams()
+		params.Stack.Services["web"] = &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{"80/tcp": {}},
+		}
+		// Subdomain of the wildcard — chain would reject this on
+		// MsgSetLeaseItemCustomDomain, but Fred validates defense-in-depth.
+		params.Items[0].CustomDomain = "evil." + ingress.WildcardDomain
+		params.Ingress = ingress
+
+		project := buildComposeProject(params)
+		svc := project.Services["web"]
+
+		// Primary still emitted.
+		primaryRouter := RouterName(params.LeaseUUID, "web", 0, 1)
+		assert.Equal(t, "true", svc.Labels["traefik.http.routers."+primaryRouter+".tls"])
+
+		// Secondary skipped — no custom-domain label, no secondary router rule.
+		customRouter := CustomDomainRouterName(params.LeaseUUID, "web")
+		assert.NotContains(t, svc.Labels, "traefik.http.routers."+customRouter+".rule")
+		assert.Empty(t, svc.Labels[LabelCustomDomain])
+	})
+
+	t.Run("custom_domain on service with no routable port is skipped", func(t *testing.T) {
+		params := baseProjectParams()
+		params.Stack.Services["web"] = &DockerManifest{
+			Image: "redis:7", // no ports
+		}
+		params.Items[0].CustomDomain = "foo.example.com"
+		params.Ingress = ingress
+
+		project := buildComposeProject(params)
+		svc := project.Services["web"]
+
+		// No primary, no secondary.
+		assert.Empty(t, svc.Labels["traefik.enable"])
+		customRouter := CustomDomainRouterName(params.LeaseUUID, "web")
+		assert.NotContains(t, svc.Labels, "traefik.http.routers."+customRouter+".rule")
+		assert.Empty(t, svc.Labels[LabelCustomDomain])
+	})
+
+	t.Run("empty custom_domain does not change behavior", func(t *testing.T) {
+		// Regression guard: items without CustomDomain should produce the
+		// same labels as before this feature shipped.
+		paramsA := baseProjectParams()
+		paramsA.Stack.Services["web"] = &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{"80/tcp": {}},
+		}
+		paramsA.Ingress = ingress
+
+		paramsB := baseProjectParams()
+		paramsB.Stack.Services["web"] = &DockerManifest{
+			Image: "nginx:latest",
+			Ports: map[string]PortConfig{"80/tcp": {}},
+		}
+		paramsB.Items[0].CustomDomain = ""
+		paramsB.Ingress = ingress
+
+		assert.Equal(t,
+			buildComposeProject(paramsA).Services["web"].Labels,
+			buildComposeProject(paramsB).Services["web"].Labels,
+		)
+	})
 }

@@ -110,15 +110,34 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			for idx := range prov.Items {
 				if prov.Items[idx].ServiceName == c.ServiceName {
 					prov.Items[idx].Quantity = len(prov.ServiceContainers[c.ServiceName])
+					// CustomDomain is per-service: all instance containers
+					// of a service carry byte-identical labels. Trust the
+					// first one we recovered; later iterations are no-ops.
+					if prov.Items[idx].CustomDomain == "" && c.CustomDomain != "" {
+						prov.Items[idx].CustomDomain = c.CustomDomain
+					}
 					found = true
 					break
 				}
 			}
 			if !found {
 				prov.Items = append(prov.Items, backend.LeaseItem{
-					SKU:         c.SKU,
-					Quantity:    1,
-					ServiceName: c.ServiceName,
+					SKU:          c.SKU,
+					Quantity:     1,
+					ServiceName:  c.ServiceName,
+					CustomDomain: c.CustomDomain,
+				})
+			}
+		} else {
+			// Legacy single-item lease: rebuild prov.Items[0] from this
+			// (only) container's labels so Restart/Update can re-emit the
+			// secondary router. Idempotent across recovery iterations
+			// because legacy provisions hold one container.
+			if len(prov.Items) == 0 {
+				prov.Items = append(prov.Items, backend.LeaseItem{
+					SKU:          c.SKU,
+					Quantity:     1,
+					CustomDomain: c.CustomDomain,
 				})
 			}
 		}

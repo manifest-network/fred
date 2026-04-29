@@ -489,6 +489,9 @@ func (m *mockLatencyBackend) Restart(ctx context.Context, req backend.RestartReq
 func (m *mockLatencyBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return nil
 }
+func (m *mockLatencyBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	return nil
+}
 func (m *mockLatencyBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
 	return nil, backend.ErrNotProvisioned
 }

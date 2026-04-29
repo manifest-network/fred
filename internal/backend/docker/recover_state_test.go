@@ -826,6 +826,101 @@ func TestRecoverState(t *testing.T) {
 	})
 }
 
+func TestRecoverState_RestoresCustomDomain(t *testing.T) {
+	now := time.Now()
+
+	t.Run("legacy single-container lease", func(t *testing.T) {
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+						CustomDomain:  "foo.example.com",
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+
+		require.NoError(t, b.recoverState(context.Background()))
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		require.Len(t, prov.Items, 1, "legacy provision must rebuild Items[0] from labels")
+		assert.Equal(t, "", prov.Items[0].ServiceName)
+		assert.Equal(t, "foo.example.com", prov.Items[0].CustomDomain)
+	})
+
+	t.Run("stack lease restores per-service custom_domain", func(t *testing.T) {
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{
+					{
+						ContainerID:   "c-web-0",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						ServiceName:   "web",
+						InstanceIndex: 0,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+						CustomDomain:  "myblog.com",
+					},
+					{
+						ContainerID:   "c-web-1",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						ServiceName:   "web",
+						InstanceIndex: 1,
+						Image:         "nginx:latest",
+						Status:        "running",
+						CreatedAt:     now,
+						CustomDomain:  "myblog.com",
+					},
+					{
+						ContainerID:   "c-db",
+						LeaseUUID:     "lease-1",
+						Tenant:        "tenant-a",
+						ProviderUUID:  "prov-1",
+						SKU:           "docker-small",
+						ServiceName:   "db",
+						InstanceIndex: 0,
+						Image:         "postgres:15",
+						Status:        "running",
+						CreatedAt:     now,
+						// db has no custom_domain
+					},
+				}, nil
+			},
+		}
+		b := newBackendForTest(mock, nil)
+
+		require.NoError(t, b.recoverState(context.Background()))
+		prov := b.provisions["lease-1"]
+		require.NotNil(t, prov)
+		require.Len(t, prov.Items, 2)
+
+		byService := make(map[string]backend.LeaseItem, len(prov.Items))
+		for _, it := range prov.Items {
+			byService[it.ServiceName] = it
+		}
+		assert.Equal(t, "myblog.com", byService["web"].CustomDomain, "web's custom_domain restored from labels")
+		assert.Equal(t, 2, byService["web"].Quantity, "web's quantity counts both instance containers")
+		assert.Equal(t, "", byService["db"].CustomDomain, "db keeps an empty custom_domain")
+	})
+}
+
 func TestRecoverState_SetsActiveProvisionsGauge(t *testing.T) {
 	now := time.Now()
 

@@ -399,6 +399,7 @@ type mockBackend struct {
 	LookupProvisionsFunc func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	RestartFunc          func(ctx context.Context, req backend.RestartRequest) error
 	UpdateFunc           func(ctx context.Context, req backend.UpdateRequest) error
+	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleasesFunc      func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	HealthFunc           func(ctx context.Context) error
 	StatsFunc            func() shared.ResourceStats
@@ -465,6 +466,15 @@ func (m *mockBackend) Update(ctx context.Context, req backend.UpdateRequest) err
 		panic("mockBackend.Update called but not configured")
 	}
 	return m.UpdateFunc(ctx, req)
+}
+
+func (m *mockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	if m.ReconcileCustomDomainFunc == nil {
+		// No-op default — most tests don't exercise this method, and the
+		// reconciler hits the endpoint on every healthy active lease.
+		return nil
+	}
+	return m.ReconcileCustomDomainFunc(ctx, leaseUUID, items)
 }
 
 func (m *mockBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {

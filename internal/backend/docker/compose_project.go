@@ -2,6 +2,7 @@ package docker
 
 import (
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"strconv"
@@ -73,6 +74,7 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				Cfg:          params.Cfg,
 				Ingress:      params.Ingress,
 				Quantity:     item.Quantity,
+				CustomDomain: item.CustomDomain,
 			})
 
 			// Apply volume binds if present.
@@ -232,6 +234,7 @@ type composeServiceParams struct {
 	Cfg          *Config
 	Ingress      IngressConfig
 	Quantity     int
+	CustomDomain string // tenant-supplied FQDN; "" when not set
 }
 
 func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfig {
@@ -405,6 +408,31 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 				labels[k] = v
 			}
 			labels[LabelFQDN] = fqdn
+
+			// Secondary router for tenant-supplied custom domain (if any).
+			// Per-service (not per-instance): all instance containers of a
+			// service emit byte-identical secondary labels so Traefik
+			// aggregates them into one router + one service with N backends.
+			if p.CustomDomain != "" {
+				if err := validateCustomDomain(p.CustomDomain, p.Ingress.WildcardDomain); err != nil {
+					slog.Error("skipping custom-domain router (validation failed)",
+						"lease_uuid", p.LeaseUUID,
+						"service_name", p.ServiceName,
+						"custom_domain", p.CustomDomain,
+						"error", err)
+				} else {
+					customRouterName := CustomDomainRouterName(p.LeaseUUID, p.ServiceName)
+					for k, v := range TraefikCustomDomainLabels(p.Ingress, customRouterName, p.CustomDomain, port) {
+						labels[k] = v
+					}
+					labels[LabelCustomDomain] = p.CustomDomain
+				}
+			}
+		} else if p.CustomDomain != "" {
+			slog.Warn("custom_domain set on item with no routable HTTP port; skipping",
+				"lease_uuid", p.LeaseUUID,
+				"service_name", p.ServiceName,
+				"custom_domain", p.CustomDomain)
 		}
 	}
 

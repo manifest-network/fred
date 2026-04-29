@@ -27,16 +27,23 @@ var noopAck = &mockAcknowledger{}
 
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
-	mu                  sync.Mutex
-	name                string
-	provisions          []backend.ProvisionInfo
-	provisionCalls      []backend.ProvisionRequest
-	deprovisionCalls    []string
-	listProvisionsCalls int
-	provisionErr        error
-	deprovisionErr      error
-	listErr             error
-	refreshErr          error
+	mu                       sync.Mutex
+	name                     string
+	provisions               []backend.ProvisionInfo
+	provisionCalls           []backend.ProvisionRequest
+	deprovisionCalls         []string
+	listProvisionsCalls      int
+	reconcileCustomDomainArgs []reconcileCustomDomainCall
+	reconcileCustomDomainErr error
+	provisionErr             error
+	deprovisionErr           error
+	listErr                  error
+	refreshErr               error
+}
+
+type reconcileCustomDomainCall struct {
+	leaseUUID string
+	items     []backend.LeaseItem
 }
 
 func (m *mockReconcilerBackend) Name() string {
@@ -117,6 +124,15 @@ func (m *mockReconcilerBackend) Restart(ctx context.Context, req backend.Restart
 }
 func (m *mockReconcilerBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return nil
+}
+func (m *mockReconcilerBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reconcileCustomDomainArgs = append(m.reconcileCustomDomainArgs, reconcileCustomDomainCall{
+		leaseUUID: leaseUUID,
+		items:     append([]backend.LeaseItem(nil), items...),
+	})
+	return m.reconcileCustomDomainErr
 }
 func (m *mockReconcilerBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
 	return nil, backend.ErrNotProvisioned
@@ -542,6 +558,90 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	assert.Equal(t, 0, provisionCount)
 	assert.Equal(t, 0, deprovisionCount)
 	assert.Equal(t, 0, ackCount)
+}
+
+func TestReconciler_ReconcileAll_ActiveProvisioned_CallsReconcileCustomDomain(t *testing.T) {
+	// On every healthy active lease, the reconciler must dispatch the
+	// chain Items[].CustomDomain values to Backend.ReconcileCustomDomain
+	// so the backend can detect and apply drift.
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE,
+					Items: []billingtypes.LeaseItem{
+						{SkuUuid: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "foo.example.com"},
+					},
+				},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady, BackendName: "test"},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	mockBackend.mu.Lock()
+	calls := append([]reconcileCustomDomainCall(nil), mockBackend.reconcileCustomDomainArgs...)
+	mockBackend.mu.Unlock()
+
+	require.Len(t, calls, 1, "exactly one ReconcileCustomDomain call per healthy active lease")
+	assert.Equal(t, "lease-1", calls[0].leaseUUID)
+	require.Len(t, calls[0].items, 1)
+	assert.Equal(t, "web", calls[0].items[0].ServiceName)
+	assert.Equal(t, "foo.example.com", calls[0].items[0].CustomDomain)
+}
+
+func TestReconciler_ReconcileAll_ReconcileCustomDomainErrorDoesNotAbortTick(t *testing.T) {
+	// A failure on ReconcileCustomDomain for one lease must not stop
+	// processing of other leases on the same tick.
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+				{Uuid: "lease-2", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady, BackendName: "test"},
+			{LeaseUUID: "lease-2", Status: backend.ProvisionStatusReady, BackendName: "test"},
+		},
+		reconcileCustomDomainErr: assert.AnError,
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, nil)
+	require.NoError(t, err)
+
+	// ReconcileAll surfaces the error (hadError=true), but we want both
+	// leases to have been visited despite the first failing.
+	_ = reconciler.ReconcileAll(t.Context())
+
+	mockBackend.mu.Lock()
+	count := len(mockBackend.reconcileCustomDomainArgs)
+	mockBackend.mu.Unlock()
+	assert.Equal(t, 2, count, "both leases must be reconciled despite per-lease errors")
 }
 
 func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
@@ -1398,6 +1498,9 @@ func (m *mockCancellingBackend) Restart(ctx context.Context, req backend.Restart
 func (m *mockCancellingBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return nil
 }
+func (m *mockCancellingBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	return nil
+}
 func (m *mockCancellingBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
 	return nil, backend.ErrNotProvisioned
 }
@@ -1816,6 +1919,9 @@ func (m *mockConcurrencyBackend) Restart(ctx context.Context, req backend.Restar
 	return nil
 }
 func (m *mockConcurrencyBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	return nil
+}
+func (m *mockConcurrencyBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
 	return nil
 }
 func (m *mockConcurrencyBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {

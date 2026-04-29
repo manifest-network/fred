@@ -196,9 +196,12 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	b.provisionsMu.Lock()
 	if prov, ok := b.provisions[req.LeaseUUID]; ok {
 		prov.SKU = req.RoutingSKU()
+		// Items are populated for both stack and legacy: stack uses them at
+		// rebuild time, legacy uses Items[0].CustomDomain for the secondary
+		// router on Restart/Update.
+		prov.Items = req.Items
 		if isStack {
 			prov.StackManifest = stackManifest
-			prov.Items = req.Items
 		} else {
 			prov.Image = manifest.Image
 		}
@@ -830,6 +833,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				Ingress:           b.cfg.Ingress,
 				NetworkName:       TenantNetworkName(req.Tenant),
 				Quantity:          totalQuantity,
+				CustomDomain:      item.CustomDomain,
 			}, b.cfg.ContainerCreateTimeout)
 			containerCreateDurationSeconds.Observe(time.Since(createStart).Seconds())
 			if createErr != nil {

@@ -275,6 +275,11 @@ func (m *MockBackend) Update(ctx context.Context, req UpdateRequest) error {
 	return nil
 }
 
+// ReconcileCustomDomain is a no-op for mock backend.
+func (m *MockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []LeaseItem) error {
+	return nil
+}
+
 // GetReleases returns empty releases for mock backend.
 func (m *MockBackend) GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error) {
 	m.mu.Lock()

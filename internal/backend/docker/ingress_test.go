@@ -270,6 +270,113 @@ func TestTraefikLabels(t *testing.T) {
 	assert.Equal(t, "80", labels["traefik.http.services.fred-web-abc1234.loadbalancer.server.port"])
 }
 
+func TestCustomDomainRouterName(t *testing.T) {
+	const lease = "lease-abc"
+	const svc = "web"
+
+	// Per-service: instance index must NOT change the result.
+	r0 := CustomDomainRouterName(lease, svc)
+	r1 := CustomDomainRouterName(lease, svc)
+	assert.Equal(t, r0, r1, "router name must be deterministic per (leaseUUID, serviceName)")
+
+	// Different (lease, service) tuples produce different names.
+	assert.NotEqual(t, r0, CustomDomainRouterName(lease, "db"))
+	assert.NotEqual(t, r0, CustomDomainRouterName("lease-other", svc))
+
+	// Distinct from the per-instance primary RouterName, regardless of instance.
+	assert.NotEqual(t, r0, RouterName(lease, svc, 0, 1))
+	assert.NotEqual(t, r0, RouterName(lease, svc, 0, 3))
+	assert.NotEqual(t, r0, RouterName(lease, svc, 1, 3))
+
+	// Deterministic suffix.
+	assert.Contains(t, r0, "-custom")
+
+	// Legacy single-item lease (empty service name) still produces a name.
+	legacy := CustomDomainRouterName(lease, "")
+	assert.NotEmpty(t, legacy)
+	assert.NotEqual(t, legacy, r0)
+}
+
+func TestTraefikCustomDomainLabels(t *testing.T) {
+	t.Run("defaults applied", func(t *testing.T) {
+		cfg := IngressConfig{Enabled: true, Entrypoint: "websecure"}
+		labels := TraefikCustomDomainLabels(cfg, "fred-web-abc-custom", "foo.example.com", 80)
+
+		assert.Equal(t, "Host(`foo.example.com`)", labels["traefik.http.routers.fred-web-abc-custom.rule"])
+		assert.Equal(t, "websecure", labels["traefik.http.routers.fred-web-abc-custom.entrypoints"])
+		assert.Equal(t, "true", labels["traefik.http.routers.fred-web-abc-custom.tls"])
+		assert.Equal(t, "http01", labels["traefik.http.routers.fred-web-abc-custom.tls.certresolver"])
+		assert.Equal(t, "security-headers@file", labels["traefik.http.routers.fred-web-abc-custom.middlewares"])
+		assert.Equal(t, "fred-web-abc-custom-svc", labels["traefik.http.routers.fred-web-abc-custom.service"])
+		assert.Equal(t, "80", labels["traefik.http.services.fred-web-abc-custom-svc.loadbalancer.server.port"])
+
+		// Secondary must NOT re-emit traefik.enable / traefik.docker.network
+		// (those are per-container, owned by the primary block).
+		assert.NotContains(t, labels, "traefik.enable")
+		assert.NotContains(t, labels, "traefik.docker.network")
+	})
+
+	t.Run("configurable cert resolver and middlewares", func(t *testing.T) {
+		cfg := IngressConfig{
+			Enabled:                  true,
+			Entrypoint:               "websecure",
+			CustomDomainCertResolver: "letsencrypt-staging",
+			CustomDomainMiddlewares:  []string{"hsts@file", "compress@file"},
+		}
+		labels := TraefikCustomDomainLabels(cfg, "fred-web-abc-custom", "foo.example.com", 8080)
+
+		assert.Equal(t, "letsencrypt-staging", labels["traefik.http.routers.fred-web-abc-custom.tls.certresolver"])
+		assert.Equal(t, "hsts@file,compress@file", labels["traefik.http.routers.fred-web-abc-custom.middlewares"])
+		assert.Equal(t, "8080", labels["traefik.http.services.fred-web-abc-custom-svc.loadbalancer.server.port"])
+	})
+
+	t.Run("byte-identical across calls with same inputs", func(t *testing.T) {
+		cfg := IngressConfig{Enabled: true, Entrypoint: "websecure"}
+		a := TraefikCustomDomainLabels(cfg, "fred-web-custom", "foo.example.com", 80)
+		b := TraefikCustomDomainLabels(cfg, "fred-web-custom", "foo.example.com", 80)
+		assert.Equal(t, a, b, "load-balancing requires byte-identical labels across all instance containers")
+	})
+}
+
+func TestValidateCustomDomain(t *testing.T) {
+	const wildcard = "barney0.manifest0.net"
+
+	tests := []struct {
+		name    string
+		domain  string
+		wantErr string
+	}{
+		{name: "well-formed", domain: "foo.example.com"},
+		{name: "subdomain", domain: "admin.foo.example.com"},
+		{name: "empty", domain: "", wantErr: "empty domain"},
+		{name: "uppercase rejected", domain: "Foo.example.com", wantErr: "lowercase"},
+		{name: "scheme rejected", domain: "https://foo.example.com", wantErr: "scheme"},
+		{name: "leading dot rejected", domain: ".foo.example.com", wantErr: "must not start with"},
+		{name: "no separator rejected", domain: "localhost", wantErr: "separator"},
+		{name: "equals wildcard", domain: wildcard, wantErr: "wildcard suffix"},
+		{name: "subdomain of wildcard", domain: "evil." + wildcard, wantErr: "wildcard suffix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCustomDomain(tt.domain, wildcard)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr, fmt.Sprintf("error: %v", err))
+			}
+		})
+	}
+
+	t.Run("empty wildcard skips local check", func(t *testing.T) {
+		// IngressConfig.Validate already requires non-empty wildcard when
+		// enabled; this just covers the defensive nil-cfg branch.
+		err := validateCustomDomain("foo.example.com", "")
+		require.NoError(t, err)
+	})
+}
+
 func TestIngressConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name    string

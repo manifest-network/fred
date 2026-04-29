@@ -178,6 +178,7 @@ type backendService interface {
 	LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	Restart(ctx context.Context, req backend.RestartRequest) error
 	Update(ctx context.Context, req backend.UpdateRequest) error
+	ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	Health(ctx context.Context) error
 	Stats() shared.ResourceStats
@@ -212,6 +213,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
 	mux.Handle("POST /restart", authMw(http.HandlerFunc(s.handleRestart)))
 	mux.Handle("POST /update", authMw(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("POST /reconcile_custom_domain", authMw(http.HandlerFunc(s.handleReconcileCustomDomain)))
 	mux.Handle("GET /releases/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetReleases)))
 
 	// Operational endpoints — no auth required (monitoring, health checks).
@@ -384,6 +386,26 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "restarting"})
+}
+
+func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Request) {
+	var req backend.ReconcileCustomDomainRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.LeaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+
+	if err := s.backend.ReconcileCustomDomain(r.Context(), req.LeaseUUID, req.Items); err != nil {
+		s.logger.Error("reconcile_custom_domain failed", "lease_uuid", req.LeaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {

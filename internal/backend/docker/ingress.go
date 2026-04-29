@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
 
 // IngressConfig holds configuration for reverse proxy integration.
@@ -24,7 +26,23 @@ type IngressConfig struct {
 	Enabled        bool   `yaml:"enabled"`
 	WildcardDomain string `yaml:"wildcard_domain"`
 	Entrypoint     string `yaml:"entrypoint"`
+
+	// CustomDomainCertResolver is the Traefik certresolver name used for
+	// per-tenant custom domains (HTTP-01 by default). Defaults to "http01"
+	// when empty.
+	CustomDomainCertResolver string `yaml:"custom_domain_cert_resolver"`
+
+	// CustomDomainMiddlewares is the list of Traefik middleware references
+	// applied to the secondary custom-domain router. Defaults to
+	// ["security-headers@file"] when empty.
+	CustomDomainMiddlewares []string `yaml:"custom_domain_middlewares"`
 }
+
+// Defaults applied at label-emit time when IngressConfig fields are empty.
+const (
+	defaultCustomDomainCertResolver = "http01"
+	defaultCustomDomainMiddleware   = "security-headers@file"
+)
 
 // maxDNSLabel is the maximum length of a single DNS label (RFC 1035).
 const maxDNSLabel = 63
@@ -185,6 +203,80 @@ func (ic *IngressConfig) Validate() error {
 	}
 	if ic.Entrypoint == "" {
 		return fmt.Errorf("ingress.entrypoint is required when ingress is enabled")
+	}
+	return nil
+}
+
+// CustomDomainRouterName returns a Traefik router name shared across all
+// instances of (leaseUUID, serviceName). Custom domain is per-LeaseItem
+// (per-service, not per-instance), so this name is the same regardless of
+// instance index — every instance container of the service emits the same
+// secondary-router labels and Traefik aggregates them into one router with
+// N backends. The "-custom" suffix avoids any collision with the
+// per-instance primary router name produced by RouterName.
+func CustomDomainRouterName(leaseUUID, serviceName string) string {
+	return "fred-" + ComputeSubdomain(leaseUUID, serviceName, 0, 1) + "-custom"
+}
+
+// TraefikCustomDomainLabels generates the secondary Traefik labels that
+// route a tenant-supplied custom domain to the same per-tenant container(s)
+// served by the primary router. The returned map is intended to be merged
+// into a container's label set alongside the primary TraefikLabels output.
+//
+// Multi-instance services (quantity > 1) are load-balanced by emitting
+// these byte-identical labels on every instance container: Traefik's Docker
+// provider deduplicates the router by name and aggregates the service into
+// one with N backends. For single-instance services this is the same path
+// with a degenerate single backend.
+//
+// The router uses cfg.CustomDomainCertResolver (default "http01") for
+// per-domain ACME and cfg.CustomDomainMiddlewares (default
+// "security-headers@file") for transport-level hardening. The entrypoint
+// reuses the existing IngressConfig.Entrypoint so the secondary router
+// shares the primary's TLS termination posture.
+func TraefikCustomDomainLabels(cfg IngressConfig, customRouterName, customDomain string, containerPort int) map[string]string {
+	resolver := cfg.CustomDomainCertResolver
+	if resolver == "" {
+		resolver = defaultCustomDomainCertResolver
+	}
+	middlewares := cfg.CustomDomainMiddlewares
+	if len(middlewares) == 0 {
+		middlewares = []string{defaultCustomDomainMiddleware}
+	}
+	customServiceName := customRouterName + "-svc"
+	return map[string]string{
+		fmt.Sprintf("traefik.http.routers.%s.rule", customRouterName):              fmt.Sprintf("Host(`%s`)", customDomain),
+		fmt.Sprintf("traefik.http.routers.%s.entrypoints", customRouterName):       cfg.Entrypoint,
+		fmt.Sprintf("traefik.http.routers.%s.tls", customRouterName):               "true",
+		fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", customRouterName):  resolver,
+		fmt.Sprintf("traefik.http.routers.%s.middlewares", customRouterName):       strings.Join(middlewares, ","),
+		fmt.Sprintf("traefik.http.routers.%s.service", customRouterName):           customServiceName,
+		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", customServiceName): strconv.Itoa(containerPort),
+	}
+}
+
+// validateCustomDomain is Fred's defense-in-depth check on a tenant-supplied
+// custom domain before emitting Traefik labels. Chain authoritatively
+// validates the FQDN format, reserved-suffix collisions, and global
+// uniqueness in MsgSetLeaseItemCustomDomain; this function re-runs the
+// cheap checks at emit time so a corrupted or out-of-band-set domain
+// can never produce labels.
+//
+// Reuses billingtypes.IsValidFQDN for format. Locally rejects domains
+// equal to or under wildcardDomain so the provider's own subdomain space
+// (which the wildcard cert covers) cannot be hijacked even if chain's
+// reserved-suffix list is misconfigured.
+func validateCustomDomain(domain, wildcardDomain string) error {
+	if err := billingtypes.IsValidFQDN(domain); err != nil {
+		return err
+	}
+	if wildcardDomain == "" {
+		return nil
+	}
+	d := strings.ToLower(strings.TrimSpace(domain))
+	w := strings.ToLower(strings.TrimSpace(wildcardDomain))
+	if d == w || strings.HasSuffix(d, "."+w) {
+		return fmt.Errorf("custom domain %q is under the provider's wildcard suffix %q", domain, wildcardDomain)
 	}
 	return nil
 }
