@@ -45,10 +45,19 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	// provision item by ServiceName (legacy uses "" on both sides), validate
 	// the new domain, and stage the change. Validation failures are skipped
 	// per item — bad inputs never block the rest of the reconcile.
+	//
+	// Rollback identifies items by ServiceName (NOT by index) plus a
+	// value-CAS check. Between this section's unlock and the rollback path's
+	// re-lock, recoverState (running on the docker-backend's own
+	// reconcileLoop) can swap b.provisions, replacing the provision struct
+	// with a freshly-rebuilt one whose Items may be in a different order.
+	// A stored index would silently target the wrong item; a stored
+	// ServiceName + value-CAS is robust against any reordering and against
+	// any concurrent mutation that already supplied the rolled-back value.
 	type pendingChange struct {
-		index    int
-		oldValue string
-		newValue string
+		serviceName string
+		oldValue    string
+		newValue    string
 	}
 	var pending []pendingChange
 
@@ -87,11 +96,15 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 				continue
 			}
 		}
+		// Apply now while we still hold the lock; the snapshot for rollback
+		// keys on ServiceName so we can safely re-find the item if the
+		// provision struct is replaced before rollback runs.
 		pending = append(pending, pendingChange{
-			index:    idx,
-			oldValue: prov.Items[idx].CustomDomain,
-			newValue: chainItem.CustomDomain,
+			serviceName: chainItem.ServiceName,
+			oldValue:    prov.Items[idx].CustomDomain,
+			newValue:    chainItem.CustomDomain,
 		})
+		prov.Items[idx].CustomDomain = chainItem.CustomDomain
 	}
 
 	if len(pending) == 0 {
@@ -99,11 +112,6 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		return nil
 	}
 
-	// Apply the new values in memory before triggering Restart so the
-	// rebuild reads the updated CustomDomain via prov.Items.
-	for _, ch := range pending {
-		prov.Items[ch.index].CustomDomain = ch.newValue
-	}
 	callbackURL := prov.CallbackURL
 	b.provisionsMu.Unlock()
 
@@ -123,11 +131,24 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		// the same drift and tries again. The provision is still running
 		// the OLD containers (Restart's rollback restores them), so the
 		// in-memory state must match.
+		//
+		// Look up by ServiceName (not stored index) and gate the write on
+		// the current value still being newValue. If recoverState rebuilt
+		// b.provisions with a reordered Items slice, ServiceName lookup
+		// targets the correct item; the CAS makes the rollback a no-op
+		// when something else (e.g., recoverState reading from container
+		// labels) has already restored the previous value.
 		b.provisionsMu.Lock()
 		if prov, ok := b.provisions[leaseUUID]; ok {
 			for _, ch := range pending {
-				if ch.index < len(prov.Items) {
-					prov.Items[ch.index].CustomDomain = ch.oldValue
+				for i := range prov.Items {
+					if prov.Items[i].ServiceName != ch.serviceName {
+						continue
+					}
+					if prov.Items[i].CustomDomain == ch.newValue {
+						prov.Items[i].CustomDomain = ch.oldValue
+					}
+					break
 				}
 			}
 		}

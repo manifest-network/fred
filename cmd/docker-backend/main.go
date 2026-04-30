@@ -400,6 +400,21 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := s.backend.ReconcileCustomDomain(r.Context(), req.LeaseUUID, req.Items); err != nil {
+		// Surface ErrNotProvisioned and ErrInvalidState as 404/409 so the
+		// HTTPClient can map them back to typed errors. Both signal benign
+		// races (lease just deprovisioned, or status flipped between our
+		// pre-check and Restart's own check) — the providerd-side circuit
+		// breaker exempts them from the trip count. Collapsing them into
+		// 500 here would cause the CB to count routine reconcile-tick
+		// races as backend failures.
+		if errors.Is(err, backend.ErrNotProvisioned) {
+			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponse(w, http.StatusConflict, "invalid state for reconcile")
+			return
+		}
 		s.logger.Error("reconcile_custom_domain failed", "lease_uuid", req.LeaseUUID, "error", err)
 		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
 		return

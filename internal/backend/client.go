@@ -980,6 +980,10 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 		switch resp.StatusCode {
 		case http.StatusAccepted, http.StatusNoContent:
 			return nil, nil
+		case http.StatusNotFound:
+			return nil, ErrNotProvisioned
+		case http.StatusConflict:
+			return nil, ErrInvalidState
 		default:
 			return nil, fmt.Errorf("reconcile_custom_domain failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}

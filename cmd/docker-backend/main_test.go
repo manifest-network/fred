@@ -381,6 +381,51 @@ func TestReconcileCustomDomain_BackendErrorReturns500(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
+func TestReconcileCustomDomain_NotProvisionedReturns404(t *testing.T) {
+	// ErrNotProvisioned must surface as 404 so HTTPClient can map it back
+	// to the typed error, which the providerd-side circuit breaker exempts
+	// from the trip count via IsSuccessful. Collapsing it into 500 would
+	// trip the CB on routine reconcile-tick races where the lease was
+	// concurrently deprovisioned.
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			return backend.ErrNotProvisioned
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1"}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Contains(t, w.Body.String(), "not provisioned")
+}
+
+func TestReconcileCustomDomain_InvalidStateReturns409(t *testing.T) {
+	// Same rationale as the 404 path: ErrInvalidState is a benign race when
+	// the lease's status flipped between our pre-check and Restart's own
+	// check, and providerd's circuit breaker exempts it. 409 keeps the
+	// signal typed across the wire.
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			return backend.ErrInvalidState
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1"}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid state")
+}
+
 // --- Update handler tests ---
 
 func TestUpdate_RequiresAuth(t *testing.T) {

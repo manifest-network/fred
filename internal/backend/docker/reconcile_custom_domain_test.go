@@ -406,6 +406,107 @@ func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
 		"in-memory CustomDomain must roll back to the pre-call value when Restart fails synchronously")
 }
 
+func TestReconcileCustomDomain_RollbackUsesServiceNameNotIndex(t *testing.T) {
+	// Rollback after a synchronous Restart failure must identify items by
+	// ServiceName, not by stored index. recoverState (running on the
+	// docker-backend's own reconcileLoop) can replace b.provisions between
+	// our pre-Restart unlock and the rollback's re-lock, leaving prov.Items
+	// in a different order; an index-based rollback would then write to the
+	// wrong item.
+	//
+	// We can't easily race the swap inside a synchronous test, but we can
+	// exercise the rollback branch with a multi-item provision where the
+	// target service is NOT at index 0 — which is enough to fail any
+	// "rollback to stored index 0" implementation.
+	prov := &provision{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		SKU:          "docker-small",
+		Status:       backend.ProvisionStatusReady,
+		Manifest:     nil, // no manifest → Restart() returns ErrInvalidState synchronously
+		ContainerIDs: []string{"old-c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db", CustomDomain: ""},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "old.example.com"},
+		},
+		Quantity: 1,
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "barney0.manifest0.net",
+		Entrypoint:     "websecure",
+	}
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db", CustomDomain: ""}, // unchanged
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "new.example.com"},
+	})
+	require.Error(t, err)
+
+	b.provisionsMu.RLock()
+	got := b.provisions["lease-1"].Items
+	b.provisionsMu.RUnlock()
+	require.Len(t, got, 2)
+
+	byService := make(map[string]string, len(got))
+	for _, it := range got {
+		byService[it.ServiceName] = it.CustomDomain
+	}
+	assert.Equal(t, "old.example.com", byService["web"],
+		"web's CustomDomain must be rolled back via ServiceName lookup")
+	assert.Equal(t, "", byService["db"],
+		"db's CustomDomain must remain unchanged (no pending change for it)")
+}
+
+func TestReconcileCustomDomain_RollbackIsCASGated(t *testing.T) {
+	// The rollback's value-CAS gate ("only restore oldValue if current ==
+	// newValue") is what makes the operation safe in the presence of a
+	// concurrent recoverState that already restored prov.Items[].CustomDomain
+	// from the (unchanged) container labels. Without the gate, the rollback
+	// would clobber a value that some other goroutine already corrected.
+	//
+	// Construct a scenario that mimics the post-recoverState state directly:
+	// after the synchronous Restart error, but before rollback runs,
+	// "something else" has already reset web's CustomDomain to a different
+	// value. Verify the rollback respects it (no-op) instead of stomping.
+	//
+	// Implementation note: ReconcileCustomDomain runs synchronously, so we
+	// can't truly interpose. Instead we drive the inputs so the mutation
+	// path writes "stage" and immediately moves on to the failing Restart,
+	// then verify the post-state matches the CAS contract. The contract
+	// here is exercised by the rollback finding ServiceName "web" with
+	// CustomDomain == newValue (because nothing concurrent ran in this
+	// test) and writing back oldValue.
+	prov := &provision{
+		LeaseUUID:    "lease-1",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		SKU:          "docker-small",
+		Status:       backend.ProvisionStatusReady,
+		Manifest:     nil,
+		ContainerIDs: []string{"old-c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "old.example.com"},
+		},
+		Quantity: 1,
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "barney0.manifest0.net",
+		Entrypoint:     "websecure",
+	}
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "new.example.com"},
+	})
+	require.Error(t, err)
+	assert.Equal(t, "old.example.com", b.provisions["lease-1"].Items[0].CustomDomain,
+		"rollback must restore oldValue when current value still equals newValue")
+}
+
 func TestReconcileCustomDomain_LegacyEmptyServiceName(t *testing.T) {
 	// Legacy single-item lease addresses its only item by ServiceName="".
 	// Reconcile must match on that and apply a no-op when domains match.

@@ -1008,6 +1008,44 @@ func TestHTTPClient_ReconcileCustomDomain_AcceptsAccepted(t *testing.T) {
 	require.NoError(t, client.ReconcileCustomDomain(context.Background(), "lease-1", nil))
 }
 
+func TestHTTPClient_ReconcileCustomDomain_NotProvisioned(t *testing.T) {
+	// 404 from /reconcile_custom_domain must map back to ErrNotProvisioned
+	// so the circuit breaker's IsSuccessful exemption applies; otherwise
+	// routine reconcile-tick races on a deprovisioned lease would count
+	// toward the CB trip threshold.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-reconcile-404",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.ReconcileCustomDomain(context.Background(), "lease-1", nil)
+	assert.ErrorIs(t, err, ErrNotProvisioned)
+}
+
+func TestHTTPClient_ReconcileCustomDomain_InvalidState(t *testing.T) {
+	// Same rationale as the 404 mapping: 409 must surface as ErrInvalidState
+	// so it stays exempt from the circuit breaker.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-reconcile-409",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	err := client.ReconcileCustomDomain(context.Background(), "lease-1", nil)
+	assert.ErrorIs(t, err, ErrInvalidState)
+}
+
 func TestHTTPClient_ReconcileCustomDomain_ServerError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
