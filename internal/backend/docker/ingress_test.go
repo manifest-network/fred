@@ -260,13 +260,17 @@ func TestTraefikLabels(t *testing.T) {
 	tenantNetwork := "fred-tenant-abc123"
 	labels := TraefikLabels(cfg, tenantNetwork, "fred-web-abc1234", "web-abc1234.barney8.manifest0.net", 80)
 
-	require.Len(t, labels, 6)
+	require.Len(t, labels, 7)
 	assert.Equal(t, "true", labels["traefik.enable"])
 	assert.Equal(t, tenantNetwork, labels["traefik.docker.network"])
 	assert.Equal(t, "Host(`web-abc1234.barney8.manifest0.net`)", labels["traefik.http.routers.fred-web-abc1234.rule"])
 	assert.Equal(t, "websecure", labels["traefik.http.routers.fred-web-abc1234.entrypoints"])
 	assert.Equal(t, "true", labels["traefik.http.routers.fred-web-abc1234.tls"])
 	assert.NotContains(t, labels, "traefik.http.routers.fred-web-abc1234.tls.certresolver")
+	// Explicit router→service binding is required so Traefik's docker
+	// provider does not need to auto-bind by name (which fails as soon as
+	// a secondary service is added on the same container — see ENG-93).
+	assert.Equal(t, "fred-web-abc1234", labels["traefik.http.routers.fred-web-abc1234.service"])
 	assert.Equal(t, "80", labels["traefik.http.services.fred-web-abc1234.loadbalancer.server.port"])
 }
 
@@ -467,6 +471,16 @@ func TestApplyIngressLabels(t *testing.T) {
 		customRouter := CustomDomainRouterName("lease-1", "web")
 		assert.Equal(t, "Host(`foo.example.com`)", labels["traefik.http.routers."+customRouter+".rule"])
 		assert.Equal(t, "foo.example.com", labels[LabelCustomDomain])
+
+		// ENG-93 regression: when a container declares both the primary and
+		// secondary services, Traefik's docker provider can no longer
+		// auto-bind the primary router to its same-named service (the
+		// container has two services, so the binding is ambiguous). The
+		// primary router must therefore carry an explicit `.service` label
+		// pointing at its own service. Without it the primary URL returns
+		// HTTP 418 once a custom_domain is set.
+		assert.Equal(t, primaryRouter, labels["traefik.http.routers."+primaryRouter+".service"])
+		assert.Equal(t, customRouter+"-svc", labels["traefik.http.routers."+customRouter+".service"])
 	})
 
 	t.Run("invalid CustomDomain skips secondary, primary kept", func(t *testing.T) {

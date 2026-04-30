@@ -177,6 +177,16 @@ func parseTCPPort(spec string) (int, bool) {
 //
 // Routers are emitted with tls=true and no certresolver; see
 // IngressConfig for the wildcard-cert provisioning contract.
+//
+// The explicit `.service` label binding is required even though
+// Traefik's docker provider can auto-bind a router to a same-named
+// service: auto-binding only fires when exactly one service is
+// declared on the container. As soon as a second service appears
+// (notably TraefikCustomDomainLabels' secondary service for tenant
+// custom domains), auto-binding becomes ambiguous and Traefik leaves
+// the router orphaned (returns HTTP 418 on the primary URL). Always
+// emitting the explicit binding is cheap and immune to future
+// label additions.
 func TraefikLabels(cfg IngressConfig, networkName, routerName, fqdn string, containerPort int) map[string]string {
 	return map[string]string{
 		"traefik.enable":         "true",
@@ -184,6 +194,7 @@ func TraefikLabels(cfg IngressConfig, networkName, routerName, fqdn string, cont
 		fmt.Sprintf("traefik.http.routers.%s.rule", routerName):                      fmt.Sprintf("Host(`%s`)", fqdn),
 		fmt.Sprintf("traefik.http.routers.%s.entrypoints", routerName):               cfg.Entrypoint,
 		fmt.Sprintf("traefik.http.routers.%s.tls", routerName):                       "true",
+		fmt.Sprintf("traefik.http.routers.%s.service", routerName):                   routerName,
 		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", routerName): strconv.Itoa(containerPort),
 	}
 }
