@@ -373,14 +373,14 @@ func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
 	// ErrInvalidState). ReconcileCustomDomain must roll back the in-memory
 	// CustomDomain so the next reconciler tick retries cleanly.
 	prov := &provision{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		SKU:          "docker-small",
-		Status:       backend.ProvisionStatusReady,
-		Manifest:     nil, // no manifest → Restart() returns ErrInvalidState
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		ProviderUUID:  "prov-1",
+		SKU:           "docker-small",
+		Status:        backend.ProvisionStatusReady,
+		Manifest:      nil, // no manifest → Restart() returns ErrInvalidState
 		StackManifest: nil,
-		ContainerIDs: []string{"old-c1"},
+		ContainerIDs:  []string{"old-c1"},
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "old.example.com"},
 		},

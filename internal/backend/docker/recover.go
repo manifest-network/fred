@@ -128,18 +128,16 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					CustomDomain: c.CustomDomain,
 				})
 			}
-		} else {
+		} else if len(prov.Items) == 0 {
 			// Legacy single-item lease: rebuild prov.Items[0] from this
 			// (only) container's labels so Restart/Update can re-emit the
 			// secondary router. Idempotent across recovery iterations
 			// because legacy provisions hold one container.
-			if len(prov.Items) == 0 {
-				prov.Items = append(prov.Items, backend.LeaseItem{
-					SKU:          c.SKU,
-					Quantity:     1,
-					CustomDomain: c.CustomDomain,
-				})
-			}
+			prov.Items = append(prov.Items, backend.LeaseItem{
+				SKU:          c.SKU,
+				Quantity:     1,
+				CustomDomain: c.CustomDomain,
+			})
 		}
 
 		// Use the highest FailCount across containers. Labels are normally

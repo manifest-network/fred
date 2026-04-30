@@ -246,12 +246,12 @@ func TraefikCustomDomainLabels(cfg IngressConfig, customRouterName, customDomain
 	}
 	customServiceName := customRouterName + "-svc"
 	return map[string]string{
-		fmt.Sprintf("traefik.http.routers.%s.rule", customRouterName):              fmt.Sprintf("Host(`%s`)", customDomain),
-		fmt.Sprintf("traefik.http.routers.%s.entrypoints", customRouterName):       cfg.Entrypoint,
-		fmt.Sprintf("traefik.http.routers.%s.tls", customRouterName):               "true",
-		fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", customRouterName):  resolver,
-		fmt.Sprintf("traefik.http.routers.%s.middlewares", customRouterName):       strings.Join(middlewares, ","),
-		fmt.Sprintf("traefik.http.routers.%s.service", customRouterName):           customServiceName,
+		fmt.Sprintf("traefik.http.routers.%s.rule", customRouterName):                       fmt.Sprintf("Host(`%s`)", customDomain),
+		fmt.Sprintf("traefik.http.routers.%s.entrypoints", customRouterName):                cfg.Entrypoint,
+		fmt.Sprintf("traefik.http.routers.%s.tls", customRouterName):                        "true",
+		fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", customRouterName):           resolver,
+		fmt.Sprintf("traefik.http.routers.%s.middlewares", customRouterName):                strings.Join(middlewares, ","),
+		fmt.Sprintf("traefik.http.routers.%s.service", customRouterName):                    customServiceName,
 		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", customServiceName): strconv.Itoa(containerPort),
 	}
 }

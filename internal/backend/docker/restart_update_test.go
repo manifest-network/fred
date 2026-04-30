@@ -822,8 +822,8 @@ func TestUpdate_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 
 	var capturedCustomDomain string
 	mock := &mockDockerClient{
-		PullImageFn:        func(ctx context.Context, image string, t time.Duration) error { return nil },
-		RemoveContainerFn:  func(ctx context.Context, id string) error { return nil },
+		PullImageFn:       func(ctx context.Context, image string, t time.Duration) error { return nil },
+		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
 		CreateContainerFn: func(ctx context.Context, p CreateContainerParams, t time.Duration) (string, error) {
 			capturedCustomDomain = p.CustomDomain
 			return "new-c1", nil

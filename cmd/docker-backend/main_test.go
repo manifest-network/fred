@@ -533,19 +533,19 @@ func TestGetReleases_PassesAuth(t *testing.T) {
 // --- mockBackend and helpers for handler logic tests ---
 
 type mockBackend struct {
-	ProvisionFunc        func(ctx context.Context, req backend.ProvisionRequest) error
-	DeprovisionFunc      func(ctx context.Context, leaseUUID string) error
-	GetInfoFunc          func(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
-	GetLogsFunc          func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
-	GetProvisionFunc     func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
-	ListProvisionsFunc   func(ctx context.Context) ([]backend.ProvisionInfo, error)
-	LookupProvisionsFunc func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
-	RestartFunc          func(ctx context.Context, req backend.RestartRequest) error
-	UpdateFunc           func(ctx context.Context, req backend.UpdateRequest) error
+	ProvisionFunc             func(ctx context.Context, req backend.ProvisionRequest) error
+	DeprovisionFunc           func(ctx context.Context, leaseUUID string) error
+	GetInfoFunc               func(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
+	GetLogsFunc               func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
+	GetProvisionFunc          func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
+	ListProvisionsFunc        func(ctx context.Context) ([]backend.ProvisionInfo, error)
+	LookupProvisionsFunc      func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
+	RestartFunc               func(ctx context.Context, req backend.RestartRequest) error
+	UpdateFunc                func(ctx context.Context, req backend.UpdateRequest) error
 	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
-	GetReleasesFunc      func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
-	HealthFunc           func(ctx context.Context) error
-	StatsFunc            func() shared.ResourceStats
+	GetReleasesFunc           func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
+	HealthFunc                func(ctx context.Context) error
+	StatsFunc                 func() shared.ResourceStats
 }
 
 func (m *mockBackend) Provision(ctx context.Context, req backend.ProvisionRequest) error {

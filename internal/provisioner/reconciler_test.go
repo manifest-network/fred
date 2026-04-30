@@ -27,18 +27,18 @@ var noopAck = &mockAcknowledger{}
 
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
-	mu                       sync.Mutex
-	name                     string
-	provisions               []backend.ProvisionInfo
-	provisionCalls           []backend.ProvisionRequest
-	deprovisionCalls         []string
-	listProvisionsCalls      int
+	mu                        sync.Mutex
+	name                      string
+	provisions                []backend.ProvisionInfo
+	provisionCalls            []backend.ProvisionRequest
+	deprovisionCalls          []string
+	listProvisionsCalls       int
 	reconcileCustomDomainArgs []reconcileCustomDomainCall
-	reconcileCustomDomainErr error
-	provisionErr             error
-	deprovisionErr           error
-	listErr                  error
-	refreshErr               error
+	reconcileCustomDomainErr  error
+	provisionErr              error
+	deprovisionErr            error
+	listErr                   error
+	refreshErr                error
 }
 
 type reconcileCustomDomainCall struct {
