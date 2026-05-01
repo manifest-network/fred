@@ -73,6 +73,7 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				Cfg:          params.Cfg,
 				Ingress:      params.Ingress,
 				Quantity:     item.Quantity,
+				CustomDomain: item.CustomDomain,
 			})
 
 			// Apply volume binds if present.
@@ -232,6 +233,7 @@ type composeServiceParams struct {
 	Cfg          *Config
 	Ingress      IngressConfig
 	Quantity     int
+	CustomDomain string // tenant-supplied FQDN; "" when not set
 }
 
 func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfig {
@@ -396,17 +398,15 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 	}
 
 	// Inject ingress labels for auto-discovery routing.
-	if p.Ingress.Enabled {
-		if port, ok := SelectIngressPort(p.Manifest.Ports); ok {
-			subdomain := ComputeSubdomain(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
-			fqdn := ComputeFQDN(subdomain, p.Ingress.WildcardDomain)
-			routerName := RouterName(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
-			for k, v := range TraefikLabels(p.Ingress, p.NetworkName, routerName, fqdn, port) {
-				labels[k] = v
-			}
-			labels[LabelFQDN] = fqdn
-		}
-	}
+	applyIngressLabels(labels, ingressLabelParams{
+		LeaseUUID:    p.LeaseUUID,
+		ServiceName:  p.ServiceName,
+		Instance:     p.Instance,
+		Quantity:     p.Quantity,
+		Ingress:      p.Ingress,
+		NetworkName:  p.NetworkName,
+		CustomDomain: p.CustomDomain,
+	}, p.Manifest.Ports)
 
 	svc.Labels = labels
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -283,6 +284,148 @@ func TestRestart_PassesValidation(t *testing.T) {
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
 }
 
+// --- ReconcileCustomDomain handler tests ---
+
+func TestReconcileCustomDomain_RequiresAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", strings.NewReader(`{"lease_uuid":"lease-1"}`))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "missing signature")
+}
+
+func TestReconcileCustomDomain_MissingLeaseUUID(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "lease_uuid is required")
+}
+
+func TestReconcileCustomDomain_InvalidJSON(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`not json`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid request body")
+}
+
+func TestReconcileCustomDomain_DispatchesToBackendAndReturns204(t *testing.T) {
+	// End-to-end happy path through the handler: signed request with a valid
+	// body reaches the backend and the handler returns 204 No Content. Use a
+	// recording mockBackend so we can verify the dispatched arguments.
+	var (
+		mu              sync.Mutex
+		seenLeaseUUID   string
+		seenItems       []backend.LeaseItem
+		invocationCount int
+	)
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			mu.Lock()
+			defer mu.Unlock()
+			invocationCount++
+			seenLeaseUUID = leaseUUID
+			seenItems = append([]backend.LeaseItem(nil), items...)
+			return nil
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1","items":[{"sku":"docker-small","quantity":1,"service_name":"web","custom_domain":"foo.example.com"}]}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNoContent, w.Code)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, invocationCount, "backend.ReconcileCustomDomain should be called exactly once")
+	assert.Equal(t, "lease-1", seenLeaseUUID)
+	require.Len(t, seenItems, 1)
+	assert.Equal(t, "web", seenItems[0].ServiceName)
+	assert.Equal(t, "foo.example.com", seenItems[0].CustomDomain)
+}
+
+func TestReconcileCustomDomain_BackendErrorReturns500(t *testing.T) {
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			return assert.AnError
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1"}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestReconcileCustomDomain_NotProvisionedReturns404(t *testing.T) {
+	// ErrNotProvisioned must surface as 404 so HTTPClient can map it back
+	// to the typed error, which the providerd-side circuit breaker exempts
+	// from the trip count via IsSuccessful. Collapsing it into 500 would
+	// trip the CB on routine reconcile-tick races where the lease was
+	// concurrently deprovisioned.
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			return backend.ErrNotProvisioned
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1"}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Contains(t, w.Body.String(), "not provisioned")
+}
+
+func TestReconcileCustomDomain_InvalidStateReturns409(t *testing.T) {
+	// Same rationale as the 404 path: ErrInvalidState is a benign race when
+	// the lease's status flipped between our pre-check and Restart's own
+	// check, and providerd's circuit breaker exempts it. 409 keeps the
+	// signal typed across the wire.
+	mb := &mockBackend{
+		ReconcileCustomDomainFunc: func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+			return backend.ErrInvalidState
+		},
+	}
+
+	body := []byte(`{"lease_uuid":"lease-1"}`)
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, body))
+	w := httptest.NewRecorder()
+
+	newMockHandler(mb).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid state")
+}
+
 // --- Update handler tests ---
 
 func TestUpdate_RequiresAuth(t *testing.T) {
@@ -390,18 +533,19 @@ func TestGetReleases_PassesAuth(t *testing.T) {
 // --- mockBackend and helpers for handler logic tests ---
 
 type mockBackend struct {
-	ProvisionFunc        func(ctx context.Context, req backend.ProvisionRequest) error
-	DeprovisionFunc      func(ctx context.Context, leaseUUID string) error
-	GetInfoFunc          func(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
-	GetLogsFunc          func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
-	GetProvisionFunc     func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
-	ListProvisionsFunc   func(ctx context.Context) ([]backend.ProvisionInfo, error)
-	LookupProvisionsFunc func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
-	RestartFunc          func(ctx context.Context, req backend.RestartRequest) error
-	UpdateFunc           func(ctx context.Context, req backend.UpdateRequest) error
-	GetReleasesFunc      func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
-	HealthFunc           func(ctx context.Context) error
-	StatsFunc            func() shared.ResourceStats
+	ProvisionFunc             func(ctx context.Context, req backend.ProvisionRequest) error
+	DeprovisionFunc           func(ctx context.Context, leaseUUID string) error
+	GetInfoFunc               func(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error)
+	GetLogsFunc               func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
+	GetProvisionFunc          func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
+	ListProvisionsFunc        func(ctx context.Context) ([]backend.ProvisionInfo, error)
+	LookupProvisionsFunc      func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
+	RestartFunc               func(ctx context.Context, req backend.RestartRequest) error
+	UpdateFunc                func(ctx context.Context, req backend.UpdateRequest) error
+	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
+	GetReleasesFunc           func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
+	HealthFunc                func(ctx context.Context) error
+	StatsFunc                 func() shared.ResourceStats
 }
 
 func (m *mockBackend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
@@ -465,6 +609,15 @@ func (m *mockBackend) Update(ctx context.Context, req backend.UpdateRequest) err
 		panic("mockBackend.Update called but not configured")
 	}
 	return m.UpdateFunc(ctx, req)
+}
+
+func (m *mockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	if m.ReconcileCustomDomainFunc == nil {
+		// No-op default — most tests don't exercise this method, and the
+		// reconciler hits the endpoint on every healthy active lease.
+		return nil
+	}
+	return m.ReconcileCustomDomainFunc(ctx, leaseUUID, items)
 }
 
 func (m *mockBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {

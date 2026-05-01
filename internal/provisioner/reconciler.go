@@ -907,7 +907,34 @@ func (r *Reconciler) processLease(
 		}
 
 	case lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned:
-		// Healthy state - nothing to do
+		// Healthy state — but reconcile per-LeaseItem custom_domain drift.
+		// ReconcileCustomDomain is idempotent: it no-ops when nothing has
+		// changed, so calling it every tick is cheap. Errors are logged
+		// (so the next tick retries) and do not abort processing of other
+		// leases.
+		b := r.backendRouter.GetBackendByName(provision.BackendName)
+		if b == nil {
+			// Backend is no longer configured. Same condition the orphan
+			// path treats as MANUAL CLEANUP REQUIRED — surface it loudly
+			// here too so a misconfigured/removed backend doesn't silently
+			// disable custom-domain reconciliation for active leases.
+			slog.Error("reconcile: custom_domain reconcile skipped - backend no longer configured",
+				"lease_uuid", leaseUUID,
+				"tenant", lease.Tenant,
+				"backend", provision.BackendName,
+			)
+			hadError = true
+			break
+		}
+		latestItems := ExtractLeaseItems(&lease)
+		if err := b.ReconcileCustomDomain(ctx, leaseUUID, latestItems); err != nil {
+			slog.Warn("reconcile: custom_domain reconcile failed; will retry next tick",
+				"lease_uuid", leaseUUID,
+				"backend", provision.BackendName,
+				"error", err,
+			)
+			hadError = true
+		}
 	}
 }
 

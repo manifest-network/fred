@@ -260,14 +260,276 @@ func TestTraefikLabels(t *testing.T) {
 	tenantNetwork := "fred-tenant-abc123"
 	labels := TraefikLabels(cfg, tenantNetwork, "fred-web-abc1234", "web-abc1234.barney8.manifest0.net", 80)
 
-	require.Len(t, labels, 6)
+	require.Len(t, labels, 7)
 	assert.Equal(t, "true", labels["traefik.enable"])
 	assert.Equal(t, tenantNetwork, labels["traefik.docker.network"])
 	assert.Equal(t, "Host(`web-abc1234.barney8.manifest0.net`)", labels["traefik.http.routers.fred-web-abc1234.rule"])
 	assert.Equal(t, "websecure", labels["traefik.http.routers.fred-web-abc1234.entrypoints"])
 	assert.Equal(t, "true", labels["traefik.http.routers.fred-web-abc1234.tls"])
 	assert.NotContains(t, labels, "traefik.http.routers.fred-web-abc1234.tls.certresolver")
+	// Explicit router→service binding is required so Traefik's docker
+	// provider does not need to auto-bind by name (which fails as soon as
+	// a secondary service is added on the same container — see ENG-93).
+	assert.Equal(t, "fred-web-abc1234", labels["traefik.http.routers.fred-web-abc1234.service"])
 	assert.Equal(t, "80", labels["traefik.http.services.fred-web-abc1234.loadbalancer.server.port"])
+}
+
+func TestCustomDomainRouterName(t *testing.T) {
+	const lease = "lease-abc"
+	const svc = "web"
+
+	// Per-service: instance index must NOT change the result.
+	r0 := CustomDomainRouterName(lease, svc)
+	r1 := CustomDomainRouterName(lease, svc)
+	assert.Equal(t, r0, r1, "router name must be deterministic per (leaseUUID, serviceName)")
+
+	// Different (lease, service) tuples produce different names.
+	assert.NotEqual(t, r0, CustomDomainRouterName(lease, "db"))
+	assert.NotEqual(t, r0, CustomDomainRouterName("lease-other", svc))
+
+	// Distinct from the per-instance primary RouterName, regardless of instance.
+	assert.NotEqual(t, r0, RouterName(lease, svc, 0, 1))
+	assert.NotEqual(t, r0, RouterName(lease, svc, 0, 3))
+	assert.NotEqual(t, r0, RouterName(lease, svc, 1, 3))
+
+	// Deterministic suffix.
+	assert.Contains(t, r0, "-custom")
+
+	// Legacy single-item lease (empty service name) still produces a name.
+	legacy := CustomDomainRouterName(lease, "")
+	assert.NotEmpty(t, legacy)
+	assert.NotEqual(t, legacy, r0)
+}
+
+func TestTraefikCustomDomainLabels(t *testing.T) {
+	t.Run("defaults applied", func(t *testing.T) {
+		cfg := IngressConfig{Enabled: true, Entrypoint: "websecure"}
+		labels := TraefikCustomDomainLabels(cfg, "fred-web-abc-custom", "foo.example.com", 80)
+
+		assert.Equal(t, "Host(`foo.example.com`)", labels["traefik.http.routers.fred-web-abc-custom.rule"])
+		assert.Equal(t, "websecure", labels["traefik.http.routers.fred-web-abc-custom.entrypoints"])
+		assert.Equal(t, "true", labels["traefik.http.routers.fred-web-abc-custom.tls"])
+		assert.Equal(t, "http01", labels["traefik.http.routers.fred-web-abc-custom.tls.certresolver"])
+		assert.Equal(t, "security-headers@file", labels["traefik.http.routers.fred-web-abc-custom.middlewares"])
+		assert.Equal(t, "fred-web-abc-custom-svc", labels["traefik.http.routers.fred-web-abc-custom.service"])
+		assert.Equal(t, "80", labels["traefik.http.services.fred-web-abc-custom-svc.loadbalancer.server.port"])
+
+		// Secondary must NOT re-emit traefik.enable / traefik.docker.network
+		// (those are per-container, owned by the primary block).
+		assert.NotContains(t, labels, "traefik.enable")
+		assert.NotContains(t, labels, "traefik.docker.network")
+	})
+
+	t.Run("configurable cert resolver and middlewares", func(t *testing.T) {
+		cfg := IngressConfig{
+			Enabled:                  true,
+			Entrypoint:               "websecure",
+			CustomDomainCertResolver: "letsencrypt-staging",
+			CustomDomainMiddlewares:  []string{"hsts@file", "compress@file"},
+		}
+		labels := TraefikCustomDomainLabels(cfg, "fred-web-abc-custom", "foo.example.com", 8080)
+
+		assert.Equal(t, "letsencrypt-staging", labels["traefik.http.routers.fred-web-abc-custom.tls.certresolver"])
+		assert.Equal(t, "hsts@file,compress@file", labels["traefik.http.routers.fred-web-abc-custom.middlewares"])
+		assert.Equal(t, "8080", labels["traefik.http.services.fred-web-abc-custom-svc.loadbalancer.server.port"])
+	})
+
+	t.Run("byte-identical across calls with same inputs", func(t *testing.T) {
+		cfg := IngressConfig{Enabled: true, Entrypoint: "websecure"}
+		a := TraefikCustomDomainLabels(cfg, "fred-web-custom", "foo.example.com", 80)
+		b := TraefikCustomDomainLabels(cfg, "fred-web-custom", "foo.example.com", 80)
+		assert.Equal(t, a, b, "load-balancing requires byte-identical labels across all instance containers")
+	})
+}
+
+func TestValidateCustomDomain(t *testing.T) {
+	const wildcard = "barney0.manifest0.net"
+
+	tests := []struct {
+		name    string
+		domain  string
+		wantErr string
+	}{
+		{name: "well-formed", domain: "foo.example.com"},
+		{name: "subdomain", domain: "admin.foo.example.com"},
+		{name: "empty", domain: "", wantErr: "empty domain"},
+		{name: "uppercase rejected", domain: "Foo.example.com", wantErr: "lowercase"},
+		{name: "scheme rejected", domain: "https://foo.example.com", wantErr: "scheme"},
+		{name: "leading dot rejected", domain: ".foo.example.com", wantErr: "must not start with"},
+		{name: "no separator rejected", domain: "localhost", wantErr: "separator"},
+		{name: "equals wildcard", domain: wildcard, wantErr: "wildcard suffix"},
+		{name: "subdomain of wildcard", domain: "evil." + wildcard, wantErr: "wildcard suffix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCustomDomain(tt.domain, wildcard)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr, fmt.Sprintf("error: %v", err))
+			}
+		})
+	}
+
+	t.Run("empty wildcard skips local check", func(t *testing.T) {
+		// IngressConfig.Validate already requires non-empty wildcard when
+		// enabled; this just covers the defensive nil-cfg branch.
+		err := validateCustomDomain("foo.example.com", "")
+		require.NoError(t, err)
+	})
+}
+
+func TestApplyIngressLabels(t *testing.T) {
+	cfg := IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "barney0.manifest0.net",
+		Entrypoint:     "websecure",
+	}
+	httpPorts := map[string]PortConfig{"80/tcp": {}}
+
+	t.Run("disabled ingress emits nothing", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "web",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      IngressConfig{Enabled: false},
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "foo.example.com",
+		}, httpPorts)
+		assert.Empty(t, labels)
+	})
+
+	t.Run("no routable port + no custom_domain emits nothing", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:   "lease-1",
+			ServiceName: "redis",
+			Instance:    0,
+			Quantity:    1,
+			Ingress:     cfg,
+			NetworkName: "fred-tenant-abc",
+		}, map[string]PortConfig{}) // no ports
+		assert.Empty(t, labels)
+	})
+
+	t.Run("no routable port + custom_domain skips both with warn", func(t *testing.T) {
+		// Regression: a tenant who set custom_domain on a TCP-only / no-HTTP
+		// service must not see Fred emit a secondary router that would
+		// reference a non-existent port. Primary is also absent (no port).
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "redis",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      cfg,
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "foo.example.com",
+		}, map[string]PortConfig{}) // no ports
+		assert.Empty(t, labels)
+	})
+
+	t.Run("primary only when CustomDomain empty", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:   "lease-1",
+			ServiceName: "web",
+			Instance:    0,
+			Quantity:    1,
+			Ingress:     cfg,
+			NetworkName: "fred-tenant-abc",
+		}, httpPorts)
+
+		assert.Equal(t, "true", labels["traefik.enable"])
+		assert.NotEmpty(t, labels[LabelFQDN])
+		assert.NotContains(t, labels, LabelCustomDomain)
+
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		assert.NotContains(t, labels, "traefik.http.routers."+customRouter+".rule")
+	})
+
+	t.Run("primary + secondary when CustomDomain valid", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "web",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      cfg,
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "foo.example.com",
+		}, httpPorts)
+
+		// Primary present.
+		primaryRouter := RouterName("lease-1", "web", 0, 1)
+		assert.Equal(t, "true", labels["traefik.http.routers."+primaryRouter+".tls"])
+		// Secondary present.
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		assert.Equal(t, "Host(`foo.example.com`)", labels["traefik.http.routers."+customRouter+".rule"])
+		assert.Equal(t, "foo.example.com", labels[LabelCustomDomain])
+
+		// ENG-93 regression: when a container declares both the primary and
+		// secondary services, Traefik's docker provider can no longer
+		// auto-bind the primary router to its same-named service (the
+		// container has two services, so the binding is ambiguous). The
+		// primary router must therefore carry an explicit `.service` label
+		// pointing at its own service. Without it the primary URL returns
+		// HTTP 418 once a custom_domain is set.
+		assert.Equal(t, primaryRouter, labels["traefik.http.routers."+primaryRouter+".service"])
+		assert.Equal(t, customRouter+"-svc", labels["traefik.http.routers."+customRouter+".service"])
+	})
+
+	t.Run("invalid CustomDomain skips secondary, primary kept", func(t *testing.T) {
+		labels := map[string]string{}
+		applyIngressLabels(labels, ingressLabelParams{
+			LeaseUUID:    "lease-1",
+			ServiceName:  "web",
+			Instance:     0,
+			Quantity:     1,
+			Ingress:      cfg,
+			NetworkName:  "fred-tenant-abc",
+			CustomDomain: "evil." + cfg.WildcardDomain, // subdomain of provider's wildcard
+		}, httpPorts)
+
+		// Primary kept.
+		primaryRouter := RouterName("lease-1", "web", 0, 1)
+		assert.Equal(t, "true", labels["traefik.http.routers."+primaryRouter+".tls"])
+		// Secondary absent.
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		assert.NotContains(t, labels, "traefik.http.routers."+customRouter+".rule")
+		assert.NotContains(t, labels, LabelCustomDomain)
+	})
+
+	t.Run("multi-instance shared secondary name across instance indices", func(t *testing.T) {
+		// Sanity check the load-balancing contract: the helper produces
+		// the same secondary router/service name for every instance index
+		// of the same (lease, service). Compose path tests assert this
+		// end-to-end; this verifies the helper's invariant directly.
+		var l0, l1, l2 map[string]string
+		for i, dst := range []*map[string]string{&l0, &l1, &l2} {
+			labels := map[string]string{}
+			applyIngressLabels(labels, ingressLabelParams{
+				LeaseUUID:    "lease-1",
+				ServiceName:  "web",
+				Instance:     i,
+				Quantity:     3,
+				Ingress:      cfg,
+				NetworkName:  "fred-tenant-abc",
+				CustomDomain: "foo.example.com",
+			}, httpPorts)
+			*dst = labels
+		}
+		customRouter := CustomDomainRouterName("lease-1", "web")
+		ruleKey := "traefik.http.routers." + customRouter + ".rule"
+		assert.Equal(t, l0[ruleKey], l1[ruleKey])
+		assert.Equal(t, l1[ruleKey], l2[ruleKey])
+		// Primary differs per instance.
+		assert.NotEqual(t, l0[LabelFQDN], l1[LabelFQDN])
+	})
 }
 
 func TestIngressConfig_Validate(t *testing.T) {

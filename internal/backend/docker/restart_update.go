@@ -149,7 +149,14 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		if isStack {
 			return b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
 		}
-		return b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, prevStatus, logger)
+		// Legacy single-item: items[0].CustomDomain holds the secondary-router
+		// domain. Items may be empty for provisions recovered without it (legacy
+		// pre-CustomDomain state); treat that as no custom domain.
+		var customDomain string
+		if len(items) > 0 {
+			customDomain = items[0].CustomDomain
+		}
+		return b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, customDomain, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, restartRequestedMsg{cancel: opCancel, work: work, ack: ack}); routeErr != nil {
@@ -170,7 +177,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 // goroutine is owned by the actor via workers barrier — see lease_actor.go.)
 
 // doRestart performs the actual container restart asynchronously.
-func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
+func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku, customDomain string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	profile, profErr := b.cfg.GetSKUProfile(sku)
 	if profErr != nil {
 		err := fmt.Errorf("SKU profile lookup failed: %w", profErr)
@@ -204,6 +211,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 		Operation:       "restart",
 		PrevStatus:      prevStatus,
 		Logger:          logger,
+		CustomDomain:    customDomain,
 	})
 }
 
@@ -542,6 +550,7 @@ type replaceContainersOp struct {
 	Operation       string                  // "restart" or "update" — used in log and callback messages
 	PrevStatus      backend.ProvisionStatus // status before the operation began, for gauge accuracy
 	Logger          *slog.Logger
+	CustomDomain    string // Legacy single-item lease's custom domain (empty when not set)
 
 	// OnSuccess is called under provisionsMu lock after successful replacement.
 	// Used by update to set Image/Manifest on the provision. May be nil.
@@ -768,6 +777,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			Ingress:           b.cfg.Ingress,
 			NetworkName:       TenantNetworkName(tenant),
 			Quantity:          op.Quantity,
+			CustomDomain:      op.CustomDomain,
 		}, b.cfg.ContainerCreateTimeout)
 		if createErr != nil {
 			err = fmt.Errorf("container creation failed (instance %d): %w", i, createErr)
@@ -1002,13 +1012,17 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 		}
 	}
 
-	// Read SKU and quantity from provision (may differ from old container count).
+	// Read SKU, quantity, and (legacy) custom domain from provision.
 	b.provisionsMu.RLock()
 	sku := ""
 	quantity := len(oldContainerIDs)
+	customDomain := ""
 	if prov, ok := b.provisions[leaseUUID]; ok {
 		sku = prov.SKU
 		quantity = prov.Quantity
+		if len(prov.Items) > 0 {
+			customDomain = prov.Items[0].CustomDomain
+		}
 	}
 	b.provisionsMu.RUnlock()
 
@@ -1022,6 +1036,7 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 		Operation:       "update",
 		PrevStatus:      prevStatus,
 		Logger:          logger,
+		CustomDomain:    customDomain,
 		OnSuccess: func(prov *provision) {
 			prov.Image = manifest.Image
 			prov.Manifest = manifest

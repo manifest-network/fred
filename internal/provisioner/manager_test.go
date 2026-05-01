@@ -102,6 +102,10 @@ func (m *mockManagerBackend) Update(ctx context.Context, req backend.UpdateReque
 	return nil
 }
 
+func (m *mockManagerBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	return nil
+}
+
 func (m *mockManagerBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
 	return nil, backend.ErrNotProvisioned
 }

@@ -75,6 +75,22 @@ type Backend interface {
 	// Returns ErrNotProvisioned if lease not found, ErrInvalidState if not updatable.
 	Update(ctx context.Context, req UpdateRequest) error
 
+	// ReconcileCustomDomain reapplies the per-LeaseItem custom_domain values
+	// from chain onto the running provision. When any item's CustomDomain
+	// differs from the in-memory provision state, the backend snapshots the
+	// current values, updates them, and triggers a Restart() to re-emit
+	// Traefik labels. On Restart failure the in-memory state is rolled back
+	// so the next reconciler tick can retry.
+	//
+	// No-op when:
+	//   - the lease is not provisioned by this backend (silent),
+	//   - the provision is not currently active,
+	//   - all items already match the incoming values.
+	//
+	// Idempotent: repeated calls with the same items list produce no
+	// container churn beyond the first reconciling call.
+	ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []LeaseItem) error
+
 	// GetReleases returns the release history for a lease.
 	// Returns ErrNotProvisioned if lease not found.
 	GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error)
@@ -88,6 +104,13 @@ type LeaseItem struct {
 	SKU         string `json:"sku"`
 	Quantity    int    `json:"quantity"`
 	ServiceName string `json:"service_name,omitempty"`
+	// CustomDomain is the optional FQDN the tenant has assigned to this item.
+	// When non-empty (and the service has a routable HTTP port), the backend
+	// emits a secondary Traefik router on the item's container(s) routing
+	// Host(<CustomDomain>) to the same loadbalancer service. Validated on-chain
+	// in MsgSetItemCustomDomain; Fred re-runs cheap defense-in-depth checks
+	// before applying labels.
+	CustomDomain string `json:"custom_domain,omitempty"`
 }
 
 // IsStack returns true when the lease items represent a stack (multi-service deployment).
@@ -920,6 +943,56 @@ func (c *HTTPClient) GetReleases(ctx context.Context, leaseUUID string) ([]Relea
 // RefreshState is a no-op for remote backends (they refresh server-side).
 func (c *HTTPClient) RefreshState(ctx context.Context) error {
 	return nil
+}
+
+// ReconcileCustomDomainRequest is the wire format for POST /reconcile_custom_domain.
+type ReconcileCustomDomainRequest struct {
+	LeaseUUID string      `json:"lease_uuid"`
+	Items     []LeaseItem `json:"items"`
+}
+
+// ReconcileCustomDomain forwards a reconciliation request to the remote
+// backend. The reconciler calls this on every active lease each tick; the
+// remote side decides whether any action is needed (idempotent on no-change).
+func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []LeaseItem) (err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("reconcile_custom_domain", start, err) }()
+
+	body, err := json.Marshal(ReconcileCustomDomainRequest{LeaseUUID: leaseUUID, Items: items})
+	if err != nil {
+		return fmt.Errorf("marshal reconcile_custom_domain request: %w", err)
+	}
+
+	_, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/reconcile_custom_domain", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("reconcile_custom_domain request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		switch resp.StatusCode {
+		case http.StatusAccepted, http.StatusNoContent:
+			return nil, nil
+		case http.StatusNotFound:
+			return nil, ErrNotProvisioned
+		case http.StatusConflict:
+			return nil, ErrInvalidState
+		default:
+			return nil, fmt.Errorf("reconcile_custom_domain failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return ErrCircuitOpen
+	}
+	return cbErr
 }
 
 // Health checks if the backend is reachable and healthy.

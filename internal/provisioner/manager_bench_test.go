@@ -55,6 +55,9 @@ func (m *mockBenchBackend) GetLogs(ctx context.Context, leaseUUID string, tail i
 }
 func (m *mockBenchBackend) Restart(ctx context.Context, req backend.RestartRequest) error { return nil }
 func (m *mockBenchBackend) Update(ctx context.Context, req backend.UpdateRequest) error   { return nil }
+func (m *mockBenchBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
+	return nil
+}
 func (m *mockBenchBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
 	return nil, backend.ErrNotProvisioned
 }

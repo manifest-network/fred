@@ -48,6 +48,7 @@ const (
 	LabelBackendName   = "fred.backend_name"
 	LabelServiceName   = "fred.service_name"
 	LabelFQDN          = "fred.fqdn"
+	LabelCustomDomain  = "fred.custom_domain"
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
@@ -79,6 +80,7 @@ type ContainerInfo struct {
 	CreatedAt     time.Time
 	Ports         map[string]PortBinding
 	FQDN          string
+	CustomDomain  string // Tenant-supplied custom FQDN (empty when not set)
 }
 
 // PortBinding represents a port mapping.
@@ -834,6 +836,13 @@ type CreateContainerParams struct {
 	Ingress     IngressConfig
 	NetworkName string // Per-tenant network name for traefik.docker.network label
 	Quantity    int    // Total quantity for this service (used in subdomain computation)
+
+	// CustomDomain is the optional tenant-supplied FQDN for this LeaseItem.
+	// When non-empty (and a routable HTTP port exists), CreateContainer
+	// emits a secondary Traefik router routing Host(<CustomDomain>) to the
+	// shared per-service loadbalancer. Validated defense-in-depth before
+	// emission; chain authoritatively validates upstream.
+	CustomDomain string
 }
 
 // portBindRetries is the number of times to retry container creation when
@@ -898,17 +907,15 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 	}
 
 	// Inject ingress labels for auto-discovery routing.
-	if params.Ingress.Enabled {
-		if port, ok := SelectIngressPort(params.Manifest.Ports); ok {
-			subdomain := ComputeSubdomain(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
-			fqdn := ComputeFQDN(subdomain, params.Ingress.WildcardDomain)
-			routerName := RouterName(params.LeaseUUID, params.ServiceName, params.InstanceIndex, params.Quantity)
-			for k, v := range TraefikLabels(params.Ingress, params.NetworkName, routerName, fqdn, port) {
-				labels[k] = v
-			}
-			labels[LabelFQDN] = fqdn
-		}
-	}
+	applyIngressLabels(labels, ingressLabelParams{
+		LeaseUUID:    params.LeaseUUID,
+		ServiceName:  params.ServiceName,
+		Instance:     params.InstanceIndex,
+		Quantity:     params.Quantity,
+		Ingress:      params.Ingress,
+		NetworkName:  params.NetworkName,
+		CustomDomain: params.CustomDomain,
+	}, params.Manifest.Ports)
 
 	// Build environment variables
 	var env []string
@@ -1378,6 +1385,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		CreatedAt:     meta.CreatedAt,
 		Ports:         make(map[string]PortBinding),
 		FQDN:          resp.Config.Labels[LabelFQDN],
+		CustomDomain:  resp.Config.Labels[LabelCustomDomain],
 	}
 
 	// Extract port bindings
@@ -1439,6 +1447,7 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			CreatedAt:     meta.CreatedAt,
 			Ports:         make(map[string]PortBinding),
 			FQDN:          c.Labels[LabelFQDN],
+			CustomDomain:  c.Labels[LabelCustomDomain],
 		}
 
 		// Extract port bindings from container ports
