@@ -221,7 +221,9 @@ ReadWritePaths=/var/lib/fred
 WantedBy=multi-user.target
 ```
 
-`docker-backend.service` is the same shape with two differences: it needs `--group-add` for the Docker group (or run as root), and `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, and `volume_data_path`.
+`docker-backend.service` is the same shape with two differences:
+- It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root.
+- `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, and `volume_data_path`.
 
 `TimeoutStopSec` should comfortably exceed `shutdown_timeout` from your config (default 30s) so systemd doesn't SIGKILL during graceful drain.
 

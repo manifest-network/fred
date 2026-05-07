@@ -260,7 +260,7 @@ Volumes are preserved. Useful when a container is stuck or you want to re-run st
 ### Update — new manifest
 
 ```bash
-NEW_MANIFEST_B64=$(base64 -w0 < new-manifest.json)
+NEW_MANIFEST_B64=$(base64 < new-manifest.json | tr -d '\n')   # portable across GNU and BSD/macOS
 curl -X POST -H "Authorization: Bearer $(fresh_token)" \
   -H "Content-Type: application/json" \
   -d "{\"payload\": \"$NEW_MANIFEST_B64\"}" \
