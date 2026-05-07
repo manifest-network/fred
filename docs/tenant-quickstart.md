@@ -56,7 +56,9 @@ This message is signed using **ADR-036** (Cosmos's standard for off-chain messag
 |---|---|
 | Maximum age | 30 seconds |
 | Maximum future skew | 10 seconds |
-| Replay (mutating endpoints only) | One-time use |
+| Replay (mutating endpoints + `/connection`) | One-time use |
+
+`/connection` is included because it returns sensitive endpoint details; the other read endpoints (`/status`, `/provision`, `/logs`, `/releases`, `/events`) are idempotent and skip the replay check. See [SECURITY.md § Which endpoints check replay](../SECURITY.md#which-endpoints-check-replay) for the full table.
 
 Tokens are short-lived. Generate a fresh one for each request, or batch requests within a 30-second window.
 
@@ -249,7 +251,7 @@ Two operations are available on a `ready` (or `failed`) lease:
 ### Restart — same manifest, fresh containers
 
 ```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" \
+curl -X POST -H "Authorization: Bearer $(fresh_token)" \
   https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/restart
 ```
 
@@ -259,7 +261,7 @@ Volumes are preserved. Useful when a container is stuck or you want to re-run st
 
 ```bash
 NEW_MANIFEST_B64=$(base64 -w0 < new-manifest.json)
-curl -X POST -H "Authorization: Bearer $TOKEN" \
+curl -X POST -H "Authorization: Bearer $(fresh_token)" \
   -H "Content-Type: application/json" \
   -d "{\"payload\": \"$NEW_MANIFEST_B64\"}" \
   https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/update
@@ -267,12 +269,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 The body shape is different from `/data` — the manifest is base64-encoded inside a JSON wrapper. Volumes are preserved across updates. On failure the operation rolls back to the previous containers.
 
-Both endpoints enforce **replay protection** since they're mutating. Each retry needs a fresh token.
+Both endpoints enforce **replay protection** since they're mutating. Each retry needs a fresh token (hence `$(fresh_token)` rather than a stored `$TOKEN` variable).
 
 To see what's been deployed:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" \
+curl -H "Authorization: Bearer $(fresh_token)" \
   https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/releases
 ```
 

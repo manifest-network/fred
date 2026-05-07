@@ -1,9 +1,9 @@
 // Package docker implements the Backend interface for Docker container
 // provisioning. It is the production backend bundled with Fred.
 //
-// For operators and tenants, see [the Docker backend README] for the full
-// configuration reference, HTTP API, lease state machine, callback protocol,
-// and Traefik integration.
+// For operators and tenants, see the README.md alongside this package
+// (internal/backend/docker/README.md) for the full configuration reference,
+// HTTP API, lease state machine, callback protocol, and Traefik integration.
 //
 // # Architecture overview (for developers)
 //
@@ -45,6 +45,4 @@
 // read-only rootfs, tmpfs for /tmp and /run, PID limits, no swap, restart
 // policy disabled (for crash detection), and per-tenant network isolation.
 // See the README for the full list and operator-facing knobs.
-//
-// [the Docker backend README]: https://github.com/manifest-network/fred/blob/main/internal/backend/docker/README.md
 package docker
