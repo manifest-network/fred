@@ -95,7 +95,7 @@ go test -run TestAuthToken ./...  # specific test by name
 go test -race -short ./...
 ```
 
-The CI pipeline runs `-race -short` on every PR. Always run it locally before pushing.
+**CI does not run `-race`** (it is omitted in `.github/workflows/ci.yml` due to memory pressure on GitHub-hosted runners). Locals are the only place this runs, so make a habit of `go test -race -short ./...` before pushing — especially on PRs that touch concurrency.
 
 ### Integration tests
 
@@ -108,7 +108,7 @@ make test-integration-restart-update   # restart, update, release-history flows
 sudo make test-integration-volume  # filesystem quota tests (root + btrfs-progs)
 ```
 
-Volume tests need root because they create btrfs subvolumes and set xfs project quotas. They run in CI on a self-hosted runner.
+Volume tests need root because they create btrfs subvolumes and set xfs project quotas. **None of the integration suites run in CI** — `.github/workflows/ci.yml` only does `build`, `test` (without `-race`, no `integration` tag), `lint`, and `vulncheck`. Anything that touches Docker or the filesystem-quota machinery has to be run locally.
 
 ### Stress tests
 
@@ -146,10 +146,10 @@ Benchmark files are listed in [PERFORMANCE.md](PERFORMANCE.md#benchmark-files).
 ### Formatting
 
 ```bash
-make fmt    # gofmt + goimports with local-prefix grouping
+make fmt    # runs `go fmt ./...`
 ```
 
-`goimports` is configured to group `github.com/manifest-network/fred` imports separately from third-party dependencies. The CI lint step enforces this.
+`make fmt` only runs `go fmt`. Import ordering (with `github.com/manifest-network/fred` grouped separately from third-party dependencies) is enforced by `goimports`, which is configured as a formatter in `.golangci.yml` and runs as part of `make lint` and the CI lint job. So the local fast loop is `make fmt && make lint`; CI catches the import grouping there even if you skip it locally.
 
 ### Linting
 

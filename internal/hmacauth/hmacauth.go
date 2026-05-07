@@ -12,11 +12,14 @@
 //
 // # Replay protection
 //
-// Verifiers reject signatures whose timestamp is more than 5 minutes old
-// or more than 1 minute in the future (clock-skew tolerance). Combined with
-// the body binding, this prevents both replay and timestamp substitution
-// attacks. The pattern is the same one used by Stripe, GitHub, and Slack
-// webhooks.
+// Verify takes a maxAge parameter — callers choose the freshness window for
+// their use case (the callback path uses 5 minutes via DefaultCallbackMaxAge).
+// The 1-minute clock-skew tolerance for future timestamps is hardcoded in
+// Verify; use VerifyWithTime to override it.
+//
+// Combined with the body binding above, the timestamp check prevents both
+// replay and timestamp substitution attacks. The pattern is the same one
+// used by Stripe, GitHub, and Slack webhooks.
 //
 // # Constant-time comparison
 //
