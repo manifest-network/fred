@@ -142,7 +142,7 @@ For a one-shot dev environment against a running local chain, use:
 bash scripts/dev-init.sh
 ```
 
-This registers a provider and SKUs on-chain, generates `config.yaml` and `docker-backend.yaml`, and writes a callback secret. All settings are overridable via environment variables — see the script header for the full list. Requires `manifestd` on `PATH` and a running local chain.
+This registers a provider and SKUs on-chain, generates `config.docker.yaml` (the `providerd` config) and `docker-backend.yaml`, and writes a callback secret. All settings are overridable via environment variables — see the script header for the full list. Requires `manifestd`, `jq`, `curl`, and `openssl` on `PATH` plus a running local chain.
 
 ## Configuration
 
