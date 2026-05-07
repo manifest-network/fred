@@ -666,3 +666,11 @@ Before deploying your backend:
 - [ ] (Optional) `/update` endpoint for deploying new manifests
 - [ ] (Optional) `/releases/{uuid}` endpoint for release history tracking
 - [ ] (Optional) `/stats` endpoint for resource monitoring
+
+## Further reading
+
+- [SECURITY.md](SECURITY.md) — full security model including HMAC details and replay protection
+- [OPERATIONS.md](OPERATIONS.md) — operator-side runbook (alert interpretation, callback debugging)
+- [docs/manifest-guide.md](docs/manifest-guide.md) — tenant manifest schema (if your backend interprets manifests)
+- [internal/backend/docker/README.md](internal/backend/docker/README.md) — the bundled Docker backend, useful as a worked example
+- [CONTRIBUTING.md § Adding a backend operation](CONTRIBUTING.md#adding-a-backend-operation) — if you're contributing a backend operation upstream rather than building a separate backend

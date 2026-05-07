@@ -113,10 +113,10 @@ allowed_registries:
 # Settings for callbacks to Fred reporting provisioning results.
 
 # HMAC secret for signing callbacks to Fred (minimum 32 characters).
-# REQUIRED — docker-backend refuses to start without this. Generate with:
-#   openssl rand -hex 32
+# REQUIRED — docker-backend refuses to start with an empty value.
+# Generate with: openssl rand -hex 32
 # Must match callback_secret configured on the Fred side.
-# callback_secret: ""
+callback_secret: ""
 
 # Skip TLS certificate verification for callbacks (development only!)
 # WARNING: Never enable in production - vulnerable to MITM attacks

@@ -1,4 +1,14 @@
 // Package metrics provides Prometheus metrics for fred observability.
+//
+// All metrics use the `fred` namespace and are registered with the global
+// promauto registry, so importing this package is enough to expose them at
+// the application's /metrics endpoint.
+//
+// The docker backend defines its own set of metrics under
+// `fred_docker_backend_*` in its package-local metrics file.
+//
+// For a categorized reference of every metric and its labels, see
+// ARCHITECTURE.md.
 package metrics
 
 import (
