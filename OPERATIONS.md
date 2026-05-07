@@ -204,7 +204,8 @@ All logs are structured JSON via `slog`. Key fields:
 | `tenant` | Set for tenant API calls and provisions |
 | `backend` | Set for backend operations |
 | `error` | Set on failures; full Go error chain |
-| `transition` | Set on lease state-machine transitions (docker-backend) |
+
+State-machine transitions in the docker backend are surfaced via the `fred_docker_backend_lease_sm_transitions_total{from,to,event}` metric rather than as a log field; query the metric for transition history.
 
 Set `log_level: debug` in `config.yaml` (or the docker-backend's own `log_level`) to see chain query traces, Watermill message routing, and per-actor inbox depth — but be aware debug-level under load can be very chatty.
 

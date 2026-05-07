@@ -60,8 +60,8 @@ Each docker-backend host typically also runs Traefik (see [Ingress](#ingress-via
 
 | Requirement | Recommendation |
 |---|---|
-| OS | Linux 5.10+ (cgroup v2 strongly recommended; tmpfs counted toward memory limits) |
-| Docker | 24.0+ with iptables enabled (the default). `--iptables=false` disables cross-tenant network isolation |
+| OS | Linux. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
+| Docker | iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads)) |
 | Network | Reachable from `providerd`; outbound reachability to image registries |
@@ -177,7 +177,7 @@ The HMAC `callback_secret` is shared between `providerd` and every backend. Beca
 
 1. Stop traffic (or accept brief 401s during rotation).
 2. Update `callback_secret` in `config.yaml` and **every** `docker-backend.yaml`.
-3. Restart `docker-backend` first, then `providerd`. Ordering is not strict, but during the rotation window in-flight requests will see 401s.
+3. Restart **every `docker-backend`** first, then `providerd` last. Rationale: with a fleet of backends, the rolling restart is the longer operation; finishing with `providerd` minimizes the total window where the old and new secrets are both in play. During the rotation window, in-flight requests in both directions will see 401s — the backend's persistent callback queue and Watermill's redelivery on the providerd side recover automatically once both ends are on the new secret.
 4. Verify with a test provision.
 
 There is no built-in support for two-secret rotation (active + previous). If you need zero-downtime rotation, deploy a second `providerd` with the new secret on a separate hostname and migrate traffic.
@@ -212,13 +212,16 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# ReadWritePaths must include the directories holding any *_db_path values
+# from your config (token_tracker_db_path, payload_store_db_path,
+# placement_store_db_path). Adjust this line to match.
 ReadWritePaths=/var/lib/fred
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-`docker-backend.service` is the same shape but `User=root` is typically required to talk to the Docker socket (or add the `fred` user to the `docker` group).
+`docker-backend.service` is the same shape with two differences: it needs `--group-add` for the Docker group (or run as root), and `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, and `volume_data_path`.
 
 `TimeoutStopSec` should comfortably exceed `shutdown_timeout` from your config (default 30s) so systemd doesn't SIGKILL during graceful drain.
 

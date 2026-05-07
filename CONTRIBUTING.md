@@ -169,7 +169,7 @@ go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 
 - **Interfaces are defined where they're consumed**, not where they're implemented. So `BackendRouter` lives in `internal/provisioner/interfaces.go`, not in `internal/backend/`. This keeps consumer packages testable without circular imports.
 - **`safeGo()` for long-lived goroutines** — wraps in `recover()` so panics surface as errors instead of crashing the daemon. Increment `fred_background_goroutine_panics_total{component=...}` when panicking; the recovery should never be silent.
-- **`cmp.Or` for defaults** — preferred over explicit zero checks in struct construction.
+- **`cmp.Or` for runtime defaults** — used in several places (e.g. `internal/backend/client.go`, `cmd/mock-backend/main.go`) to fold in zero-value defaults at use sites. Not enforced project-wide; explicit zero checks are also fine.
 - **Structured logging** — `slog` with consistent field names (`lease_uuid`, `tenant`, `backend`, `error`). Don't `fmt.Sprintf` into log messages; use key-value fields so logs are queryable.
 - **Errors at boundaries, panics never** — return errors from public APIs. `recover()` is for actor handlers and long-lived goroutines only, where a single panic must not take out the process.
 - **No tests in production code paths** — `internal/backend/chain.MockClient` lives outside the production build (issue context: PR #81). Test mocks go in `chaintest/` or alongside the test files using build tags.
@@ -200,7 +200,7 @@ Look at `internal/scheduler/doc.go` or `internal/backend/docker/doc.go` for the 
 ## Adding an API endpoint
 
 1. Add a handler in `internal/api/handlers.go` (or a focused file if the handler is long).
-2. Register the route in `internal/api/server.go` with the right middleware chain (`AuthMiddleware` for tenant-authenticated routes, `PayloadAuthMiddleware` for `/data`-style routes).
+2. Register the route in `internal/api/server.go` using the existing `withAuthRL` wrapper (most authenticated tenant endpoints) or `withPayloadRL` (the `/data` upload). These wrappers apply per-tenant rate limiting plus the appropriate token validator (`tenantRateLimiter.AuthMiddleware()` or `tenantRateLimiter.PayloadAuthMiddleware()`).
 3. Decide whether replay protection applies — it should be **on** for any endpoint that mutates state or returns sensitive details, **off** for idempotent reads. The decision matrix is in [SECURITY.md](SECURITY.md#which-endpoints-check-replay).
 4. Document the endpoint in [README.md § API Endpoints](README.md#api-endpoints) — include path, method, auth, replay flag, request shape, response shape, and all status codes.
 5. Add a handler test in `internal/api/server_handler_test.go` and an integration test if the path is non-trivial.
