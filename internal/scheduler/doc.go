@@ -30,7 +30,11 @@
 // # Failure handling
 //
 // Transient chain errors are retried with exponential backoff up to
-// `maxRetries` (3) and `maxBackoff` (10s). Persistent failures increment
-// `credit_check_error_threshold`; once the threshold is exceeded, credit
-// monitoring is disabled until the next successful withdrawal.
+// `maxRetries` (3) and `maxBackoff` (10s). Per-tenant credit-query errors
+// are tracked as `consecutiveErrs` in the tenant's state; once that count
+// reaches `credit_check_error_threshold` (default 3), the scheduler treats
+// the failures as potentially transient: it does not close the tenant's
+// leases on the still-failing data, but does schedule an earlier follow-up
+// run after `credit_check_retry_interval` (default 30s). A successful
+// query resets the counter.
 package scheduler

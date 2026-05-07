@@ -12,10 +12,10 @@ Both `providerd` and `docker-backend` expose `GET /health` that returns 200 when
 
 | Endpoint | Checks |
 |---|---|
-| `providerd /health` | Chain gRPC reachable, all backends reachable, token tracker DB writable, placement store DB writable |
+| `providerd /health` | Chain gRPC reachable, all backends reachable, plus token-tracker and placement-store DB writability *if those stores are configured* (`token_tracker_db_path` and `placement_store_db_path`) |
 | `docker-backend /health` | Docker daemon reachable |
 
-A 503 from `providerd /health` includes a JSON body with per-check status; the failing component is identified there.
+A 503 from `providerd /health` includes a JSON body with per-check status; the failing component is identified there. The `token_tracker` and `placement_store` keys only appear when the corresponding DB is configured — a dev-mode instance without them simply omits those checks rather than failing.
 
 ---
 
