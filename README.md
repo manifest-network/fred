@@ -134,6 +134,16 @@ go build -o build/mock-backend ./cmd/mock-backend
 go build -o build/docker-backend ./cmd/docker-backend
 ```
 
+## Local Development Setup
+
+For a one-shot dev environment against a running local chain, use:
+
+```bash
+bash scripts/dev-init.sh
+```
+
+This registers a provider and SKUs on-chain, generates `config.docker.yaml` (the `providerd` config) and `docker-backend.yaml`, and writes a callback secret. All settings are overridable via environment variables — see the script header for the full list. Requires `manifestd`, `jq`, `curl`, and `openssl` on `PATH` plus a running local chain.
+
 ## Configuration
 
 Copy the example configuration and customize:
@@ -186,6 +196,16 @@ callback_secret: "your-32-character-or-longer-secret-here"
 # Records which backend serves each lease so reads hit the right machine.
 # placement_store_db_path: "/var/lib/fred/placements.db"
 ```
+
+**Per-backend fields:**
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `name` | Unique backend identifier | (required) |
+| `url` | Absolute `http://` or `https://` URL with a host | (required) |
+| `skus` | Exact list of on-chain SKU UUIDs this backend serves | `[]` |
+| `default` | Use as fallback when no SKU match | `false` |
+| `timeout` | HTTP request timeout for calls to this backend | `30s` |
 
 **Validation rules:**
 - Backend names must be unique
@@ -514,6 +534,8 @@ Returns container logs for a lease. Works for both active and non-active leases,
 - `404 Not Found` - Provision not found (never provisioned or logs expired)
 
 ### Upload Payload
+
+The payload is a deployment manifest in JSON format. See the [Manifest Guide](docs/manifest-guide.md) for the full schema (single-service and stack formats, validation rules, examples). A formal [JSON Schema](docs/manifest-schema.json) is available for client-side validation.
 
 ```
 POST /v1/leases/{lease_uuid}/data
@@ -958,6 +980,10 @@ MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
 | `MOCK_BACKEND_DELAY` | Simulated provisioning delay | `0s` |
 | `MOCK_BACKEND_TLS_SKIP_VERIFY` | Skip TLS verification for callbacks (use `true` for self-signed certs) | `false` |
 | `MOCK_BACKEND_CALLBACK_SECRET` | HMAC secret for signing callbacks (required, min 32 chars) | (required) |
+| `MOCK_BACKEND_CLIENT_TIMEOUT` | HTTP client timeout for outbound callbacks | `10s` |
+| `MOCK_BACKEND_READ_TIMEOUT` | HTTP server read timeout | `15s` |
+| `MOCK_BACKEND_WRITE_TIMEOUT` | HTTP server write timeout | `15s` |
+| `MOCK_BACKEND_IDLE_TIMEOUT` | HTTP server idle timeout | `60s` |
 
 **Note:** The mock backend stores callback URLs per lease UUID, so concurrent provisions with different callback URLs are handled correctly without race conditions.
 
@@ -1192,6 +1218,22 @@ Fred's event processing pipeline has been extensively benchmarked:
 | 1M event test | 17.7 seconds, 100% processed |
 
 See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test results, and comparison with other solutions.
+
+## Documentation
+
+| Audience | Doc |
+|---|---|
+| Operators | [DEPLOYMENT.md](DEPLOYMENT.md) — host requirements, filesystem setup, TLS, multi-host, backups, upgrades |
+| Operators | [OPERATIONS.md](OPERATIONS.md) — runbook, alert interpretation, tuning, recovery |
+| Operators | [SECURITY.md](SECURITY.md) — auth, replay protection, hardening |
+| Operators | [PERFORMANCE.md](PERFORMANCE.md) — benchmarks and capacity planning |
+| Tenants | [docs/tenant-quickstart.md](docs/tenant-quickstart.md) — end-to-end API walkthrough |
+| Tenants | [docs/manifest-guide.md](docs/manifest-guide.md) — manifest schema and validation rules |
+| Tenants | [docs/manifest-schema.json](docs/manifest-schema.json) — formal JSON Schema |
+| Backend developers | [BACKEND_GUIDE.md](BACKEND_GUIDE.md) — implementing a third-party backend |
+| Fred developers | [ARCHITECTURE.md](ARCHITECTURE.md) — design decisions, event flow, observability |
+| Fred developers | [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, tests, code style, PRs |
+| Fred developers | [internal/backend/docker/README.md](internal/backend/docker/README.md) — Docker backend internals |
 
 ## Dependencies
 

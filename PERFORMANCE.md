@@ -119,6 +119,8 @@ In production, the limiting factors will be:
 
 Fred's 56,000+ events/sec throughput far exceeds realistic chain event rates, ensuring **Fred will never be the bottleneck**.
 
+For capacity sizing in real deployments (chain ack throughput, per-backend image-pull dominance, memory budgeting), see [OPERATIONS.md § Capacity planning](OPERATIONS.md#capacity-planning) and [DEPLOYMENT.md § Host requirements](DEPLOYMENT.md#host-requirements).
+
 ## Running Benchmarks
 
 ### Quick Benchmarks

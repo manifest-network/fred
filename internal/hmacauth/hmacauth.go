@@ -1,8 +1,35 @@
-// Package hmacauth provides HMAC-SHA256 signing and verification
-// for request authentication between Fred components.
+// Package hmacauth provides HMAC-SHA256 signing and verification for
+// request authentication between Fred components (Fred ↔ backends).
 //
-// Signature format: "t=<unix-timestamp>,sha256=<hex-encoded-hmac>"
-// Signed payload: "<timestamp>.<body>"
+// # Wire format
+//
+// Header: "X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>"
+//
+// # Signed payload
+//
+// "<timestamp>.<body>" — the timestamp is bound to the body so an attacker
+// cannot substitute a different timestamp on a captured request.
+//
+// # Replay protection
+//
+// Verify takes a maxAge parameter — callers choose the freshness window for
+// their use case (the callback path uses 5 minutes via DefaultCallbackMaxAge).
+// The 1-minute clock-skew tolerance for future timestamps is hardcoded in
+// Verify; use VerifyWithTime to override it.
+//
+// Combined with the body binding above, the timestamp check prevents both
+// replay and timestamp substitution attacks. The pattern is the same one
+// used by Stripe, GitHub, and Slack webhooks.
+//
+// # Constant-time comparison
+//
+// Verification uses hmac.Equal (constant-time) to prevent timing attacks.
+//
+// # Used by
+//
+//   - Backend → Fred callbacks (internal/api/callback_auth.go)
+//   - Fred → backend HTTP requests (internal/backend/client.go)
+//   - Backend self-verification middleware (cmd/docker-backend/main.go)
 package hmacauth
 
 import (

@@ -1,5 +1,25 @@
 // Package shared provides backend-agnostic components that can be reused
 // across different backend implementations (Docker, Kubernetes, Nomad, etc.).
+//
+// # What lives here
+//
+//   - SKUProfile, ResourceStats, ResourceAllocator (resources.go) — the
+//     resource pool primitives used by every backend that tracks CPU/memory/disk
+//   - Registry (registry.go) — generic provision-record store with status
+//     transitions and concurrency guards
+//   - CallbackSender (callback_sender.go) — HMAC-signed callback delivery
+//     with bbolt-backed persistence so failure callbacks survive restarts
+//   - BoltStore (bolt_store.go) — small wrapper around bbolt used by the
+//     callback, diagnostics, and release stores
+//   - Diagnostics (diagnostics.go) — persisted failure diagnostics with
+//     fallback for "lease no longer in memory" reads
+//   - Releases (releases.go) — release/deployment history with TTL cleanup
+//   - Types (types.go) — shared SKU and resource types
+//
+// All of these are consumed by the docker backend and are usable by any
+// future in-process backend (Kubernetes, Nomad, etc.). HTTP-only backends
+// running in a separate process should reuse callback_sender and the
+// HMAC types but typically maintain their own registry.
 package shared
 
 import "fmt"

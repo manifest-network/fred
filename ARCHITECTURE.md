@@ -183,6 +183,38 @@ Key interfaces defined where they're consumed:
 | `CallbackPublisher` | `api/server.go` | API callback handler |
 | `StatusChecker` | `api/server.go` | API status handler |
 
+## State Reference
+
+Two state machines run side-by-side: the chain owns the lease's billing state, and Fred (with the backend) owns the provision's runtime state. Both appear in API responses, metrics, and reconciliation logic.
+
+### Chain Lease State
+
+Authoritative on-chain field. The chain emits events when this changes; Fred reacts.
+
+| State | Description | Source |
+|---|---|---|
+| `PENDING` | Lease created on-chain. Awaiting provisioning (and a payload upload if `meta_hash` is set). | `LEASE_STATE_PENDING` |
+| `ACTIVE` | Provisioned and acknowledged. Tenant can use the resource and is being billed. | `LEASE_STATE_ACTIVE` |
+| `CLOSED` | Tenant-closed or auto-closed (credit depletion, expiry). Resources should be deprovisioned. | `LEASE_STATE_CLOSED` |
+| `EXPIRED` | Lease's time bound elapsed. Same handling as CLOSED. | `LEASE_STATE_EXPIRED` |
+
+### Provision Status
+
+Fred-internal runtime status of the provisioned resource. Surfaced via `GET /v1/leases/{uuid}/provision`, the docker-backend's `GET /provisions/{uuid}`, and the lease state machine in `internal/backend/docker/lease_sm.go`.
+
+| Status | Description | Terminal? |
+|---|---|---|
+| `provisioning` | Backend has accepted the request and is creating the resource. | No |
+| `ready` | Resource is healthy and serving traffic. | No |
+| `failing` | Container death detected; diagnostics being gathered. Brief transient — collapses to `failed` (or `deprovisioning` if a Deprovision arrives in this window). | No |
+| `failed` | Provisioning or runtime failure. May be re-provisioned, restarted, updated, or deprovisioned. | Yes (until next request) |
+| `restarting` | Containers are being recreated with the same manifest. | No |
+| `updating` | New manifest is being deployed (containers replaced). | No |
+| `deprovisioning` | Containers/volumes are being removed. | Yes (transient before actor exits) |
+| `unknown` | Reserved safety state — should never appear in normal flow. | — |
+
+The full transition matrix lives in [internal/backend/docker/README.md](internal/backend/docker/README.md#lease-state-machine). The reconciler matrix in [README.md](README.md#reconciliation) shows how chain state × provision status maps to corrective actions.
+
 ## Event Flow
 
 ### Lease Creation (No Payload)
@@ -470,49 +502,139 @@ Used tokens are tracked in bbolt to prevent replay attacks:
 
 ### Metrics (Prometheus)
 
-Key metrics exposed at `/metrics`:
+All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-backend exposes its own set under `fred_docker_backend_*` at the docker-backend's own `/metrics` endpoint.
+
+#### Fred (`/metrics` on the providerd HTTP server)
 
 **API:**
-- `fred_api_requests_total` - Request count by method/path/status
-- `fred_api_request_duration_seconds` - Request latency histogram
-- `fred_api_rate_limit_rejections_total` - Rate limit rejections by limiter (global, tenant)
-- `fred_api_non_in_flight_callbacks_total` - Callbacks for non-tracked leases
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_api_requests_total` | counter | `method, path, status` | API request count |
+| `fred_api_request_duration_seconds` | histogram | `method, path, status` | Request latency |
+| `fred_api_rate_limit_rejections_total` | counter | `limiter` | Rate limit rejections (`global`, `tenant`) |
+| `fred_api_non_in_flight_callbacks_total` | counter | `backend, status` | Callbacks for leases not tracked in-flight (restart/update completions, late delivery, intentional deprovision) |
 
 **Provisioner:**
-- `fred_provisioner_in_flight_provisions` - Current in-flight provisions gauge
-- `fred_provisioner_provisioning_total` - Provisioning operations by outcome/backend
-- `fred_provisioner_provisioning_duration_seconds` - Provisioning latency histogram
-- `fred_provisioner_callback_timeouts_total` - Backend callback timeouts
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_provisioner_in_flight_provisions` | gauge | — | Current in-flight provisions |
+| `fred_provisioner_provisioning_total` | counter | `outcome, backend` | Provisioning operations by outcome/backend |
+| `fred_provisioner_provisioning_duration_seconds` | histogram | `backend` | Provisioning latency |
+| `fred_provisioner_callback_timeouts_total` | counter | — | Backend callback timeouts |
+| `fred_provisioner_ack_batch_fee_gas_errors_total` | counter | `lane` | Ack-batch failures classified as insufficient-fee or out-of-gas — sustained non-zero indicates `gas_limit`/`max_gas_limit`/fee misconfiguration |
+| `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
+| `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
+| `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`) — any non-zero is a latent bug |
 
 **Reconciler:**
-- `fred_reconciler_runs_total` - Reconciliation runs by outcome
-- `fred_reconciler_duration_seconds` - Reconciliation timing histogram
-- `fred_reconciler_actions_total` - Actions taken (provisioned, acknowledged, deprovisioned, anomaly)
-- `fred_reconciler_last_success_timestamp_seconds` - Last successful run timestamp
-- `fred_reconciler_conflicts_total` - Lease already in-flight conflicts
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_reconciler_runs_total` | counter | `outcome` | Reconciliation runs by outcome |
+| `fred_reconciler_duration_seconds` | histogram | — | Run timing |
+| `fred_reconciler_actions_total` | counter | `action` | Actions taken (`provisioned`, `acknowledged`, `deprovisioned`, `anomaly`, `lease_error`) |
+| `fred_reconciler_last_success_timestamp_seconds` | gauge | — | Unix timestamp of last successful run |
+| `fred_reconciler_conflicts_total` | counter | — | Reconciler conflicts (lease already in-flight) |
 
 **Backend:**
-- `fred_backend_requests_total` - Request count by backend/operation/status
-- `fred_backend_request_duration_seconds` - Request latency histogram
-- `fred_backend_circuit_breaker_state` - Circuit breaker state (0=closed, 1=half-open, 2=open)
-- `fred_backend_healthy` - Backend health status gauge
-- `fred_backend_insufficient_resources_total` - Capacity rejections by backend
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_backend_requests_total` | counter | `backend, operation, status` | Backend request count |
+| `fred_backend_request_duration_seconds` | histogram | `backend, operation, status` | Backend request latency |
+| `fred_backend_circuit_breaker_state` | gauge | `backend` | Circuit breaker state (0=closed, 1=half-open, 2=open) |
+| `fred_backend_healthy` | gauge | `backend` | Backend health (1=healthy, 0=unhealthy) |
+| `fred_backend_insufficient_resources_total` | counter | `backend` | Capacity 503s |
 
 **Chain:**
-- `fred_chain_transactions_total` - Chain transactions by type/outcome
-- `fred_chain_query_duration_seconds` - Chain query latency histogram
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_chain_transactions_total` | counter | `type, outcome` | Chain transactions (`acknowledge`, `reject`, `withdraw`, `close`) |
+| `fred_chain_query_duration_seconds` | histogram | `query` | Chain query latency |
+| `fred_chain_signer_oog_retries_total` | counter | `result` | Out-of-gas retry decisions at the broadcast layer (`retried`, `exhausted`) |
 
 **Payload:**
-- `fred_payload_uploads_total` - Upload count by outcome
-- `fred_payload_stored_count` - Currently stored payloads gauge
-- `fred_payload_size_bytes` - Upload size histogram
-- `fred_payload_leases_awaiting` - Leases currently waiting for payload upload
 
-**Watermill:**
-- `fred_watermill_messages_total` - Messages processed by topic/outcome
-- `fred_watermill_poisoned_messages_total` - Messages sent to poison queue
-- `fred_events_dropped_total` - Events dropped due to full subscriber channels
-- `fred_messages_malformed_total` - Unparseable messages by topic
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_payload_uploads_total` | counter | `outcome` | Uploads (`success`, `invalid_auth`, `hash_mismatch`, `conflict`, `error`) |
+| `fred_payload_stored_count` | gauge | — | Payloads currently stored |
+| `fred_payload_size_bytes` | histogram | — | Upload size distribution |
+| `fred_payload_leases_awaiting` | gauge | — | Leases waiting for payload upload |
+
+**Signer pool:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_signer_pool_size` | gauge | — | Total signers (primary + sub-signers) |
+| `fred_signer_pool_lane_count` | gauge | — | Active batcher lanes |
+
+**Watermill / events:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_watermill_messages_total` | counter | `topic, outcome` | Watermill messages processed |
+| `fred_watermill_poisoned_messages_total` | counter | — | Messages sent to poison queue |
+| `fred_events_dropped_total` | counter | `event_type` | Events dropped due to full subscriber channels |
+| `fred_messages_malformed_total` | counter | `topic` | Unparseable messages |
+
+**Background goroutine health:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_background_cleanup_panics_total` | counter | `component` | Panics in cleanup loops (token tracker, callback store, etc.) — any non-zero is a bug |
+| `fred_background_goroutine_panics_total` | counter | `component` | Panics in long-lived background goroutines |
+
+#### Docker backend (`/metrics` on the docker-backend HTTP server)
+
+All docker-backend metrics live under `fred_docker_backend_*`.
+
+**Provisioning & resources:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_docker_backend_provisions_total` | counter | `outcome` | Provision attempts |
+| `fred_docker_backend_deprovisions_total` | counter | — | Deprovision operations |
+| `fred_docker_backend_active_provisions` | gauge | — | Active provisions |
+| `fred_docker_backend_provision_duration_seconds` | histogram | — | End-to-end provision time |
+| `fred_docker_backend_image_pull_duration_seconds` | histogram | — | Image pull duration |
+| `fred_docker_backend_container_create_duration_seconds` | histogram | — | Container create duration |
+| `fred_docker_backend_resource_cpu_allocated_ratio` | gauge | — | Allocated/total CPU |
+| `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
+| `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total disk |
+
+**Callbacks:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_docker_backend_callback_delivery_total` | counter | `outcome` | Callback delivery attempts |
+| `fred_docker_backend_callback_store_errors_total` | counter | — | bbolt persistence failures for callbacks |
+
+**Reconciliation:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_docker_backend_reconciliation_total` | counter | `outcome` | Reconciliation runs |
+| `fred_docker_backend_reconciliation_last_success_timestamp_seconds` | gauge | — | Unix timestamp of last successful reconciliation |
+| `fred_docker_backend_idempotent_ops_total` | counter | `op, reason` | Docker operations skipped because the daemon reported the work was already done. Spikes on `remove`/`in_progress` suggest reconciler/event races; spikes on `create`/`already_exists` suggest crash-replay |
+| `fred_docker_backend_container_removal_wait_failures_total` | counter | — | RemoveContainer calls where the "in progress" wait did not confirm NotFound before timeout |
+
+**Lease actor / state machine:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_docker_backend_lease_sm_transitions_total` | counter | `from, to, event` | State-machine transitions |
+| `fred_docker_backend_lease_actors_created_total` | counter | — | Cumulative actors created since startup |
+| `fred_docker_backend_lease_actor_stuck_seconds` | gauge | — | Age of oldest in-flight actor `handle()` call. Alert threshold should exceed the longest legitimate operation (Deprovision can hold the actor for minutes during cleanup) |
+| `fred_docker_backend_lease_actor_inbox_depth` | histogram | — | Per-actor inbox depth (cap is 16). Healthy: p99 near 0 |
+| `fred_docker_backend_lease_actor_panics_total` | counter | — | Panics recovered in actor handlers — any non-zero is a bug |
+| `fred_docker_backend_lease_terminal_event_dropped_total` | counter | `event` | Terminal SM events `sendTerminal` refused to deliver (actor exited, mid-exit, or inbox wedged). Sustained non-zero under clean shutdown indicates a real data-loss pattern |
+| `fred_docker_backend_die_event_dropped_total` | counter | `source` | Container-death signals `routeToLease` could not deliver (`event_loop`, `reconcile`). Reconciler re-detects on next cycle, so this is not data loss but flags a wedged actor or chronic burst |
+| `fred_docker_backend_lease_failing_race_skipped_total` | counter | — | `onEnterFailing` bails due to concurrent Restart/Update |
+| `fred_docker_backend_lease_worker_panics_total` | counter | `worker_type` | Panics in lease worker goroutines (provision/replace/diag) — any non-zero is a latent bug |
 
 ### Logging (slog)
 
@@ -524,24 +646,38 @@ Structured logging with consistent fields:
 
 ## Testing Strategy
 
-### Unit Tests
+The full developer-facing test reference (commands, prerequisites, conventions) lives in [CONTRIBUTING.md § Testing](CONTRIBUTING.md#testing). This section covers the testing *philosophy*.
 
-- Mock interfaces for chain client, backends
-- Table-driven tests for validation logic
-- In-memory Watermill for handler tests
+### Layers
 
-### Integration Tests
+| Layer | Where | What it covers | How to run |
+|---|---|---|---|
+| Unit | `_test.go` next to each file | Single function / type behavior. Mock interfaces for chain, backends, etc. | `make test` |
+| Race | Same files, `-race -short` | Concurrency invariants — actor messages, in-flight tracker, signer pool. Stress tests skip via `testing.Short()` because they OOM under `-race`. | `go test -race -short ./...` |
+| Integration (provisioner) | `_test.go` with no build tag | Full event flow with the in-memory mock backend. Watermill GoChannel transport. | `make test` |
+| Integration (Docker) | `_test.go` with `//go:build integration` | Real Docker daemon, real container lifecycle. | `make test-integration` (requires Docker) |
+| Integration (volumes) | Same, gated on root | btrfs/xfs/zfs quota enforcement. | `sudo make test-integration-volume` |
+| Stress | `manager_stress_test.go` | 10K–1M event burst tests, sustained-load tests. | See [PERFORMANCE.md](PERFORMANCE.md#running-benchmarks); 500K/1M gated by `STRESS_TEST_LARGE=1` |
+| Bench | `*_bench_test.go` | Throughput and latency profiling. | `go test -bench=.` |
 
-- Mock backend for end-to-end flow testing
-- Simulated delays and failures
-- Callback authentication testing
+### Test fixtures
 
-### Test Fixtures
+Common test data lives in `internal/testutil/fixtures.go`:
 
-Common test data in `internal/testutil/fixtures.go`:
-- Valid/invalid auth tokens
-- Lease objects in various states
-- Signed messages for ADR-036 testing
+- `NewTestKeyPair(seed)` — deterministic secp256k1 keypair from a string seed
+- `CreateTestToken` / `CreateTestPayloadToken` — signed ADR-036 bearer tokens (see [tenant-quickstart.md](docs/tenant-quickstart.md) for the canonical token shape)
+- `CreateExpiredToken`, `CreateFutureToken` — variants for negative testing
+
+Chain-client mocks live in `internal/chain/chaintest/` and are deliberately separated from package `chain` so they do not link into the production `providerd` binary.
+
+### Failure-mode coverage
+
+Race-detector runs and integration tests catch most concurrency bugs. The patterns to match when adding a feature:
+
+- **Multiple-message races**: cover the case where two messages arrive at a lease actor in the same tick (see `lease_actor_test.go::TestLeaseActor_DeprovisionDuringProvisioning`).
+- **Reconciler vs event-loop races**: cover cases where the reconciler and the realtime event path observe the same transition (see `recover_state_test.go`).
+- **Backend timeout/circuit-breaker**: cover cases where the backend client fails fast on a circuit-open state.
+- **bbolt I/O failures**: cover cases where the writer goroutine fails — the package must not silently lose data.
 
 ## Security Model
 

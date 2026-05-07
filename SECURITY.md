@@ -251,7 +251,7 @@ Network isolation places each tenant's containers in a dedicated Docker bridge n
 | Payload `meta_hash` | 64 hex chars | Yes (`subtle.ConstantTimeCompare`) | Never |
 | ADR-036 signatures | N/A | secp256k1 library verify | Signature logged in debug (public data) |
 
-**Secret rotation:** The callback secret is static per deployment. Rotation requires coordinated restart of Fred and all backends with the new secret.
+**Secret rotation:** The callback secret is static per deployment. Rotation requires coordinated restart of Fred and all backends with the new secret. See [DEPLOYMENT.md § Secret rotation](DEPLOYMENT.md#secret-rotation) for the procedure.
 
 ## Production Mode
 
@@ -272,3 +272,7 @@ The daemon refuses to start if any check fails.
 2. **Release history includes raw manifests.** The `GET /releases` response includes the full manifest payload. If tenants put secrets in environment variables, those persist in the release store and are returned on read. This is tenant-visible-to-tenant-only (properly authenticated), but tenants should be aware that manifest contents are stored.
 
 3. **Per-tenant rate limiting adds ECDSA cost to every request.** Tokens are fully validated (secp256k1 signature verification) before bucket consumption, which adds CPU overhead per request. This is the correct trade-off: the previous design (skipping verification) allowed attackers to burn a victim's quota with forged tokens.
+
+## Incident response
+
+For runbook-style guidance on responding to active incidents — replay attempts, suspicious callback traffic, sustained auth failures, wedged actors — see [OPERATIONS.md](OPERATIONS.md). Security-relevant signals are flagged in the alert table there (rate-limit spikes, panic counters, callback timeouts, etc.).
