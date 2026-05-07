@@ -27,7 +27,7 @@
 //
 //   - lease_actor.go, lease_sm.go: the per-lease actor and its state machine
 //   - work_barrier.go: per-actor worker reference counter (used by OnExit
-//     to wait for cancelled goroutines before completing the transition)
+//     to wait for canceled goroutines before completing the transition)
 //   - provision.go, deprovision.go, restart_update.go: the lifecycle
 //     workers that the actor spawns for each long-running operation
 //   - recover.go: state recovery from Docker labels on startup and during
