@@ -17,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
@@ -140,7 +141,7 @@ type provision struct {
 	SKU                   string
 	ContainerIDs          []string // Multiple containers for multi-unit leases
 	Image                 string
-	Manifest              *DockerManifest // Single-manifest leases (mutually exclusive with StackManifest); persisted for restart/update.
+	Manifest              *manifest.Manifest // Single-manifest leases (mutually exclusive with StackManifest); persisted for restart/update.
 	Status                backend.ProvisionStatus
 	Quantity              int // Expected number of containers
 	CreatedAt             time.Time
@@ -150,7 +151,7 @@ type provision struct {
 	CallbackURL           string // URL to notify on provision completion
 
 	// Stack fields (set when IsStack() returns true)
-	StackManifest     *StackManifest      // Per-service manifests for stack deployments
+	StackManifest     *manifest.StackManifest // Per-service manifests for stack deployments
 	ServiceContainers map[string][]string // service name → container IDs
 	Items             []backend.LeaseItem // Original lease items (preserved for stack operations)
 }

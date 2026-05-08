@@ -1,4 +1,29 @@
-package docker
+// Package manifest defines the tenant-facing container manifest schema
+// (single-container Manifest and multi-service StackManifest), JSON
+// parsing, and validation. It is consumed by every backend that
+// provisions tenant workloads (Docker, K3s, future substrates) so the
+// on-the-wire schema and validation stay identical across substrates.
+//
+// # Substrate boundaries
+//
+// Some fields here carry Docker-flavored conventions because that is
+// the lingua franca of the schema. K8s/K3s translation is the job of
+// each backend, not of this package:
+//
+//   - HealthCheckConfig.Test uses the Docker exec format
+//     (["CMD", cmd, args...], ["CMD-SHELL", "shell-string"], ["NONE"]).
+//     A K3s/K8s backend must translate this to exec / httpGet /
+//     tcpSocket probes substrate-side; that translation is out of
+//     scope for this package.
+//   - validateUserSpec accepts Docker's USER-directive format
+//     (uid, uid:gid, username, username:group). Generic enough to
+//     remain here as the wire format; backends translate to
+//     securityContext.runAsUser / runAsGroup as needed.
+//   - Tmpfs and StopGracePeriod are Docker-flavored field names but
+//     translate cleanly to K8s emptyDir.medium=Memory tmpfs mounts and
+//     terminationGracePeriodSeconds; backends do that translation
+//     substrate-side.
+package manifest
 
 import (
 	"encoding/json"
@@ -24,9 +49,9 @@ var serviceNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 // excessive RAM via tmpfs mounts that bypass the container's cgroup memory limit.
 const maxTmpfsMounts = 4
 
-// DockerManifest represents the tenant's container specification.
+// Manifest represents the tenant's container specification.
 // Resource limits are determined by the SKU, not the manifest.
-type DockerManifest struct {
+type Manifest struct {
 	// Image is the container image to run (required).
 	Image string `json:"image"`
 
@@ -54,6 +79,9 @@ type DockerManifest struct {
 	// always mounted automatically. Use this for application-specific writable
 	// directories (e.g., "/var/cache/nginx", "/var/log/nginx").
 	// Each mount uses the operator-configured tmpfs size limit.
+	//
+	// Field name follows Docker convention. K8s/K3s backends translate this
+	// substrate-side to emptyDir mounts with medium=Memory.
 	Tmpfs []string `json:"tmpfs,omitempty"`
 
 	// User overrides the container's runtime user. Required for images like
@@ -71,6 +99,9 @@ type DockerManifest struct {
 
 	// StopGracePeriod is the time to wait after SIGTERM before sending SIGKILL.
 	// Bounded to 1s–120s.
+	//
+	// Field name follows Docker convention. K8s/K3s backends translate this
+	// substrate-side to terminationGracePeriodSeconds.
 	StopGracePeriod *Duration `json:"stop_grace_period,omitempty"`
 
 	// Init runs an init process (tini) as PID 1 inside the container for
@@ -103,6 +134,15 @@ type PortConfig struct {
 // HealthCheckConfig specifies container health check parameters.
 type HealthCheckConfig struct {
 	// Test is the health check command. First element can be "CMD", "CMD-SHELL", or "NONE".
+	//
+	// The slice format follows Docker's exec convention:
+	//   - ["CMD", "binary", "arg1", "arg2", ...] — exec the binary with args
+	//   - ["CMD-SHELL", "shell-string"]          — exec /bin/sh -c shell-string
+	//   - ["NONE"]                                — disable inherited health check
+	//
+	// K8s/K3s backends MUST translate this substrate-side to the appropriate
+	// probe shape (exec / httpGet / tcpSocket). Translation is out of scope
+	// for this package; this is the wire format the chain stores.
 	Test []string `json:"test"`
 
 	// Interval between health checks.
@@ -152,15 +192,15 @@ func (d Duration) Duration() time.Duration {
 	return time.Duration(d)
 }
 
-// ParseManifest parses and validates a DockerManifest from JSON.
+// ParseManifest parses and validates a Manifest from JSON.
 // Unknown fields are rejected to catch accidental misuse (e.g., passing
 // a stack manifest where a single-container manifest is expected).
-func ParseManifest(data []byte) (*DockerManifest, error) {
+func ParseManifest(data []byte) (*Manifest, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("manifest is empty")
 	}
 
-	var m DockerManifest
+	var m Manifest
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&m); err != nil {
@@ -176,20 +216,20 @@ func ParseManifest(data []byte) (*DockerManifest, error) {
 
 // Validate checks that the manifest is valid for single-container use.
 // It rejects stack-only fields like depends_on.
-func (m *DockerManifest) Validate() error {
+func (m *Manifest) Validate() error {
 	return m.validate(false)
 }
 
 // ValidateInStack checks that the manifest is valid for use within a stack.
 // It allows stack-only fields like depends_on (cross-service validation is
 // done separately by StackManifest.Validate).
-func (m *DockerManifest) ValidateInStack() error {
+func (m *Manifest) ValidateInStack() error {
 	return m.validate(true)
 }
 
 // validate is the shared validation logic. When inStack is false, stack-only
 // fields (depends_on) are rejected.
-func (m *DockerManifest) validate(inStack bool) error {
+func (m *Manifest) validate(inStack bool) error {
 	if m.Image == "" {
 		return fmt.Errorf("image is required")
 	}
@@ -210,7 +250,7 @@ func (m *DockerManifest) validate(inStack bool) error {
 		}
 		if portCfg.Ingress {
 			ingressPorts = append(ingressPorts, portSpec)
-			if _, ok := parseTCPPort(portSpec); !ok {
+			if _, ok := ParseTCPPort(portSpec); !ok {
 				return fmt.Errorf("invalid port %q: ingress hint requires TCP protocol", portSpec)
 			}
 		}
@@ -271,6 +311,12 @@ func (m *DockerManifest) validate(inStack bool) error {
 
 // validateUserSpec validates a Docker USER specification.
 // Valid formats: "uid", "uid:gid", "username", "username:group".
+//
+// This format is generic enough to remain the wire format across
+// substrates. K8s/K3s backends translate uid/gid substrate-side
+// (securityContext.runAsUser / runAsGroup); username strings require
+// resolution against the container image's /etc/passwd, which is also
+// substrate-side.
 func validateUserSpec(user string) error {
 	if strings.ContainsAny(user, " \t\n\r") {
 		return fmt.Errorf("user: must not contain whitespace: %q", user)
@@ -283,6 +329,21 @@ func validateUserSpec(user string) error {
 		return fmt.Errorf("user: group part cannot be empty after colon: %q", user)
 	}
 	return nil
+}
+
+// ParseTCPPort extracts the port number from a "port/tcp" spec string
+// (case-insensitive protocol). Returns (port, true) for valid TCP specs,
+// (0, false) otherwise.
+func ParseTCPPort(spec string) (int, bool) {
+	parts := strings.SplitN(spec, "/", 2)
+	if len(parts) != 2 || strings.ToLower(parts[1]) != "tcp" {
+		return 0, false
+	}
+	port, err := strconv.Atoi(parts[0])
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
 }
 
 // validatePortSpec validates a port specification like "80/tcp".
@@ -324,7 +385,7 @@ const (
 
 // HasActiveHealthCheck returns true when the manifest declares a health check
 // that is not disabled (i.e., Test[0] is not "NONE").
-func (m *DockerManifest) HasActiveHealthCheck() bool {
+func (m *Manifest) HasActiveHealthCheck() bool {
 	return m.HealthCheck != nil && len(m.HealthCheck.Test) > 0 && HealthCheckTestType(m.HealthCheck.Test[0]) != HealthCheckTestNone
 }
 
@@ -455,10 +516,10 @@ func validateExposePorts(ports []string) error {
 }
 
 // StackManifest represents a multi-service deployment where each service
-// has its own DockerManifest. The services map is keyed by service name
+// has its own Manifest. The services map is keyed by service name
 // (matching LeaseItem.ServiceName from the chain).
 type StackManifest struct {
-	Services map[string]*DockerManifest `json:"services"`
+	Services map[string]*Manifest `json:"services"`
 }
 
 // Validate checks that the stack manifest is valid.
@@ -583,9 +644,9 @@ func (s *StackManifest) detectDependsOnCycles() error {
 	return nil
 }
 
-// ParsePayload auto-detects whether data is a single DockerManifest or a
+// ParsePayload auto-detects whether data is a single Manifest or a
 // StackManifest (contains a "services" key). Returns exactly one non-nil result.
-func ParsePayload(data []byte) (*DockerManifest, *StackManifest, error) {
+func ParsePayload(data []byte) (*Manifest, *StackManifest, error) {
 	if len(data) == 0 {
 		return nil, nil, fmt.Errorf("payload is empty")
 	}

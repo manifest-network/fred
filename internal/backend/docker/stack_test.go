@@ -16,15 +16,16 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // validStackManifestJSON builds a minimal valid stack manifest payload.
 func validStackManifestJSON(services map[string]string) []byte {
-	svcMap := make(map[string]*DockerManifest, len(services))
+	svcMap := make(map[string]*manifest.Manifest, len(services))
 	for name, image := range services {
-		svcMap[name] = &DockerManifest{Image: image}
+		svcMap[name] = &manifest.Manifest{Image: image}
 	}
-	sm := StackManifest{Services: svcMap}
+	sm := manifest.StackManifest{Services: svcMap}
 	b, _ := json.Marshal(sm)
 	return b
 }
@@ -77,8 +78,8 @@ func TestStackContainerLogKeys(t *testing.T) {
 
 	t.Run("containerLogKeys with stack provision", func(t *testing.T) {
 		prov := &provision{
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx"},
 				},
 			},
@@ -198,14 +199,14 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 	// "web" has a health check, "db" does not.
 	// Both should succeed if per-service health check verification works correctly.
-	payload, _ := json.Marshal(StackManifest{
-		Services: map[string]*DockerManifest{
+	payload, _ := json.Marshal(manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image: "nginx:latest",
-				HealthCheck: &HealthCheckConfig{
+				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD-SHELL", "curl -f http://localhost/"},
-					Interval: Duration(1 * time.Second),
-					Timeout:  Duration(1 * time.Second),
+					Interval: manifest.Duration(1 * time.Second),
+					Timeout:  manifest.Duration(1 * time.Second),
 					Retries:  2,
 				},
 			},
@@ -327,8 +328,8 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 				"web": {"old-web-c1"},
 				"db":  {"old-db-c1"},
 			},
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx:latest"},
 					"db":  {Image: "postgres:16"},
 				},
@@ -398,8 +399,8 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 // --- Stack Restart tests ---
 
 func TestStackRestart_Success(t *testing.T) {
-	stackManifest := &StackManifest{
-		Services: map[string]*DockerManifest{
+	stackManifest := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:latest"},
 			"db":  {Image: "postgres:16"},
 		},
@@ -505,8 +506,8 @@ func TestStackRestart_Success(t *testing.T) {
 }
 
 func TestStackRestart_FailureRollsBack(t *testing.T) {
-	stackManifest := &StackManifest{
-		Services: map[string]*DockerManifest{
+	stackManifest := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:latest"},
 			"db":  {Image: "postgres:16"},
 		},
@@ -615,8 +616,8 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 // --- Stack Update tests ---
 
 func TestStackUpdate_Success(t *testing.T) {
-	oldStack := &StackManifest{
-		Services: map[string]*DockerManifest{
+	oldStack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:1.24"},
 			"db":  {Image: "postgres:15"},
 		},
@@ -700,7 +701,7 @@ func TestStackUpdate_Success(t *testing.T) {
 
 	assert.Equal(t, backend.CallbackStatusSuccess, callbackPayload.Status)
 
-	// Verify OnSuccess updated the StackManifest.
+	// Verify OnSuccess updated the manifest.StackManifest.
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	status := prov.Status
@@ -724,7 +725,7 @@ func TestStackUpdate_PayloadTypeMismatch(t *testing.T) {
 			"lease-1": {
 				LeaseUUID:     "lease-1",
 				Status:        backend.ProvisionStatusReady,
-				StackManifest: &StackManifest{Services: map[string]*DockerManifest{"web": {Image: "nginx"}}},
+				StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx"}}},
 				Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}},
 			},
 		}
@@ -743,7 +744,7 @@ func TestStackUpdate_PayloadTypeMismatch(t *testing.T) {
 			"lease-1": {
 				LeaseUUID: "lease-1",
 				Status:    backend.ProvisionStatusReady,
-				Manifest:  &DockerManifest{Image: "nginx"},
+				Manifest:  &manifest.Manifest{Image: "nginx"},
 				SKU:       "docker-small",
 			},
 		}
@@ -791,8 +792,8 @@ func TestGetInfo_Stack(t *testing.T) {
 		"lease-1": {
 			LeaseUUID: "lease-1",
 			Status:    backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx:latest"},
 					"db":  {Image: "postgres:16"},
 				},
@@ -843,8 +844,8 @@ func TestGetLogs_Stack(t *testing.T) {
 		"lease-1": {
 			LeaseUUID: "lease-1",
 			Status:    backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx"},
 					"db":  {Image: "postgres"},
 				},
@@ -875,8 +876,8 @@ func TestGetLogs_Stack_MultiInstance(t *testing.T) {
 		"lease-1": {
 			LeaseUUID: "lease-1",
 			Status:    backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{"web": {Image: "nginx"}},
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{"web": {Image: "nginx"}},
 			},
 			ContainerIDs: []string{"w1", "w2"},
 			ServiceContainers: map[string][]string{
@@ -923,8 +924,8 @@ func TestDeprovision_Stack(t *testing.T) {
 			Tenant:    "tenant-a",
 			Status:    backend.ProvisionStatusReady,
 			Quantity:  2,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx"},
 					"db":  {Image: "postgres"},
 				},
@@ -1086,8 +1087,8 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx"},
 					"db":  {Image: "postgres"},
 				},

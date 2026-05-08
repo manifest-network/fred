@@ -21,6 +21,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // mockVolumeManager implements volumeManager for testing. Unlike mockDockerClient,
@@ -1539,13 +1540,13 @@ func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
 func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 	now := time.Now()
 
-	manifest := DockerManifest{
+	m := manifest.Manifest{
 		Image:   "nginx:latest",
 		Command: []string{"nginx", "-g", "daemon off;"},
 		Env:     map[string]string{"FOO": "bar"},
-		Ports:   map[string]PortConfig{"80/tcp": {HostPort: 0}},
+		Ports:   map[string]manifest.PortConfig{"80/tcp": {HostPort: 0}},
 	}
-	manifestBytes, err := json.Marshal(manifest)
+	manifestBytes, err := json.Marshal(m)
 	require.NoError(t, err)
 
 	t.Run("manifest restored on cold start", func(t *testing.T) {
@@ -1557,7 +1558,7 @@ func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 		// Pre-seed the release store with a manifest for this lease.
 		err = relStore.Append("lease-1", shared.Release{
 			Manifest:  manifestBytes,
-			Image:     manifest.Image,
+			Image:     m.Image,
 			Status:    "active",
 			CreatedAt: now,
 		})
@@ -1640,7 +1641,7 @@ func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		alpineManifest := DockerManifest{Image: "alpine:latest", Command: []string{"sleep", "3600"}}
+		alpineManifest := manifest.Manifest{Image: "alpine:latest", Command: []string{"sleep", "3600"}}
 		alpineBytes, _ := json.Marshal(alpineManifest)
 		err = relStore.Append("lease-1", shared.Release{
 			Manifest:  alpineBytes,

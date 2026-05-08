@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestReconcileCustomDomain_NoProvision(t *testing.T) {
@@ -268,7 +269,7 @@ func TestReconcileCustomDomain_Set(t *testing.T) {
 	// Empty → "foo.example.com": worker must rebuild containers with the
 	// new CustomDomain on CreateContainerParams; in-memory state must
 	// reflect the new value after success.
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	prov := &provision{
 		LeaseUUID:    "lease-1",
 		Tenant:       "tenant-a",
@@ -303,7 +304,7 @@ func TestReconcileCustomDomain_Set(t *testing.T) {
 func TestReconcileCustomDomain_Cleared(t *testing.T) {
 	// "foo.example.com" → "": worker must rebuild containers with no
 	// secondary router; in-memory CustomDomain reverts to "".
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	prov := &provision{
 		LeaseUUID:    "lease-1",
 		Tenant:       "tenant-a",
@@ -337,7 +338,7 @@ func TestReconcileCustomDomain_Cleared(t *testing.T) {
 
 func TestReconcileCustomDomain_Changed(t *testing.T) {
 	// "foo.example.com" → "bar.example.com".
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	prov := &provision{
 		LeaseUUID:    "lease-1",
 		Tenant:       "tenant-a",

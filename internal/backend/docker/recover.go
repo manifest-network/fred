@@ -7,6 +7,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // recoverState rebuilds in-memory state from Docker containers.
@@ -76,7 +77,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if b.releaseStore != nil {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
 					// Use ParsePayload to auto-detect single vs stack manifest.
-					singleM, stackM, payloadErr := ParsePayload(rel.Manifest)
+					singleM, stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
 					switch {
 					case payloadErr != nil:
 						b.logger.Warn("failed to parse recovered manifest",

@@ -25,12 +25,13 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 // validManifestJSON returns a minimal valid manifest payload.
 func validManifestJSON(image string) []byte {
-	m := DockerManifest{
+	m := manifest.Manifest{
 		Image: image,
 	}
 	b, _ := json.Marshal(m)
@@ -93,7 +94,7 @@ func rebuildCallbackSender(b *Backend) {
 // can assert on callback state immediately after it returns. The actor
 // inbox path is exercised by the public Provision flow and its dedicated
 // tests.
-func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, manifest *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) {
 	actor := b.actorFor(req.LeaseUUID)
 	if actor.sm == nil {
 		actor.sm = newLeaseSM(actor)
@@ -108,7 +109,7 @@ func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionR
 }
 
 // doProvisionStackAndFire is the stack-variant companion to doProvisionAndFire.
-func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
 	actor := b.actorFor(req.LeaseUUID)
 	if actor.sm == nil {
 		actor.sm = newLeaseSM(actor)
@@ -410,7 +411,7 @@ func TestDoProvision_MultiItem_QuantityPassesTotalNotPerItem(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
 
 	req := backend.ProvisionRequest{
@@ -461,7 +462,7 @@ func TestDoProvision_PullFailure(t *testing.T) {
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -530,7 +531,7 @@ func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := backend.ProvisionRequest{
@@ -567,7 +568,7 @@ func TestDoProvision_ContextCanceled(t *testing.T) {
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -623,7 +624,7 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -677,7 +678,7 @@ func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -738,9 +739,9 @@ func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
 
-	manifest := &DockerManifest{
+	manifest := &manifest.Manifest{
 		Image: "nginx:latest",
-		HealthCheck: &HealthCheckConfig{
+		HealthCheck: &manifest.HealthCheckConfig{
 			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
 		},
 	}
@@ -828,7 +829,7 @@ func TestDoProvision_StatefulSKUCreatesVolume(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -903,7 +904,7 @@ func TestDoProvision_StatefulSKUMultipleVolumes(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 2048}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -960,7 +961,7 @@ func TestDoProvision_VolumeCreateFailure(t *testing.T) {
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -1045,7 +1046,7 @@ func TestDoProvision_CleanupOnlyDestroysNewVolumes(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := backend.ProvisionRequest{
@@ -1110,7 +1111,7 @@ func TestDoProvision_StatefulSKUNoImageVolumes(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -1878,8 +1879,8 @@ func stackProvision() *provision {
 			{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
 			{SKU: "docker-large", Quantity: 1, ServiceName: "db"},
 		},
-		StackManifest: &StackManifest{
-			Services: map[string]*DockerManifest{
+		StackManifest: &manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{
 				"web": {Image: "nginx:1.25"},
 				"db":  {Image: "postgres:16"},
 			},
@@ -1887,7 +1888,7 @@ func stackProvision() *provision {
 	}
 }
 
-// stackProvisionNilManifest returns a stack provision with a nil StackManifest
+// stackProvisionNilManifest returns a stack provision with a nil manifest.StackManifest
 // (simulates cold restart with no release store).
 func stackProvisionNilManifest() *provision {
 	return &provision{
@@ -1922,11 +1923,11 @@ func assertStackFields(t *testing.T, info *backend.ProvisionInfo) {
 	assert.Equal(t, "postgres:16", info.ServiceImages["db"])
 }
 
-// assertNilManifestFields verifies workload fields when StackManifest is nil.
+// assertNilManifestFields verifies workload fields when manifest.StackManifest is nil.
 func assertNilManifestFields(t *testing.T, info *backend.ProvisionInfo) {
 	t.Helper()
 	require.Len(t, info.Items, 1)
-	assert.Nil(t, info.ServiceImages, "nil StackManifest should produce nil ServiceImages")
+	assert.Nil(t, info.ServiceImages, "nil manifest.StackManifest should produce nil ServiceImages")
 }
 
 // backendWithProvision creates a test backend with a single provision keyed by lease UUID.
@@ -2031,7 +2032,7 @@ func TestListProvisions_ItemsDefensivelyCopied(t *testing.T) {
 			Status:        backend.ProvisionStatusReady,
 			Quantity:      2,
 			Items:         originalItems,
-			StackManifest: &StackManifest{Services: map[string]*DockerManifest{"web": {Image: "nginx:1.25"}}},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		},
 	})
 
@@ -2548,7 +2549,7 @@ func TestDoProvision_LastError_ContextCanceled(t *testing.T) {
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2605,7 +2606,7 @@ func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -2688,7 +2689,7 @@ func TestDoProvision_EphemeralProfileWithoutDiskMB(t *testing.T) {
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	// Ephemeral profile with DiskMB=0 — no volume binds, image volumes get tmpfs
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512}}
 
@@ -2749,7 +2750,7 @@ func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
 		"ports": {"80/tcp": {}},
 		"tmpfs": ["/var/cache/nginx", "/var/log/nginx"]
 	}`)
-	manifest, err := ParseManifest(manifestJSON)
+	manifest, err := manifest.ParseManifest(manifestJSON)
 	require.NoError(t, err)
 
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
@@ -3138,20 +3139,20 @@ func TestGetLogs_EmptyContainerIDs(t *testing.T) {
 // Fix 5: Explicit (non-ephemeral) port conflict returns error immediately without retry.
 func TestCreateContainer_ExplicitPortConflict_NoRetry(t *testing.T) {
 	// Verify the decision logic: explicit ports should NOT trigger retry
-	assert.False(t, hasEphemeralPorts(map[string]PortConfig{
+	assert.False(t, hasEphemeralPorts(map[string]manifest.PortConfig{
 		"80/tcp": {HostPort: 8080},
 	}), "explicit ports should not be ephemeral")
 	assert.True(t, isPortBindingError(fmt.Errorf("port is already allocated")))
 
 	// Mixed ports (one explicit, one ephemeral) DO trigger retry
-	assert.True(t, hasEphemeralPorts(map[string]PortConfig{
+	assert.True(t, hasEphemeralPorts(map[string]manifest.PortConfig{
 		"80/tcp":  {HostPort: 8080}, // explicit
 		"443/tcp": {HostPort: 0},    // ephemeral
 	}), "mixed ports with an ephemeral should be ephemeral")
 
 	// No ports means no ephemeral
 	assert.False(t, hasEphemeralPorts(nil))
-	assert.False(t, hasEphemeralPorts(map[string]PortConfig{}))
+	assert.False(t, hasEphemeralPorts(map[string]manifest.PortConfig{}))
 }
 
 // Fix 1: Deprovision on a provisioning lease still removes containers.
@@ -3460,7 +3461,7 @@ func TestDoProvision_CallbackSanitized_ContainerExitedDuringStartup(t *testing.T
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -3523,9 +3524,9 @@ func TestDoProvision_CallbackSanitized_Unhealthy(t *testing.T) {
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest := &DockerManifest{
+	manifest := &manifest.Manifest{
 		Image: "nginx:latest",
-		HealthCheck: &HealthCheckConfig{
+		HealthCheck: &manifest.HealthCheckConfig{
 			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
 		},
 	}
@@ -3570,7 +3571,7 @@ func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -3938,8 +3939,8 @@ func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-chown-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifestPayload, _ := json.Marshal(DockerManifest{Image: "postgres:16", User: "999:999"})
-	manifest, _ := ParseManifest(manifestPayload)
+	manifestPayload, _ := json.Marshal(manifest.Manifest{Image: "postgres:16", User: "999:999"})
+	manifest, _ := manifest.ParseManifest(manifestPayload)
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-chown", "tenant-a", "docker-small", 1, manifestPayload)
@@ -4007,7 +4008,7 @@ func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-root-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-root", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -4764,7 +4765,7 @@ func TestDoProvision_WritablePathBinds(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -4837,7 +4838,7 @@ func TestDoProvision_WritablePathBinds_PartialFailure(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -4910,7 +4911,7 @@ func TestDoRestart_WritablePathBinds(t *testing.T) {
 	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	b.doRestart(context.Background(), "lease-1", manifest, []string{"old-container"}, "docker-small", "", backend.ProvisionStatusReady, b.logger)
 
 	assert.True(t, extractCalled, "ExtractImageContent should be called on restart")
@@ -4978,7 +4979,7 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	manifest, _ := ParseManifest(validManifestJSON("nginx:latest"))
+	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}} // ephemeral
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))

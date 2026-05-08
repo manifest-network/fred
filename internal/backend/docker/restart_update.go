@@ -10,6 +10,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // restartRollback undoes the synchronous Status/CallbackURL mutation that
@@ -95,7 +96,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
 	}
-	manifest := prov.Manifest
+	m := prov.Manifest
 	stackManifest := prov.StackManifest
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
 	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
@@ -117,8 +118,8 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 			manifestBytes, marshalErr = json.Marshal(stackManifest)
 			releaseImage = "stack"
 		} else {
-			manifestBytes, marshalErr = json.Marshal(manifest)
-			releaseImage = manifest.Image
+			manifestBytes, marshalErr = json.Marshal(m)
+			releaseImage = m.Image
 		}
 		if marshalErr != nil {
 			b.provisionsMu.Lock()
@@ -156,7 +157,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		if len(items) > 0 {
 			customDomain = items[0].CustomDomain
 		}
-		return b.doRestart(opCtx, req.LeaseUUID, manifest, containerIDs, sku, customDomain, prevStatus, logger)
+		return b.doRestart(opCtx, req.LeaseUUID, m, containerIDs, sku, customDomain, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, restartRequestedMsg{cancel: opCancel, work: work, ack: ack}); routeErr != nil {
@@ -177,7 +178,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 // goroutine is owned by the actor via workers barrier — see lease_actor.go.)
 
 // doRestart performs the actual container restart asynchronously.
-func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *DockerManifest, oldContainerIDs []string, sku, customDomain string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
+func (b *Backend) doRestart(ctx context.Context, leaseUUID string, m *manifest.Manifest, oldContainerIDs []string, sku, customDomain string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	profile, profErr := b.cfg.GetSKUProfile(sku)
 	if profErr != nil {
 		err := fmt.Errorf("SKU profile lookup failed: %w", profErr)
@@ -203,7 +204,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 
 	return b.doReplaceContainers(ctx, replaceContainersOp{
 		LeaseUUID:       leaseUUID,
-		Manifest:        manifest,
+		Manifest:        m,
 		SKU:             sku,
 		Profile:         profile,
 		OldContainerIDs: oldContainerIDs,
@@ -217,7 +218,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, manifest *Doc
 
 // doRestartStack performs an async stack restart: stops all service containers
 // and recreates them from the stored StackManifest.
-func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
+func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	profiles := make(map[string]SKUProfile, len(items))
 	for _, item := range items {
 		if _, ok := profiles[item.SKU]; ok {
@@ -258,7 +259,7 @@ func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *S
 // replaceStackContainersOp describes a stack container replacement operation.
 type replaceStackContainersOp struct {
 	LeaseUUID         string
-	Stack             *StackManifest
+	Stack             *manifest.StackManifest
 	Items             []backend.LeaseItem
 	Profiles          map[string]SKUProfile
 	OldContainerIDs   []string
@@ -542,7 +543,7 @@ func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
 // Used by both restart and update to share the stop → create → verify lifecycle.
 type replaceContainersOp struct {
 	LeaseUUID       string
-	Manifest        *DockerManifest
+	Manifest        *manifest.Manifest
 	SKU             string
 	Profile         SKUProfile
 	OldContainerIDs []string
@@ -832,7 +833,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	isStack := prov.IsStack()
 
 	// Parse new payload (auto-detects single vs stack).
-	manifest, stackManifest, parseErr := ParsePayload(req.Payload)
+	m, stackManifest, parseErr := manifest.ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
@@ -850,7 +851,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 
 	if isStack {
 		// Validate stack against stored items.
-		if valErr := ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
+		if valErr := manifest.ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
 			b.provisionsMu.Unlock()
 			return fmt.Errorf("%w: %w", backend.ErrValidation, valErr)
 		}
@@ -928,7 +929,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	}
 
 	// Single-manifest path.
-	if imgErr := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); imgErr != nil {
+	if imgErr := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); imgErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrValidation, imgErr)
 	}
@@ -951,7 +952,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	if b.releaseStore != nil {
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  req.Payload,
-			Image:     manifest.Image,
+			Image:     m.Image,
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
@@ -967,7 +968,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	// spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() replaceResult {
-		return b.doUpdate(opCtx, req.LeaseUUID, manifest, profile, oldContainerIDs, prevStatus, logger)
+		return b.doUpdate(opCtx, req.LeaseUUID, m, profile, oldContainerIDs, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, updateRequestedMsg{cancel: opCancel, work: work, ack: ack}); routeErr != nil {
@@ -985,10 +986,10 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 }
 
 // doUpdate performs the actual container update asynchronously.
-func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *DockerManifest, profile SKUProfile, oldContainerIDs []string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
+func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, m *manifest.Manifest, profile SKUProfile, oldContainerIDs []string, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	// Pull new image — this is the only update-specific pre-flight step.
-	logger.Info("pulling image for update", "image", manifest.Image)
-	if pullErr := b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); pullErr != nil {
+	logger.Info("pulling image for update", "image", m.Image)
+	if pullErr := b.docker.PullImage(ctx, m.Image, b.cfg.ImagePullTimeout); pullErr != nil {
 		err := fmt.Errorf("image pull failed: %w", pullErr)
 		b.recordPreflightFailure(leaseUUID, err, logger)
 		// Update preflight failure: force Status=Failed unconditionally
@@ -1028,7 +1029,7 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 
 	return b.doReplaceContainers(ctx, replaceContainersOp{
 		LeaseUUID:       leaseUUID,
-		Manifest:        manifest,
+		Manifest:        m,
 		SKU:             sku,
 		Profile:         profile,
 		OldContainerIDs: oldContainerIDs,
@@ -1038,14 +1039,14 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, manifest *Dock
 		Logger:          logger,
 		CustomDomain:    customDomain,
 		OnSuccess: func(prov *provision) {
-			prov.Image = manifest.Image
-			prov.Manifest = manifest
+			prov.Image = m.Image
+			prov.Manifest = m
 		},
 	})
 }
 
 // doUpdateStack performs the actual stack container update asynchronously.
-func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
+func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) replaceResult {
 	// Pull each unique image (deduplicated).
 	pulledImages := make(map[string]bool)
 	for svcName, svc := range stack.Services {

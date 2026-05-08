@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func testConfig() *Config {
@@ -24,8 +25,8 @@ func baseProjectParams() composeProjectParams {
 		CallbackURL:  "http://localhost/callback",
 		BackendName:  "docker",
 		FailCount:    0,
-		Stack: &StackManifest{
-			Services: map[string]*DockerManifest{
+		Stack: &manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{
 				"web": {Image: "nginx:latest"},
 			},
 		},
@@ -45,12 +46,12 @@ func baseProjectParams() composeProjectParams {
 
 func TestBuildComposeProject_BasicMapping(t *testing.T) {
 	params := baseProjectParams()
-	params.Stack.Services["web"] = &DockerManifest{
+	params.Stack.Services["web"] = &manifest.Manifest{
 		Image:   "nginx:latest",
 		Command: []string{"/bin/sh", "-c"},
 		Args:    []string{"echo hello"},
 		Env:     map[string]string{"FOO": "bar"},
-		Ports: map[string]PortConfig{
+		Ports: map[string]manifest.PortConfig{
 			"80/tcp": {HostPort: 8080},
 		},
 	}
@@ -125,12 +126,12 @@ func TestBuildComposeProject_Labels(t *testing.T) {
 
 func TestBuildComposeProject_HealthCheck(t *testing.T) {
 	params := baseProjectParams()
-	params.Stack.Services["web"].HealthCheck = &HealthCheckConfig{
+	params.Stack.Services["web"].HealthCheck = &manifest.HealthCheckConfig{
 		Test:        []string{"CMD-SHELL", "curl -f http://localhost/"},
-		Interval:    Duration(10 * time.Second),
-		Timeout:     Duration(5 * time.Second),
+		Interval:    manifest.Duration(10 * time.Second),
+		Timeout:     manifest.Duration(5 * time.Second),
 		Retries:     3,
-		StartPeriod: Duration(30 * time.Second),
+		StartPeriod: manifest.Duration(30 * time.Second),
 	}
 
 	project := buildComposeProject(params)
@@ -305,7 +306,7 @@ func TestBuildComposeProject_NoAnonymousVolumes(t *testing.T) {
 
 func TestBuildComposeProject_QuantityFanOut(t *testing.T) {
 	params := baseProjectParams()
-	params.Stack.Services["web"] = &DockerManifest{Image: "nginx:latest"}
+	params.Stack.Services["web"] = &manifest.Manifest{Image: "nginx:latest"}
 	params.Items = []backend.LeaseItem{
 		{SKU: "docker-small", Quantity: 3, ServiceName: "web"},
 	}
@@ -382,8 +383,8 @@ func TestBuildComposeProject_NoNetworkWhenIsolationDisabled(t *testing.T) {
 
 func TestBuildComposeProject_MultiService(t *testing.T) {
 	params := baseProjectParams()
-	params.Stack = &StackManifest{
-		Services: map[string]*DockerManifest{
+	params.Stack = &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:latest"},
 			"db":  {Image: "postgres:16"},
 		},
@@ -441,11 +442,11 @@ func TestBuildComposeProject_TmpfsMounts(t *testing.T) {
 
 func TestBuildComposeProject_DependsOn_Simple(t *testing.T) {
 	params := baseProjectParams()
-	params.Stack = &StackManifest{
-		Services: map[string]*DockerManifest{
+	params.Stack = &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image: "nginx",
-				DependsOn: map[string]DependsOnCondition{
+				DependsOn: map[string]manifest.DependsOnCondition{
 					"db": {Condition: "service_started"},
 				},
 			},
@@ -473,17 +474,17 @@ func TestBuildComposeProject_DependsOn_Simple(t *testing.T) {
 func TestBuildComposeProject_DependsOn_FanOutDep(t *testing.T) {
 	// web (qty 1) depends on db (qty 2) → web depends on db-0 and db-1.
 	params := baseProjectParams()
-	params.Stack = &StackManifest{
-		Services: map[string]*DockerManifest{
+	params.Stack = &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image: "nginx",
-				DependsOn: map[string]DependsOnCondition{
+				DependsOn: map[string]manifest.DependsOnCondition{
 					"db": {Condition: "service_healthy"},
 				},
 			},
 			"db": {
 				Image: "postgres",
-				HealthCheck: &HealthCheckConfig{
+				HealthCheck: &manifest.HealthCheckConfig{
 					Test: []string{"CMD", "pg_isready"},
 				},
 			},
@@ -508,11 +509,11 @@ func TestBuildComposeProject_DependsOn_FanOutDep(t *testing.T) {
 func TestBuildComposeProject_DependsOn_BothFanOut(t *testing.T) {
 	// web (qty 2) depends on db (qty 2) → web-0 and web-1 both depend on db-0 and db-1.
 	params := baseProjectParams()
-	params.Stack = &StackManifest{
-		Services: map[string]*DockerManifest{
+	params.Stack = &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image: "nginx",
-				DependsOn: map[string]DependsOnCondition{
+				DependsOn: map[string]manifest.DependsOnCondition{
 					"db": {Condition: "service_started"},
 				},
 			},
@@ -539,7 +540,7 @@ func TestBuildComposeProject_DependsOn_BothFanOut(t *testing.T) {
 
 func TestBuildComposeProject_StopGracePeriod_Set(t *testing.T) {
 	params := baseProjectParams()
-	d := Duration(30 * time.Second)
+	d := manifest.Duration(30 * time.Second)
 	params.Stack.Services["web"].StopGracePeriod = &d
 
 	project := buildComposeProject(params)
@@ -636,11 +637,11 @@ func TestBuildComposeProject_DependsOn_ComposeGraphResolvable(t *testing.T) {
 	// Regression test: Compose's NewGraph keys vertices by ServiceConfig.Name.
 	// If Name is empty, depends_on resolution fails with "could not find: not found".
 	params := baseProjectParams()
-	params.Stack = &StackManifest{
-		Services: map[string]*DockerManifest{
+	params.Stack = &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image: "nginx",
-				DependsOn: map[string]DependsOnCondition{
+				DependsOn: map[string]manifest.DependsOnCondition{
 					"db": {Condition: "service_started"},
 				},
 			},
@@ -700,9 +701,9 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("routable service gets traefik labels with tenant network", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack.Services["web"] = &DockerManifest{
+		params.Stack.Services["web"] = &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
 		}
 		params.Ingress = ingress
 
@@ -732,9 +733,9 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("non-routable service does not get traefik labels", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack = &StackManifest{
-			Services: map[string]*DockerManifest{
-				"web":   {Image: "nginx:latest", Ports: map[string]PortConfig{"80/tcp": {}}},
+		params.Stack = &manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{
+				"web":   {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
 				"redis": {Image: "redis:7"}, // no ports
 			},
 		}
@@ -758,9 +759,9 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("disabled ingress produces no traefik labels", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack.Services["web"] = &DockerManifest{
+		params.Stack.Services["web"] = &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
 		}
 		// params.Ingress is zero value (disabled)
 
@@ -774,9 +775,9 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("custom_domain emits secondary router on single-instance service", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack.Services["web"] = &DockerManifest{
+		params.Stack.Services["web"] = &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
 		}
 		params.Items[0].CustomDomain = "foo.example.com"
 		params.Ingress = ingress
@@ -799,9 +800,9 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("multi-instance emits byte-identical secondary labels", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack.Services["web"] = &DockerManifest{
+		params.Stack.Services["web"] = &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
 		}
 		params.Items[0].Quantity = 3
 		params.Items[0].CustomDomain = "foo.example.com"
@@ -848,10 +849,10 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("multi-service stack emits secondary only on the item that owns it", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack = &StackManifest{
-			Services: map[string]*DockerManifest{
-				"frontend": {Image: "nginx:latest", Ports: map[string]PortConfig{"80/tcp": {}}},
-				"db":       {Image: "postgres:15", Ports: map[string]PortConfig{"80/tcp": {}}}, // give a routable HTTP port to isolate "no custom_domain on this item"
+		params.Stack = &manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{
+				"frontend": {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+				"db":       {Image: "postgres:15", Ports: map[string]manifest.PortConfig{"80/tcp": {}}}, // give a routable HTTP port to isolate "no custom_domain on this item"
 			},
 		}
 		params.Items = []backend.LeaseItem{
@@ -877,9 +878,9 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("invalid custom_domain skips secondary, primary keeps working", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack.Services["web"] = &DockerManifest{
+		params.Stack.Services["web"] = &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
 		}
 		// Subdomain of the wildcard — chain would reject this on
 		// MsgSetItemCustomDomain, but Fred validates defense-in-depth.
@@ -901,7 +902,7 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 	t.Run("custom_domain on service with no routable port is skipped", func(t *testing.T) {
 		params := baseProjectParams()
-		params.Stack.Services["web"] = &DockerManifest{
+		params.Stack.Services["web"] = &manifest.Manifest{
 			Image: "redis:7", // no ports
 		}
 		params.Items[0].CustomDomain = "foo.example.com"
@@ -921,16 +922,16 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 		// Regression guard: items without CustomDomain should produce the
 		// same labels as before this feature shipped.
 		paramsA := baseProjectParams()
-		paramsA.Stack.Services["web"] = &DockerManifest{
+		paramsA.Stack.Services["web"] = &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
 		}
 		paramsA.Ingress = ingress
 
 		paramsB := baseProjectParams()
-		paramsB.Stack.Services["web"] = &DockerManifest{
+		paramsB.Stack.Services["web"] = &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{"80/tcp": {}},
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
 		}
 		paramsB.Items[0].CustomDomain = ""
 		paramsB.Ingress = ingress

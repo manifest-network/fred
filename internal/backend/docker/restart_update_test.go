@@ -17,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // --- Restart tests ---
@@ -47,7 +48,7 @@ func TestRestart_InvalidState_Provisioning(t *testing.T) {
 }
 
 func TestRestart_AllowedFromFailed(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -149,7 +150,7 @@ func TestRestart_NoManifest(t *testing.T) {
 }
 
 func TestRestart_SetsRestartingStatus(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -210,7 +211,7 @@ func TestRestart_SetsRestartingStatus(t *testing.T) {
 }
 
 func TestRestart_Success(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -298,7 +299,7 @@ func TestRestart_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 	// secondary router survives across Restart cycles. Without the
 	// propagation, a Restart on a Ready provision would silently drop the
 	// custom-domain router on the new container.
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -360,7 +361,7 @@ func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
 	// Backwards compat: provisions recovered before this feature shipped
 	// may have prov.Items unset (legacy pre-CustomDomain state). Restart
 	// must treat that as "no custom domain" without panicking.
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -416,7 +417,7 @@ func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
 }
 
 func TestRestart_Failure_ContainerStartFails(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -488,7 +489,7 @@ func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 }
 
 func TestRestart_Failure_SKUProfileLookupFails(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -543,7 +544,7 @@ func TestRestart_Failure_SKUProfileLookupFails(t *testing.T) {
 }
 
 func TestRestart_MultipleContainers(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -617,7 +618,7 @@ func TestRestart_MultipleContainers(t *testing.T) {
 }
 
 func TestRestart_UpdatesCallbackURL(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -1274,7 +1275,7 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 			ContainerIDs: []string{"old-c1"},
 			Quantity:     1,
 			Image:        "nginx:1.25",
-			Manifest:     &DockerManifest{Image: "nginx:1.25"},
+			Manifest:     &manifest.Manifest{Image: "nginx:1.25"},
 		},
 	}
 
@@ -1330,7 +1331,7 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 }
 
 func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
-	oldManifest := &DockerManifest{Image: "postgres:17", Command: []string{"postgres"}}
+	oldManifest := &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -1430,7 +1431,7 @@ func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
 }
 
 func TestUpdate_RollbackFailed_SetsStatusFailed(t *testing.T) {
-	oldManifest := &DockerManifest{Image: "postgres:17", Command: []string{"postgres"}}
+	oldManifest := &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -1838,7 +1839,7 @@ func TestRollbackContainers_InspectFails(t *testing.T) {
 }
 
 func TestRestart_RollbackClearsLastError(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -1902,7 +1903,7 @@ func TestRestart_RollbackClearsLastError(t *testing.T) {
 }
 
 func TestConcurrentRestartAndUpdate_OnlyOneSucceeds(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {
 			LeaseUUID:    "lease-1",
@@ -2028,7 +2029,7 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusReady,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1,
@@ -2099,7 +2100,7 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1,
@@ -2165,7 +2166,7 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1,
@@ -2237,7 +2238,7 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusReady,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1,
@@ -2359,7 +2360,7 @@ func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1,

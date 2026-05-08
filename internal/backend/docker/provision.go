@@ -17,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // Provision starts async provisioning of containers.
@@ -122,7 +123,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
-	manifest, stackManifest, parseErr := ParsePayload(req.Payload)
+	m, stackManifest, parseErr := manifest.ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
@@ -140,7 +141,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 
 	// Validate images against registry allowlist.
 	if isStack {
-		if err := ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
+		if err := manifest.ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
 			b.removeProvision(req.LeaseUUID)
 			return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 		}
@@ -151,7 +152,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			}
 		}
 	} else {
-		if err := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); err != nil {
+		if err := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); err != nil {
 			b.removeProvision(req.LeaseUUID)
 			return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 		}
@@ -203,7 +204,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		if isStack {
 			prov.StackManifest = stackManifest
 		} else {
-			prov.Image = manifest.Image
+			prov.Image = m.Image
 		}
 	}
 	b.provisionsMu.Unlock()
@@ -220,7 +221,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		if isStack {
 			return b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 		}
-		return b.doProvision(provCtx, req, manifest, profiles, logger)
+		return b.doProvision(provCtx, req, m, profiles, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, provisionRequestedMsg{
@@ -517,7 +518,7 @@ func (b *Backend) setupStackVolBinds(
 	items []backend.LeaseItem,
 	profiles map[string]SKUProfile,
 	imageSetups map[string]*imageSetup,
-	services map[string]*DockerManifest,
+	services map[string]*manifest.Manifest,
 	logger *slog.Logger,
 ) (map[string]map[int]serviceVolBinds, []string, error) {
 	volBinds := make(map[string]map[int]serviceVolBinds)
@@ -573,8 +574,8 @@ func (b *Backend) setupStackVolBinds(
 // verifyStartup checks that containers started successfully.
 // Uses health-check-aware polling when the manifest declares an active health check,
 // otherwise falls back to a fixed-wait + inspect check.
-func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, containerIDs []string, logger *slog.Logger) error {
-	if manifest.HasActiveHealthCheck() {
+func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, containerIDs []string, logger *slog.Logger) error {
+	if m.HasActiveHealthCheck() {
 		return b.waitForHealthy(ctx, containerIDs, logger)
 	}
 
@@ -617,7 +618,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // failure, release-store updates on success, and stale-diagnostic removal
 // on success. Provision struct mutations (Status, FailCount, LastError,
 // ContainerIDs, Manifest) are owned by the SM entry actions.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, m *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
@@ -670,7 +671,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		if b.releaseStore != nil {
 			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 				Manifest:  req.Payload,
-				Image:     manifest.Image,
+				Image:     m.Image,
 				Status:    "active",
 				CreatedAt: time.Now(),
 			}); relErr != nil {
@@ -688,7 +689,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 		resultRet = provisionSuccessResult{
 			containerIDs: containerIDs,
-			manifest:     manifest,
+			manifest:     m,
 		}
 	}()
 
@@ -701,9 +702,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 
 	// Pull image (only once, shared by all containers)
-	logger.Info("pulling image", "image", manifest.Image)
+	logger.Info("pulling image", "image", m.Image)
 	pullStart := time.Now()
-	if err = b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); err != nil {
+	if err = b.docker.PullImage(ctx, m.Image, b.cfg.ImagePullTimeout); err != nil {
 		logger.Error("failed to pull image", "error", err)
 		err = fmt.Errorf("image pull failed: %w", err)
 		callbackErr = "image pull failed"
@@ -712,7 +713,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())
 
 	// Inspect image and resolve user
-	imgSetup, setupErr := b.inspectImageForSetup(ctx, manifest.Image, manifest.User)
+	imgSetup, setupErr := b.inspectImageForSetup(ctx, m.Image, m.User)
 	if setupErr != nil {
 		logger.Error("image setup failed", "error", setupErr)
 		err = setupErr
@@ -801,7 +802,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 					// Set up writable path binds
 					if needsWritableVolume {
-						writablePathBinds = b.setupWritablePathBinds(ctx, manifest.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
+						writablePathBinds = b.setupWritablePathBinds(ctx, m.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
 					}
 				}
 			} else if profile.DiskMB > 0 && len(imgSetup.Volumes) == 0 {
@@ -815,7 +816,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				Tenant:            req.Tenant,
 				ProviderUUID:      req.ProviderUUID,
 				SKU:               item.SKU,
-				Manifest:          manifest,
+				Manifest:          m,
 				Profile:           profile,
 				InstanceIndex:     instanceIndex,
 				FailCount:         failCount,
@@ -859,7 +860,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 
 	// Startup verification
-	if err = b.verifyStartup(ctx, manifest, containerIDs, logger); err != nil {
+	if err = b.verifyStartup(ctx, m, containerIDs, logger); err != nil {
 		callbackErr = startupErrorToCallbackMsg(err)
 		return
 	}
@@ -874,7 +875,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 //
 // See doProvision for the (callbackErr, result, logs, err) return contract.
 // Stack-specific result fields are stackManifest + serviceContainers.
-func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error

@@ -11,6 +11,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // leaseEvent is the typed event enum fired into the lease state machine.
@@ -691,8 +692,8 @@ type diagResult struct {
 // populate Manifest; stacks populate StackManifest + ServiceContainers.
 type provisionSuccessResult struct {
 	containerIDs      []string
-	manifest          *DockerManifest
-	stackManifest     *StackManifest
+	manifest          *manifest.Manifest
+	stackManifest     *manifest.StackManifest
 	serviceContainers map[string][]string
 }
 
