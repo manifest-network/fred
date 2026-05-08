@@ -593,7 +593,7 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 		}
 		status := containerStatusToProvisionStatus(info.Status)
 		if status != backend.ProvisionStatusReady {
-			diag := b.containerFailureDiagnostics(ctx, containerID, info)
+			diag := b.containerFailureDiagnostics(ctx, containerID, containerInfoToInstanceState(info))
 			return fmt.Errorf("container %d exited during startup (status: %s): %s", i, info.Status, diag)
 		}
 	}
@@ -1148,7 +1148,7 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 				// Check if container has exited.
 				status := containerStatusToProvisionStatus(info.Status)
 				if status == backend.ProvisionStatusFailed {
-					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], info)
+					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], containerInfoToInstanceState(info))
 					return fmt.Errorf("container %d exited while waiting for healthy (status: %s): %s", i, info.Status, diag)
 				}
 
@@ -1157,7 +1157,7 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 					logger.Info("container healthy", "instance", i, "container_id", shortID(containerIDs[i]))
 					delete(pending, i)
 				case HealthStatusUnhealthy:
-					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], info)
+					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], containerInfoToInstanceState(info))
 					return fmt.Errorf("container %d reported unhealthy: %s", i, diag)
 				default:
 					// "starting" or other — keep polling

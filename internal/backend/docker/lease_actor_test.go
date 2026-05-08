@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // TestLeaseActor_DirectDispatch exercises the async actor path without the
@@ -890,10 +891,11 @@ func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
 	// Queue a diagGatheredMsg, then fire shutdown. Whatever the inbox
 	// select picks next (msg or stopCtx.Done), drainOnShutdown must
 	// process the queued message before the actor exits.
+	exitCode := 1
 	ok := actor.sendTerminal(diagGatheredMsg{
 		result: diagResult{
 			containerID: "c1",
-			info:        &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1},
+			info:        &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode},
 			diag:        "synthetic diag",
 		},
 	})
@@ -1229,7 +1231,8 @@ func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
 	actor.workers.Add()
 	go func() {
 		defer actor.workers.Done()
-		actor.gatherDiagAsync(ctx, "c1", &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1})
+		exitCode := 1
+		actor.gatherDiagAsync(ctx, "c1", &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode}, "")
 	}()
 
 	// SM must reach Failed once the panic recovery fires diagGatheredMsg.
@@ -1655,7 +1658,8 @@ func TestGatherDiagAsync_SendsOnDeadlineExceeded(t *testing.T) {
 	// Build an actor without running its dispatch loop so we can observe
 	// the inbox directly after gatherDiagAsync returns.
 	actor := newLeaseActor(b, "lease-1")
-	info := &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1}
+	exitCode := 1
+	info := &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode}
 
 	// Build a ctx that's already DeadlineExceeded (simulating the 30s
 	// diag timeout having elapsed without any Failing.OnExit cancel).
@@ -1665,7 +1669,7 @@ func TestGatherDiagAsync_SendsOnDeadlineExceeded(t *testing.T) {
 	require.ErrorIs(t, diagCtx.Err(), context.DeadlineExceeded,
 		"test precondition: diagCtx must be DeadlineExceeded, not Canceled")
 
-	actor.gatherDiagAsync(diagCtx, "c1", info)
+	actor.gatherDiagAsync(diagCtx, "c1", info, "")
 
 	select {
 	case msg := <-actor.inbox:
@@ -1692,14 +1696,15 @@ func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
 	defer b.stopCancel()
 
 	actor := newLeaseActor(b, "lease-1")
-	info := &ContainerInfo{ContainerID: "c1", Status: "exited", ExitCode: 1}
+	exitCode := 1
+	info := &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode}
 
 	diagCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.ErrorIs(t, diagCtx.Err(), context.Canceled,
 		"test precondition: diagCtx must be Canceled")
 
-	actor.gatherDiagAsync(diagCtx, "c1", info)
+	actor.gatherDiagAsync(diagCtx, "c1", info, "")
 
 	select {
 	case msg := <-actor.inbox:

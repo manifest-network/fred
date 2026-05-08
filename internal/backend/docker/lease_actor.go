@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
 )
 
@@ -241,14 +242,27 @@ func (replaceFailedMsg) onPanic(error)           {} // no caller to unblock
 type leaseActor struct {
 	leaseUUID string
 	backend   *Backend
+	// cfg holds the substrate-agnostic dependencies the SM/actor consume
+	// for the listed seams. Set in newLeaseActor; immutable after
+	// construction. Compound critical sections that read/write multiple
+	// provision-record fields under one lock keep direct access via
+	// `backend` to preserve atomicity — see leasesm.LeaseProvisionStore
+	// docstring for the rationale.
+	cfg       leasesm.LeaseActorConfig
 	inbox     chan leaseMessage
 	done      chan struct{}
 	sm        *leaseSM
-	// pendingDeathInfo carries the Docker Inspect result from the SM's guard
-	// into the onEnterFailing action. Single-field handoff works because the
-	// actor processes messages serially; no two messages read/write this
-	// field concurrently.
-	pendingDeathInfo *ContainerInfo
+	// pendingDeathInfo carries the inspected instance state from the SM's
+	// guard into the onEnterFailing action. Single-field handoff works
+	// because the actor processes messages serially; no two messages
+	// read/write this field concurrently.
+	//
+	// pendingDeathServiceName carries the substrate-specific service name
+	// alongside InstanceState (which intentionally does not include it,
+	// since K8s pods have no equivalent field). Used for logging
+	// continuity at the death-event log line.
+	pendingDeathInfo        *leasesm.InstanceState
+	pendingDeathServiceName string
 	// diagCancel is set when entering Failing (spawning the async diag
 	// goroutine) and called by Failing.OnExit to signal cancellation. Any
 	// transition out of Failing cancels the goroutine before a stale Failed
@@ -320,6 +334,32 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 		exiting:   make(chan struct{}),
 		workers:   workbarrier.New(),
 	}
+	// Build the substrate-agnostic config the SM/actor consume for the
+	// dependencies that have a leasesm seam. The actor still keeps `b`
+	// for non-config concerns (compose, container lifecycle, compound
+	// provision-record critical sections). PR5 will remove the *Backend
+	// pointer entirely as the SM/actor move to shared/leasesm.
+	a.cfg = leasesm.LeaseActorConfig{
+		LeaseUUID:      leaseUUID,
+		Logger:         b.logger,
+		StopCtx:        b.stopCtx,
+		WG:             &b.wg,
+		Inspector:      b.inspector,
+		Diag:           b.gatherer,
+		CallbackSender: b.callbackSender,
+		ProvisionStore: b.provisionStore,
+		// OnTerminated closes over `a` so the registry-delete check
+		// preserves its existing "only delete if I'm still the
+		// registered actor for this UUID" semantics — equivalent to
+		// removeFromRegistry's `reg == a` guard before this PR.
+		OnTerminated: func(uuid string) {
+			b.actorsMu.Lock()
+			defer b.actorsMu.Unlock()
+			if reg, ok := b.actors[uuid]; ok && reg == a {
+				delete(b.actors, uuid)
+			}
+		},
+	}
 	// Initialize the SM eagerly so that the actor's goroutine and any
 	// external reader (DebugActors over /debug/actors) see the same
 	// pointer without synchronization on a lazy-init field. Construction
@@ -365,7 +405,7 @@ func (a *leaseActor) run() {
 		select {
 		case msg := <-a.inbox:
 			a.handle(msg)
-		case <-a.backend.stopCtx.Done():
+		case <-a.cfg.StopCtx.Done():
 			// Shutdown: exit the main loop. The deferred waitForWorkers +
 			// drainInbox guarantee in-flight workers finish and their
 			// terminal events get handled before the actor is torn down.
@@ -387,7 +427,7 @@ func (a *leaseActor) waitForWorkers() {
 	select {
 	case <-a.workers.Zero():
 	case <-time.After(workExitWaitTimeout):
-		a.backend.logger.Warn("actor waitForWorkers: worker did not exit within timeout",
+		a.cfg.Logger.Warn("actor waitForWorkers: worker did not exit within timeout",
 			"lease_uuid", a.leaseUUID,
 			"timeout", workExitWaitTimeout,
 		)
@@ -426,7 +466,7 @@ func (a *leaseActor) handle(msg leaseMessage) {
 	// and senders blocking forever.
 	defer func() {
 		if r := recover(); r != nil {
-			a.backend.logger.Error("lease actor panic",
+			a.cfg.Logger.Error("lease actor panic",
 				"lease_uuid", a.leaseUUID,
 				"panic", r,
 				"stack", string(debug.Stack()),
@@ -464,21 +504,21 @@ func (a *leaseActor) handle(msg leaseMessage) {
 	case replaceFailedMsg:
 		a.handleReplaceFailed(m.info)
 	default:
-		a.backend.logger.Warn("lease actor: unknown message type",
+		a.cfg.Logger.Warn("lease actor: unknown message type",
 			"lease_uuid", a.leaseUUID,
 		)
 	}
 }
 
 func (a *leaseActor) handleContainerDied(containerID string) {
-	_ = a.sm.Fire(a.backend.stopCtx, evContainerDied, containerID)
+	_ = a.sm.Fire(a.cfg.StopCtx, evContainerDied, containerID)
 }
 
 func (a *leaseActor) handleDiagGathered(result diagResult) {
 	// If we're no longer in Failing (e.g., Deprovision preempted), the SM's
 	// Ignore declarations on Failed/Deprovisioning drop this event; Fire
 	// returns an unhandled-trigger error we can safely discard.
-	_ = a.sm.Fire(a.backend.stopCtx, evDiagGathered, result)
+	_ = a.sm.Fire(a.cfg.StopCtx, evDiagGathered, result)
 }
 
 // fireAndVerify fires an SM event and verifies the transition landed in
@@ -497,7 +537,7 @@ func (a *leaseActor) handleDiagGathered(result diagResult) {
 // the Fire error (unhandled trigger) OR an errFireIgnored wrapping the
 // actual state (Ignore-returns-nil).
 func (a *leaseActor) fireAndVerify(ev leaseEvent, wantState backend.ProvisionStatus) error {
-	if err := a.sm.Fire(a.backend.stopCtx, ev); err != nil {
+	if err := a.sm.Fire(a.cfg.StopCtx, ev); err != nil {
 		return err
 	}
 	if state := a.sm.State(); state != wantState {
@@ -543,7 +583,7 @@ func (a *leaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 // have been removed.
 func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessResult, map[string]string, error)) {
 	a.workers.Add()
-	a.backend.wg.Go(func() {
+	a.cfg.WG.Go(func() {
 		// Exactly one sendTerminal call site (the middle defer), driven
 		// by terminalMsg. Defer ordering (LIFO):
 		//   1. recover (innermost, runs FIRST on panic) — may override
@@ -572,7 +612,7 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 			}
 			if !a.sendTerminal(terminalMsg) {
 				leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
-				a.backend.logger.Warn("terminal provision event dropped (actor exited or inbox wedged)",
+				a.cfg.Logger.Warn("terminal provision event dropped (actor exited or inbox wedged)",
 					"lease_uuid", a.leaseUUID,
 					"event", event,
 				)
@@ -580,7 +620,7 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				a.backend.logger.Error("provision worker panic — recovering to keep fred alive",
+				a.cfg.Logger.Error("provision worker panic — recovering to keep fred alive",
 					"lease_uuid", a.leaseUUID,
 					"panic", r,
 					"stack", string(debug.Stack()),
@@ -619,11 +659,11 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 }
 
 func (a *leaseActor) handleProvisionCompleted(result provisionSuccessResult) {
-	_ = a.sm.Fire(a.backend.stopCtx, evProvisionCompleted, result)
+	_ = a.sm.Fire(a.cfg.StopCtx, evProvisionCompleted, result)
 }
 
 func (a *leaseActor) handleProvisionErrored(callbackErr, lastError string, logs map[string]string) {
-	_ = a.sm.Fire(a.backend.stopCtx, evProvisionErrored, provisionErrorInfo{
+	_ = a.sm.Fire(a.cfg.StopCtx, evProvisionErrored, provisionErrorInfo{
 		callbackErr: callbackErr,
 		lastError:   lastError,
 		logs:        logs,
@@ -664,7 +704,7 @@ func (a *leaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 // preempting Deprovision reading prov observes the new set under lock.
 func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 	a.workers.Add()
-	a.backend.wg.Go(func() {
+	a.cfg.WG.Go(func() {
 		// Same defer structure as spawnProvisionWorker — see that
 		// function for the rationale. One sendTerminal call site in
 		// the middle defer; normal path and panic recover both write
@@ -682,7 +722,7 @@ func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 			}
 			if !a.sendTerminal(terminalMsg) {
 				leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
-				a.backend.logger.Warn("terminal replace event dropped (actor exited or inbox wedged)",
+				a.cfg.Logger.Warn("terminal replace event dropped (actor exited or inbox wedged)",
 					"lease_uuid", a.leaseUUID,
 					"event", event,
 				)
@@ -690,7 +730,7 @@ func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				a.backend.logger.Error("replace worker panic — recovering to keep fred alive",
+				a.cfg.Logger.Error("replace worker panic — recovering to keep fred alive",
 					"lease_uuid", a.leaseUUID,
 					"panic", r,
 					"stack", string(debug.Stack()),
@@ -729,15 +769,15 @@ func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 }
 
 func (a *leaseActor) handleReplaceCompleted(result replaceSuccessResult) {
-	_ = a.sm.Fire(a.backend.stopCtx, evReplaceCompleted, result)
+	_ = a.sm.Fire(a.cfg.StopCtx, evReplaceCompleted, result)
 }
 
 func (a *leaseActor) handleReplaceRecovered(info replaceFailureInfo) {
-	_ = a.sm.Fire(a.backend.stopCtx, evReplaceRecovered, info)
+	_ = a.sm.Fire(a.cfg.StopCtx, evReplaceRecovered, info)
 }
 
 func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
-	_ = a.sm.Fire(a.backend.stopCtx, evReplaceFailed, info)
+	_ = a.sm.Fire(a.cfg.StopCtx, evReplaceFailed, info)
 }
 
 // send enqueues a message. Blocks when the inbox is full (backpressure).
@@ -751,11 +791,11 @@ func (a *leaseActor) handleReplaceFailed(info replaceFailureInfo) {
 // physical work has already happened on the host and MUST be recorded
 // by the SM even during shutdown — use sendTerminal instead.
 func (a *leaseActor) send(msg leaseMessage) bool {
-	if a.backend.stopCtx.Err() != nil || a.hasExited() {
+	if a.cfg.StopCtx.Err() != nil || a.hasExited() {
 		return false
 	}
 	select {
-	case <-a.backend.stopCtx.Done():
+	case <-a.cfg.StopCtx.Done():
 		return false
 	case <-a.done:
 		return false
@@ -850,16 +890,14 @@ func (a *leaseActor) closeExiting() {
 // enough that a wedged actor doesn't pin the goroutine indefinitely.
 const terminalSendTimeout = 10 * time.Second
 
-// removeFromRegistry deletes this actor from b.actors under actorsMu.
-// CompareAndDelete semantics: only deletes if the registered entry is
-// THIS actor, so a fresh actor stored for the same UUID after our exit
-// started isn't clobbered. Used as a deferred action on actor exit.
+// removeFromRegistry deletes this actor from the substrate's actor
+// registry via the OnTerminated callback wired at construction. The
+// docker-side closure preserves CompareAndDelete semantics: only
+// deletes if the registered entry is THIS actor, so a fresh actor
+// stored for the same UUID after our exit started isn't clobbered.
+// Used as a deferred action on actor exit.
 func (a *leaseActor) removeFromRegistry() {
-	a.backend.actorsMu.Lock()
-	defer a.backend.actorsMu.Unlock()
-	if reg, ok := a.backend.actors[a.leaseUUID]; ok && reg == a {
-		delete(a.backend.actors, a.leaseUUID)
-	}
+	a.cfg.OnTerminated(a.leaseUUID)
 }
 
 // actorForLocked returns the lease actor for leaseUUID, creating + starting

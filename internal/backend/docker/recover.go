@@ -7,6 +7,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -329,13 +330,17 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.provisionsMu.RUnlock()
 
 		for _, cid := range containerIDs {
-			info, inspErr := b.docker.InspectContainer(ctx, cid)
+			state, inspErr := b.inspector.InspectInstance(ctx, cid)
 			if inspErr != nil {
 				b.logger.Warn("failed to inspect container during diagnostics gathering", "lease", uuid, "container_id", shortID(cid), "error", inspErr)
 				continue
 			}
-			if containerStatusToProvisionStatus(info.Status) == backend.ProvisionStatusFailed {
-				failedDiagnostics[uuid] = b.containerFailureDiagnostics(ctx, cid, info)
+			// Mirror the "terminally gone?" decision from the SM guard:
+			// PhaseExited and PhaseFailed cover the Docker statuses that
+			// previously mapped to ProvisionStatusFailed in
+			// containerStatusToProvisionStatus.
+			if state != nil && (state.Phase == leasesm.PhaseExited || state.Phase == leasesm.PhaseFailed) {
+				failedDiagnostics[uuid] = b.gatherer.GatherDiagnostics(ctx, cid, state)
 				break
 			}
 		}

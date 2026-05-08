@@ -11,6 +11,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -270,31 +271,45 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 	if !ok {
 		return false
 	}
-	b := lsm.actor.backend
+	cfg := &lsm.actor.cfg
 
-	b.provisionsMu.RLock()
-	p, exists := b.provisions[lsm.actor.leaseUUID]
-	if !exists || p.Status != backend.ProvisionStatusReady {
-		b.provisionsMu.RUnlock()
+	// Status guard via the substrate-agnostic LeaseProvisionStore. This is
+	// the one in-flow site in PR4 where a single lease-status read
+	// migrates cleanly to the seam (no other field reads/writes share
+	// the critical section). All compound critical sections in this file
+	// keep direct b.provisionsMu access — see leasesm.LeaseProvisionStore
+	// docstring for the rationale.
+	if status, ok := cfg.ProvisionStore.Get(lsm.actor.leaseUUID); !ok || status != backend.ProvisionStatusReady {
 		return false
 	}
-	b.provisionsMu.RUnlock()
 
 	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	info, err := b.docker.InspectContainer(reqCtx, containerID)
+	// Inspect via the substrate-agnostic InstanceInspector. ServiceName
+	// rides along on InstanceState (populated by the docker adapter from
+	// the underlying ContainerInfo's label) so the SM does not reach for
+	// substrate-specific metadata at this seam. cfg.Inspector is
+	// exercised here and in recover.go.
+	state, err := cfg.Inspector.InspectInstance(reqCtx, containerID)
 	if err != nil {
-		b.logger.Warn("failed to inspect container after die event",
+		cfg.Logger.Warn("failed to inspect container after die event",
 			"container_id", shortID(containerID),
 			"lease_uuid", lsm.actor.leaseUUID,
 			"error", err,
 		)
 		return false
 	}
-	if containerStatusToProvisionStatus(info.Status) != backend.ProvisionStatusFailed {
+	// "Terminally gone?" check: PhaseExited and PhaseFailed cover the
+	// Docker statuses {"exited", "removing", "dead"} that previously
+	// mapped to ProvisionStatusFailed. PhaseRunning and PhaseUnknown
+	// (which subsumes "created", "restarting", and unrecognized) are
+	// not terminal — same as the prior containerStatusToProvisionStatus
+	// behavior.
+	if state == nil || (state.Phase != leasesm.PhaseExited && state.Phase != leasesm.PhaseFailed) {
 		return false
 	}
-	lsm.actor.pendingDeathInfo = info
+	lsm.actor.pendingDeathInfo = state
+	lsm.actor.pendingDeathServiceName = state.ServiceName
 	return true
 }
 
@@ -363,7 +378,7 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	lsm.actor.workers.Add()
 	b.wg.Go(func() {
 		defer lsm.actor.workers.Done()
-		lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
+		lsm.actor.gatherDiagAsync(diagCtx, containerID, info, lsm.actor.pendingDeathServiceName)
 	})
 	return nil
 }
@@ -671,8 +686,8 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 		"container_id", shortID(result.containerID),
 		"fail_count", failCount,
 	}
-	if result.info != nil && result.info.ServiceName != "" {
-		logAttrs = append(logAttrs, "service_name", result.info.ServiceName)
+	if result.serviceName != "" {
+		logAttrs = append(logAttrs, "service_name", result.serviceName)
 	}
 	b.logger.Warn("container death detected via events API", logAttrs...)
 	return nil
@@ -680,9 +695,15 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 
 // diagResult carries gather output from the async goroutine into the Failed
 // entry action via Fire args.
+//
+// info is the substrate-agnostic InstanceState the SM consumes. serviceName
+// is carried separately for logging continuity — InstanceState intentionally
+// omits ServiceName because it is a Fred-side (lease-level) concept, not a
+// substrate-level one (K8s pods have no equivalent field).
 type diagResult struct {
 	containerID string
-	info        *ContainerInfo
+	info        *leasesm.InstanceState
+	serviceName string
 	diag        string
 }
 
@@ -781,7 +802,7 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 // sendTerminal lands before the actor proceeds past the transition;
 // on timeout the SM proceeds and a late sendTerminal is refused by the
 // Deprovisioning.Ignore backstop.
-func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *ContainerInfo) {
+func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *leasesm.InstanceState, serviceName string) {
 	// Same single-send defer pattern as spawnProvisionWorker /
 	// spawnReplaceWorker (see lease_actor.go). One sendTerminal site;
 	// the recover overrides terminalMsg on panic, the normal path
@@ -796,20 +817,20 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 		}
 		if terminalMsg == nil {
 			terminalMsg = diagGatheredMsg{
-				result: diagResult{containerID: containerID, info: info, diag: ""},
+				result: diagResult{containerID: containerID, info: info, serviceName: serviceName, diag: ""},
 			}
 			event = "diag_no_result"
 		}
 		if !a.sendTerminal(terminalMsg) {
 			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
-			a.backend.logger.Warn("terminal diag event dropped (actor exited or inbox wedged)",
+			a.cfg.Logger.Warn("terminal diag event dropped (actor exited or inbox wedged)",
 				"lease_uuid", a.leaseUUID,
 			)
 		}
 	}()
 	defer func() {
 		if r := recover(); r != nil {
-			a.backend.logger.Error("diag worker panic — recovering to keep fred alive",
+			a.cfg.Logger.Error("diag worker panic — recovering to keep fred alive",
 				"lease_uuid", a.leaseUUID,
 				"container_id", shortID(containerID),
 				"panic", r,
@@ -820,13 +841,13 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 			// Deprovisioning.Ignore still covers the case where the
 			// SM has already moved past Failing.
 			terminalMsg = diagGatheredMsg{
-				result: diagResult{containerID: containerID, info: info, diag: ""},
+				result: diagResult{containerID: containerID, info: info, serviceName: serviceName, diag: ""},
 			}
 			event = "diag_panic"
 			suppress = false
 		}
 	}()
-	diag := a.backend.containerFailureDiagnostics(ctx, containerID, info)
+	diag := a.cfg.Diag.GatherDiagnostics(ctx, containerID, info)
 	// Distinguish the two cancellation causes:
 	//   - context.Canceled: diagCancel() fired from Failing.OnExit (preempt
 	//     by Deprovision/Restart/Update). SM has left Failing; any
@@ -843,6 +864,6 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 		return
 	}
 	terminalMsg = diagGatheredMsg{
-		result: diagResult{containerID: containerID, info: info, diag: diag},
+		result: diagResult{containerID: containerID, info: info, serviceName: serviceName, diag: diag},
 	}
 }

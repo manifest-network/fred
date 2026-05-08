@@ -300,6 +300,9 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
 	})
+	b.inspector = &dockerInstanceInspector{docker: b.docker}
+	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
+	b.provisionStore = &backendProvisionStore{backend: b}
 	return b
 }
 

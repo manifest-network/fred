@@ -17,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/metrics"
 )
@@ -130,6 +131,18 @@ type Backend struct {
 	// the prior sync.Map design allowed.
 	actorsMu sync.Mutex
 	actors   map[string]*leaseActor // leaseUUID → *leaseActor
+
+	// inspector / gatherer / provisionStore are the substrate-agnostic
+	// seams the lease state machine consumes via leaseActor.cfg. Wired
+	// at backend construction (NewBackend and the test helpers
+	// newBackendForTest / newBackendForProvisionTest) and remain stable
+	// for the backend's lifetime. PR5 will inject these directly into
+	// the actor instead of routing through Backend; for PR4 the Backend
+	// is the canonical owner so test helpers can override them via the
+	// same mock surface that already exists.
+	inspector      leasesm.InstanceInspector
+	gatherer       leasesm.DiagnosticsGatherer
+	provisionStore leasesm.LeaseProvisionStore
 }
 
 // provision tracks provisioned containers for a lease.
@@ -199,11 +212,25 @@ const (
 )
 
 // containerFailureDiagnostics builds a diagnostic string from a failed
-// container's exit state and recent logs.
-func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID string, info *ContainerInfo) string {
+// container's exit state and recent logs. Takes a substrate-agnostic
+// *leasesm.InstanceState so callers in lease_sm/lease_actor/recover
+// don't need to handle the Docker-shaped *ContainerInfo at the seam;
+// non-SM callers (provision.go startup verify, waitForHealthy) convert
+// their *ContainerInfo via containerInfoToInstanceState before calling.
+//
+// state.ExitCode is dereferenced; a nil ExitCode is treated as 0 to
+// preserve the existing string format ("exit_code=0") for cases where
+// the container hasn't actually exited but diagnostics are gathered
+// anyway. The Docker-specific log fetch lives here because
+// b.docker.ContainerLogs is substrate-private.
+func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID string, state *leasesm.InstanceState) string {
 	var buf strings.Builder
-	fmt.Fprintf(&buf, "exit_code=%d", info.ExitCode)
-	if info.OOMKilled {
+	exitCode := 0
+	if state != nil && state.ExitCode != nil {
+		exitCode = *state.ExitCode
+	}
+	fmt.Fprintf(&buf, "exit_code=%d", exitCode)
+	if state != nil && state.OOMKilled {
 		buf.WriteString(", oom_killed=true")
 	}
 
@@ -474,6 +501,14 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 			callbackStoreErrorsTotal.Inc()
 		},
 	})
+
+	// Wire the substrate-agnostic seams the lease state machine consumes.
+	// Each adapter is a thin pass-through to the existing Docker-specific
+	// methods; they exist so the SM/actor can depend on leasesm.* without
+	// reaching back through *Backend at the seam.
+	b.inspector = &dockerInstanceInspector{docker: b.docker}
+	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
+	b.provisionStore = &backendProvisionStore{backend: b}
 
 	return b, nil
 }

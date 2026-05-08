@@ -3347,8 +3347,8 @@ func TestContainerFailureDiagnostics_ExitCodeAndLogs(t *testing.T) {
 	}
 	b := newBackendForTest(mock, nil)
 
-	info := &ContainerInfo{ExitCode: 1}
-	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+	info := &ContainerInfo{Status: "exited", ExitCode: 1}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", containerInfoToInstanceState(info))
 
 	assert.Equal(t, "exit_code=1; logs:\nError: EACCES: permission denied", diag)
 }
@@ -3361,8 +3361,8 @@ func TestContainerFailureDiagnostics_OOMKilled(t *testing.T) {
 	}
 	b := newBackendForTest(mock, nil)
 
-	info := &ContainerInfo{ExitCode: 137, OOMKilled: true}
-	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+	info := &ContainerInfo{Status: "exited", ExitCode: 137, OOMKilled: true}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", containerInfoToInstanceState(info))
 
 	assert.Contains(t, diag, "exit_code=137")
 	assert.Contains(t, diag, "oom_killed=true")
@@ -3377,8 +3377,8 @@ func TestContainerFailureDiagnostics_LogsFetchFails(t *testing.T) {
 	}
 	b := newBackendForTest(mock, nil)
 
-	info := &ContainerInfo{ExitCode: 1}
-	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+	info := &ContainerInfo{Status: "exited", ExitCode: 1}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", containerInfoToInstanceState(info))
 
 	assert.Equal(t, "exit_code=1", diag)
 }
@@ -3391,8 +3391,8 @@ func TestContainerFailureDiagnostics_ZeroExitCode(t *testing.T) {
 	}
 	b := newBackendForTest(mock, nil)
 
-	info := &ContainerInfo{ExitCode: 0}
-	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+	info := &ContainerInfo{Status: "exited", ExitCode: 0}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", containerInfoToInstanceState(info))
 
 	assert.Equal(t, "exit_code=0", diag)
 }
@@ -3407,8 +3407,8 @@ func TestContainerFailureDiagnostics_Truncation(t *testing.T) {
 	}
 	b := newBackendForTest(mock, nil)
 
-	info := &ContainerInfo{ExitCode: 1}
-	diag := b.containerFailureDiagnostics(context.Background(), "c1", info)
+	info := &ContainerInfo{Status: "exited", ExitCode: 1}
+	diag := b.containerFailureDiagnostics(context.Background(), "c1", containerInfoToInstanceState(info))
 
 	assert.LessOrEqual(t, len(diag), diagnosticMaxBytes)
 	assert.True(t, strings.HasSuffix(diag, "..."))
