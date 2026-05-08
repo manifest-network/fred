@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
 )
 
 // errActorTerminated is returned on the ack/reply channel when a
@@ -273,7 +274,7 @@ type leaseActor struct {
 	// The SM enforces at-most-one-worker-at-a-time across the work-owning
 	// states, so workers.Zero effectively waits for "the one worker
 	// currently running"; the count happens to always be 0 or 1.
-	workers *workBarrier
+	workers *workbarrier.Barrier
 	// currentMessageStart is the UnixNano timestamp of the message the
 	// actor is currently processing in handle(), or 0 when idle. Used by
 	// the stuck-actor sampler to detect hung handlers. Written by the
@@ -317,7 +318,7 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 		inbox:     make(chan leaseMessage, leaseActorInboxSize),
 		done:      make(chan struct{}),
 		exiting:   make(chan struct{}),
-		workers:   newWorkBarrier(),
+		workers:   workbarrier.New(),
 	}
 	// Initialize the SM eagerly so that the actor's goroutine and any
 	// external reader (DebugActors over /debug/actors) see the same
@@ -378,7 +379,7 @@ func (a *leaseActor) run() {
 // worker (Docker daemon hang with ctx ignored) can't pin the actor.
 // If the timeout fires we log and continue — the wedged worker itself
 // becomes a zombie goroutine; recoverState reconciles state on next
-// start. workBarrier's Zero() is a real channel, so the select here
+// start. workbarrier.Barrier's Zero() is a real channel, so the select here
 // spawns no helper goroutine: even under timeout, this function leaks
 // nothing on top of whatever the wedged worker itself has already
 // leaked.
