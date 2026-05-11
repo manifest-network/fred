@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
@@ -90,41 +89,42 @@ func (g *dockerDiagnosticsGatherer) GatherDiagnostics(ctx context.Context, insta
 
 // backendProvisionStore adapts Backend.provisions + Backend.provisionsMu
 // to the leasesm.LeaseProvisionStore interface. The adapter takes the
-// SAME mutex as direct accessors so cross-path atomicity is preserved.
+// SAME mutex as direct accessors (recover.go, deprovision.go,
+// startup-time mutators) so cross-path atomicity is preserved.
 //
-// The 3-method interface intentionally covers only simple status reads
-// and single-field writes; compound critical sections (multi-field
-// writes that must atomically observe-and-update) keep direct access
-// to b.provisionsMu in the SM/actor/recover paths.
+// The closure-style UpdateFn captures any compound multi-field update
+// inside one Lock acquisition — atomicity is preserved without the
+// interface needing one method per transition.
 type backendProvisionStore struct {
 	backend *Backend
 }
 
-// UpdateStatus implements leasesm.LeaseProvisionStore.
-func (s *backendProvisionStore) UpdateStatus(leaseUUID string, status backend.ProvisionStatus, lastErr string) {
-	s.backend.provisionsMu.Lock()
-	defer s.backend.provisionsMu.Unlock()
-	if p, ok := s.backend.provisions[leaseUUID]; ok {
-		p.Status = status
-		p.LastError = lastErr
-	}
-}
-
-// IncFailCount implements leasesm.LeaseProvisionStore.
-func (s *backendProvisionStore) IncFailCount(leaseUUID string) {
-	s.backend.provisionsMu.Lock()
-	defer s.backend.provisionsMu.Unlock()
-	if p, ok := s.backend.provisions[leaseUUID]; ok {
-		p.FailCount++
-	}
-}
-
-// Get implements leasesm.LeaseProvisionStore.
-func (s *backendProvisionStore) Get(leaseUUID string) (backend.ProvisionStatus, bool) {
+// Get implements leasesm.LeaseProvisionStore. Returns a SHALLOW
+// value-copy snapshot of the ProvisionState — slices/maps alias the
+// underlying record (no deep copy). Caller does NOT hold any lock
+// after Get returns.
+func (s *backendProvisionStore) Get(leaseUUID string) (*leasesm.ProvisionState, bool) {
 	s.backend.provisionsMu.RLock()
 	defer s.backend.provisionsMu.RUnlock()
-	if p, ok := s.backend.provisions[leaseUUID]; ok {
-		return p.Status, true
+	p, ok := s.backend.provisions[leaseUUID]
+	if !ok {
+		return nil, false
 	}
-	return "", false
+	snap := *p
+	return &snap, true
+}
+
+// UpdateFn implements leasesm.LeaseProvisionStore. Runs fn under one
+// Lock acquisition on b.provisionsMu, passing a pointer to the
+// ProvisionState. Mutations made by fn persist on the underlying
+// record. Returns true when the lease existed and fn was applied.
+func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.ProvisionState)) bool {
+	s.backend.provisionsMu.Lock()
+	defer s.backend.provisionsMu.Unlock()
+	p, ok := s.backend.provisions[leaseUUID]
+	if !ok {
+		return false
+	}
+	fn(p)
+	return true
 }

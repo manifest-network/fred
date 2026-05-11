@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
 )
@@ -359,6 +360,19 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 				delete(b.actors, uuid)
 			}
 		},
+		// Backend-method closures: thin pass-throughs to the existing
+		// docker-side methods. After PR5 the SM/actor live in
+		// shared/leasesm and reach the substrate-private store /
+		// callback queue exclusively through these closures.
+		PersistDiagnosticsFn: func(entry shared.DiagnosticEntry, containerIDs []string, keys map[string]string) {
+			b.persistDiagnostics(entry, containerIDs, keys)
+		},
+		PersistDiagnosticsWithLogsFn: func(entry shared.DiagnosticEntry, logs map[string]string) {
+			b.persistDiagnosticsWithLogs(entry, logs)
+		},
+		SendCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
+			b.sendCallbackWithURL(uuid, url, status, errMsg)
+		},
 	}
 	// Initialize the SM eagerly so that the actor's goroutine and any
 	// external reader (DebugActors over /debug/actors) see the same
@@ -640,11 +654,9 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 			// Pre-publish so a concurrent Deprovision-preempt reading
 			// prov.ContainerIDs sees the new IDs and can tear them down
 			// rather than leaving orphans.
-			a.backend.provisionsMu.Lock()
-			if p, ok := a.backend.provisions[a.leaseUUID]; ok {
+			a.cfg.ProvisionStore.UpdateFn(a.leaseUUID, func(p *leasesm.ProvisionState) {
 				p.ContainerIDs = result.containerIDs
-			}
-			a.backend.provisionsMu.Unlock()
+			})
 			terminalMsg = provisionCompletedMsg{result: result}
 			event = "provision_completed"
 		} else {
@@ -745,14 +757,12 @@ func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 		}()
 		result := work()
 		if result.err == nil {
-			a.backend.provisionsMu.Lock()
-			if p, ok := a.backend.provisions[a.leaseUUID]; ok {
+			a.cfg.ProvisionStore.UpdateFn(a.leaseUUID, func(p *leasesm.ProvisionState) {
 				p.ContainerIDs = result.success.containerIDs
 				if result.success.serviceContainers != nil {
 					p.ServiceContainers = result.success.serviceContainers
 				}
-			}
-			a.backend.provisionsMu.Unlock()
+			})
 		}
 		switch {
 		case result.err == nil:

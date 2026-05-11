@@ -191,16 +191,20 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		var diagSnap shared.DiagnosticEntry
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
-			p.VolumeCleanupAttempts++
+			b.volumeCleanupAttempts[leaseUUID]++
 			p.ContainerIDs = nil // containers are gone
 
-			if p.VolumeCleanupAttempts >= maxVolumeCleanupAttempts {
+			if b.volumeCleanupAttempts[leaseUUID] >= maxVolumeCleanupAttempts {
 				// Too many failed attempts — give up and remove the provision.
 				// The leaked volumes require manual cleanup by the operator.
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
-					p.VolumeCleanupAttempts, errors.Join(volumeErrs...))
+					b.volumeCleanupAttempts[leaseUUID], errors.Join(volumeErrs...))
 				diagSnap = diagnosticSnapshot(p)
+				// volumeCleanupAttempts must be deleted in sync with
+				// b.provisions[uuid] under b.provisionsMu Lock — shared
+				// lock domain (see field declaration in backend.go).
 				delete(b.provisions, leaseUUID)
+				delete(b.volumeCleanupAttempts, leaseUUID)
 				b.provisionsMu.Unlock()
 
 				// Persist diagnostics before losing the provision so operators
@@ -221,7 +225,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				deprovisionsTotal.Inc()
 
 				logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
-					"attempts", p.VolumeCleanupAttempts,
+					"attempts", b.volumeCleanupAttempts[leaseUUID],
 					"errors", errors.Join(volumeErrs...),
 				)
 
@@ -250,8 +254,12 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	// All containers and volumes removed — delete provision from map.
+	// volumeCleanupAttempts must be deleted in sync with b.provisions[uuid]
+	// under b.provisionsMu Lock — shared lock domain (see field
+	// declaration in backend.go).
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
+	delete(b.volumeCleanupAttempts, leaseUUID)
 	b.provisionsMu.Unlock()
 
 	// Clean up tenant network if isolation is enabled. releaseTenantNetwork

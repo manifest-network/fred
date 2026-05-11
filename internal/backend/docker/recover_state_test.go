@@ -284,16 +284,17 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 
 	b := &Backend{
-		cfg:        cfg,
-		docker:     mock,
-		compose:    &mockComposeExecutor{},
-		pool:       pool,
-		volumes:    &noopVolumeManager{},
-		logger:     slog.Default(),
-		provisions: provs,
-		actors:     make(map[string]*leaseActor),
-		stopCtx:    stopCtx,
-		stopCancel: stopCancel,
+		cfg:                   cfg,
+		docker:                mock,
+		compose:               &mockComposeExecutor{},
+		pool:                  pool,
+		volumes:               &noopVolumeManager{},
+		logger:                slog.Default(),
+		provisions:            provs,
+		volumeCleanupAttempts: make(map[string]int),
+		actors:                make(map[string]*leaseActor),
+		stopCtx:               stopCtx,
+		stopCancel:            stopCancel,
 	}
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,

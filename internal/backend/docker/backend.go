@@ -18,7 +18,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
@@ -67,6 +66,27 @@ type Backend struct {
 	// provisions tracks active provisions by lease UUID
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
+
+	// volumeCleanupAttempts is a parallel counter map keyed by lease
+	// UUID, tracking how many times Deprovision has retried volume
+	// cleanup for a lease. Lives outside the substrate-agnostic
+	// provision record because it is purely Docker-internal —
+	// volume cleanup is a Docker-specific operation; K3s would
+	// implement deprovision retry differently.
+	//
+	// Lock domain: `b.provisionsMu` (shared with `b.provisions`).
+	// Every read/write site holds provisionsMu — see
+	// `deprovision.go` (increment + delete-on-give-up + delete-on-success)
+	// and `removeProvision` for the synchronization invariant.
+	//
+	// Future-refactor hint: if Docker grows a SECOND private field on
+	// the provision record (today VolumeCleanupAttempts is the only
+	// one — audited at every `*provision` field assignment in PR5a),
+	// consider migrating from the type-alias + parallel-map pattern
+	// to an embedded-struct wrapper around leasesm.ProvisionState to
+	// keep Docker-private state cohesive and avoid parallel-map
+	// maintenance overhead at each cleanup site.
+	volumeCleanupAttempts map[string]int
 
 	// tenantNetworkStripes serializes EnsureTenantNetwork and
 	// RemoveTenantNetworkIfEmpty per tenant. Tenant networks are shared
@@ -145,34 +165,15 @@ type Backend struct {
 	provisionStore leasesm.LeaseProvisionStore
 }
 
-// provision tracks provisioned containers for a lease.
-// A single lease may have multiple containers based on quantity.
-type provision struct {
-	LeaseUUID             string
-	Tenant                string
-	ProviderUUID          string
-	SKU                   string
-	ContainerIDs          []string // Multiple containers for multi-unit leases
-	Image                 string
-	Manifest              *manifest.Manifest // Single-manifest leases (mutually exclusive with StackManifest); persisted for restart/update.
-	Status                backend.ProvisionStatus
-	Quantity              int // Expected number of containers
-	CreatedAt             time.Time
-	FailCount             int    // Number of times provisioning has failed for this lease
-	VolumeCleanupAttempts int    // Number of failed volume cleanup attempts during deprovision
-	LastError             string // Last error message, queryable after failure
-	CallbackURL           string // URL to notify on provision completion
-
-	// Stack fields (set when IsStack() returns true)
-	StackManifest     *manifest.StackManifest // Per-service manifests for stack deployments
-	ServiceContainers map[string][]string // service name → container IDs
-	Items             []backend.LeaseItem // Original lease items (preserved for stack operations)
-}
-
-// IsStack returns true when this provision represents a stack deployment.
-func (p *provision) IsStack() bool {
-	return p.StackManifest != nil
-}
+// provision is a type alias for the substrate-agnostic
+// leasesm.ProvisionState. The lease state machine reasons about these
+// fields exclusively; the Docker backend uses the same record type,
+// keeping the substrate-private VolumeCleanupAttempts counter in a
+// parallel map (b.volumeCleanupAttempts) rather than on a wrapper
+// struct. The alias keeps existing struct-literal initializations
+// (`provision{LeaseUUID: x, Status: y}`) working unchanged across
+// the test fixtures.
+type provision = leasesm.ProvisionState
 
 // shortID truncates a container/network ID to 12 characters for logging.
 // Uses Docker's stringid.TruncateID for consistency with Docker CLI output.
@@ -476,8 +477,9 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		pool:             pool,
 		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
-		provisions:       make(map[string]*provision),
-		actors:           make(map[string]*leaseActor),
+		provisions:            make(map[string]*provision),
+		volumeCleanupAttempts: make(map[string]int),
+		actors:                make(map[string]*leaseActor),
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,
@@ -703,9 +705,16 @@ func (b *Backend) sendCallbackWithURL(leaseUUID, callbackURL string, status back
 
 // removeProvision removes a provision reservation and its callback URL.
 // Used when pre-flight validation fails after the slot was reserved.
+// Also clears the volumeCleanupAttempts entry so a re-provision under
+// the same lease UUID starts fresh.
+//
+// Invariant: `b.volumeCleanupAttempts` entries MUST be deleted in
+// sync with `b.provisions` deletes under `b.provisionsMu` Lock —
+// they share the same lock domain.
 func (b *Backend) removeProvision(leaseUUID string) {
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
+	delete(b.volumeCleanupAttempts, leaseUUID)
 	b.provisionsMu.Unlock()
 }
 

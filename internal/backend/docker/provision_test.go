@@ -1473,7 +1473,9 @@ func TestDeprovision_VolumeDestroyFailure(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 	assert.Nil(t, prov.ContainerIDs, "containers should be nil since they were removed")
 	assert.Contains(t, prov.LastError, "volume cleanup failed")
-	assert.Equal(t, 1, prov.VolumeCleanupAttempts)
+	b.provisionsMu.RLock()
+	assert.Equal(t, 1, b.volumeCleanupAttempts["lease-1"])
+	b.provisionsMu.RUnlock()
 }
 
 func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
@@ -1491,14 +1493,14 @@ func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {
-			LeaseUUID:             "lease-1",
-			Tenant:                "tenant-a",
-			Status:                backend.ProvisionStatusFailed,
-			Quantity:              1,
-			ContainerIDs:          nil, // containers already removed
-			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusFailed,
+			Quantity:     1,
+			ContainerIDs: nil, // containers already removed
 		},
 	})
+	b.volumeCleanupAttempts["lease-1"] = maxVolumeCleanupAttempts - 1
 	b.volumes = vm
 
 	err := b.Deprovision(context.Background(), "lease-1")
@@ -1586,15 +1588,15 @@ func TestDeprovision_VolumeExhaustionSendsFailedCallback(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {
-			LeaseUUID:             "lease-1",
-			Tenant:                "tenant-a",
-			Status:                backend.ProvisionStatusFailed,
-			Quantity:              1,
-			ContainerIDs:          nil,
-			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
-			CallbackURL:           server.URL,
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusFailed,
+			Quantity:     1,
+			ContainerIDs: nil,
+			CallbackURL:  server.URL,
 		},
 	})
+	b.volumeCleanupAttempts["lease-1"] = maxVolumeCleanupAttempts - 1
 	b.volumes = vm
 	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"

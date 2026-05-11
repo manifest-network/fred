@@ -279,7 +279,7 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 	// the critical section). All compound critical sections in this file
 	// keep direct b.provisionsMu access — see leasesm.LeaseProvisionStore
 	// docstring for the rationale.
-	if status, ok := cfg.ProvisionStore.Get(lsm.actor.leaseUUID); !ok || status != backend.ProvisionStatusReady {
+	if state, ok := cfg.ProvisionStore.Get(lsm.actor.leaseUUID); !ok || state.Status != backend.ProvisionStatusReady {
 		return false
 	}
 
@@ -325,7 +325,6 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	if !ok {
 		return fmt.Errorf("onEnterFailing: containerID not string")
 	}
-	b := lsm.actor.backend
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
 
@@ -346,22 +345,28 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	// to the state prov.Status already reflects. Failing.Ignore on
 	// ContainerDied/DiagGathered prevents stray events from doing
 	// anything during the drift window.
-	b.provisionsMu.Lock()
-	currentProv, exists := b.provisions[leaseUUID]
+	var raceSkipped, applied bool
+	exists := lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+		if p.Status != backend.ProvisionStatusReady {
+			raceSkipped = true
+			return
+		}
+		p.Status = backend.ProvisionStatusFailing
+		p.FailCount++
+		p.LastError = errMsgContainerExited
+		applied = true
+	})
 	if !exists {
-		b.provisionsMu.Unlock()
 		return nil
 	}
-	if currentProv.Status != backend.ProvisionStatusReady {
-		b.provisionsMu.Unlock()
+	if raceSkipped {
 		leaseFailingRaceSkippedTotal.Inc()
 		return nil
 	}
-	currentProv.Status = backend.ProvisionStatusFailing
-	currentProv.FailCount++
-	currentProv.LastError = errMsgContainerExited
-	activeProvisions.Dec()
-	b.provisionsMu.Unlock()
+	if applied {
+		activeProvisions.Dec()
+	}
+
 
 	// Spawn the async diag gather. Its context is derived from
 	// context.Background() with a bounded timeout — NOT from stopCtx —
@@ -376,7 +381,7 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	diagCtx, diagCancel := context.WithTimeout(context.Background(), diagnosticsGatherTimeout)
 	lsm.actor.diagCancel = diagCancel
 	lsm.actor.workers.Add()
-	b.wg.Go(func() {
+	lsm.actor.cfg.WG.Go(func() {
 		defer lsm.actor.workers.Done()
 		lsm.actor.gatherDiagAsync(diagCtx, containerID, info, lsm.actor.pendingDeathServiceName)
 	})
@@ -442,12 +447,12 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 	if !ok {
 		return fmt.Errorf("onEnterReadyFromProvision: arg not provisionSuccessResult")
 	}
-	b := lsm.actor.backend
+	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
-	b.provisionsMu.Lock()
-	if p, ok := b.provisions[leaseUUID]; ok {
+	var applied bool
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 		p.Status = backend.ProvisionStatusReady
 		p.ContainerIDs = result.containerIDs
 		p.LastError = ""
@@ -460,12 +465,14 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		if result.serviceContainers != nil {
 			p.ServiceContainers = result.serviceContainers
 		}
-		activeProvisions.Inc()
 		callbackURL = p.CallbackURL
+		applied = true
+	})
+	if applied {
+		activeProvisions.Inc()
 	}
-	b.provisionsMu.Unlock()
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
 	return nil
 }
 
@@ -481,12 +488,12 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 	if !ok {
 		return fmt.Errorf("onEnterReadyFromReplaceCompleted: arg not replaceSuccessResult")
 	}
-	b := lsm.actor.backend
+	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
-	b.provisionsMu.Lock()
-	if p, ok := b.provisions[leaseUUID]; ok {
+	var incActive bool
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 		p.ContainerIDs = result.containerIDs
 		if result.serviceContainers != nil {
 			p.ServiceContainers = result.serviceContainers
@@ -494,16 +501,18 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		p.Status = backend.ProvisionStatusReady
 		p.LastError = ""
 		if result.prevStatus == backend.ProvisionStatusFailed {
-			activeProvisions.Inc()
+			incActive = true
 		}
 		if result.onSuccess != nil {
 			result.onSuccess(p)
 		}
 		callbackURL = p.CallbackURL
+	})
+	if incActive {
+		activeProvisions.Inc()
 	}
-	b.provisionsMu.Unlock()
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
 	return nil
 }
 
@@ -521,13 +530,12 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	if !ok {
 		return fmt.Errorf("onEnterReadyFromReplaceRecovered: arg not replaceFailureInfo")
 	}
-	b := lsm.actor.backend
+	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	b.provisionsMu.Lock()
-	if p, ok := b.provisions[leaseUUID]; ok {
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 		p.LastError = info.lastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusReady
@@ -539,17 +547,16 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		}
 		diagSnap = diagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
-	}
-	b.provisionsMu.Unlock()
+	})
 
 	if diagSnap.LeaseUUID != "" {
 		// Use logs captured by doReplace*'s defer BEFORE rollback tore
 		// the failed containers down — post-cleanup log fetches would
 		// hit already-deleted containers and record an empty entry.
-		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
+		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
 	}
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }
 
@@ -565,32 +572,34 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	if !ok {
 		return fmt.Errorf("onEnterFailedFromReplace: arg not replaceFailureInfo")
 	}
-	b := lsm.actor.backend
+	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	b.provisionsMu.Lock()
-	if p, ok := b.provisions[leaseUUID]; ok {
+	var decActive bool
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 		p.LastError = info.lastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
 		if info.prevStatus == backend.ProvisionStatusReady {
-			activeProvisions.Dec()
+			decActive = true
 		}
 		diagSnap = diagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
+	})
+	if decActive {
+		activeProvisions.Dec()
 	}
-	b.provisionsMu.Unlock()
 
 	if diagSnap.LeaseUUID != "" {
 		// Use logs captured by doReplace*'s defer BEFORE rollback tore
 		// the failed containers down — post-cleanup log fetches would
 		// hit already-deleted containers and record an empty entry.
-		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
+		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
 	}
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }
 
@@ -607,30 +616,28 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	if !ok {
 		return fmt.Errorf("onEnterFailedFromProvision: arg not provisionErrorInfo")
 	}
-	b := lsm.actor.backend
+	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	b.provisionsMu.Lock()
-	if p, ok := b.provisions[leaseUUID]; ok {
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
 		diagSnap = diagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
-	}
-	b.provisionsMu.Unlock()
+	})
 
 	if diagSnap.LeaseUUID != "" {
 		// Use the logs captured by doProvision's cleanup defer (before the
 		// failed containers were removed). If the worker didn't capture
 		// any (e.g., failure before any containers were created), the
 		// entry is persisted without logs.
-		b.persistDiagnosticsWithLogs(diagSnap, info.logs)
+		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
 	}
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }
 
@@ -647,7 +654,7 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	if !ok {
 		return fmt.Errorf("onEnterFailedFromDiag: arg not diagResult")
 	}
-	b := lsm.actor.backend
+	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
@@ -655,31 +662,29 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	var diagSnap shared.DiagnosticEntry
 	var diagContainerIDs []string
 	var diagKeys map[string]string
-	b.provisionsMu.Lock()
-	p, exists := b.provisions[leaseUUID]
+	exists := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+		p.Status = backend.ProvisionStatusFailed
+		if result.diag != "" {
+			p.LastError = errMsgContainerExited + ": " + result.diag
+		}
+		callbackURL = p.CallbackURL
+		failCount = p.FailCount
+		diagSnap = diagnosticSnapshot(p)
+		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
+		diagKeys = containerLogKeys(p)
+	})
 	if !exists {
-		b.provisionsMu.Unlock()
 		return nil
 	}
-	p.Status = backend.ProvisionStatusFailed
-	if result.diag != "" {
-		p.LastError = errMsgContainerExited + ": " + result.diag
-	}
-	callbackURL = p.CallbackURL
-	failCount = p.FailCount
-	diagSnap = diagnosticSnapshot(p)
-	diagContainerIDs = append([]string(nil), p.ContainerIDs...)
-	diagKeys = containerLogKeys(p)
-	b.provisionsMu.Unlock()
 
 	// Persist diagnostics (bbolt write). Runs in the actor goroutine —
 	// briefly blocks other messages for this lease, but matches the
 	// "actor owns all state" invariant. Bbolt writes are ~ms.
 	if diagSnap.LeaseUUID != "" {
-		b.persistDiagnostics(diagSnap, diagContainerIDs, diagKeys)
+		cfg.PersistDiagnosticsFn(diagSnap, diagContainerIDs, diagKeys)
 	}
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
 
 	logAttrs := []any{
 		"lease_uuid", leaseUUID,
@@ -689,7 +694,7 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	if result.serviceName != "" {
 		logAttrs = append(logAttrs, "service_name", result.serviceName)
 	}
-	b.logger.Warn("container death detected via events API", logAttrs...)
+	cfg.Logger.Warn("container death detected via events API", logAttrs...)
 	return nil
 }
 

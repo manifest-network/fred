@@ -16,6 +16,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // Phase is a substrate-agnostic container/instance lifecycle phase.
@@ -92,24 +93,136 @@ type DiagnosticsGatherer interface {
 	GatherDiagnostics(ctx context.Context, instanceID string, state *InstanceState) string
 }
 
-// LeaseProvisionStore is the substrate-agnostic seam for the simple
-// provision-record reads/writes the SM and actor perform.
+// IsStack returns true when this provision represents a stack
+// deployment (multi-service). Methods on ProvisionState are limited
+// to substrate-agnostic queries; substrate-specific behavior lives in
+// the substrate package's adapter or on a wrapper.
+func (p *ProvisionState) IsStack() bool {
+	return p.StackManifest != nil
+}
+
+// ProvisionState is the substrate-agnostic snapshot of a lease's
+// provision record. The lease state machine and actor reason about
+// these fields exclusively; substrate-specific fields (e.g.
+// VolumeCleanupAttempts on the Docker backend) live on a docker-private
+// wrapper that embeds *ProvisionState.
 //
-// Compound multi-field updates (Status + ContainerIDs + Manifest in a
-// single critical section) are not expressible through this interface
-// without losing atomicity; substrate implementations and consumers
-// keep direct access for those sites. Implementations MUST guard
-// accesses with the same mutex that direct callers use, so atomicity
-// is preserved across the two access paths.
+// Manifest and StackManifest are substrate-shared schema (lifted to
+// internal/backend/shared/manifest in PR2) — they live here even
+// though substrates translate them to substrate-specific shapes
+// (Docker compose-spec, K8s pod spec) at provision time.
+type ProvisionState struct {
+	LeaseUUID         string
+	Tenant            string
+	ProviderUUID      string
+	SKU               string
+	Image             string
+	Status            backend.ProvisionStatus
+	Quantity          int
+	CreatedAt         time.Time
+	FailCount         int
+	LastError         string
+	CallbackURL       string
+	Items             []backend.LeaseItem
+	ContainerIDs      []string
+	Manifest          *manifest.Manifest
+	StackManifest     *manifest.StackManifest
+	ServiceContainers map[string][]string
+}
+
+// LeaseProvisionStore is the substrate-agnostic seam for the
+// provision-record reads and writes the SM and actor perform. The
+// closure-style UpdateFn captures any compound multi-field update
+// inside one mutex acquisition, so atomicity is preserved without
+// the interface needing one method per transition.
+//
+// Implementations MUST guard accesses with the same mutex that any
+// substrate-internal direct access uses, so cross-path atomicity is
+// preserved.
+//
+// # UpdateFn closure contract
+//
+// UpdateFn runs the supplied closure under one mutex Lock acquisition
+// on the implementation's internal mutex. The closure body sees a
+// live *ProvisionState whose mutations persist on the underlying
+// record. The closure MUST NOT:
+//
+//   - block on any external resource (network, disk I/O, channel
+//     send/receive) — it runs under the mutex and will starve other
+//     UpdateFn / Get callers
+//   - call any other method on the same LeaseProvisionStore (deadlock
+//     under typical mutex implementations)
+//   - retain the *ProvisionState pointer beyond closure return — the
+//     pointer is only valid for the duration of the call
+//
+// # Communicating outcomes from inside the closure
+//
+// The closure's signature is `func(*ProvisionState)` with no return.
+// When callers need to communicate decision data (callback URL,
+// diagnostic snapshots, "applied vs skipped" flags) from inside the
+// critical section to post-Unlock code, capture outer-scope
+// variables. The pattern:
+//
+//	var callbackURL string
+//	var raceSkipped bool
+//	cfg.ProvisionStore.UpdateFn(uuid, func(p *ProvisionState) {
+//	    if p.Status != backend.ProvisionStatusReady {
+//	        raceSkipped = true
+//	        return
+//	    }
+//	    p.Status = backend.ProvisionStatusFailing
+//	    p.FailCount++
+//	    p.LastError = errMsg
+//	    callbackURL = p.CallbackURL
+//	})
+//	if raceSkipped {
+//	    metrics.RaceSkipped.Inc()
+//	    return nil
+//	}
+//	// post-Unlock work uses the captured callbackURL
+//	cfg.SendCallbackFn(uuid, callbackURL, ...)
+//
+// Pick outer-capture for ALL UpdateFn call sites — mixing capture-style
+// and a hypothetical "UpdateFn returns values" extension is a
+// readability tax. The current API is locked at no-return.
+//
+// # Idempotence requirement (forward-looking, ENG-154)
+//
+// Closure bodies SHOULD be idempotent: running the closure multiple
+// times against the same starting state should produce the same end
+// state. The current mutex+map implementation never re-runs the
+// closure, but a future implementation (ENG-154) may swap to
+// atomic.Pointer-based copy-on-write with CAS retry — under contention,
+// the closure can be re-invoked against a fresh snapshot. Closure
+// authors MUST avoid:
+//
+//   - side effects that aren't idempotent (e.g., logging-with-counters,
+//     metric increments — keep those OUTSIDE the closure, in
+//     post-UpdateFn code using captured outer flags)
+//   - reading mutable outer state inside the closure (the snapshot may
+//     have changed between retries; the closure should derive everything
+//     from the *ProvisionState parameter)
+//
+// The 9 SM compound sections shipped with PR5 are all read-then-write
+// against the *ProvisionState alone, with side effects (metric Inc/Dec,
+// callback dispatch, log lines) factored out into post-UpdateFn code
+// behind captured flags. PR5 sets that pattern; future contributors
+// must preserve it.
 type LeaseProvisionStore interface {
-	// UpdateStatus sets Status and LastError under one critical section.
-	UpdateStatus(leaseUUID string, status backend.ProvisionStatus, lastErr string)
+	// Get returns a SHALLOW value-copy snapshot of the provision state
+	// and ok=true when the lease exists. Callers receive the copy by
+	// value — they do NOT hold any lock after Get returns. Slices
+	// and maps inside ProvisionState are shared with the underlying
+	// record (no deep copy); callers must NOT mutate them. Use
+	// UpdateFn for any mutation.
+	Get(leaseUUID string) (state *ProvisionState, ok bool)
 
-	// IncFailCount atomically increments the FailCount.
-	IncFailCount(leaseUUID string)
-
-	// Get returns the current Status and ok=true when the lease exists.
-	Get(leaseUUID string) (status backend.ProvisionStatus, ok bool)
+	// UpdateFn applies fn to the provision record under one critical
+	// section. Returns true if the lease existed and fn was applied,
+	// false otherwise. Implementations MUST hold the same mutex that
+	// guards direct accesses for the duration of fn — the closure
+	// runs inside the lock.
+	UpdateFn(leaseUUID string, fn func(*ProvisionState)) bool
 }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at
@@ -132,4 +245,25 @@ type LeaseActorConfig struct {
 	CallbackSender *shared.CallbackSender
 	ProvisionStore LeaseProvisionStore
 	OnTerminated   func(leaseUUID string)
+
+	// PersistDiagnosticsFn writes a failure diagnostic to the
+	// substrate's diagnostics store, including a fresh fetch of
+	// container logs from the supplied containerIDs (substrate-side
+	// concern). The optional keys map overrides default index-based
+	// log keys (e.g., "web/0" for stack services). Best-effort: errors
+	// log internally and are not propagated.
+	PersistDiagnosticsFn func(entry shared.DiagnosticEntry, containerIDs []string, keys map[string]string)
+
+	// PersistDiagnosticsWithLogsFn writes a failure diagnostic to the
+	// substrate's diagnostics store using PRE-CAPTURED logs. Used by
+	// failure-path workers that captured logs BEFORE cleanup tore the
+	// containers down (re-fetching after cleanup would hit deleted
+	// containers).
+	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
+
+	// SendCallbackFn dispatches a callback (success or failure) for
+	// the given lease/URL pair. The substrate adapter handles error
+	// truncation, HMAC signing, retry, and store persistence; the SM
+	// only supplies the inputs.
+	SendCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
 }

@@ -137,68 +137,60 @@ func TestDockerDiagnosticsGatherer_GatherDiagnostics(t *testing.T) {
 	assert.Contains(t, got, "boom")
 }
 
-// TestBackendProvisionStore_Get covers the read path.
+// TestBackendProvisionStore_Get covers the snapshot read path.
 func TestBackendProvisionStore_Get(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
 	})
 	s := &backendProvisionStore{backend: b}
 
-	t.Run("known lease returns status + ok", func(t *testing.T) {
-		status, ok := s.Get("lease-1")
+	t.Run("known lease returns snapshot + ok", func(t *testing.T) {
+		state, ok := s.Get("lease-1")
 		assert.True(t, ok)
-		assert.Equal(t, backend.ProvisionStatusReady, status)
+		require.NotNil(t, state)
+		assert.Equal(t, backend.ProvisionStatusReady, state.Status)
+		assert.Equal(t, "lease-1", state.LeaseUUID)
 	})
 
-	t.Run("unknown lease returns ok=false", func(t *testing.T) {
-		status, ok := s.Get("nope")
+	t.Run("unknown lease returns nil + ok=false", func(t *testing.T) {
+		state, ok := s.Get("nope")
 		assert.False(t, ok)
-		assert.Equal(t, backend.ProvisionStatus(""), status)
+		assert.Nil(t, state)
 	})
 }
 
-// TestBackendProvisionStore_UpdateStatus writes Status + LastError under
-// the same critical section as direct callers (verified by inspecting
-// the mutated provision struct after the call).
-func TestBackendProvisionStore_UpdateStatus(t *testing.T) {
+// TestBackendProvisionStore_UpdateFn applies the closure under one
+// critical section (verified by inspecting the mutated provision
+// struct after the call).
+func TestBackendProvisionStore_UpdateFn(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady, FailCount: 2},
 	})
 	s := &backendProvisionStore{backend: b}
 
-	s.UpdateStatus("lease-1", backend.ProvisionStatusFailed, "container exited")
+	t.Run("compound update applies all writes atomically", func(t *testing.T) {
+		applied := s.UpdateFn("lease-1", func(p *leasesm.ProvisionState) {
+			p.Status = backend.ProvisionStatusFailed
+			p.LastError = "container exited"
+			p.FailCount++
+		})
+		assert.True(t, applied)
 
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	require.NotNil(t, prov)
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
-	assert.Equal(t, "container exited", prov.LastError)
-}
-
-// TestBackendProvisionStore_UpdateStatus_UnknownLease is a no-op
-// (matches the existing "if p, ok := b.provisions[uuid]; ok { ... }"
-// pattern at direct call sites).
-func TestBackendProvisionStore_UpdateStatus_UnknownLease(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	s := &backendProvisionStore{backend: b}
-	// Should not panic.
-	s.UpdateStatus("nope", backend.ProvisionStatusFailed, "x")
-}
-
-// TestBackendProvisionStore_IncFailCount covers the increment under
-// lock; verified via direct read after the call.
-func TestBackendProvisionStore_IncFailCount(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", FailCount: 2},
+		b.provisionsMu.RLock()
+		prov := b.provisions["lease-1"]
+		b.provisionsMu.RUnlock()
+		require.NotNil(t, prov)
+		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+		assert.Equal(t, "container exited", prov.LastError)
+		assert.Equal(t, 3, prov.FailCount)
 	})
-	s := &backendProvisionStore{backend: b}
 
-	s.IncFailCount("lease-1")
-	s.IncFailCount("lease-1")
-
-	b.provisionsMu.RLock()
-	got := b.provisions["lease-1"].FailCount
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, 4, got)
+	t.Run("unknown lease returns false; closure not invoked", func(t *testing.T) {
+		called := false
+		applied := s.UpdateFn("nope", func(p *leasesm.ProvisionState) {
+			called = true
+		})
+		assert.False(t, applied)
+		assert.False(t, called)
+	})
 }
