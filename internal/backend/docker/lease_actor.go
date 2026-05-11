@@ -373,6 +373,7 @@ func newLeaseActor(b *Backend, leaseUUID string) *leaseActor {
 		SendCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
 			b.sendCallbackWithURL(uuid, url, status, errMsg)
 		},
+		Metrics: dockerSMMetrics{},
 	}
 	// Initialize the SM eagerly so that the actor's goroutine and any
 	// external reader (DebugActors over /debug/actors) see the same
@@ -625,7 +626,7 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 				event = "provision_no_result"
 			}
 			if !a.sendTerminal(terminalMsg) {
-				leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+				a.cfg.Metrics.TerminalEventDropped(event)
 				a.cfg.Logger.Warn("terminal provision event dropped (actor exited or inbox wedged)",
 					"lease_uuid", a.leaseUUID,
 					"event", event,
@@ -639,7 +640,7 @@ func (a *leaseActor) spawnProvisionWorker(work func() (string, provisionSuccessR
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				leaseWorkerPanicsTotal.WithLabelValues("provision").Inc()
+				a.cfg.Metrics.WorkerPanic("provision")
 				// Override any terminalMsg set by the normal path —
 				// the panic means the post-set work did not complete.
 				terminalMsg = provisionErroredMsg{
@@ -733,7 +734,7 @@ func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 				event = "replace_no_result"
 			}
 			if !a.sendTerminal(terminalMsg) {
-				leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+				a.cfg.Metrics.TerminalEventDropped(event)
 				a.cfg.Logger.Warn("terminal replace event dropped (actor exited or inbox wedged)",
 					"lease_uuid", a.leaseUUID,
 					"event", event,
@@ -747,7 +748,7 @@ func (a *leaseActor) spawnReplaceWorker(work func() replaceResult) {
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				leaseWorkerPanicsTotal.WithLabelValues("replace").Inc()
+				a.cfg.Metrics.WorkerPanic("replace")
 				terminalMsg = replaceFailedMsg{info: replaceFailureInfo{
 					callbackErr: errMsgInternal,
 					lastError:   fmt.Sprintf("worker panic: %v", r),
@@ -920,7 +921,7 @@ func (b *Backend) actorForLocked(leaseUUID string) *leaseActor {
 	}
 	candidate := newLeaseActor(b, leaseUUID)
 	b.actors[leaseUUID] = candidate
-	leaseActorsCreatedTotal.Inc()
+	candidate.cfg.Metrics.ActorCreated()
 	b.wg.Go(candidate.run)
 	return candidate
 }

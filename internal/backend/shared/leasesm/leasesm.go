@@ -225,6 +225,28 @@ type LeaseProvisionStore interface {
 	UpdateFn(leaseUUID string, fn func(*ProvisionState)) bool
 }
 
+// SMMetrics is the observability seam for substrate-specific metric
+// emission. Each substrate provides its own implementation, owning
+// the prometheus registry, naming, and labels — the Docker backend
+// keeps `fred_docker_backend_lease_*` names; K3s will choose its own
+// substrate-flavored namespacing. The SM/actor code calls these
+// methods at fixed sites; the substrate adapter shapes the
+// counter/label semantics.
+//
+// WorkerPanic's workerType is one of "provision" / "replace" / "diag"
+// (the three categories of worker goroutines the actor spawns).
+// TerminalEventDropped's event is a short tag identifying the event
+// type that was dropped (e.g., "diag_gathered", "provision_completed").
+type SMMetrics interface {
+	SMTransition(source, dest, trigger string)
+	ActorCreated()
+	FailingRaceSkipped()
+	WorkerPanic(workerType string)
+	TerminalEventDropped(event string)
+	ActiveProvisionsInc()
+	ActiveProvisionsDec()
+}
+
 // LeaseActorConfig groups the dependencies a lease actor receives at
 // construction. Substrate-private concerns (compose project access,
 // container lifecycle calls, etc.) stay on the actor's substrate
@@ -245,6 +267,7 @@ type LeaseActorConfig struct {
 	CallbackSender *shared.CallbackSender
 	ProvisionStore LeaseProvisionStore
 	OnTerminated   func(leaseUUID string)
+	Metrics        SMMetrics
 
 	// PersistDiagnosticsFn writes a failure diagnostic to the
 	// substrate's diagnostics store, including a fresh fetch of

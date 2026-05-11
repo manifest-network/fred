@@ -93,11 +93,11 @@ func newLeaseSM(actor *leaseActor) *leaseSM {
 	// Count every transition for operator visibility. Runs inside Fire
 	// in the actor's goroutine, so no additional synchronization needed.
 	sm.OnTransitioned(func(_ context.Context, tr stateless.Transition) {
-		leaseSMTransitionsTotal.WithLabelValues(
+		actor.cfg.Metrics.SMTransition(
 			fmt.Sprintf("%v", tr.Source),
 			fmt.Sprintf("%v", tr.Destination),
 			fmt.Sprintf("%v", tr.Trigger),
-		).Inc()
+		)
 	})
 
 	lsm := &leaseSM{actor: actor, sm: sm}
@@ -360,11 +360,11 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 		return nil
 	}
 	if raceSkipped {
-		leaseFailingRaceSkippedTotal.Inc()
+		lsm.actor.cfg.Metrics.FailingRaceSkipped()
 		return nil
 	}
 	if applied {
-		activeProvisions.Dec()
+		lsm.actor.cfg.Metrics.ActiveProvisionsDec()
 	}
 
 
@@ -469,7 +469,7 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		applied = true
 	})
 	if applied {
-		activeProvisions.Inc()
+		cfg.Metrics.ActiveProvisionsInc()
 	}
 
 	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
@@ -509,7 +509,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		callbackURL = p.CallbackURL
 	})
 	if incActive {
-		activeProvisions.Inc()
+		cfg.Metrics.ActiveProvisionsInc()
 	}
 
 	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
@@ -589,7 +589,7 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		callbackURL = p.CallbackURL
 	})
 	if decActive {
-		activeProvisions.Dec()
+		cfg.Metrics.ActiveProvisionsDec()
 	}
 
 	if diagSnap.LeaseUUID != "" {
@@ -827,7 +827,7 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 			event = "diag_no_result"
 		}
 		if !a.sendTerminal(terminalMsg) {
-			leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+			a.cfg.Metrics.TerminalEventDropped(event)
 			a.cfg.Logger.Warn("terminal diag event dropped (actor exited or inbox wedged)",
 				"lease_uuid", a.leaseUUID,
 			)
@@ -841,7 +841,7 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 				"panic", r,
 				"stack", string(debug.Stack()),
 			)
-			leaseWorkerPanicsTotal.WithLabelValues("diag").Inc()
+			a.cfg.Metrics.WorkerPanic("diag")
 			// Drive Failing→Failed via an empty diagGatheredMsg —
 			// Deprovisioning.Ignore still covers the case where the
 			// SM has already moved past Failing.
