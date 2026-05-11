@@ -2,6 +2,7 @@ package docker
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1503,6 +1504,16 @@ func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
 	b.volumeCleanupAttempts["lease-1"] = maxVolumeCleanupAttempts - 1
 	b.volumes = vm
 
+	// Capture log output so we can assert that the "MANUAL CLEANUP REQUIRED"
+	// log line emits the correct `attempts` value. Pre-fix, the log read
+	// `b.volumeCleanupAttempts[leaseUUID]` AFTER the entry had been deleted
+	// from the parallel map AND after the Lock was released — yielding 0.
+	// The fix captures `attempts` inside the Lock before the delete; this
+	// test guards against regression by asserting the captured value is the
+	// expected maxVolumeCleanupAttempts (3).
+	var logBuf bytes.Buffer
+	b.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
 	err := b.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err, "should return nil when giving up")
 
@@ -1511,6 +1522,29 @@ func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
 	_, exists := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, exists, "provision should be removed after max volume cleanup attempts")
+
+	// Scan the captured log for the MANUAL CLEANUP REQUIRED record and
+	// assert its `attempts` field equals the expected count. The slog
+	// JSON handler writes one record per line; iterate and match by the
+	// message string to find the specific record we care about.
+	var found bool
+	for _, line := range bytes.Split(bytes.TrimRight(logBuf.Bytes(), "\n"), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		require.NoError(t, json.Unmarshal(line, &rec))
+		if msg, _ := rec["msg"].(string); strings.HasPrefix(msg, "MANUAL CLEANUP REQUIRED") {
+			// slog encodes ints as JSON numbers (float64 on unmarshal).
+			attempts, _ := rec["attempts"].(float64)
+			assert.Equal(t, float64(maxVolumeCleanupAttempts), attempts,
+				"MANUAL CLEANUP REQUIRED log must emit the actual attempt count, not zero")
+			found = true
+			break
+		}
+	}
+	require.True(t, found,
+		"expected MANUAL CLEANUP REQUIRED log record in captured output; got: %s", logBuf.String())
 }
 
 // TestDeprovision_SendsDeprovisionedCallback verifies that a clean successful

@@ -189,16 +189,27 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 
 	if len(volumeErrs) > 0 {
 		var diagSnap shared.DiagnosticEntry
+		// attempts is captured INSIDE the b.provisionsMu Lock span (after
+		// the increment) so we can use the correct value at logger.Error
+		// below — which runs AFTER the Unlock and AFTER the parallel-map
+		// entry has been deleted. Reading b.volumeCleanupAttempts[leaseUUID]
+		// after the Unlock + delete would yield zero. The other reads in
+		// this block (the if-guard and the LastError fmt.Sprintf) also use
+		// the captured value to make the lock-held-state dependency
+		// explicit and prevent future regressions where someone moves a
+		// read outside the Lock.
+		var attempts int
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
 			b.volumeCleanupAttempts[leaseUUID]++
+			attempts = b.volumeCleanupAttempts[leaseUUID]
 			p.ContainerIDs = nil // containers are gone
 
-			if b.volumeCleanupAttempts[leaseUUID] >= maxVolumeCleanupAttempts {
+			if attempts >= maxVolumeCleanupAttempts {
 				// Too many failed attempts — give up and remove the provision.
 				// The leaked volumes require manual cleanup by the operator.
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
-					b.volumeCleanupAttempts[leaseUUID], errors.Join(volumeErrs...))
+					attempts, errors.Join(volumeErrs...))
 				diagSnap = diagnosticSnapshot(p)
 				// volumeCleanupAttempts must be deleted in sync with
 				// b.provisions[uuid] under b.provisionsMu Lock — shared
@@ -225,7 +236,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				deprovisionsTotal.Inc()
 
 				logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
-					"attempts", b.volumeCleanupAttempts[leaseUUID],
+					"attempts", attempts,
 					"errors", errors.Join(volumeErrs...),
 				)
 
