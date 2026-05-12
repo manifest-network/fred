@@ -83,11 +83,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
 			for _, containerID := range containerIDs {
 				if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-					logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
-					errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+					logger.Error("failed to remove container", "container_id", leasesm.ShortID(containerID), "error", err)
+					errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(containerID), err))
 					failedIDs = append(failedIDs, containerID)
 				} else {
-					logger.Info("container removed", "container_id", shortID(containerID))
+					logger.Info("container removed", "container_id", leasesm.ShortID(containerID))
 				}
 			}
 		} else {
@@ -96,11 +96,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	} else {
 		for _, containerID := range containerIDs {
 			if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-				logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
-				errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+				logger.Error("failed to remove container", "container_id", leasesm.ShortID(containerID), "error", err)
+				errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(containerID), err))
 				failedIDs = append(failedIDs, containerID)
 			} else {
-				logger.Info("container removed", "container_id", shortID(containerID))
+				logger.Info("container removed", "container_id", leasesm.ShortID(containerID))
 			}
 		}
 	}
@@ -131,7 +131,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			p.Status = backend.ProvisionStatusFailed
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
-			diagSnap = diagnosticSnapshot(p)
+			diagSnap = leasesm.DiagnosticSnapshot(p)
 		}
 		b.provisionsMu.Unlock()
 		b.persistDiagnostics(diagSnap, failedIDs)
@@ -183,7 +183,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				// The leaked volumes require manual cleanup by the operator.
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
 					attempts, errors.Join(volumeErrs...))
-				diagSnap = diagnosticSnapshot(p)
+				diagSnap = leasesm.DiagnosticSnapshot(p)
 				// volumeCleanupAttempts must be deleted in sync with
 				// b.provisions[uuid] under b.provisionsMu Lock — shared
 				// lock domain (see field declaration in backend.go).
@@ -221,7 +221,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// Under the limit — keep provision visible for retry.
 			p.Status = backend.ProvisionStatusFailed
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
-			diagSnap = diagnosticSnapshot(p)
+			diagSnap = leasesm.DiagnosticSnapshot(p)
 		}
 		b.provisionsMu.Unlock()
 		// Persist diagnostics outside the lock so failure state survives

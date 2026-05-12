@@ -293,7 +293,7 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 	state, err := cfg.Inspector.InspectInstance(reqCtx, containerID)
 	if err != nil {
 		cfg.Logger.Warn("failed to inspect container after die event",
-			"container_id", shortID(containerID),
+			"container_id", ShortID(containerID),
 			"lease_uuid", lsm.actor.leaseUUID,
 			"error", err,
 		)
@@ -544,7 +544,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		if info.OldStopped && info.Operation == "restart" {
 			p.LastError = ""
 		}
-		diagSnap = diagnosticSnapshot(p)
+		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
 
@@ -584,7 +584,7 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		if info.PrevStatus == backend.ProvisionStatusReady {
 			decActive = true
 		}
-		diagSnap = diagnosticSnapshot(p)
+		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
 	if decActive {
@@ -624,7 +624,7 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
-		diagSnap = diagnosticSnapshot(p)
+		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
 
@@ -668,9 +668,9 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 		}
 		callbackURL = p.CallbackURL
 		failCount = p.FailCount
-		diagSnap = diagnosticSnapshot(p)
+		diagSnap = DiagnosticSnapshot(p)
 		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
-		diagKeys = containerLogKeys(p)
+		diagKeys = ContainerLogKeys(p)
 	})
 	if !exists {
 		return nil
@@ -687,7 +687,7 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 
 	logAttrs := []any{
 		"lease_uuid", leaseUUID,
-		"container_id", shortID(result.containerID),
+		"container_id", ShortID(result.containerID),
 		"fail_count", failCount,
 	}
 	if result.serviceName != "" {
@@ -843,7 +843,7 @@ func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 		if r := recover(); r != nil {
 			a.cfg.Logger.Error("diag worker panic — recovering to keep fred alive",
 				"lease_uuid", a.leaseUUID,
-				"container_id", shortID(containerID),
+				"container_id", ShortID(containerID),
 				"panic", r,
 				"stack", string(debug.Stack()),
 			)
@@ -910,16 +910,23 @@ const errMsgInternal = "internal error"
 // "no-divergence" rationale.
 const ErrMsgInternal = errMsgInternal
 
-// shortID truncates a substrate-side instance ID to 12 characters for
-// logging continuity. Mirrors github.com/docker/docker/pkg/stringid.TruncateID
-// (strip any leading "type:" prefix such as "sha256:", then bound to 12
-// chars) without taking the docker library as a dependency. Substrate-
-// agnostic — K3s adapters can safely call this on pod UIDs; the prefix
-// strip is a no-op when there is no colon, and the byte-bounded truncate
-// is universal. Kept here so leasesm stays free of any docker import.
+// shortIDLen is the truncation length for ShortID; matches Docker's
+// stringid.TruncateID 12-character convention so log lines stay
+// consistent with Docker CLI output for the same container.
 const shortIDLen = 12
 
-func shortID(id string) string {
+// ShortID truncates a substrate-side instance ID to a 12-character
+// shorthand for use in lease/container log formatting only. NOT a
+// general string-truncation utility — speculative reuse for unrelated
+// truncation needs should write its own helper.
+//
+// Mirrors github.com/docker/docker/pkg/stringid.TruncateID semantics
+// (strip leading "type:" prefix such as "sha256:", then byte-bound to
+// 12 chars) without taking the docker library as a dependency. The
+// prefix strip is a no-op when there is no colon, and the byte-bounded
+// truncate is universal — K3s adapters can safely call this on pod
+// UIDs. Kept here so leasesm stays free of any docker import.
+func ShortID(id string) string {
 	if i := strings.IndexRune(id, ':'); i >= 0 {
 		id = id[i+1:]
 	}
@@ -929,11 +936,19 @@ func shortID(id string) string {
 	return id
 }
 
-// diagnosticSnapshot captures the ProvisionState fields needed for
+// DiagnosticSnapshot captures the ProvisionState fields needed for
 // diagnostics persistence. Built inside an UpdateFn closure (under the
 // store's mutex) so the snapshot is consistent; PersistDiagnosticsFn /
 // PersistDiagnosticsWithLogsFn write it out after the closure returns.
-func diagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
+// Use only for diagnostics-store writes; not a general ProvisionState
+// projection helper.
+//
+// Omits SKU, Image, Status, Quantity, CallbackURL, Items, ContainerIDs,
+// Manifest, StackManifest, and ServiceContainers — those are operational
+// state that's either already on the lease's authoritative record or
+// not relevant to the on-disk diagnostic blob a future operator reads
+// to understand a failure.
+func DiagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
 	return shared.DiagnosticEntry{
 		LeaseUUID:    prov.LeaseUUID,
 		ProviderUUID: prov.ProviderUUID,
@@ -944,12 +959,18 @@ func diagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
 	}
 }
 
-// containerLogKeys builds a containerID → display key mapping for stack
+// ContainerLogKeys builds a containerID → display key mapping for stack
 // provisions (e.g., "web/0", "web/1") so diagnostic log entries use the
 // service-name view rather than raw indices. Returns nil for non-stack
-// provisions; nil is the documented "default index-based keys" signal to
-// PersistDiagnosticsFn.
-func containerLogKeys(prov *ProvisionState) map[string]string {
+// provisions; nil is the documented "default index-based keys" signal
+// to PersistDiagnosticsFn. Use only for diagnostics-log key formatting;
+// not a general ServiceContainers projection helper.
+//
+// Reads ONLY ServiceContainers — never inspects Manifest / ContainerIDs
+// / Items / etc. The mapping is shape-only (containerID → service/index)
+// and stays stable across stack lifecycle events as long as the
+// ServiceContainers map is consistent.
+func ContainerLogKeys(prov *ProvisionState) map[string]string {
 	if prov == nil || !prov.IsStack() {
 		return nil
 	}

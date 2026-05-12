@@ -187,7 +187,7 @@ func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string
 	// ContainerLogs on containers that may be in the process of being
 	// removed; panicking here forces every failure-path test to set a
 	// stub. Match Docker's real behavior on removed containers instead.
-	return "", fmt.Errorf("no such container: %s", shortID(containerID))
+	return "", fmt.Errorf("no such container: %s", leasesm.ShortID(containerID))
 }
 
 func (m *mockDockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {

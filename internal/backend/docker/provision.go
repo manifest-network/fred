@@ -95,7 +95,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		for _, cid := range oldContainerIDs {
 			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
 				logger.Warn("failed to remove old container during re-provision",
-					"container_id", shortID(cid), "error", err)
+					"container_id", leasesm.ShortID(cid), "error", err)
 			}
 		}
 		logger.Info("replacing failed provision",
@@ -648,7 +648,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			defer cleanupCancel()
 			for _, cid := range containerIDs {
 				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-					logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
+					logger.Warn("failed to cleanup container after error", "container_id", leasesm.ShortID(cid), "error", rmErr)
 				}
 			}
 
@@ -847,7 +847,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			containerIDs = append(containerIDs, containerID)
 
 			// Start container
-			instanceLogger.Info("starting container", "container_id", shortID(containerID))
+			instanceLogger.Info("starting container", "container_id", leasesm.ShortID(containerID))
 			if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
 				instanceLogger.Error("failed to start container", "error", startErr)
 				err = fmt.Errorf("container start failed (instance %d, sku %s): %w", instanceIndex, item.SKU, startErr)
@@ -855,7 +855,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				return
 			}
 
-			instanceLogger.Info("container provisioned successfully", "container_id", shortID(containerID))
+			instanceLogger.Info("container provisioned successfully", "container_id", leasesm.ShortID(containerID))
 			instanceIndex++
 		}
 	}
@@ -911,7 +911,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 				logger.Warn("compose down failed during cleanup, falling back to individual removal", "error", downErr)
 				for _, cid := range containerIDs {
 					if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-						logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
+						logger.Warn("failed to cleanup container after error", "container_id", leasesm.ShortID(cid), "error", rmErr)
 					}
 				}
 			}
@@ -1155,7 +1155,7 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 
 				switch info.Health {
 				case HealthStatusHealthy:
-					logger.Info("container healthy", "instance", i, "container_id", shortID(containerIDs[i]))
+					logger.Info("container healthy", "instance", i, "container_id", leasesm.ShortID(containerIDs[i]))
 					delete(pending, i)
 				case HealthStatusUnhealthy:
 					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], containerInfoToInstanceState(info))

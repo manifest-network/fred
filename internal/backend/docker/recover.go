@@ -40,7 +40,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for _, c := range containers {
 		// Skip containers without required labels
 		if c.LeaseUUID == "" || c.SKU == "" {
-			b.logger.Warn("skipping container with missing labels", "container_id", shortID(c.ContainerID))
+			b.logger.Warn("skipping container with missing labels", "container_id", leasesm.ShortID(c.ContainerID))
 			continue
 		}
 
@@ -48,7 +48,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		profile, err := b.cfg.GetSKUProfile(c.SKU)
 		if err != nil {
 			b.logger.Error("skipping container with unknown SKU — container is running but untracked",
-				"container_id", shortID(c.ContainerID),
+				"container_id", leasesm.ShortID(c.ContainerID),
 				"sku", c.SKU,
 			)
 			skippedUnknownSKU++
@@ -332,7 +332,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		for _, cid := range containerIDs {
 			state, inspErr := b.inspector.InspectInstance(ctx, cid)
 			if inspErr != nil {
-				b.logger.Warn("failed to inspect container during diagnostics gathering", "lease", uuid, "container_id", shortID(cid), "error", inspErr)
+				b.logger.Warn("failed to inspect container during diagnostics gathering", "lease", uuid, "container_id", leasesm.ShortID(cid), "error", inspErr)
 				continue
 			}
 			// Mirror the "terminally gone?" decision from the SM guard:
@@ -375,9 +375,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for _, uuid := range allFailed {
 		if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
 			diagItems = append(diagItems, diagItem{
-				entry:        diagnosticSnapshot(prov),
+				entry:        leasesm.DiagnosticSnapshot(prov),
 				containerIDs: append([]string(nil), prov.ContainerIDs...),
-				keys:         containerLogKeys(prov),
+				keys:         leasesm.ContainerLogKeys(prov),
 			})
 		}
 	}
@@ -404,7 +404,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if !b.routeToLease(uuid, leasesm.ContainerDiedMsg{ContainerID: containerID}) {
 			dieEventDroppedTotal.WithLabelValues("reconcile").Inc()
 			b.logger.Warn("die event dropped during reconcile dispatch; reconciler will re-detect",
-				"lease_uuid", uuid, "container_id", shortID(containerID))
+				"lease_uuid", uuid, "container_id", leasesm.ShortID(containerID))
 		}
 	}
 
@@ -555,7 +555,7 @@ func (b *Backend) containerEventLoop() {
 						if !b.routeToLease(leaseUUID, leasesm.ContainerDiedMsg{ContainerID: event.ContainerID}) {
 							dieEventDroppedTotal.WithLabelValues("event_loop").Inc()
 							b.logger.Warn("die event dropped at event loop dispatch; reconciler will re-detect",
-								"lease_uuid", leaseUUID, "container_id", shortID(event.ContainerID))
+								"lease_uuid", leaseUUID, "container_id", leasesm.ShortID(event.ContainerID))
 						}
 					}
 				}

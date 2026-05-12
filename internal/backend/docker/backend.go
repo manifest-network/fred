@@ -13,7 +13,6 @@ import (
 	"time"
 
 	networktypes "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/pkg/stringid"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -175,11 +174,11 @@ type Backend struct {
 // the test fixtures.
 type provision = leasesm.ProvisionState
 
-// shortID truncates a container/network ID to 12 characters for logging.
-// Uses Docker's stringid.TruncateID for consistency with Docker CLI output.
-func shortID(id string) string {
-	return stringid.TruncateID(id)
-}
+// shortID, diagnosticSnapshot, and containerLogKeys moved to
+// internal/backend/shared/leasesm at PR5b-2 BC-3 dedupe (task #19).
+// Docker callers now reach the canonical leasesm.{ShortID,
+// DiagnosticSnapshot, ContainerLogKeys} versions; the docker-side
+// duplicates that previously lived here have been removed.
 
 const (
 	diagnosticLogTail  = 20
@@ -236,7 +235,7 @@ func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID s
 	logs, err := b.docker.ContainerLogs(ctx, containerID, diagnosticLogTail)
 	if err != nil {
 		b.logger.Warn("failed to fetch container logs for diagnostics",
-			"container_id", shortID(containerID), "error", err)
+			"container_id", leasesm.ShortID(containerID), "error", err)
 		return buf.String()
 	}
 	if logs != "" {
@@ -249,19 +248,6 @@ func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID s
 		s = s[:diagnosticMaxBytes-3] + "..."
 	}
 	return s
-}
-
-// diagnosticSnapshot captures provision fields needed for diagnostics persistence.
-// Built under provisionsMu so that persistDiagnostics can run without holding the lock.
-func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
-	return shared.DiagnosticEntry{
-		LeaseUUID:    prov.LeaseUUID,
-		ProviderUUID: prov.ProviderUUID,
-		Tenant:       prov.Tenant,
-		Error:        prov.LastError,
-		FailCount:    prov.FailCount,
-		CreatedAt:    time.Now(),
-	}
 }
 
 // captureContainerLogs fetches logs from the given containerIDs for
@@ -291,7 +277,7 @@ func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[
 		logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
 		if err != nil {
 			b.logger.Debug("failed to fetch container logs for diagnostics persistence",
-				"container_id", shortID(cid), "error", err)
+				"container_id", leasesm.ShortID(cid), "error", err)
 			continue
 		}
 		key := fmt.Sprintf("%d", i)
@@ -361,15 +347,6 @@ func (b *Backend) persistDiagnosticsWithLogs(entry shared.DiagnosticEntry, logs 
 		b.logger.Warn("failed to persist failure diagnostics",
 			"lease_uuid", entry.LeaseUUID, "error", err)
 	}
-}
-
-// containerLogKeys builds a containerID → display key mapping for stack provisions.
-// Returns nil for non-stack provisions.
-func containerLogKeys(prov *provision) map[string]string {
-	if prov == nil || !prov.IsStack() {
-		return nil
-	}
-	return stackContainerLogKeys(prov.ServiceContainers)
 }
 
 // stackContainerLogKeys builds a containerID → display key mapping from a
@@ -654,7 +631,7 @@ func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, lo
 		// stop failed mid-loop for a multi-container lease.
 		info, inspectErr := b.docker.InspectContainer(ctx, cid)
 		if inspectErr != nil {
-			logger.Error("rollback: failed to inspect container", "container_id", shortID(cid), "error", inspectErr)
+			logger.Error("rollback: failed to inspect container", "container_id", leasesm.ShortID(cid), "error", inspectErr)
 			continue
 		}
 		if info.Status == "running" {
@@ -664,10 +641,10 @@ func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, lo
 
 		canonicalName := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
 		if renameErr := b.docker.RenameContainer(ctx, cid, canonicalName); renameErr != nil {
-			logger.Error("rollback: failed to rename container", "container_id", shortID(cid), "error", renameErr)
+			logger.Error("rollback: failed to rename container", "container_id", leasesm.ShortID(cid), "error", renameErr)
 		}
 		if err := b.docker.StartContainer(ctx, cid, 30*time.Second); err != nil {
-			logger.Error("rollback: failed to restart container", "container_id", shortID(cid), "error", err)
+			logger.Error("rollback: failed to restart container", "container_id", leasesm.ShortID(cid), "error", err)
 		} else {
 			restored++
 		}

@@ -625,7 +625,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			defer cleanupCancel()
 			for _, cid := range newContainerIDs {
 				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-					op.Logger.Warn("failed to cleanup container after "+op.Operation+" error", "container_id", shortID(cid), "error", rmErr)
+					op.Logger.Warn("failed to cleanup container after "+op.Operation+" error", "container_id", leasesm.ShortID(cid), "error", rmErr)
 				}
 			}
 
@@ -660,7 +660,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 		defer cleanupCancel()
 		for _, cid := range op.OldContainerIDs {
 			if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-				op.Logger.Warn("failed to remove old container after "+op.Operation, "container_id", shortID(cid), "error", rmErr)
+				op.Logger.Warn("failed to remove old container after "+op.Operation, "container_id", leasesm.ShortID(cid), "error", rmErr)
 			}
 		}
 
@@ -717,15 +717,15 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	// Old containers are kept stopped for rollback on failure.
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 	for i, cid := range op.OldContainerIDs {
-		op.Logger.Info("stopping container for "+op.Operation, "container_id", shortID(cid))
+		op.Logger.Info("stopping container for "+op.Operation, "container_id", leasesm.ShortID(cid))
 		if stopErr := b.docker.StopContainer(ctx, cid, stopTimeout); stopErr != nil {
-			err = fmt.Errorf("failed to stop container %s: %w", shortID(cid), stopErr)
+			err = fmt.Errorf("failed to stop container %s: %w", leasesm.ShortID(cid), stopErr)
 			callbackErr = op.Operation + " failed"
 			return
 		}
 		oldStopped = true
 		if renameErr := b.docker.RenameContainer(ctx, cid, prevContainerName(op.LeaseUUID, i)); renameErr != nil {
-			err = fmt.Errorf("failed to rename old container %s: %w", shortID(cid), renameErr)
+			err = fmt.Errorf("failed to rename old container %s: %w", leasesm.ShortID(cid), renameErr)
 			callbackErr = op.Operation + " failed"
 			return
 		}

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -87,7 +88,7 @@ func TestStackContainerLogKeys(t *testing.T) {
 				"web": {"c1", "c2"},
 			},
 		}
-		keys := containerLogKeys(prov)
+		keys := leasesm.ContainerLogKeys(prov)
 		assert.Equal(t, map[string]string{
 			"c1": "web/0",
 			"c2": "web/1",
@@ -98,11 +99,11 @@ func TestStackContainerLogKeys(t *testing.T) {
 		prov := &provision{
 			ContainerIDs: []string{"c1"},
 		}
-		assert.Nil(t, containerLogKeys(prov))
+		assert.Nil(t, leasesm.ContainerLogKeys(prov))
 	})
 
 	t.Run("containerLogKeys with nil provision", func(t *testing.T) {
-		assert.Nil(t, containerLogKeys(nil))
+		assert.Nil(t, leasesm.ContainerLogKeys(nil))
 	})
 }
 

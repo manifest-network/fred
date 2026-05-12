@@ -2378,9 +2378,9 @@ func TestName(t *testing.T) {
 // --- Pure function tests ---
 
 func TestShortID(t *testing.T) {
-	assert.Equal(t, "abcdefghijkl", shortID("abcdefghijklmnop"))
-	assert.Equal(t, "short", shortID("short"))
-	assert.Equal(t, "", shortID(""))
+	assert.Equal(t, "abcdefghijkl", leasesm.ShortID("abcdefghijklmnop"))
+	assert.Equal(t, "short", leasesm.ShortID("short"))
+	assert.Equal(t, "", leasesm.ShortID(""))
 }
 
 func TestContainerStatusToProvisionStatus(t *testing.T) {
