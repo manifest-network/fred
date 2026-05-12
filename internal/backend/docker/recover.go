@@ -59,16 +59,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		prov, exists := recovered[c.LeaseUUID]
 		if !exists {
 			prov = &provision{
-				LeaseUUID:    c.LeaseUUID,
-				Tenant:       c.Tenant,
-				ProviderUUID: c.ProviderUUID,
-				SKU:          c.SKU,
-				Image:        c.Image,
-				Status:       containerStatusToProvisionStatus(c.Status),
-				CreatedAt:    c.CreatedAt,
-				FailCount:    c.FailCount,
-				CallbackURL:  c.CallbackURL,
-				ContainerIDs: make([]string, 0),
+				ProvisionState: leasesm.ProvisionState{
+					LeaseUUID:    c.LeaseUUID,
+					Tenant:       c.Tenant,
+					ProviderUUID: c.ProviderUUID,
+					SKU:          c.SKU,
+					Image:        c.Image,
+					Status:       containerStatusToProvisionStatus(c.Status),
+					CreatedAt:    c.CreatedAt,
+					FailCount:    c.FailCount,
+					CallbackURL:  c.CallbackURL,
+					ContainerIDs: make([]string, 0),
+				},
 			}
 
 			// Restore manifest from the last successful (active) release so
@@ -375,9 +377,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for _, uuid := range allFailed {
 		if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
 			diagItems = append(diagItems, diagItem{
-				entry:        leasesm.DiagnosticSnapshot(prov),
+				entry:        leasesm.DiagnosticSnapshot(&prov.ProvisionState),
 				containerIDs: append([]string(nil), prov.ContainerIDs...),
-				keys:         leasesm.ContainerLogKeys(prov),
+				keys:         leasesm.ContainerLogKeys(&prov.ProvisionState),
 			})
 		}
 	}

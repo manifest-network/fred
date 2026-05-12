@@ -270,7 +270,7 @@ type replaceStackContainersOp struct {
 	Logger            *slog.Logger
 
 	// OnSuccess is called under provisionsMu lock after successful replacement.
-	OnSuccess func(prov *provision)
+	OnSuccess func(prov *leasesm.ProvisionState)
 }
 
 // doReplaceStackContainers performs the stack container replacement lifecycle
@@ -556,7 +556,7 @@ type replaceContainersOp struct {
 
 	// OnSuccess is called under provisionsMu lock after successful replacement.
 	// Used by update to set Image/Manifest on the provision. May be nil.
-	OnSuccess func(prov *provision)
+	OnSuccess func(prov *leasesm.ProvisionState)
 }
 
 // recordPreflightFailure logs the preflight error (e.g., profile lookup,
@@ -1039,7 +1039,7 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, m *manifest.Ma
 		PrevStatus:      prevStatus,
 		Logger:          logger,
 		CustomDomain:    customDomain,
-		OnSuccess: func(prov *provision) {
+		OnSuccess: func(prov *leasesm.ProvisionState) {
 			prov.Image = m.Image
 			prov.Manifest = m
 		},
@@ -1086,7 +1086,7 @@ func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *ma
 		Operation:         "update",
 		PrevStatus:        prevStatus,
 		Logger:            logger,
-		OnSuccess: func(prov *provision) {
+		OnSuccess: func(prov *leasesm.ProvisionState) {
 			prov.StackManifest = stack
 		},
 	})

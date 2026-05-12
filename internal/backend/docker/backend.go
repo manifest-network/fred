@@ -66,27 +66,6 @@ type Backend struct {
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
 
-	// volumeCleanupAttempts is a parallel counter map keyed by lease
-	// UUID, tracking how many times Deprovision has retried volume
-	// cleanup for a lease. Lives outside the substrate-agnostic
-	// provision record because it is purely Docker-internal —
-	// volume cleanup is a Docker-specific operation; K3s would
-	// implement deprovision retry differently.
-	//
-	// Lock domain: `b.provisionsMu` (shared with `b.provisions`).
-	// Every read/write site holds provisionsMu — see
-	// `deprovision.go` (increment + delete-on-give-up + delete-on-success)
-	// and `removeProvision` for the synchronization invariant.
-	//
-	// Future-refactor hint: if Docker grows a SECOND private field on
-	// the provision record (today VolumeCleanupAttempts is the only
-	// one — audited at every `*provision` field assignment in PR5a),
-	// consider migrating from the type-alias + parallel-map pattern
-	// to an embedded-struct wrapper around leasesm.ProvisionState to
-	// keep Docker-private state cohesive and avoid parallel-map
-	// maintenance overhead at each cleanup site.
-	volumeCleanupAttempts map[string]int
-
 	// tenantNetworkStripes serializes EnsureTenantNetwork and
 	// RemoveTenantNetworkIfEmpty per tenant. Tenant networks are shared
 	// across every lease for that tenant, so a concurrent provision of
@@ -164,15 +143,39 @@ type Backend struct {
 	provisionStore leasesm.LeaseProvisionStore
 }
 
-// provision is a type alias for the substrate-agnostic
-// leasesm.ProvisionState. The lease state machine reasons about these
-// fields exclusively; the Docker backend uses the same record type,
-// keeping the substrate-private VolumeCleanupAttempts counter in a
-// parallel map (b.volumeCleanupAttempts) rather than on a wrapper
-// struct. The alias keeps existing struct-literal initializations
-// (`provision{LeaseUUID: x, Status: y}`) working unchanged across
-// the test fixtures.
-type provision = leasesm.ProvisionState
+// provision wraps the substrate-agnostic leasesm.ProvisionState with
+// Docker-private state. The lease state machine reasons about the
+// embedded ProvisionState exclusively; substrate-private fields
+// (currently VolumeCleanupAttempts) live alongside it on this wrapper
+// so the lifecycle is structural — allocating a fresh *provision
+// resets every Docker-private counter, and deleting from b.provisions
+// drops the Docker-private state at the same time.
+//
+// Promoted-field access keeps existing call sites working: `p.LeaseUUID`,
+// `p.Status`, etc. resolve to the embedded ProvisionState fields via Go's
+// embedding rules. Sites that need the *ProvisionState pointer (e.g., the
+// backendProvisionStore adapter passing it to a LeaseProvisionStore.UpdateFn
+// closure) take &p.ProvisionState.
+//
+// History: prior to ENG-148 follow-up (commit superseding fde8633), this
+// was a type alias plus a parallel `b.volumeCleanupAttempts map[string]int`
+// guarded by b.provisionsMu. The parallel-map pattern required every
+// site that created or deleted a provisions entry to also handle the
+// parallel map under the same lock; provision.go's re-provision path
+// missed that invariant, leaking stale attempt counts across
+// re-provisions and causing premature give-ups on subsequent
+// Deprovision. The wrapper-struct pattern makes that bug class
+// structurally impossible.
+type provision struct {
+	leasesm.ProvisionState
+
+	// VolumeCleanupAttempts tracks how many times Deprovision has
+	// retried volume cleanup for this lease before either succeeding
+	// or hitting maxVolumeCleanupAttempts and giving up. Docker-private
+	// because volume cleanup is Docker-specific — K3s would implement
+	// deprovision retry differently.
+	VolumeCleanupAttempts int
+}
 
 // shortID, diagnosticSnapshot, and containerLogKeys moved to
 // internal/backend/shared/leasesm at PR5b-2 BC-3 dedupe (task #19).
@@ -446,19 +449,18 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	}
 
 	b := &Backend{
-		cfg:                   cfg,
-		docker:                docker,
-		compose:               composeSvc,
-		pool:                  pool,
-		volumes:               volumes,
-		logger:                logger.With("backend", cfg.Name),
-		provisions:            make(map[string]*provision),
-		volumeCleanupAttempts: make(map[string]int),
-		actors:                make(map[string]*leasesm.LeaseActor),
-		callbackStore:         cbStore,
-		diagnosticsStore:      diagStore,
-		releaseStore:          releaseStore,
-		httpClient:            httpClient,
+		cfg:              cfg,
+		docker:           docker,
+		compose:          composeSvc,
+		pool:             pool,
+		volumes:          volumes,
+		logger:           logger.With("backend", cfg.Name),
+		provisions:       make(map[string]*provision),
+		actors:           make(map[string]*leasesm.LeaseActor),
+		callbackStore:    cbStore,
+		diagnosticsStore: diagStore,
+		releaseStore:     releaseStore,
+		httpClient:       httpClient,
 		// tenantNetworkStripes is a fixed-size array embedded in Backend;
 		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}
@@ -678,18 +680,14 @@ func (b *Backend) sendCallbackWithURL(leaseUUID, callbackURL string, status back
 	b.callbackSender.SendCallback(leaseUUID, callbackURL, b.Name(), status, errMsg)
 }
 
-// removeProvision removes a provision reservation and its callback URL.
-// Used when pre-flight validation fails after the slot was reserved.
-// Also clears the volumeCleanupAttempts entry so a re-provision under
-// the same lease UUID starts fresh.
-//
-// Invariant: `b.volumeCleanupAttempts` entries MUST be deleted in
-// sync with `b.provisions` deletes under `b.provisionsMu` Lock —
-// they share the same lock domain.
+// removeProvision removes a provision reservation. Used when pre-flight
+// validation fails after the slot was reserved. Because Docker-private
+// state (VolumeCleanupAttempts) is a field on the *provision wrapper,
+// the single map delete also drops every per-lease counter — no parallel
+// cleanup required.
 func (b *Backend) removeProvision(leaseUUID string) {
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
-	delete(b.volumeCleanupAttempts, leaseUUID)
 	b.provisionsMu.Unlock()
 }
 

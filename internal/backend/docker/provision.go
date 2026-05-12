@@ -62,15 +62,19 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		delete(b.provisions, req.LeaseUUID)
 	}
 	b.provisions[req.LeaseUUID] = &provision{
-		LeaseUUID:    req.LeaseUUID,
-		Tenant:       req.Tenant,
-		ProviderUUID: req.ProviderUUID,
-		Status:       backend.ProvisionStatusProvisioning,
-		Quantity:     totalQuantity,
-		ContainerIDs: make([]string, 0, totalQuantity),
-		CreatedAt:    time.Now(),
-		FailCount:    prevFailCount,
-		CallbackURL:  req.CallbackURL,
+		ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    req.LeaseUUID,
+			Tenant:       req.Tenant,
+			ProviderUUID: req.ProviderUUID,
+			Status:       backend.ProvisionStatusProvisioning,
+			Quantity:     totalQuantity,
+			ContainerIDs: make([]string, 0, totalQuantity),
+			CreatedAt:    time.Now(),
+			FailCount:    prevFailCount,
+			CallbackURL:  req.CallbackURL,
+		},
+		// VolumeCleanupAttempts: 0 by struct-zero — structural reset
+		// of the per-lease counter is the whole point of the wrapper.
 	}
 	b.provisionsMu.Unlock()
 

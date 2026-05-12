@@ -63,12 +63,11 @@ func TestCrossLeaseParallelism(t *testing.T) {
 	provisions := make(map[string]*provision, numLeases)
 	for i := 0; i < numLeases; i++ {
 		uuid := fmt.Sprintf("lease-%d", i)
-		provisions[uuid] = &provision{
-			LeaseUUID:    uuid,
+		provisions[uuid] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: uuid,
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{fmt.Sprintf("c-%d", i)},
 			Status:       backend.ProvisionStatusReady,
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		}
 	}
 	b := newBackendForTest(mock, provisions)
@@ -147,11 +146,10 @@ func TestCrossLeaseInboxBackpressure(t *testing.T) {
 		containerIDs[i] = fmt.Sprintf("c-%d", i)
 	}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: containerIDs,
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(mock, provisions)

@@ -131,7 +131,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			p.Status = backend.ProvisionStatusFailed
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
-			diagSnap = leasesm.DiagnosticSnapshot(p)
+			diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
 		}
 		b.provisionsMu.Unlock()
 		b.persistDiagnostics(diagSnap, failedIDs)
@@ -164,18 +164,17 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		var diagSnap shared.DiagnosticEntry
 		// attempts is captured INSIDE the b.provisionsMu Lock span (after
 		// the increment) so we can use the correct value at logger.Error
-		// below — which runs AFTER the Unlock and AFTER the parallel-map
-		// entry has been deleted. Reading b.volumeCleanupAttempts[leaseUUID]
-		// after the Unlock + delete would yield zero. The other reads in
-		// this block (the if-guard and the LastError fmt.Sprintf) also use
-		// the captured value to make the lock-held-state dependency
+		// below — which runs AFTER the Unlock and AFTER the provision
+		// entry has been deleted in the give-up branch. The other reads
+		// in this block (the if-guard and the LastError fmt.Sprintf) also
+		// use the captured value to make the lock-held-state dependency
 		// explicit and prevent future regressions where someone moves a
 		// read outside the Lock.
 		var attempts int
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
-			b.volumeCleanupAttempts[leaseUUID]++
-			attempts = b.volumeCleanupAttempts[leaseUUID]
+			p.VolumeCleanupAttempts++
+			attempts = p.VolumeCleanupAttempts
 			p.ContainerIDs = nil // containers are gone
 
 			if attempts >= maxVolumeCleanupAttempts {
@@ -183,12 +182,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				// The leaked volumes require manual cleanup by the operator.
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
 					attempts, errors.Join(volumeErrs...))
-				diagSnap = leasesm.DiagnosticSnapshot(p)
-				// volumeCleanupAttempts must be deleted in sync with
-				// b.provisions[uuid] under b.provisionsMu Lock — shared
-				// lock domain (see field declaration in backend.go).
+				diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
 				delete(b.provisions, leaseUUID)
-				delete(b.volumeCleanupAttempts, leaseUUID)
 				b.provisionsMu.Unlock()
 
 				// Persist diagnostics before losing the provision so operators
@@ -221,7 +216,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// Under the limit — keep provision visible for retry.
 			p.Status = backend.ProvisionStatusFailed
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
-			diagSnap = leasesm.DiagnosticSnapshot(p)
+			diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
 		}
 		b.provisionsMu.Unlock()
 		// Persist diagnostics outside the lock so failure state survives
@@ -238,12 +233,10 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	// All containers and volumes removed — delete provision from map.
-	// volumeCleanupAttempts must be deleted in sync with b.provisions[uuid]
-	// under b.provisionsMu Lock — shared lock domain (see field
-	// declaration in backend.go).
+	// Docker-private state (VolumeCleanupAttempts) is structural on the
+	// provision wrapper, so the single map delete drops it too.
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
-	delete(b.volumeCleanupAttempts, leaseUUID)
 	b.provisionsMu.Unlock()
 
 	// Clean up tenant network if isolation is enabled. releaseTenantNetwork

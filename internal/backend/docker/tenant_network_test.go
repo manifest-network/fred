@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // TestReleaseTenantNetwork_SkipsWhenOtherLeaseActive covers the race that
@@ -27,7 +28,7 @@ func TestReleaseTenantNetwork_SkipsWhenOtherLeaseActive(t *testing.T) {
 
 	// Another lease on the same tenant is still live.
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-b": {LeaseUUID: "lease-b", Tenant: "tenant-x", Status: backend.ProvisionStatusProvisioning},
+		"lease-b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-b", Tenant: "tenant-x", Status: backend.ProvisionStatusProvisioning}},
 	})
 
 	err := b.releaseTenantNetwork(context.Background(), "tenant-x")
@@ -66,7 +67,7 @@ func TestReleaseTenantNetwork_DifferentTenantsDoNotBlock(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-other": {LeaseUUID: "lease-other", Tenant: "tenant-y", Status: backend.ProvisionStatusReady},
+		"lease-other": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-other", Tenant: "tenant-y", Status: backend.ProvisionStatusReady}},
 	})
 
 	err := b.releaseTenantNetwork(context.Background(), "tenant-x")
@@ -180,7 +181,7 @@ func TestTenantNetwork_RaceScenario(t *testing.T) {
 	// Lease B exists in b.provisions (as it would after Provision()'s
 	// synchronous reservation phase) while its doProvision is running.
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-b": {LeaseUUID: "lease-b", Tenant: "tenant-x", Status: backend.ProvisionStatusProvisioning},
+		"lease-b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-b", Tenant: "tenant-x", Status: backend.ProvisionStatusProvisioning}},
 	})
 
 	ctx := context.Background()

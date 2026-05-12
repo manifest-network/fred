@@ -140,7 +140,7 @@ func TestDockerDiagnosticsGatherer_GatherDiagnostics(t *testing.T) {
 // TestBackendProvisionStore_Get covers the snapshot read path.
 func TestBackendProvisionStore_Get(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 	s := &backendProvisionStore{backend: b}
 
@@ -164,7 +164,7 @@ func TestBackendProvisionStore_Get(t *testing.T) {
 // struct after the call).
 func TestBackendProvisionStore_UpdateFn(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady, FailCount: 2},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady, FailCount: 2}},
 	})
 	s := &backendProvisionStore{backend: b}
 

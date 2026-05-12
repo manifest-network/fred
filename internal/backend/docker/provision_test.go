@@ -182,9 +182,8 @@ func TestProvision_Success(t *testing.T) {
 func TestProvision_AlreadyProvisioned(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady},
 		},
 	})
 
@@ -203,9 +202,8 @@ func TestProvision_AlreadyProvisioned(t *testing.T) {
 func TestProvision_RejectsWhileDeprovisioning(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusDeprovisioning,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusDeprovisioning},
 		},
 	})
 
@@ -238,12 +236,11 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    2,
 			Quantity:     1,
-			ContainerIDs: []string{"old-container"},
+			ContainerIDs: []string{"old-container"}},
 		},
 	})
 	// Pre-allocate a resource for the old provision
@@ -276,6 +273,95 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 	assert.Equal(t, 2, prov.FailCount, "FailCount should be preserved from previous provision")
 
 	<-callbackReceived
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+// TestProvision_ReProvision_ClearsVolumeCleanupAttempts is a regression
+// guard for the bug where re-provision of a failed lease inherited a
+// stale volumeCleanupAttempts counter from the previous provision.
+//
+// Pre-fix scenario: a lease had its volume cleanup partially fail during
+// deprovision (volumeCleanupAttempts incremented but below the limit, so
+// status reset to Failed and the parallel-map entry persisted). A
+// subsequent re-provision (Status=Failed → re-provision path) deleted
+// the old provisions entry and inserted a new one, but did NOT clear
+// the parallel volumeCleanupAttempts entry. The new lease then started
+// life with attempts > 0, and a future Deprovision could hit
+// maxVolumeCleanupAttempts (3) prematurely — after as few as ONE failed
+// cleanup instead of three.
+//
+// Fix: re-provision lifecycle is now structural — the per-lease counter
+// is a field on the provision wrapper struct that gets freshly
+// allocated on the new provision entry, eliminating the stale-state
+// class of bug. This test asserts that property end-to-end through the
+// Provision API.
+func TestProvision_ReProvision_ClearsVolumeCleanupAttempts(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+			return nil
+		},
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
+			return "new-container", nil
+		},
+		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {
+			ProvisionState: leasesm.ProvisionState{
+				LeaseUUID:    "lease-1",
+				Status:       backend.ProvisionStatusFailed,
+				FailCount:    2,
+				Quantity:     1,
+				ContainerIDs: []string{"old-container"},
+			},
+			// Simulate prior partial deprovision: 2 of 3 max attempts
+			// already consumed by failed volume cleanup. The new
+			// provision MUST start at 0, not inherit this stale state.
+			VolumeCleanupAttempts: 2,
+		},
+	})
+	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = callbackServer.URL
+	err := b.Provision(context.Background(), req)
+	require.NoError(t, err)
+
+	<-callbackReceived
+
+	// The load-bearing assertion: the re-provisioned lease has a fresh
+	// VolumeCleanupAttempts counter (zero), NOT the stale 2 from the
+	// old provision. The wrapper-struct refactor makes this structural:
+	// re-provision allocates a fresh *provision so the embedded counter
+	// resets along with every other Docker-private field.
+	b.provisionsMu.RLock()
+	attempts := b.provisions["lease-1"].VolumeCleanupAttempts
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, 0, attempts,
+		"re-provision must reset VolumeCleanupAttempts so a subsequent Deprovision starts at 0, not inherit stale state from the old provision")
+
 	b.stopCancel()
 	b.wg.Wait()
 }
@@ -396,10 +482,9 @@ func TestDoProvision_MultiItem_QuantityPassesTotalNotPerItem(t *testing.T) {
 
 	// Two items, each with Quantity=1 → totalQuantity=2.
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  2,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 2},
 		},
 	})
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
@@ -449,10 +534,9 @@ func TestDoProvision_PullFailure(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
@@ -517,10 +601,9 @@ func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  2,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 2},
 		},
 	})
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
@@ -555,10 +638,9 @@ func TestDoProvision_ContextCanceled(t *testing.T) {
 	mock := &mockDockerClient{}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
@@ -609,10 +691,9 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.cfg.NetworkIsolation = ptrBool(true)
@@ -664,10 +745,9 @@ func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.provisions["lease-1"].CallbackURL = callbackServer.URL
@@ -725,11 +805,10 @@ func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    2,
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -814,10 +893,9 @@ func TestDoProvision_StatefulSKUCreatesVolume(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.volumes = vm
@@ -889,10 +967,9 @@ func TestDoProvision_StatefulSKUMultipleVolumes(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.volumes = vm
@@ -947,10 +1024,9 @@ func TestDoProvision_VolumeCreateFailure(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.volumes = vm
@@ -1031,10 +1107,9 @@ func TestDoProvision_CleanupOnlyDestroysNewVolumes(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  2,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 2},
 		},
 	})
 	b.volumes = vm
@@ -1096,10 +1171,9 @@ func TestDoProvision_StatefulSKUNoImageVolumes(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.volumes = vm
@@ -1157,12 +1231,11 @@ func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    1,
 			Quantity:     1,
-			ContainerIDs: []string{"old-container"},
+			ContainerIDs: []string{"old-container"}},
 		},
 	})
 	b.volumes = vm
@@ -1209,13 +1282,12 @@ func TestDeprovision_Success(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
 			ContainerIDs: []string{"c1", "c2"},
-			CallbackURL:  "http://localhost/callback",
+			CallbackURL:  "http://localhost/callback"},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -1256,12 +1328,11 @@ func TestDeprovision_PartialContainerFailure(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -1296,12 +1367,11 @@ func TestDeprovision_PartialFailure_UpdatesResourceMetrics(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -1336,12 +1406,11 @@ func TestDeprovision_PartialFailure_RetryOnlyStuck(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 
@@ -1374,12 +1443,11 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     1,
-			ContainerIDs: []string{"c1"},
+			ContainerIDs: []string{"c1"}},
 		},
 	})
 	b.cfg.NetworkIsolation = ptrBool(true)
@@ -1407,12 +1475,11 @@ func TestDeprovision_DestroysVolumes(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 	b.volumes = vm
@@ -1445,12 +1512,11 @@ func TestDeprovision_VolumeDestroyFailure(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 	b.volumes = vm
@@ -1470,7 +1536,7 @@ func TestDeprovision_VolumeDestroyFailure(t *testing.T) {
 	assert.Nil(t, prov.ContainerIDs, "containers should be nil since they were removed")
 	assert.Contains(t, prov.LastError, "volume cleanup failed")
 	b.provisionsMu.RLock()
-	assert.Equal(t, 1, b.volumeCleanupAttempts["lease-1"])
+	assert.Equal(t, 1, b.provisions["lease-1"].VolumeCleanupAttempts)
 	b.provisionsMu.RUnlock()
 }
 
@@ -1489,23 +1555,24 @@ func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusFailed,
-			Quantity:     1,
-			ContainerIDs: nil, // containers already removed
+			ProvisionState: leasesm.ProvisionState{
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusFailed,
+				Quantity:     1,
+				ContainerIDs: nil, // containers already removed
+			},
+			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
 		},
 	})
-	b.volumeCleanupAttempts["lease-1"] = maxVolumeCleanupAttempts - 1
 	b.volumes = vm
 
 	// Capture log output so we can assert that the "MANUAL CLEANUP REQUIRED"
-	// log line emits the correct `attempts` value. Pre-fix, the log read
-	// `b.volumeCleanupAttempts[leaseUUID]` AFTER the entry had been deleted
-	// from the parallel map AND after the Lock was released — yielding 0.
-	// The fix captures `attempts` inside the Lock before the delete; this
-	// test guards against regression by asserting the captured value is the
-	// expected maxVolumeCleanupAttempts (3).
+	// log line emits the correct `attempts` value. Pre-fix (regression-fix
+	// before the wrapper refactor), the log read attempts via the parallel
+	// map AFTER the entry had been deleted — yielding 0. The fix captures
+	// `attempts` inside the Lock before the delete; this test guards against
+	// regression by asserting the captured value is maxVolumeCleanupAttempts.
 	var logBuf bytes.Buffer
 	b.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -1563,13 +1630,12 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 		RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     1,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL,
+			CallbackURL:  server.URL},
 		},
 	})
 	b.httpClient = server.Client()
@@ -1617,15 +1683,17 @@ func TestDeprovision_VolumeExhaustionSendsFailedCallback(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusFailed,
-			Quantity:     1,
-			ContainerIDs: nil,
-			CallbackURL:  server.URL,
+			ProvisionState: leasesm.ProvisionState{
+				LeaseUUID:    "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusFailed,
+				Quantity:     1,
+				ContainerIDs: nil,
+				CallbackURL:  server.URL,
+			},
+			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
 		},
 	})
-	b.volumeCleanupAttempts["lease-1"] = maxVolumeCleanupAttempts - 1
 	b.volumes = vm
 	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
@@ -1674,13 +1742,12 @@ func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
 	defer server.Close()
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
 			ContainerIDs: []string{"c1", "c2"},
-			CallbackURL:  server.URL,
+			CallbackURL:  server.URL},
 		},
 	})
 	b.httpClient = server.Client()
@@ -1734,10 +1801,9 @@ func TestGetInfo_Success(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1"},
+			ContainerIDs: []string{"c1"}},
 		},
 	})
 	b.cfg.HostAddress = "192.168.1.100"
@@ -1761,9 +1827,8 @@ func TestGetInfo_NotProvisioned(t *testing.T) {
 func TestGetInfo_NotReady(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusProvisioning},
 		},
 	})
 
@@ -1787,10 +1852,9 @@ func TestGetInfo_MultiContainer(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1", "c2", "c3"},
+			ContainerIDs: []string{"c1", "c2", "c3"}},
 		},
 	})
 
@@ -1809,10 +1873,9 @@ func TestGetLogs_Success(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 
@@ -1842,10 +1905,9 @@ func TestGetLogs_PartialError(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 
@@ -1860,12 +1922,11 @@ func TestGetLogs_PartialError(t *testing.T) {
 func TestGetProvision_Found(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    2,
-			LastError:    "exit_code=1; logs:\nSECRET=abc",
+			LastError:    "exit_code=1; logs:\nSECRET=abc"},
 		},
 	})
 
@@ -1889,20 +1950,18 @@ func TestGetProvision_NotFound(t *testing.T) {
 
 // nonStackProvision returns a simple non-stack provision fixture.
 func nonStackProvision() *provision {
-	return &provision{
-		LeaseUUID:    "lease-1",
+	return &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		ProviderUUID: "prov-1",
 		Status:       backend.ProvisionStatusReady,
 		SKU:          "docker-micro",
 		Image:        "nginx:1.25",
-		Quantity:     2,
+		Quantity:     2},
 	}
 }
 
 // stackProvision returns a stack provision fixture with web + db services.
 func stackProvision() *provision {
-	return &provision{
-		LeaseUUID:    "lease-1",
+	return &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		ProviderUUID: "prov-1",
 		Status:       backend.ProvisionStatusReady,
 		Quantity:     3,
@@ -1915,20 +1974,19 @@ func stackProvision() *provision {
 				"web": {Image: "nginx:1.25"},
 				"db":  {Image: "postgres:16"},
 			},
-		},
+		}},
 	}
 }
 
 // stackProvisionNilManifest returns a stack provision with a nil manifest.StackManifest
 // (simulates cold restart with no release store).
 func stackProvisionNilManifest() *provision {
-	return &provision{
-		LeaseUUID:     "lease-1",
+	return &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		ProviderUUID:  "prov-1",
 		Status:        backend.ProvisionStatusReady,
 		Quantity:      2,
 		Items:         []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}},
-		StackManifest: nil,
+		StackManifest: nil},
 	}
 }
 
@@ -2002,18 +2060,16 @@ func TestListProvisions_Empty(t *testing.T) {
 func TestListProvisions_Multiple(t *testing.T) {
 	now := time.Now()
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusReady,
-			CreatedAt:    now,
+			CreatedAt:    now},
 		},
-		"lease-2": {
-			LeaseUUID:    "lease-2",
+		"lease-2": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-2",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusFailed,
 			CreatedAt:    now,
-			FailCount:    3,
+			FailCount:    3},
 		},
 	})
 
@@ -2057,13 +2113,12 @@ func TestListProvisions_ItemsDefensivelyCopied(t *testing.T) {
 		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
 	}
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:     "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			ProviderUUID:  "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			Quantity:      2,
 			Items:         originalItems,
-			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}}},
 		},
 	})
 
@@ -2087,9 +2142,9 @@ func TestLookupProvisions_Empty(t *testing.T) {
 func TestLookupProvisions_Subset(t *testing.T) {
 	now := time.Now()
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now},
-		"lease-2": {LeaseUUID: "lease-2", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now},
-		"lease-3": {LeaseUUID: "lease-3", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now}},
+		"lease-2": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-2", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now}},
+		"lease-3": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-3", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, CreatedAt: now}},
 	})
 
 	result, err := b.LookupProvisions(context.Background(), []string{"lease-1", "lease-3"})
@@ -2107,7 +2162,7 @@ func TestLookupProvisions_Subset(t *testing.T) {
 
 func TestLookupProvisions_UnknownIgnored(t *testing.T) {
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 
 	result, err := b.LookupProvisions(context.Background(), []string{"lease-1", "lease-unknown"})
@@ -2118,7 +2173,7 @@ func TestLookupProvisions_UnknownIgnored(t *testing.T) {
 
 func TestLookupProvisions_AllUnknownReturnsEmpty(t *testing.T) {
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 
 	result, err := b.LookupProvisions(context.Background(), []string{"lease-unknown-1", "lease-unknown-2"})
@@ -2151,7 +2206,7 @@ func TestSendCallback_Success(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
 	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
@@ -2175,7 +2230,7 @@ func TestSendCallback_FailurePayload(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
 	b.httpClient = server.Client()
 	rebuildCallbackSender(b)
@@ -2203,7 +2258,7 @@ func TestSendCallback_TruncatesLongError(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
 	b.httpClient = server.Client()
 	rebuildCallbackSender(b)
@@ -2232,7 +2287,7 @@ func TestSendCallback_Retry(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
 	b.httpClient = server.Client()
 	rebuildCallbackSender(b)
@@ -2252,7 +2307,7 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
 	b.httpClient = server.Client()
 	// Use long backoff so shutdown cancellation is observable.
@@ -2409,7 +2464,7 @@ func TestContainerStatusToProvisionStatus(t *testing.T) {
 func TestRemoveProvision(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: "http://localhost"},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: "http://localhost"}},
 	})
 
 	b.removeProvision("lease-1")
@@ -2571,11 +2626,10 @@ func TestDoProvision_LastError_ContextCanceled(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    1,
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -2626,12 +2680,11 @@ func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
 
 	// Start with a previously failed provision that had a LastError
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    1,
 			LastError:   "previous error",
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -2656,13 +2709,12 @@ func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
 func TestListProvisions_IncludesLastError(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusFailed,
 			CreatedAt:    time.Now(),
 			FailCount:    2,
-			LastError:    "container crashed",
+			LastError:    "container crashed"},
 		},
 	})
 
@@ -2709,11 +2761,10 @@ func TestDoProvision_EphemeralProfileWithoutDiskMB(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    1,
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
@@ -2765,11 +2816,10 @@ func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    1,
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -2809,7 +2859,7 @@ func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
@@ -2838,7 +2888,7 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", CallbackURL: server.URL},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
 	b.httpClient = server.Client()
 	b.callbackStore = cbStore
@@ -3048,12 +3098,11 @@ func TestDeprovision_AllContainersFail(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
+			ContainerIDs: []string{"c1", "c2"}},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3137,10 +3186,9 @@ func TestGetLogs_ProvisioningLease(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusProvisioning,
-			ContainerIDs: []string{"c1"},
+			ContainerIDs: []string{"c1"}},
 		},
 	})
 
@@ -3155,10 +3203,9 @@ func TestGetLogs_EmptyContainerIDs(t *testing.T) {
 	mock := &mockDockerClient{}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{},
+			ContainerIDs: []string{}},
 		},
 	})
 
@@ -3197,12 +3244,11 @@ func TestDeprovision_ProvisioningLease(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusProvisioning,
 			Quantity:     1,
-			ContainerIDs: []string{"c1"},
+			ContainerIDs: []string{"c1"}},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3230,12 +3276,11 @@ func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
 			},
 		}
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusReady,
 				Quantity:     1,
-				ContainerIDs: []string{"c1"},
+				ContainerIDs: []string{"c1"}},
 			},
 		})
 		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3253,12 +3298,11 @@ func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
 			},
 		}
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusFailed,
 				Quantity:     1,
-				ContainerIDs: []string{"c1"},
+				ContainerIDs: []string{"c1"}},
 			},
 		})
 		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3277,12 +3321,11 @@ func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
 			},
 		}
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusProvisioning,
 				Quantity:     1,
-				ContainerIDs: []string{"c1"},
+				ContainerIDs: []string{"c1"}},
 			},
 		})
 		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3308,12 +3351,11 @@ func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
 			},
 		}
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusReady,
 				Quantity:     2,
-				ContainerIDs: []string{"c1", "c2"},
+				ContainerIDs: []string{"c1", "c2"}},
 			},
 		})
 		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3354,11 +3396,10 @@ func TestGetLogs_FailedLease(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusFailed,
 			ContainerIDs: []string{"c1"},
-			LastError:    "container crashed",
+			LastError:    "container crashed"},
 		},
 	})
 
@@ -3482,11 +3523,10 @@ func TestDoProvision_CallbackSanitized_ContainerExitedDuringStartup(t *testing.T
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    1,
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -3546,11 +3586,10 @@ func TestDoProvision_CallbackSanitized_Unhealthy(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    1,
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3593,11 +3632,10 @@ func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:   "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:      backend.ProvisionStatusProvisioning,
 			Quantity:    1,
-			CallbackURL: callbackServer.URL,
+			CallbackURL: callbackServer.URL},
 		},
 	})
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
@@ -3888,14 +3926,13 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-reprov": {
-			LeaseUUID:    "lease-reprov",
+		"lease-reprov": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-reprov",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    1,
 			Quantity:     1,
-			ContainerIDs: []string{"old-ctr"},
+			ContainerIDs: []string{"old-ctr"}},
 		},
 	})
 	b.diagnosticsStore = diagStore
@@ -3959,10 +3996,9 @@ func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-chown": {
-			LeaseUUID: "lease-chown",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-chown": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-chown",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.volumes = vm
@@ -4028,10 +4064,9 @@ func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-root": {
-			LeaseUUID: "lease-root",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-root": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-root",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.volumes = vm
@@ -4784,10 +4819,9 @@ func TestDoProvision_WritablePathBinds(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
@@ -4857,10 +4891,9 @@ func TestDoProvision_WritablePathBinds_PartialFailure(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
@@ -4927,15 +4960,14 @@ func TestDoRestart_WritablePathBinds(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusRestarting,
 			Quantity:     1,
 			ContainerIDs: []string{"old-container"},
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		},
 	})
 	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
@@ -4991,10 +5023,9 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			Quantity:  1,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusProvisioning,
+			Quantity: 1},
 		},
 	})
 	b.cfg.ContainerReadonlyRootfs = ptrBool(true)

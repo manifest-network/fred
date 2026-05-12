@@ -16,6 +16,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 func TestSanitizeVolumePath(t *testing.T) {
@@ -226,8 +227,8 @@ func TestCleanupOrphanedVolumes_DestroysOrphans(t *testing.T) {
 		volumes: vm,
 		logger:  slog.Default(),
 		provisions: map[string]*provision{
-			"lease-1": {LeaseUUID: "lease-1", Quantity: 1, Status: backend.ProvisionStatusReady},
-			"lease-2": {LeaseUUID: "lease-2", Quantity: 1, Status: backend.ProvisionStatusReady},
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Quantity: 1, Status: backend.ProvisionStatusReady}},
+			"lease-2": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-2", Quantity: 1, Status: backend.ProvisionStatusReady}},
 		},
 		stopCtx:    stopCtx,
 		stopCancel: stopCancel,

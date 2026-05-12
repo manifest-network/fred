@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -41,12 +42,11 @@ func TestReconcileCustomDomain_NotActive(t *testing.T) {
 	} {
 		t.Run(string(status), func(t *testing.T) {
 			provisions := map[string]*provision{
-				"lease-1": {
-					LeaseUUID: "lease-1",
-					Status:    status,
+				"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+					Status: status,
 					Items: []backend.LeaseItem{
 						{SKU: "docker-small", ServiceName: "web", CustomDomain: ""},
-					},
+					}},
 				},
 			}
 			b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -65,13 +65,12 @@ func TestReconcileCustomDomain_NotActive(t *testing.T) {
 func TestReconcileCustomDomain_NoChange(t *testing.T) {
 	// Items already match incoming → no-op even when Status is Ready.
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", ServiceName: "web", CustomDomain: "foo.example.com"},
 				{SKU: "docker-small", ServiceName: "db", CustomDomain: ""},
-			},
+			}},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -90,13 +89,12 @@ func TestReconcileCustomDomain_InvalidDomainSkipsThatItem(t *testing.T) {
 	// reconcile. The bad item is left at its current value; valid items
 	// proceed.
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", ServiceName: "web", CustomDomain: ""},
 				{SKU: "docker-small", ServiceName: "admin", CustomDomain: ""},
-			},
+			}},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -135,12 +133,11 @@ func TestReconcileCustomDomain_IngressDisabledIsNoOp(t *testing.T) {
 	// trigger by setting a custom_domain on a provider that runs ingress-less.
 	// The fix: short-circuit the reconcile when ingress is disabled.
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", ServiceName: "web", CustomDomain: ""},
-			},
+			}},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -161,12 +158,11 @@ func TestReconcileCustomDomain_UnknownServiceNameSkipped(t *testing.T) {
 	// (e.g. partial recovery, cross-version lease). Reconcile must not
 	// panic or error; it silently skips that item.
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", ServiceName: "web", CustomDomain: ""},
-			},
+			}},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -270,8 +266,7 @@ func TestReconcileCustomDomain_Set(t *testing.T) {
 	// new CustomDomain on CreateContainerParams; in-memory state must
 	// reflect the new value after success.
 	manifest := &manifest.Manifest{Image: "nginx:latest"}
-	prov := &provision{
-		LeaseUUID:    "lease-1",
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
@@ -281,7 +276,7 @@ func TestReconcileCustomDomain_Set(t *testing.T) {
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: ""},
 		},
-		Quantity: 1,
+		Quantity: 1},
 	}
 	h := newReconcileHarness(t, prov)
 
@@ -305,8 +300,7 @@ func TestReconcileCustomDomain_Cleared(t *testing.T) {
 	// "foo.example.com" → "": worker must rebuild containers with no
 	// secondary router; in-memory CustomDomain reverts to "".
 	manifest := &manifest.Manifest{Image: "nginx:latest"}
-	prov := &provision{
-		LeaseUUID:    "lease-1",
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
@@ -316,7 +310,7 @@ func TestReconcileCustomDomain_Cleared(t *testing.T) {
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
 		},
-		Quantity: 1,
+		Quantity: 1},
 	}
 	h := newReconcileHarness(t, prov)
 
@@ -339,8 +333,7 @@ func TestReconcileCustomDomain_Cleared(t *testing.T) {
 func TestReconcileCustomDomain_Changed(t *testing.T) {
 	// "foo.example.com" → "bar.example.com".
 	manifest := &manifest.Manifest{Image: "nginx:latest"}
-	prov := &provision{
-		LeaseUUID:    "lease-1",
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
@@ -350,7 +343,7 @@ func TestReconcileCustomDomain_Changed(t *testing.T) {
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
 		},
-		Quantity: 1,
+		Quantity: 1},
 	}
 	h := newReconcileHarness(t, prov)
 
@@ -373,8 +366,7 @@ func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
 	// Restart() returns a synchronous error (here: no stored manifest →
 	// ErrInvalidState). ReconcileCustomDomain must roll back the in-memory
 	// CustomDomain so the next reconciler tick retries cleanly.
-	prov := &provision{
-		LeaseUUID:     "lease-1",
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:        "tenant-a",
 		ProviderUUID:  "prov-1",
 		SKU:           "docker-small",
@@ -385,7 +377,7 @@ func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "old.example.com"},
 		},
-		Quantity: 1,
+		Quantity: 1},
 	}
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
 	b.cfg.Ingress = IngressConfig{
@@ -419,8 +411,7 @@ func TestReconcileCustomDomain_RollbackUsesServiceNameNotIndex(t *testing.T) {
 	// exercise the rollback branch with a multi-item provision where the
 	// target service is NOT at index 0 — which is enough to fail any
 	// "rollback to stored index 0" implementation.
-	prov := &provision{
-		LeaseUUID:    "lease-1",
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
@@ -431,7 +422,7 @@ func TestReconcileCustomDomain_RollbackUsesServiceNameNotIndex(t *testing.T) {
 			{SKU: "docker-small", Quantity: 1, ServiceName: "db", CustomDomain: ""},
 			{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "old.example.com"},
 		},
-		Quantity: 1,
+		Quantity: 1},
 	}
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
 	b.cfg.Ingress = IngressConfig{
@@ -480,8 +471,7 @@ func TestReconcileCustomDomain_RollbackIsCASGated(t *testing.T) {
 	// here is exercised by the rollback finding ServiceName "web" with
 	// CustomDomain == newValue (because nothing concurrent ran in this
 	// test) and writing back oldValue.
-	prov := &provision{
-		LeaseUUID:    "lease-1",
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
@@ -491,7 +481,7 @@ func TestReconcileCustomDomain_RollbackIsCASGated(t *testing.T) {
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "old.example.com"},
 		},
-		Quantity: 1,
+		Quantity: 1},
 	}
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
 	b.cfg.Ingress = IngressConfig{
@@ -512,12 +502,11 @@ func TestReconcileCustomDomain_LegacyEmptyServiceName(t *testing.T) {
 	// Legacy single-item lease addresses its only item by ServiceName="".
 	// Reconcile must match on that and apply a no-op when domains match.
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", ServiceName: "", CustomDomain: "foo.example.com"},
-			},
+			}},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)

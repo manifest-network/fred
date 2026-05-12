@@ -41,12 +41,11 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusReady,
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		},
 	})
 	b.httpClient = callbackServer.Client()
@@ -118,12 +117,11 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusReady,
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		},
 	})
 	b.httpClient = callbackServer.Client()
@@ -186,17 +184,15 @@ func TestDebugActors(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-a": {
-			LeaseUUID:    "lease-a",
+		"lease-a": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-a",
 			Tenant:       "tenant-1",
 			ContainerIDs: []string{"ca"},
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
-		"lease-b": {
-			LeaseUUID:    "lease-b",
+		"lease-b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-b",
 			Tenant:       "tenant-1",
 			ContainerIDs: []string{"cb"},
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
 	})
 	defer b.stopCancel()
@@ -228,7 +224,7 @@ func TestDebugActors(t *testing.T) {
 // publication synchronous with the actor's exposure via b.actors.
 func TestLeaseActor_EagerSMInit(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 	defer b.stopCancel()
 
@@ -253,11 +249,10 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
 	})
 	defer b.stopCancel()
@@ -411,7 +406,7 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 // wedged.
 func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailing},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailing}},
 	})
 	defer b.stopCancel()
 
@@ -467,7 +462,7 @@ func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 	defer b.stopCancel()
 
@@ -537,7 +532,7 @@ func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 	defer b.stopCancel()
 
@@ -587,7 +582,7 @@ func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 	defer b.stopCancel()
 
@@ -615,7 +610,7 @@ func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
 func TestLeaseActor_ProvisionRequestedSMRejection(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		// Ready state does NOT Permit evProvisionRequested — SM rejects.
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 	defer b.stopCancel()
 
@@ -656,11 +651,10 @@ func TestLeaseActor_RegistryDeletedBeforeDoneClose(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
 	})
 	defer b.stopCancel()
@@ -708,11 +702,10 @@ func TestBackend_ShutdownDrainsAllActors(t *testing.T) {
 		default:
 			status = backend.ProvisionStatusUpdating
 		}
-		provs[leaseUUID] = &provision{
-			LeaseUUID:    leaseUUID,
+		provs[leaseUUID] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:       "tenant-a",
 			Status:       status,
-			ContainerIDs: []string{fmt.Sprintf("c-%d", i)},
+			ContainerIDs: []string{fmt.Sprintf("c-%d", i)}},
 		}
 	}
 
@@ -751,10 +744,9 @@ func TestHandleContainerDeath_ShutdownDoesNotHang(t *testing.T) {
 	mock := &mockDockerClient{}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
 	})
 
@@ -803,12 +795,11 @@ func TestOnEnterFailing_RaceWithConcurrentStatusFlip(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			FailCount:    0,
+			FailCount:    0},
 		},
 	})
 	defer b.stopCancel()
@@ -899,11 +890,10 @@ func TestHandlerPanic_UnblocksReplyChannel(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1"},
+			ContainerIDs: []string{"c1"}},
 		},
 	})
 	defer b.stopCancel()

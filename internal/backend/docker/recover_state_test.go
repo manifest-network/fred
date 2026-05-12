@@ -285,17 +285,16 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 
 	b := &Backend{
-		cfg:                   cfg,
-		docker:                mock,
-		compose:               &mockComposeExecutor{},
-		pool:                  pool,
-		volumes:               &noopVolumeManager{},
-		logger:                slog.Default(),
-		provisions:            provs,
-		volumeCleanupAttempts: make(map[string]int),
-		actors:                make(map[string]*leasesm.LeaseActor),
-		stopCtx:               stopCtx,
-		stopCancel:            stopCancel,
+		cfg:        cfg,
+		docker:     mock,
+		compose:    &mockComposeExecutor{},
+		pool:       pool,
+		volumes:    &noopVolumeManager{},
+		logger:     slog.Default(),
+		provisions: provs,
+		actors:     make(map[string]*leasesm.LeaseActor),
+		stopCtx:    stopCtx,
+		stopCancel: stopCancel,
 	}
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
@@ -482,11 +481,10 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusProvisioning,
-				CreatedAt: now,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -506,12 +504,11 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusFailed,
 				FailCount: 2,
-				CreatedAt: now,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -537,13 +534,12 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusFailing,
 				FailCount: 1,
 				LastError: leasesm.ErrMsgContainerExited,
-				CreatedAt: now,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -566,12 +562,11 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusReady,
 				ContainerIDs: []string{"c1"},
-				CreatedAt:    now,
+				CreatedAt:    now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -589,9 +584,8 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
-				Status:    backend.ProvisionStatusReady,
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+				Status: backend.ProvisionStatusReady},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -732,13 +726,12 @@ func TestRecoverState(t *testing.T) {
 		}
 		// Pre-populate with a "ready" provision so recoverState detects a ready→failed transition.
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusReady,
 				ContainerIDs: []string{"c1"},
 				FailCount:    0,
-				CreatedAt:    now,
+				CreatedAt:    now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -1033,10 +1026,9 @@ func TestRecoverState_SetsActiveProvisionsGauge(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Status:    backend.ProvisionStatusProvisioning,
-				CreatedAt: now,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -1282,14 +1274,13 @@ func TestRecoverState_PersistsDiagnostics(t *testing.T) {
 	}
 
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
 			FailCount:    0,
-			CreatedAt:    now,
+			CreatedAt:    now},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1369,14 +1360,13 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	}
 
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
 			FailCount:    0,
 			CreatedAt:    now,
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1451,14 +1441,13 @@ func TestRecoverState_InFlightReProvisionPreservesFailCount(t *testing.T) {
 
 	// Existing in-memory state: in-flight re-provision with accumulated FailCount.
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusProvisioning,
 			Quantity:     1,
 			ContainerIDs: []string{}, // new provision hasn't created containers yet
 			FailCount:    2,
-			CreatedAt:    now,
+			CreatedAt:    now},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1517,14 +1506,13 @@ func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
 	// Existing in-memory state: recoverState already ran once and incremented
 	// FailCount to 1. Provision has Status=Failed (transition already detected).
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusFailed,
 			Quantity:     1,
 			ContainerIDs: []string{"dead-container"},
 			FailCount:    1,
-			CreatedAt:    now,
+			CreatedAt:    now},
 		},
 	}
 	b := newBackendForTest(mock, existing)
