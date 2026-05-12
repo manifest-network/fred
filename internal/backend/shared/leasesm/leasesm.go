@@ -1,11 +1,18 @@
-// Package leasesm declares the substrate-agnostic seams the per-lease
-// state machine and actor consume. The Docker backend implements the
-// interfaces against its DockerClient + provision-record map; future
-// substrates (K3s, etc.) implement them against their own primitives.
+// Package leasesm owns the per-lease state machine and actor, plus the
+// substrate-agnostic seams they consume. The state machine + actor
+// implementations live in lease_sm.go and lease_actor.go in this
+// package; substrate-specific concerns are injected via the interfaces
+// declared here (InstanceInspector, DiagnosticsGatherer,
+// LeaseProvisionStore, SMMetrics) and the closure-bridge fields on
+// LeaseActorConfig (PersistDiagnosticsFn, SendCallbackFn,
+// DoDeprovisionFn, OnTerminated). The Docker backend implements those
+// against its DockerClient + provision-record map; future substrates
+// (K3s, etc.) implement them against their own primitives.
 //
-// The package contains scaffolding only — no behavior. The actual SM
-// and actor still live in internal/backend/docker/ as of ENG-148 PR4;
-// PR5 will move them here without further interface changes.
+// Cross-package test access goes through the bounded set of ForTest
+// helpers in testhelpers.go (the ONLY exported scaffolding for tests);
+// substrate-side tests that need to drive the SM synchronously compose
+// these helpers around their own substrate calls.
 package leasesm
 
 import (
