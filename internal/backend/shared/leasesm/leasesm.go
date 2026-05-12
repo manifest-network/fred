@@ -113,14 +113,21 @@ func (p *ProvisionState) IsStack() bool {
 // these fields exclusively; substrate-specific state is kept
 // substrate-side and never reaches this struct.
 //
-// The Docker backend keeps its private state (e.g. VolumeCleanupAttempts)
-// in a parallel map (Backend.volumeCleanupAttempts) guarded by the same
-// mutex as the provisions map, and aliases its in-memory record type
-// directly to *ProvisionState (type provision = leasesm.ProvisionState).
-// Other substrates may choose differently — embedding *ProvisionState in
-// a wrapper struct is equally valid when there's enough substrate-private
-// state to justify a named type; both shapes are compatible with the
-// LeaseProvisionStore interface.
+// Substrate implementations typically embed ProvisionState in a
+// wrapper struct alongside any substrate-private fields they need to
+// keep per-lease. The Docker backend uses
+//
+//	type provision struct {
+//	    leasesm.ProvisionState
+//	    VolumeCleanupAttempts int
+//	}
+//
+// so the per-lease counter rides on the same allocation as the
+// ProvisionState and gets cleared structurally on each new provision.
+// The LeaseProvisionStore adapter passes &p.ProvisionState through the
+// Get / UpdateFn seams; substrate-private wrapper fields are NOT
+// reachable through the interface — the SM has no business reading
+// them.
 //
 // Manifest and StackManifest are substrate-shared schema (lifted to
 // internal/backend/shared/manifest in PR2) — they live here even
