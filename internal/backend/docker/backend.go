@@ -13,10 +13,10 @@ import (
 	"time"
 
 	networktypes "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/pkg/stringid"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
@@ -128,43 +128,60 @@ type Backend struct {
 	// other — eliminating the stale-pointer / orphan-worker race class
 	// the prior sync.Map design allowed.
 	actorsMu sync.Mutex
-	actors   map[string]*leaseActor // leaseUUID → *leaseActor
+	actors   map[string]*leasesm.LeaseActor // leaseUUID → *leasesm.LeaseActor
+
+	// inspector / gatherer / provisionStore are the substrate-agnostic
+	// seams the lease state machine consumes via leaseActor.cfg. Wired
+	// at backend construction (NewBackend and the test helpers
+	// newBackendForTest / newBackendForProvisionTest) and remain stable
+	// for the backend's lifetime. PR5 will inject these directly into
+	// the actor instead of routing through Backend; for PR4 the Backend
+	// is the canonical owner so test helpers can override them via the
+	// same mock surface that already exists.
+	inspector      leasesm.InstanceInspector
+	gatherer       leasesm.DiagnosticsGatherer
+	provisionStore leasesm.LeaseProvisionStore
 }
 
-// provision tracks provisioned containers for a lease.
-// A single lease may have multiple containers based on quantity.
+// provision wraps the substrate-agnostic leasesm.ProvisionState with
+// Docker-private state. The lease state machine reasons about the
+// embedded ProvisionState exclusively; substrate-private fields
+// (currently VolumeCleanupAttempts) live alongside it on this wrapper
+// so the lifecycle is structural — allocating a fresh *provision
+// resets every Docker-private counter, and deleting from b.provisions
+// drops the Docker-private state at the same time.
+//
+// Promoted-field access keeps existing call sites working: `p.LeaseUUID`,
+// `p.Status`, etc. resolve to the embedded ProvisionState fields via Go's
+// embedding rules. Sites that need the *ProvisionState pointer (e.g., the
+// backendProvisionStore adapter passing it to a LeaseProvisionStore.UpdateFn
+// closure) take &p.ProvisionState.
+//
+// History: prior to ENG-148 follow-up (commit superseding fde8633), this
+// was a type alias plus a parallel `b.volumeCleanupAttempts map[string]int`
+// guarded by b.provisionsMu. The parallel-map pattern required every
+// site that created or deleted a provisions entry to also handle the
+// parallel map under the same lock; provision.go's re-provision path
+// missed that invariant, leaking stale attempt counts across
+// re-provisions and causing premature give-ups on subsequent
+// Deprovision. The wrapper-struct pattern makes that bug class
+// structurally impossible.
 type provision struct {
-	LeaseUUID             string
-	Tenant                string
-	ProviderUUID          string
-	SKU                   string
-	ContainerIDs          []string // Multiple containers for multi-unit leases
-	Image                 string
-	Manifest              *DockerManifest // Single-manifest leases (mutually exclusive with StackManifest); persisted for restart/update.
-	Status                backend.ProvisionStatus
-	Quantity              int // Expected number of containers
-	CreatedAt             time.Time
-	FailCount             int    // Number of times provisioning has failed for this lease
-	VolumeCleanupAttempts int    // Number of failed volume cleanup attempts during deprovision
-	LastError             string // Last error message, queryable after failure
-	CallbackURL           string // URL to notify on provision completion
+	leasesm.ProvisionState
 
-	// Stack fields (set when IsStack() returns true)
-	StackManifest     *StackManifest      // Per-service manifests for stack deployments
-	ServiceContainers map[string][]string // service name → container IDs
-	Items             []backend.LeaseItem // Original lease items (preserved for stack operations)
+	// VolumeCleanupAttempts tracks how many times Deprovision has
+	// retried volume cleanup for this lease before either succeeding
+	// or hitting maxVolumeCleanupAttempts and giving up. Docker-private
+	// because volume cleanup is Docker-specific — K3s would implement
+	// deprovision retry differently.
+	VolumeCleanupAttempts int
 }
 
-// IsStack returns true when this provision represents a stack deployment.
-func (p *provision) IsStack() bool {
-	return p.StackManifest != nil
-}
-
-// shortID truncates a container/network ID to 12 characters for logging.
-// Uses Docker's stringid.TruncateID for consistency with Docker CLI output.
-func shortID(id string) string {
-	return stringid.TruncateID(id)
-}
+// shortID, diagnosticSnapshot, and containerLogKeys moved to
+// internal/backend/shared/leasesm at PR5b-2 BC-3 dedupe (task #19).
+// Docker callers now reach the canonical leasesm.{ShortID,
+// DiagnosticSnapshot, ContainerLogKeys} versions; the docker-side
+// duplicates that previously lived here have been removed.
 
 const (
 	diagnosticLogTail  = 20
@@ -184,32 +201,44 @@ const (
 	// (e.g., permission denied on files created by the container process).
 	// Stuck volumes require manual cleanup.
 	maxVolumeCleanupAttempts = 3
-
-	// errMsgContainerExited is the base error message for containers that
-	// exit unexpectedly, used by recoverState and failure callbacks.
-	errMsgContainerExited = "container exited unexpectedly"
-
-	// errMsgInternal is the hardcoded on-chain-safe callback message used
-	// when a worker goroutine panics. Full diagnostics (panic value,
-	// stack) go to provision.LastError and the structured log; the
-	// callback message itself stays generic so we don't leak internals
-	// on-chain.
-	errMsgInternal = "internal error"
 )
 
+// errMsgContainerExited / errMsgInternal moved to
+// internal/backend/shared/leasesm at PR5b-2 D — both strings are
+// on-chain callback payloads per the callback-error-sanitization
+// invariant; divergence between docker/ and leasesm/ copies could emit
+// different on-chain strings for the same failure. The canonical
+// constants live in leasesm/lease_sm.go (unexported sources) with
+// exported aliases leasesm.ErrMsgContainerExited / leasesm.ErrMsgInternal
+// that substrate adapters reach for.
+
 // containerFailureDiagnostics builds a diagnostic string from a failed
-// container's exit state and recent logs.
-func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID string, info *ContainerInfo) string {
+// container's exit state and recent logs. Takes a substrate-agnostic
+// *leasesm.InstanceState so callers in lease_sm/lease_actor/recover
+// don't need to handle the Docker-shaped *ContainerInfo at the seam;
+// non-SM callers (provision.go startup verify, waitForHealthy) convert
+// their *ContainerInfo via containerInfoToInstanceState before calling.
+//
+// state.ExitCode is dereferenced; a nil ExitCode is treated as 0 to
+// preserve the existing string format ("exit_code=0") for cases where
+// the container hasn't actually exited but diagnostics are gathered
+// anyway. The Docker-specific log fetch lives here because
+// b.docker.ContainerLogs is substrate-private.
+func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID string, state *leasesm.InstanceState) string {
 	var buf strings.Builder
-	fmt.Fprintf(&buf, "exit_code=%d", info.ExitCode)
-	if info.OOMKilled {
+	exitCode := 0
+	if state != nil && state.ExitCode != nil {
+		exitCode = *state.ExitCode
+	}
+	fmt.Fprintf(&buf, "exit_code=%d", exitCode)
+	if state != nil && state.OOMKilled {
 		buf.WriteString(", oom_killed=true")
 	}
 
 	logs, err := b.docker.ContainerLogs(ctx, containerID, diagnosticLogTail)
 	if err != nil {
 		b.logger.Warn("failed to fetch container logs for diagnostics",
-			"container_id", shortID(containerID), "error", err)
+			"container_id", leasesm.ShortID(containerID), "error", err)
 		return buf.String()
 	}
 	if logs != "" {
@@ -222,19 +251,6 @@ func (b *Backend) containerFailureDiagnostics(ctx context.Context, containerID s
 		s = s[:diagnosticMaxBytes-3] + "..."
 	}
 	return s
-}
-
-// diagnosticSnapshot captures provision fields needed for diagnostics persistence.
-// Built under provisionsMu so that persistDiagnostics can run without holding the lock.
-func diagnosticSnapshot(prov *provision) shared.DiagnosticEntry {
-	return shared.DiagnosticEntry{
-		LeaseUUID:    prov.LeaseUUID,
-		ProviderUUID: prov.ProviderUUID,
-		Tenant:       prov.Tenant,
-		Error:        prov.LastError,
-		FailCount:    prov.FailCount,
-		CreatedAt:    time.Now(),
-	}
 }
 
 // captureContainerLogs fetches logs from the given containerIDs for
@@ -264,7 +280,7 @@ func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[
 		logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
 		if err != nil {
 			b.logger.Debug("failed to fetch container logs for diagnostics persistence",
-				"container_id", shortID(cid), "error", err)
+				"container_id", leasesm.ShortID(cid), "error", err)
 			continue
 		}
 		key := fmt.Sprintf("%d", i)
@@ -334,15 +350,6 @@ func (b *Backend) persistDiagnosticsWithLogs(entry shared.DiagnosticEntry, logs 
 		b.logger.Warn("failed to persist failure diagnostics",
 			"lease_uuid", entry.LeaseUUID, "error", err)
 	}
-}
-
-// containerLogKeys builds a containerID → display key mapping for stack provisions.
-// Returns nil for non-stack provisions.
-func containerLogKeys(prov *provision) map[string]string {
-	if prov == nil || !prov.IsStack() {
-		return nil
-	}
-	return stackContainerLogKeys(prov.ServiceContainers)
 }
 
 // stackContainerLogKeys builds a containerID → display key mapping from a
@@ -449,7 +456,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
 		provisions:       make(map[string]*provision),
-		actors:           make(map[string]*leaseActor),
+		actors:           make(map[string]*leasesm.LeaseActor),
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,
@@ -473,6 +480,14 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 			callbackStoreErrorsTotal.Inc()
 		},
 	})
+
+	// Wire the substrate-agnostic seams the lease state machine consumes.
+	// Each adapter is a thin pass-through to the existing Docker-specific
+	// methods; they exist so the SM/actor can depend on leasesm.* without
+	// reaching back through *Backend at the seam.
+	b.inspector = &dockerInstanceInspector{docker: b.docker}
+	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
+	b.provisionStore = &backendProvisionStore{backend: b}
 
 	return b, nil
 }
@@ -618,7 +633,7 @@ func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, lo
 		// stop failed mid-loop for a multi-container lease.
 		info, inspectErr := b.docker.InspectContainer(ctx, cid)
 		if inspectErr != nil {
-			logger.Error("rollback: failed to inspect container", "container_id", shortID(cid), "error", inspectErr)
+			logger.Error("rollback: failed to inspect container", "container_id", leasesm.ShortID(cid), "error", inspectErr)
 			continue
 		}
 		if info.Status == "running" {
@@ -628,10 +643,10 @@ func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, lo
 
 		canonicalName := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
 		if renameErr := b.docker.RenameContainer(ctx, cid, canonicalName); renameErr != nil {
-			logger.Error("rollback: failed to rename container", "container_id", shortID(cid), "error", renameErr)
+			logger.Error("rollback: failed to rename container", "container_id", leasesm.ShortID(cid), "error", renameErr)
 		}
 		if err := b.docker.StartContainer(ctx, cid, 30*time.Second); err != nil {
-			logger.Error("rollback: failed to restart container", "container_id", shortID(cid), "error", err)
+			logger.Error("rollback: failed to restart container", "container_id", leasesm.ShortID(cid), "error", err)
 		} else {
 			restored++
 		}
@@ -665,8 +680,11 @@ func (b *Backend) sendCallbackWithURL(leaseUUID, callbackURL string, status back
 	b.callbackSender.SendCallback(leaseUUID, callbackURL, b.Name(), status, errMsg)
 }
 
-// removeProvision removes a provision reservation and its callback URL.
-// Used when pre-flight validation fails after the slot was reserved.
+// removeProvision removes a provision reservation. Used when pre-flight
+// validation fails after the slot was reserved. Because Docker-private
+// state (VolumeCleanupAttempts) is a field on the *provision wrapper,
+// the single map delete also drops every per-lease counter — no parallel
+// cleanup required.
 func (b *Backend) removeProvision(leaseUUID string) {
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)

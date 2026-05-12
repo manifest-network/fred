@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // IngressConfig holds configuration for reverse proxy integration.
@@ -111,7 +113,7 @@ func RouterName(leaseUUID, serviceName string, instanceIndex, quantity int) stri
 // SelectIngressPort picks the best TCP port for ingress routing.
 // Preference: ingress hint > 80 > 8080 > lowest TCP port number.
 // Returns (port, true) if a suitable port is found, (0, false) otherwise.
-func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
+func SelectIngressPort(ports map[string]manifest.PortConfig) (int, bool) {
 	if len(ports) == 0 {
 		return 0, false
 	}
@@ -121,7 +123,7 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 		if !cfg.Ingress {
 			continue
 		}
-		if port, ok := parseTCPPort(spec); ok {
+		if port, ok := manifest.ParseTCPPort(spec); ok {
 			return port, true
 		}
 	}
@@ -131,7 +133,7 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 	found := false
 
 	for spec := range ports {
-		port, ok := parseTCPPort(spec)
+		port, ok := manifest.ParseTCPPort(spec)
 		if !ok {
 			continue
 		}
@@ -152,21 +154,6 @@ func SelectIngressPort(ports map[string]PortConfig) (int, bool) {
 	}
 
 	return bestPort, found
-}
-
-// parseTCPPort extracts the port number from a "port/tcp" spec string
-// (case-insensitive protocol). Returns (port, true) for valid TCP specs,
-// (0, false) otherwise.
-func parseTCPPort(spec string) (int, bool) {
-	parts := strings.SplitN(spec, "/", 2)
-	if len(parts) != 2 || strings.ToLower(parts[1]) != "tcp" {
-		return 0, false
-	}
-	port, err := strconv.Atoi(parts[0])
-	if err != nil || port < 1 || port > 65535 {
-		return 0, false
-	}
-	return port, true
 }
 
 // TraefikLabels generates the Docker labels that Traefik uses for
@@ -291,7 +278,7 @@ type ingressLabelParams struct {
 // lease) and compose_project.go's buildComposeServiceConfig (stack).
 // Keeping the glue in one place ensures the two paths can never drift in
 // what they emit for the same logical item.
-func applyIngressLabels(labels map[string]string, p ingressLabelParams, ports map[string]PortConfig) {
+func applyIngressLabels(labels map[string]string, p ingressLabelParams, ports map[string]manifest.PortConfig) {
 	if !p.Ingress.Enabled {
 		return
 	}

@@ -17,6 +17,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // --- Restart tests ---
@@ -32,9 +34,8 @@ func TestRestart_NotProvisioned(t *testing.T) {
 
 func TestRestart_InvalidState_Provisioning(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusProvisioning},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -47,16 +48,15 @@ func TestRestart_InvalidState_Provisioning(t *testing.T) {
 }
 
 func TestRestart_AllowedFromFailed(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusFailed,
 			Manifest:     manifest,
-			ContainerIDs: []string{"old-c1"},
+			ContainerIDs: []string{"old-c1"}},
 		},
 	}
 
@@ -103,9 +103,8 @@ func TestRestart_AllowedFromFailed(t *testing.T) {
 
 func TestRestart_InvalidState_Restarting(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusRestarting,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusRestarting},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -118,9 +117,8 @@ func TestRestart_InvalidState_Restarting(t *testing.T) {
 
 func TestRestart_InvalidState_Updating(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusUpdating,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusUpdating},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -133,10 +131,9 @@ func TestRestart_InvalidState_Updating(t *testing.T) {
 
 func TestRestart_NoManifest(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
-			Manifest:  nil, // No stored manifest
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status:   backend.ProvisionStatusReady,
+			Manifest: nil}, // No stored manifest
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -149,16 +146,15 @@ func TestRestart_NoManifest(t *testing.T) {
 }
 
 func TestRestart_SetsRestartingStatus(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
-			ContainerIDs: []string{"old-c1"},
+			ContainerIDs: []string{"old-c1"}},
 		},
 	}
 
@@ -210,16 +206,15 @@ func TestRestart_SetsRestartingStatus(t *testing.T) {
 }
 
 func TestRestart_Success(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
-			ContainerIDs: []string{"old-c1"},
+			ContainerIDs: []string{"old-c1"}},
 		},
 	}
 
@@ -298,10 +293,9 @@ func TestRestart_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 	// secondary router survives across Restart cycles. Without the
 	// propagation, a Restart on a Ready provision would silently drop the
 	// custom-domain router on the new container.
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
@@ -311,7 +305,7 @@ func TestRestart_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
 			},
-			Quantity: 1,
+			Quantity: 1},
 		},
 	}
 
@@ -360,10 +354,9 @@ func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
 	// Backwards compat: provisions recovered before this feature shipped
 	// may have prov.Items unset (legacy pre-CustomDomain state). Restart
 	// must treat that as "no custom domain" without panicking.
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
@@ -371,7 +364,7 @@ func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
 			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
 			Items:        nil, // pre-feature recovered provision
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -416,17 +409,16 @@ func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
 }
 
 func TestRestart_Failure_ContainerStartFails(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
-			FailCount:    0,
+			FailCount:    0},
 		},
 	}
 
@@ -488,17 +480,16 @@ func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 }
 
 func TestRestart_Failure_SKUProfileLookupFails(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "unknown-sku",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
-			FailCount:    0,
+			FailCount:    0},
 		},
 	}
 
@@ -543,17 +534,16 @@ func TestRestart_Failure_SKUProfileLookupFails(t *testing.T) {
 }
 
 func TestRestart_MultipleContainers(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1", "old-c2"},
-			Quantity:     2,
+			Quantity:     2},
 		},
 	}
 
@@ -617,17 +607,16 @@ func TestRestart_MultipleContainers(t *testing.T) {
 }
 
 func TestRestart_UpdatesCallbackURL(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
-			CallbackURL:  "http://old-callback/url",
+			CallbackURL:  "http://old-callback/url"},
 		},
 	}
 
@@ -686,10 +675,9 @@ func TestUpdate_NotProvisioned(t *testing.T) {
 
 func TestUpdate_InvalidState_Provisioning(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusProvisioning,
-			SKU:       "docker-small",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusProvisioning,
+			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -703,10 +691,9 @@ func TestUpdate_InvalidState_Provisioning(t *testing.T) {
 
 func TestUpdate_InvalidState_Restarting(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusRestarting,
-			SKU:       "docker-small",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusRestarting,
+			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -720,10 +707,9 @@ func TestUpdate_InvalidState_Restarting(t *testing.T) {
 
 func TestUpdate_InvalidState_Updating(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusUpdating,
-			SKU:       "docker-small",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusUpdating,
+			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -737,14 +723,13 @@ func TestUpdate_InvalidState_Updating(t *testing.T) {
 
 func TestUpdate_AllowedFromReady(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -806,8 +791,7 @@ func TestUpdate_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 	// secondary router survives a manifest update without requiring a
 	// separate reconcile.
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
@@ -816,7 +800,7 @@ func TestUpdate_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 			Quantity:     1,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
-			},
+			}},
 		},
 	}
 
@@ -864,15 +848,14 @@ func TestUpdate_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 
 func TestUpdate_AllowedFromFailed(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusFailed,
 			ContainerIDs: []string{"old-c1"},
 			Quantity:     1,
-			FailCount:    2,
+			FailCount:    2},
 		},
 	}
 
@@ -928,10 +911,9 @@ func TestUpdate_AllowedFromFailed(t *testing.T) {
 
 func TestUpdate_InvalidManifest(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
-			SKU:       "docker-small",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
+			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -946,10 +928,9 @@ func TestUpdate_InvalidManifest(t *testing.T) {
 
 func TestUpdate_ImageNotAllowed(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
-			SKU:       "docker-small",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
+			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -964,14 +945,13 @@ func TestUpdate_ImageNotAllowed(t *testing.T) {
 
 func TestUpdate_SetsUpdatingStatus(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -1009,15 +989,14 @@ func TestUpdate_SetsUpdatingStatus(t *testing.T) {
 
 func TestUpdate_Failure_ImagePullFails(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"old-c1"},
 			Quantity:     1,
-			FailCount:    0,
+			FailCount:    0},
 		},
 	}
 
@@ -1080,14 +1059,13 @@ func TestUpdate_RecordsRelease(t *testing.T) {
 	defer releaseStore.Close()
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -1151,14 +1129,13 @@ func TestUpdate_ReleaseMarkedFailedOnError(t *testing.T) {
 	defer releaseStore.Close()
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -1203,14 +1180,13 @@ func TestUpdate_ReleaseMarkedFailedOnError(t *testing.T) {
 
 func TestUpdate_CleansUpNewContainersOnFailure(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -1265,8 +1241,7 @@ func TestUpdate_CleansUpNewContainersOnFailure(t *testing.T) {
 
 func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
@@ -1274,7 +1249,7 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 			ContainerIDs: []string{"old-c1"},
 			Quantity:     1,
 			Image:        "nginx:1.25",
-			Manifest:     &DockerManifest{Image: "nginx:1.25"},
+			Manifest:     &manifest.Manifest{Image: "nginx:1.25"}},
 		},
 	}
 
@@ -1330,10 +1305,9 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 }
 
 func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
-	oldManifest := &DockerManifest{Image: "postgres:17", Command: []string{"postgres"}}
+	oldManifest := &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
@@ -1341,7 +1315,7 @@ func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
 			Manifest:     oldManifest,
 			Image:        "postgres:17",
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -1430,10 +1404,9 @@ func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
 }
 
 func TestUpdate_RollbackFailed_SetsStatusFailed(t *testing.T) {
-	oldManifest := &DockerManifest{Image: "postgres:17", Command: []string{"postgres"}}
+	oldManifest := &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
@@ -1441,7 +1414,7 @@ func TestUpdate_RollbackFailed_SetsStatusFailed(t *testing.T) {
 			Manifest:     oldManifest,
 			Image:        "postgres:17",
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -1521,9 +1494,8 @@ func TestGetReleases_NotProvisioned(t *testing.T) {
 
 func TestGetReleases_NilReleaseStore(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -1556,9 +1528,8 @@ func TestGetReleases_WithReleases(t *testing.T) {
 	}))
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -1584,9 +1555,8 @@ func TestGetReleases_EmptyHistory(t *testing.T) {
 	defer releaseStore.Close()
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -1606,11 +1576,10 @@ func TestRecoverState_RestartingPreserved(t *testing.T) {
 		},
 	}
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:    "tenant-a",
 			Status:    backend.ProvisionStatusRestarting,
-			CreatedAt: time.Now(),
+			CreatedAt: time.Now()},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1631,11 +1600,10 @@ func TestRecoverState_UpdatingPreserved(t *testing.T) {
 		},
 	}
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:    "tenant-a",
 			Status:    backend.ProvisionStatusUpdating,
-			CreatedAt: time.Now(),
+			CreatedAt: time.Now()},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1666,14 +1634,13 @@ func TestDeprovision_CleansUpReleases(t *testing.T) {
 	}))
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -1838,16 +1805,15 @@ func TestRollbackContainers_InspectFails(t *testing.T) {
 }
 
 func TestRestart_RollbackClearsLastError(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
-			ContainerIDs: []string{"old-c1"},
+			ContainerIDs: []string{"old-c1"}},
 		},
 	}
 
@@ -1902,17 +1868,16 @@ func TestRestart_RollbackClearsLastError(t *testing.T) {
 }
 
 func TestConcurrentRestartAndUpdate_OnlyOneSucceeds(t *testing.T) {
-	manifest := &DockerManifest{Image: "nginx:latest"}
+	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
+			Quantity:     1},
 		},
 	}
 
@@ -2022,16 +1987,15 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 		defer callbackServer.Close()
 
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusReady,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
-				Quantity:     1,
+				Quantity:     1},
 			},
 		})
 		b.httpClient = callbackServer.Client()
@@ -2093,16 +2057,15 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 		defer callbackServer.Close()
 
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
-				Quantity:     1,
+				Quantity:     1},
 			},
 		})
 		b.httpClient = callbackServer.Client()
@@ -2159,16 +2122,15 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 		defer callbackServer.Close()
 
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
-				Quantity:     1,
+				Quantity:     1},
 			},
 		})
 		b.httpClient = callbackServer.Client()
@@ -2231,16 +2193,15 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 		defer callbackServer.Close()
 
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusReady,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
-				Quantity:     1,
+				Quantity:     1},
 			},
 		})
 		b.httpClient = callbackServer.Client()
@@ -2292,14 +2253,13 @@ func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
 		defer callbackServer.Close()
 
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusReady,
 				ContainerIDs: []string{"old-c1"},
-				Quantity:     1,
+				Quantity:     1},
 			},
 		})
 		b.httpClient = callbackServer.Client()
@@ -2353,16 +2313,15 @@ func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
 		defer callbackServer.Close()
 
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &DockerManifest{Image: "nginx:latest"},
+				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
 				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
-				Quantity:     1,
+				Quantity:     1},
 			},
 		})
 		b.httpClient = callbackServer.Client()

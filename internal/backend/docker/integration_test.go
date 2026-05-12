@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -219,7 +220,7 @@ func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("lifecycle-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -288,7 +289,7 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	leaseUUID1 := fmt.Sprintf("net-iso-1-%d", time.Now().UnixNano())
 	leaseUUID2 := fmt.Sprintf("net-iso-2-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -385,7 +386,7 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("hardening-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -457,7 +458,7 @@ func TestIntegration_Docker_DeprovisionIdempotent(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("idempotent-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -595,7 +596,7 @@ func TestIntegration_Docker_MultiContainerProvision(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("multi-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -655,7 +656,7 @@ func TestIntegration_Docker_ContainerKilled_Detected(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("killed-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -711,7 +712,7 @@ func TestIntegration_Docker_MultiContainer_PartialKill(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("partial-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -768,7 +769,7 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	leaseUUID := fmt.Sprintf("exit-%d", time.Now().UnixNano())
 
 	// Command ["false"] exits immediately with code 1
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"false"},
 	}
@@ -808,13 +809,13 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	leaseUUID := fmt.Sprintf("health-%d", time.Now().UnixNano())
 
 	// Health check ["CMD", "false"] always fails
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
-		HealthCheck: &HealthCheckConfig{
+		HealthCheck: &manifest.HealthCheckConfig{
 			Test:     []string{"CMD", "false"},
-			Interval: Duration(1 * time.Second),
-			Timeout:  Duration(1 * time.Second),
+			Interval: manifest.Duration(1 * time.Second),
+			Timeout:  manifest.Duration(1 * time.Second),
 			Retries:  1,
 		},
 	}
@@ -883,7 +884,7 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 
 	leaseUUID := fmt.Sprintf("cold-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -972,7 +973,7 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 
 	leaseUUID := fmt.Sprintf("cold-dead-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1039,10 +1040,10 @@ func TestIntegration_Docker_PortConflict(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("port-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
-		Ports: map[string]PortConfig{
+		Ports: map[string]manifest.PortConfig{
 			"80/tcp": {HostPort: 19876},
 		},
 	}
@@ -1136,7 +1137,7 @@ func TestIntegration_Docker_UnknownSKU_Rejected(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("bad-sku-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1182,7 +1183,7 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		leaseUUID := fmt.Sprintf("bad-manifest-%d", time.Now().UnixNano())
 
 		// Manifest with empty image
-		manifest := DockerManifest{
+		manifest := manifest.Manifest{
 			Image:   "",
 			Command: []string{"sleep", "3600"},
 		}
@@ -1209,7 +1210,7 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		leaseUUID := fmt.Sprintf("bad-registry-%d", time.Now().UnixNano())
 
 		// Use an image from a registry not in AllowedRegistries
-		manifest := DockerManifest{
+		manifest := manifest.Manifest{
 			Image:   "registry.evil.com/malware:latest",
 			Command: []string{"sleep", "3600"},
 		}
@@ -1262,7 +1263,7 @@ func TestIntegration_Docker_DuplicateProvision_Rejected(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("dup-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1320,7 +1321,7 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 
 	ctx := context.Background()
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1405,7 +1406,7 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 	leaseUUID2 := fmt.Sprintf("same-net-2-%d", time.Now().UnixNano())
 	leaseUUID3 := fmt.Sprintf("other-net-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1495,7 +1496,7 @@ func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("restart-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1578,7 +1579,7 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	leaseUUID := fmt.Sprintf("update-%d", time.Now().UnixNano())
 
 	// Provision with busybox
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1608,7 +1609,7 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	oldContainerID := containersBefore[0].ID
 
 	// Update to alpine
-	newManifest := DockerManifest{
+	newManifest := manifest.Manifest{
 		Image:   "alpine:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1663,7 +1664,7 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	leaseUUID := fmt.Sprintf("releases-%d", time.Now().UnixNano())
 
 	// Provision with busybox
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1688,7 +1689,7 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	}
 
 	// Update to alpine
-	newManifest := DockerManifest{
+	newManifest := manifest.Manifest{
 		Image:   "alpine:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1740,7 +1741,7 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("update-failed-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1783,7 +1784,7 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 
 	// Update with new manifest (should be allowed from Failed state)
-	newManifest := DockerManifest{
+	newManifest := manifest.Manifest{
 		Image:   "alpine:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1832,7 +1833,7 @@ func TestIntegration_Docker_RestartFromFailed(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("restart-invalid-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1909,7 +1910,7 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	leaseUUID := fmt.Sprintf("full-%d", time.Now().UnixNano())
 
 	// 1. Provision with busybox
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -1934,7 +1935,7 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	}
 
 	// 2. Update to alpine
-	newManifest := DockerManifest{
+	newManifest := manifest.Manifest{
 		Image:   "alpine:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2001,7 +2002,7 @@ func TestIntegration_Docker_MultiContainerRestart(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("multi-restart-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2073,7 +2074,7 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("multi-update-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2106,7 +2107,7 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	}
 
 	// Update to alpine
-	newManifest := DockerManifest{
+	newManifest := manifest.Manifest{
 		Image:   "alpine:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2154,7 +2155,7 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("bad-update-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2180,7 +2181,7 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	}
 
 	// Update with an image that doesn't exist (passes registry check, fails pull)
-	badManifest := DockerManifest{
+	badManifest := manifest.Manifest{
 		Image:   "busybox:this-tag-does-not-exist-xyz-99999",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2233,7 +2234,7 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	leaseUUID := fmt.Sprintf("seq-update-%d", time.Now().UnixNano())
 
 	// 1. Provision with busybox
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2258,7 +2259,7 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	}
 
 	// 2. Update to alpine
-	alpineManifest := DockerManifest{
+	alpineManifest := manifest.Manifest{
 		Image:   "alpine:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -2336,7 +2337,7 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	leaseUUID := fmt.Sprintf("restart-vol-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
@@ -2408,7 +2409,7 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	leaseUUID := fmt.Sprintf("update-vol-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
@@ -2439,7 +2440,7 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
 
 	// Update to a different redis tag (same VOLUME /data declaration)
-	newManifest := DockerManifest{
+	newManifest := manifest.Manifest{
 		Image:   "redis:7-alpine",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
@@ -2491,8 +2492,8 @@ func TestIntegration_Stack_ProvisionLifecycle(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-lifecycle-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 		},
@@ -2560,16 +2561,16 @@ func TestIntegration_Stack_HealthCheck(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-health-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db": {
 				Image:   "busybox:latest",
 				Command: []string{"sleep", "3600"},
-				HealthCheck: &HealthCheckConfig{
+				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD", "true"},
-					Interval: Duration(1 * time.Second),
-					Timeout:  Duration(1 * time.Second),
+					Interval: manifest.Duration(1 * time.Second),
+					Timeout:  manifest.Duration(1 * time.Second),
 					Retries:  3,
 				},
 			},
@@ -2616,16 +2617,16 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-health-fail-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db": {
 				Image:   "busybox:latest",
 				Command: []string{"sleep", "3600"},
-				HealthCheck: &HealthCheckConfig{
+				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD", "false"},
-					Interval: Duration(1 * time.Second),
-					Timeout:  Duration(1 * time.Second),
+					Interval: manifest.Duration(1 * time.Second),
+					Timeout:  manifest.Duration(1 * time.Second),
 					Retries:  1,
 				},
 			},
@@ -2661,12 +2662,12 @@ func TestIntegration_Stack_DependsOn(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-depends-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image:   "busybox:latest",
 				Command: []string{"sleep", "3600"},
-				DependsOn: map[string]DependsOnCondition{
+				DependsOn: map[string]manifest.DependsOnCondition{
 					"db": {Condition: "service_started"},
 				},
 			},
@@ -2713,22 +2714,22 @@ func TestIntegration_Stack_DependsOnHealthy(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-depends-healthy-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image:   "busybox:latest",
 				Command: []string{"sleep", "3600"},
-				DependsOn: map[string]DependsOnCondition{
+				DependsOn: map[string]manifest.DependsOnCondition{
 					"db": {Condition: "service_healthy"},
 				},
 			},
 			"db": {
 				Image:   "busybox:latest",
 				Command: []string{"sleep", "3600"},
-				HealthCheck: &HealthCheckConfig{
+				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD", "true"},
-					Interval: Duration(1 * time.Second),
-					Timeout:  Duration(1 * time.Second),
+					Interval: manifest.Duration(1 * time.Second),
+					Timeout:  manifest.Duration(1 * time.Second),
 					Retries:  3,
 				},
 			},
@@ -2777,8 +2778,8 @@ func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
 	// web resolves db by DNS name — if resolution works, the services share a network.
 	// Use nslookup instead of ping because cap_drop: ALL removes NET_RAW.
 	// Retry loop handles the race where db hasn't registered in Docker DNS yet.
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image:   "busybox:latest",
 				Command: []string{"sh", "-c", "for i in 1 2 3 4 5; do nslookup db && break; sleep 1; done; sleep 3600"},
@@ -2841,8 +2842,8 @@ func TestIntegration_Stack_Restart(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-restart-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 		},
@@ -2909,8 +2910,8 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-update-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 		},
@@ -2935,8 +2936,8 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
 
 	// Update both services to alpine
-	updatedStack := StackManifest{
-		Services: map[string]*DockerManifest{
+	updatedStack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
 		},
@@ -2979,8 +2980,8 @@ func TestIntegration_Stack_Deprovision(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-deprov-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 		},
@@ -3027,8 +3028,8 @@ func TestIntegration_Stack_MultiQuantity(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-multi-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 		},
@@ -3081,8 +3082,8 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("stack-full-%d", time.Now().UnixNano())
 
-	stack := StackManifest{
-		Services: map[string]*DockerManifest{
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
 		},
@@ -3124,8 +3125,8 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 
 	// Step 3: Update to alpine
-	updatedStack := StackManifest{
-		Services: map[string]*DockerManifest{
+	updatedStack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
 			"db":  {Image: "alpine:latest", Command: []string{"sleep", "3600"}},
 		},

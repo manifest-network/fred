@@ -32,6 +32,7 @@ import (
 	"github.com/docker/go-connections/nat"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // Labels used for tracking managed containers.
@@ -787,7 +788,7 @@ type CreateContainerParams struct {
 	ProviderUUID  string
 	SKU           string
 	ServiceName   string // Stack service name (empty for single-container leases)
-	Manifest      *DockerManifest
+	Manifest      *manifest.Manifest
 	Profile       SKUProfile
 	InstanceIndex int // For multi-unit leases (0-based index)
 
@@ -866,7 +867,7 @@ func isPortBindingError(err error) bool {
 // port (HostPort == 0 or empty, meaning Docker assigns a random port).
 // Returns false only when all ports have an explicit HostPort, in which
 // case retrying a port conflict won't help.
-func hasEphemeralPorts(ports map[string]PortConfig) bool {
+func hasEphemeralPorts(ports map[string]manifest.PortConfig) bool {
 	if len(ports) == 0 {
 		return false // No ports, no conflicts to retry
 	}

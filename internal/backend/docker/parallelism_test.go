@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // TestCrossLeaseParallelism measures whether container-death events on
@@ -62,12 +63,11 @@ func TestCrossLeaseParallelism(t *testing.T) {
 	provisions := make(map[string]*provision, numLeases)
 	for i := 0; i < numLeases; i++ {
 		uuid := fmt.Sprintf("lease-%d", i)
-		provisions[uuid] = &provision{
-			LeaseUUID:    uuid,
+		provisions[uuid] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: uuid,
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{fmt.Sprintf("c-%d", i)},
 			Status:       backend.ProvisionStatusReady,
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		}
 	}
 	b := newBackendForTest(mock, provisions)
@@ -83,7 +83,7 @@ func TestCrossLeaseParallelism(t *testing.T) {
 		// Use the fire-and-forget actor dispatch path (what the production
 		// event loop uses), not the synchronous shim.
 		if leaseUUID, found := b.findLeaseByContainerID(cid); found {
-			b.actorFor(leaseUUID).send(containerDiedMsg{containerID: cid})
+			b.actorFor(leaseUUID).TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: cid})
 		}
 	}
 	dispatchElapsed := time.Since(start)
@@ -146,11 +146,10 @@ func TestCrossLeaseInboxBackpressure(t *testing.T) {
 		containerIDs[i] = fmt.Sprintf("c-%d", i)
 	}
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: containerIDs,
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(mock, provisions)
@@ -163,7 +162,7 @@ func TestCrossLeaseInboxBackpressure(t *testing.T) {
 	go func() {
 		defer close(dispatchDone)
 		for _, cid := range containerIDs {
-			b.actorFor("lease-1").send(containerDiedMsg{containerID: cid})
+			b.actorFor("lease-1").TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: cid})
 		}
 	}()
 

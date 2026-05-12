@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
@@ -45,12 +46,11 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusReady,
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		},
 	})
 	b.httpClient = callbackServer.Client()
@@ -79,7 +79,7 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	assert.Equal(t, 1, prov.FailCount)
-	assert.Contains(t, prov.LastError, errMsgContainerExited)
+	assert.Contains(t, prov.LastError, leasesm.ErrMsgContainerExited)
 	b.provisionsMu.RUnlock()
 
 	// Verify callback was sent.
@@ -107,11 +107,10 @@ func TestContainerEventLoop_IgnoresNonReadyLease(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusRestarting,
+			Status:       backend.ProvisionStatusRestarting},
 		},
 	})
 	defer b.stopCancel()
@@ -188,10 +187,9 @@ func TestHandleContainerDeath_UnknownContainer(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady,
+			Status:       backend.ProvisionStatusReady},
 		},
 	})
 
@@ -221,11 +219,10 @@ func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusDeprovisioning,
-			FailCount:    0,
+			FailCount:    0},
 		},
 	})
 
@@ -251,13 +248,11 @@ func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
 
 func TestFindLeaseByContainerID(t *testing.T) {
 	b := newBackendForTest(nil, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			ContainerIDs: []string{"c1", "c2"},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			ContainerIDs: []string{"c1", "c2"}},
 		},
-		"lease-2": {
-			LeaseUUID:    "lease-2",
-			ContainerIDs: []string{"c3"},
+		"lease-2": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-2",
+			ContainerIDs: []string{"c3"}},
 		},
 	})
 

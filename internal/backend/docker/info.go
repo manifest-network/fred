@@ -6,6 +6,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // GetReleases returns the release history for a lease.
@@ -110,7 +112,7 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 func inspectToInstance(info *ContainerInfo) backend.LeaseInstance {
 	inst := backend.LeaseInstance{
 		InstanceIndex: info.InstanceIndex,
-		ContainerID:   shortID(info.ContainerID),
+		ContainerID:   leasesm.ShortID(info.ContainerID),
 		Image:         info.Image,
 		Status:        info.Status,
 		FQDN:          info.FQDN,
@@ -234,7 +236,7 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 							"lease_uuid", leaseUUID,
 							"service", svcName,
 							"instance", i,
-							"container_id", shortID(containerID),
+							"container_id", leasesm.ShortID(containerID),
 							"error", err,
 						)
 						result[key] = fmt.Sprintf("<error: %s>", err)
@@ -254,7 +256,7 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 				b.logger.Warn("failed to retrieve container logs",
 					"lease_uuid", leaseUUID,
 					"instance", i,
-					"container_id", shortID(containerID),
+					"container_id", leasesm.ShortID(containerID),
 					"error", err,
 				)
 				result[fmt.Sprintf("%d", i)] = fmt.Sprintf("<error: %s>", err)
@@ -307,7 +309,7 @@ func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo 
 
 // serviceImages extracts a service name → image map from a StackManifest.
 // Returns nil if the manifest is nil (e.g., after cold restart with no release store).
-func serviceImages(sm *StackManifest) map[string]string {
+func serviceImages(sm *manifest.StackManifest) map[string]string {
 	if sm == nil {
 		return nil
 	}

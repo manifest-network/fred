@@ -12,6 +12,7 @@ import (
 	composeapi "github.com/docker/compose/v2/pkg/api"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // composeProjectParams holds all inputs for building a Compose project.
@@ -22,7 +23,7 @@ type composeProjectParams struct {
 	CallbackURL  string
 	BackendName  string
 	FailCount    int
-	Stack        *StackManifest
+	Stack        *manifest.StackManifest
 	Items        []backend.LeaseItem
 	Profiles     map[string]SKUProfile
 	ImageSetups  map[string]*imageSetup
@@ -163,7 +164,7 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 // applyDependsOn maps manifest-level depends_on to Compose DependsOnConfig.
 // It handles fan-out expansion: if service "web" depends on "db" and "db"
 // has quantity 2, then each "web" instance depends on both "db-0" and "db-1".
-func applyDependsOn(services composetypes.Services, stack *StackManifest, items []backend.LeaseItem) {
+func applyDependsOn(services composetypes.Services, stack *manifest.StackManifest, items []backend.LeaseItem) {
 	// Build a map of service name → quantity for fan-out.
 	qty := make(map[string]int, len(items))
 	for _, item := range items {
@@ -172,14 +173,14 @@ func applyDependsOn(services composetypes.Services, stack *StackManifest, items 
 
 	for _, item := range items {
 		svcName := item.ServiceName
-		manifest := stack.Services[svcName]
-		if len(manifest.DependsOn) == 0 {
+		m := stack.Services[svcName]
+		if len(m.DependsOn) == 0 {
 			continue
 		}
 
 		// Build the Compose DependsOnConfig for this service.
 		depConfig := make(composetypes.DependsOnConfig)
-		for depName, cond := range manifest.DependsOn {
+		for depName, cond := range m.DependsOn {
 			depQty := qty[depName]
 			if depQty <= 1 {
 				// Simple: depends on the single instance (no suffix).
@@ -226,7 +227,7 @@ type composeServiceParams struct {
 	ServiceName  string
 	Instance     int
 	SKU          string
-	Manifest     *DockerManifest
+	Manifest     *manifest.Manifest
 	Profile      SKUProfile
 	ImgSetup     *imageSetup
 	NetworkName  string

@@ -12,6 +12,8 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestParseLabelMeta(t *testing.T) {
@@ -284,7 +286,7 @@ func TestValidateAdoption(t *testing.T) {
 	)
 	params := CreateContainerParams{
 		LeaseUUID:   lease,
-		Manifest:    &DockerManifest{Image: image},
+		Manifest:    &manifest.Manifest{Image: image},
 		FailCount:   0,
 		BackendName: backend,
 	}

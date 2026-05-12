@@ -16,15 +16,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // validStackManifestJSON builds a minimal valid stack manifest payload.
 func validStackManifestJSON(services map[string]string) []byte {
-	svcMap := make(map[string]*DockerManifest, len(services))
+	svcMap := make(map[string]*manifest.Manifest, len(services))
 	for name, image := range services {
-		svcMap[name] = &DockerManifest{Image: image}
+		svcMap[name] = &manifest.Manifest{Image: image}
 	}
-	sm := StackManifest{Services: svcMap}
+	sm := manifest.StackManifest{Services: svcMap}
 	b, _ := json.Marshal(sm)
 	return b
 }
@@ -76,17 +78,16 @@ func TestStackContainerLogKeys(t *testing.T) {
 	})
 
 	t.Run("containerLogKeys with stack provision", func(t *testing.T) {
-		prov := &provision{
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
-					"web": {Image: "nginx"},
-				},
+		prov := &provision{ProvisionState: leasesm.ProvisionState{StackManifest: &manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{
+				"web": {Image: "nginx"},
 			},
+		},
 			ServiceContainers: map[string][]string{
 				"web": {"c1", "c2"},
-			},
+			}},
 		}
-		keys := containerLogKeys(prov)
+		keys := leasesm.ContainerLogKeys(&prov.ProvisionState)
 		assert.Equal(t, map[string]string{
 			"c1": "web/0",
 			"c2": "web/1",
@@ -94,14 +95,12 @@ func TestStackContainerLogKeys(t *testing.T) {
 	})
 
 	t.Run("containerLogKeys with non-stack provision", func(t *testing.T) {
-		prov := &provision{
-			ContainerIDs: []string{"c1"},
-		}
-		assert.Nil(t, containerLogKeys(prov))
+		prov := &provision{ProvisionState: leasesm.ProvisionState{ContainerIDs: []string{"c1"}}}
+		assert.Nil(t, leasesm.ContainerLogKeys(&prov.ProvisionState))
 	})
 
 	t.Run("containerLogKeys with nil provision", func(t *testing.T) {
-		assert.Nil(t, containerLogKeys(nil))
+		assert.Nil(t, leasesm.ContainerLogKeys(nil))
 	})
 }
 
@@ -198,14 +197,14 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 	// "web" has a health check, "db" does not.
 	// Both should succeed if per-service health check verification works correctly.
-	payload, _ := json.Marshal(StackManifest{
-		Services: map[string]*DockerManifest{
+	payload, _ := json.Marshal(manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {
 				Image: "nginx:latest",
-				HealthCheck: &HealthCheckConfig{
+				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD-SHELL", "curl -f http://localhost/"},
-					Interval: Duration(1 * time.Second),
-					Timeout:  Duration(1 * time.Second),
+					Interval: manifest.Duration(1 * time.Second),
+					Timeout:  manifest.Duration(1 * time.Second),
 					Retries:  2,
 				},
 			},
@@ -316,8 +315,7 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    1,
 			Quantity:     2,
@@ -327,12 +325,12 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 				"web": {"old-web-c1"},
 				"db":  {"old-db-c1"},
 			},
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx:latest"},
 					"db":  {Image: "postgres:16"},
 				},
-			},
+			}},
 		},
 	})
 	b.compose = composeMock
@@ -398,8 +396,8 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 // --- Stack Restart tests ---
 
 func TestStackRestart_Success(t *testing.T) {
-	stackManifest := &StackManifest{
-		Services: map[string]*DockerManifest{
+	stackManifest := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:latest"},
 			"db":  {Image: "postgres:16"},
 		},
@@ -410,8 +408,7 @@ func TestStackRestart_Success(t *testing.T) {
 	}
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:     "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:        "tenant-a",
 			ProviderUUID:  "prov-1",
 			SKU:           "docker-small",
@@ -422,7 +419,7 @@ func TestStackRestart_Success(t *testing.T) {
 				"web": {"old-web"},
 				"db":  {"old-db"},
 			},
-			Items: items,
+			Items: items},
 		},
 	}
 
@@ -505,8 +502,8 @@ func TestStackRestart_Success(t *testing.T) {
 }
 
 func TestStackRestart_FailureRollsBack(t *testing.T) {
-	stackManifest := &StackManifest{
-		Services: map[string]*DockerManifest{
+	stackManifest := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:latest"},
 			"db":  {Image: "postgres:16"},
 		},
@@ -517,8 +514,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 	}
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:     "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:        "tenant-a",
 			ProviderUUID:  "prov-1",
 			SKU:           "docker-small",
@@ -529,7 +525,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 				"web": {"old-web"},
 				"db":  {"old-db"},
 			},
-			Items: items,
+			Items: items},
 		},
 	}
 
@@ -615,8 +611,8 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 // --- Stack Update tests ---
 
 func TestStackUpdate_Success(t *testing.T) {
-	oldStack := &StackManifest{
-		Services: map[string]*DockerManifest{
+	oldStack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:1.24"},
 			"db":  {Image: "postgres:15"},
 		},
@@ -627,8 +623,7 @@ func TestStackUpdate_Success(t *testing.T) {
 	}
 
 	provisions := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:     "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:        "tenant-a",
 			ProviderUUID:  "prov-1",
 			SKU:           "docker-small",
@@ -639,7 +634,7 @@ func TestStackUpdate_Success(t *testing.T) {
 				"web": {"old-web"},
 				"db":  {"old-db"},
 			},
-			Items: items,
+			Items: items},
 		},
 	}
 
@@ -700,7 +695,7 @@ func TestStackUpdate_Success(t *testing.T) {
 
 	assert.Equal(t, backend.CallbackStatusSuccess, callbackPayload.Status)
 
-	// Verify OnSuccess updated the StackManifest.
+	// Verify OnSuccess updated the manifest.StackManifest.
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	status := prov.Status
@@ -721,11 +716,10 @@ func TestStackUpdate_Success(t *testing.T) {
 func TestStackUpdate_PayloadTypeMismatch(t *testing.T) {
 	t.Run("stack lease with single manifest payload", func(t *testing.T) {
 		provisions := map[string]*provision{
-			"lease-1": {
-				LeaseUUID:     "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Status:        backend.ProvisionStatusReady,
-				StackManifest: &StackManifest{Services: map[string]*DockerManifest{"web": {Image: "nginx"}}},
-				Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}},
+				StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx"}}},
+				Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}}},
 			},
 		}
 		b := newBackendForProvisionTest(t, &mockDockerClient{}, provisions)
@@ -740,11 +734,10 @@ func TestStackUpdate_PayloadTypeMismatch(t *testing.T) {
 
 	t.Run("non-stack lease with stack manifest payload", func(t *testing.T) {
 		provisions := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
-				Status:    backend.ProvisionStatusReady,
-				Manifest:  &DockerManifest{Image: "nginx"},
-				SKU:       "docker-small",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+				Status:   backend.ProvisionStatusReady,
+				Manifest: &manifest.Manifest{Image: "nginx"},
+				SKU:      "docker-small"},
 			},
 		}
 		b := newBackendForProvisionTest(t, &mockDockerClient{}, provisions)
@@ -788,11 +781,10 @@ func TestGetInfo_Stack(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx:latest"},
 					"db":  {Image: "postgres:16"},
 				},
@@ -801,7 +793,7 @@ func TestGetInfo_Stack(t *testing.T) {
 			ServiceContainers: map[string][]string{
 				"web": {"web-c1"},
 				"db":  {"db-c1"},
-			},
+			}},
 		},
 	})
 	b.cfg.HostAddress = "10.0.0.1"
@@ -840,11 +832,10 @@ func TestGetLogs_Stack(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx"},
 					"db":  {Image: "postgres"},
 				},
@@ -853,7 +844,7 @@ func TestGetLogs_Stack(t *testing.T) {
 			ServiceContainers: map[string][]string{
 				"web": {"web-c1"},
 				"db":  {"db-c1"},
-			},
+			}},
 		},
 	})
 
@@ -872,16 +863,15 @@ func TestGetLogs_Stack_MultiInstance(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Status:    backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{"web": {Image: "nginx"}},
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{"web": {Image: "nginx"}},
 			},
 			ContainerIDs: []string{"w1", "w2"},
 			ServiceContainers: map[string][]string{
 				"web": {"w1", "w2"},
-			},
+			}},
 		},
 	})
 
@@ -918,13 +908,12 @@ func TestDeprovision_Stack(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  2,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant:   "tenant-a",
+			Status:   backend.ProvisionStatusReady,
+			Quantity: 2,
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx"},
 					"db":  {Image: "postgres"},
 				},
@@ -934,7 +923,7 @@ func TestDeprovision_Stack(t *testing.T) {
 				"web": {"web-c1"},
 				"db":  {"db-c1"},
 			},
-			Items: items,
+			Items: items},
 		},
 	})
 	b.compose = composeMock
@@ -1080,14 +1069,13 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			StackManifest: &StackManifest{
-				Services: map[string]*DockerManifest{
+			StackManifest: &manifest.StackManifest{
+				Services: map[string]*manifest.Manifest{
 					"web": {Image: "nginx"},
 					"db":  {Image: "postgres"},
 				},
@@ -1097,7 +1085,7 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 				"web": {"web-c1"},
 				"db":  {"db-c1"},
 			},
-			Items: items,
+			Items: items},
 		},
 	})
 	b.compose = composeMock

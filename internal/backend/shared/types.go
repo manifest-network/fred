@@ -5,8 +5,9 @@
 //
 //   - SKUProfile, ResourceStats, ResourceAllocator (resources.go) — the
 //     resource pool primitives used by every backend that tracks CPU/memory/disk
-//   - Registry (registry.go) — generic provision-record store with status
-//     transitions and concurrency guards
+//   - Registry helpers (registry.go) — image-registry parsing + allowlist
+//     validation (ParseRegistry, IsImageAllowed, ValidateImage) used by
+//     substrate adapters to enforce per-tenant image policy
 //   - CallbackSender (callback_sender.go) — HMAC-signed callback delivery
 //     with bbolt-backed persistence so failure callbacks survive restarts
 //   - BoltStore (bolt_store.go) — small wrapper around bbolt used by the

@@ -1,4 +1,4 @@
-package docker
+package workbarrier
 
 import (
 	"runtime"
@@ -14,7 +14,7 @@ import (
 // TestWorkBarrier_ZeroAtStart: a fresh barrier has count=0, so Zero()
 // must return an already-closed channel so callers don't block.
 func TestWorkBarrier_ZeroAtStart(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 	select {
 	case <-b.Zero():
 	case <-time.After(50 * time.Millisecond):
@@ -25,7 +25,7 @@ func TestWorkBarrier_ZeroAtStart(t *testing.T) {
 // TestWorkBarrier_BlocksUntilDone: Add() installs an open zeroCh;
 // Zero() blocks; Done() closes it.
 func TestWorkBarrier_BlocksUntilDone(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 	b.Add()
 
 	ch := b.Zero()
@@ -46,7 +46,7 @@ func TestWorkBarrier_BlocksUntilDone(t *testing.T) {
 // TestWorkBarrier_MultipleAddDone: only the final Done (count→0)
 // closes the channel.
 func TestWorkBarrier_MultipleAddDone(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 	b.Add()
 	b.Add()
 	b.Add()
@@ -73,7 +73,7 @@ func TestWorkBarrier_MultipleAddDone(t *testing.T) {
 // got the prior (closed) zeroCh sees it closed — but a new Zero()
 // call returns the fresh un-closed channel.
 func TestWorkBarrier_ResetAfterDone(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 	b.Add()
 	stale := b.Zero()
 	b.Done()
@@ -114,7 +114,7 @@ func TestWorkBarrier_ResetAfterDone(t *testing.T) {
 // TestWorkBarrier_DonePanicsOnZero: Done with count=0 catches
 // mismatched Add/Done pairs (mirrors sync.WaitGroup semantics).
 func TestWorkBarrier_DonePanicsOnZero(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 	assert.Panics(t, func() { b.Done() },
 		"Done() with count=0 must panic")
 }
@@ -123,7 +123,7 @@ func TestWorkBarrier_DonePanicsOnZero(t *testing.T) {
 // Add/Done pairs. Must pass -race. Final Zero() resolves after all
 // goroutines Done.
 func TestWorkBarrier_ConcurrentAddDone(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 	const N = 1000
 
 	var wg sync.WaitGroup
@@ -148,7 +148,7 @@ func TestWorkBarrier_ConcurrentAddDone(t *testing.T) {
 
 // TestWorkBarrier_NoGoroutineLeak is the critical test: verify that
 // many wait-with-timeout cycles never increase the runtime goroutine
-// count. This is the whole reason workBarrier exists. If this test
+// count. This is the whole reason Barrier exists. If this test
 // regresses, the primitive no longer solves the problem.
 func TestWorkBarrier_NoGoroutineLeak(t *testing.T) {
 	// Baseline goroutine count.
@@ -158,7 +158,7 @@ func TestWorkBarrier_NoGoroutineLeak(t *testing.T) {
 
 	const cycles = 200
 	for i := 0; i < cycles; i++ {
-		b := newWorkBarrier()
+		b := New()
 		b.Add()
 		// Simulate a "wedged" worker: never Done. Select with a short
 		// timeout and bail. A sync.WaitGroup-based pattern would leak
@@ -181,14 +181,14 @@ func TestWorkBarrier_NoGoroutineLeak(t *testing.T) {
 	// The critical property: we did NOT grow by ~`cycles`.
 	delta := after - before
 	assert.LessOrEqualf(t, delta, 2,
-		"workBarrier must not spawn goroutines: delta=%d after %d wait cycles (before=%d, after=%d)",
+		"Barrier must not spawn goroutines: delta=%d after %d wait cycles (before=%d, after=%d)",
 		delta, cycles, before, after)
 }
 
 // TestWorkBarrier_MultipleWaitersOnSameZero: two concurrent waiters
 // selecting on the same zeroCh both unblock on the final Done.
 func TestWorkBarrier_MultipleWaitersOnSameZero(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 	b.Add()
 
 	var unblocked atomic.Int32
@@ -218,7 +218,7 @@ func TestWorkBarrier_MultipleWaitersOnSameZero(t *testing.T) {
 // without leaking.
 func TestWorkBarrier_SelectWithTimeout(t *testing.T) {
 	t.Run("zero arm fires when workers finish", func(t *testing.T) {
-		b := newWorkBarrier()
+		b := New()
 		b.Add()
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -232,7 +232,7 @@ func TestWorkBarrier_SelectWithTimeout(t *testing.T) {
 	})
 
 	t.Run("timeout arm fires when worker never exits", func(t *testing.T) {
-		b := newWorkBarrier()
+		b := New()
 		b.Add()
 		// No Done() — simulate wedged worker.
 		select {
@@ -256,7 +256,7 @@ func TestWorkBarrier_SelectWithTimeout(t *testing.T) {
 // caller's snapshot — reading a closed channel remains non-blocking.
 // A fresh Zero() call sees the new (un-closed) channel.
 func TestWorkBarrier_ZeroSnapshotSurvivesAdd(t *testing.T) {
-	b := newWorkBarrier()
+	b := New()
 
 	snapshot := b.Zero()
 	select {
@@ -299,7 +299,7 @@ func TestWorkBarrier_UnderRaceDetector(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
 	}
-	b := newWorkBarrier()
+	b := New()
 	const workers = 50
 	const reps = 200
 

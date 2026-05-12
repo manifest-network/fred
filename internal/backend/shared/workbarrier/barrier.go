@@ -1,8 +1,12 @@
-package docker
+// Package workbarrier provides a reference-counted barrier whose zero
+// signal is exposed as a real channel, so callers can wait-with-timeout
+// using a plain select without spawning helper goroutines that would
+// leak when the count never drops to zero.
+package workbarrier
 
 import "sync"
 
-// workBarrier is a reference-counted barrier that exposes a channel
+// Barrier is a reference-counted barrier that exposes a channel
 // which closes whenever the count reaches zero. It exists so callers
 // can implement "wait for all workers to finish, with a timeout" using
 // a plain `select` — without spawning a helper goroutine that would
@@ -13,17 +17,18 @@ import "sync"
 // calls wg.Wait() and closes a channel when it returns, then racing
 // that channel against a timer. If the timer wins, the waiter goroutine
 // is stuck on wg.Wait() forever (it only exits once the count reaches
-// zero). In the actor model here, `waitForWorkers` is called on every
-// SM transition out of a work-owning state AND on actor exit — so the
-// pathological case (wedged worker) compounds into multiple leaked
-// waiter goroutines per wedged worker. workBarrier closes that gap by
-// making the "count reached zero" signal a real channel that callers
-// can select on directly.
+// zero). In the actor model that consumes this primitive,
+// `waitForWorkers` is called on every SM transition out of a
+// work-owning state AND on actor exit — so the pathological case
+// (wedged worker) compounds into multiple leaked waiter goroutines
+// per wedged worker. Barrier closes that gap by making the "count
+// reached zero" signal a real channel that callers can select on
+// directly.
 //
 // # Invariants
 //
 //  1. count >= 0 at all times.
-//  2. zeroCh is always non-nil (initialized by newWorkBarrier).
+//  2. zeroCh is always non-nil (initialized by New).
 //  3. A Zero() call returns a channel `ch` such that `ch` is closed
 //     exactly when count has transitioned to zero via Done — or was
 //     zero at the time Zero() was called.
@@ -48,7 +53,7 @@ import "sync"
 //	case <-b.Zero():
 //	    // all workers finished
 //	case <-time.After(timeout):
-//	    // gave up waiting — no goroutine spawned by workBarrier
+//	    // gave up waiting — no goroutine spawned by Barrier
 //	}
 //
 // # Correctness argument
@@ -58,7 +63,7 @@ import "sync"
 // cases:
 //
 //   - If count == 0 when Zero() runs, the snapshot is a channel that
-//     was closed by the most recent N→0 Done (or by newWorkBarrier).
+//     was closed by the most recent N→0 Done (or by New).
 //     The caller immediately unblocks.
 //   - If count > 0 when Zero() runs, the snapshot is a channel that
 //     will be closed by the next N→0 Done. The caller blocks until
@@ -72,19 +77,21 @@ import "sync"
 // Done panics if called when count is already 0: this catches the
 // caller-side bug of mismatched Add/Done pairs, mirroring
 // sync.WaitGroup semantics.
-type workBarrier struct {
+type Barrier struct {
 	mu     sync.Mutex
 	count  int
 	zeroCh chan struct{}
 }
 
-func newWorkBarrier() *workBarrier {
+// New returns a Barrier with count zero. Zero() on a freshly constructed
+// Barrier returns an already-closed channel.
+func New() *Barrier {
 	ch := make(chan struct{})
 	close(ch)
-	return &workBarrier{zeroCh: ch}
+	return &Barrier{zeroCh: ch}
 }
 
-func (b *workBarrier) Add() {
+func (b *Barrier) Add() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.count == 0 {
@@ -93,11 +100,11 @@ func (b *workBarrier) Add() {
 	b.count++
 }
 
-func (b *workBarrier) Done() {
+func (b *Barrier) Done() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.count == 0 {
-		panic("workBarrier: Done called with count 0")
+		panic("workbarrier: Done called with count 0")
 	}
 	b.count--
 	if b.count == 0 {
@@ -109,7 +116,7 @@ func (b *workBarrier) Done() {
 // reaches zero. The channel snapshot is valid for exactly one wait
 // cycle — callers that wait again after a subsequent 0→1 transition
 // must call Zero() again to get the fresh channel.
-func (b *workBarrier) Zero() <-chan struct{} {
+func (b *Barrier) Zero() <-chan struct{} {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.zeroCh

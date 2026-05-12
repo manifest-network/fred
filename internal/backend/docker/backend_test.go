@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestParseManifest(t *testing.T) {
@@ -37,7 +38,7 @@ func TestParseManifest(t *testing.T) {
 			}
 		}`
 
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 
 		assert.Equal(t, "nginx:1.25-alpine", m.Image)
@@ -50,42 +51,42 @@ func TestParseManifest(t *testing.T) {
 	t.Run("minimal manifest", func(t *testing.T) {
 		data := `{"image": "nginx"}`
 
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 
 		assert.Equal(t, "nginx", m.Image)
 	})
 
 	t.Run("empty manifest", func(t *testing.T) {
-		_, err := ParseManifest([]byte{})
+		_, err := manifest.ParseManifest([]byte{})
 		assert.Error(t, err)
 	})
 
 	t.Run("missing image", func(t *testing.T) {
 		data := `{"ports": {"80/tcp": {}}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.Error(t, err)
 	})
 
 	t.Run("invalid port spec", func(t *testing.T) {
 		data := `{"image": "nginx", "ports": {"invalid": {}}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.Error(t, err)
 	})
 
 	t.Run("reserved label prefix", func(t *testing.T) {
 		data := `{"image": "nginx", "labels": {"fred.custom": "value"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.Error(t, err)
 	})
 
 	t.Run("invalid host_port", func(t *testing.T) {
 		data := `{"image": "nginx", "ports": {"80/tcp": {"host_port": 99999}}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.Error(t, err)
 	})
 }
@@ -94,7 +95,7 @@ func TestParseManifest_Env(t *testing.T) {
 	t.Run("safe env allowed", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"APP_PORT": "8080", "DATABASE_URL": "postgres://localhost/db"}}`
 
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 		assert.Equal(t, "8080", m.Env["APP_PORT"])
 	})
@@ -102,77 +103,77 @@ func TestParseManifest_Env(t *testing.T) {
 	t.Run("PATH blocked", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"PATH": "/usr/local/bin:/usr/bin"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "not allowed")
 	})
 
 	t.Run("PATH case insensitive", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"Path": "/usr/local/bin"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "not allowed")
 	})
 
 	t.Run("LD_PRELOAD blocked", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"LD_PRELOAD": "/tmp/malicious.so"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "not allowed")
 	})
 
 	t.Run("LD_LIBRARY_PATH blocked", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"LD_LIBRARY_PATH": "/tmp"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "prefix")
 	})
 
 	t.Run("LD_AUDIT blocked", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"LD_AUDIT": "/tmp/audit.so"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "prefix")
 	})
 
 	t.Run("ld_preload case insensitive", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"ld_preload": "/tmp/lib.so"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "not allowed")
 	})
 
 	t.Run("DOCKER_ prefix blocked", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"DOCKER_HOST": "tcp://attacker:2375"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "prefix")
 	})
 
 	t.Run("FRED_ prefix blocked", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"FRED_INTERNAL": "value"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "prefix")
 	})
 
 	t.Run("empty name rejected", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"": "value"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "empty")
 	})
 
 	t.Run("name with equals rejected", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"FOO=BAR": "value"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.ErrorContains(t, err, "invalid character")
 	})
 
 	t.Run("mixed safe and blocked rejects all", func(t *testing.T) {
 		data := `{"image": "nginx", "env": {"APP_PORT": "8080", "LD_PRELOAD": "/tmp/lib.so"}}`
 
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		assert.Error(t, err)
 	})
 }
@@ -340,21 +341,21 @@ func TestConfigValidation(t *testing.T) {
 
 func TestDuration(t *testing.T) {
 	t.Run("unmarshal string", func(t *testing.T) {
-		var d Duration
+		var d manifest.Duration
 		err := json.Unmarshal([]byte(`"30s"`), &d)
 		require.NoError(t, err)
 		assert.Equal(t, 30*time.Second, d.Duration())
 	})
 
 	t.Run("unmarshal number", func(t *testing.T) {
-		var d Duration
+		var d manifest.Duration
 		err := json.Unmarshal([]byte(`1000000000`), &d) // 1 second in nanoseconds
 		require.NoError(t, err)
 		assert.Equal(t, time.Second, d.Duration())
 	})
 
 	t.Run("marshal", func(t *testing.T) {
-		d := Duration(30 * time.Second)
+		d := manifest.Duration(30 * time.Second)
 		data, err := json.Marshal(d)
 		require.NoError(t, err)
 		assert.Equal(t, `"30s"`, string(data))
@@ -363,49 +364,49 @@ func TestDuration(t *testing.T) {
 
 func TestHealthCheckValidation(t *testing.T) {
 	t.Run("valid CMD", func(t *testing.T) {
-		hc := &HealthCheckConfig{
+		hc := &manifest.HealthCheckConfig{
 			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
 		}
 		assert.NoError(t, hc.Validate())
 	})
 
 	t.Run("valid CMD-SHELL", func(t *testing.T) {
-		hc := &HealthCheckConfig{
+		hc := &manifest.HealthCheckConfig{
 			Test: []string{"CMD-SHELL", "curl -f http://localhost/health"},
 		}
 		assert.NoError(t, hc.Validate())
 	})
 
 	t.Run("valid NONE", func(t *testing.T) {
-		hc := &HealthCheckConfig{
+		hc := &manifest.HealthCheckConfig{
 			Test: []string{"NONE"},
 		}
 		assert.NoError(t, hc.Validate())
 	})
 
 	t.Run("empty test", func(t *testing.T) {
-		hc := &HealthCheckConfig{
+		hc := &manifest.HealthCheckConfig{
 			Test: []string{},
 		}
 		assert.Error(t, hc.Validate())
 	})
 
 	t.Run("CMD without command", func(t *testing.T) {
-		hc := &HealthCheckConfig{
+		hc := &manifest.HealthCheckConfig{
 			Test: []string{"CMD"},
 		}
 		assert.Error(t, hc.Validate())
 	})
 
 	t.Run("invalid test type", func(t *testing.T) {
-		hc := &HealthCheckConfig{
+		hc := &manifest.HealthCheckConfig{
 			Test: []string{"INVALID", "command"},
 		}
 		assert.Error(t, hc.Validate())
 	})
 
 	t.Run("negative retries", func(t *testing.T) {
-		hc := &HealthCheckConfig{
+		hc := &manifest.HealthCheckConfig{
 			Test:    []string{"CMD", "curl", "-f", "http://localhost/health"},
 			Retries: -1,
 		}
@@ -413,46 +414,11 @@ func TestHealthCheckValidation(t *testing.T) {
 	})
 }
 
-func TestPortSpecValidation(t *testing.T) {
-	tests := []struct {
-		spec      string
-		expectErr bool
-	}{
-		{"80/tcp", false},
-		{"443/tcp", false},
-		{"53/udp", false},
-		{"8080/tcp", false},
-		{"65535/tcp", false},
-		{"1/tcp", false},
-
-		// Invalid
-		{"80", true},           // Missing protocol
-		{"tcp/80", true},       // Wrong order
-		{"80/http", true},      // Invalid protocol
-		{"0/tcp", true},        // Port too low
-		{"65536/tcp", true},    // Port too high
-		{"-1/tcp", true},       // Negative port
-		{"abc/tcp", true},      // Non-numeric port
-		{"80/tcp/extra", true}, // Extra component
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.spec, func(t *testing.T) {
-			err := validatePortSpec(tt.spec)
-			if tt.expectErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
 func TestPortIngressHintValidation(t *testing.T) {
 	t.Run("single ingress hint is valid", func(t *testing.T) {
-		m := &DockerManifest{
+		m := &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{
+			Ports: map[string]manifest.PortConfig{
 				"18789/tcp": {Ingress: true},
 				"8083/tcp":  {},
 			},
@@ -461,9 +427,9 @@ func TestPortIngressHintValidation(t *testing.T) {
 	})
 
 	t.Run("multiple ingress hints rejected", func(t *testing.T) {
-		m := &DockerManifest{
+		m := &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{
+			Ports: map[string]manifest.PortConfig{
 				"18789/tcp": {Ingress: true},
 				"8083/tcp":  {Ingress: true},
 			},
@@ -474,9 +440,9 @@ func TestPortIngressHintValidation(t *testing.T) {
 	})
 
 	t.Run("ingress hint on UDP rejected", func(t *testing.T) {
-		m := &DockerManifest{
+		m := &manifest.Manifest{
 			Image: "nginx:latest",
-			Ports: map[string]PortConfig{
+			Ports: map[string]manifest.PortConfig{
 				"53/udp": {Ingress: true},
 			},
 		}
@@ -485,9 +451,9 @@ func TestPortIngressHintValidation(t *testing.T) {
 		assert.Contains(t, err.Error(), "ingress hint requires TCP")
 	})
 
-	t.Run("ingress hint roundtrip via ParseManifest", func(t *testing.T) {
+	t.Run("ingress hint roundtrip via manifest.ParseManifest", func(t *testing.T) {
 		data := []byte(`{"image":"nginx","ports":{"18789/tcp":{"ingress":true}}}`)
-		m, err := ParseManifest(data)
+		m, err := manifest.ParseManifest(data)
 		require.NoError(t, err)
 		assert.True(t, m.Ports["18789/tcp"].Ingress)
 	})
@@ -721,102 +687,103 @@ func TestParseManifest_Tmpfs(t *testing.T) {
 			"ports": {"80/tcp": {}},
 			"tmpfs": ["/var/cache/nginx", "/var/log/nginx"]
 		}`
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 		assert.Equal(t, []string{"/var/cache/nginx", "/var/log/nginx"}, m.Tmpfs)
 	})
 
 	t.Run("empty tmpfs is valid", func(t *testing.T) {
 		data := `{"image": "nginx:latest", "tmpfs": []}`
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 		assert.Empty(t, m.Tmpfs)
 	})
 
 	t.Run("no tmpfs field is valid", func(t *testing.T) {
 		data := `{"image": "nginx:latest"}`
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 		assert.Nil(t, m.Tmpfs)
 	})
 
 	t.Run("relative path rejected", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["var/cache"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must be absolute")
 	})
 
 	t.Run("root path rejected", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "root filesystem")
 	})
 
 	t.Run("/tmp rejected (managed by backend)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/tmp"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "managed by the backend")
 	})
 
 	t.Run("/run rejected (managed by backend)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/run"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "managed by the backend")
 	})
 
 	t.Run("/proc rejected (sensitive)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/proc"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "sensitive path")
 	})
 
 	t.Run("/sys rejected (sensitive)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/sys"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "sensitive path")
 	})
 
 	t.Run("/dev rejected (sensitive)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/dev"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "sensitive path")
 	})
 
 	t.Run("duplicate paths rejected", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/var/log", "/var/log"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "duplicate")
 	})
 
 	t.Run("paths are cleaned before duplicate check", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/var/log/", "/var/log"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "duplicate")
 	})
 
 	t.Run("too many mounts rejected", func(t *testing.T) {
-		paths := make([]string, maxTmpfsMounts+1)
+		// Exceeds manifest.MaxTmpfsMounts.
+		paths := make([]string, manifest.MaxTmpfsMounts+1)
 		for i := range paths {
 			paths[i] = fmt.Sprintf("/mnt/vol%d", i)
 		}
-		data, _ := json.Marshal(DockerManifest{Image: "nginx", Tmpfs: paths})
-		_, err := ParseManifest(data)
+		data, _ := json.Marshal(manifest.Manifest{Image: "nginx", Tmpfs: paths})
+		_, err := manifest.ParseManifest(data)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "too many mounts")
 	})
 
 	t.Run("path with .. rejected after cleaning to blocked path", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/tmp/../proc"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		// After path.Clean, "/tmp/../proc" becomes "/proc" which is blocked
 		assert.Contains(t, err.Error(), "sensitive path")
@@ -824,35 +791,35 @@ func TestParseManifest_Tmpfs(t *testing.T) {
 
 	t.Run("/proc/self rejected (subdirectory of sensitive path)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/proc/self"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "under sensitive path")
 	})
 
 	t.Run("/sys/fs/cgroup rejected (subdirectory of sensitive path)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/sys/fs/cgroup"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "under sensitive path")
 	})
 
 	t.Run("/dev/shm rejected (subdirectory of sensitive path)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/dev/shm"]}`
-		_, err := ParseManifest([]byte(data))
+		_, err := manifest.ParseManifest([]byte(data))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "under sensitive path")
 	})
 
 	t.Run("/run/mysqld allowed (subdirectory of backend-managed tmpfs)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/run/mysqld"]}`
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 		assert.Equal(t, []string{"/run/mysqld"}, m.Tmpfs)
 	})
 
 	t.Run("/tmp/cache allowed (subdirectory of backend-managed tmpfs)", func(t *testing.T) {
 		data := `{"image": "nginx", "tmpfs": ["/tmp/cache"]}`
-		m, err := ParseManifest([]byte(data))
+		m, err := manifest.ParseManifest([]byte(data))
 		require.NoError(t, err)
 		assert.Equal(t, []string{"/tmp/cache"}, m.Tmpfs)
 	})
@@ -861,32 +828,32 @@ func TestParseManifest_Tmpfs(t *testing.T) {
 func TestHasActiveHealthCheck(t *testing.T) {
 	tests := []struct {
 		name     string
-		manifest DockerManifest
+		manifest manifest.Manifest
 		expected bool
 	}{
 		{
 			name:     "nil health check",
-			manifest: DockerManifest{Image: "busybox:latest"},
+			manifest: manifest.Manifest{Image: "busybox:latest"},
 			expected: false,
 		},
 		{
 			name:     "empty test slice",
-			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{}}},
+			manifest: manifest.Manifest{Image: "busybox:latest", HealthCheck: &manifest.HealthCheckConfig{Test: []string{}}},
 			expected: false,
 		},
 		{
 			name:     "NONE disables health check",
-			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{"NONE"}}},
+			manifest: manifest.Manifest{Image: "busybox:latest", HealthCheck: &manifest.HealthCheckConfig{Test: []string{"NONE"}}},
 			expected: false,
 		},
 		{
 			name:     "CMD is active",
-			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{"CMD", "true"}}},
+			manifest: manifest.Manifest{Image: "busybox:latest", HealthCheck: &manifest.HealthCheckConfig{Test: []string{"CMD", "true"}}},
 			expected: true,
 		},
 		{
 			name:     "CMD-SHELL is active",
-			manifest: DockerManifest{Image: "busybox:latest", HealthCheck: &HealthCheckConfig{Test: []string{"CMD-SHELL", "true"}}},
+			manifest: manifest.Manifest{Image: "busybox:latest", HealthCheck: &manifest.HealthCheckConfig{Test: []string{"CMD-SHELL", "true"}}},
 			expected: true,
 		},
 	}
@@ -920,14 +887,14 @@ func TestIsPortBindingError(t *testing.T) {
 func TestHasEphemeralPorts(t *testing.T) {
 	tests := []struct {
 		name     string
-		ports    map[string]PortConfig
+		ports    map[string]manifest.PortConfig
 		expected bool
 	}{
 		{"nil ports", nil, false},
-		{"empty ports", map[string]PortConfig{}, false},
-		{"ephemeral port", map[string]PortConfig{"80/tcp": {HostPort: 0}}, true},
-		{"explicit port only", map[string]PortConfig{"80/tcp": {HostPort: 8080}}, false},
-		{"mixed ports", map[string]PortConfig{"80/tcp": {HostPort: 0}, "443/tcp": {HostPort: 8443}}, true},
+		{"empty ports", map[string]manifest.PortConfig{}, false},
+		{"ephemeral port", map[string]manifest.PortConfig{"80/tcp": {HostPort: 0}}, true},
+		{"explicit port only", map[string]manifest.PortConfig{"80/tcp": {HostPort: 8080}}, false},
+		{"mixed ports", map[string]manifest.PortConfig{"80/tcp": {HostPort: 0}, "443/tcp": {HostPort: 8443}}, true},
 	}
 
 	for _, tt := range tests {

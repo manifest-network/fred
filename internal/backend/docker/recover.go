@@ -7,6 +7,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // recoverState rebuilds in-memory state from Docker containers.
@@ -38,7 +40,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for _, c := range containers {
 		// Skip containers without required labels
 		if c.LeaseUUID == "" || c.SKU == "" {
-			b.logger.Warn("skipping container with missing labels", "container_id", shortID(c.ContainerID))
+			b.logger.Warn("skipping container with missing labels", "container_id", leasesm.ShortID(c.ContainerID))
 			continue
 		}
 
@@ -46,7 +48,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		profile, err := b.cfg.GetSKUProfile(c.SKU)
 		if err != nil {
 			b.logger.Error("skipping container with unknown SKU — container is running but untracked",
-				"container_id", shortID(c.ContainerID),
+				"container_id", leasesm.ShortID(c.ContainerID),
 				"sku", c.SKU,
 			)
 			skippedUnknownSKU++
@@ -57,16 +59,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		prov, exists := recovered[c.LeaseUUID]
 		if !exists {
 			prov = &provision{
-				LeaseUUID:    c.LeaseUUID,
-				Tenant:       c.Tenant,
-				ProviderUUID: c.ProviderUUID,
-				SKU:          c.SKU,
-				Image:        c.Image,
-				Status:       containerStatusToProvisionStatus(c.Status),
-				CreatedAt:    c.CreatedAt,
-				FailCount:    c.FailCount,
-				CallbackURL:  c.CallbackURL,
-				ContainerIDs: make([]string, 0),
+				ProvisionState: leasesm.ProvisionState{
+					LeaseUUID:    c.LeaseUUID,
+					Tenant:       c.Tenant,
+					ProviderUUID: c.ProviderUUID,
+					SKU:          c.SKU,
+					Image:        c.Image,
+					Status:       containerStatusToProvisionStatus(c.Status),
+					CreatedAt:    c.CreatedAt,
+					FailCount:    c.FailCount,
+					CallbackURL:  c.CallbackURL,
+					ContainerIDs: make([]string, 0),
+				},
 			}
 
 			// Restore manifest from the last successful (active) release so
@@ -76,7 +80,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if b.releaseStore != nil {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
 					// Use ParsePayload to auto-detect single vs stack manifest.
-					singleM, stackM, payloadErr := ParsePayload(rel.Manifest)
+					singleM, stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
 					switch {
 					case payloadErr != nil:
 						b.logger.Warn("failed to parse recovered manifest",
@@ -215,7 +219,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if rec.Status == backend.ProvisionStatusFailed {
 			if _, hasExisting := b.provisions[uuid]; !hasExisting {
 				rec.FailCount++
-				rec.LastError = errMsgContainerExited
+				rec.LastError = leasesm.ErrMsgContainerExited
 				coldStartFailed = append(coldStartFailed, uuid)
 				b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
 					"lease_uuid", uuid,
@@ -328,13 +332,17 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.provisionsMu.RUnlock()
 
 		for _, cid := range containerIDs {
-			info, inspErr := b.docker.InspectContainer(ctx, cid)
+			state, inspErr := b.inspector.InspectInstance(ctx, cid)
 			if inspErr != nil {
-				b.logger.Warn("failed to inspect container during diagnostics gathering", "lease", uuid, "container_id", shortID(cid), "error", inspErr)
+				b.logger.Warn("failed to inspect container during diagnostics gathering", "lease", uuid, "container_id", leasesm.ShortID(cid), "error", inspErr)
 				continue
 			}
-			if containerStatusToProvisionStatus(info.Status) == backend.ProvisionStatusFailed {
-				failedDiagnostics[uuid] = b.containerFailureDiagnostics(ctx, cid, info)
+			// Mirror the "terminally gone?" decision from the SM guard:
+			// PhaseExited and PhaseFailed cover the Docker statuses that
+			// previously mapped to ProvisionStatusFailed in
+			// containerStatusToProvisionStatus.
+			if state != nil && (state.Phase == leasesm.PhaseExited || state.Phase == leasesm.PhaseFailed) {
+				failedDiagnostics[uuid] = b.gatherer.GatherDiagnostics(ctx, cid, state)
 				break
 			}
 		}
@@ -349,7 +357,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.provisionsMu.Lock()
 		for uuid, diag := range failedDiagnostics {
 			if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
-				prov.LastError = errMsgContainerExited + ": " + diag
+				prov.LastError = leasesm.ErrMsgContainerExited + ": " + diag
 			}
 		}
 		b.provisionsMu.Unlock()
@@ -369,9 +377,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for _, uuid := range allFailed {
 		if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
 			diagItems = append(diagItems, diagItem{
-				entry:        diagnosticSnapshot(prov),
+				entry:        leasesm.DiagnosticSnapshot(&prov.ProvisionState),
 				containerIDs: append([]string(nil), prov.ContainerIDs...),
-				keys:         containerLogKeys(prov),
+				keys:         leasesm.ContainerLogKeys(&prov.ProvisionState),
 			})
 		}
 	}
@@ -395,10 +403,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				"lease_uuid", uuid)
 			continue
 		}
-		if !b.routeToLease(uuid, containerDiedMsg{containerID: containerID}) {
+		if !b.routeToLease(uuid, leasesm.ContainerDiedMsg{ContainerID: containerID}) {
 			dieEventDroppedTotal.WithLabelValues("reconcile").Inc()
 			b.logger.Warn("die event dropped during reconcile dispatch; reconciler will re-detect",
-				"lease_uuid", uuid, "container_id", shortID(containerID))
+				"lease_uuid", uuid, "container_id", leasesm.ShortID(containerID))
 		}
 	}
 
@@ -546,10 +554,10 @@ func (b *Backend) containerEventLoop() {
 				}
 				if event.Action == "die" {
 					if leaseUUID, found := b.findLeaseByContainerID(event.ContainerID); found {
-						if !b.routeToLease(leaseUUID, containerDiedMsg{containerID: event.ContainerID}) {
+						if !b.routeToLease(leaseUUID, leasesm.ContainerDiedMsg{ContainerID: event.ContainerID}) {
 							dieEventDroppedTotal.WithLabelValues("event_loop").Inc()
 							b.logger.Warn("die event dropped at event loop dispatch; reconciler will re-detect",
-								"lease_uuid", leaseUUID, "container_id", shortID(event.ContainerID))
+								"lease_uuid", leaseUUID, "container_id", leasesm.ShortID(event.ContainerID))
 						}
 					}
 				}

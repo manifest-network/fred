@@ -18,6 +18,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
@@ -151,7 +152,7 @@ func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
 	sku := "docker-micro"
 
 	// Prepare the manifest payload
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -265,7 +266,7 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -379,7 +380,7 @@ func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -470,7 +471,7 @@ func TestIntegration_Reconciler_MultiContainer_PartialKill_Recovers(t *testing.T
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -584,7 +585,7 @@ func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
@@ -662,7 +663,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}

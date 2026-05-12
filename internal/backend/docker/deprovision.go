@@ -9,6 +9,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // Deprovision is the public shim: it routes the request through the lease's
@@ -18,44 +19,16 @@ import (
 // suppression of stale Failed callbacks.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	reply := make(chan error, 1)
-	if err := b.routeToLeaseBlocking(ctx, leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}); err != nil {
+	if err := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.DeprovisionMsg{Ctx: ctx, Reply: reply}); err != nil {
 		return err
 	}
 	return b.waitForReply(ctx, reply)
 }
 
-// handleDeprovision runs inside the lease actor's message handler. It fires
-// the SM transition then runs the work synchronously, returning the outcome
-// on the deprovisionMsg's reply channel.
-func (a *leaseActor) handleDeprovision(ctx context.Context) error {
-	// Attempt the SM transition. If it's not permitted, check whether the
-	// provision is already gone (idempotent success) or we're in an unexpected
-	// state (surface the error).
-	if err := a.sm.Fire(ctx, evDeprovisionRequested); err != nil {
-		a.backend.provisionsMu.RLock()
-		_, exists := a.backend.provisions[a.leaseUUID]
-		a.backend.provisionsMu.RUnlock()
-		if !exists {
-			a.terminated = true
-			return nil
-		}
-		a.backend.logger.Warn("deprovision transition denied by SM",
-			"lease_uuid", a.leaseUUID, "error", err)
-		// Fall through to the work anyway — the SM may not know every state
-		// (partial port). The work itself is idempotent.
-	}
-	err := a.backend.doDeprovision(ctx, a.leaseUUID)
-	// If the provision entry was fully removed (success path), signal the
-	// run loop to exit so a subsequent re-provision with the same UUID
-	// creates a fresh actor instead of being Ignored by a stale SM.
-	a.backend.provisionsMu.RLock()
-	_, exists := a.backend.provisions[a.leaseUUID]
-	a.backend.provisionsMu.RUnlock()
-	if !exists {
-		a.terminated = true
-	}
-	return err
-}
+// handleDeprovision (lease-actor message handler) moved to
+// internal/backend/shared/leasesm/lease_actor.go at PR5b-2 BC.
+// doDeprovision (Backend method below) stays here; the substrate-agnostic
+// SM/actor reaches it via cfg.DoDeprovisionFn.
 
 // doDeprovision releases resources for a lease. Must be idempotent.
 // For multi-unit leases, removes all containers.
@@ -110,11 +83,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
 			for _, containerID := range containerIDs {
 				if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-					logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
-					errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+					logger.Error("failed to remove container", "container_id", leasesm.ShortID(containerID), "error", err)
+					errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(containerID), err))
 					failedIDs = append(failedIDs, containerID)
 				} else {
-					logger.Info("container removed", "container_id", shortID(containerID))
+					logger.Info("container removed", "container_id", leasesm.ShortID(containerID))
 				}
 			}
 		} else {
@@ -123,11 +96,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	} else {
 		for _, containerID := range containerIDs {
 			if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-				logger.Error("failed to remove container", "container_id", shortID(containerID), "error", err)
-				errs = append(errs, fmt.Errorf("container %s: %w", shortID(containerID), err))
+				logger.Error("failed to remove container", "container_id", leasesm.ShortID(containerID), "error", err)
+				errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(containerID), err))
 				failedIDs = append(failedIDs, containerID)
 			} else {
-				logger.Info("container removed", "container_id", shortID(containerID))
+				logger.Info("container removed", "container_id", leasesm.ShortID(containerID))
 			}
 		}
 	}
@@ -158,7 +131,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			p.Status = backend.ProvisionStatusFailed
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
-			diagSnap = diagnosticSnapshot(p)
+			diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
 		}
 		b.provisionsMu.Unlock()
 		b.persistDiagnostics(diagSnap, failedIDs)
@@ -189,17 +162,27 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 
 	if len(volumeErrs) > 0 {
 		var diagSnap shared.DiagnosticEntry
+		// attempts is captured INSIDE the b.provisionsMu Lock span (after
+		// the increment) so we can use the correct value at logger.Error
+		// below — which runs AFTER the Unlock and AFTER the provision
+		// entry has been deleted in the give-up branch. The other reads
+		// in this block (the if-guard and the LastError fmt.Sprintf) also
+		// use the captured value to make the lock-held-state dependency
+		// explicit and prevent future regressions where someone moves a
+		// read outside the Lock.
+		var attempts int
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
 			p.VolumeCleanupAttempts++
+			attempts = p.VolumeCleanupAttempts
 			p.ContainerIDs = nil // containers are gone
 
-			if p.VolumeCleanupAttempts >= maxVolumeCleanupAttempts {
+			if attempts >= maxVolumeCleanupAttempts {
 				// Too many failed attempts — give up and remove the provision.
 				// The leaked volumes require manual cleanup by the operator.
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
-					p.VolumeCleanupAttempts, errors.Join(volumeErrs...))
-				diagSnap = diagnosticSnapshot(p)
+					attempts, errors.Join(volumeErrs...))
+				diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
 				delete(b.provisions, leaseUUID)
 				b.provisionsMu.Unlock()
 
@@ -221,7 +204,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				deprovisionsTotal.Inc()
 
 				logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
-					"attempts", p.VolumeCleanupAttempts,
+					"attempts", attempts,
 					"errors", errors.Join(volumeErrs...),
 				)
 
@@ -233,7 +216,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// Under the limit — keep provision visible for retry.
 			p.Status = backend.ProvisionStatusFailed
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
-			diagSnap = diagnosticSnapshot(p)
+			diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
 		}
 		b.provisionsMu.Unlock()
 		// Persist diagnostics outside the lock so failure state survives
@@ -250,6 +233,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	// All containers and volumes removed — delete provision from map.
+	// Docker-private state (VolumeCleanupAttempts) is structural on the
+	// provision wrapper, so the single map delete drops it too.
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
 	b.provisionsMu.Unlock()

@@ -10,8 +10,11 @@
 // The package is organized around a single concurrency primitive: the
 // per-lease actor. Every active lease owns one goroutine that serializes
 // all state-mutating operations for that lease through a stateless state
-// machine (see lease_sm.go and lease_actor.go). All Docker calls happen
-// outside any shared mutex; linearization comes from the actor's inbox.
+// machine. The actor and SM implementations are substrate-agnostic and
+// live in internal/backend/shared/leasesm; this package supplies the
+// Docker-specific seams via the closure-builder factory in
+// lease_actor_factory.go. All Docker calls happen outside any shared
+// mutex; linearization comes from the actor's inbox.
 //
 // The actor model is what gives the backend its key properties:
 //
@@ -25,9 +28,18 @@
 //
 // # Major components
 //
-//   - lease_actor.go, lease_sm.go: the per-lease actor and its state machine
-//   - work_barrier.go: per-actor worker reference counter (used by OnExit
-//     to wait for canceled goroutines before completing the transition)
+//   - internal/backend/shared/leasesm: per-lease actor + state machine
+//     (substrate-agnostic; consumed by every backend, not just Docker)
+//   - lease_actor_factory.go, lease_actor_routing.go: factory wiring
+//     Docker dependencies into leasesm.NewLeaseActor, plus Backend-side
+//     routing/dispatch around the actor inbox (b.actors map, routeToLease,
+//     DebugActors)
+//   - leasesm_adapters.go, leasesm_metrics.go: Docker implementations of
+//     leasesm.InstanceInspector / DiagnosticsGatherer / LeaseProvisionStore
+//     / SMMetrics
+//   - internal/backend/shared/workbarrier: per-actor worker reference counter
+//     (used by OnExit to wait for canceled goroutines before completing the
+//     transition)
 //   - provision.go, deprovision.go, restart_update.go: the lifecycle
 //     workers that the actor spawns for each long-running operation
 //   - recover.go: state recovery from Docker labels on startup and during

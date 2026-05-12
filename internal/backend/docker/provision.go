@@ -17,6 +17,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // Provision starts async provisioning of containers.
@@ -60,15 +62,19 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		delete(b.provisions, req.LeaseUUID)
 	}
 	b.provisions[req.LeaseUUID] = &provision{
-		LeaseUUID:    req.LeaseUUID,
-		Tenant:       req.Tenant,
-		ProviderUUID: req.ProviderUUID,
-		Status:       backend.ProvisionStatusProvisioning,
-		Quantity:     totalQuantity,
-		ContainerIDs: make([]string, 0, totalQuantity),
-		CreatedAt:    time.Now(),
-		FailCount:    prevFailCount,
-		CallbackURL:  req.CallbackURL,
+		ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    req.LeaseUUID,
+			Tenant:       req.Tenant,
+			ProviderUUID: req.ProviderUUID,
+			Status:       backend.ProvisionStatusProvisioning,
+			Quantity:     totalQuantity,
+			ContainerIDs: make([]string, 0, totalQuantity),
+			CreatedAt:    time.Now(),
+			FailCount:    prevFailCount,
+			CallbackURL:  req.CallbackURL,
+		},
+		// VolumeCleanupAttempts: 0 by struct-zero — structural reset
+		// of the per-lease counter is the whole point of the wrapper.
 	}
 	b.provisionsMu.Unlock()
 
@@ -93,7 +99,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		for _, cid := range oldContainerIDs {
 			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
 				logger.Warn("failed to remove old container during re-provision",
-					"container_id", shortID(cid), "error", err)
+					"container_id", leasesm.ShortID(cid), "error", err)
 			}
 		}
 		logger.Info("replacing failed provision",
@@ -122,7 +128,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
-	manifest, stackManifest, parseErr := ParsePayload(req.Payload)
+	m, stackManifest, parseErr := manifest.ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
@@ -140,7 +146,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 
 	// Validate images against registry allowlist.
 	if isStack {
-		if err := ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
+		if err := manifest.ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
 			b.removeProvision(req.LeaseUUID)
 			return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 		}
@@ -151,7 +157,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			}
 		}
 	} else {
-		if err := shared.ValidateImage(manifest.Image, b.cfg.AllowedRegistries); err != nil {
+		if err := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); err != nil {
 			b.removeProvision(req.LeaseUUID)
 			return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 		}
@@ -203,7 +209,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		if isStack {
 			prov.StackManifest = stackManifest
 		} else {
-			prov.Image = manifest.Image
+			prov.Image = m.Image
 		}
 	}
 	b.provisionsMu.Unlock()
@@ -216,17 +222,17 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// worker is left as a zombie and recoverState reconciles on next
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
-	work := func() (string, provisionSuccessResult, map[string]string, error) {
+	work := func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
 		if isStack {
 			return b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 		}
-		return b.doProvision(provCtx, req, manifest, profiles, logger)
+		return b.doProvision(provCtx, req, m, profiles, logger)
 	}
 	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, provisionRequestedMsg{
-		cancel: provCancel,
-		work:   work,
-		ack:    ack,
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.ProvisionRequestedMsg{
+		Cancel: provCancel,
+		Work:   work,
+		Ack:    ack,
 	}); routeErr != nil {
 		provCancel()
 		for _, id := range allocatedIDs {
@@ -517,7 +523,7 @@ func (b *Backend) setupStackVolBinds(
 	items []backend.LeaseItem,
 	profiles map[string]SKUProfile,
 	imageSetups map[string]*imageSetup,
-	services map[string]*DockerManifest,
+	services map[string]*manifest.Manifest,
 	logger *slog.Logger,
 ) (map[string]map[int]serviceVolBinds, []string, error) {
 	volBinds := make(map[string]map[int]serviceVolBinds)
@@ -573,8 +579,8 @@ func (b *Backend) setupStackVolBinds(
 // verifyStartup checks that containers started successfully.
 // Uses health-check-aware polling when the manifest declares an active health check,
 // otherwise falls back to a fixed-wait + inspect check.
-func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, containerIDs []string, logger *slog.Logger) error {
-	if manifest.HasActiveHealthCheck() {
+func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, containerIDs []string, logger *slog.Logger) error {
+	if m.HasActiveHealthCheck() {
 		return b.waitForHealthy(ctx, containerIDs, logger)
 	}
 
@@ -592,7 +598,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 		}
 		status := containerStatusToProvisionStatus(info.Status)
 		if status != backend.ProvisionStatusReady {
-			diag := b.containerFailureDiagnostics(ctx, containerID, info)
+			diag := b.containerFailureDiagnostics(ctx, containerID, containerInfoToInstanceState(info))
 			return fmt.Errorf("container %d exited during startup (status: %s): %s", i, info.Status, diag)
 		}
 	}
@@ -604,7 +610,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // For multi-SKU leases, each container gets the appropriate resource profile.
 //
 // Returns (callbackErr, result, logs, err). On success, result carries
-// the populated provisionSuccessResult for the SM's Ready entry action
+// the populated leasesm.ProvisionSuccessResult for the SM's Ready entry action
 // to write into the provision struct; logs is nil. On failure, result
 // is zero and logs is the pre-captured container-log map (fetched by
 // the failure defer BEFORE cleanup removes the containers) — the SM's
@@ -617,7 +623,7 @@ func (b *Backend) verifyStartup(ctx context.Context, manifest *DockerManifest, c
 // failure, release-store updates on success, and stale-diagnostic removal
 // on success. Provision struct mutations (Status, FailCount, LastError,
 // ContainerIDs, Manifest) are owned by the SM entry actions.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, manifest *DockerManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, m *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
@@ -646,7 +652,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			defer cleanupCancel()
 			for _, cid := range containerIDs {
 				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-					logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
+					logger.Warn("failed to cleanup container after error", "container_id", leasesm.ShortID(cid), "error", rmErr)
 				}
 			}
 
@@ -670,7 +676,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		if b.releaseStore != nil {
 			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 				Manifest:  req.Payload,
-				Image:     manifest.Image,
+				Image:     m.Image,
 				Status:    "active",
 				CreatedAt: time.Now(),
 			}); relErr != nil {
@@ -686,9 +692,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 		updateResourceMetrics(b.pool.Stats())
 
-		resultRet = provisionSuccessResult{
-			containerIDs: containerIDs,
-			manifest:     manifest,
+		resultRet = leasesm.ProvisionSuccessResult{
+			ContainerIDs: containerIDs,
+			Manifest:     m,
 		}
 	}()
 
@@ -701,9 +707,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 
 	// Pull image (only once, shared by all containers)
-	logger.Info("pulling image", "image", manifest.Image)
+	logger.Info("pulling image", "image", m.Image)
 	pullStart := time.Now()
-	if err = b.docker.PullImage(ctx, manifest.Image, b.cfg.ImagePullTimeout); err != nil {
+	if err = b.docker.PullImage(ctx, m.Image, b.cfg.ImagePullTimeout); err != nil {
 		logger.Error("failed to pull image", "error", err)
 		err = fmt.Errorf("image pull failed: %w", err)
 		callbackErr = "image pull failed"
@@ -712,7 +718,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())
 
 	// Inspect image and resolve user
-	imgSetup, setupErr := b.inspectImageForSetup(ctx, manifest.Image, manifest.User)
+	imgSetup, setupErr := b.inspectImageForSetup(ctx, m.Image, m.User)
 	if setupErr != nil {
 		logger.Error("image setup failed", "error", setupErr)
 		err = setupErr
@@ -801,7 +807,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 					// Set up writable path binds
 					if needsWritableVolume {
-						writablePathBinds = b.setupWritablePathBinds(ctx, manifest.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
+						writablePathBinds = b.setupWritablePathBinds(ctx, m.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
 					}
 				}
 			} else if profile.DiskMB > 0 && len(imgSetup.Volumes) == 0 {
@@ -815,7 +821,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				Tenant:            req.Tenant,
 				ProviderUUID:      req.ProviderUUID,
 				SKU:               item.SKU,
-				Manifest:          manifest,
+				Manifest:          m,
 				Profile:           profile,
 				InstanceIndex:     instanceIndex,
 				FailCount:         failCount,
@@ -845,7 +851,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			containerIDs = append(containerIDs, containerID)
 
 			// Start container
-			instanceLogger.Info("starting container", "container_id", shortID(containerID))
+			instanceLogger.Info("starting container", "container_id", leasesm.ShortID(containerID))
 			if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
 				instanceLogger.Error("failed to start container", "error", startErr)
 				err = fmt.Errorf("container start failed (instance %d, sku %s): %w", instanceIndex, item.SKU, startErr)
@@ -853,13 +859,13 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				return
 			}
 
-			instanceLogger.Info("container provisioned successfully", "container_id", shortID(containerID))
+			instanceLogger.Info("container provisioned successfully", "container_id", leasesm.ShortID(containerID))
 			instanceIndex++
 		}
 	}
 
 	// Startup verification
-	if err = b.verifyStartup(ctx, manifest, containerIDs, logger); err != nil {
+	if err = b.verifyStartup(ctx, m, containerIDs, logger); err != nil {
 		callbackErr = startupErrorToCallbackMsg(err)
 		return
 	}
@@ -874,7 +880,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 //
 // See doProvision for the (callbackErr, result, logs, err) return contract.
 // Stack-specific result fields are stackManifest + serviceContainers.
-func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
@@ -909,7 +915,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 				logger.Warn("compose down failed during cleanup, falling back to individual removal", "error", downErr)
 				for _, cid := range containerIDs {
 					if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-						logger.Warn("failed to cleanup container after error", "container_id", shortID(cid), "error", rmErr)
+						logger.Warn("failed to cleanup container after error", "container_id", leasesm.ShortID(cid), "error", rmErr)
 					}
 				}
 			}
@@ -944,10 +950,10 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 
 		updateResourceMetrics(b.pool.Stats())
 
-		resultRet = provisionSuccessResult{
-			containerIDs:      containerIDs,
-			stackManifest:     stack,
-			serviceContainers: serviceContainers,
+		resultRet = leasesm.ProvisionSuccessResult{
+			ContainerIDs:      containerIDs,
+			StackManifest:     stack,
+			ServiceContainers: serviceContainers,
 		}
 	}()
 
@@ -1147,16 +1153,16 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 				// Check if container has exited.
 				status := containerStatusToProvisionStatus(info.Status)
 				if status == backend.ProvisionStatusFailed {
-					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], info)
+					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], containerInfoToInstanceState(info))
 					return fmt.Errorf("container %d exited while waiting for healthy (status: %s): %s", i, info.Status, diag)
 				}
 
 				switch info.Health {
 				case HealthStatusHealthy:
-					logger.Info("container healthy", "instance", i, "container_id", shortID(containerIDs[i]))
+					logger.Info("container healthy", "instance", i, "container_id", leasesm.ShortID(containerIDs[i]))
 					delete(pending, i)
 				case HealthStatusUnhealthy:
-					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], info)
+					diag := b.containerFailureDiagnostics(ctx, containerIDs[i], containerInfoToInstanceState(info))
 					return fmt.Errorf("container %d reported unhealthy: %s", i, diag)
 				default:
 					// "starting" or other — keep polling

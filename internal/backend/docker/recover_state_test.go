@@ -21,6 +21,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // mockVolumeManager implements volumeManager for testing. Unlike mockDockerClient,
@@ -185,7 +187,7 @@ func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string
 	// ContainerLogs on containers that may be in the process of being
 	// removed; panicking here forces every failure-path test to set a
 	// stub. Match Docker's real behavior on removed containers instead.
-	return "", fmt.Errorf("no such container: %s", shortID(containerID))
+	return "", fmt.Errorf("no such container: %s", leasesm.ShortID(containerID))
 }
 
 func (m *mockDockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
@@ -290,7 +292,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		volumes:    &noopVolumeManager{},
 		logger:     slog.Default(),
 		provisions: provs,
-		actors:     make(map[string]*leaseActor),
+		actors:     make(map[string]*leasesm.LeaseActor),
 		stopCtx:    stopCtx,
 		stopCancel: stopCancel,
 	}
@@ -299,6 +301,9 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
 	})
+	b.inspector = &dockerInstanceInspector{docker: b.docker}
+	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
+	b.provisionStore = &backendProvisionStore{backend: b}
 	return b
 }
 
@@ -476,11 +481,10 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusProvisioning,
-				CreatedAt: now,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -500,12 +504,11 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusFailed,
 				FailCount: 2,
-				CreatedAt: now,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -531,13 +534,12 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusFailing,
 				FailCount: 1,
-				LastError: errMsgContainerExited,
-				CreatedAt: now,
+				LastError: leasesm.ErrMsgContainerExited,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -550,7 +552,7 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
 			"Failing must be normalized to Failed on recovery to unblock retries")
 		assert.Equal(t, 1, prov.FailCount, "FailCount preserved across normalization")
-		assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError preserved")
+		assert.Equal(t, leasesm.ErrMsgContainerExited, prov.LastError, "LastError preserved")
 	})
 
 	t.Run("ready provision without containers dropped", func(t *testing.T) {
@@ -560,12 +562,11 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusReady,
 				ContainerIDs: []string{"c1"},
-				CreatedAt:    now,
+				CreatedAt:    now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -583,9 +584,8 @@ func TestRecoverState(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
-				Status:    backend.ProvisionStatusReady,
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+				Status: backend.ProvisionStatusReady},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -726,13 +726,12 @@ func TestRecoverState(t *testing.T) {
 		}
 		// Pre-populate with a "ready" provision so recoverState detects a ready→failed transition.
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID:    "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Tenant:       "tenant-a",
 				Status:       backend.ProvisionStatusReady,
 				ContainerIDs: []string{"c1"},
 				FailCount:    0,
-				CreatedAt:    now,
+				CreatedAt:    now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -1027,10 +1026,9 @@ func TestRecoverState_SetsActiveProvisionsGauge(t *testing.T) {
 			},
 		}
 		existing := map[string]*provision{
-			"lease-1": {
-				LeaseUUID: "lease-1",
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Status:    backend.ProvisionStatusProvisioning,
-				CreatedAt: now,
+				CreatedAt: now},
 			},
 		}
 		b := newBackendForTest(mock, existing)
@@ -1276,14 +1274,13 @@ func TestRecoverState_PersistsDiagnostics(t *testing.T) {
 	}
 
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
 			FailCount:    0,
-			CreatedAt:    now,
+			CreatedAt:    now},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1315,7 +1312,7 @@ func TestRecoverState_PersistsDiagnostics(t *testing.T) {
 
 func TestRecoverState_CallbackSanitized(t *testing.T) {
 	// Verify that recoverState failure callbacks never include container logs
-	// or dynamic data — only the hardcoded errMsgContainerExited.
+	// or dynamic data — only the hardcoded leasesm.ErrMsgContainerExited.
 	secret := "AWS_SECRET_KEY=wJalrXUtnFEMI"
 	now := time.Now()
 
@@ -1363,14 +1360,13 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	}
 
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
 			FailCount:    0,
 			CreatedAt:    now,
-			CallbackURL:  callbackServer.URL,
+			CallbackURL:  callbackServer.URL},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1383,12 +1379,12 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	// Callback is now emitted by the SM's Failed.OnEntryFrom(evDiagGathered)
 	// entry action after the Failing goroutine completes. Poll for it.
 	require.Eventually(t, func() bool {
-		return readPayload().Error == errMsgContainerExited
+		return readPayload().Error == leasesm.ErrMsgContainerExited
 	}, 2*time.Second, 10*time.Millisecond, "Failed callback should eventually arrive")
 
 	// Callback should have hardcoded message only — no secrets.
 	payload := readPayload()
-	assert.Equal(t, errMsgContainerExited, payload.Error)
+	assert.Equal(t, leasesm.ErrMsgContainerExited, payload.Error)
 	assert.NotContains(t, payload.Error, secret)
 	assert.NotContains(t, payload.Error, "exit_code")
 
@@ -1445,14 +1441,13 @@ func TestRecoverState_InFlightReProvisionPreservesFailCount(t *testing.T) {
 
 	// Existing in-memory state: in-flight re-provision with accumulated FailCount.
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusProvisioning,
 			Quantity:     1,
 			ContainerIDs: []string{}, // new provision hasn't created containers yet
 			FailCount:    2,
-			CreatedAt:    now,
+			CreatedAt:    now},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1511,14 +1506,13 @@ func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
 	// Existing in-memory state: recoverState already ran once and incremented
 	// FailCount to 1. Provision has Status=Failed (transition already detected).
 	existing := map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			Status:       backend.ProvisionStatusFailed,
 			Quantity:     1,
 			ContainerIDs: []string{"dead-container"},
 			FailCount:    1,
-			CreatedAt:    now,
+			CreatedAt:    now},
 		},
 	}
 	b := newBackendForTest(mock, existing)
@@ -1539,13 +1533,13 @@ func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
 func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 	now := time.Now()
 
-	manifest := DockerManifest{
+	m := manifest.Manifest{
 		Image:   "nginx:latest",
 		Command: []string{"nginx", "-g", "daemon off;"},
 		Env:     map[string]string{"FOO": "bar"},
-		Ports:   map[string]PortConfig{"80/tcp": {HostPort: 0}},
+		Ports:   map[string]manifest.PortConfig{"80/tcp": {HostPort: 0}},
 	}
-	manifestBytes, err := json.Marshal(manifest)
+	manifestBytes, err := json.Marshal(m)
 	require.NoError(t, err)
 
 	t.Run("manifest restored on cold start", func(t *testing.T) {
@@ -1557,7 +1551,7 @@ func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 		// Pre-seed the release store with a manifest for this lease.
 		err = relStore.Append("lease-1", shared.Release{
 			Manifest:  manifestBytes,
-			Image:     manifest.Image,
+			Image:     m.Image,
 			Status:    "active",
 			CreatedAt: now,
 		})
@@ -1640,7 +1634,7 @@ func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		alpineManifest := DockerManifest{Image: "alpine:latest", Command: []string{"sleep", "3600"}}
+		alpineManifest := manifest.Manifest{Image: "alpine:latest", Command: []string{"sleep", "3600"}}
 		alpineBytes, _ := json.Marshal(alpineManifest)
 		err = relStore.Append("lease-1", shared.Release{
 			Manifest:  alpineBytes,

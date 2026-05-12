@@ -1,4 +1,4 @@
-package docker
+package manifest
 
 import (
 	"strings"
@@ -23,7 +23,7 @@ func TestStackManifest_ServiceNameValidation(t *testing.T) {
 	for _, name := range valid {
 		t.Run("valid/"+name, func(t *testing.T) {
 			sm := StackManifest{
-				Services: map[string]*DockerManifest{
+				Services: map[string]*Manifest{
 					name: {Image: "nginx"},
 				},
 			}
@@ -46,7 +46,7 @@ func TestStackManifest_ServiceNameValidation(t *testing.T) {
 	for _, tc := range invalid {
 		t.Run("invalid/"+tc.name, func(t *testing.T) {
 			sm := StackManifest{
-				Services: map[string]*DockerManifest{
+				Services: map[string]*Manifest{
 					tc.name: {Image: "nginx"},
 				},
 			}
@@ -58,7 +58,7 @@ func TestStackManifest_ServiceNameValidation(t *testing.T) {
 }
 
 func TestStackManifest_Validate_EmptyServices(t *testing.T) {
-	sm := StackManifest{Services: map[string]*DockerManifest{}}
+	sm := StackManifest{Services: map[string]*Manifest{}}
 	err := sm.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "at least one service")
@@ -73,7 +73,7 @@ func TestStackManifest_Validate_NilServices(t *testing.T) {
 
 func TestStackManifest_Validate_NilServiceManifest(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": nil,
 		},
 	}
@@ -84,7 +84,7 @@ func TestStackManifest_Validate_NilServiceManifest(t *testing.T) {
 
 func TestStackManifest_Validate_EmptyServiceName(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"": {Image: "nginx"},
 		},
 	}
@@ -95,7 +95,7 @@ func TestStackManifest_Validate_EmptyServiceName(t *testing.T) {
 
 func TestStackManifest_Validate_InvalidServiceManifest(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {Image: ""}, // image is required
 		},
 	}
@@ -107,7 +107,7 @@ func TestStackManifest_Validate_InvalidServiceManifest(t *testing.T) {
 func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 	t.Run("duplicate service names in items", func(t *testing.T) {
 		stack := &StackManifest{
-			Services: map[string]*DockerManifest{
+			Services: map[string]*Manifest{
 				"web": {Image: "nginx"},
 			},
 		}
@@ -122,7 +122,7 @@ func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 
 	t.Run("matching items and manifest", func(t *testing.T) {
 		stack := &StackManifest{
-			Services: map[string]*DockerManifest{
+			Services: map[string]*Manifest{
 				"web": {Image: "nginx"},
 				"db":  {Image: "postgres"},
 			},
@@ -136,7 +136,7 @@ func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 
 	t.Run("extra item not in manifest", func(t *testing.T) {
 		stack := &StackManifest{
-			Services: map[string]*DockerManifest{
+			Services: map[string]*Manifest{
 				"web": {Image: "nginx"},
 			},
 		}
@@ -152,7 +152,7 @@ func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 
 	t.Run("extra service not in items", func(t *testing.T) {
 		stack := &StackManifest{
-			Services: map[string]*DockerManifest{
+			Services: map[string]*Manifest{
 				"web": {Image: "nginx"},
 				"db":  {Image: "postgres"},
 			},
@@ -169,7 +169,7 @@ func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 
 func TestParsePayload(t *testing.T) {
 	t.Run("single manifest", func(t *testing.T) {
-		data := validManifestJSON("nginx:latest")
+		data := []byte(`{"image":"nginx:latest"}`)
 		m, s, err := ParsePayload(data)
 		require.NoError(t, err)
 		assert.NotNil(t, m)
@@ -178,10 +178,7 @@ func TestParsePayload(t *testing.T) {
 	})
 
 	t.Run("stack manifest", func(t *testing.T) {
-		data := validStackManifestJSON(map[string]string{
-			"web": "nginx:latest",
-			"db":  "postgres:16",
-		})
+		data := []byte(`{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`)
 		m, s, err := ParsePayload(data)
 		require.NoError(t, err)
 		assert.Nil(t, m)
@@ -204,9 +201,8 @@ func TestParsePayload(t *testing.T) {
 	})
 
 	t.Run("stack with invalid service name", func(t *testing.T) {
-		data := validStackManifestJSON(map[string]string{
-			"Web": "nginx:latest", // uppercase — fails service name regex
-		})
+		// Uppercase service name fails the service-name regex.
+		data := []byte(`{"services":{"Web":{"image":"nginx:latest"}}}`)
 		_, _, err := ParsePayload(data)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must match")
@@ -217,7 +213,7 @@ func TestParsePayload(t *testing.T) {
 
 func TestStackManifest_DependsOn_ValidServiceStarted(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -232,7 +228,7 @@ func TestStackManifest_DependsOn_ValidServiceStarted(t *testing.T) {
 
 func TestStackManifest_DependsOn_ValidServiceHealthy(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -252,7 +248,7 @@ func TestStackManifest_DependsOn_ValidServiceHealthy(t *testing.T) {
 
 func TestStackManifest_DependsOn_MissingRef(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -269,7 +265,7 @@ func TestStackManifest_DependsOn_MissingRef(t *testing.T) {
 
 func TestStackManifest_DependsOn_SelfRef(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -285,7 +281,7 @@ func TestStackManifest_DependsOn_SelfRef(t *testing.T) {
 
 func TestStackManifest_DependsOn_InvalidCondition(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -302,7 +298,7 @@ func TestStackManifest_DependsOn_InvalidCondition(t *testing.T) {
 
 func TestStackManifest_DependsOn_EmptyCondition(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -319,7 +315,7 @@ func TestStackManifest_DependsOn_EmptyCondition(t *testing.T) {
 
 func TestStackManifest_DependsOn_HealthyWithoutHealthCheck(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -336,7 +332,7 @@ func TestStackManifest_DependsOn_HealthyWithoutHealthCheck(t *testing.T) {
 
 func TestStackManifest_DependsOn_HealthyWithNoneHealthCheck(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -358,7 +354,7 @@ func TestStackManifest_DependsOn_HealthyWithNoneHealthCheck(t *testing.T) {
 
 func TestStackManifest_DependsOn_MultipleDependencies(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"web": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -380,7 +376,7 @@ func TestStackManifest_DependsOn_MultipleDependencies(t *testing.T) {
 
 func TestStackManifest_DependsOn_CycleDirectAB(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"a": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -402,7 +398,7 @@ func TestStackManifest_DependsOn_CycleDirectAB(t *testing.T) {
 
 func TestStackManifest_DependsOn_CycleTransitiveABC(t *testing.T) {
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"a": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -431,7 +427,7 @@ func TestStackManifest_DependsOn_CycleTransitiveABC(t *testing.T) {
 func TestStackManifest_DependsOn_DiamondNoCycle(t *testing.T) {
 	// A→B, A→C, B→D, C→D — diamond, not a cycle.
 	sm := StackManifest{
-		Services: map[string]*DockerManifest{
+		Services: map[string]*Manifest{
 			"a": {
 				Image: "nginx",
 				DependsOn: map[string]DependsOnCondition{
@@ -457,8 +453,8 @@ func TestStackManifest_DependsOn_DiamondNoCycle(t *testing.T) {
 	assert.NoError(t, sm.Validate())
 }
 
-func TestDockerManifest_DependsOn_RejectedOutsideStack(t *testing.T) {
-	m := &DockerManifest{
+func TestManifest_DependsOn_RejectedOutsideStack(t *testing.T) {
+	m := &Manifest{
 		Image: "nginx",
 		DependsOn: map[string]DependsOnCondition{
 			"db": {Condition: "service_started"},
@@ -471,18 +467,18 @@ func TestDockerManifest_DependsOn_RejectedOutsideStack(t *testing.T) {
 
 // --- stop_grace_period validation tests ---
 
-func TestDockerManifest_StopGracePeriod_Valid(t *testing.T) {
+func TestManifest_StopGracePeriod_Valid(t *testing.T) {
 	d := Duration(10 * time.Second)
-	m := &DockerManifest{
+	m := &Manifest{
 		Image:           "nginx",
 		StopGracePeriod: &d,
 	}
 	assert.NoError(t, m.Validate())
 }
 
-func TestDockerManifest_StopGracePeriod_TooLow(t *testing.T) {
+func TestManifest_StopGracePeriod_TooLow(t *testing.T) {
 	d := Duration(500 * time.Millisecond)
-	m := &DockerManifest{
+	m := &Manifest{
 		Image:           "nginx",
 		StopGracePeriod: &d,
 	}
@@ -491,9 +487,9 @@ func TestDockerManifest_StopGracePeriod_TooLow(t *testing.T) {
 	assert.Contains(t, err.Error(), "at least 1s")
 }
 
-func TestDockerManifest_StopGracePeriod_TooHigh(t *testing.T) {
+func TestManifest_StopGracePeriod_TooHigh(t *testing.T) {
 	d := Duration(121 * time.Second)
-	m := &DockerManifest{
+	m := &Manifest{
 		Image:           "nginx",
 		StopGracePeriod: &d,
 	}
@@ -502,31 +498,31 @@ func TestDockerManifest_StopGracePeriod_TooHigh(t *testing.T) {
 	assert.Contains(t, err.Error(), "at most 120s")
 }
 
-func TestDockerManifest_StopGracePeriod_Boundaries(t *testing.T) {
+func TestManifest_StopGracePeriod_Boundaries(t *testing.T) {
 	t.Run("exactly 1s", func(t *testing.T) {
 		d := Duration(time.Second)
-		m := &DockerManifest{Image: "nginx", StopGracePeriod: &d}
+		m := &Manifest{Image: "nginx", StopGracePeriod: &d}
 		assert.NoError(t, m.Validate())
 	})
 	t.Run("exactly 120s", func(t *testing.T) {
 		d := Duration(120 * time.Second)
-		m := &DockerManifest{Image: "nginx", StopGracePeriod: &d}
+		m := &Manifest{Image: "nginx", StopGracePeriod: &d}
 		assert.NoError(t, m.Validate())
 	})
 }
 
 // --- expose validation tests ---
 
-func TestDockerManifest_Expose_Valid(t *testing.T) {
-	m := &DockerManifest{
+func TestManifest_Expose_Valid(t *testing.T) {
+	m := &Manifest{
 		Image:  "nginx",
 		Expose: []string{"3000", "8080"},
 	}
 	assert.NoError(t, m.Validate())
 }
 
-func TestDockerManifest_Expose_InvalidPort(t *testing.T) {
-	m := &DockerManifest{
+func TestManifest_Expose_InvalidPort(t *testing.T) {
+	m := &Manifest{
 		Image:  "nginx",
 		Expose: []string{"abc"},
 	}
@@ -535,8 +531,8 @@ func TestDockerManifest_Expose_InvalidPort(t *testing.T) {
 	assert.Contains(t, err.Error(), "not a valid port number")
 }
 
-func TestDockerManifest_Expose_Duplicate(t *testing.T) {
-	m := &DockerManifest{
+func TestManifest_Expose_Duplicate(t *testing.T) {
+	m := &Manifest{
 		Image:  "nginx",
 		Expose: []string{"3000", "3000"},
 	}
@@ -545,36 +541,74 @@ func TestDockerManifest_Expose_Duplicate(t *testing.T) {
 	assert.Contains(t, err.Error(), "duplicate port")
 }
 
-func TestDockerManifest_Expose_OutOfRange(t *testing.T) {
+func TestManifest_Expose_OutOfRange(t *testing.T) {
 	t.Run("zero", func(t *testing.T) {
-		m := &DockerManifest{Image: "nginx", Expose: []string{"0"}}
+		m := &Manifest{Image: "nginx", Expose: []string{"0"}}
 		err := m.Validate()
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "between 1 and 65535")
 	})
 	t.Run("too high", func(t *testing.T) {
-		m := &DockerManifest{Image: "nginx", Expose: []string{"65536"}}
+		m := &Manifest{Image: "nginx", Expose: []string{"65536"}}
 		err := m.Validate()
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "between 1 and 65535")
 	})
 }
 
+// TestPortSpecValidation exercises the package-internal validatePortSpec
+// helper used by Manifest.Validate. (Moved here from the docker test file
+// when the manifest parser was lifted out of internal/backend/docker.)
+func TestPortSpecValidation(t *testing.T) {
+	tests := []struct {
+		spec      string
+		expectErr bool
+	}{
+		{"80/tcp", false},
+		{"443/tcp", false},
+		{"53/udp", false},
+		{"8080/tcp", false},
+		{"65535/tcp", false},
+		{"1/tcp", false},
+
+		// Invalid
+		{"80", true},           // Missing protocol
+		{"tcp/80", true},       // Wrong order
+		{"80/http", true},      // Invalid protocol
+		{"0/tcp", true},        // Port too low
+		{"65536/tcp", true},    // Port too high
+		{"-1/tcp", true},       // Negative port
+		{"abc/tcp", true},      // Non-numeric port
+		{"80/tcp/extra", true}, // Extra component
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.spec, func(t *testing.T) {
+			err := validatePortSpec(tt.spec)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 // --- init validation tests (no validation to fail — just ensure it doesn't error) ---
 
-func TestDockerManifest_Init_Valid(t *testing.T) {
+func TestManifest_Init_Valid(t *testing.T) {
 	trueVal := true
 	falseVal := false
 	t.Run("true", func(t *testing.T) {
-		m := &DockerManifest{Image: "nginx", Init: &trueVal}
+		m := &Manifest{Image: "nginx", Init: &trueVal}
 		assert.NoError(t, m.Validate())
 	})
 	t.Run("false", func(t *testing.T) {
-		m := &DockerManifest{Image: "nginx", Init: &falseVal}
+		m := &Manifest{Image: "nginx", Init: &falseVal}
 		assert.NoError(t, m.Validate())
 	})
 	t.Run("nil", func(t *testing.T) {
-		m := &DockerManifest{Image: "nginx"}
+		m := &Manifest{Image: "nginx"}
 		assert.NoError(t, m.Validate())
 	})
 }

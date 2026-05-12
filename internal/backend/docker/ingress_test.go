@@ -7,6 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestComputeSubdomain(t *testing.T) {
@@ -140,24 +142,24 @@ func TestRouterName(t *testing.T) {
 func TestSelectIngressPort(t *testing.T) {
 	tests := []struct {
 		name     string
-		ports    map[string]PortConfig
+		ports    map[string]manifest.PortConfig
 		wantPort int
 		wantOK   bool
 	}{
 		{
 			name:   "empty",
-			ports:  map[string]PortConfig{},
+			ports:  map[string]manifest.PortConfig{},
 			wantOK: false,
 		},
 		{
 			name:     "single TCP",
-			ports:    map[string]PortConfig{"3000/tcp": {}},
+			ports:    map[string]manifest.PortConfig{"3000/tcp": {}},
 			wantPort: 3000,
 			wantOK:   true,
 		},
 		{
 			name: "prefer 80",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"3000/tcp": {},
 				"80/tcp":   {},
 				"8080/tcp": {},
@@ -167,7 +169,7 @@ func TestSelectIngressPort(t *testing.T) {
 		},
 		{
 			name: "prefer 8080 over others",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"3000/tcp": {},
 				"8080/tcp": {},
 				"9090/tcp": {},
@@ -177,7 +179,7 @@ func TestSelectIngressPort(t *testing.T) {
 		},
 		{
 			name: "8080 beats lower non-preferred ports",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"8080/tcp": {},
 				"3000/tcp": {},
 			},
@@ -186,7 +188,7 @@ func TestSelectIngressPort(t *testing.T) {
 		},
 		{
 			name: "lowest fallback",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"9090/tcp": {},
 				"3000/tcp": {},
 				"5000/tcp": {},
@@ -196,14 +198,14 @@ func TestSelectIngressPort(t *testing.T) {
 		},
 		{
 			name: "UDP only",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"53/udp": {},
 			},
 			wantOK: false,
 		},
 		{
 			name: "mixed protocols",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"53/udp":   {},
 				"8080/tcp": {},
 			},
@@ -212,7 +214,7 @@ func TestSelectIngressPort(t *testing.T) {
 		},
 		{
 			name: "ingress hint overrides default preference",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"80/tcp":    {},
 				"18789/tcp": {Ingress: true},
 				"8083/tcp":  {},
@@ -222,7 +224,7 @@ func TestSelectIngressPort(t *testing.T) {
 		},
 		{
 			name: "ingress hint on single port",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"9090/tcp": {Ingress: true},
 			},
 			wantPort: 9090,
@@ -230,7 +232,7 @@ func TestSelectIngressPort(t *testing.T) {
 		},
 		{
 			name: "ingress hint beats 8080",
-			ports: map[string]PortConfig{
+			ports: map[string]manifest.PortConfig{
 				"8080/tcp": {},
 				"3000/tcp": {Ingress: true},
 			},
@@ -387,7 +389,7 @@ func TestApplyIngressLabels(t *testing.T) {
 		WildcardDomain: "barney0.manifest0.net",
 		Entrypoint:     "websecure",
 	}
-	httpPorts := map[string]PortConfig{"80/tcp": {}}
+	httpPorts := map[string]manifest.PortConfig{"80/tcp": {}}
 
 	t.Run("disabled ingress emits nothing", func(t *testing.T) {
 		labels := map[string]string{}
@@ -412,7 +414,7 @@ func TestApplyIngressLabels(t *testing.T) {
 			Quantity:    1,
 			Ingress:     cfg,
 			NetworkName: "fred-tenant-abc",
-		}, map[string]PortConfig{}) // no ports
+		}, map[string]manifest.PortConfig{}) // no ports
 		assert.Empty(t, labels)
 	})
 
@@ -429,7 +431,7 @@ func TestApplyIngressLabels(t *testing.T) {
 			Ingress:      cfg,
 			NetworkName:  "fred-tenant-abc",
 			CustomDomain: "foo.example.com",
-		}, map[string]PortConfig{}) // no ports
+		}, map[string]manifest.PortConfig{}) // no ports
 		assert.Empty(t, labels)
 	})
 

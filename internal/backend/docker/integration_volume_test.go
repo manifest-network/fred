@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // setupBtrfsLoopback creates a btrfs filesystem on a loopback file and mounts it.
@@ -175,7 +176,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	leaseUUID := fmt.Sprintf("vol-lifecycle-%d", time.Now().UnixNano())
 
 	// Redis declares VOLUME /data
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
@@ -255,7 +256,7 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("vol-persist-%d", time.Now().UnixNano())
 
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
@@ -365,7 +366,7 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 	leaseUUID := fmt.Sprintf("ephemeral-%d", time.Now().UnixNano())
 
 	// Redis declares VOLUME /data
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server"},
 	}
@@ -418,7 +419,7 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	leaseUUID := fmt.Sprintf("vol-multi-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"sleep", "3600"},
 	}
@@ -532,7 +533,7 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	leaseUUID := fmt.Sprintf("orphan-vol-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data → triggers btrfs subvolume creation
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"sleep", "3600"},
 	}
@@ -619,7 +620,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 
 	// redis:7 declares VOLUME /data → bind-mounted to 5MB btrfs subvolume.
 	// Using "sleep" as command so redis-server doesn't start and consume space.
-	manifest := DockerManifest{
+	manifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"sleep", "3600"},
 	}
