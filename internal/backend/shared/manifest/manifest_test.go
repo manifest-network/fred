@@ -453,7 +453,7 @@ func TestStackManifest_DependsOn_DiamondNoCycle(t *testing.T) {
 	assert.NoError(t, sm.Validate())
 }
 
-func TestDockerManifest_DependsOn_RejectedOutsideStack(t *testing.T) {
+func TestManifest_DependsOn_RejectedOutsideStack(t *testing.T) {
 	m := &Manifest{
 		Image: "nginx",
 		DependsOn: map[string]DependsOnCondition{
@@ -467,7 +467,7 @@ func TestDockerManifest_DependsOn_RejectedOutsideStack(t *testing.T) {
 
 // --- stop_grace_period validation tests ---
 
-func TestDockerManifest_StopGracePeriod_Valid(t *testing.T) {
+func TestManifest_StopGracePeriod_Valid(t *testing.T) {
 	d := Duration(10 * time.Second)
 	m := &Manifest{
 		Image:           "nginx",
@@ -476,7 +476,7 @@ func TestDockerManifest_StopGracePeriod_Valid(t *testing.T) {
 	assert.NoError(t, m.Validate())
 }
 
-func TestDockerManifest_StopGracePeriod_TooLow(t *testing.T) {
+func TestManifest_StopGracePeriod_TooLow(t *testing.T) {
 	d := Duration(500 * time.Millisecond)
 	m := &Manifest{
 		Image:           "nginx",
@@ -487,7 +487,7 @@ func TestDockerManifest_StopGracePeriod_TooLow(t *testing.T) {
 	assert.Contains(t, err.Error(), "at least 1s")
 }
 
-func TestDockerManifest_StopGracePeriod_TooHigh(t *testing.T) {
+func TestManifest_StopGracePeriod_TooHigh(t *testing.T) {
 	d := Duration(121 * time.Second)
 	m := &Manifest{
 		Image:           "nginx",
@@ -498,7 +498,7 @@ func TestDockerManifest_StopGracePeriod_TooHigh(t *testing.T) {
 	assert.Contains(t, err.Error(), "at most 120s")
 }
 
-func TestDockerManifest_StopGracePeriod_Boundaries(t *testing.T) {
+func TestManifest_StopGracePeriod_Boundaries(t *testing.T) {
 	t.Run("exactly 1s", func(t *testing.T) {
 		d := Duration(time.Second)
 		m := &Manifest{Image: "nginx", StopGracePeriod: &d}
@@ -513,7 +513,7 @@ func TestDockerManifest_StopGracePeriod_Boundaries(t *testing.T) {
 
 // --- expose validation tests ---
 
-func TestDockerManifest_Expose_Valid(t *testing.T) {
+func TestManifest_Expose_Valid(t *testing.T) {
 	m := &Manifest{
 		Image:  "nginx",
 		Expose: []string{"3000", "8080"},
@@ -521,7 +521,7 @@ func TestDockerManifest_Expose_Valid(t *testing.T) {
 	assert.NoError(t, m.Validate())
 }
 
-func TestDockerManifest_Expose_InvalidPort(t *testing.T) {
+func TestManifest_Expose_InvalidPort(t *testing.T) {
 	m := &Manifest{
 		Image:  "nginx",
 		Expose: []string{"abc"},
@@ -531,7 +531,7 @@ func TestDockerManifest_Expose_InvalidPort(t *testing.T) {
 	assert.Contains(t, err.Error(), "not a valid port number")
 }
 
-func TestDockerManifest_Expose_Duplicate(t *testing.T) {
+func TestManifest_Expose_Duplicate(t *testing.T) {
 	m := &Manifest{
 		Image:  "nginx",
 		Expose: []string{"3000", "3000"},
@@ -541,7 +541,7 @@ func TestDockerManifest_Expose_Duplicate(t *testing.T) {
 	assert.Contains(t, err.Error(), "duplicate port")
 }
 
-func TestDockerManifest_Expose_OutOfRange(t *testing.T) {
+func TestManifest_Expose_OutOfRange(t *testing.T) {
 	t.Run("zero", func(t *testing.T) {
 		m := &Manifest{Image: "nginx", Expose: []string{"0"}}
 		err := m.Validate()
@@ -596,7 +596,7 @@ func TestPortSpecValidation(t *testing.T) {
 
 // --- init validation tests (no validation to fail — just ensure it doesn't error) ---
 
-func TestDockerManifest_Init_Valid(t *testing.T) {
+func TestManifest_Init_Valid(t *testing.T) {
 	trueVal := true
 	falseVal := false
 	t.Run("true", func(t *testing.T) {

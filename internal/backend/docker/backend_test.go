@@ -770,8 +770,8 @@ func TestParseManifest_Tmpfs(t *testing.T) {
 	})
 
 	t.Run("too many mounts rejected", func(t *testing.T) {
-		// manifest package's maxTmpfsMounts is 4; 5 paths exceeds the limit.
-		paths := make([]string, 5)
+		// Exceeds manifest.MaxTmpfsMounts.
+		paths := make([]string, manifest.MaxTmpfsMounts+1)
 		for i := range paths {
 			paths[i] = fmt.Sprintf("/mnt/vol%d", i)
 		}

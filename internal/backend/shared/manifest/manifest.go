@@ -43,11 +43,11 @@ import (
 // volume IDs, filesystem paths, and network aliases.
 var serviceNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
-// maxTmpfsMounts is the maximum number of additional tmpfs mounts a tenant can request.
+// MaxTmpfsMounts is the maximum number of additional tmpfs mounts a tenant can request.
 // Combined with the automatic /tmp and /run mounts (2), and the default 64MB per mount,
 // this limits total tmpfs memory to 6 × 64MB = 384MB. This prevents tenants from using
 // excessive RAM via tmpfs mounts that bypass the container's cgroup memory limit.
-const maxTmpfsMounts = 4
+const MaxTmpfsMounts = 4
 
 // Manifest represents the tenant's container specification.
 // Resource limits are determined by the SKU, not the manifest.
@@ -450,8 +450,8 @@ var sensitiveKernelPaths = map[string]bool{
 
 // validateTmpfsPaths checks that tmpfs mount paths are safe and reasonable.
 func validateTmpfsPaths(paths []string) error {
-	if len(paths) > maxTmpfsMounts {
-		return fmt.Errorf("tmpfs: too many mounts (%d), maximum is %d", len(paths), maxTmpfsMounts)
+	if len(paths) > MaxTmpfsMounts {
+		return fmt.Errorf("tmpfs: too many mounts (%d), maximum is %d", len(paths), MaxTmpfsMounts)
 	}
 
 	seen := make(map[string]bool, len(paths))
