@@ -150,7 +150,7 @@ type Backend struct {
 	// other — eliminating the stale-pointer / orphan-worker race class
 	// the prior sync.Map design allowed.
 	actorsMu sync.Mutex
-	actors   map[string]*leaseActor // leaseUUID → *leaseActor
+	actors   map[string]*leasesm.LeaseActor // leaseUUID → *leasesm.LeaseActor
 
 	// inspector / gatherer / provisionStore are the substrate-agnostic
 	// seams the lease state machine consumes via leaseActor.cfg. Wired
@@ -200,17 +200,16 @@ const (
 	// Stuck volumes require manual cleanup.
 	maxVolumeCleanupAttempts = 3
 
-	// errMsgContainerExited is the base error message for containers that
-	// exit unexpectedly, used by recoverState and failure callbacks.
-	errMsgContainerExited = "container exited unexpectedly"
-
-	// errMsgInternal is the hardcoded on-chain-safe callback message used
-	// when a worker goroutine panics. Full diagnostics (panic value,
-	// stack) go to provision.LastError and the structured log; the
-	// callback message itself stays generic so we don't leak internals
-	// on-chain.
-	errMsgInternal = "internal error"
 )
+
+// errMsgContainerExited / errMsgInternal moved to
+// internal/backend/shared/leasesm at PR5b-2 D — both strings are
+// on-chain callback payloads per the callback-error-sanitization
+// invariant; divergence between docker/ and leasesm/ copies could emit
+// different on-chain strings for the same failure. The canonical
+// constants live in leasesm/lease_sm.go (unexported sources) with
+// exported aliases leasesm.ErrMsgContainerExited / leasesm.ErrMsgInternal
+// that substrate adapters reach for.
 
 // containerFailureDiagnostics builds a diagnostic string from a failed
 // container's exit state and recent logs. Takes a substrate-agnostic
@@ -479,7 +478,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		logger:           logger.With("backend", cfg.Name),
 		provisions:            make(map[string]*provision),
 		volumeCleanupAttempts: make(map[string]int),
-		actors:                make(map[string]*leaseActor),
+		actors:                make(map[string]*leasesm.LeaseActor),
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,

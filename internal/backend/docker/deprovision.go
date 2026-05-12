@@ -9,6 +9,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // Deprovision is the public shim: it routes the request through the lease's
@@ -18,44 +19,16 @@ import (
 // suppression of stale Failed callbacks.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	reply := make(chan error, 1)
-	if err := b.routeToLeaseBlocking(ctx, leaseUUID, deprovisionMsg{ctx: ctx, reply: reply}); err != nil {
+	if err := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.DeprovisionMsg{Ctx: ctx, Reply: reply}); err != nil {
 		return err
 	}
 	return b.waitForReply(ctx, reply)
 }
 
-// handleDeprovision runs inside the lease actor's message handler. It fires
-// the SM transition then runs the work synchronously, returning the outcome
-// on the deprovisionMsg's reply channel.
-func (a *leaseActor) handleDeprovision(ctx context.Context) error {
-	// Attempt the SM transition. If it's not permitted, check whether the
-	// provision is already gone (idempotent success) or we're in an unexpected
-	// state (surface the error).
-	if err := a.sm.Fire(ctx, evDeprovisionRequested); err != nil {
-		a.backend.provisionsMu.RLock()
-		_, exists := a.backend.provisions[a.leaseUUID]
-		a.backend.provisionsMu.RUnlock()
-		if !exists {
-			a.terminated = true
-			return nil
-		}
-		a.backend.logger.Warn("deprovision transition denied by SM",
-			"lease_uuid", a.leaseUUID, "error", err)
-		// Fall through to the work anyway — the SM may not know every state
-		// (partial port). The work itself is idempotent.
-	}
-	err := a.backend.doDeprovision(ctx, a.leaseUUID)
-	// If the provision entry was fully removed (success path), signal the
-	// run loop to exit so a subsequent re-provision with the same UUID
-	// creates a fresh actor instead of being Ignored by a stale SM.
-	a.backend.provisionsMu.RLock()
-	_, exists := a.backend.provisions[a.leaseUUID]
-	a.backend.provisionsMu.RUnlock()
-	if !exists {
-		a.terminated = true
-	}
-	return err
-}
+// handleDeprovision (lease-actor message handler) moved to
+// internal/backend/shared/leasesm/lease_actor.go at PR5b-2 BC.
+// doDeprovision (Backend method below) stays here; the substrate-agnostic
+// SM/actor reaches it via cfg.DoDeprovisionFn.
 
 // doDeprovision releases resources for a lease. Must be idempotent.
 // For multi-unit leases, removes all containers.

@@ -17,6 +17,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -217,17 +218,17 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// worker is left as a zombie and recoverState reconciles on next
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
-	work := func() (string, provisionSuccessResult, map[string]string, error) {
+	work := func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
 		if isStack {
 			return b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 		}
 		return b.doProvision(provCtx, req, m, profiles, logger)
 	}
 	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, provisionRequestedMsg{
-		cancel: provCancel,
-		work:   work,
-		ack:    ack,
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.ProvisionRequestedMsg{
+		Cancel: provCancel,
+		Work:   work,
+		Ack:    ack,
 	}); routeErr != nil {
 		provCancel()
 		for _, id := range allocatedIDs {
@@ -605,7 +606,7 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 // For multi-SKU leases, each container gets the appropriate resource profile.
 //
 // Returns (callbackErr, result, logs, err). On success, result carries
-// the populated provisionSuccessResult for the SM's Ready entry action
+// the populated leasesm.ProvisionSuccessResult for the SM's Ready entry action
 // to write into the provision struct; logs is nil. On failure, result
 // is zero and logs is the pre-captured container-log map (fetched by
 // the failure defer BEFORE cleanup removes the containers) — the SM's
@@ -618,7 +619,7 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 // failure, release-store updates on success, and stale-diagnostic removal
 // on success. Provision struct mutations (Status, FailCount, LastError,
 // ContainerIDs, Manifest) are owned by the SM entry actions.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, m *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, m *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	totalQuantity := req.TotalQuantity()
 	var containerIDs []string
 	var createdVolumeIDs []string // tracks volumes actually created for accurate cleanup
@@ -687,9 +688,9 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 		updateResourceMetrics(b.pool.Stats())
 
-		resultRet = provisionSuccessResult{
-			containerIDs: containerIDs,
-			manifest:     m,
+		resultRet = leasesm.ProvisionSuccessResult{
+			ContainerIDs: containerIDs,
+			Manifest:     m,
 		}
 	}()
 
@@ -875,7 +876,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 //
 // See doProvision for the (callbackErr, result, logs, err) return contract.
 // Stack-specific result fields are stackManifest + serviceContainers.
-func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet provisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
@@ -945,10 +946,10 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 
 		updateResourceMetrics(b.pool.Stats())
 
-		resultRet = provisionSuccessResult{
-			containerIDs:      containerIDs,
-			stackManifest:     stack,
-			serviceContainers: serviceContainers,
+		resultRet = leasesm.ProvisionSuccessResult{
+			ContainerIDs:      containerIDs,
+			StackManifest:     stack,
+			ServiceContainers: serviceContainers,
 		}
 	}()
 

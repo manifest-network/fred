@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // TestCrossLeaseParallelism measures whether container-death events on
@@ -83,7 +84,7 @@ func TestCrossLeaseParallelism(t *testing.T) {
 		// Use the fire-and-forget actor dispatch path (what the production
 		// event loop uses), not the synchronous shim.
 		if leaseUUID, found := b.findLeaseByContainerID(cid); found {
-			b.actorFor(leaseUUID).send(containerDiedMsg{containerID: cid})
+			b.actorFor(leaseUUID).TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: cid})
 		}
 	}
 	dispatchElapsed := time.Since(start)
@@ -163,7 +164,7 @@ func TestCrossLeaseInboxBackpressure(t *testing.T) {
 	go func() {
 		defer close(dispatchDone)
 		for _, cid := range containerIDs {
-			b.actorFor("lease-1").send(containerDiedMsg{containerID: cid})
+			b.actorFor("lease-1").TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: cid})
 		}
 	}()
 

@@ -21,6 +21,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -292,7 +293,7 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 		logger:                slog.Default(),
 		provisions:            provs,
 		volumeCleanupAttempts: make(map[string]int),
-		actors:                make(map[string]*leaseActor),
+		actors:                make(map[string]*leasesm.LeaseActor),
 		stopCtx:               stopCtx,
 		stopCancel:            stopCancel,
 	}
@@ -541,7 +542,7 @@ func TestRecoverState(t *testing.T) {
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusFailing,
 				FailCount: 1,
-				LastError: errMsgContainerExited,
+				LastError: leasesm.ErrMsgContainerExited,
 				CreatedAt: now,
 			},
 		}
@@ -555,7 +556,7 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
 			"Failing must be normalized to Failed on recovery to unblock retries")
 		assert.Equal(t, 1, prov.FailCount, "FailCount preserved across normalization")
-		assert.Equal(t, errMsgContainerExited, prov.LastError, "LastError preserved")
+		assert.Equal(t, leasesm.ErrMsgContainerExited, prov.LastError, "LastError preserved")
 	})
 
 	t.Run("ready provision without containers dropped", func(t *testing.T) {
@@ -1320,7 +1321,7 @@ func TestRecoverState_PersistsDiagnostics(t *testing.T) {
 
 func TestRecoverState_CallbackSanitized(t *testing.T) {
 	// Verify that recoverState failure callbacks never include container logs
-	// or dynamic data — only the hardcoded errMsgContainerExited.
+	// or dynamic data — only the hardcoded leasesm.ErrMsgContainerExited.
 	secret := "AWS_SECRET_KEY=wJalrXUtnFEMI"
 	now := time.Now()
 
@@ -1388,12 +1389,12 @@ func TestRecoverState_CallbackSanitized(t *testing.T) {
 	// Callback is now emitted by the SM's Failed.OnEntryFrom(evDiagGathered)
 	// entry action after the Failing goroutine completes. Poll for it.
 	require.Eventually(t, func() bool {
-		return readPayload().Error == errMsgContainerExited
+		return readPayload().Error == leasesm.ErrMsgContainerExited
 	}, 2*time.Second, 10*time.Millisecond, "Failed callback should eventually arrive")
 
 	// Callback should have hardcoded message only — no secrets.
 	payload := readPayload()
-	assert.Equal(t, errMsgContainerExited, payload.Error)
+	assert.Equal(t, leasesm.ErrMsgContainerExited, payload.Error)
 	assert.NotContains(t, payload.Error, secret)
 	assert.NotContains(t, payload.Error, "exit_code")
 

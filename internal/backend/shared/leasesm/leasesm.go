@@ -235,6 +235,9 @@ type LeaseProvisionStore interface {
 //
 // WorkerPanic's workerType is one of "provision" / "replace" / "diag"
 // (the three categories of worker goroutines the actor spawns).
+// ActorPanic is the distinct site for panics in the actor's own
+// message-handler goroutine (recovered by handle()'s defer); it has
+// no label because the actor goroutine is a single category.
 // TerminalEventDropped's event is a short tag identifying the event
 // type that was dropped (e.g., "diag_gathered", "provision_completed").
 type SMMetrics interface {
@@ -242,6 +245,7 @@ type SMMetrics interface {
 	ActorCreated()
 	FailingRaceSkipped()
 	WorkerPanic(workerType string)
+	ActorPanic()
 	TerminalEventDropped(event string)
 	ActiveProvisionsInc()
 	ActiveProvisionsDec()
@@ -289,4 +293,16 @@ type LeaseActorConfig struct {
 	// truncation, HMAC signing, retry, and store persistence; the SM
 	// only supplies the inputs.
 	SendCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
+
+	// DoDeprovisionFn dispatches the substrate-specific deprovision
+	// flow for the given lease. Called from handleDeprovision after
+	// the SM's evDeprovisionRequested fires.
+	//
+	// The ctx threaded in MUST be the actor-owned ctx delivered with
+	// the inbound DeprovisionMsg (which itself carries the caller's
+	// ctx from Backend.Deprovision). Substrate implementers MUST NOT
+	// substitute a caller-imported ctx or a fresh ctx here — the
+	// actor's serial processing of inbound messages depends on each
+	// handler honoring the inbound ctx for cancellation semantics.
+	DoDeprovisionFn func(ctx context.Context, leaseUUID string) error
 }

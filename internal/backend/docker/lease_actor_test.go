@@ -53,7 +53,7 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 	rebuildCallbackSender(b)
 	defer b.stopCancel()
 
-	require.True(t, b.actorFor("lease-1").send(containerDiedMsg{containerID: "c1"}))
+	require.True(t, b.actorFor("lease-1").TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: "c1"}))
 
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
@@ -209,7 +209,8 @@ func TestDebugActors(t *testing.T) {
 	snaps := b.DebugActors()
 	require.Len(t, snaps, 1)
 	require.Equal(t, "lease-a", snaps[0].LeaseUUID)
-	require.Equal(t, leaseActorInboxSize, snaps[0].InboxCap)
+	require.Equal(t, 16, snaps[0].InboxCap,
+		"inbox cap must match leasesm's leaseActorInboxSize (=16)")
 	// The SM is initialized eagerly — its initial state mirrors the
 	// provision's current Status at actor creation time.
 	require.Equal(t, string(backend.ProvisionStatusReady), snaps[0].SMState)
@@ -232,9 +233,9 @@ func TestLeaseActor_EagerSMInit(t *testing.T) {
 	defer b.stopCancel()
 
 	actor := b.actorFor("lease-1")
-	require.NotNil(t, actor.sm,
+	require.NotNil(t, actor,
 		"sm must be initialized in newLeaseActor; lazy init races with DebugActors")
-	require.Equal(t, backend.ProvisionStatusReady, actor.sm.State(),
+	require.Equal(t, backend.ProvisionStatusReady, actor.State(),
 		"sm initial state mirrors the provision's current Status at actor creation")
 }
 
@@ -266,7 +267,7 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 
 	// Actor deletes itself from b.actors and closes done on exit.
 	select {
-	case <-first.done:
+	case <-first.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("actor did not exit after successful deprovision")
 	}
@@ -281,12 +282,12 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 	second := b.actorFor("lease-1")
 	require.NotSame(t, first, second,
 		"UUID reuse after Deprovision must produce a fresh actor")
-	require.Equal(t, backend.ProvisionStatusProvisioning, second.sm.State(),
+	require.Equal(t, backend.ProvisionStatusProvisioning, second.State(),
 		"fresh actor's SM starts in Provisioning (no provision entry exists)")
 }
 
 // TestLeaseActor_StatusMatchesSMState is the cross-cutting consistency
-// test for the "prov.Status == actor.sm.State()" contract. prov.Status
+// test for the "prov.Status == actor.State()" contract. prov.Status
 // is set in multiple places (the synchronous section of
 // Provision/Restart/Update, SM entry actions, recoverState's
 // Failing→Failed normalization), and we want drift between the two to
@@ -315,9 +316,9 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 		if !provExists {
 			return // no provision — no contract to enforce
 		}
-		smState := actor.sm.State()
+		smState := actor.State()
 		assert.Equal(t, status, smState,
-			"%s: prov.Status (%s) must match actor.sm.State() (%s)",
+			"%s: prov.Status (%s) must match actor.State() (%s)",
 			context, status, smState)
 	}
 
@@ -416,17 +417,17 @@ func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
 
 	// Warm the actor so its SM is in Failing.
 	actor := b.actorFor("lease-1")
-	require.Equal(t, backend.ProvisionStatusFailing, actor.sm.State())
+	require.Equal(t, backend.ProvisionStatusFailing, actor.State())
 
 	// Route a provisionRequestedMsg — the Failing→Provisioning Permit
 	// should accept it.
 	ack := make(chan error, 1)
-	ok := b.routeToLease("lease-1", provisionRequestedMsg{
-		cancel: func() {},
-		work: func() (string, provisionSuccessResult, map[string]string, error) {
-			return "", provisionSuccessResult{}, nil, nil
+	ok := b.routeToLease("lease-1", leasesm.ProvisionRequestedMsg{
+		Cancel: func() {},
+		Work: func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
+			return "", leasesm.ProvisionSuccessResult{}, nil, nil
 		},
-		ack: ack,
+		Ack: ack,
 	})
 	require.True(t, ok)
 	select {
@@ -437,146 +438,6 @@ func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
 	}
 }
 
-// TestLeaseActor_SurvivesHandlerPanic pins the defer-recover in handle():
-// a panic in a handler path (SM guard, entry action, or downstream I/O)
-// must be contained to a single message. Without recovery, the actor
-// goroutine dies and senders block on a full inbox forever.
-func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
-	var inspectCalls atomic.Int32
-	mock := &mockDockerClient{
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			if inspectCalls.Add(1) == 1 {
-				panic("simulated inspect failure")
-			}
-			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
-		},
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return "", nil
-		},
-	}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady,
-		},
-	})
-	defer b.stopCancel()
-
-	actor := b.actorFor("lease-1")
-	before := testutil.ToFloat64(leaseActorPanicsTotal)
-
-	// First send: panics inside the SM guard (InspectContainer).
-	require.True(t, actor.send(containerDiedMsg{containerID: "c1"}))
-	require.Eventually(t, func() bool {
-		return testutil.ToFloat64(leaseActorPanicsTotal) > before
-	}, 2*time.Second, 10*time.Millisecond,
-		"leaseActorPanicsTotal must increment when a handler panics")
-
-	// Second send: must be processed — the actor survived the panic.
-	done := make(chan struct{})
-	require.True(t, actor.send(containerDiedMsg{containerID: "c1", done: done}))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor did not process a message after recovering from panic")
-	}
-}
-
-// TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural
-// invariant for terminal-event delivery during shutdown: when stopCtx
-// fires with an in-flight work goroutine, the actor must (1) wait for
-// the goroutine to complete (via workers.Zero), (2) drain the inbox so the
-// terminal SM event is processed via handle(), and only then exit.
-// Without the drain, the event would be dropped at the send-check
-// because the actor had already exited on stopCtx.
-func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusProvisioning,
-			ContainerIDs: nil,
-		},
-	})
-
-	actor := b.actorFor("lease-1")
-	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
-
-	// Simulate an in-flight worker via workers.Add. The actor's exit-path
-	// waitForWorkers defer will block until we Done().
-	actor.workers.Add()
-
-	// Fire shutdown BEFORE the worker completes. The actor's run loop
-	// returns immediately but waitForWorkers must block.
-	b.stopCancel()
-
-	// Simulate the worker: send terminal event, then Done(). The actor
-	// should then drain the inbox (via handle()) and process the event,
-	// flipping Status to Ready.
-	go func() {
-		ok := actor.sendTerminal(provisionCompletedMsg{
-			result: provisionSuccessResult{
-				containerIDs: []string{"c1"},
-			},
-		})
-		require.True(t, ok, "sendTerminal must not refuse during shutdown drain")
-		actor.workers.Done()
-	}()
-
-	// The actor must exit cleanly, and the provision must be Ready.
-	select {
-	case <-actor.done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("actor did not exit after shutdown drain")
-	}
-
-	b.provisionsMu.RLock()
-	defer b.provisionsMu.RUnlock()
-	prov := b.provisions["lease-1"]
-	require.NotNil(t, prov)
-	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,
-		"terminal provisionCompletedMsg sent during shutdown must have been drained and processed")
-	assert.Equal(t, []string{"c1"}, prov.ContainerIDs,
-		"ContainerIDs must reflect the SM entry action running on the drained event")
-}
-
-// TestLeaseActor_SendTerminalRefusesAfterActorExit guards the sendTerminal
-// contract: once the actor has fully exited (a.done closed), sendTerminal
-// must return false rather than block forever on a channel nobody will
-// drain. This lets call sites count + log the dropped event instead of
-// wedging the goroutine.
-func TestLeaseActor_SendTerminalRefusesAfterActorExit(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
-
-	actor := b.actorFor("lease-gone")
-	// Force the actor to exit by shutting down and waiting for it.
-	b.stopCancel()
-	<-actor.done
-
-	ok := actor.sendTerminal(provisionCompletedMsg{})
-	assert.False(t, ok, "sendTerminal must refuse once the actor has exited")
-}
-
-// TestLeaseActor_SendRefusesAfterActorExit mirrors the sendTerminal test
-// for the non-terminal send path. Before the defer-reorder fix, post-exit
-// send() could queue a message into an inbox nobody would drain because
-// the hasExited check didn't exist on this path.
-func TestLeaseActor_SendRefusesAfterActorExit(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
-
-	actor := b.actorFor("lease-gone")
-	b.stopCancel()
-	<-actor.done
-
-	ok := actor.send(containerDiedMsg{containerID: "c1"})
-	assert.False(t, ok, "send must refuse once the actor has exited")
-}
-
 // TestRouteToLease_DropsOnFullInbox pins the non-blocking-under-mutex
 // contract of routeToLease. When an actor's inbox is saturated, the
 // non-blocking send in routeToLease returns false — the registry mutex
@@ -585,27 +446,50 @@ func TestLeaseActor_SendRefusesAfterActorExit(t *testing.T) {
 // dieEventDroppedTotal metric wiring, this turns "one wedged actor
 // stalls all lease event delivery" into "one wedged actor loses its
 // own die events (reconciler re-detects)".
+//
+// Wedges the actor's run loop via a hung Inspector.InspectInstance in the
+// SM ContainerDied guard. This is the real production wedge mechanism;
+// the previous install-without-run pattern was a synthetic state that
+// can't occur in production (NewLeaseActor unconditionally spawns the
+// run loop). See ENG-148 PR5b-2 deviation E-1.
 func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
+	firstInspected := make(chan struct{})
+	var inspectCount atomic.Int32
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			if inspectCount.Add(1) == 1 {
+				close(firstInspected)
+			}
+			// Block until the actor's per-call guard ctx (10s) or the
+			// backend's stopCtx fires. The test ends well before either.
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+	})
 	defer b.stopCancel()
 
-	// Install an actor directly without starting its run loop, so its
-	// inbox is never drained and we can fill it to capacity.
-	actor := newLeaseActor(b, "lease-1")
-	b.actorsMu.Lock()
-	b.actors["lease-1"] = actor
-	b.actorsMu.Unlock()
+	// First message: routeToLease creates the actor (spawning its run
+	// loop via NewLeaseActor) and enqueues. The actor consumes it,
+	// invokes handle() → handleContainerDied → sm.Fire → guard →
+	// Inspector.InspectInstance, which wedges on the hung mock above.
+	require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "c1"}))
+	<-firstInspected
 
-	// Fill inbox to capacity.
-	for i := 0; i < leaseActorInboxSize; i++ {
-		ok := b.routeToLease("lease-1", containerDiedMsg{containerID: "c1"})
-		require.True(t, ok, "message %d should enqueue", i)
+	// Actor is now blocked in the SM guard. Fill the remaining 16 inbox
+	// slots — none of these get consumed because the actor is wedged.
+	for i := 0; i < 16; i++ {
+		require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "cN"}),
+			"message %d should enqueue while actor is wedged", i)
 	}
 
-	// Inbox is full → routeToLease must refuse without blocking.
+	// Inbox is now at capacity. Next routeToLease must refuse without
+	// blocking.
 	done := make(chan bool, 1)
 	go func() {
-		done <- b.routeToLease("lease-1", containerDiedMsg{containerID: "overflow"})
+		done <- b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "overflow"})
 	}()
 	select {
 	case ok := <-done:
@@ -620,33 +504,62 @@ func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
 // routeToLeaseBlocking polls at routeToLeaseRetryInterval and succeeds
 // once space appears. Replaces the old "full inbox → spurious backend
 // shutting down error" behavior.
+//
+// Wedges the actor's run loop via a hung Inspector.InspectInstance in the
+// SM ContainerDied guard. This is the real production wedge mechanism;
+// the previous install-without-run pattern was a synthetic state that
+// can't occur in production (NewLeaseActor unconditionally spawns the
+// run loop). See ENG-148 PR5b-2 deviation E-1.
 func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
+	firstInspected := make(chan struct{})
+	unblockFirst := make(chan struct{})
+	var inspectCount atomic.Int32
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			n := inspectCount.Add(1)
+			if n == 1 {
+				close(firstInspected)
+				// First call: block until the test signals release.
+				select {
+				case <-unblockFirst:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				// Return a not-terminally-gone phase so the guard
+				// short-circuits and the actor handler returns —
+				// this is what frees the inbox slot.
+				return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+			}
+			// Subsequent calls: block until ctx times out. We only
+			// want ONE slot freed for this test.
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+	})
 	defer b.stopCancel()
 
-	// Install an actor directly with an unstarted run loop so its
-	// inbox doesn't drain. Fill to capacity.
-	actor := newLeaseActor(b, "lease-1")
-	b.actorsMu.Lock()
-	b.actors["lease-1"] = actor
-	b.actorsMu.Unlock()
-	for i := 0; i < leaseActorInboxSize; i++ {
-		require.True(t, b.routeToLease("lease-1", containerDiedMsg{containerID: "cN"}))
+	// Fill inbox: first message wedges the actor in the SM guard;
+	// next 16 queue.
+	require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "c0"}))
+	<-firstInspected
+	for i := 0; i < 16; i++ {
+		require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "cN"}))
 	}
 
 	// routeToLeaseBlocking should not return false immediately — it
-	// must retry while inbox is full. Drain one slot after ~30ms so
-	// retry finds space and the call returns nil.
+	// must retry while inbox is full. Free one slot after ~30ms by
+	// releasing the wedged Inspector so the actor's handler returns
+	// and the next message gets pulled off the inbox.
 	start := time.Now()
-	drained := make(chan struct{})
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		<-actor.inbox // free one slot
-		close(drained)
+		close(unblockFirst)
 	}()
 
-	err := b.routeToLeaseBlocking(context.Background(), "lease-1", containerDiedMsg{containerID: "c-retry"})
-	<-drained
+	err := b.routeToLeaseBlocking(context.Background(), "lease-1", leasesm.ContainerDiedMsg{ContainerID: "c-retry"})
 	require.NoError(t, err, "routeToLeaseBlocking must succeed once slot frees")
 	assert.GreaterOrEqual(t, time.Since(start), 30*time.Millisecond,
 		"should have waited for inbox space rather than returning immediately")
@@ -655,22 +568,39 @@ func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
 // TestRouteToLeaseBlocking_ReturnsCtxErr pins the ctx-cancel contract:
 // if the caller's ctx is cancelled (at entry or during retry),
 // routeToLeaseBlocking must return ctx.Err() without enqueueing.
+//
+// Wedges the actor's run loop via a hung Inspector.InspectInstance in the
+// SM ContainerDied guard. This is the real production wedge mechanism;
+// the previous install-without-run pattern was a synthetic state that
+// can't occur in production (NewLeaseActor unconditionally spawns the
+// run loop). See ENG-148 PR5b-2 deviation E-1.
 func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
+	firstInspected := make(chan struct{})
+	var inspectCount atomic.Int32
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			if inspectCount.Add(1) == 1 {
+				close(firstInspected)
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady},
+	})
 	defer b.stopCancel()
 
-	// Install a saturated actor.
-	actor := newLeaseActor(b, "lease-1")
-	b.actorsMu.Lock()
-	b.actors["lease-1"] = actor
-	b.actorsMu.Unlock()
-	for i := 0; i < leaseActorInboxSize; i++ {
-		require.True(t, b.routeToLease("lease-1", containerDiedMsg{}))
+	// Saturate: first message wedges actor; next 16 queue.
+	require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "c0"}))
+	<-firstInspected
+	for i := 0; i < 16; i++ {
+		require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "cN"}))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := b.routeToLeaseBlocking(ctx, "lease-1", containerDiedMsg{containerID: "c-timeout"})
+	err := b.routeToLeaseBlocking(ctx, "lease-1", leasesm.ContainerDiedMsg{ContainerID: "c-timeout"})
 	assert.ErrorIs(t, err, context.DeadlineExceeded,
 		"routeToLeaseBlocking must surface ctx.Err() when caller's ctx expires while inbox is wedged")
 }
@@ -690,16 +620,16 @@ func TestLeaseActor_ProvisionRequestedSMRejection(t *testing.T) {
 	defer b.stopCancel()
 
 	// Warm the actor so its SM is in Ready.
-	require.Equal(t, backend.ProvisionStatusReady, b.actorFor("lease-1").sm.State())
+	require.Equal(t, backend.ProvisionStatusReady, b.actorFor("lease-1").State())
 
 	ack := make(chan error, 1)
-	ok := b.routeToLease("lease-1", provisionRequestedMsg{
-		cancel: func() {},
-		work: func() (string, provisionSuccessResult, map[string]string, error) {
+	ok := b.routeToLease("lease-1", leasesm.ProvisionRequestedMsg{
+		Cancel: func() {},
+		Work: func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
 			t.Fatal("work closure must not run when SM rejects the transition")
-			return "", provisionSuccessResult{}, nil, nil
+			return "", leasesm.ProvisionSuccessResult{}, nil, nil
 		},
-		ack: ack,
+		Ack: ack,
 	})
 	require.True(t, ok, "routeToLease itself must succeed; rejection is at SM-fire time")
 
@@ -737,183 +667,13 @@ func TestLeaseActor_RegistryDeletedBeforeDoneClose(t *testing.T) {
 
 	first := b.actorFor("lease-1")
 	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
-	<-first.done
+	<-first.Done()
 
 	// By the time done is closed, Delete must have already run — so
 	// actorFor returns a fresh actor, not the exiting one.
 	second := b.actorFor("lease-1")
 	require.NotSame(t, first, second,
 		"fresh actorFor after Deprovision+done must not return the exiting actor — Delete must fire before close(done)")
-}
-
-// TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine pins the
-// orphan-containers invariant for the Restart flow: when Deprovision
-// preempts an in-flight restart, Restarting.OnExit must cancel the
-// work goroutine and wait on workDone before doDeprovision reads
-// ContainerIDs. Guards against future refactors that move the replace
-// spawn sites without plumbing the done channel.
-//
-// The Update flow uses the exact same SM transition and OnExit handler,
-// so this single test covers both — the behaviour is identical.
-func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
-	var removedMu sync.Mutex
-	var removedIDs []string
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removedMu.Lock()
-			removedIDs = append(removedIDs, containerID)
-			removedMu.Unlock()
-			return nil
-		},
-	}
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusRestarting,
-			ContainerIDs: []string{"old-container"},
-		},
-	})
-	defer b.stopCancel()
-
-	actor := b.actorFor("lease-1")
-	require.Equal(t, backend.ProvisionStatusRestarting, actor.sm.State())
-
-	// Simulate an in-flight replace worker via workers.Add + cancel func.
-	var cancelCalled atomic.Bool
-	workerRelease := make(chan struct{})
-	actor.workCancel = func() { cancelCalled.Store(true) }
-	actor.workers.Add()
-	go func() {
-		<-workerRelease
-		// Publish new container IDs before Done — mirrors the real
-		// replace worker's pre-publish step.
-		b.provisionsMu.Lock()
-		b.provisions["lease-1"].ContainerIDs = []string{"new-container"}
-		b.provisionsMu.Unlock()
-		actor.workers.Done()
-	}()
-
-	deprovErr := make(chan error, 1)
-	go func() {
-		deprovErr <- b.Deprovision(context.Background(), "lease-1")
-	}()
-
-	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
-		"OnExit must call workCancel before waiting for the worker (Restart path)")
-
-	select {
-	case err := <-deprovErr:
-		t.Fatalf("Deprovision returned before worker finished: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	// Release the worker → wg.Done → onExitProvisioning unblocks →
-	// doDeprovision runs.
-	close(workerRelease)
-
-	select {
-	case err := <-deprovErr:
-		require.NoError(t, err, "Deprovision must succeed after worker completes")
-	case <-time.After(3 * time.Second):
-		t.Fatal("Deprovision did not complete after worker finished")
-	}
-
-	removedMu.Lock()
-	defer removedMu.Unlock()
-	require.Contains(t, removedIDs, "new-container",
-		"doDeprovision must see the new containerIDs published by the replace worker")
-}
-
-// TestLeaseActor_ExitWaitsForWorkers pins the structural fix for the
-// shutdown-drain race: the actor's exit-path waitForWorkers defer must
-// block until every worker goroutine (provision/restart/update/diag)
-// has returned. Without it, a worker's sendTerminal could land after
-// the actor's drainInbox had already run, dropping the terminal event.
-//
-// Installs a synthetic worker via workers.Add, fires shutdown,
-// verifies the actor does not exit until the worker Done()s.
-func TestLeaseActor_ExitWaitsForWorkers(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailing},
-	})
-
-	actor := b.actorFor("lease-1")
-	actor.workers.Add()
-
-	b.stopCancel()
-
-	// Actor must block in waitForWorkers until we Done().
-	select {
-	case <-actor.done:
-		t.Fatal("actor exited before worker Done() — waitForWorkers did not block")
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	// Mark worker complete. Actor must now exit cleanly.
-	actor.workers.Done()
-	select {
-	case <-actor.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor did not exit after worker Done()")
-	}
-}
-
-// TestLeaseActor_DiagGathered_ShutdownDrain exercises the drain-on-shutdown
-// path for a lease in the Failing state: stopCtx fires with a diagGatheredMsg
-// freshly queued in the inbox, and the actor must process it (transitioning
-// Failing→Failed) before exiting. Pre-fix: the actor would exit on
-// stopCtx.Done and the diag message would be discarded by drainInbox
-// without handling, leaving Status stuck at Failing.
-//
-// Asserts on the SM-observable outcome (Status flip) rather than HTTP
-// callback delivery — the callbackSender uses stopCtx and legitimately
-// cannot reach an external HTTP endpoint during shutdown (the callback
-// is persisted to the bbolt store for replay on next start instead).
-func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
-	mock := &mockDockerClient{
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
-		},
-	}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusFailing,
-		},
-	})
-
-	actor := b.actorFor("lease-1")
-	require.Equal(t, backend.ProvisionStatusFailing, actor.sm.State())
-
-	// Queue a diagGatheredMsg, then fire shutdown. Whatever the inbox
-	// select picks next (msg or stopCtx.Done), drainOnShutdown must
-	// process the queued message before the actor exits.
-	exitCode := 1
-	ok := actor.sendTerminal(diagGatheredMsg{
-		result: diagResult{
-			containerID: "c1",
-			info:        &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode},
-			diag:        "synthetic diag",
-		},
-	})
-	require.True(t, ok, "sendTerminal must enqueue while the actor is alive")
-	b.stopCancel()
-
-	select {
-	case <-actor.done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("actor did not exit after shutdown drain")
-	}
-
-	b.provisionsMu.RLock()
-	defer b.provisionsMu.RUnlock()
-	prov := b.provisions["lease-1"]
-	require.NotNil(t, prov)
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
-		"drained diagGatheredMsg must transition SM Failing→Failed")
 }
 
 // TestBackend_ShutdownDrainsAllActors stresses the drain-on-shutdown path
@@ -1116,136 +876,6 @@ func TestOnEnterFailing_RaceWithConcurrentStatusFlip(t *testing.T) {
 		"leaseFailingRaceSkippedTotal must increment by exactly 1")
 }
 
-// TestSpawnProvisionWorker_PanicRecovery pins the invariant that a
-// panic in the provision worker does NOT crash fred: the recover logs
-// the panic with stack, bumps lease_worker_panics_total{worker_type=
-// "provision"}, drives the SM to Failed, and lets the actor keep
-// serving other messages. Without this recovery an unrecovered panic
-// would take down the entire fred binary (Go's panic semantics).
-func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusProvisioning,
-		},
-	})
-	defer b.stopCancel()
-
-	actor := b.actorFor("lease-1")
-	panicsBefore := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("provision"))
-
-	// Inject a worker that panics instead of doing real work. The
-	// recover must catch the panic, bump the metric, and fire a
-	// provisionErrored terminal so the SM transitions to Failed.
-	actor.spawnProvisionWorker(func() (string, provisionSuccessResult, map[string]string, error) {
-		panic("synthetic provision panic")
-	})
-
-	// SM must reach Failed within a short window — proves the recover
-	// fired the terminal event and the actor processed it.
-	require.Eventually(t, func() bool {
-		return actor.sm.State() == backend.ProvisionStatusFailed
-	}, 2*time.Second, 10*time.Millisecond,
-		"SM must transition to Failed after worker panic recovery")
-
-	panicsAfter := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("provision"))
-	assert.Equal(t, panicsBefore+1, panicsAfter,
-		"lease_worker_panics_total{worker_type=provision} must increment by 1")
-
-	// Actor is still alive and responsive — send a container-death
-	// event and verify it gets handled (the run loop didn't die).
-	done := make(chan struct{})
-	require.True(t, actor.send(containerDiedMsg{containerID: "nonexistent", done: done}))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor stopped processing after worker panic — fred would have crashed")
-	}
-}
-
-// TestSpawnReplaceWorker_PanicRecovery: same invariant for the
-// restart/update worker path.
-func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusRestarting,
-		},
-	})
-	defer b.stopCancel()
-
-	actor := b.actorFor("lease-1")
-	panicsBefore := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("replace"))
-
-	actor.spawnReplaceWorker(func() replaceResult {
-		panic("synthetic replace panic")
-	})
-
-	require.Eventually(t, func() bool {
-		return actor.sm.State() == backend.ProvisionStatusFailed
-	}, 2*time.Second, 10*time.Millisecond,
-		"SM must transition to Failed after replace worker panic recovery")
-
-	panicsAfter := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("replace"))
-	assert.Equal(t, panicsBefore+1, panicsAfter,
-		"lease_worker_panics_total{worker_type=replace} must increment by 1")
-
-	done := make(chan struct{})
-	require.True(t, actor.send(containerDiedMsg{containerID: "nonexistent", done: done}))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor stopped processing after replace worker panic")
-	}
-}
-
-// TestGatherDiagAsync_PanicRecovery: the diag worker (spawned from
-// Failing.OnEntry) must also recover. A panic in containerFailureDiagnostics
-// used to crash fred; now it bumps the metric and drives Failing→Failed
-// with empty diag so the lease isn't wedged in Failing.
-func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
-	mock := &mockDockerClient{
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			panic("synthetic diag panic")
-		},
-	}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusFailing,
-			ContainerIDs: []string{"c1"},
-		},
-	})
-	defer b.stopCancel()
-
-	actor := b.actorFor("lease-1")
-	panicsBefore := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("diag"))
-
-	// Drive Failing.OnEntry by invoking gatherDiagAsync directly with a
-	// cancellable context matching what onEnterFailing would set up.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	actor.workers.Add()
-	go func() {
-		defer actor.workers.Done()
-		exitCode := 1
-		actor.gatherDiagAsync(ctx, "c1", &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode}, "")
-	}()
-
-	// SM must reach Failed once the panic recovery fires diagGatheredMsg.
-	require.Eventually(t, func() bool {
-		return actor.sm.State() == backend.ProvisionStatusFailed
-	}, 2*time.Second, 10*time.Millisecond,
-		"SM must transition Failing→Failed after diag worker panic recovery")
-
-	panicsAfter := testutil.ToFloat64(leaseWorkerPanicsTotal.WithLabelValues("diag"))
-	assert.Equal(t, panicsBefore+1, panicsAfter,
-		"lease_worker_panics_total{worker_type=diag} must increment by 1")
-}
-
 // TestHandlerPanic_UnblocksReplyChannel pins the invariant that a panic
 // inside the actor's message-handler dispatch does NOT leave the caller
 // blocked on their reply/ack channel forever. Before the onPanic hook
@@ -1299,121 +929,6 @@ func TestHandlerPanic_UnblocksReplyChannel(t *testing.T) {
 	panicsAfter := testutil.ToFloat64(leaseActorPanicsTotal)
 	assert.Greater(t, panicsAfter, panicsBefore,
 		"leaseActorPanicsTotal must increment for handler panic")
-}
-
-// TestTerminatedActor_RejectsCallerFacingRequests pins the fix for the
-// lifecycle race between handleDeprovision setting a.terminated=true
-// and the actor's deferred removeFromRegistry() actually running.
-//
-// Scenario: a Backend.Provision (or Restart/Update) routes a message
-// after Deprovision has removed the provision entry but before the
-// actor has been removed from b.actors. Without the terminated check,
-// the handler fires evProvisionRequested into the SM — which is in
-// Deprovisioning state — and Deprovisioning.Ignore(evProvisionRequested)
-// causes Fire to return nil. The handler interprets that as "SM
-// accepted the transition," acks success, and spawns a worker under
-// a terminated actor. Containers get created, no callback fires,
-// lease is wedged.
-//
-// With the fix, the handler checks a.terminated first and returns
-// errActorTerminated on ack. The caller (Backend.X) rolls back via
-// removeProvision; a retry resolves-or-creates a fresh actor.
-func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {
-			LeaseUUID: "lease-1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusDeprovisioning,
-		},
-	})
-
-	actor := b.actorFor("lease-1")
-
-	// Shut the actor's run goroutine down first so the test goroutine
-	// is the sole reader/writer of actor.terminated and of the SM.
-	// In production, these handlers run in the actor's own goroutine
-	// after handleDeprovision has set terminated=true and the main
-	// loop is draining the inbox via the run-exit defers.
-	b.stopCancel()
-	select {
-	case <-actor.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor did not exit after stopCancel")
-	}
-	actor.terminated = true // simulate post-handleDeprovision state
-
-	t.Run("Provision", func(t *testing.T) {
-		var workerSpawned atomic.Bool
-		msg := provisionRequestedMsg{
-			cancel: func() {},
-			work: func() (string, provisionSuccessResult, map[string]string, error) {
-				workerSpawned.Store(true)
-				return "", provisionSuccessResult{}, nil, nil
-			},
-			ack: make(chan error, 1),
-		}
-		actor.handleProvisionRequested(msg)
-
-		select {
-		case err := <-msg.ack:
-			assert.ErrorIs(t, err, errActorTerminated,
-				"terminated actor must reject Provision with errActorTerminated")
-		case <-time.After(time.Second):
-			t.Fatal("ack channel never received a value — handler did not unblock caller")
-		}
-		// Give any stray goroutine time to fire before we assert.
-		time.Sleep(20 * time.Millisecond)
-		assert.False(t, workerSpawned.Load(),
-			"terminated actor must NOT spawn a provision worker")
-	})
-
-	t.Run("Restart", func(t *testing.T) {
-		var workerSpawned atomic.Bool
-		msg := restartRequestedMsg{
-			cancel: func() {},
-			work: func() replaceResult {
-				workerSpawned.Store(true)
-				return replaceResult{}
-			},
-			ack: make(chan error, 1),
-		}
-		actor.handleRestartRequested(msg)
-
-		select {
-		case err := <-msg.ack:
-			assert.ErrorIs(t, err, errActorTerminated,
-				"terminated actor must reject Restart with errActorTerminated")
-		case <-time.After(time.Second):
-			t.Fatal("ack channel never received a value")
-		}
-		time.Sleep(20 * time.Millisecond)
-		assert.False(t, workerSpawned.Load(),
-			"terminated actor must NOT spawn a replace worker for Restart")
-	})
-
-	t.Run("Update", func(t *testing.T) {
-		var workerSpawned atomic.Bool
-		msg := updateRequestedMsg{
-			cancel: func() {},
-			work: func() replaceResult {
-				workerSpawned.Store(true)
-				return replaceResult{}
-			},
-			ack: make(chan error, 1),
-		}
-		actor.handleUpdateRequested(msg)
-
-		select {
-		case err := <-msg.ack:
-			assert.ErrorIs(t, err, errActorTerminated,
-				"terminated actor must reject Update with errActorTerminated")
-		case <-time.After(time.Second):
-			t.Fatal("ack channel never received a value")
-		}
-		time.Sleep(20 * time.Millisecond)
-		assert.False(t, workerSpawned.Load(),
-			"terminated actor must NOT spawn a replace worker for Update")
-	})
 }
 
 // TestAckOrAbort_HonorsAckEvenWhenCtxCanceled pins the ctx-vs-ack race
@@ -1608,111 +1123,6 @@ func TestConcurrentProvisionDeprovision_Stress(t *testing.T) {
 	}
 }
 
-// TestSendTerminal_RejectsAfterExitingClosed pins the fix for the
-// post-drain / pre-done window. Without the exiting signal, a late
-// worker sendTerminal in that window would succeed and the message
-// would rot in an unread inbox. With exiting closed, sendTerminal
-// rejects (returns false) and the caller can correctly count the drop.
-//
-// We can't easily reproduce the real waitForWorkers-timeout scenario
-// without wedging a worker for 75s, so we exercise the refusal directly:
-// close exiting, then call sendTerminal, assert false. The closeExiting
-// helper is idempotent (sync.Once) so the production exit defer running
-// later on b.stopCancel() will not double-close.
-func TestSendTerminal_RejectsAfterExitingClosed(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	defer b.stopCancel()
-	actor := b.actorFor("lease-1")
-
-	// Actor is still running; a.done is NOT closed. Before exiting is
-	// closed, sendTerminal accepts.
-	require.True(t, actor.sendTerminal(provisionCompletedMsg{}),
-		"baseline: sendTerminal should succeed on a live actor")
-
-	// Simulate the exit-sequence defer that closes this channel just
-	// before drainInbox runs. After this, sendTerminal must reject.
-	actor.closeExiting()
-
-	rejected := !actor.sendTerminal(provisionCompletedMsg{})
-	assert.True(t, rejected,
-		"sendTerminal must reject once exiting is closed — otherwise a post-drain send would rot in the inbox")
-}
-
-// TestGatherDiagAsync_SendsOnDeadlineExceeded pins bug_002: before the fix,
-// gatherDiagAsync suppressed the terminal send on ANY ctx.Err(), including
-// the 30s diagnosticsGatherTimeout elapsing. The SM stayed in Failing
-// forever and the Failed callback never fired. After the fix, only
-// context.Canceled (from Failing.OnExit's diagCancel) suppresses; timeout
-// expiry falls through to send diagGatheredMsg (which always carries at
-// least "exit_code=N") and drives Failing→Failed.
-func TestGatherDiagAsync_SendsOnDeadlineExceeded(t *testing.T) {
-	mock := &mockDockerClient{
-		ContainerLogsFn: func(ctx context.Context, _ string, _ int) (string, error) {
-			<-ctx.Done()
-			return "", ctx.Err()
-		},
-	}
-	b := newBackendForTest(mock, nil)
-	defer b.stopCancel()
-
-	// Build an actor without running its dispatch loop so we can observe
-	// the inbox directly after gatherDiagAsync returns.
-	actor := newLeaseActor(b, "lease-1")
-	exitCode := 1
-	info := &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode}
-
-	// Build a ctx that's already DeadlineExceeded (simulating the 30s
-	// diag timeout having elapsed without any Failing.OnExit cancel).
-	diagCtx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	time.Sleep(5 * time.Millisecond)
-	require.ErrorIs(t, diagCtx.Err(), context.DeadlineExceeded,
-		"test precondition: diagCtx must be DeadlineExceeded, not Canceled")
-
-	actor.gatherDiagAsync(diagCtx, "c1", info, "")
-
-	select {
-	case msg := <-actor.inbox:
-		_, ok := msg.(diagGatheredMsg)
-		assert.True(t, ok, "gatherDiagAsync must enqueue diagGatheredMsg on DeadlineExceeded, got %T", msg)
-	default:
-		t.Fatal("gatherDiagAsync suppressed terminal send on DeadlineExceeded — lease would wedge in Failing (bug_002)")
-	}
-}
-
-// TestGatherDiagAsync_SuppressesOnCanceled is the other half of bug_002:
-// when Failing.OnExit's diagCancel fires (a Deprovision/Restart/Update
-// preempt), the SM has already left Failing and any diagGatheredMsg
-// would hit Deprovisioning.Ignore. Suppression is the correct behavior
-// there, so the fix must NOT turn this case into a spurious send.
-func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
-	mock := &mockDockerClient{
-		ContainerLogsFn: func(ctx context.Context, _ string, _ int) (string, error) {
-			<-ctx.Done()
-			return "", ctx.Err()
-		},
-	}
-	b := newBackendForTest(mock, nil)
-	defer b.stopCancel()
-
-	actor := newLeaseActor(b, "lease-1")
-	exitCode := 1
-	info := &leasesm.InstanceState{Phase: leasesm.PhaseExited, ExitCode: &exitCode}
-
-	diagCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	require.ErrorIs(t, diagCtx.Err(), context.Canceled,
-		"test precondition: diagCtx must be Canceled")
-
-	actor.gatherDiagAsync(diagCtx, "c1", info, "")
-
-	select {
-	case msg := <-actor.inbox:
-		t.Fatalf("gatherDiagAsync must suppress terminal send on Canceled; got %T", msg)
-	default:
-	}
-}
-
 // TestDeprovision_HonorsLateReplyAfterCtxCancel pins bug_003: when the
 // actor acks success at the same instant as the caller's ctx cancels,
 // Go's select can take the cancellation arm and return ctx.Err() even
@@ -1790,50 +1200,3 @@ func TestProvision_ReleasesPoolOnRouteFailure(t *testing.T) {
 		"pool disk must be released on route-failure rollback (bug_001)")
 }
 
-// TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning pins bug_005:
-// when a Deprovision partially fails, the provision entry is preserved
-// with Status=Failed but the actor is NOT terminated and the SM remains
-// in Deprovisioning. A retry Provision (accepted by the sync-phase
-// Failed-guard) routes to the same actor. Fire(evProvisionRequested) on
-// Deprovisioning is Ignored → returns nil. Without the post-Fire state
-// check, the handler would ack success and spawn a worker that creates
-// real containers whose provisionCompletedMsg would ALSO be Ignored,
-// wedging the lease. The fix verifies sm.State() == Provisioning after
-// Fire and rejects otherwise.
-func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusDeprovisioning,
-			ContainerIDs: []string{"c1"},
-		},
-	})
-	defer b.stopCancel()
-
-	actor := b.actorFor("lease-1")
-	// actorForLocked initializes the SM from prov.Status, so SM is in
-	// Deprovisioning. terminated stays false because handleDeprovision
-	// was never run (simulating a partial-deprov scenario where the
-	// actor's run loop is alive with SM=Deprovisioning).
-	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.sm.State(),
-		"test precondition: SM must be in Deprovisioning")
-
-	ack := make(chan error, 1)
-	msg := provisionRequestedMsg{
-		cancel: func() {},
-		work: func() (string, provisionSuccessResult, map[string]string, error) {
-			return "", provisionSuccessResult{}, nil, nil
-		},
-		ack: ack,
-	}
-	actor.handleProvisionRequested(msg)
-
-	select {
-	case err := <-ack:
-		require.Error(t, err,
-			"handleProvisionRequested must reject when SM silently Ignores the event (bug_005); got ack success")
-	default:
-		t.Fatal("handler did not send on ack channel")
-	}
-}

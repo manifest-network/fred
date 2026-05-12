@@ -217,7 +217,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if rec.Status == backend.ProvisionStatusFailed {
 			if _, hasExisting := b.provisions[uuid]; !hasExisting {
 				rec.FailCount++
-				rec.LastError = errMsgContainerExited
+				rec.LastError = leasesm.ErrMsgContainerExited
 				coldStartFailed = append(coldStartFailed, uuid)
 				b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
 					"lease_uuid", uuid,
@@ -355,7 +355,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		b.provisionsMu.Lock()
 		for uuid, diag := range failedDiagnostics {
 			if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
-				prov.LastError = errMsgContainerExited + ": " + diag
+				prov.LastError = leasesm.ErrMsgContainerExited + ": " + diag
 			}
 		}
 		b.provisionsMu.Unlock()
@@ -401,7 +401,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				"lease_uuid", uuid)
 			continue
 		}
-		if !b.routeToLease(uuid, containerDiedMsg{containerID: containerID}) {
+		if !b.routeToLease(uuid, leasesm.ContainerDiedMsg{ContainerID: containerID}) {
 			dieEventDroppedTotal.WithLabelValues("reconcile").Inc()
 			b.logger.Warn("die event dropped during reconcile dispatch; reconciler will re-detect",
 				"lease_uuid", uuid, "container_id", shortID(containerID))
@@ -552,7 +552,7 @@ func (b *Backend) containerEventLoop() {
 				}
 				if event.Action == "die" {
 					if leaseUUID, found := b.findLeaseByContainerID(event.ContainerID); found {
-						if !b.routeToLease(leaseUUID, containerDiedMsg{containerID: event.ContainerID}) {
+						if !b.routeToLease(leaseUUID, leasesm.ContainerDiedMsg{ContainerID: event.ContainerID}) {
 							dieEventDroppedTotal.WithLabelValues("event_loop").Inc()
 							b.logger.Warn("die event dropped at event loop dispatch; reconciler will re-detect",
 								"lease_uuid", leaseUUID, "container_id", shortID(event.ContainerID))

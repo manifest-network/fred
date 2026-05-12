@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
@@ -79,7 +80,7 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	assert.Equal(t, 1, prov.FailCount)
-	assert.Contains(t, prov.LastError, errMsgContainerExited)
+	assert.Contains(t, prov.LastError, leasesm.ErrMsgContainerExited)
 	b.provisionsMu.RUnlock()
 
 	// Verify callback was sent.

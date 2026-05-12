@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -26,6 +25,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
@@ -91,36 +91,31 @@ func rebuildCallbackSender(b *Backend) {
 // doProvision directly; tests do (to exercise specific branches without
 // the full validate-and-allocate preamble).
 //
-// SM events fire synchronously here (bypassing the actor inbox) so tests
-// can assert on callback state immediately after it returns. The actor
-// inbox path is exercised by the public Provision flow and its dedicated
-// tests.
+// SM events fire synchronously here (bypassing the actor inbox) via the
+// leasesm.FireXxxForTest helpers — see leasesm/testhelpers.go for the
+// architect's bounded-set rationale. Tests can assert on callback state
+// immediately after this returns. The actor inbox path is exercised by
+// the public Provision flow and its dedicated tests.
 func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, manifest *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) {
 	actor := b.actorFor(req.LeaseUUID)
-	if actor.sm == nil {
-		actor.sm = newLeaseSM(actor)
-	}
-	_ = actor.sm.Fire(ctx, evProvisionRequested)
+	leasesm.FireProvisionRequestedForTest(actor)
 	callbackErr, result, logs, err := b.doProvision(ctx, req, manifest, profiles, logger)
 	if err != nil {
-		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error(), logs: logs})
+		leasesm.FireProvisionErroredForTest(actor, callbackErr, err.Error(), logs)
 	} else {
-		_ = actor.sm.Fire(ctx, evProvisionCompleted, result)
+		leasesm.FireProvisionCompletedForTest(actor, result)
 	}
 }
 
 // doProvisionStackAndFire is the stack-variant companion to doProvisionAndFire.
 func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
 	actor := b.actorFor(req.LeaseUUID)
-	if actor.sm == nil {
-		actor.sm = newLeaseSM(actor)
-	}
-	_ = actor.sm.Fire(ctx, evProvisionRequested)
+	leasesm.FireProvisionRequestedForTest(actor)
 	callbackErr, result, logs, err := b.doProvisionStack(ctx, req, stack, profiles, logger)
 	if err != nil {
-		_ = actor.sm.Fire(ctx, evProvisionErrored, provisionErrorInfo{callbackErr: callbackErr, lastError: err.Error(), logs: logs})
+		leasesm.FireProvisionErroredForTest(actor, callbackErr, err.Error(), logs)
 	} else {
-		_ = actor.sm.Fire(ctx, evProvisionCompleted, result)
+		leasesm.FireProvisionCompletedForTest(actor, result)
 	}
 }
 
@@ -5031,88 +5026,9 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 }
 
 // TestProvision_DeprovisionWaitsForInFlightGoroutine pins the
-// orphan-containers invariant: when Deprovision preempts an in-flight
-// doProvision, Provisioning.OnExit must (1) cancel the goroutine's
-// context and (2) wait for the goroutine to exit before doDeprovision
-// reads ContainerIDs. Without this, the goroutine's successful
-// creations stay on the host even though the provision struct reports
-// none.
-//
-// Unit-tests the wait mechanism directly: installs synthetic
-// workCancel + workDone on the actor, fires Deprovision,
-// verifies OnExit blocks until workDone closes, and verifies
-// doDeprovision then observes the "pre-published" ContainerIDs
-// (simulating the real goroutine's pre-publish step).
-func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
-	var removedMu sync.Mutex
-	var removedIDs []string
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removedMu.Lock()
-			removedIDs = append(removedIDs, containerID)
-			removedMu.Unlock()
-			return nil
-		},
-	}
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusProvisioning,
-			ContainerIDs: nil,
-		},
-	})
-	defer b.stopCancel()
-
-	// Eager SM in newLeaseActor reads initial state from the provision
-	// entry's Status, so actor.sm starts in Provisioning.
-	actor := b.actorFor("lease-1")
-	require.Equal(t, backend.ProvisionStatusProvisioning, actor.sm.State())
-
-	// Simulate an in-flight provision worker via workers. The actor's
-	// onExitProvisioning will call workCancel then waitForWorkers.
-	var cancelCalled atomic.Bool
-	workerRelease := make(chan struct{})
-	actor.workCancel = func() { cancelCalled.Store(true) }
-	actor.workers.Add()
-	go func() {
-		<-workerRelease
-		// Simulate the worker's pre-publish step before Done.
-		b.provisionsMu.Lock()
-		b.provisions["lease-1"].ContainerIDs = []string{"published-container"}
-		b.provisionsMu.Unlock()
-		actor.workers.Done()
-	}()
-
-	deprovErr := make(chan error, 1)
-	go func() {
-		deprovErr <- b.Deprovision(context.Background(), "lease-1")
-	}()
-
-	// onExitProvisioning must call workCancel before entering the wait.
-	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
-		"OnExit must call workCancel before waitForWorkers")
-
-	// Deprovision must be blocked in waitForWorkers.
-	select {
-	case err := <-deprovErr:
-		t.Fatalf("Deprovision returned before worker finished: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	// Release the worker → wg.Done → waitForWorkers unblocks → doDeprovision
-	// runs and reads the pre-published ContainerIDs.
-	close(workerRelease)
-
-	select {
-	case err := <-deprovErr:
-		require.NoError(t, err, "Deprovision must succeed after worker completes")
-	case <-time.After(3 * time.Second):
-		t.Fatal("Deprovision did not complete after worker finished")
-	}
-
-	removedMu.Lock()
-	defer removedMu.Unlock()
-	require.Contains(t, removedIDs, "published-container",
-		"doDeprovision must see the pre-published ContainerIDs and call RemoveContainer")
-}
+// TestProvision_DeprovisionWaitsForInFlightGoroutine migrated to
+// internal/backend/shared/leasesm/lease_actor_test.go at PR5b-2 E
+// sub-batch 3 — the test depends on unexported leasesm internals
+// (actor.workers, actor.workCancel) and is cleaner expressed via the
+// leasesm test fixtures (newTestActor + mock DoDeprovisionFn) than
+// via Backend integration.

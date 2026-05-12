@@ -1,17 +1,17 @@
-package docker
+package leasesm
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/qmuntal/stateless"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -82,11 +82,11 @@ func (e leaseEvent) String() string {
 // leaseSM wraps a stateless.StateMachine with a typed façade. Each lease
 // actor owns one SM; transitions are serialized by the actor's inbox.
 type leaseSM struct {
-	actor *leaseActor
+	actor *LeaseActor
 	sm    *stateless.StateMachine
 }
 
-func newLeaseSM(actor *leaseActor) *leaseSM {
+func newLeaseSM(actor *LeaseActor) *leaseSM {
 	initial := readProvisionStatus(actor)
 	sm := stateless.NewStateMachine(initial)
 
@@ -277,7 +277,7 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 	// the one in-flow site in PR4 where a single lease-status read
 	// migrates cleanly to the seam (no other field reads/writes share
 	// the critical section). All compound critical sections in this file
-	// keep direct b.provisionsMu access — see leasesm.LeaseProvisionStore
+	// keep direct b.provisionsMu access — see LeaseProvisionStore
 	// docstring for the rationale.
 	if state, ok := cfg.ProvisionStore.Get(lsm.actor.leaseUUID); !ok || state.Status != backend.ProvisionStatusReady {
 		return false
@@ -305,7 +305,7 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 	// (which subsumes "created", "restarting", and unrecognized) are
 	// not terminal — same as the prior containerStatusToProvisionStatus
 	// behavior.
-	if state == nil || (state.Phase != leasesm.PhaseExited && state.Phase != leasesm.PhaseFailed) {
+	if state == nil || (state.Phase != PhaseExited && state.Phase != PhaseFailed) {
 		return false
 	}
 	lsm.actor.pendingDeathInfo = state
@@ -346,7 +346,7 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	// ContainerDied/DiagGathered prevents stray events from doing
 	// anything during the drift window.
 	var raceSkipped, applied bool
-	exists := lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+	exists := lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		if p.Status != backend.ProvisionStatusReady {
 			raceSkipped = true
 			return
@@ -366,7 +366,6 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	if applied {
 		lsm.actor.cfg.Metrics.ActiveProvisionsDec()
 	}
-
 
 	// Spawn the async diag gather. Its context is derived from
 	// context.Background() with a bounded timeout — NOT from stopCtx —
@@ -443,27 +442,27 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterReadyFromProvision: missing result")
 	}
-	result, ok := args[0].(provisionSuccessResult)
+	result, ok := args[0].(ProvisionSuccessResult)
 	if !ok {
-		return fmt.Errorf("onEnterReadyFromProvision: arg not provisionSuccessResult")
+		return fmt.Errorf("onEnterReadyFromProvision: arg not ProvisionSuccessResult")
 	}
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
 	var applied bool
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusReady
-		p.ContainerIDs = result.containerIDs
+		p.ContainerIDs = result.ContainerIDs
 		p.LastError = ""
-		if result.manifest != nil {
-			p.Manifest = result.manifest
+		if result.Manifest != nil {
+			p.Manifest = result.Manifest
 		}
-		if result.stackManifest != nil {
-			p.StackManifest = result.stackManifest
+		if result.StackManifest != nil {
+			p.StackManifest = result.StackManifest
 		}
-		if result.serviceContainers != nil {
-			p.ServiceContainers = result.serviceContainers
+		if result.ServiceContainers != nil {
+			p.ServiceContainers = result.ServiceContainers
 		}
 		callbackURL = p.CallbackURL
 		applied = true
@@ -484,27 +483,27 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterReadyFromReplaceCompleted: missing result")
 	}
-	result, ok := args[0].(replaceSuccessResult)
+	result, ok := args[0].(ReplaceSuccessResult)
 	if !ok {
-		return fmt.Errorf("onEnterReadyFromReplaceCompleted: arg not replaceSuccessResult")
+		return fmt.Errorf("onEnterReadyFromReplaceCompleted: arg not ReplaceSuccessResult")
 	}
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
 	var incActive bool
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
-		p.ContainerIDs = result.containerIDs
-		if result.serviceContainers != nil {
-			p.ServiceContainers = result.serviceContainers
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+		p.ContainerIDs = result.ContainerIDs
+		if result.ServiceContainers != nil {
+			p.ServiceContainers = result.ServiceContainers
 		}
 		p.Status = backend.ProvisionStatusReady
 		p.LastError = ""
-		if result.prevStatus == backend.ProvisionStatusFailed {
+		if result.PrevStatus == backend.ProvisionStatusFailed {
 			incActive = true
 		}
-		if result.onSuccess != nil {
-			result.onSuccess(p)
+		if result.OnSuccess != nil {
+			result.OnSuccess(p)
 		}
 		callbackURL = p.CallbackURL
 	})
@@ -526,23 +525,23 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterReadyFromReplaceRecovered: missing info")
 	}
-	info, ok := args[0].(replaceFailureInfo)
+	info, ok := args[0].(ReplaceFailureInfo)
 	if !ok {
-		return fmt.Errorf("onEnterReadyFromReplaceRecovered: arg not replaceFailureInfo")
+		return fmt.Errorf("onEnterReadyFromReplaceRecovered: arg not ReplaceFailureInfo")
 	}
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
-		p.LastError = info.lastError
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+		p.LastError = info.LastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusReady
 		// Restart: if we actually stopped old containers and then restored
 		// them, we're back to the exact same state — no persistent error.
 		// Update: keep LastError so the UI shows why the update failed.
-		if info.oldStopped && info.operation == "restart" {
+		if info.OldStopped && info.Operation == "restart" {
 			p.LastError = ""
 		}
 		diagSnap = diagnosticSnapshot(p)
@@ -553,10 +552,10 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		// Use logs captured by doReplace*'s defer BEFORE rollback tore
 		// the failed containers down — post-cleanup log fetches would
 		// hit already-deleted containers and record an empty entry.
-		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
+		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.Logs)
 	}
 
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
 	return nil
 }
 
@@ -568,9 +567,9 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterFailedFromReplace: missing info")
 	}
-	info, ok := args[0].(replaceFailureInfo)
+	info, ok := args[0].(ReplaceFailureInfo)
 	if !ok {
-		return fmt.Errorf("onEnterFailedFromReplace: arg not replaceFailureInfo")
+		return fmt.Errorf("onEnterFailedFromReplace: arg not ReplaceFailureInfo")
 	}
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
@@ -578,11 +577,11 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
 	var decActive bool
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
-		p.LastError = info.lastError
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+		p.LastError = info.LastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
-		if info.prevStatus == backend.ProvisionStatusReady {
+		if info.PrevStatus == backend.ProvisionStatusReady {
 			decActive = true
 		}
 		diagSnap = diagnosticSnapshot(p)
@@ -596,10 +595,10 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		// Use logs captured by doReplace*'s defer BEFORE rollback tore
 		// the failed containers down — post-cleanup log fetches would
 		// hit already-deleted containers and record an empty entry.
-		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
+		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.Logs)
 	}
 
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
+	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
 	return nil
 }
 
@@ -621,7 +620,7 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
@@ -662,7 +661,7 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	var diagSnap shared.DiagnosticEntry
 	var diagContainerIDs []string
 	var diagKeys map[string]string
-	exists := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+	exists := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
 		if result.diag != "" {
 			p.LastError = errMsgContainerExited + ": " + result.diag
@@ -707,20 +706,22 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 // substrate-level one (K8s pods have no equivalent field).
 type diagResult struct {
 	containerID string
-	info        *leasesm.InstanceState
+	info        *InstanceState
 	serviceName string
 	diag        string
 }
 
-// provisionSuccessResult carries doProvision / doProvisionStack output
+// ProvisionSuccessResult carries doProvision / doProvisionStack output
 // into Ready.OnEntryFrom(evProvisionCompleted) via Fire args. Manifest
 // and StackManifest are mutually exclusive — single-manifest provisions
 // populate Manifest; stacks populate StackManifest + ServiceContainers.
-type provisionSuccessResult struct {
-	containerIDs      []string
-	manifest          *manifest.Manifest
-	stackManifest     *manifest.StackManifest
-	serviceContainers map[string][]string
+// Exported because the substrate's provision worker closure constructs
+// the value and returns it via the ProvisionRequestedMsg.Work signature.
+type ProvisionSuccessResult struct {
+	ContainerIDs      []string
+	Manifest          *manifest.Manifest
+	StackManifest     *manifest.StackManifest
+	ServiceContainers map[string][]string
 }
 
 // provisionErrorInfo carries doProvision failure data into
@@ -738,62 +739,67 @@ type provisionErrorInfo struct {
 	logs        map[string]string
 }
 
-// replaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
+// ReplaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
 // success output into onEnterReadyFromReplace. The goroutine returns these;
 // the entry action writes them to provision under a single lock acquisition.
-// onSuccess is the optional hook supplied by the caller (update flow sets
-// Manifest/StackManifest there).
-type replaceSuccessResult struct {
-	prevStatus        backend.ProvisionStatus
-	containerIDs      []string
-	serviceContainers map[string][]string // non-nil for stack
-	onSuccess         func(*provision)
+// OnSuccess is the optional hook supplied by the caller (update flow sets
+// Manifest/StackManifest there). Exported because the substrate's replace
+// worker closure builds the value and the SM entry action reads it.
+type ReplaceSuccessResult struct {
+	PrevStatus        backend.ProvisionStatus
+	ContainerIDs      []string
+	ServiceContainers map[string][]string // non-nil for stack
+	OnSuccess         func(*ProvisionState)
 }
 
-// replaceFailureInfo carries doReplace* failure data. Used by both
+// ReplaceFailureInfo carries doReplace* failure data. Used by both
 // onEnterReadyFromReplaceRecovered (Status ends up Ready) and
 // onEnterFailedFromReplace (Status ends up Failed). The entry actions
 // set LastError, increment FailCount, persist diagnostics, and adjust
-// the activeProvisions gauge based on prevStatus.
-type replaceFailureInfo struct {
-	prevStatus  backend.ProvisionStatus
-	operation   string // "restart" or "update"
-	oldStopped  bool   // only meaningful on the recovery path (restart-with-oldStopped clears LastError)
-	callbackErr string
-	lastError   string
-	// logs is the pre-captured container-log map from the NEW (failed)
+// the activeProvisions gauge based on PrevStatus. Exported because
+// the substrate's replace worker closure builds the value.
+type ReplaceFailureInfo struct {
+	PrevStatus  backend.ProvisionStatus
+	Operation   string // "restart" or "update"
+	OldStopped  bool   // only meaningful on the recovery path (restart-with-oldStopped clears LastError)
+	CallbackErr string
+	LastError   string
+	// Logs is the pre-captured container-log map from the NEW (failed)
 	// containers. Populated by doReplace*'s defer BEFORE rollback tears
 	// those containers down — persistDiagnostics would otherwise find
 	// them gone and record an empty entry. For stacks, keys are
 	// "serviceName/instanceIndex"; for single-container, raw indices.
-	logs map[string]string
+	Logs map[string]string
 }
 
-// replaceResult is doReplace*'s return value bundling everything the
+// ReplaceResult is doReplace*'s return value bundling everything the
 // goroutine wrapper needs to fire the right SM event. The callback path
-// depends on (err, restored):
+// depends on (Err, Restored):
 //
-//	err == nil            → fire evReplaceCompleted with .success
-//	err != nil, restored  → fire evReplaceRecovered with .failure
-//	err != nil, !restored → fire evReplaceFailed    with .failure
-type replaceResult struct {
-	callbackErr string
-	err         error
-	restored    bool                 // only meaningful if err != nil
-	success     replaceSuccessResult // populated when err == nil
-	failure     replaceFailureInfo   // populated when err != nil
+//	Err == nil            → fire evReplaceCompleted with .Success
+//	Err != nil, Restored  → fire evReplaceRecovered with .Failure
+//	Err != nil, !Restored → fire evReplaceFailed    with .Failure
+//
+// Exported because the substrate's replace worker constructs the value
+// and the actor dispatches on its fields.
+type ReplaceResult struct {
+	CallbackErr string
+	Err         error
+	Restored    bool                 // only meaningful if Err != nil
+	Success     ReplaceSuccessResult // populated when Err == nil
+	Failure     ReplaceFailureInfo   // populated when Err != nil
 }
 
-// readProvisionStatus snapshots provision.Status under RLock. Used on SM
-// creation to pick the initial state.
-func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
-	actor.backend.provisionsMu.RLock()
-	defer actor.backend.provisionsMu.RUnlock()
-	p, ok := actor.backend.provisions[actor.leaseUUID]
+// readProvisionStatus snapshots the lease's current provision status via
+// the substrate-agnostic LeaseProvisionStore seam. Used on SM creation to
+// pick the initial state. Returns ProvisionStatusProvisioning when the
+// lease is unknown (the same default as the prior in-docker reach-through).
+func readProvisionStatus(actor *LeaseActor) backend.ProvisionStatus {
+	state, ok := actor.cfg.ProvisionStore.Get(actor.leaseUUID)
 	if !ok {
 		return backend.ProvisionStatusProvisioning
 	}
-	return p.Status
+	return state.Status
 }
 
 // gatherDiagAsync runs in a goroutine (spawned by onEnterFailing), doing
@@ -807,13 +813,13 @@ func readProvisionStatus(actor *leaseActor) backend.ProvisionStatus {
 // sendTerminal lands before the actor proceeds past the transition;
 // on timeout the SM proceeds and a late sendTerminal is refused by the
 // Deprovisioning.Ignore backstop.
-func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *leasesm.InstanceState, serviceName string) {
+func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *InstanceState, serviceName string) {
 	// Same single-send defer pattern as spawnProvisionWorker /
 	// spawnReplaceWorker (see lease_actor.go). One sendTerminal site;
 	// the recover overrides terminalMsg on panic, the normal path
 	// sets it on completion. ctx-cancel is special: we suppress the
 	// send entirely (the Deprovisioning.Ignore path handles that case).
-	var terminalMsg leaseMessage
+	var terminalMsg LeaseMessage
 	var event = "diag_gathered"
 	var suppress bool
 	defer func() {
@@ -871,4 +877,90 @@ func (a *leaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 	terminalMsg = diagGatheredMsg{
 		result: diagResult{containerID: containerID, info: info, serviceName: serviceName, diag: diag},
 	}
+}
+
+// errMsgContainerExited is the canonical on-chain-safe callback message
+// for containers that exit unexpectedly, used by the Failing/Failed
+// transition's callback path. The exported alias ErrMsgContainerExited
+// is what substrate adapters reach for — divergence between docker/'s
+// recover code and the SM's callback emission would produce different
+// on-chain strings for the same failure, violating the
+// callback-error-sanitization invariant. Both names refer to the same
+// constant so drift is structurally impossible.
+const errMsgContainerExited = "container exited unexpectedly"
+
+// ErrMsgContainerExited is the exported view of errMsgContainerExited for
+// substrate adapters that emit failure callbacks outside the SM's own
+// onEnter actions (e.g., the Docker backend's recover.go records this
+// string as the on-chain Error when reconstructing a Failed lease's
+// LastError on startup). All on-chain callback strings for
+// "container-exited" failures MUST reference this constant.
+const ErrMsgContainerExited = errMsgContainerExited
+
+// errMsgInternal is the canonical hardcoded on-chain-safe callback
+// message used when a worker goroutine panics. Full diagnostics (panic
+// value, stack) go to ProvisionState.LastError and the structured log;
+// the callback message itself stays generic so internals do not leak
+// on-chain. The exported alias ErrMsgInternal mirrors this for substrate
+// adapters that emit failure callbacks outside the SM.
+const errMsgInternal = "internal error"
+
+// ErrMsgInternal is the exported view of errMsgInternal for substrate
+// adapters; see ErrMsgContainerExited's docstring for the
+// "no-divergence" rationale.
+const ErrMsgInternal = errMsgInternal
+
+// shortID truncates a substrate-side instance ID to 12 characters for
+// logging continuity. Mirrors github.com/docker/docker/pkg/stringid.TruncateID
+// (strip any leading "type:" prefix such as "sha256:", then bound to 12
+// chars) without taking the docker library as a dependency. Substrate-
+// agnostic — K3s adapters can safely call this on pod UIDs; the prefix
+// strip is a no-op when there is no colon, and the byte-bounded truncate
+// is universal. Kept here so leasesm stays free of any docker import.
+const shortIDLen = 12
+
+func shortID(id string) string {
+	if i := strings.IndexRune(id, ':'); i >= 0 {
+		id = id[i+1:]
+	}
+	if len(id) > shortIDLen {
+		id = id[:shortIDLen]
+	}
+	return id
+}
+
+// diagnosticSnapshot captures the ProvisionState fields needed for
+// diagnostics persistence. Built inside an UpdateFn closure (under the
+// store's mutex) so the snapshot is consistent; PersistDiagnosticsFn /
+// PersistDiagnosticsWithLogsFn write it out after the closure returns.
+func diagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
+	return shared.DiagnosticEntry{
+		LeaseUUID:    prov.LeaseUUID,
+		ProviderUUID: prov.ProviderUUID,
+		Tenant:       prov.Tenant,
+		Error:        prov.LastError,
+		FailCount:    prov.FailCount,
+		CreatedAt:    time.Now(),
+	}
+}
+
+// containerLogKeys builds a containerID → display key mapping for stack
+// provisions (e.g., "web/0", "web/1") so diagnostic log entries use the
+// service-name view rather than raw indices. Returns nil for non-stack
+// provisions; nil is the documented "default index-based keys" signal to
+// PersistDiagnosticsFn.
+func containerLogKeys(prov *ProvisionState) map[string]string {
+	if prov == nil || !prov.IsStack() {
+		return nil
+	}
+	if len(prov.ServiceContainers) == 0 {
+		return nil
+	}
+	keys := make(map[string]string)
+	for svcName, cids := range prov.ServiceContainers {
+		for i, cid := range cids {
+			keys[cid] = fmt.Sprintf("%s/%d", svcName, i)
+		}
+	}
+	return keys
 }

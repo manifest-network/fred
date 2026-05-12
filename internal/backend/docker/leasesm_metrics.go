@@ -39,6 +39,13 @@ func (dockerSMMetrics) WorkerPanic(workerType string) {
 	leaseWorkerPanicsTotal.WithLabelValues(workerType).Inc()
 }
 
+// ActorPanic records a panic recovered by the actor's handle() defer
+// — a panic in the message-handler goroutine itself, distinct from
+// the worker categories WorkerPanic covers.
+func (dockerSMMetrics) ActorPanic() {
+	leaseActorPanicsTotal.Inc()
+}
+
 // TerminalEventDropped records a terminal SM event that could not be
 // delivered (actor exited or inbox wedged). event is a short tag
 // identifying the dropped event type.
