@@ -264,14 +264,9 @@ type LeaseActor struct {
 	// pendingDeathInfo carries the inspected instance state from the SM's
 	// guard into the onEnterFailing action. Single-field handoff works
 	// because the actor processes messages serially; no two messages
-	// read/write this field concurrently.
-	//
-	// pendingDeathServiceName carries the substrate-specific service name
-	// alongside InstanceState (which intentionally does not include it,
-	// since K8s pods have no equivalent field). Used for logging
-	// continuity at the death-event log line.
-	pendingDeathInfo        *InstanceState
-	pendingDeathServiceName string
+	// read/write this field concurrently. The service name for the
+	// death-event log line rides on pendingDeathInfo.ServiceName.
+	pendingDeathInfo *InstanceState
 	// diagCancel is set when entering Failing (spawning the async diag
 	// goroutine) and called by Failing.OnExit to signal cancellation. Any
 	// transition out of Failing cancels the goroutine before a stale Failed

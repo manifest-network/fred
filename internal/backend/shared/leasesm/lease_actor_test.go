@@ -280,7 +280,7 @@ func TestGatherDiagAsync_SendsOnDeadlineExceeded(t *testing.T) {
 	require.ErrorIs(t, diagCtx.Err(), context.DeadlineExceeded,
 		"test precondition: diagCtx must be DeadlineExceeded, not Canceled")
 
-	actor.gatherDiagAsync(diagCtx, "c1", info, "")
+	actor.gatherDiagAsync(diagCtx, "c1", info)
 
 	select {
 	case msg := <-actor.inbox:
@@ -312,7 +312,7 @@ func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
 	require.ErrorIs(t, diagCtx.Err(), context.Canceled,
 		"test precondition: diagCtx must be Canceled")
 
-	actor.gatherDiagAsync(diagCtx, "c1", info, "")
+	actor.gatherDiagAsync(diagCtx, "c1", info)
 
 	select {
 	case msg := <-actor.inbox:
@@ -608,7 +608,7 @@ func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
 	go func() {
 		defer actor.workers.Done()
 		exitCode := 1
-		actor.gatherDiagAsync(gatherCtx, "c1", &InstanceState{Phase: PhaseExited, ExitCode: &exitCode}, "")
+		actor.gatherDiagAsync(gatherCtx, "c1", &InstanceState{Phase: PhaseExited, ExitCode: &exitCode})
 	}()
 
 	// SM must reach Failed once the panic recovery fires diagGatheredMsg.

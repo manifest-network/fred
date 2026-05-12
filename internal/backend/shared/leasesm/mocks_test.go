@@ -149,10 +149,15 @@ type testActorOpts struct {
 // entry for leaseUUID, mockSMMetrics, no-op InstanceInspector and
 // DiagnosticsGatherer, no-op callback / persist / deprovision closures.
 //
-// Tests that need a real ProvisionState must either set opts.ProvisionStore
-// to their own pre-seeded store, OR call store.put(...) before creating
-// the actor (the default store is freshly empty but is returned for
-// access via the caller's opts.ProvisionStore reference).
+// Tests that need to read or pre-seed the provision state must construct
+// the store themselves and pass it in via opts.ProvisionStore — opts is
+// passed by value, so the defaulted store created here is NOT observable
+// to the caller after newTestActor returns. Typical pattern:
+//
+//	store := newMockProvisionStore()
+//	store.put(leaseUUID, &ProvisionState{Status: backend.ProvisionStatusReady})
+//	actor := newTestActor(t, leaseUUID, testActorOpts{ProvisionStore: store, ...})
+//	// later: store.Get(leaseUUID) is observable here
 //
 // The actor's run-loop goroutine starts inside NewLeaseActor. Tests
 // that want to drive the actor synchronously must take care to either:

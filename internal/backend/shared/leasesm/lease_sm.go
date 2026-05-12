@@ -309,7 +309,6 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 		return false
 	}
 	lsm.actor.pendingDeathInfo = state
-	lsm.actor.pendingDeathServiceName = state.ServiceName
 	return true
 }
 
@@ -382,7 +381,7 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	lsm.actor.workers.Add()
 	lsm.actor.cfg.WG.Go(func() {
 		defer lsm.actor.workers.Done()
-		lsm.actor.gatherDiagAsync(diagCtx, containerID, info, lsm.actor.pendingDeathServiceName)
+		lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
 	})
 	return nil
 }
@@ -690,8 +689,8 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 		"container_id", ShortID(result.containerID),
 		"fail_count", failCount,
 	}
-	if result.serviceName != "" {
-		logAttrs = append(logAttrs, "service_name", result.serviceName)
+	if result.info != nil && result.info.ServiceName != "" {
+		logAttrs = append(logAttrs, "service_name", result.info.ServiceName)
 	}
 	cfg.Logger.Warn("container death detected via events API", logAttrs...)
 	return nil
@@ -700,14 +699,17 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 // diagResult carries gather output from the async goroutine into the Failed
 // entry action via Fire args.
 //
-// info is the substrate-agnostic InstanceState the SM consumes. serviceName
-// is carried separately for logging continuity — InstanceState intentionally
-// omits ServiceName because it is a Fred-side (lease-level) concept, not a
-// substrate-level one (K8s pods have no equivalent field).
+// info is the substrate-agnostic InstanceState the SM consumes. The service
+// name (used for death-event logging continuity in multi-service stacks)
+// rides along on info.ServiceName — InstanceState carries it because it is
+// the only piece of substrate-shaped metadata the SM otherwise needs at the
+// post-death log line, and lifting it into InstanceState avoids a parallel
+// pending-state field. Substrate adapters populate ServiceName from their
+// own conventions (Docker labels, K8s pod annotations); leases without a
+// meaningful service name leave it empty.
 type diagResult struct {
 	containerID string
 	info        *InstanceState
-	serviceName string
 	diag        string
 }
 
@@ -813,7 +815,7 @@ func readProvisionStatus(actor *LeaseActor) backend.ProvisionStatus {
 // sendTerminal lands before the actor proceeds past the transition;
 // on timeout the SM proceeds and a late sendTerminal is refused by the
 // Deprovisioning.Ignore backstop.
-func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *InstanceState, serviceName string) {
+func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, info *InstanceState) {
 	// Same single-send defer pattern as spawnProvisionWorker /
 	// spawnReplaceWorker (see lease_actor.go). One sendTerminal site;
 	// the recover overrides terminalMsg on panic, the normal path
@@ -828,7 +830,7 @@ func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 		}
 		if terminalMsg == nil {
 			terminalMsg = diagGatheredMsg{
-				result: diagResult{containerID: containerID, info: info, serviceName: serviceName, diag: ""},
+				result: diagResult{containerID: containerID, info: info, diag: ""},
 			}
 			event = "diag_no_result"
 		}
@@ -852,7 +854,7 @@ func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 			// Deprovisioning.Ignore still covers the case where the
 			// SM has already moved past Failing.
 			terminalMsg = diagGatheredMsg{
-				result: diagResult{containerID: containerID, info: info, serviceName: serviceName, diag: ""},
+				result: diagResult{containerID: containerID, info: info, diag: ""},
 			}
 			event = "diag_panic"
 			suppress = false
@@ -875,7 +877,7 @@ func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 		return
 	}
 	terminalMsg = diagGatheredMsg{
-		result: diagResult{containerID: containerID, info: info, serviceName: serviceName, diag: diag},
+		result: diagResult{containerID: containerID, info: info, diag: diag},
 	}
 }
 
