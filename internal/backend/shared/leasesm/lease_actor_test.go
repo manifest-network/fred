@@ -64,7 +64,9 @@ func TestLeaseActor_SendTerminalRefusesAfterActorExit(t *testing.T) {
 // inbox no one would drain.
 //
 // Sequence: the actor's exit-defer order is
-//   waitForWorkers → removeFromRegistry → closeExiting → drainInbox → close(done)
+//
+//	waitForWorkers → removeFromRegistry → closeExiting → drainInbox → close(done)
+//
 // Between closeExiting and close(done), the inbox is no longer
 // monitored. A worker calling sendTerminal in that window would land in
 // a slot that gets dropped silently. The fix: sendTerminal checks

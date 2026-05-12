@@ -1199,4 +1199,3 @@ func TestProvision_ReleasesPoolOnRouteFailure(t *testing.T) {
 	assert.Equal(t, beforeStats.AllocatedDiskMB, afterStats.AllocatedDiskMB,
 		"pool disk must be released on route-failure rollback (bug_001)")
 }
-

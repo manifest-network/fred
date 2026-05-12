@@ -199,7 +199,6 @@ const (
 	// (e.g., permission denied on files created by the container process).
 	// Stuck volumes require manual cleanup.
 	maxVolumeCleanupAttempts = 3
-
 )
 
 // errMsgContainerExited / errMsgInternal moved to
@@ -470,19 +469,19 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	}
 
 	b := &Backend{
-		cfg:              cfg,
-		docker:           docker,
-		compose:          composeSvc,
-		pool:             pool,
-		volumes:          volumes,
-		logger:           logger.With("backend", cfg.Name),
+		cfg:                   cfg,
+		docker:                docker,
+		compose:               composeSvc,
+		pool:                  pool,
+		volumes:               volumes,
+		logger:                logger.With("backend", cfg.Name),
 		provisions:            make(map[string]*provision),
 		volumeCleanupAttempts: make(map[string]int),
 		actors:                make(map[string]*leasesm.LeaseActor),
-		callbackStore:    cbStore,
-		diagnosticsStore: diagStore,
-		releaseStore:     releaseStore,
-		httpClient:       httpClient,
+		callbackStore:         cbStore,
+		diagnosticsStore:      diagStore,
+		releaseStore:          releaseStore,
+		httpClient:            httpClient,
 		// tenantNetworkStripes is a fixed-size array embedded in Backend;
 		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}

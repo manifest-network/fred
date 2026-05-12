@@ -975,22 +975,6 @@ func (a *LeaseActor) Terminated() bool {
 	return a.terminated
 }
 
-// setTerminated marks the actor as terminated. Test-only seam for
-// leasesm-internal tests that need to simulate post-handleDeprovision
-// state without driving the full Deprovision flow. Production code
-// MUST NOT call this — terminated is set only by handleDeprovision,
-// on the actor's own goroutine, after the provision entry is removed.
-//
-// Intra-package only: tests migrating from docker at E will live in
-// `package leasesm` (per Deviation #1's "tests of internal actor
-// semantics → leasesm") and can write the `terminated` field directly,
-// making this helper redundant. Kept as a documented seam in case a
-// future test wants the explicit name; safe to delete in the
-// doc/cleanup PR (task #14) if no caller emerges.
-func (a *LeaseActor) setTerminated(v bool) { //nolint:unused
-	a.terminated = v
-}
-
 // TryEnqueue does a non-blocking enqueue of msg into the actor's inbox.
 // Returns true on success, false if the inbox is full. This is the
 // primary entrypoint the substrate's routing layer uses to deliver

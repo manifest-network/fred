@@ -69,7 +69,7 @@ const (
 // behavior decisions branch on it.
 type InstanceState struct {
 	Phase       Phase
-	ExitCode    *int      // nil when not yet exited
+	ExitCode    *int // nil when not yet exited
 	OOMKilled   bool
 	FinishedAt  time.Time // zero value when still running
 	Reason      string    // substrate-specific termination reason ("OOMKilled", "Error", etc.)

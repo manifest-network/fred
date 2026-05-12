@@ -85,14 +85,14 @@ func (m *mockProvisionStore) UpdateFn(uuid string, fn func(*ProvisionState)) boo
 // field stub pattern shown below (see mockInstanceInspector).
 type mockSMMetrics struct{}
 
-func (mockSMMetrics) SMTransition(_, _, _ string)  {}
-func (mockSMMetrics) ActorCreated()                {}
-func (mockSMMetrics) FailingRaceSkipped()          {}
-func (mockSMMetrics) WorkerPanic(_ string)         {}
-func (mockSMMetrics) ActorPanic()                  {}
+func (mockSMMetrics) SMTransition(_, _, _ string)   {}
+func (mockSMMetrics) ActorCreated()                 {}
+func (mockSMMetrics) FailingRaceSkipped()           {}
+func (mockSMMetrics) WorkerPanic(_ string)          {}
+func (mockSMMetrics) ActorPanic()                   {}
 func (mockSMMetrics) TerminalEventDropped(_ string) {}
-func (mockSMMetrics) ActiveProvisionsInc()         {}
-func (mockSMMetrics) ActiveProvisionsDec()         {}
+func (mockSMMetrics) ActiveProvisionsInc()          {}
+func (mockSMMetrics) ActiveProvisionsDec()          {}
 
 // mockInstanceInspector implements InstanceInspector with a function-
 // field stub. Tests set InspectInstanceFn to control the inspect
