@@ -110,9 +110,17 @@ func (p *ProvisionState) IsStack() bool {
 
 // ProvisionState is the substrate-agnostic snapshot of a lease's
 // provision record. The lease state machine and actor reason about
-// these fields exclusively; substrate-specific fields (e.g.
-// VolumeCleanupAttempts on the Docker backend) live on a docker-private
-// wrapper that embeds *ProvisionState.
+// these fields exclusively; substrate-specific state is kept
+// substrate-side and never reaches this struct.
+//
+// The Docker backend keeps its private state (e.g. VolumeCleanupAttempts)
+// in a parallel map (Backend.volumeCleanupAttempts) guarded by the same
+// mutex as the provisions map, and aliases its in-memory record type
+// directly to *ProvisionState (type provision = leasesm.ProvisionState).
+// Other substrates may choose differently — embedding *ProvisionState in
+// a wrapper struct is equally valid when there's enough substrate-private
+// state to justify a named type; both shapes are compatible with the
+// LeaseProvisionStore interface.
 //
 // Manifest and StackManifest are substrate-shared schema (lifted to
 // internal/backend/shared/manifest in PR2) — they live here even
