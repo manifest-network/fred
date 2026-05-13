@@ -7,6 +7,13 @@ dist/
 *.so
 *.dylib
 
+# Built cmd binaries at repo root (one per cmd/<name>/)
+/docker-backend
+/k3s-backend
+/mock-backend
+/providerd
+/loadtest
+
 # Test binary
 *.test
 
