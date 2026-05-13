@@ -18,6 +18,20 @@ import (
 // per-call contexts; this default doesn't affect them.
 const kubeClientTimeout = 5 * time.Second
 
+// kubeClientQPS / kubeClientBurst raise client-go's default 5/10
+// rate-limit ceiling. ENG-133 issues a single Discovery() request per
+// /health call, so the defaults would suffice today — but ENG-134+'s
+// provisioner will fan out concurrent Pod/Service/PVC reads and writes
+// per lease, and 5 QPS is too low to avoid silent throttling at that
+// volume. Setting these now is cheap insurance and keeps the limit in
+// one place. Operators can override via the resolved kubeconfig if
+// finer tuning is needed (the if-zero check below preserves a
+// user-set value).
+const (
+	kubeClientQPS   = 50
+	kubeClientBurst = 100
+)
+
 // buildKubeClient returns a typed clientset configured to reach the K3s
 // API server. Resolution order (first hit wins):
 //
@@ -40,6 +54,12 @@ func buildKubeClient(cfg Config) (kubernetes.Interface, error) {
 	}
 	if rc.Timeout == 0 {
 		rc.Timeout = kubeClientTimeout
+	}
+	if rc.QPS == 0 {
+		rc.QPS = kubeClientQPS
+	}
+	if rc.Burst == 0 {
+		rc.Burst = kubeClientBurst
 	}
 	return kubernetes.NewForConfig(rc)
 }

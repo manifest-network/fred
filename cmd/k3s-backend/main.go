@@ -89,13 +89,17 @@ func main() {
 	// Create server
 	server := NewServer(b, string(cfg.CallbackSecret), logger)
 
-	// Setup HTTP server
+	// Setup HTTP server. ReadHeaderTimeout closes the slow-loris attack
+	// surface (a client that trickles request headers to hold a goroutine
+	// open indefinitely). The 10s window is generous for legitimate Fred
+	// traffic on a LAN/VPN while still bounding malicious slow-headers.
 	httpServer := &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      server.Handler(),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              cfg.ListenAddr,
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Start HTTP server
