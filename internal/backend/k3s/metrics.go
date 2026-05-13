@@ -28,13 +28,18 @@ var (
 		[]string{"outcome"},
 	)
 
-	// callbackDeliveryTotal counts callback delivery attempts by outcome.
-	// Label values "success" / "failure" match the strings emitted by
-	// shared.CallbackSender.reportDelivery (see shared/callback_sender.go).
+	// callbackDeliveryTotal counts callback delivery OUTCOMES (not HTTP
+	// attempts). shared.CallbackSender.reportDelivery increments this
+	// counter once per overall delivery result — success once any attempt
+	// succeeds, or failure once the retry loop is exhausted/aborted. It is
+	// NOT a per-HTTP-attempt counter; alerting and dashboards that want
+	// retry-volume must read it as "deliveries closed" rather than
+	// "requests sent". Label values "success" / "failure" match the
+	// strings emitted by reportDelivery (see shared/callback_sender.go).
 	callbackDeliveryTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "fred_k3s_backend_callback_delivery_total",
-			Help: "Total callback delivery attempts by the k3s backend, by outcome (success|failure).",
+			Help: "Total callback delivery outcomes (one per overall delivery, after retries) by the k3s backend, by outcome (success|failure).",
 		},
 		[]string{"outcome"},
 	)

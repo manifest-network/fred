@@ -210,20 +210,66 @@ func TestProvision_RejectsInvalidRequests(t *testing.T) {
 	}
 }
 
-func TestProvision_RejectsAlreadyProvisioned(t *testing.T) {
+func TestProvision_RejectsActiveDuplicate(t *testing.T) {
+	// Duplicate Provision on a lease whose entry is in a non-failed status
+	// (Provisioning, or — once ENG-134+ ships real lifecycle — Ready/
+	// Restarting/etc.) must return ErrAlreadyProvisioned. Only failed entries
+	// are eligible for replacement (covered by TestProvision_AllowsRetryAfterFailure).
+	//
+	// We seed the in-memory map directly with a Provisioning entry instead
+	// of racing against the stub goroutine — the goroutine flips to Failed
+	// quickly and would defeat the in-progress check non-deterministically.
+	fred, _ := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+
+	b.provisionsMu.Lock()
+	b.provisions["lease-active"] = &provision{
+		LeaseUUID: "lease-active",
+		Status:    backend.ProvisionStatusProvisioning,
+		CreatedAt: time.Now(),
+	}
+	b.provisionsMu.Unlock()
+
+	err := b.Provision(context.Background(), newProvisionRequest("lease-active", fred.URL))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
+}
+
+func TestProvision_AllowsRetryAfterFailure(t *testing.T) {
+	// Regression test for the round-4 Copilot finding: a provision in
+	// status=Failed must be replaceable by a subsequent Provision call so
+	// Fred's reconciler can retry failed-active leases until FailCount
+	// reaches the configured retry ceiling. Mirrors docker-backend's
+	// status-aware check.
+	//
+	// Verifies: (a) the second Provision succeeds (not ErrAlreadyProvisioned),
+	// (b) FailCount carries forward across the replacement (1 -> 2 after
+	// the second stub failure), (c) the map entry is replaced (not
+	// duplicated).
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
 
-	// First Provision succeeds and the stub goroutine fires the failure
-	// callback. We await delivery so the in-memory entry is in its final
-	// state before attempting the duplicate — though the duplicate check
-	// fires on any in-memory entry regardless of status.
 	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
 	_ = awaitCallback(t, ch)
 
-	err := b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL))
-	require.Error(t, err)
-	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
+	info, err := b.GetProvision(context.Background(), "lease-1")
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	require.Equal(t, 1, info.FailCount)
+
+	// Retry. Should succeed and inherit the prior FailCount.
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	_ = awaitCallback(t, ch)
+
+	info, err = b.GetProvision(context.Background(), "lease-1")
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	assert.Equal(t, 2, info.FailCount,
+		"FailCount must carry forward across retry-after-failure cycles for reconciler ceiling enforcement")
+
+	list, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	assert.Len(t, list, 1, "lease must not be duplicated in the map after replacement")
 }
 
 // --- Stub provisioner: happy path (ENG-133 AC3) --------------------------

@@ -29,12 +29,16 @@ EXPOSE 8080
 ENTRYPOINT ["/providerd"]
 
 # ---- k3s-backend runtime ----
-# Config must be mounted at runtime. The kubeconfig must also be readable.
+# Config must be mounted at runtime. The kubeconfig must also be readable
+# at the path the config points at — config.k3s.yaml.example defaults
+# kubeconfig_path to /etc/rancher/k3s/k3s.yaml, so either mount the
+# kubeconfig there OR override kubeconfig_path in the YAML to wherever
+# you mount it.
 # Persist /data to retain k3s-callbacks.db, k3s-diagnostics.db, and
 # k3s-releases.db:
 #   docker run -v k3s-db-data:/data \
 #     -v ./config.k3s.yaml:/data/config.k3s.yaml \
-#     -v ~/.kube/k3s.yaml:/data/kubeconfig:ro \
+#     -v ~/.kube/k3s.yaml:/etc/rancher/k3s/k3s.yaml:ro \
 #     fred-k3s-backend
 FROM gcr.io/distroless/static-debian12 AS k3s-backend
 

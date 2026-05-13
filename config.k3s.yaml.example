@@ -170,9 +170,13 @@ diagnostics_max_age: 168h
 # =============================================================================
 # RELEASE HISTORY
 # =============================================================================
-# Tracks deployment releases (provisions, updates) per lease. The
-# GET /releases/{lease_uuid} endpoint returns this history. Releases are
-# persisted to a bbolt database so they survive backend restarts.
+# Tracks deployment releases (provisions, updates) per lease in a bbolt
+# database that survives backend restarts. The GET /releases/{lease_uuid}
+# endpoint returns this history once ENG-134+ wires the real provisioner
+# (the ENG-133 scaffold's GetReleases always returns 404 — no entries are
+# ever written until a real provision lands). The store path and max-age
+# below are honored today; the operator-visible read endpoint is
+# scaffold-disabled.
 
 # Path to bbolt database for persisting release history.
 # Default: k3s-releases.db (k3s-prefixed to avoid collision with

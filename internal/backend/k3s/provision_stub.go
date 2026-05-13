@@ -40,10 +40,24 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	}
 
 	b.provisionsMu.Lock()
-	if _, exists := b.provisions[req.LeaseUUID]; exists {
-		b.provisionsMu.Unlock()
-		provisionsTotal.WithLabelValues("rejected").Inc()
-		return backend.ErrAlreadyProvisioned
+	// Mirror docker-backend's status-aware check: only entries in
+	// ProvisionStatusFailed are eligible for replacement. Fred's reconciler
+	// relies on this — it retries failed-active leases by calling Provision
+	// again until FailCount reaches the configured retry ceiling. Rejecting
+	// all existing entries (regardless of status) would loop the reconciler
+	// at 409 forever, never incrementing FailCount, never garbage-collecting
+	// the lease.
+	var prevFailCount int
+	if existing, exists := b.provisions[req.LeaseUUID]; exists {
+		if existing.Status != backend.ProvisionStatusFailed {
+			b.provisionsMu.Unlock()
+			provisionsTotal.WithLabelValues("rejected").Inc()
+			return backend.ErrAlreadyProvisioned
+		}
+		// Carry forward FailCount across the replacement so the runStubProvisioner
+		// goroutine's increment lands on the cumulative count.
+		prevFailCount = existing.FailCount
+		delete(b.provisions, req.LeaseUUID)
 	}
 	p := &provision{
 		LeaseUUID:    req.LeaseUUID,
@@ -51,6 +65,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		ProviderUUID: req.ProviderUUID,
 		Status:       backend.ProvisionStatusProvisioning,
 		CallbackURL:  req.CallbackURL,
+		FailCount:    prevFailCount,
 		CreatedAt:    time.Now(),
 	}
 	b.provisions[req.LeaseUUID] = p
@@ -83,11 +98,14 @@ func (b *Backend) runStubProvisioner(p *provision) {
 	b.provisionsMu.Lock()
 	p.Status = backend.ProvisionStatusFailed
 	p.LastError = stubProvisionerErrMsg
-	// Set FailCount in the in-memory record alongside Status so map-path
-	// and diagnostics-fallback wire returns from GetProvision agree on
-	// fail_count for the same lease. Docker parity: docker's in-memory
-	// provision wraps leasesm.ProvisionState which carries FailCount.
-	p.FailCount = 1
+	// Increment FailCount (not set to 1) so retry cycles accumulate
+	// correctly across Provision -> failed -> Provision-again -> failed
+	// chains. The Provision method carries forward prevFailCount when
+	// replacing a failed entry; runStubProvisioner adds 1 on top.
+	// Docker parity: docker's in-memory provision wraps
+	// leasesm.ProvisionState which carries FailCount through retries.
+	p.FailCount++
+	currentFailCount := p.FailCount
 	callbackURL := p.CallbackURL
 	leaseUUID := p.LeaseUUID
 	tenant := p.Tenant
@@ -99,7 +117,7 @@ func (b *Backend) runStubProvisioner(p *provision) {
 		ProviderUUID: providerUUID,
 		Tenant:       tenant,
 		Error:        stubProvisionerErrMsg,
-		FailCount:    1,
+		FailCount:    currentFailCount,
 		CreatedAt:    time.Now(),
 	}); err != nil {
 		b.logger.Error("failed to persist failure diagnostic",
