@@ -3,11 +3,13 @@ package k3s
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -487,4 +489,112 @@ func TestStats_ReturnsPoolSnapshot(t *testing.T) {
 	assert.InDelta(t, 8.0, stats.AvailableCPU(), 0.001)
 	assert.Equal(t, int64(16384), stats.AvailableMemoryMB())
 	assert.Equal(t, int64(102400), stats.AvailableDiskMB())
+}
+
+// --- Task #19 regression tests --------------------------------------------
+
+func TestGetProvision_NoRace_UnderConcurrentProvision(t *testing.T) {
+	// Task #19 Fix 2 regression guard. The pre-fix GetProvision dropped
+	// the RLock before reading p.Status / p.FailCount / p.LastError —
+	// which runStubProvisioner mutates under the write lock. This test
+	// hammers the same lease UUID from a Provision writer and a
+	// GetProvision reader concurrently, with NO channel-sync between
+	// the pair (intentional: T7b's existing GetProvision tests use
+	// awaitCallback's channel-sync happens-before, which masks the race
+	// because the reader never observes the writer mid-flight).
+	//
+	// Pre-fix: race detector trips on the unsynchronized field reads.
+	// Post-fix: reads occur under RLock — race detector clean.
+	//
+	// N=50 pairs run for up to 2 seconds — empirically reliable for
+	// triggering the race window pre-fix while keeping wall clock under
+	// 3s post-fix.
+
+	// Drain-only Fred handler: outbound callbacks from runStubProvisioner
+	// must not block on a buffered channel. HMAC verification isn't
+	// relevant to the race fix (the race is in-process map access, not
+	// callback delivery), so we skip it here to keep the test focused.
+	fred := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(fred.Close)
+
+	b := newBackendForTest(t, fred.URL)
+
+	const N = 50
+	var wg sync.WaitGroup
+	wg.Add(2 * N)
+
+	for i := 0; i < N; i++ {
+		uuid := fmt.Sprintf("lease-race-%d", i)
+
+		go func(uuid string) {
+			defer wg.Done()
+			_ = b.Provision(context.Background(), newProvisionRequest(uuid, fred.URL))
+		}(uuid)
+
+		go func(uuid string) {
+			defer wg.Done()
+			// Tight loop until deadline. Each iteration potentially
+			// observes a different snapshot of the writer's state —
+			// pre-fix, any iteration could trip the race detector.
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				_, _ = b.GetProvision(context.Background(), uuid)
+			}
+		}(uuid)
+	}
+
+	wg.Wait()
+
+	// Sanity check: by the time wg.Wait returns, the writer goroutine
+	// for lease-race-0 has at least called Provision, which inserts the
+	// in-memory entry. GetProvision should surface it (whether the stub
+	// goroutine has finished mutating or not — both states are valid map
+	// hits). Doesn't verify the race fix itself (that's the race
+	// detector's job); just ensures the test setup actually exercised
+	// the contended code path and didn't no-op.
+	info, err := b.GetProvision(context.Background(), "lease-race-0")
+	require.NoError(t, err)
+	require.NotNil(t, info)
+}
+
+func TestListProvisions_PopulatesFailCount(t *testing.T) {
+	// Task #19 Fix 3 regression guard. Pre-fix ListProvisions omitted
+	// FailCount from the returned ProvisionInfo struct literal,
+	// surfacing fail_count=0 on the wire for failed provisions —
+	// contradicting GetProvision's map path which carries FailCount=1.
+	// Post-fix: ListProvisions populates FailCount from p.FailCount
+	// alongside the other fields, agreeing with GetProvision on the
+	// wire shape.
+	fred, ch := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	_ = awaitCallback(t, ch)
+
+	list, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, 1, list[0].FailCount,
+		"ListProvisions must populate FailCount from the in-memory record")
+}
+
+func TestLookupProvisions_PopulatesFailCount(t *testing.T) {
+	// Task #19 Fix 3 regression guard for the filtered list path.
+	// Same shape as TestListProvisions_PopulatesFailCount: pre-fix
+	// LookupProvisions omitted FailCount in its struct literal;
+	// post-fix it carries FailCount: p.FailCount.
+	fred, ch := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	_ = awaitCallback(t, ch)
+
+	list, err := b.LookupProvisions(context.Background(), []string{"lease-1"})
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, 1, list[0].FailCount,
+		"LookupProvisions must populate FailCount from the in-memory record")
 }
