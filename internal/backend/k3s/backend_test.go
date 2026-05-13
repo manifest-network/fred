@@ -361,7 +361,8 @@ func TestGetProvision_FromDiagnostics_AfterDeprovision(t *testing.T) {
 	assert.Equal(t, "lease-1", info.LeaseUUID)
 	assert.Equal(t, "prov-1", info.ProviderUUID)
 	// Fallback synthesizes Status=Failed because shared.DiagnosticEntry
-	// is failure-only by construction (provision_stub.go:150-156).
+	// is failure-only by construction (only the runStubProvisioner failure
+	// path calls diagnosticsStore.Store).
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.Equal(t, "not implemented", info.LastError)
 	assert.Equal(t, 1, info.FailCount)

@@ -147,7 +147,9 @@ callback_secret: ""
 callback_db_path: "k3s-callbacks.db"
 
 # Maximum age of persisted callback entries. Entries older than this are
-# removed during startup replay. Default: 24h.
+# removed when the callback store opens (one synchronous sweep inside
+# shared.NewCallbackStore at backend startup) AND by a periodic background
+# loop while the backend runs. Default: 24h.
 callback_max_age: 24h
 
 # =============================================================================

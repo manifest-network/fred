@@ -2,8 +2,8 @@
 // declares the Server type, the backendService interface every handler
 // calls into, the route table, the HMAC inbound middleware, the SSRF
 // guard on outbound callback URLs, and the response helpers. main.go
-// (T6) wires a *k3s.Backend instance into NewServer and runs the HTTP
-// loop with graceful shutdown.
+// wires a *k3s.Backend instance into NewServer and runs the HTTP loop
+// with graceful shutdown.
 package main
 
 import (
@@ -30,10 +30,10 @@ import (
 )
 
 // backendService defines the methods that handlers call on the backend.
-// *k3s.Backend satisfies this interface structurally once T4 lands the
-// provisioner methods (Provision, Deprovision, GetInfo, GetLogs,
-// GetProvision, ListProvisions, LookupProvisions, Restart, Update,
-// ReconcileCustomDomain, GetReleases, Stats). Health is shipped in T3.
+// *k3s.Backend satisfies this interface structurally. The compile-time
+// guard in internal/backend/k3s/provision_stub.go re-states the contract
+// inline so any signature drift surfaces at the package boundary rather
+// than only at the NewServer call site.
 type backendService interface {
 	Provision(ctx context.Context, req backend.ProvisionRequest) error
 	Deprovision(ctx context.Context, leaseUUID string) error
@@ -266,13 +266,13 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := s.backend.ReconcileCustomDomain(r.Context(), req.LeaseUUID, req.Items); err != nil {
-		// Surface ErrNotProvisioned and ErrInvalidState as 404/409 so the
-		// HTTPClient can map them back to typed errors. Both signal benign
-		// races (lease just deprovisioned, or status flipped between our
-		// pre-check and Restart's own check) — the providerd-side circuit
-		// breaker exempts them from the trip count. Collapsing them into
-		// 500 here would cause the CB to count routine reconcile-tick
-		// races as backend failures.
+		// Forward-compat error mapping for ENG-134+. In the ENG-133 scaffold,
+		// ReconcileCustomDomain unconditionally returns nil (no-op) because
+		// ingress is rejected at config-Validate time, so the branches below
+		// are unreachable today. When ENG-134+ ships real custom-domain
+		// reconciliation, transient sentinels (lease just deprovisioned,
+		// status flipped mid-reconcile) must surface as 404/409 — not 500 —
+		// so providerd's circuit breaker exempts them from the trip count.
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return

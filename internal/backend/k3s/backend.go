@@ -48,9 +48,9 @@ type provision struct {
 // Backend implements the Fred backend protocol for K3s. The ENG-133
 // scaffold provides only the lifecycle skeleton (New / Start / Stop /
 // Name) and a /health probe; substantive provisioning logic is deferred
-// to ENG-134+. The HTTP server's backendService interface is satisfied
-// across T2 (lifecycle + Health stub) and T4 (provisioner methods +
-// Stats); T2 alone does not satisfy it.
+// to ENG-134+. *Backend structurally satisfies the backendService
+// interface declared in cmd/k3s-backend/server.go, verified by the
+// compile-time guard at the bottom of provision_stub.go.
 type Backend struct {
 	cfg    Config
 	logger *slog.Logger
@@ -210,9 +210,13 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 func (b *Backend) Start(ctx context.Context) error {
 	_ = ctx
 	b.callbackSender.ReplayPendingCallbacks()
+	// The provisions map is always empty here in the ENG-133 scaffold —
+	// k3s-backend does not recover lease state from the cluster on boot
+	// (unlike docker.recoverState which scans the daemon). ENG-134+'s
+	// real state-recovery loop will repopulate the map before Start
+	// returns; until then there's no useful count to log.
 	b.logger.Info("k3s backend started",
 		"kubeconfig_path", b.cfg.KubeconfigPath,
-		"in_memory_provisions", len(b.provisions),
 	)
 	return nil
 }
