@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -532,8 +533,12 @@ func validateCallbackURL(rawURL string) error {
 		return fmt.Errorf("host is required")
 	}
 
-	// Extract hostname (without port)
+	// Extract hostname (without port) and normalize FQDN notation. The
+	// trailing-dot trim mirrors internal/config.validateExternalURL — without
+	// it, "http://169.254.169.254./..." would make net.ParseIP return nil and
+	// skip the link-local block, despite resolving to the same metadata IP.
 	hostname := parsed.Hostname()
+	hostname = strings.TrimSuffix(hostname, ".")
 
 	// Check if hostname is an IP address
 	ip := net.ParseIP(hostname)
@@ -542,6 +547,12 @@ func validateCallbackURL(rawURL string) error {
 		// include cloud metadata endpoints like 169.254.169.254.
 		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return fmt.Errorf("link-local addresses are not allowed")
+		}
+		// Block unspecified addresses (0.0.0.0, ::). These resolve to
+		// "any interface" on the target host and shouldn't be used as
+		// callback destinations. Matches internal/config.validateExternalURL.
+		if ip.IsUnspecified() {
+			return fmt.Errorf("unspecified addresses are not allowed")
 		}
 	}
 
