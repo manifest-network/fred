@@ -46,9 +46,19 @@ ENTRYPOINT ["/providerd"]
 #   2. Use Docker's --user 0:0 flag to run as root inside the container
 #      (DEFEATS the nonroot hardening — not recommended for production).
 #
+# Networking note: K3s writes its default kubeconfig with
+# `server: https://127.0.0.1:6443`, which inside a non-host-networked
+# container resolves to the container itself — /health will fail with
+# connection-refused even though the file is mounted. Two options:
+#   a. Run with --network host (Linux only; simplest for local dev).
+#   b. Rewrite the kubeconfig's `server:` URL to an address the
+#      container can reach (e.g. the host's LAN IP, or
+#      host.docker.internal on Docker Desktop). Do this on the
+#      already-copied-and-chowned working copy from step 1 above.
+#
 # Persist /data to retain k3s-callbacks.db, k3s-diagnostics.db, and
 # k3s-releases.db:
-#   docker run -v k3s-db-data:/data \
+#   docker run --network host -v k3s-db-data:/data \
 #     -v ./config.k3s.yaml:/data/config.k3s.yaml \
 #     -v /tmp/k3s.yaml:/etc/rancher/k3s/k3s.yaml:ro \
 #     fred-k3s-backend
