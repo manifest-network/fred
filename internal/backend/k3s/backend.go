@@ -35,10 +35,12 @@ type provision struct {
 	CallbackURL  string
 	LastError    string
 	// FailCount mirrors leasesm.ProvisionState.FailCount in docker. The
-	// stub provisioner sets it to 1 alongside Status=Failed under the
-	// same lock; map-path and diagnostics-fallback wire returns from
-	// GetProvision agree on fail_count (BACKEND_GUIDE documents
-	// fail_count as a wire field).
+	// stub provisioner increments it (not sets to 1) so retry-after-failure
+	// cycles accumulate — Provision carries prevFailCount forward when
+	// replacing a failed entry, and runStubProvisioner adds 1 on top under
+	// the same lock as the Status=Failed mutation. Map-path and
+	// diagnostics-fallback wire returns from GetProvision agree on
+	// fail_count (BACKEND_GUIDE documents fail_count as a wire field).
 	FailCount int
 	CreatedAt time.Time
 }
