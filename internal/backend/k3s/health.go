@@ -9,11 +9,14 @@ import (
 
 // Health probes the K3s API server's reachability with a single
 // Discovery().ServerVersion() call. The typed clientset is built
-// lazily on the first call (under sync.Once); failures are cached
-// for the process lifetime — fixing a bad kubeconfig requires a
-// restart. This is acceptable for the ENG-133 scaffold (/health is
-// the only consumer); ENG-134+ may revisit when Provision/etc.
-// start consuming the client.
+// lazily on the first call (under sync.Once); the client-build
+// outcome is cached for the process lifetime, so a bad kubeconfig
+// requires a restart to retry. Transient ServerVersion() failures
+// (e.g., a brief API-server outage on a successfully-built client)
+// are NOT cached — they are retried on every subsequent Health call.
+// This is acceptable for the ENG-133 scaffold (/health is the only
+// consumer); ENG-134+ may revisit when Provision/etc. start
+// consuming the client.
 //
 // On success returns nil. On any failure (build error or ServerVersion
 // error) returns fmt.Errorf("k3s API unreachable: %w", err) so the
