@@ -50,11 +50,19 @@ total_memory_mb: 16384
 total_disk_mb: 102400
 
 # =============================================================================
-# SKU MAPPING (REQUIRED)
+# SKU MAPPING (REQUIRED FOR REAL PROVISIONING)
 # =============================================================================
 # Maps on-chain SKU UUIDs to local profile names. When a tenant creates a
 # lease, the chain assigns a SKU UUID. This mapping tells the backend which
 # resource profile to provision.
+#
+# In the ENG-133 scaffold this section is optional: the stub provisioner
+# never resolves SKUs and every accepted provision is reported as
+# `status=failed, error="not implemented"`. The mapping becomes required
+# once ENG-134+ ships real K8s provisioning — at that point a mapping
+# entry is needed for every on-chain SKU the operator wants to serve, and
+# Validate() rejects profiles with no inbound mapping entry as
+# "unreachable from on-chain SKUs".
 #
 # To get your SKU UUIDs:
 #   manifestd query sku skus-by-provider <your-provider-uuid>
