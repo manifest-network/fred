@@ -96,6 +96,23 @@ func (b *Backend) runStubProvisioner(p *provision) {
 	defer b.wg.Done()
 
 	b.provisionsMu.Lock()
+	// Suppress stale Failed callbacks when a concurrent Deprovision has
+	// already removed (or replaced) the lease entry. Without this check,
+	// a sequence of Provision -> Deprovision -> (worker scheduled later)
+	// would persist a failure diagnostic AND fire a signed status=failed
+	// callback for a lease Fred has already torn down — Fred would treat
+	// it as a real failure and trip its circuit breaker / fail-count
+	// metrics. Mirrors docker-backend's leasesm OnExit-cancel pattern
+	// (PR #79 / commit cc62f3b).
+	//
+	// The pointer-equality check also handles the Provision-replaces-
+	// failed-entry path: if a new Provision call replaced the entry we
+	// were spawned for, only the new worker should mutate the new entry.
+	current, exists := b.provisions[p.LeaseUUID]
+	if !exists || current != p {
+		b.provisionsMu.Unlock()
+		return
+	}
 	p.Status = backend.ProvisionStatusFailed
 	p.LastError = stubProvisionerErrMsg
 	// Increment FailCount (not set to 1) so retry cycles accumulate

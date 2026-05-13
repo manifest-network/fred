@@ -514,6 +514,60 @@ func TestStubMethods_ReturnErrNotProvisioned(t *testing.T) {
 	})
 }
 
+func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
+	// Regression test for the round-6 Copilot finding: runStubProvisioner
+	// must not fire a stale status=failed callback (or persist a stale
+	// diagnostic) when a concurrent Deprovision has already removed the
+	// entry from b.provisions.
+	//
+	// Race scenario:
+	//   Provision()   -> entry inserted, goroutine spawned but unscheduled.
+	//   Deprovision() -> entry deleted from map.
+	//   <worker runs> -> p pointer is still alive but map no longer holds
+	//                    it; without the suppression check it would mutate
+	//                    and send a failed callback for a lease Fred just
+	//                    tore down.
+	//
+	// We seed an entry directly into the map, delete it (simulating the
+	// fast Deprovision), then invoke runStubProvisioner synchronously so
+	// the test is deterministic instead of racing the Go scheduler.
+	fred, callbacks := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+
+	p := &provision{
+		LeaseUUID:    "lease-deleted",
+		Tenant:       "manifest1test",
+		ProviderUUID: "prov-1",
+		Status:       backend.ProvisionStatusProvisioning,
+		CallbackURL:  fred.URL,
+		CreatedAt:    time.Now(),
+	}
+	b.provisionsMu.Lock()
+	b.provisions[p.LeaseUUID] = p
+	b.provisionsMu.Unlock()
+	b.wg.Add(1) // runStubProvisioner's defer wg.Done() needs a paired Add.
+
+	// Deprovision the entry BEFORE the worker runs.
+	require.NoError(t, b.Deprovision(context.Background(), p.LeaseUUID))
+
+	// Run the worker synchronously. With the suppression check it must
+	// see the missing map entry and exit silently.
+	b.runStubProvisioner(p)
+
+	// Assert no callback was sent.
+	select {
+	case got := <-callbacks:
+		t.Fatalf("expected no callback after deprovision, got: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: callback channel stays empty.
+	}
+
+	// Assert no diagnostic was persisted either.
+	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
+	require.NoError(t, err)
+	assert.Nil(t, diag, "no diagnostic should be persisted for a deprovisioned lease")
+}
+
 func TestReconcileCustomDomain_NoOpForUnhandledLease(t *testing.T) {
 	// Per the backendService contract, ReconcileCustomDomain must be a
 	// no-op (return nil) for leases the backend doesn't manage and for

@@ -34,11 +34,23 @@ ENTRYPOINT ["/providerd"]
 # kubeconfig_path to /etc/rancher/k3s/k3s.yaml, so either mount the
 # kubeconfig there OR override kubeconfig_path in the YAML to wherever
 # you mount it.
+#
+# Permissions note: this image runs as nonroot (UID 65532). K3s installs
+# its kubeconfig as 0600 root:root, so the mounted file MUST be readable
+# by UID 65532. Two common approaches:
+#   1. Copy + chmod a working copy:
+#        sudo cp /etc/rancher/k3s/k3s.yaml /tmp/k3s.yaml
+#        sudo chown 65532:65532 /tmp/k3s.yaml
+#        sudo chmod 0600 /tmp/k3s.yaml
+#        docker run ... -v /tmp/k3s.yaml:/etc/rancher/k3s/k3s.yaml:ro ...
+#   2. Use Docker's --user 0:0 flag to run as root inside the container
+#      (DEFEATS the nonroot hardening — not recommended for production).
+#
 # Persist /data to retain k3s-callbacks.db, k3s-diagnostics.db, and
 # k3s-releases.db:
 #   docker run -v k3s-db-data:/data \
 #     -v ./config.k3s.yaml:/data/config.k3s.yaml \
-#     -v ~/.kube/k3s.yaml:/etc/rancher/k3s/k3s.yaml:ro \
+#     -v /tmp/k3s.yaml:/etc/rancher/k3s/k3s.yaml:ro \
 #     fred-k3s-backend
 FROM gcr.io/distroless/static-debian12 AS k3s-backend
 
