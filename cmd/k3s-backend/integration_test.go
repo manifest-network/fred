@@ -71,7 +71,11 @@ func TestIntegration_BinaryProvisionsAndCallsBack(t *testing.T) {
 	httpReq.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(secret, bodyBytes))
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	// Bounded timeout so a handler deadlock or stalled connection fails the
+	// test in seconds, not minutes — the default go-test 10-min timeout is
+	// far too coarse to detect /provision unresponsiveness here.
+	provisionClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := provisionClient.Do(httpReq)
 	require.NoError(t, err)
 	respBody, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -261,10 +265,17 @@ func startBinary(t *testing.T, binPath, cfgPath string) *exec.Cmd {
 }
 
 // relayOutput forwards a binary stream into the test log line-by-line.
+// scanner.Err() is logged after the loop so a pipe error (closed stream,
+// I/O failure) or a line exceeding bufio.MaxScanTokenSize (64 KiB) is
+// visible to anyone debugging a failed test rather than silently
+// truncating the captured output.
 func relayOutput(t *testing.T, label string, r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		t.Logf("binary %s: %s", label, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		t.Logf("binary %s: scan error: %v", label, err)
 	}
 }
 
@@ -274,10 +285,14 @@ func relayOutput(t *testing.T, label string, r io.Reader) {
 // binary's listener accepting connections is the only invariant we need.
 func waitForListening(t *testing.T, port int) {
 	t.Helper()
+	// Per-attempt timeout shorter than the poll interval so a stuck
+	// connection on the loopback bind window doesn't eat the whole 3s
+	// deadline in a single try.
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 	deadline := time.Now().Add(3 * time.Second)
 	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(url) // nolint:gosec // localhost test request
+		resp, err := client.Get(url) // nolint:gosec // localhost test request
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
