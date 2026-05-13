@@ -168,19 +168,27 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 func (b *Backend) GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
 	_ = ctx
 
+	// Map-path read: construct the ProvisionInfo under RLock so the
+	// reads of p.Status / p.FailCount / p.LastError (mutated by
+	// runStubProvisioner under the write lock) are race-free. The
+	// diagnostics fallback below runs OUTSIDE the lock because
+	// diagnosticsStore.Get is unbounded bbolt I/O — holding the lock
+	// across it would serialize concurrent GetProvision callers
+	// pointlessly.
 	b.provisionsMu.RLock()
-	p, exists := b.provisions[leaseUUID]
-	b.provisionsMu.RUnlock()
-	if exists {
-		return &backend.ProvisionInfo{
+	if p, exists := b.provisions[leaseUUID]; exists {
+		info := &backend.ProvisionInfo{
 			LeaseUUID:    p.LeaseUUID,
 			ProviderUUID: p.ProviderUUID,
 			Status:       p.Status,
 			FailCount:    p.FailCount,
 			LastError:    p.LastError,
 			CreatedAt:    p.CreatedAt,
-		}, nil
+		}
+		b.provisionsMu.RUnlock()
+		return info, nil
 	}
+	b.provisionsMu.RUnlock()
 
 	diag, err := b.diagnosticsStore.Get(leaseUUID)
 	if err != nil {
@@ -212,6 +220,7 @@ func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, 
 			LeaseUUID:    p.LeaseUUID,
 			ProviderUUID: p.ProviderUUID,
 			Status:       p.Status,
+			FailCount:    p.FailCount,
 			LastError:    p.LastError,
 			CreatedAt:    p.CreatedAt,
 		})
@@ -234,6 +243,7 @@ func (b *Backend) LookupProvisions(ctx context.Context, uuids []string) ([]backe
 				LeaseUUID:    p.LeaseUUID,
 				ProviderUUID: p.ProviderUUID,
 				Status:       p.Status,
+				FailCount:    p.FailCount,
 				LastError:    p.LastError,
 				CreatedAt:    p.CreatedAt,
 			})

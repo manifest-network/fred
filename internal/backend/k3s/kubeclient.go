@@ -21,8 +21,9 @@ const kubeClientTimeout = 5 * time.Second
 // buildKubeClient returns a typed clientset configured to reach the K3s
 // API server. Resolution order (first hit wins):
 //
-//  1. cfg.KubeconfigPath non-empty: load that file. Must be an absolute
-//     path — clientcmd.BuildConfigFromFlags does NOT expand "~".
+//  1. cfg.KubeconfigPath non-empty: load that file. Prefer an absolute
+//     path — clientcmd.BuildConfigFromFlags does NOT expand "~". Relative
+//     paths work but are resolved against the process CWD.
 //  2. In-cluster (rest.InClusterConfig): works only when the binary
 //     runs inside a Pod that has the default service-account mounts at
 //     /var/run/secrets/kubernetes.io/serviceaccount/. Falls through on
@@ -30,7 +31,8 @@ const kubeClientTimeout = 5 * time.Second
 //  3. Default loading rules: $KUBECONFIG env var, then ~/.kube/config.
 //     client-go expands "~" in this branch.
 //
-// A 5s timeout is applied at the rest.Config layer (see kubeClientTimeout).
+// A 5s timeout is applied at the rest.Config layer when the resolved
+// config doesn't already set one (see kubeClientTimeout).
 func buildKubeClient(cfg Config) (kubernetes.Interface, error) {
 	rc, err := resolveRESTConfig(cfg)
 	if err != nil {

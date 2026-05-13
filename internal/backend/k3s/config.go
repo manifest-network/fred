@@ -24,7 +24,7 @@ type TenantQuotaConfig = shared.TenantQuotaConfig
 // Gateway API mapping has not landed yet.
 //
 // K8s anchor: an Ingress (or the newer Gateway in the Gateway API)
-// is roughly the analogue of Docker labels for Traefik — a
+// is roughly the analog of Docker labels for Traefik — a
 // declarative "route external traffic to this Service" object.
 // ClassName picks which controller (Traefik, nginx, etc.) handles
 // the route.
@@ -49,8 +49,8 @@ func (ic *IngressConfig) Validate() error {
 // substrate-agnostic (totals, SKU mapping/profiles, callbacks,
 // diagnostics, releases, tenant quota, reconcile interval, host
 // address). Docker-private hardening / volume / network-isolation
-// knobs are dropped because they have no K8s analogue in scope for
-// ENG-133. K8s adds one field, KubeconfigPath — the analogue of
+// knobs are dropped because they have no K8s analog in scope for
+// ENG-133. K8s adds one field, KubeconfigPath — the analog of
 // DOCKER_HOST that tells client-go which API server to talk to. The
 // canonical kept / dropped / added list is the design plan
 // (§2 of the ENG-133 architecture doc); the comment here only
@@ -71,13 +71,15 @@ type Config struct {
 	// client-go to talk to the K3s API server. When empty, the resolver
 	// (kubeclient.go, T3) falls back in order: in-cluster config →
 	// $KUBECONFIG env var → ~/.kube/config. K8s anchor: this is the
-	// rough analogue of Docker's DOCKER_HOST — a single configuration
+	// rough analog of Docker's DOCKER_HOST — a single configuration
 	// pointer that tells the client which cluster to address.
 	//
-	// Must be an absolute path. Go's stdlib doesn't expand "~", and
-	// neither does the T3 resolver — callers should either set this
-	// explicitly to (for example) "/etc/rancher/k3s/k3s.yaml" or leave
-	// it empty and rely on the resolution chain above.
+	// Prefer an absolute path. Go's stdlib doesn't expand "~", and
+	// neither does the T3 resolver. Relative paths work (client-go
+	// resolves them against the process's working directory) but are
+	// fragile — callers should either set this explicitly to (for
+	// example) "/etc/rancher/k3s/k3s.yaml" or leave it empty and rely
+	// on the resolution chain above.
 	KubeconfigPath string `yaml:"kubeconfig_path"`
 
 	// TotalCPUCores is the total CPU cores available in the resource pool.

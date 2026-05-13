@@ -70,7 +70,7 @@ type Backend struct {
 	// httpClient is used by callbackSender for outbound callback delivery.
 	httpClient *http.Client
 
-	// stopCtx is canceled on shutdown; stopCancel triggers it. Cancelling
+	// stopCtx is canceled on shutdown; stopCancel triggers it. Canceling
 	// aborts in-flight callback retries (see shared.CallbackSender).
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -101,9 +101,9 @@ type Backend struct {
 // Mirrors docker.New's lifecycle shape (validate config → build pool →
 // build http client → open three bbolt stores → build callback sender)
 // minus every Docker-specific dependency (no docker client, no compose
-// service, no volume manager, no leasesm seams). Callback delivery hooks
-// (OnDelivery / OnStoreError) are intentionally nil here — T4 wires them
-// when it lands metrics.go.
+// service, no volume manager, no leasesm seams). The CallbackSender's
+// OnDelivery and OnStoreError hooks are wired to the fred_k3s_backend_*
+// Prometheus counters defined in metrics.go.
 func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
