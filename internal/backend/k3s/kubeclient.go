@@ -13,9 +13,15 @@ import (
 // kubeClientTimeout is the hardcoded reachability-probe timeout for
 // ENG-133's /health endpoint. Applied at the rest.Config layer because
 // client-go's Discovery().ServerVersion() does not take a context — the
-// rest-layer timeout is the only place to bound the probe. ENG-134+
-// methods that consume ctx-aware client-go APIs will continue to honor
-// per-call contexts; this default doesn't affect them.
+// rest-layer timeout is the only place to bound the probe.
+//
+// IMPORTANT: rest.Config.Timeout is a client-wide HTTP timeout, not a
+// per-request one. Once ENG-134+ wires the clientset into Pod/Service/PVC
+// operations, every request made with this clientset will be capped at
+// 5s regardless of the caller's context deadline. If real provisioner
+// methods need to make longer-running calls (e.g., Watch streams, log
+// streaming), ENG-134+ should either build a separate clientset for
+// those paths or refactor to use per-request transports.
 const kubeClientTimeout = 5 * time.Second
 
 // kubeClientQPS / kubeClientBurst raise client-go's default 5/10
@@ -24,9 +30,14 @@ const kubeClientTimeout = 5 * time.Second
 // provisioner will fan out concurrent Pod/Service/PVC reads and writes
 // per lease, and 5 QPS is too low to avoid silent throttling at that
 // volume. Setting these now is cheap insurance and keeps the limit in
-// one place. Operators can override via the resolved kubeconfig if
-// finer tuning is needed (the if-zero check below preserves a
-// user-set value).
+// one place.
+//
+// Standard kubeconfig YAML has no fields for QPS/Burst (they're not part
+// of the kubeconfig schema), so these values are effectively hardcoded
+// from an operator's perspective. The if-zero check below only preserves
+// a value that Go code earlier in the resolver chain has set on the
+// rest.Config — not a kubeconfig override. Adding config-driven
+// tunability is a documented follow-up.
 const (
 	kubeClientQPS   = 50
 	kubeClientBurst = 100

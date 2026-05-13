@@ -21,6 +21,16 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
+  - id: k3s-backend
+    main: ./cmd/k3s-backend
+    binary: k3s-backend
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
 archives:
   - id: providerd
     ids: [providerd]
@@ -28,6 +38,9 @@ archives:
   - id: docker-backend
     ids: [docker-backend]
     name_template: "docker-backend_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: k3s-backend
+    ids: [k3s-backend]
+    name_template: "k3s-backend_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 dockers:
   - ids: [providerd]

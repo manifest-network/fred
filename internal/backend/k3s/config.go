@@ -114,7 +114,10 @@ type Config struct {
 	CallbackInsecureSkipVerify bool `yaml:"callback_insecure_skip_verify"`
 
 	// CallbackDBPath is the path to the bbolt database for persisting pending callbacks.
-	// Defaults to "callbacks.db".
+	// Defaults to "k3s-callbacks.db" (k3s-prefixed so the file doesn't
+	// collide with docker-backend's "callbacks.db" when both backends run
+	// from the same working directory — bbolt takes an exclusive file lock
+	// and would refuse to open a name already held by the sibling process).
 	CallbackDBPath string `yaml:"callback_db_path"`
 
 	// CallbackMaxAge is the maximum age of a persisted callback entry.
@@ -123,7 +126,8 @@ type Config struct {
 	CallbackMaxAge time.Duration `yaml:"callback_max_age"`
 
 	// DiagnosticsDBPath is the path to the bbolt database for persisting failure diagnostics.
-	// Defaults to "diagnostics.db".
+	// Defaults to "k3s-diagnostics.db" (k3s-prefixed; see CallbackDBPath
+	// for the side-by-side rationale).
 	DiagnosticsDBPath string `yaml:"diagnostics_db_path"`
 
 	// DiagnosticsMaxAge is the maximum age of a persisted diagnostic entry.
@@ -132,7 +136,8 @@ type Config struct {
 	DiagnosticsMaxAge time.Duration `yaml:"diagnostics_max_age"`
 
 	// ReleasesDBPath is the path to the bbolt database for persisting release history.
-	// Defaults to "releases.db".
+	// Defaults to "k3s-releases.db" (k3s-prefixed; see CallbackDBPath for
+	// the side-by-side rationale).
 	ReleasesDBPath string `yaml:"releases_db_path"`
 
 	// ReleasesMaxAge is the maximum age of a persisted release entry.
@@ -167,11 +172,11 @@ func DefaultConfig() Config {
 		TotalCPUCores:     8.0,
 		TotalMemoryMB:     16384,
 		TotalDiskMB:       102400,
-		CallbackDBPath:    "callbacks.db",
+		CallbackDBPath:    "k3s-callbacks.db",
 		CallbackMaxAge:    24 * time.Hour,
-		DiagnosticsDBPath: "diagnostics.db",
+		DiagnosticsDBPath: "k3s-diagnostics.db",
 		DiagnosticsMaxAge: 7 * 24 * time.Hour,
-		ReleasesDBPath:    "releases.db",
+		ReleasesDBPath:    "k3s-releases.db",
 		ReleasesMaxAge:    90 * 24 * time.Hour,
 		ReconcileInterval: 5 * time.Minute,
 		SKUProfiles: map[string]SKUProfile{

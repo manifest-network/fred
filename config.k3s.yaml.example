@@ -134,8 +134,10 @@ callback_secret: ""
 # callback_insecure_skip_verify: false
 
 # Path to bbolt database for persisting pending callbacks.
-# Callbacks are stored before delivery to survive restarts. Default: callbacks.db.
-callback_db_path: "callbacks.db"
+# Callbacks are stored before delivery to survive restarts.
+# Default: k3s-callbacks.db (prefixed so the file doesn't collide with
+# docker-backend's "callbacks.db" when both run from the same directory).
+callback_db_path: "k3s-callbacks.db"
 
 # Maximum age of persisted callback entries. Entries older than this are
 # removed during startup replay. Default: 24h.
@@ -144,13 +146,16 @@ callback_max_age: 24h
 # =============================================================================
 # DIAGNOSTICS
 # =============================================================================
-# Failure diagnostics (error messages and pod/container output) are persisted
-# to a bbolt database so they survive deprovision and backend restarts. The
-# GET /provisions/{lease_uuid} and GET /logs/{lease_uuid} endpoints fall back
-# to this store when the provision is no longer in memory.
+# Failure diagnostics (error messages) are persisted to a bbolt database so
+# they survive deprovision and backend restarts. The GET /provisions/{lease_uuid}
+# endpoint falls back to this store when the provision is no longer in memory.
+# (GET /logs/{lease_uuid} returns 404 in the ENG-133 scaffold; once ENG-134+
+# wires real pod logs, the fallback to persisted diagnostics may extend there.)
 
-# Path to bbolt database for persisting failure diagnostics. Default: diagnostics.db.
-diagnostics_db_path: "diagnostics.db"
+# Path to bbolt database for persisting failure diagnostics.
+# Default: k3s-diagnostics.db (k3s-prefixed to avoid collision with
+# docker-backend's diagnostics.db).
+diagnostics_db_path: "k3s-diagnostics.db"
 
 # Maximum age of persisted diagnostic entries. Default: 7 days (168h).
 diagnostics_max_age: 168h
@@ -162,8 +167,10 @@ diagnostics_max_age: 168h
 # GET /releases/{lease_uuid} endpoint returns this history. Releases are
 # persisted to a bbolt database so they survive backend restarts.
 
-# Path to bbolt database for persisting release history. Default: releases.db.
-releases_db_path: "releases.db"
+# Path to bbolt database for persisting release history.
+# Default: k3s-releases.db (k3s-prefixed to avoid collision with
+# docker-backend's releases.db).
+releases_db_path: "k3s-releases.db"
 
 # Maximum age of persisted release entries. Default: 90 days (2160h).
 releases_max_age: 2160h
