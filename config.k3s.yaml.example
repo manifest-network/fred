@@ -7,8 +7,15 @@
 #   2. Fill in `callback_secret` and `host_address` below.
 #   3. Confirm `kubeconfig_path` points to your kubeconfig. The K3s
 #      installer's default is /etc/rancher/k3s/k3s.yaml.
-#   4. Add at least one `sku_mapping` entry so the chain SKU UUIDs you
-#      care about route to a local profile.
+#   4. Adjust `sku_mapping` so every entry under `sku_profiles` has an
+#      inbound on-chain SKU UUID. Note: Validate() rejects any profile
+#      that has no mapping entry as "unreachable from on-chain SKUs",
+#      so partial customization (e.g. keeping one profile and one
+#      mapping while leaving the others to merge from defaults) will
+#      fail at startup. If you want fewer profiles than the defaults,
+#      either supply ALL profile-and-mapping pairs you want to keep, or
+#      leave the example's four pairs in place and treat the unused
+#      ones as inert.
 
 # Log verbosity. Valid values: debug, info, warn, error. Default: info.
 # log_level: "info"

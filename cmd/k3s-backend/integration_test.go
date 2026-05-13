@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -243,8 +244,20 @@ func startBinary(t *testing.T, binPath, cfgPath string) *exec.Cmd {
 	require.NoError(t, cmd.Start())
 
 	// Pipe binary output into the test's log so failure modes surface.
-	go relayOutput(t, "stdout", stdout)
-	go relayOutput(t, "stderr", stderr)
+	// relayWg tracks both relay goroutines so the cleanup function can join
+	// them before returning. Without this, the goroutines' final
+	// scanner.Err() + t.Logf calls race against the test being marked done
+	// — Go's testing runtime panics on t.Logf after test.done is set.
+	var relayWg sync.WaitGroup
+	relayWg.Add(2)
+	go func() {
+		defer relayWg.Done()
+		relayOutput(t, "stdout", stdout)
+	}()
+	go func() {
+		defer relayWg.Done()
+		relayOutput(t, "stderr", stderr)
+	}()
 
 	t.Cleanup(func() {
 		if cmd.Process == nil {
@@ -260,6 +273,10 @@ func startBinary(t *testing.T, binPath, cfgPath string) *exec.Cmd {
 			_ = cmd.Process.Kill()
 			<-done
 		}
+		// Join relay goroutines AFTER cmd.Wait so the pipes have closed and
+		// scanner.Scan returns false; both goroutines will then exit cleanly
+		// and their final t.Logf calls land before this cleanup returns.
+		relayWg.Wait()
 	})
 	return cmd
 }

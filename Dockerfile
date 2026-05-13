@@ -28,27 +28,6 @@ USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/providerd"]
 
-# ---- docker-backend runtime ----
-# Config must be mounted at runtime. The Docker socket must also be accessible.
-# Persist /data to retain callbacks.db, diagnostics.db, and releases.db:
-#   docker run -v db-data:/data \
-#     -v ./docker-backend.yaml:/data/docker-backend.yaml \
-#     -v /var/run/docker.sock:/var/run/docker.sock \
-#     --group-add <docker-gid> \
-#     fred-docker-backend
-FROM gcr.io/distroless/static-debian12 AS docker-backend
-
-COPY --from=builder /out/docker-backend /docker-backend
-
-# /data holds persistent state (callbacks.db, diagnostics.db, releases.db).
-# Declare as a volume so data survives container restarts.
-COPY --from=builder --chown=65532:65532 /out/data /data
-WORKDIR /data
-VOLUME /data
-USER nonroot:nonroot
-EXPOSE 9001
-ENTRYPOINT ["/docker-backend"]
-
 # ---- k3s-backend runtime ----
 # Config must be mounted at runtime. The kubeconfig must also be readable.
 # Persist /data to retain k3s-callbacks.db, k3s-diagnostics.db, and
@@ -69,3 +48,29 @@ VOLUME /data
 USER nonroot:nonroot
 EXPOSE 9002
 ENTRYPOINT ["/k3s-backend"]
+
+# ---- docker-backend runtime ----
+# This stage is kept LAST so `docker build .` without an explicit --target
+# preserves the pre-k3s default of producing the docker-backend image.
+# Callers that want a specific stage should pass --target providerd,
+# --target docker-backend, or --target k3s-backend explicitly.
+#
+# Config must be mounted at runtime. The Docker socket must also be accessible.
+# Persist /data to retain callbacks.db, diagnostics.db, and releases.db:
+#   docker run -v db-data:/data \
+#     -v ./docker-backend.yaml:/data/docker-backend.yaml \
+#     -v /var/run/docker.sock:/var/run/docker.sock \
+#     --group-add <docker-gid> \
+#     fred-docker-backend
+FROM gcr.io/distroless/static-debian12 AS docker-backend
+
+COPY --from=builder /out/docker-backend /docker-backend
+
+# /data holds persistent state (callbacks.db, diagnostics.db, releases.db).
+# Declare as a volume so data survives container restarts.
+COPY --from=builder --chown=65532:65532 /out/data /data
+WORKDIR /data
+VOLUME /data
+USER nonroot:nonroot
+EXPOSE 9001
+ENTRYPOINT ["/docker-backend"]

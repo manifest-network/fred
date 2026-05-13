@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -174,8 +175,15 @@ func applyEnvOverrides(cfg *k3s.Config) {
 	// gets a single discoverable knob. When cfg.KubeconfigPath is
 	// explicitly set in YAML, that wins — env should not override an
 	// explicit config value.
+	//
+	// Multi-path values (e.g. KUBECONFIG=/path/a:/path/b) are
+	// intentionally NOT copied: clientcmd.BuildConfigFromFlags would
+	// treat the colon-separated string as a literal filename and fail.
+	// Falling through with cfg.KubeconfigPath empty routes resolution
+	// through client-go's default loading rules, which DO handle
+	// multi-path KUBECONFIG by merging the files in order.
 	if cfg.KubeconfigPath == "" {
-		if kc := os.Getenv("KUBECONFIG"); kc != "" {
+		if kc := os.Getenv("KUBECONFIG"); kc != "" && !strings.ContainsRune(kc, os.PathListSeparator) {
 			cfg.KubeconfigPath = kc
 		}
 	}
