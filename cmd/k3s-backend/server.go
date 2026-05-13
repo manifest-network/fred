@@ -533,12 +533,23 @@ func validateCallbackURL(rawURL string) error {
 		return fmt.Errorf("host is required")
 	}
 
-	// Extract hostname (without port) and normalize FQDN notation. The
-	// trailing-dot trim mirrors internal/config.validateExternalURL — without
+	// Extract hostname (without port) and normalize for SSRF parsing.
+	//
+	// Trailing-dot trim mirrors internal/config.validateExternalURL — without
 	// it, "http://169.254.169.254./..." would make net.ParseIP return nil and
 	// skip the link-local block, despite resolving to the same metadata IP.
+	//
+	// Zone-suffix split handles RFC 6874 zone-scoped IPv6 literals like
+	// "http://[fe80::1%25eth0]/...". url.Hostname() returns "fe80::1%eth0"
+	// (URL-decodes %25 to %); net.ParseIP rejects zone-suffixed strings;
+	// Go's net.Dialer DOES dial them on Linux/BSD. Stripping the zone
+	// suffix before ParseIP makes the IP-class check see "fe80::1" and
+	// correctly trip IsLinkLocalUnicast.
 	hostname := parsed.Hostname()
 	hostname = strings.TrimSuffix(hostname, ".")
+	if i := strings.IndexByte(hostname, '%'); i >= 0 {
+		hostname = hostname[:i]
+	}
 
 	// Check if hostname is an IP address
 	ip := net.ParseIP(hostname)

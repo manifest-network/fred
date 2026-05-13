@@ -501,18 +501,45 @@ func TestStubMethods_ReturnErrNotProvisioned(t *testing.T) {
 		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 	})
 
-	t.Run("ReconcileCustomDomain", func(t *testing.T) {
-		err := b.ReconcileCustomDomain(ctx, "lease-1", []backend.LeaseItem{
-			{SKU: "k3s-small", Quantity: 1, ServiceName: "web", CustomDomain: "foo.example.com"},
-		})
-		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
-	})
+	// ReconcileCustomDomain is intentionally NOT in this group: it returns
+	// nil (no-op) rather than ErrNotProvisioned to match docker-backend's
+	// contract for unhandled / ingress-disabled leases. See
+	// TestReconcileCustomDomain_NoOpForUnhandledLease for the positive
+	// assertion.
 
 	t.Run("GetReleases", func(t *testing.T) {
 		releases, err := b.GetReleases(ctx, "lease-1")
 		assert.Nil(t, releases)
 		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 	})
+}
+
+func TestReconcileCustomDomain_NoOpForUnhandledLease(t *testing.T) {
+	// Per the backendService contract, ReconcileCustomDomain must be a
+	// no-op (return nil) for leases the backend doesn't manage and for
+	// scenarios where ingress is disabled. Docker-backend follows this
+	// (internal/backend/docker/reconcile_custom_domain.go early-returns
+	// nil for missing / non-ready provisions and ingress.Enabled=false).
+	//
+	// In the ENG-133 scaffold ingress is rejected at config time so EVERY
+	// call should return nil. Verifies the contract so Fred's reconciler
+	// doesn't see 404 on every tick per active lease.
+	fred, callbacks := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+	ctx := context.Background()
+	items := []backend.LeaseItem{
+		{SKU: "k3s-small", Quantity: 1, ServiceName: "web", CustomDomain: "foo.example.com"},
+	}
+
+	// Lease not present in the map.
+	err := b.ReconcileCustomDomain(ctx, "ghost-lease", items)
+	assert.NoError(t, err, "ReconcileCustomDomain must no-op (nil) for unhandled leases")
+
+	// Lease present (provisioned, then flipped to failed by the stub).
+	require.NoError(t, b.Provision(ctx, newProvisionRequest("lease-rcd", fred.URL)))
+	_ = awaitCallback(t, callbacks)
+	err = b.ReconcileCustomDomain(ctx, "lease-rcd", items)
+	assert.NoError(t, err, "ReconcileCustomDomain must no-op (nil) even for present leases while ingress is disabled")
 }
 
 // --- Stats ---------------------------------------------------------------

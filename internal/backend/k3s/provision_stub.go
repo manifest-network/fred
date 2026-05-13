@@ -287,14 +287,27 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return backend.ErrNotProvisioned
 }
 
-// ReconcileCustomDomain is a stub for ENG-133. Returns
-// ErrNotProvisioned. ENG-134+ wires real custom-domain reconciliation
-// via Ingress / Gateway API objects.
+// ReconcileCustomDomain is a no-op in the ENG-133 scaffold and returns
+// nil. The backendService contract documents this method as idempotent /
+// no-op for leases the backend doesn't manage (or when ingress is
+// disabled), and docker-backend follows the same pattern
+// (internal/backend/docker/reconcile_custom_domain.go early-returns nil
+// for missing / non-ready provisions and when ingress.Enabled=false).
+//
+// Returning ErrNotProvisioned here would 404 every reconciler tick on
+// every active lease, polluting Fred's reconciler error metrics and
+// log output for a path that has nothing to do — k3s-backend's Ingress
+// config rejects Enabled=true (config.go:IngressConfig.Validate), so
+// there are no Ingress / Gateway routes to reconcile.
+//
+// ENG-134+ wires real custom-domain reconciliation via Ingress /
+// Gateway API objects; the no-op default carries over for the
+// missing/non-ready/disabled cases.
 func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
 	_ = ctx
 	_ = leaseUUID
 	_ = items
-	return backend.ErrNotProvisioned
+	return nil
 }
 
 // GetReleases is a stub for ENG-133. Returns ErrNotProvisioned. The
