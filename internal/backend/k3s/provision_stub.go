@@ -24,7 +24,16 @@ const stubProvisionerErrMsg = "not implemented"
 // ENG-134+ replaces runStubProvisioner with the real Pod/Deployment
 // creation flow.
 func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
-	_ = ctx
+	// Short-circuit when the caller has already abandoned the request.
+	// Mirrors docker-backend's ctx-aware pattern (internal/backend/docker/
+	// lease_actor_routing.go uses the same `ctx.Err() != nil → return err`
+	// guard at the top of routing entry points). Without this check, a
+	// canceled/timeout HTTP request can still produce a recorded provision
+	// + spawned goroutine + signed callback after the caller has hung up.
+	if err := ctx.Err(); err != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return err
+	}
 
 	if req.LeaseUUID == "" {
 		provisionsTotal.WithLabelValues("rejected").Inc()
@@ -159,10 +168,31 @@ func (b *Backend) runStubProvisioner(p *provision) {
 // deprovision so GetProvision's diagnostics-store fallback can surface
 // failure diagnostics for tenants and operators after the lease ends.
 // cfg.DiagnosticsMaxAge handles eventual cleanup.
+//
+// callbackStore.Remove IS called: shared.CallbackSender persists every
+// callback to bbolt BEFORE delivery and only Removes on successful
+// delivery (see shared/callback_sender.go). Without this cleanup, a
+// failed-delivery → Deprovision → restart sequence would let
+// ReplayPendingCallbacks fire a stale status=failed for a torn-down
+// lease — Fred would treat it as a real failure and trip its
+// circuit-breaker / fail-count metrics. The pattern mirrors the stale-
+// callback suppression in runStubProvisioner.
+//
+// Remove is a bbolt Delete (no-op on missing key); any returned error
+// is a real I/O failure (disk full, db closed) — log it and continue
+// rather than failing the Deprovision call, since the in-memory record
+// is already gone and the lease state from the caller's perspective is
+// "deprovisioned".
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	_ = ctx
 	b.provisionsMu.Lock()
 	delete(b.provisions, leaseUUID)
+	if err := b.callbackStore.Remove(leaseUUID); err != nil {
+		b.logger.Error("failed to remove pending callback on deprovision",
+			"lease_uuid", leaseUUID,
+			"error", err,
+		)
+	}
 	b.provisionsMu.Unlock()
 	return nil
 }

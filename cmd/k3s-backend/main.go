@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -171,20 +172,32 @@ func applyEnvOverrides(cfg *k3s.Config) {
 	// KUBECONFIG is the standard K8s convention for pointing at a
 	// kubeconfig file (kubectl reads it; client-go's default loader
 	// honors it). When cfg.KubeconfigPath is empty in YAML and
-	// KUBECONFIG is set in the env, copy it across so the operator
-	// gets a single discoverable knob. When cfg.KubeconfigPath is
-	// explicitly set in YAML, that wins — env should not override an
-	// explicit config value.
+	// KUBECONFIG is set in the env, propagate it so the operator gets
+	// a single discoverable knob. When cfg.KubeconfigPath is explicitly
+	// set in YAML, that wins — env should not override an explicit
+	// config value.
 	//
-	// Multi-path values (e.g. KUBECONFIG=/path/a:/path/b) are
-	// intentionally NOT copied: clientcmd.BuildConfigFromFlags would
-	// treat the colon-separated string as a literal filename and fail.
-	// Falling through with cfg.KubeconfigPath empty routes resolution
-	// through client-go's default loading rules, which DO handle
-	// multi-path KUBECONFIG by merging the files in order.
+	// Single-path KUBECONFIG (no os.PathListSeparator) flows into
+	// cfg.KubeconfigPath — the resolver's first-tier branch loads a
+	// single explicit file.
+	//
+	// Multi-path KUBECONFIG (e.g. KUBECONFIG=/path/a:/path/b on Linux)
+	// is split via filepath.SplitList and placed in
+	// cfg.KubeconfigPathList. resolveRESTConfig hands the list to
+	// client-go's clientcmd.ClientConfigLoadingRules (Precedence:)
+	// for the canonical merge semantics — context/cluster/user entries
+	// in earlier paths shadow those in later paths. Without this
+	// branch, an explicit multi-path KUBECONFIG would be silently
+	// ignored whenever the binary runs in-cluster (the in-cluster
+	// branch would win) and would only flow through to the default
+	// loader on hosts where in-cluster lookup fails.
 	if cfg.KubeconfigPath == "" {
-		if kc := os.Getenv("KUBECONFIG"); kc != "" && !strings.ContainsRune(kc, os.PathListSeparator) {
-			cfg.KubeconfigPath = kc
+		if kc := os.Getenv("KUBECONFIG"); kc != "" {
+			if strings.ContainsRune(kc, os.PathListSeparator) {
+				cfg.KubeconfigPathList = filepath.SplitList(kc)
+			} else {
+				cfg.KubeconfigPath = kc
+			}
 		}
 	}
 }

@@ -323,6 +323,41 @@ func TestDeprovision_RemovesFromMap_AfterProvision(t *testing.T) {
 	assert.Empty(t, list)
 }
 
+// TestDeprovision_RemovesPendingCallback pins the regression guard for
+// Copilot id 3237313147. shared.CallbackSender persists every callback
+// to bbolt BEFORE delivery and Removes only on success. Pre-fix,
+// Deprovision deleted the in-memory record but left the bbolt entry,
+// so a failed-delivery → Deprovision → restart sequence would let
+// ReplayPendingCallbacks fire a stale status=failed for a torn-down
+// lease. Asserts that Deprovision now clears the pending entry too.
+func TestDeprovision_RemovesPendingCallback(t *testing.T) {
+	fred, _ := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+
+	// Seed the callback store directly to simulate "callback persisted,
+	// delivery hasn't succeeded yet". Bypasses Provision so the goroutine-
+	// timing path stays out of the test.
+	entry := shared.CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: fred.URL + "/callbacks/provision",
+		Status:      backend.CallbackStatusFailed,
+		Backend:     b.cfg.Name,
+		Error:       "not implemented",
+		CreatedAt:   time.Now(),
+	}
+	require.NoError(t, b.callbackStore.Store(entry))
+
+	pending, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "precondition: callback store has the seeded entry")
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+
+	pending, err = b.callbackStore.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending, "Deprovision must drop the pending callback so ReplayPendingCallbacks won't fire a stale status=failed")
+}
+
 // --- GetProvision contract (architect's required test set) ---------------
 
 func TestGetProvision_FromMap_AfterStubFailure(t *testing.T) {

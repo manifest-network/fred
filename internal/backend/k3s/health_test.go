@@ -105,8 +105,10 @@ func TestHealth_DiscoveryServerError(t *testing.T) {
 	server := fakeAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
 		// Build succeeds (the kubeconfig is structurally valid); only the
 		// Discovery.ServerVersion() HTTP request fails. This exercises
-		// health.go's terminal "k3s API unreachable: %w" wrap at line 54
-		// (the post-build path), distinct from the build-time wrap at line 33.
+		// health.go's terminal "k3s API unreachable: %w" wrap around the
+		// cs.Discovery().ServerVersion() call (the post-build path),
+		// distinct from the build-time wrap inside the kubeBuildOnce.Do
+		// block that TestHealth_KubeconfigNotFound exercises.
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 	})
 

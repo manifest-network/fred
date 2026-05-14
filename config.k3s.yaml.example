@@ -10,12 +10,8 @@
 #   4. Adjust `sku_mapping` so every entry under `sku_profiles` has an
 #      inbound on-chain SKU UUID. Note: Validate() rejects any profile
 #      that has no mapping entry as "unreachable from on-chain SKUs",
-#      so partial customization (e.g. keeping one profile and one
-#      mapping while leaving the others to merge from defaults) will
-#      fail at startup. If you want fewer profiles than the defaults,
-#      either supply ALL profile-and-mapping pairs you want to keep, or
-#      leave the example's four pairs in place and treat the unused
-#      ones as inert.
+#      so partial customization will fail at startup. See the YAML-merge
+#      caveat below the sku_profiles block before editing.
 
 # Log verbosity. Valid values: debug, info, warn, error. Default: info.
 # log_level: "info"
@@ -84,6 +80,28 @@ sku_mapping:
 
 # SKU profiles define resource limits for each tier.
 # Profile names are referenced by sku_mapping above.
+#
+# YAML-MERGE CAVEAT — read before customizing this section:
+#   The backend's loadConfig (cmd/k3s-backend/main.go) seeds the Config
+#   with DefaultConfig() and THEN runs yaml.Unmarshal over it. yaml.v3
+#   MERGES map keys rather than replacing the map wholesale — so any
+#   `sku_profiles:` block you write here is ADDED to the four default
+#   profiles (k3s-micro / k3s-small / k3s-medium / k3s-large), not
+#   substituted for them. Concretely:
+#     - Defining one custom profile `my-tier` here leaves the four
+#       defaults in place AND adds `my-tier`. Validate() then rejects
+#       startup with "unreachable from on-chain SKUs" for any default
+#       profile that has no `sku_mapping` entry.
+#     - To replace the defaults, you must either (a) ship a
+#       `sku_mapping` entry for every default profile you want to keep,
+#       or (b) override each default profile name explicitly under
+#       `sku_profiles:` so the merged result still satisfies
+#       reachability. There is no YAML construct in yaml.v3 to clear a
+#       seeded map from the outside; the fix has to live in the
+#       application code, which ENG-134+ may revisit.
+#   In practice the safest customization path is: leave the four default
+#   profiles AND their four `sku_mapping` entries above as-is; ADD your
+#   own profile/mapping pairs alongside.
 sku_profiles:
   k3s-micro:
     cpu_cores: 0.25

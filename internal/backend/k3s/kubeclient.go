@@ -49,11 +49,18 @@ const (
 //  1. cfg.KubeconfigPath non-empty: load that file. Prefer an absolute
 //     path — clientcmd.BuildConfigFromFlags does NOT expand "~". Relative
 //     paths work but are resolved against the process CWD.
-//  2. In-cluster (rest.InClusterConfig): works only when the binary
+//  2. cfg.KubeconfigPathList non-empty: an explicit multi-path
+//     KUBECONFIG propagated by applyEnvOverrides (cmd/k3s-backend/main.go).
+//     Built via clientcmd.ClientConfigLoadingRules{Precedence: …} so
+//     client-go applies its canonical merge order (entries in earlier
+//     paths shadow later ones). Sits above in-cluster so an explicit
+//     multi-path env value isn't silently overridden by Pod
+//     service-account mounts.
+//  3. In-cluster (rest.InClusterConfig): works only when the binary
 //     runs inside a Pod that has the default service-account mounts at
 //     /var/run/secrets/kubernetes.io/serviceaccount/. Falls through on
 //     rest.ErrNotInCluster (the typical host-installed K3s case).
-//  3. Default loading rules: $KUBECONFIG env var, then ~/.kube/config.
+//  4. Default loading rules: $KUBECONFIG env var, then ~/.kube/config.
 //     client-go expands "~" in this branch.
 //
 // A 5s timeout is applied at the rest.Config layer when the resolved
@@ -82,6 +89,26 @@ func resolveRESTConfig(cfg Config) (*rest.Config, error) {
 		rc, err := clientcmd.BuildConfigFromFlags("", cfg.KubeconfigPath)
 		if err != nil {
 			return nil, fmt.Errorf("loading kubeconfig %q: %w", cfg.KubeconfigPath, err)
+		}
+		return rc, nil
+	}
+
+	// Tier 2: explicit multi-path KUBECONFIG propagated by
+	// applyEnvOverrides. Sits ABOVE in-cluster so an operator who set
+	// KUBECONFIG=/path/a:/path/b deliberately isn't silently overridden
+	// by Pod service-account mounts. Uses clientcmd's own loading rules
+	// so the merge semantics match every other client-go consumer.
+	if len(cfg.KubeconfigPathList) > 0 {
+		loadingRules := &clientcmd.ClientConfigLoadingRules{
+			Precedence: cfg.KubeconfigPathList,
+		}
+		loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			loadingRules,
+			&clientcmd.ConfigOverrides{},
+		)
+		rc, err := loader.ClientConfig()
+		if err != nil {
+			return nil, fmt.Errorf("loading multi-path kubeconfig %v: %w", cfg.KubeconfigPathList, err)
 		}
 		return rc, nil
 	}

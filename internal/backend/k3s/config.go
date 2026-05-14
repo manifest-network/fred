@@ -69,9 +69,9 @@ type Config struct {
 
 	// KubeconfigPath is the explicit path to a kubeconfig file used by
 	// client-go to talk to the K3s API server. When empty, the resolver
-	// (kubeclient.go, T3) falls back in order: in-cluster config →
-	// $KUBECONFIG env var → ~/.kube/config. K8s anchor: this is the
-	// rough analog of Docker's DOCKER_HOST — a single configuration
+	// (kubeclient.go, T3) falls back in order: KubeconfigPathList → in-cluster
+	// config → ~/.kube/config (via the default loader). K8s anchor: this is
+	// the rough analog of Docker's DOCKER_HOST — a single configuration
 	// pointer that tells the client which cluster to address.
 	//
 	// Prefer an absolute path. Go's stdlib doesn't expand "~", and
@@ -81,6 +81,22 @@ type Config struct {
 	// example) "/etc/rancher/k3s/k3s.yaml" or leave it empty and rely
 	// on the resolution chain above.
 	KubeconfigPath string `yaml:"kubeconfig_path"`
+
+	// KubeconfigPathList is the merged-precedence list of kubeconfig file
+	// paths used when KUBECONFIG is set to a multi-path value
+	// (e.g. KUBECONFIG=/path/a:/path/b on Linux). It is NOT a YAML field:
+	// applyEnvOverrides in cmd/k3s-backend/main.go populates it from the
+	// env var when it sees os.PathListSeparator, and resolveRESTConfig
+	// hands the list to client-go's clientcmd.ClientConfigLoadingRules
+	// (Precedence:) for the canonical merge semantics.
+	//
+	// Resolution precedence: KubeconfigPath (single explicit path) wins
+	// when set; otherwise a non-empty KubeconfigPathList wins over
+	// in-cluster config (so an operator explicitly setting a multi-path
+	// KUBECONFIG isn't silently overridden when the binary happens to
+	// run inside a Pod). When both are empty the resolver falls through
+	// to in-cluster and then the default loader (~/.kube/config).
+	KubeconfigPathList []string `yaml:"-"`
 
 	// TotalCPUCores is the total CPU cores available in the resource pool.
 	TotalCPUCores float64 `yaml:"total_cpu_cores"`
