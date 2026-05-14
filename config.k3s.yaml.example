@@ -34,9 +34,19 @@ listen_addr: ":9002"
 # value to point at the absolute path of that copy.
 #
 # When this field is empty, the backend resolves the client config in
-# this order: in-cluster config (when running inside a Pod) → $KUBECONFIG
-# env var → ~/.kube/config (the last is resolved by client-go itself,
-# not by this YAML).
+# this order:
+#   1. An explicit kubeconfig populated from the `$KUBECONFIG` environment
+#      variable (applyEnvOverrides copies a single-path value into this
+#      field, and splits a multi-path value — e.g. /path/a:/path/b — into
+#      a precedence list that client-go merges with its standard
+#      semantics). An explicit value set here in YAML always wins over
+#      `$KUBECONFIG`.
+#   2. In-cluster config (when running inside a Pod with the default
+#      service-account mounts).
+#   3. The client-go default loader (`~/.kube/config`).
+# Step 1 sits ABOVE in-cluster so an operator who deliberately points
+# `$KUBECONFIG` at an external cluster isn't silently overridden by the
+# Pod's in-cluster service-account when the binary runs inside K8s.
 
 kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
 

@@ -183,6 +183,48 @@ func (b *Backend) runStubProvisioner(p *provision) {
 // rather than failing the Deprovision call, since the in-memory record
 // is already gone and the lease state from the caller's perspective is
 // "deprovisioned".
+//
+// # Systemic note on post-unlock races
+//
+// The store writes that runStubProvisioner performs AFTER releasing
+// provisionsMu — diagnosticsStore.Store (the failure-diagnostic
+// persist) and callbackSender.SendCallback (the signed status=failed
+// delivery) — both run outside the lock. bbolt has its own internal
+// locking, but it lives entirely outside provisionsMu's scope, so any
+// of those post-unlock store touches can race against a concurrent
+// Deprovision call that has already torn down the in-memory entry.
+// The callbackStore.Remove added above to Deprovision has the
+// symmetric shape: it runs inside provisionsMu but cannot prevent a
+// concurrent SendCallback that the prior worker has already started
+// (the worker captured callbackURL/leaseUUID into locals before
+// unlock; the Store-before-Send sequence in shared.CallbackSender
+// can therefore re-persist an entry that Deprovision is racing to
+// remove).
+//
+// The ENG-133 scaffold tolerates this because runStubProvisioner is
+// synchronous and trivial — the lock-protected pointer-equality check
+// at the top of runStubProvisioner (the `current != p` guard) covers
+// the WIDE race (worker not yet scheduled vs Provision/Deprovision).
+// What remains is a sub-millisecond post-unlock window with no real
+// I/O between the unlock and the external store writes; in
+// production this manifests as at most a stale diagnostic entry or a
+// single replayed callback after a tightly-timed Provision→
+// Deprovision sequence. cfg.DiagnosticsMaxAge / cfg.CallbackMaxAge
+// eventually clean up either way.
+//
+// The structural fix lives in ENG-189 (k3s-backend: per-lease
+// cancellable context for provisioner lifecycle). When ENG-134+
+// wires the real K8s provisioner — where every post-unlock step
+// performs real I/O on the millisecond-to-second timescale — the
+// worker will run under a per-lease context that Deprovision
+// cancels before returning, mirroring docker-backend's leasesm.OnExit
+// pattern (commit cc62f3b / PR #79). That converts the race window
+// from "implicit and tolerated" to "explicitly closed by ctx
+// cancellation" and lets every post-unlock store touch check
+// ctx.Err() before acting. Until then, additional per-call
+// re-checks here would be whack-a-mole — every new bbolt touch
+// would need its own guard — so we document the shape and defer the
+// fix to ENG-189.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	_ = ctx
 	b.provisionsMu.Lock()
