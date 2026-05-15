@@ -89,8 +89,8 @@ func (diagGatheredMsg) onPanic(error)           {} // no caller to unblock
 
 // ProvisionRequestedMsg asks the actor to drive a provision flow. Carries
 // the Cancel func (stored on the actor so Provisioning.OnExit can preempt)
-// and a Work closure containing everything doProvision / doProvisionStack
-// needs — the actor doesn't need to know the arg shapes. After firing the SM
+// and a Work closure containing everything doProvision needs — the actor
+// doesn't need to know the arg shapes. After firing the SM
 // transition, the actor sends the Fire result on Ack and spawns a worker
 // (tracked by workers) to run Work. Backend.Provision blocks on Ack so it
 // knows whether the SM accepted the transition before returning. Exported
@@ -591,8 +591,8 @@ func (a *LeaseActor) handleProvisionRequested(msg ProvisionRequestedMsg) {
 	a.spawnProvisionWorker(msg.Work)
 }
 
-// spawnProvisionWorker runs doProvision (or doProvisionStack, supplied as
-// the work closure), pre-publishes container IDs on success so a preempting
+// spawnProvisionWorker runs doProvision (supplied as the work closure),
+// pre-publishes container IDs on success so a preempting
 // Deprovision sees them under lock, and sends the terminal SM event via
 // sendTerminal. Tracked by workers so the actor waits for this worker
 // before exit. On failure, the worker captures container logs BEFORE

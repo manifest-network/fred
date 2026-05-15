@@ -339,7 +339,7 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	}
 
 	// 3. Build the Compose project. SKU profile lookup + items list mirror
-	// the live provision flow (provision.go:doProvisionStack); the only
+	// the live provision flow (provision.go:doProvision); the only
 	// migration-specific input is the VolBinds map seeded from the
 	// just-renamed directories.
 	profile, err := b.cfg.GetSKUProfile(m.SKU)
@@ -364,7 +364,7 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 			for _, r := range inst.VolRenames {
 				// Match the stack-path convention: subdir per target under hostRoot.
 				// The legacy on-disk layout already follows this convention (see
-				// provision.go's setupVolumeBinds / buildStatefulVolumeBinds), so
+				// provision.go's setupVolBinds / buildStatefulVolumeBinds), so
 				// after the parent rename the data sits at exactly
 				// `<hostRoot>/sanitize(target)`.
 				sanitized := sanitizeVolumePath(r.Target)

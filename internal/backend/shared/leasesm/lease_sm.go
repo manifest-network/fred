@@ -710,11 +710,11 @@ type diagResult struct {
 	diag        string
 }
 
-// ProvisionSuccessResult carries doProvision / doProvisionStack output
-// into Ready.OnEntryFrom(evProvisionCompleted) via Fire args. Manifest
-// and StackManifest are mutually exclusive — single-manifest provisions
-// populate Manifest; stacks populate StackManifest + ServiceContainers.
-// Exported because the substrate's provision worker closure constructs
+// ProvisionSuccessResult carries doProvision output into
+// Ready.OnEntryFrom(evProvisionCompleted) via Fire args. Every provision
+// is stack-shaped post-Task-15; StackManifest + ServiceContainers are
+// always populated. Exported because the substrate's provision worker
+// closure constructs
 // the value and returns it via the ProvisionRequestedMsg.Work signature.
 type ProvisionSuccessResult struct {
 	ContainerIDs      []string
