@@ -373,7 +373,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	}
 
 	// Ensure volumes exist for all services/instances.
-	volBinds, _, volErr := b.setupStackVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
+	volBinds, _, volErr := b.setupVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
 	if volErr != nil {
 		err = volErr
 		callbackErr = op.Operation + " failed"
@@ -476,7 +476,7 @@ func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
 	}
 
 	// Re-use existing volumes (already created during original provision).
-	volBinds, _, volErr := b.setupStackVolBinds(rollbackCtx, op.LeaseUUID, op.Items, op.Profiles, prevImageSetups, prevStack.Services, op.Logger)
+	volBinds, _, volErr := b.setupVolBinds(rollbackCtx, op.LeaseUUID, op.Items, op.Profiles, prevImageSetups, prevStack.Services, op.Logger)
 	if volErr != nil {
 		op.Logger.Error("rollback: volume setup failed", "error", volErr)
 		return false
@@ -718,12 +718,13 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	// Create and start new containers.
 	newContainerIDs = make([]string, 0, op.Quantity)
 	for i := range op.Quantity {
-		volumeBinds, volErr := b.setupVolumeBinds(ctx, op.LeaseUUID, i, op.Profile.DiskMB, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
-		if volErr != nil {
-			err = volErr
-			callbackErr = op.Operation + " failed"
-			return
-		}
+		// Volume bind setup elided: doReplaceContainers is the legacy
+		// single-service replace helper, dead since Tasks 5/6 collapsed
+		// the Restart/Update entry points onto doReplaceStackContainers.
+		// The function body persists only until Task 14 deletes it. Task 11
+		// removed setupVolumeBinds; nil-ing volumeBinds keeps this code
+		// path compile-clean without re-shimming the now-stack-only helper.
+		var volumeBinds map[string]string
 
 		var writablePathBinds map[string]string
 		if len(imgSetup.WritablePaths) > 0 {

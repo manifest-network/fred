@@ -404,40 +404,6 @@ func (b *Backend) ensureNetworkConfig(ctx context.Context, tenant string) (*netw
 	return buildNetworkConfig(networkID), nil
 }
 
-// setupVolumeBinds creates volume bind mounts for a single container instance.
-// Returns nil when no volumes are needed (diskMB <= 0 or no image volumes).
-// Volumes are created idempotently — existing volumes are reused.
-func (b *Backend) setupVolumeBinds(ctx context.Context, leaseUUID string, instanceIndex int, diskMB int64, imageVolumes []string, volumeUID, volumeGID int) (map[string]string, error) {
-	if diskMB <= 0 || len(imageVolumes) == 0 {
-		return nil, nil
-	}
-
-	volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, instanceIndex)
-	hostPath, _, err := b.volumes.Create(ctx, volumeID, diskMB)
-	if err != nil {
-		return nil, fmt.Errorf("volume access failed (instance %d): %w", instanceIndex, err)
-	}
-
-	binds := make(map[string]string, len(imageVolumes))
-	for _, volPath := range imageVolumes {
-		sanitized := sanitizeVolumePath(volPath)
-		if sanitized == "" {
-			continue
-		}
-		subdir := filepath.Join(hostPath, sanitized)
-		if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
-			return nil, fmt.Errorf("volume subdir creation failed (instance %d): %w", instanceIndex, mkErr)
-		}
-		if volumeUID != 0 || volumeGID != 0 {
-			if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
-				return nil, fmt.Errorf("volume subdir chown failed (instance %d): %w", instanceIndex, chownErr)
-			}
-		}
-		binds[subdir] = volPath
-	}
-	return binds, nil
-}
-
 // buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
 // under hostPath and returns bind mount mappings. Returns an error if any
 // VOLUME path cannot be sanitized (unsupported path format).
@@ -500,10 +466,10 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 	return binds
 }
 
-// setupStackVolBinds creates volume bind mounts for all services/instances of a stack.
+// setupVolBinds creates volume bind mounts for all services/instances of a stack.
 // It returns the volume binds map, a list of newly created volume IDs, and any fatal error.
 // Non-fatal failures (writable-path-only volume creation) are logged as warnings.
-func (b *Backend) setupStackVolBinds(
+func (b *Backend) setupVolBinds(
 	ctx context.Context,
 	leaseUUID string,
 	items []backend.LeaseItem,
@@ -1003,7 +969,7 @@ func (b *Backend) doProvisionStack(ctx context.Context, req backend.ProvisionReq
 	b.provisionsMu.RUnlock()
 
 	var volBinds map[string]map[int]serviceVolBinds
-	volBinds, createdVolumeIDs, err = b.setupStackVolBinds(ctx, req.LeaseUUID, req.Items, profiles, imageSetups, stack.Services, logger)
+	volBinds, createdVolumeIDs, err = b.setupVolBinds(ctx, req.LeaseUUID, req.Items, profiles, imageSetups, stack.Services, logger)
 	if err != nil {
 		callbackErr = "volume creation failed"
 		return
