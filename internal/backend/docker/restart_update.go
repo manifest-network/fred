@@ -718,13 +718,12 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	// Create and start new containers.
 	newContainerIDs = make([]string, 0, op.Quantity)
 	for i := range op.Quantity {
-		// Volume bind setup elided: doReplaceContainers is the legacy
-		// single-service replace helper, dead since Tasks 5/6 collapsed
-		// the Restart/Update entry points onto doReplaceStackContainers.
-		// The function body persists only until Task 14 deletes it. Task 11
-		// removed setupVolumeBinds; nil-ing volumeBinds keeps this code
-		// path compile-clean without re-shimming the now-stack-only helper.
-		var volumeBinds map[string]string
+		volumeBinds, volErr := b.setupVolumeBinds(ctx, op.LeaseUUID, i, op.Profile.DiskMB, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+		if volErr != nil {
+			err = volErr
+			callbackErr = op.Operation + " failed"
+			return
+		}
 
 		var writablePathBinds map[string]string
 		if len(imgSetup.WritablePaths) > 0 {

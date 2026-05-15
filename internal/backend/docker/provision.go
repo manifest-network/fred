@@ -404,6 +404,46 @@ func (b *Backend) ensureNetworkConfig(ctx context.Context, tenant string) (*netw
 	return buildNetworkConfig(networkID), nil
 }
 
+// setupVolumeBinds creates volume bind mounts for a single container instance.
+// Returns nil when no volumes are needed (diskMB <= 0 or no image volumes).
+// Volumes are created idempotently — existing volumes are reused.
+//
+// Deprecated: dead code post-Tasks-5/6 — the only caller is the legacy
+// doReplaceContainers (restart_update.go), itself unreachable since the
+// Restart/Update entry points dispatch only to the stack helpers. Retained
+// in tree so the legacy function bodies still compile. Task 14 deletes
+// this helper alongside doRestart / doUpdate / doReplaceContainers.
+func (b *Backend) setupVolumeBinds(ctx context.Context, leaseUUID string, instanceIndex int, diskMB int64, imageVolumes []string, volumeUID, volumeGID int) (map[string]string, error) {
+	if diskMB <= 0 || len(imageVolumes) == 0 {
+		return nil, nil
+	}
+
+	volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, instanceIndex)
+	hostPath, _, err := b.volumes.Create(ctx, volumeID, diskMB)
+	if err != nil {
+		return nil, fmt.Errorf("volume access failed (instance %d): %w", instanceIndex, err)
+	}
+
+	binds := make(map[string]string, len(imageVolumes))
+	for _, volPath := range imageVolumes {
+		sanitized := sanitizeVolumePath(volPath)
+		if sanitized == "" {
+			continue
+		}
+		subdir := filepath.Join(hostPath, sanitized)
+		if mkErr := os.MkdirAll(subdir, 0o700); mkErr != nil {
+			return nil, fmt.Errorf("volume subdir creation failed (instance %d): %w", instanceIndex, mkErr)
+		}
+		if volumeUID != 0 || volumeGID != 0 {
+			if chownErr := os.Chown(subdir, volumeUID, volumeGID); chownErr != nil {
+				return nil, fmt.Errorf("volume subdir chown failed (instance %d): %w", instanceIndex, chownErr)
+			}
+		}
+		binds[subdir] = volPath
+	}
+	return binds, nil
+}
+
 // buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
 // under hostPath and returns bind mount mappings. Returns an error if any
 // VOLUME path cannot be sanitized (unsupported path format).
