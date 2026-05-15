@@ -42,9 +42,15 @@
 // # Method and URI conventions
 //
 // Method is case-sensitive (RFC 9110 §9.1) — callers pass it as-is, and no
-// normalization is performed. Sender and verifier must agree on case; in
-// practice both sides obtain the method from the same Go stdlib, which
-// uses uppercase canonical forms ("GET", "POST", ...).
+// normalization is performed. Sender and verifier must agree on case;
+// Go's net/http does NOT canonicalize method case (http.NewRequest("post",
+// ...) preserves "post"; server parsing preserves whatever the client put
+// on the wire). Agreement in this codebase comes from convention: every
+// call site uses the http.MethodGet / http.MethodPost / ... named
+// constants, which are uppercase. A caller that passes a literal "post"
+// will produce a signature that does not verify against a verifier seeing
+// "POST" — that is the intended behavior, since silent normalization would
+// mask method-confusion bugs.
 //
 // URI is the request-target: path plus "?<raw-query>" if a query string is
 // present. On the verifier side, use r.URL.RequestURI(). On the sender
