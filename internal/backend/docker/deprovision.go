@@ -64,36 +64,22 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	if wasReady {
 		activeProvisions.Dec()
 	}
-	isStack := prov.IsStack()
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
 	items := append([]backend.LeaseItem(nil), prov.Items...)
-	quantity := prov.Quantity
 	tenant := prov.Tenant
 	callbackURL := prov.CallbackURL
 	b.provisionsMu.Unlock()
 
-	// Remove all containers.
-	// For stacks, use Compose Down for atomic cleanup; fall back to individual
-	// removal if Compose fails. For single-container leases, use RemoveContainer.
+	// Remove all containers via Compose Down for atomic cleanup; fall back
+	// to individual RemoveContainer if Compose fails (e.g., compose project
+	// metadata went missing). After Tasks 4-6 every provision is stack-
+	// shaped, so the per-container fallback only fires under genuine
+	// substrate failure rather than as the steady-state legacy path.
 	var errs []error
 	var failedIDs []string
-	if isStack {
-		stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-		if downErr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); downErr != nil {
-			logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
-			for _, containerID := range containerIDs {
-				if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-					logger.Error("failed to remove container", "container_id", leasesm.ShortID(containerID), "error", err)
-					errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(containerID), err))
-					failedIDs = append(failedIDs, containerID)
-				} else {
-					logger.Info("container removed", "container_id", leasesm.ShortID(containerID))
-				}
-			}
-		} else {
-			logger.Info("compose down completed", "project", composeProjectName(leaseUUID))
-		}
-	} else {
+	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
+	if downErr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); downErr != nil {
+		logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
 		for _, containerID := range containerIDs {
 			if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
 				logger.Error("failed to remove container", "container_id", leasesm.ShortID(containerID), "error", err)
@@ -103,19 +89,19 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				logger.Info("container removed", "container_id", leasesm.ShortID(containerID))
 			}
 		}
+	} else {
+		logger.Info("compose down completed", "project", composeProjectName(leaseUUID))
 	}
 
 	// Release resource pool allocations regardless of outcome — the lease
-	// is being abandoned and these resources should be freed.
-	if isStack {
-		for _, item := range items {
-			for i := range item.Quantity {
-				b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
-			}
-		}
-	} else {
-		for i := range quantity {
-			b.pool.Release(fmt.Sprintf("%s-%d", leaseUUID, i))
+	// is being abandoned and these resources should be freed. Allocation IDs
+	// are always service-aware now ({lease}-{service}-{idx}); the legacy
+	// {lease}-{idx} scheme is gone from the live path. Task 9's recover-time
+	// migration releases / re-allocates legacy allocs as part of converting
+	// on-disk artefacts.
+	for _, item := range items {
+		for i := range item.Quantity {
+			b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
 		}
 	}
 	// Update gauges immediately after releasing allocations so metrics stay
@@ -138,21 +124,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
 	}
 
-	// Destroy managed volumes for all instances.
+	// Destroy managed volumes for all instances. Volume IDs are always
+	// service-aware now (fred-{lease}-{service}-{idx}); the legacy
+	// fred-{lease}-{idx} scheme is gone from the live path. Task 9's
+	// recover-time migration renames pre-existing legacy volumes onto
+	// the new naming convention before this code sees them.
 	var volumeErrs []error
-	if isStack {
-		for _, item := range items {
-			for i := range item.Quantity {
-				volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)
-				if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
-					logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
-					volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
-				}
-			}
-		}
-	} else {
-		for i := range quantity {
-			volumeID := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
+	for _, item := range items {
+		for i := range item.Quantity {
+			volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)
 			if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
 				logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
 				volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
