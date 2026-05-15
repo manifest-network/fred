@@ -210,7 +210,14 @@ func (b *Backend) runStubProvisioner(p *provision) {
 // production this manifests as at most a stale diagnostic entry or a
 // single replayed callback after a tightly-timed Provision→
 // Deprovision sequence. cfg.DiagnosticsMaxAge / cfg.CallbackMaxAge
-// eventually clean up either way.
+// eventually clean up either way — but only when those knobs are
+// non-zero (the defaults are 7d / 24h respectively). Both stores
+// treat MaxAge=0 as "no expiry" (internal/backend/shared/diagnostics.go,
+// internal/backend/shared/callbacks.go), and Config.Validate accepts
+// 0 (it rejects only negative values), so an operator who sets either
+// to 0 disables cleanup entirely and stale entries from these races
+// persist for the process lifetime — the races become permanent
+// rather than time-bounded.
 //
 // The structural fix lives in ENG-189 (k3s-backend: per-lease
 // cancellable context for provisioner lifecycle). When ENG-134+
