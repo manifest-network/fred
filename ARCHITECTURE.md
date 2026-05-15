@@ -702,17 +702,27 @@ Race-detector runs and integration tests catch most concurrency bugs. The patter
 
 ### Callback Authentication
 
-Callbacks use HMAC-SHA256 with timestamp-based replay protection (following the Stripe pattern):
+Callbacks (backend → Fred) and inbound requests (Fred → backend) use
+HMAC-SHA256 with a four-field canonical string that binds the timestamp,
+HTTP method, request URI, and a hash of the body:
 
 ```
-1. Backend computes timestamp and signed payload: "<timestamp>.<body>"
-2. Backend computes HMAC-SHA256(signed_payload, shared_secret)
-3. Backend sends X-Fred-Signature: t=<timestamp>,sha256=<hex>
-4. Fred parses timestamp and signature
-5. Fred rejects if timestamp > 5 minutes old (replay protection)
-6. Fred rejects if timestamp > 1 minute in future (clock skew limit)
-7. Fred recomputes signature and compares (constant-time)
+1. Sender constructs the canonical string:
+     "<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>"
+2. Sender computes HMAC-SHA256(canonical_string, shared_secret)
+3. Sender sends X-Fred-Signature: t=<timestamp>,sha256=<hex>
+4. Verifier extracts r.Method and r.URL.RequestURI() from the request
+5. Verifier reads the body and hashes it (sha256.Sum256)
+6. Verifier rejects if timestamp > 5 minutes old (replay protection)
+7. Verifier rejects if timestamp > 1 minute in future (clock skew limit)
+8. Verifier recomputes the canonical string + HMAC and compares (constant-time)
 ```
+
+Binding the method and request URI prevents cross-endpoint replay
+(a captured `POST /provision` signature cannot be replayed against
+`POST /deprovision`, nor a `GET /info/<id>` against `GET /logs/<id>`).
+Including the body as a SHA-256 hash rather than as a literal string
+keeps the canonical string bounded in length and binary-safe.
 
 ### Defense in Depth
 

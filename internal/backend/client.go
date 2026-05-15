@@ -608,7 +608,7 @@ func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
 	if c.secret == "" {
 		return
 	}
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(c.secret, body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.SignRequest(c.secret, req, body))
 }
 
 // doGet executes a GET request through the circuit breaker, decoding the

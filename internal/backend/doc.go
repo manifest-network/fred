@@ -51,7 +51,11 @@
 //
 //	{"lease_uuid": "...", "status": "success"|"failed", "error": "..."}
 //
-// The HMAC is computed over "<timestamp>.<body>" to bind the timestamp to
-// the signature. Callbacks older than 5 minutes are rejected (replay protection).
-// Timestamps up to 1 minute in the future are accepted (clock skew tolerance).
+// The HMAC is computed over the four-field canonical string
+// "<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>" — binding
+// the method and URI prevents cross-endpoint replay, and hashing the body
+// makes the canonical string binary-safe. Callbacks older than 5 minutes
+// are rejected (replay protection); timestamps up to 1 minute in the
+// future are accepted (clock skew tolerance). See internal/hmacauth for
+// the reference implementation.
 package backend

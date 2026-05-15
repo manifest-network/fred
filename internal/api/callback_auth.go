@@ -89,15 +89,17 @@ func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*C
 	}, nil
 }
 
-// ComputeSignature computes the HMAC-SHA256 signature for a payload with timestamp.
+// ComputeSignature computes the HMAC-SHA256 signature for a request shape with
+// the current timestamp. method and uri must match what the verifier will see
+// on the wire (typically req.Method and req.URL.RequestURI()).
 // Returns the signature in the format "t=<timestamp>,sha256=<hex>".
-func (a *CallbackAuthenticator) ComputeSignature(payload []byte) string {
-	return hmacauth.SignWithTime(a.secret, payload, a.now())
+func (a *CallbackAuthenticator) ComputeSignature(method, uri string, payload []byte) string {
+	return hmacauth.SignWithTime(a.secret, method, uri, payload, a.now())
 }
 
 // ComputeSignatureWithTime computes the signature with a specific timestamp (for testing).
-func (a *CallbackAuthenticator) ComputeSignatureWithTime(payload []byte, t time.Time) string {
-	return hmacauth.SignWithTime(a.secret, payload, t)
+func (a *CallbackAuthenticator) ComputeSignatureWithTime(method, uri string, payload []byte, t time.Time) string {
+	return hmacauth.SignWithTime(a.secret, method, uri, payload, t)
 }
 
 // now returns the current time, using the injected time function if set.
@@ -108,20 +110,34 @@ func (a *CallbackAuthenticator) now() time.Time {
 	return time.Now()
 }
 
-// VerifySignature verifies that the provided signature matches the payload.
-// The signature should be in the format "t=<timestamp>,sha256=<hex>".
+// VerifySignature verifies that the provided signature matches the request shape.
+// method and uri must match what the sender used (typically r.Method and
+// r.URL.RequestURI() on the inbound request). The signature should be in the
+// format "t=<timestamp>,sha256=<hex>".
 // Returns false if the signature is invalid, the timestamp is too old, or the timestamp is too far in the future.
-func (a *CallbackAuthenticator) VerifySignature(payload []byte, signature string) bool {
-	return a.VerifySignatureWithTime(payload, signature, a.now())
+func (a *CallbackAuthenticator) VerifySignature(method, uri string, payload []byte, signature string) bool {
+	return a.VerifySignatureWithTime(method, uri, payload, signature, a.now())
 }
 
 // VerifySignatureWithTime verifies the signature against a reference time (for testing).
-func (a *CallbackAuthenticator) VerifySignatureWithTime(payload []byte, signature string, now time.Time) bool {
-	return a.verifySignatureWithError(payload, signature, now) == nil
+func (a *CallbackAuthenticator) VerifySignatureWithTime(method, uri string, payload []byte, signature string, now time.Time) bool {
+	return a.verifySignatureWithError(method, uri, payload, signature, now) == nil
 }
 
 // VerifyRequest reads the request body, verifies the signature, and returns the body bytes.
 // Returns an error if verification fails or the timestamp is too old.
+//
+// Note: do not confuse this method with hmacauth.VerifyRequest. The names
+// live in different packages and have different semantics:
+//
+//   - This method reads r.Body itself (callers pass the bare *http.Request
+//     and receive the body back) and applies the callback-specific maxAge
+//     and clock-skew tolerance configured on the CallbackAuthenticator.
+//   - hmacauth.VerifyRequest is a low-level wrapper that takes a
+//     pre-read body and an explicit maxAge; r.Body is untouched.
+//
+// Internally, this method delegates the canonical-string check to
+// hmacauth.VerifyWithTime via verifySignatureWithError.
 func (a *CallbackAuthenticator) VerifyRequest(r *http.Request) ([]byte, error) {
 	signature := r.Header.Get(CallbackSignatureHeader)
 	if signature == "" {
@@ -133,7 +149,7 @@ func (a *CallbackAuthenticator) VerifyRequest(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
 
-	if err := a.verifySignatureWithError(body, signature, a.now()); err != nil {
+	if err := a.verifySignatureWithError(r.Method, r.URL.RequestURI(), body, signature, a.now()); err != nil {
 		return nil, err
 	}
 
@@ -141,6 +157,6 @@ func (a *CallbackAuthenticator) VerifyRequest(r *http.Request) ([]byte, error) {
 }
 
 // verifySignatureWithError is like VerifySignature but returns a descriptive error.
-func (a *CallbackAuthenticator) verifySignatureWithError(payload []byte, signature string, now time.Time) error {
-	return hmacauth.VerifyWithTime(a.secret, payload, signature, a.maxAge, callbackClockSkewTolerance, now)
+func (a *CallbackAuthenticator) verifySignatureWithError(method, uri string, payload []byte, signature string, now time.Time) error {
+	return hmacauth.VerifyWithTime(a.secret, method, uri, payload, signature, a.maxAge, callbackClockSkewTolerance, now)
 }

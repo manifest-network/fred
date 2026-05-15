@@ -170,7 +170,7 @@ func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.Callbac
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if err := hmacauth.Verify(testCallbackSecret, body, sig, 5*time.Minute); err != nil {
+		if err := hmacauth.Verify(testCallbackSecret, r.Method, r.URL.RequestURI(), body, sig, 5*time.Minute); err != nil {
 			t.Logf("callback: invalid signature: %v", err)
 			w.WriteHeader(http.StatusUnauthorized)
 			return

@@ -92,7 +92,7 @@ func startFakeFred(t *testing.T) (*httptest.Server, <-chan backend.CallbackPaylo
 			return
 		}
 		sig := r.Header.Get(hmacauth.SignatureHeader)
-		if err := hmacauth.Verify(testCallbackSecret, body, sig, 5*time.Minute); err != nil {
+		if err := hmacauth.Verify(testCallbackSecret, r.Method, r.URL.RequestURI(), body, sig, 5*time.Minute); err != nil {
 			t.Errorf("fake Fred: HMAC verify failed: %v (sig=%q)", err, sig)
 			w.WriteHeader(http.StatusUnauthorized)
 			return

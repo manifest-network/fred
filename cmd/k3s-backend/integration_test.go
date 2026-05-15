@@ -69,7 +69,7 @@ func TestIntegration_BinaryProvisionsAndCallsBack(t *testing.T) {
 		bytes.NewReader(bodyBytes),
 	)
 	require.NoError(t, err)
-	httpReq.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(secret, bodyBytes))
+	httpReq.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(secret, httpReq.Method, httpReq.URL.RequestURI(), bodyBytes))
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	// Bounded timeout so a handler deadlock or stalled connection fails the
@@ -173,7 +173,7 @@ func startIntegrationFred(t *testing.T, secret string) (*httptest.Server, <-chan
 			return
 		}
 		sig := r.Header.Get(hmacauth.SignatureHeader)
-		if err := hmacauth.Verify(secret, body, sig, 5*time.Minute); err != nil {
+		if err := hmacauth.Verify(secret, r.Method, r.URL.RequestURI(), body, sig, 5*time.Minute); err != nil {
 			t.Errorf("fake Fred: HMAC verify failed: %v (sig=%q)", err, sig)
 			w.WriteHeader(http.StatusUnauthorized)
 			return

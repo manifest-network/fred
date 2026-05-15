@@ -463,15 +463,16 @@ func (lt *LoadTester) doCallbackRequest(ctx context.Context, results *Results) {
 
 	body, _ := json.Marshal(callback)
 
-	// Sign the callback
-	signature := lt.signCallback(body)
-
 	url := fmt.Sprintf("%s/callbacks/provision", lt.target)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		results.Record(0, 0, err, 0, 0)
 		return
 	}
+
+	// Sign the callback after the request is built so the signed canonical
+	// string includes the same method + URI the verifier will see.
+	signature := lt.signCallback(req.Method, req.URL.RequestURI(), body)
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Fred-Signature", signature)
@@ -573,6 +574,7 @@ func (lt *LoadTester) generateAuthToken(leaseUUID, metaHash string) string {
 }
 
 // signCallback signs a callback payload using the CallbackAuthenticator.
-func (lt *LoadTester) signCallback(payload []byte) string {
-	return lt.callbackAuth.ComputeSignature(payload)
+// method and uri must match what the verifier will see on the wire.
+func (lt *LoadTester) signCallback(method, uri string, payload []byte) string {
+	return lt.callbackAuth.ComputeSignature(method, uri, payload)
 }

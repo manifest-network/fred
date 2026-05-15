@@ -38,15 +38,17 @@ Tenants authenticate to Fred's API using signed bearer tokens. Each token is a b
 
 ### Callback Authentication (HMAC-SHA256)
 
-Backends authenticate callbacks to Fred using HMAC-SHA256 with timestamp-based replay protection, following the Stripe webhook pattern.
+Backends authenticate callbacks to Fred using HMAC-SHA256 with a four-field canonical string that binds the timestamp, HTTP method, request URI, and body hash. Binding the method and URI prevents cross-endpoint replay; hashing the body keeps the canonical string binary-safe.
 
 **Header format:** `X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>`
 
-**Signed payload:** `<timestamp>.<request-body>` — binding the timestamp to the body prevents timestamp substitution attacks.
+**Signed canonical string:** `<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>` — binding all four fields prevents timestamp substitution AND cross-endpoint replay (a captured `POST /callbacks/provision` signature cannot be replayed against any other endpoint or method).
 
 | Parameter | Value |
 |-----------|-------|
 | Algorithm | HMAC-SHA256 |
+| Canonical fields | `timestamp`, HTTP method, `r.URL.RequestURI()`, `sha256(body)` |
+| Field separator | `\n` (0x0A) |
 | Minimum secret length | 32 bytes |
 | Maximum callback age | 5 minutes |
 | Clock skew tolerance | 1 minute into the future |
@@ -54,15 +56,23 @@ Backends authenticate callbacks to Fred using HMAC-SHA256 with timestamp-based r
 
 **Signing example (Go):**
 ```go
+// Build the request first so the signed canonical string includes the
+// same method + URI the verifier will see on the wire.
+req, _ := http.NewRequest(http.MethodPost, callbackURL, bytes.NewReader(body))
+
 timestamp := time.Now().Unix()
-signedPayload := fmt.Sprintf("%d.%s", timestamp, body)
+bodyHash := sha256.Sum256(body) // sha256.Sum256(nil) is stable
+signed := fmt.Sprintf("%d\n%s\n%s\n%x",
+    timestamp, req.Method, req.URL.RequestURI(), bodyHash[:])
 
 mac := hmac.New(sha256.New, []byte(secret))
-mac.Write([]byte(signedPayload))
+mac.Write([]byte(signed))
 sig := hex.EncodeToString(mac.Sum(nil))
 
-header := fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
+req.Header.Set("X-Fred-Signature", fmt.Sprintf("t=%d,sha256=%s", timestamp, sig))
 ```
+
+Go backends in this repository can import `internal/hmacauth` and call `hmacauth.SignRequest(secret, req, body)` instead of computing the canonical string by hand.
 
 **Implementation:** `internal/api/callback_auth.go`, `internal/hmacauth/`
 

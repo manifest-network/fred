@@ -35,8 +35,8 @@ func (p *capturingCallbackPublisher) PublishCallback(cb backend.CallbackPayload)
 // signedRequest creates a POST request with a valid HMAC signature.
 func signedRequest(t *testing.T, auth *CallbackAuthenticator, body string) *http.Request {
 	t.Helper()
-	sig := auth.ComputeSignature([]byte(body))
 	req := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
+	sig := auth.ComputeSignature(req.Method, req.URL.RequestURI(), []byte(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(CallbackSignatureHeader, sig)
 	return req
