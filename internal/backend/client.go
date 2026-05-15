@@ -131,6 +131,54 @@ func IsStack(items []LeaseItem) (bool, error) {
 	return isStack, nil
 }
 
+// defaultServiceName is the synthetic service name applied when fred
+// normalizes a legacy single-item-without-service_name request into the
+// stack-shaped contract. Must stay in lock-step with
+// manifest.DefaultServiceName; duplicated here only because the manifest
+// package imports backend (cycle prevents the inverse import). If this
+// ever drifts, the wire-level auto-wrap and the item auto-tag would
+// disagree and lease items would no longer match the wrapped manifest's
+// service map — caught by TestNormalizeProvisionRequest_* +
+// TestParsePayload_WrapsFlat in tandem.
+const defaultServiceName = "app"
+
+// NormalizeProvisionRequest applies boundary normalization to a provision
+// request: any single-item request that lacks ServiceName is auto-tagged
+// with defaultServiceName, transitioning legacy wire-format leases into
+// the stack-shaped contract every downstream component now expects. Named
+// items are passed through. Mixed-presence and multi-unnamed combinations
+// are rejected — both were structurally invalid under the legacy
+// contract too, so this only formalizes the rejection.
+//
+// The normalization is in-place; callers should invoke this at the very
+// entry of Provision/Update, before any docker work or pool allocation,
+// so the rest of the path operates on uniformly stack-shaped state.
+func NormalizeProvisionRequest(req *ProvisionRequest) error {
+	if req == nil || len(req.Items) == 0 {
+		return fmt.Errorf("%w: provision request has no items", ErrValidation)
+	}
+	named, unnamed := 0, 0
+	for _, item := range req.Items {
+		if item.ServiceName == "" {
+			unnamed++
+		} else {
+			named++
+		}
+	}
+	if named > 0 && unnamed > 0 {
+		return fmt.Errorf("%w: mixed service_name presence across items (got %d named, %d unnamed)",
+			ErrInvalidManifest, named, unnamed)
+	}
+	if unnamed > 1 {
+		return fmt.Errorf("%w: legacy single-service form requires exactly 1 item; got %d",
+			ErrInvalidManifest, unnamed)
+	}
+	if unnamed == 1 {
+		req.Items[0].ServiceName = defaultServiceName
+	}
+	return nil
+}
+
 // ProvisionRequest contains the data needed to provision a resource.
 type ProvisionRequest struct {
 	LeaseUUID    string      `json:"lease_uuid"`

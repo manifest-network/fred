@@ -833,6 +833,21 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 
 	isStack := prov.IsStack()
 
+	// Boundary normalization (defensive): if prov.Items is populated, it
+	// was normalized at provision time — re-check here so any malformed
+	// in-memory state (e.g., a recovered provision whose stored items
+	// predate Task 3) is surfaced before triggering an update. Empty
+	// prov.Items is tolerated because pre-Task-3 legacy provisions and
+	// recovered legacy state may not carry items; the downstream code
+	// keeps working with the existing prov.Manifest in that case. Task 6
+	// folds this defensive check into the unified update path.
+	if len(prov.Items) > 0 {
+		if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: prov.Items}); err != nil {
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("%w: %w", backend.ErrInvalidState, err)
+		}
+	}
+
 	// Parse new payload. ParsePayload always returns a *StackManifest now;
 	// legacy flat payloads are auto-wrapped under DefaultServiceName.
 	stackManifest, parseErr := manifest.ParsePayload(req.Payload)

@@ -122,8 +122,21 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		profiles[item.SKU] = profile
 	}
 
+	// Boundary normalization: auto-tag a single unnamed item with the
+	// default service name so every downstream component (and the parser
+	// below) sees a uniformly stack-shaped request. Rejects malformed
+	// mixed/multi-unnamed inputs that were structurally invalid under the
+	// legacy contract too.
+	if err := backend.NormalizeProvisionRequest(&req); err != nil {
+		b.removeProvision(req.LeaseUUID)
+		return err
+	}
+
 	// Parse payload. ParsePayload always returns a *StackManifest now;
-	// legacy flat payloads are auto-wrapped under DefaultServiceName.
+	// legacy flat payloads are auto-wrapped under DefaultServiceName. After
+	// the normalization above, IsStack is structurally always true here.
+	// The variable is preserved so the unchanged downstream branching keeps
+	// compiling; Task 4 collapses it.
 	isStack, err := backend.IsStack(req.Items)
 	if err != nil {
 		b.removeProvision(req.LeaseUUID)
@@ -135,13 +148,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
 	}
 
-	// For legacy lease items (no service_name on items), the auto-wrapped
-	// stack carries the single service under DefaultServiceName. If the
-	// tenant submitted a multi-service stack payload AND legacy items, that
-	// is a wire-level mismatch — surface it the same way the pre-Task-2
-	// validator did. After Task 3 folds NormalizeProvisionRequest in,
-	// legacy items get auto-tagged with the default service name and the
-	// branching below collapses (Tasks 4-7).
+	// Dead branch after Task 3: NormalizeProvisionRequest guarantees every
+	// item carries a service name, so isStack is always true here. The
+	// block is retained so the legacy `m` variable stays in scope for the
+	// rest of the function until Tasks 4-7 collapse the legacy execution
+	// paths entirely.
 	var m *manifest.Manifest
 	if !isStack {
 		m = stackManifest.Services[manifest.DefaultServiceName]
