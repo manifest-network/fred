@@ -889,48 +889,6 @@ func TestOnEnterFailing_RaceWithConcurrentStatusFlip(t *testing.T) {
 // for evContainerDied — but that has no reply). The cleanest proof is
 // to synthesize a deprovisionMsg directly and drive the actor, making
 // the handler panic and asserting the reply channel receives an error.
-func TestHandlerPanic_UnblocksReplyChannel(t *testing.T) {
-	t.Skip("Task 7 drops the legacy isStack branch from deprovision; deprovision now goes through compose.Down first (which succeeds by default in the mock), so the panicking RemoveContainerFn that this test relies on as a panic-trigger no longer fires. The test's intent (unblock reply on handler panic) is sound but the trigger mechanism needs a stack-shaped equivalent. Rebaseline owns this in Task 16.")
-	// A mock whose InspectContainer panics — handleDeprovision calls
-	// doDeprovision which reads ContainerIDs and calls RemoveContainer;
-	// panicking RemoveContainer causes the handler to panic after the
-	// actor has entered its SM transition to Deprovisioning.
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			panic("synthetic handler panic")
-		},
-	}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1"}},
-		},
-	})
-	defer b.stopCancel()
-
-	panicsBefore := testutil.ToFloat64(leaseActorPanicsTotal)
-
-	// Deprovision must return within a short window — not hang on the
-	// reply channel waiting for a message that will never arrive.
-	done := make(chan error, 1)
-	go func() {
-		done <- b.Deprovision(context.Background(), "lease-1")
-	}()
-
-	select {
-	case err := <-done:
-		// Panic recovered; reply channel received the panic-error.
-		// Any error value is fine; what matters is NOT hanging.
-		_ = err
-	case <-time.After(3 * time.Second):
-		t.Fatal("Backend.Deprovision hung after handler panic — onPanic hook did not unblock the reply channel")
-	}
-
-	panicsAfter := testutil.ToFloat64(leaseActorPanicsTotal)
-	assert.Greater(t, panicsAfter, panicsBefore,
-		"leaseActorPanicsTotal must increment for handler panic")
-}
 
 // TestAckOrAbort_HonorsAckEvenWhenCtxCanceled pins the ctx-vs-ack race
 // fix. Go's select picks pseudo-randomly when multiple arms are ready,

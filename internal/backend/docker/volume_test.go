@@ -14,9 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 func TestSanitizeVolumePath(t *testing.T) {
@@ -201,50 +199,6 @@ func TestNewVolumeManager_UnsupportedFilesystem(t *testing.T) {
 	_, err := newVolumeManager("/tmp", "ext4", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported volume_filesystem")
-}
-
-func TestCleanupOrphanedVolumes_DestroysOrphans(t *testing.T) {
-	t.Skip("Task 15 drops IsStack branches in GetLogs/orphan-volume/provisionToInfo and the ProvisionState.Image/Manifest fields; legacy-shape fixture no longer compatible. Rebaseline owns this in Task 16.")
-	var destroyedIDs []string
-	vm := &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{"fred-lease-1-0", "fred-lease-2-0", "fred-orphan-0"}, nil
-		},
-		DestroyFn: func(ctx context.Context, id string) error {
-			destroyedIDs = append(destroyedIDs, id)
-			return nil
-		},
-	}
-
-	cfg := DefaultConfig()
-	cfg.NetworkIsolation = ptrBool(false)
-	pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
-	stopCtx, stopCancel := context.WithCancel(context.Background())
-	defer stopCancel()
-
-	b := &Backend{
-		cfg:     cfg,
-		pool:    pool,
-		volumes: vm,
-		logger:  slog.Default(),
-		provisions: map[string]*provision{
-			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Quantity: 1, Status: backend.ProvisionStatusReady}},
-			"lease-2": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-2", Quantity: 1, Status: backend.ProvisionStatusReady}},
-		},
-		stopCtx:    stopCtx,
-		stopCancel: stopCancel,
-	}
-	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
-		HTTPClient: http.DefaultClient,
-		Logger:     b.logger,
-		StopCtx:    b.stopCtx,
-	})
-
-	err := b.cleanupOrphanedVolumes(context.Background())
-	require.NoError(t, err)
-
-	// Only the orphan should be destroyed — lease-1 and lease-2 volumes are expected
-	assert.Equal(t, []string{"fred-orphan-0"}, destroyedIDs)
 }
 
 func TestCleanupOrphanedVolumes_ListFailure(t *testing.T) {

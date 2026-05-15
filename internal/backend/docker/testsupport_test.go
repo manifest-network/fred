@@ -69,8 +69,8 @@ func (b *Backend) handleContainerDeath(containerID string) {
 // assert against).
 type fakeDocker struct {
 	// Docker engine side.
-	containers []ContainerInfo               // returned by ListManagedContainers
-	mounts     map[string][]ContainerMount   // containerID → mounts (test-only)
+	containers []ContainerInfo             // returned by ListManagedContainers
+	mounts     map[string][]ContainerMount // containerID → mounts (test-only)
 
 	// Compose side.
 	composeUpErr           error  // returned by composeExecutor.Up if non-nil

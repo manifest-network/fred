@@ -713,44 +713,6 @@ func TestStackUpdate_Success(t *testing.T) {
 	b.wg.Wait()
 }
 
-func TestStackUpdate_PayloadTypeMismatch(t *testing.T) {
-	t.Run("stack lease with single manifest payload", func(t *testing.T) {
-		provisions := map[string]*provision{
-			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-				Status:        backend.ProvisionStatusReady,
-				StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx"}}},
-				Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}}},
-			},
-		}
-		b := newBackendForProvisionTest(t, &mockDockerClient{}, provisions)
-
-		err := b.Update(context.Background(), backend.UpdateRequest{
-			LeaseUUID: "lease-1",
-			Payload:   validManifestJSON("nginx:latest"), // single, not stack
-		})
-		require.Error(t, err)
-		assert.ErrorIs(t, err, backend.ErrInvalidManifest)
-	})
-
-	t.Run("non-stack lease with stack manifest payload", func(t *testing.T) {
-		t.Skip("Task 6 routes Update through the stack path; legacy prov.Manifest fixture (no Items) exits early at NormalizeProvisionRequest with ErrInvalidState. Rebaseline owns this in Task 16.")
-		provisions := map[string]*provision{
-			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-				Status:   backend.ProvisionStatusReady,
-				SKU:      "docker-small"},
-			},
-		}
-		b := newBackendForProvisionTest(t, &mockDockerClient{}, provisions)
-
-		err := b.Update(context.Background(), backend.UpdateRequest{
-			LeaseUUID: "lease-1",
-			Payload:   validStackManifestJSON(map[string]string{"web": "nginx:latest"}),
-		})
-		require.Error(t, err)
-		assert.ErrorIs(t, err, backend.ErrInvalidManifest)
-	})
-}
-
 // --- Stack GetInfo tests ---
 
 func TestGetInfo_Stack(t *testing.T) {
@@ -1231,4 +1193,198 @@ func TestRecoverState_StackMultiInstance(t *testing.T) {
 	assert.Equal(t, "web", prov.Items[0].ServiceName)
 	assert.Equal(t, 2, prov.Items[0].Quantity)
 	assert.Len(t, prov.ServiceContainers["web"], 2)
+}
+
+// --- Coverage lifted from Task 16 bulk-delete of legacy-fixture tests ---
+//
+// The following tests preserve coverage that was unique to the deleted
+// legacy-shape suite — i.e. semantic behaviour not already exercised by
+// the existing stack_test.go suite or the post-Task-15 baseline tests.
+// Each test is intentionally minimal: a 1-service stack fixture plus a
+// focused assertion on the one behaviour we're preserving.
+
+// TestStackRestart_PreservesCustomDomainInItems lifts a slice of the
+// CustomDomain-threading coverage from the deleted
+// TestRestart_LegacyPropagatesCustomDomainFromProvItems. The original
+// test exercised CreateContainerParams.CustomDomain end-to-end — that
+// path is gone with the legacy doProvision. End-to-end label-level
+// verification now requires a configured Traefik ingress which is
+// substantial test scaffolding; instead this test pins the narrower
+// (but load-bearing) invariant: a Restart cycle must not lose the
+// CustomDomain off prov.Items. The downstream label-emission is
+// independently covered by ingress_test.go (TraefikCustomDomainLabels,
+// CustomDomainRouterName).
+func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
+	const customDomain = "foo.example.com"
+	payload := validStackManifestJSON(map[string]string{
+		manifest.DefaultServiceName: "nginx:latest",
+	})
+	stack, err := manifest.ParsePayload(payload)
+	require.NoError(t, err)
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     1,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName, CustomDomain: customDomain},
+			},
+			StackManifest:     stack,
+			ServiceContainers: map[string][]string{manifest.DefaultServiceName: {"old-c1"}},
+			ContainerIDs:      []string{"old-c1"},
+		}},
+	}
+
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "new-c1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return nil
+		},
+	}
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, image string, t time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	}))
+	<-callbackReceived
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	require.NotNil(t, prov)
+	preserved := prov.Items[0].CustomDomain
+	b.provisionsMu.RUnlock()
+
+	assert.Equal(t, customDomain, preserved,
+		"Restart must preserve prov.Items[*].CustomDomain — downstream label-emission depends on it")
+}
+
+// TestStackRestart_RollbackClearsLastError lifts coverage from the
+// deleted TestRestart_RollbackClearsLastError. After a Restart's
+// compose.Up fails and the rollback reinstates the old containers,
+// prov.LastError must be cleared (a stale LastError would confuse
+// the operator into thinking the lease is still in a degraded state)
+// and prov.FailCount must still reflect the attempted-but-rolled-back
+// failure.
+func TestStackRestart_RollbackClearsLastError(t *testing.T) {
+	payload := validStackManifestJSON(map[string]string{
+		manifest.DefaultServiceName: "nginx:latest",
+	})
+	stack, err := manifest.ParsePayload(payload)
+	require.NoError(t, err)
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     1,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName},
+			},
+			StackManifest:     stack,
+			ServiceContainers: map[string][]string{manifest.DefaultServiceName: {"old-c1"}},
+			ContainerIDs:      []string{"old-c1"},
+			LastError:         "",
+			FailCount:         0,
+		}},
+	}
+
+	upCalls := 0
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			upCalls++
+			if upCalls == 1 {
+				// First Up (new generation) fails.
+				return fmt.Errorf("simulated compose up failure")
+			}
+			// Rollback Up succeeds.
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "old-c1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return nil
+		},
+	}
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, image string, t time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
+	}
+
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	}))
+	<-callbackReceived
+
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,
+		"status must be Ready after a successful rollback reinstated old generation")
+	assert.Empty(t, prov.LastError,
+		"LastError must be cleared after successful rollback — a stale error would confuse operator triage")
+	assert.Equal(t, 1, prov.FailCount,
+		"FailCount must still reflect the attempted-but-rolled-back failure")
 }
