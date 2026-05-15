@@ -1328,6 +1328,28 @@ func TestValidateCallbackURL(t *testing.T) {
 		{name: "AWS metadata", url: "http://169.254.169.254/latest/meta-data/", wantErr: "link-local addresses are not allowed"},
 		{name: "link-local", url: "http://169.254.1.1/callback", wantErr: "link-local addresses are not allowed"},
 
+		// Trailing-dot normalization (commit 859bfc3). Without the strip in
+		// validateCallbackURL, net.ParseIP returns nil for "169.254.169.254."
+		// and the link-local block is skipped despite resolving to the same
+		// metadata IP. Public hosts must still validate cleanly with a
+		// trailing dot — FQDN form is legal DNS syntax.
+		{name: "trailing-dot AWS metadata blocked", url: "http://169.254.169.254./callback", wantErr: "link-local addresses are not allowed"},
+		{name: "trailing-dot public host allowed", url: "http://example.com./callback", wantErr: ""},
+
+		// IPv6 zone-suffix stripping (commit 483f9bd). RFC 6874 zone-scoped
+		// IPv6 literals embed the interface as "%<zone>" (URL-encoded as
+		// "%25<zone>"). url.Hostname() returns "fe80::1%eth0", which
+		// net.ParseIP rejects; net.Dialer would still dial it on
+		// Linux/BSD. Stripping the "%"-suffix before ParseIP exposes the
+		// link-local class so the guard fires.
+		{name: "ipv6 zone-suffix link-local blocked", url: "http://[fe80::1%25eth0]/callback", wantErr: "link-local addresses are not allowed"},
+
+		// Unspecified addresses (commit 859bfc3). 0.0.0.0 / :: resolve to
+		// "any interface" on the target host — never a legitimate callback
+		// destination.
+		{name: "unspecified IPv4 0.0.0.0", url: "http://0.0.0.0/callback", wantErr: "unspecified addresses are not allowed"},
+		{name: "unspecified IPv6 ::", url: "http://[::]/callback", wantErr: "unspecified addresses are not allowed"},
+
 		// Malformed
 		{name: "empty host", url: "http:///callback", wantErr: "host is required"},
 	}

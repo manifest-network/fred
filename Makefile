@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker build-k3s install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker run-k3s fmt generate verify help
+.PHONY: all build build-mock build-docker build-k3s install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-k3s test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker run-k3s fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -103,6 +103,13 @@ test-integration-volume:
 	@echo "Running volume integration tests (requires root + Docker + btrfs-progs)..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota|RestartPreservesVolumes|UpdatePreservesVolumes)" -timeout 10m
 
+# Run k3s-backend integration tests (requires `go` toolchain; cmd/k3s-backend/integration_test.go
+# self-builds the binary into t.TempDir and exercises the full HTTP + callback path against a fake Fred).
+# The current scaffold test does not require a live K3s cluster.
+test-integration-k3s:
+	@echo "Running k3s-backend integration tests..."
+	$(GOTEST) -tags integration -v ./cmd/k3s-backend/ -timeout 10m
+
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
 	@echo "Running tests with coverage..."
@@ -186,6 +193,7 @@ help:
 	@echo "  test-integration-stack         - Run stack integration tests (requires Docker)"
 	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
 	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, btrfs-progs)"
+	@echo "  test-integration-k3s           - Run k3s-backend integration tests (self-builds binary)"
 	@echo "  test-coverage           - Run tests with coverage report"
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"
 	@echo "  lint             - Run linter"
