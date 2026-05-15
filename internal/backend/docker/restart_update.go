@@ -815,142 +815,65 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, status)
 	}
 
-	isStack := prov.IsStack()
-
-	// Boundary normalization (defensive): if prov.Items is populated, it
-	// was normalized at provision time — re-check here so any malformed
-	// in-memory state (e.g., a recovered provision whose stored items
-	// predate Task 3) is surfaced before triggering an update. Empty
-	// prov.Items is tolerated because pre-Task-3 legacy provisions and
-	// recovered legacy state may not carry items; the downstream code
-	// keeps working with the existing prov.Manifest in that case. Task 6
-	// folds this defensive check into the unified update path.
-	if len(prov.Items) > 0 {
-		if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: prov.Items}); err != nil {
-			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: %w", backend.ErrInvalidState, err)
-		}
+	// Boundary normalization: prov.Items must be populated (it is set at
+	// Provision time and rehydrated from container labels by recover.go).
+	// Task 3's `len(prov.Items) > 0` guard is removed here per the Task 3
+	// review carry-over; after Task 8-9's recover-time migration every
+	// recovered provision will have Items populated. A surviving empty
+	// Items now surfaces immediately as ErrInvalidState rather than
+	// silently routing into the (now-gone) legacy path.
+	if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: prov.Items}); err != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrInvalidState, err)
 	}
 
-	// Parse new payload. ParsePayload always returns a *StackManifest now;
+	// Parse new payload. ParsePayload always returns a *StackManifest;
 	// legacy flat payloads are auto-wrapped under DefaultServiceName.
 	stackManifest, parseErr := manifest.ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
 	}
+	if isFlatPayload(req.Payload) {
+		logger.Warn("manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack",
+			"lease_uuid", req.LeaseUUID)
+	}
 
-	// For legacy provisions, derive the single per-service manifest from the
-	// auto-wrapped stack. A multi-service payload submitted against a legacy
-	// provision is a wire-level mismatch — surface it the same way the
-	// pre-Task-2 validator did. Tasks 3-7 collapse this branch.
-	var m *manifest.Manifest
-	if !isStack {
-		m = stackManifest.Services[manifest.DefaultServiceName]
-		if m == nil || len(stackManifest.Services) != 1 {
+	// Validate stack against stored items. A flat payload submitted against
+	// a multi-service stack lease auto-wraps to {"app": <flat>} and falls
+	// through here as a service-name mismatch — preserving the pre-Task-2
+	// error category via ErrInvalidManifest (mirrors provision.go).
+	if valErr := manifest.ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, valErr)
+	}
+	// Validate all images.
+	for svcName, svc := range stackManifest.Services {
+		if imgErr := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); imgErr != nil {
 			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: non-stack lease cannot be updated with a stack manifest", backend.ErrInvalidManifest)
+			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, imgErr)
 		}
 	}
-
-	if isStack {
-		// Validate stack against stored items. Now that ParsePayload
-		// auto-wraps flat payloads under DefaultServiceName, a flat payload
-		// submitted against a stack lease falls through to this check
-		// (auto-wrapped service name "app" mismatches the lease's named
-		// services), so we wrap with ErrInvalidManifest — matching
-		// provision.go's pattern and preserving the pre-Task-2 error
-		// category for the payload-type-mismatch case.
-		if valErr := manifest.ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
+	// Validate all SKU profiles.
+	profiles := make(map[string]SKUProfile, len(prov.Items))
+	for _, item := range prov.Items {
+		if _, ok := profiles[item.SKU]; ok {
+			continue
+		}
+		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
+		if profErr != nil {
 			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, valErr)
+			return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
 		}
-		// Validate all images.
-		for svcName, svc := range stackManifest.Services {
-			if imgErr := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); imgErr != nil {
-				b.provisionsMu.Unlock()
-				return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, imgErr)
-			}
-		}
-		// Validate all SKU profiles.
-		profiles := make(map[string]SKUProfile, len(prov.Items))
-		for _, item := range prov.Items {
-			if _, ok := profiles[item.SKU]; ok {
-				continue
-			}
-			profile, profErr := b.cfg.GetSKUProfile(item.SKU)
-			if profErr != nil {
-				b.provisionsMu.Unlock()
-				return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
-			}
-			profiles[item.SKU] = profile
-		}
-
-		oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
-		serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
-		for k, v := range prov.ServiceContainers {
-			serviceContainers[k] = append([]string(nil), v...)
-		}
-		items := append([]backend.LeaseItem(nil), prov.Items...)
-		prevStatus := prov.Status
-		prevCallbackURL := prov.CallbackURL
-		prov.Status = backend.ProvisionStatusUpdating
-		if req.CallbackURL != "" {
-			prov.CallbackURL = req.CallbackURL
-		}
-		b.provisionsMu.Unlock()
-
-		// Record release.
-		releaseImage := "stack"
-		if b.releaseStore != nil {
-			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
-				Manifest:  req.Payload,
-				Image:     releaseImage,
-				Status:    "deploying",
-				CreatedAt: time.Now(),
-			}); relErr != nil {
-				b.provisionsMu.Lock()
-				prov.Status = prevStatus
-				prov.CallbackURL = prevCallbackURL
-				b.provisionsMu.Unlock()
-				return fmt.Errorf("failed to record release: %w", relErr)
-			}
-		}
-
-		// Hand off to the actor. See handleUpdateRequested /
-		// spawnReplaceWorker.
-		opCtx, opCancel := b.shutdownAwareContext()
-		work := func() leasesm.ReplaceResult {
-			return b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
-		}
-		ack := make(chan error, 1)
-		if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
-			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
-			return routeErr
-		}
-		// See ackOrAbort's comment for the ctx-vs-ack race rationale.
-		if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
-			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
-			return err
-		}
-		return nil
-	}
-
-	// Single-manifest path.
-	if imgErr := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); imgErr != nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: %w", backend.ErrValidation, imgErr)
-	}
-
-	profile, profErr := b.cfg.GetSKUProfile(prov.SKU)
-	if profErr != nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
+		profiles[item.SKU] = profile
 	}
 
 	oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
+	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+	for k, v := range prov.ServiceContainers {
+		serviceContainers[k] = append([]string(nil), v...)
+	}
+	items := append([]backend.LeaseItem(nil), prov.Items...)
 	prevStatus := prov.Status
 	prevCallbackURL := prov.CallbackURL
 	prov.Status = backend.ProvisionStatusUpdating
@@ -959,10 +882,14 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	}
 	b.provisionsMu.Unlock()
 
+	// Record release. Image:"stack" is the existing stack-path sentinel
+	// (pre-Task-2 behavior for multi-service leases); after Task 6 it
+	// also covers auto-wrapped 1-service leases. GetReleases tenants
+	// already see this sentinel for stack-shaped leases.
 	if b.releaseStore != nil {
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  req.Payload,
-			Image:     m.Image,
+			Image:     "stack",
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
@@ -978,7 +905,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	// spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
-		return b.doUpdate(opCtx, req.LeaseUUID, m, profile, oldContainerIDs, prevStatus, logger)
+		return b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
