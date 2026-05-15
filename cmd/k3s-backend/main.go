@@ -116,11 +116,17 @@ func main() {
 	// Wait for shutdown signal or server error
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// startupErr captures a ListenAndServe failure (port in use, bind refused,
+	// etc.) so the process can exit non-zero after the graceful-shutdown path
+	// runs. Without this, supervisors / k8s liveness probes / CI would see the
+	// "binary that never bound" as a successful run.
+	var startupErr error
 	select {
 	case <-sigCh:
 		logger.Info("shutting down...")
 	case err := <-serverErr:
 		logger.Error("HTTP server error, shutting down", "error", err)
+		startupErr = err
 	}
 
 	// Graceful shutdown — drain HTTP first so in-flight Provisions
@@ -139,6 +145,14 @@ func main() {
 	}
 
 	logger.Info("shutdown complete")
+
+	// Propagate ListenAndServe failure as a non-zero exit. The graceful-
+	// shutdown path above still runs (so the bbolt stores close cleanly) but
+	// we MUST NOT report success when the binary never accepted a single
+	// request — k8s liveness, systemd, and CI all key off exit code.
+	if startupErr != nil {
+		os.Exit(1)
+	}
 }
 
 func loadConfig(path string) (k3s.Config, error) {
