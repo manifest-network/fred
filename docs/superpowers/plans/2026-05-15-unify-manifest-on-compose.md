@@ -1474,10 +1474,11 @@ git commit -m "refactor(docker): delete legacy doProvision/doRestart/doUpdate; d
 
 ## Task 15: Delete `IsStack` and finalize the manifest API
 
-**Goal:** Remove the now-unreferenced `IsStack` helper. Clean up `prov.Image`-style legacy fields if they remain unused.
+**Goal:** Remove the now-unreferenced `IsStack` helper. Delete the transitional `type Manifest = flatManifest` alias introduced in Task 2 (commit `c5c27ad`). Clean up `prov.Image`-style legacy fields if they remain unused.
 
 **Files:**
 - Modify: `internal/backend/client.go`
+- Modify: `internal/backend/shared/manifest/manifest.go` (drop the `type Manifest = flatManifest` alias)
 - Modify: `internal/backend/shared/leasesm/leasesm.go`, `lease_sm.go`
 
 - [ ] **Step 15.1: Confirm no callers remain.**
@@ -1490,7 +1491,20 @@ Expected: no matches. If matches remain, update them to use the unified path.
 
 - [ ] **Step 15.2: Delete `IsStack` (client.go:121-132).**
 
-- [ ] **Step 15.3: Audit `ProvisionState.Image` and `prov.Manifest` (single).**
+- [ ] **Step 15.3: Drop the transitional `Manifest` alias and confirm zero references.**
+
+The alias `type Manifest = flatManifest` was introduced in Task 2 (commit `c5c27ad`) as a transitional shim so legacy `doProvision`/`doRestart`/`doUpdate` bodies could still reference `manifest.Manifest` until Task 14 deleted them. After Task 14 nothing should reference the alias anymore.
+
+**Acceptance gate (must show zero hits):**
+
+```bash
+grep -rn "manifest\.Manifest\b" --include="*.go" . | grep -v _test.go
+grep -rn "^type Manifest\b\|^type Manifest " internal/backend/shared/manifest/
+```
+
+The first command must return no matches outside test files; the second must return no matches at all (the alias declaration itself is deleted in this step). If either grep finds something, identify the holdout and either update it to `*manifest.StackManifest` or fold the legacy reference away — do NOT re-introduce the alias. After confirming zero hits, delete the `type Manifest = flatManifest` line and its doc comment from `internal/backend/shared/manifest/manifest.go`.
+
+- [ ] **Step 15.4: Audit `ProvisionState.Image` and `prov.Manifest` (single).**
 
 ```bash
 grep -rn "prov\.Image\b\|ProvisionState.Image\b\|prov\.Manifest\b" --include="*.go" .
@@ -1500,7 +1514,7 @@ If still referenced (probably in `info.go` for the `ProvisionInfo.Image` conveni
 
 If `prov.Manifest` (single) is no longer used: delete the field from `ProvisionState`.
 
-- [ ] **Step 15.4: Build.**
+- [ ] **Step 15.5: Build.**
 
 ```bash
 go build ./...
@@ -1508,7 +1522,7 @@ go build ./...
 
 Expected: success.
 
-- [ ] **Step 15.5: Run full test suite.**
+- [ ] **Step 15.6: Run full test suite.**
 
 ```bash
 go test ./... -count=1
@@ -1516,11 +1530,11 @@ go test ./... -count=1
 
 Expected: stack-format tests PASS.
 
-- [ ] **Step 15.6: Commit.**
+- [ ] **Step 15.7: Commit.**
 
 ```bash
-git add internal/backend/client.go internal/backend/shared/leasesm/ internal/backend/docker/
-git commit -m "refactor: delete IsStack; finalize manifest API surface"
+git add internal/backend/client.go internal/backend/shared/manifest/ internal/backend/shared/leasesm/ internal/backend/docker/
+git commit -m "refactor: delete IsStack and transitional Manifest alias; finalize manifest API surface"
 ```
 
 ---
