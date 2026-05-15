@@ -29,8 +29,9 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 		// ServiceName empty: legacy
 	}}
 	fakeDocker.mounts["legacy-cid"] = []ContainerMount{{
-		Source: "/var/lib/fred/volumes/fred-lease-1-0",
+		Source: "/var/lib/fred/volumes/fred-lease-1-0/data",
 		Target: "/data",
+		Type:   "bind",
 	}}
 	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
 	fakeRelStore.Seed(t) // flush the test-side releases map into the backing store

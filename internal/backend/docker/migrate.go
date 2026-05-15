@@ -39,11 +39,15 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -230,4 +234,248 @@ func sortInstancesByIndex(xs []legacyMigrationInstance) {
 	sort.SliceStable(xs, func(i, j int) bool {
 		return xs[i].LegacyContainer.InstanceIndex < xs[j].LegacyContainer.InstanceIndex
 	})
+}
+
+// executeLegacyMigration carries one [*legacyMigration] through the
+// rename-and-recreate pipeline atomically for the whole lease (all
+// instances in a single Compose.Up call). The per-lease atomicity is
+// load-bearing: compose.Up runs with RemoveOrphans:true (compose.go),
+// so a per-instance loop would tear down already-migrated siblings.
+//
+// Pipeline order (locked):
+//  1. Stop every legacy container in the lease + rename each to
+//     `<newName>-prev`. Stop must precede volume rename because zfs
+//     rejects rename on a busy dataset, and on xfs/btrfs renaming
+//     under a live bind risks dangling-inode confusion.
+//  2. Rename each instance's managed volume directories to the new
+//     service-aware naming convention. Per-instance, per-volume;
+//     stateless leases naturally fall through (no managed mounts).
+//  3. Build a Compose project for the whole lease with per-instance
+//     VolBinds pointing at the just-renamed host paths.
+//  4. Compose.Up. Creates N stack-form containers in one shot.
+//  5. Wait for ready (waitForHealthy, bounded by
+//     b.cfg.MigrationReadyTimeout).
+//  6. Schedule background removal of all `-prev` containers after
+//     b.cfg.MigrationGracePeriod — preserves rollback inspection
+//     potential without blocking startup.
+//  7. RecordMigration on the release store so the next boot sees the
+//     wrapped manifest as the active release. Idempotent on
+//     byte-equal payload.
+//
+// Failure semantics: any step error returns immediately. The caller
+// (recoverState) wraps with operator remediation guidance. The whole
+// migration is idempotent — interrupted runs resume on next boot
+// because each step's primitive is itself idempotent (RenameVolume,
+// RecordMigration, the rename-already-named tolerance below).
+func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration, logger *slog.Logger) error {
+	logger = logger.With("lease_uuid", m.LeaseUUID, "instances", len(m.Instances))
+	logger.Info("legacy migration starting")
+
+	svc := m.Stack.Services[manifest.DefaultServiceName]
+	if svc == nil {
+		return fmt.Errorf("internal: wrapped stack missing default service %q", manifest.DefaultServiceName)
+	}
+	stopGrace := 10 * time.Second
+	if svc.StopGracePeriod != nil {
+		stopGrace = svc.StopGracePeriod.Duration()
+	}
+
+	// 1. Stop + rename every legacy container.
+	for _, inst := range m.Instances {
+		if err := b.docker.StopContainer(ctx, inst.LegacyContainer.ContainerID, stopGrace); err != nil {
+			// Tolerate already-stopped (the docker SDK returns an error for
+			// a stop on a non-running container). Don't fail the migration
+			// over it — the rename below will surface a real "container
+			// missing" condition if it's serious.
+			logger.Warn("stop legacy container returned error (continuing)",
+				"container_id", inst.LegacyContainer.ContainerID, "error", err)
+		}
+		if err := b.docker.RenameContainer(ctx, inst.LegacyContainer.ContainerID, inst.PrevName); err != nil {
+			if !isAlreadyNamedErr(err, inst.PrevName) {
+				return fmt.Errorf("rename %s to %s: %w", inst.LegacyContainer.ContainerID, inst.PrevName, err)
+			}
+		}
+	}
+
+	// 2. Rename managed volume directories. RenameVolume is idempotent
+	// (Task 10), so re-runs after a partial migration succeed quietly.
+	for _, inst := range m.Instances {
+		for _, r := range inst.VolRenames {
+			if err := b.volumes.RenameVolume(r.Old, r.New); err != nil {
+				return fmt.Errorf("rename volume %s→%s (instance idx=%d): %w",
+					r.Old, r.New, inst.LegacyContainer.InstanceIndex, err)
+			}
+		}
+	}
+
+	// 3. Build the Compose project. SKU profile lookup + items list mirror
+	// the live provision flow (provision.go:doProvisionStack); the only
+	// migration-specific input is the VolBinds map seeded from the
+	// just-renamed directories.
+	profile, err := b.cfg.GetSKUProfile(m.SKU)
+	if err != nil {
+		return fmt.Errorf("load SKU profile %s: %w", m.SKU, err)
+	}
+	quantity := len(m.Instances)
+	items := []backend.LeaseItem{{
+		SKU:         m.SKU,
+		Quantity:    quantity,
+		ServiceName: manifest.DefaultServiceName,
+	}}
+
+	volBinds := map[string]map[int]serviceVolBinds{
+		manifest.DefaultServiceName: {},
+	}
+	for _, inst := range m.Instances {
+		binds := serviceVolBinds{}
+		if len(inst.VolRenames) > 0 {
+			binds.StatefulBinds = make(map[string]string, len(inst.VolRenames))
+			hostRoot := b.volumes.HostPath(inst.VolRenames[0].New) // single volume name per instance
+			for _, r := range inst.VolRenames {
+				// Match the stack-path convention: subdir per target under hostRoot.
+				// The legacy on-disk layout already follows this convention (see
+				// provision.go's setupVolumeBinds / buildStatefulVolumeBinds), so
+				// after the parent rename the data sits at exactly
+				// `<hostRoot>/sanitize(target)`.
+				sanitized := sanitizeVolumePath(r.Target)
+				if sanitized == "" {
+					return fmt.Errorf("legacy mount target %q is unsupported under stack-form layout", r.Target)
+				}
+				binds.StatefulBinds[filepath.Join(hostRoot, sanitized)] = r.Target
+			}
+		}
+		volBinds[manifest.DefaultServiceName][inst.LegacyContainer.InstanceIndex] = binds
+	}
+
+	project := buildComposeProject(composeProjectParams{
+		LeaseUUID: m.LeaseUUID,
+		Tenant:    m.Tenant,
+		Stack:     m.Stack,
+		Items:     items,
+		Profiles:  map[string]SKUProfile{m.SKU: profile},
+		VolBinds:  volBinds,
+		Cfg:       &b.cfg,
+	})
+
+	// 4. Compose Up — brings up all instances at once.
+	if err := b.compose.Up(ctx, project, composeUpOpts{}); err != nil {
+		return fmt.Errorf("compose up: %w", err)
+	}
+
+	// 5. Wait for ready. Resolves the new container IDs by name and reuses
+	// the existing verifyStartup helper (provision.go), which is
+	// health-check-aware: it polls via waitForHealthy when the manifest
+	// declares an active health check and falls back to a fixed-wait +
+	// inspect when it doesn't. Matches the readiness contract used by
+	// the live provision path.
+	newIDs, err := b.resolveContainerIDsByName(ctx, namesOf(m.Instances))
+	if err != nil {
+		return fmt.Errorf("resolve new container IDs: %w", err)
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, b.cfg.MigrationReadyTimeout)
+	defer cancel()
+	if err := b.verifyStartup(readyCtx, svc, newIDs, logger); err != nil {
+		return fmt.Errorf("wait for ready: %w", err)
+	}
+
+	// 6. Schedule per-instance `-prev` removal after the operator-
+	// inspection grace window. Background — must not block startup.
+	for _, inst := range m.Instances {
+		inst := inst
+		go func() {
+			select {
+			case <-time.After(b.cfg.MigrationGracePeriod):
+			case <-ctx.Done():
+				return
+			}
+			// Use a fresh context with a short timeout so a wedged
+			// docker daemon doesn't keep the goroutine alive forever.
+			// Logged as warning rather than failing the migration —
+			// the data plane is already on the stack-form container;
+			// the -prev leftover is an operator cleanup at worst.
+			rmCtx, rmCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer rmCancel()
+			if err := b.docker.RemoveContainer(rmCtx, inst.PrevName); err != nil {
+				logger.Warn("remove -prev container after grace failed (manual cleanup may be needed)",
+					"name", inst.PrevName, "error", err)
+			}
+		}()
+	}
+
+	// 7. Persist wrapped manifest. RecordMigration is idempotent.
+	if b.releaseStore != nil {
+		data, mErr := json.Marshal(m.Stack)
+		if mErr != nil {
+			logger.Warn("marshal wrapped manifest for release store (migration still complete)", "error", mErr)
+		} else if persistErr := b.releaseStore.RecordMigration(m.LeaseUUID, data); persistErr != nil {
+			logger.Warn("release store RecordMigration failed (migration still complete)", "error", persistErr)
+		}
+	}
+
+	logger.Info("legacy migration complete")
+	return nil
+}
+
+// isAlreadyNamedErr reports whether a docker RenameContainer failure
+// indicates the source container already carries the target name —
+// covering the idempotency case where a previous migration run
+// renamed and then crashed before the next step. Heuristic against
+// the docker SDK's error string; tolerant. We don't want false
+// positives here (would mask a real conflict), so we require both
+// the target name AND an "already" / "in use" / "conflict" hint.
+func isAlreadyNamedErr(err error, targetName string) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, targetName) {
+		return false
+	}
+	return strings.Contains(msg, "already") ||
+		strings.Contains(msg, "in use") ||
+		strings.Contains(msg, "conflict")
+}
+
+// namesOf returns the new container names for a slice of migration
+// instances. Helper for resolveContainerIDsByName.
+func namesOf(insts []legacyMigrationInstance) []string {
+	out := make([]string, 0, len(insts))
+	for _, i := range insts {
+		out = append(out, i.NewContainerName)
+	}
+	return out
+}
+
+// resolveContainerIDsByName scans the managed-container list and
+// returns the container IDs whose Name matches any of the given
+// names. Used by the migration to translate just-created Compose
+// container names back to engine IDs for the readiness wait.
+//
+// Returns an error if any expected name is unresolved — the caller
+// already validated the Up call succeeded, so a missing container
+// means a name mismatch or a race we can't safely paper over.
+func (b *Backend) resolveContainerIDsByName(ctx context.Context, names []string) ([]string, error) {
+	containers, err := b.docker.ListManagedContainers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list managed containers: %w", err)
+	}
+	want := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		want[n] = struct{}{}
+	}
+	got := make(map[string]string, len(names)) // name → containerID
+	for _, c := range containers {
+		if _, ok := want[c.Name]; ok {
+			got[c.Name] = c.ContainerID
+		}
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		id, ok := got[n]
+		if !ok {
+			return nil, fmt.Errorf("container with name %q not found in managed list (Compose Up may not have created it)", n)
+		}
+		out = append(out, id)
+	}
+	return out, nil
 }

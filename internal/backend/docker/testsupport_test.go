@@ -189,6 +189,17 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 			}
 			return out, nil
 		},
+		// StopContainer + RemoveContainer default to silent success so
+		// the migration's stop-legacy / -prev-cleanup paths don't blow
+		// up the test runtime (mockDockerClient.RemoveContainer panics
+		// by default). RenameContainer default already returns nil
+		// silently in the underlying mock.
+		StopContainerFn: func(_ context.Context, _ string, _ time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error {
+			return nil
+		},
 		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
 			for i := range state.containers {
 				if state.containers[i].ContainerID == containerID {
@@ -211,10 +222,32 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 
 	fakeCompose := &mockComposeExecutor{
 		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
-			if project != nil {
-				state.lastComposeProjectName = project.Name
+			if project == nil {
+				return state.composeUpErr
 			}
-			return state.composeUpErr
+			state.lastComposeProjectName = project.Name
+			if state.composeUpErr != nil {
+				return state.composeUpErr
+			}
+			// Simulate compose successfully creating containers: append one
+			// post-migration ContainerInfo per service in the project, with
+			// Status:"running" so waitForHealthy doesn't block. Production
+			// compose creates real containers; the test fake mirrors that
+			// behaviour at the ContainerInfo abstraction so downstream code
+			// (resolveContainerIDsByName, ListManagedContainers) sees a
+			// post-Up state consistent with production semantics.
+			for _, svc := range project.Services {
+				if svc.ContainerName == "" {
+					continue
+				}
+				state.containers = append(state.containers, ContainerInfo{
+					ContainerID: "post-mig-" + svc.ContainerName,
+					Name:        svc.ContainerName,
+					Status:      "running",
+					Health:      HealthStatusNone,
+				})
+			}
+			return nil
 		},
 	}
 
@@ -222,6 +255,18 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 	b.compose = fakeCompose
 	b.volumes = fakeVol
 	b.releaseStore = relStore
+	// Migration tests assume managed volume sources live under this root
+	// — matches the fixture mounts used by migrate_test.go.
+	b.cfg.VolumeDataPath = "/var/lib/fred/volumes"
+	// MigrationReadyTimeout must be short in tests so verifyStartup's
+	// no-healthcheck path (fixed wait + inspect) doesn't bloat suite
+	// runtime. StartupVerifyDuration covers the same bound at the
+	// per-poll level.
+	b.cfg.MigrationReadyTimeout = 500 * time.Millisecond
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	// MigrationGracePeriod: keep short so the background -prev cleanup
+	// goroutine doesn't outlive t.Cleanup teardown.
+	b.cfg.MigrationGracePeriod = 100 * time.Millisecond
 
 	return b, state, fakeVol, fakeRel
 }

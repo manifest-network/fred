@@ -3,7 +3,6 @@ package docker
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -52,22 +51,28 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		)
 	}
 	if len(legacyPlans) > 0 {
-		// Execution lives in Task 9; fail loudly so we don't proceed into
-		// the main loop with on-disk state the stack-only paths can't
-		// drive. After Task 9 ships, this branch becomes an executor
-		// invocation that runs to completion before the main loop.
-		//
-		// Surface each lease UUID in the error so operators can correlate
-		// "what's about to break on the next boot" with the planning logs
-		// above. Joining lease UUIDs keeps the error short on the common
-		// 1-lease case while still being useful when several legacy
-		// leases need migration.
-		leaseUUIDs := make([]string, 0, len(legacyPlans))
-		for _, p := range legacyPlans {
-			leaseUUIDs = append(leaseUUIDs, p.LeaseUUID)
+		// Execute each plan atomically per lease. Any per-lease failure
+		// aborts startup with operator-actionable guidance — fred refuses
+		// to run with half-migrated state because the stack-only code
+		// downstream can't drive a mixed cohort.
+		for _, plan := range legacyPlans {
+			if err := b.executeLegacyMigration(ctx, plan, b.logger); err != nil {
+				return fmt.Errorf("legacy migration FAILED: lease %s: %w\n"+
+					"fred refuses to start with unmigrated legacy containers. "+
+					"Investigate the failure cause; re-run fred (migration is idempotent), or "+
+					"deprovision the lease manually if data loss is acceptable.",
+					plan.LeaseUUID, err)
+			}
 		}
-		return fmt.Errorf("recover-time migration required for %d lease(s) [%s] but executor is not yet implemented (Task 9)",
-			len(legacyPlans), strings.Join(leaseUUIDs, ", "))
+		// Re-list managed containers: migration changed every container's
+		// name + label set, so the slice captured at the top of this
+		// function is stale and the main loop below would otherwise see
+		// the old names.
+		refreshed, err := b.docker.ListManagedContainers(ctx)
+		if err != nil {
+			return fmt.Errorf("re-list managed containers after migration: %w", err)
+		}
+		containers = refreshed
 	}
 
 	allocsByLease := make(map[string][]shared.ResourceAllocation)
