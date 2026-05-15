@@ -25,6 +25,39 @@
 //
 // Verification uses hmac.Equal (constant-time) to prevent timing attacks.
 //
+// # Known limitation: cross-endpoint replay within the freshness window
+//
+// The signed payload is "<timestamp>.<body>" — the HTTP method and request
+// URI are NOT bound. An attacker who captures a signed request can replay
+// it within the freshness window (5 minutes on the callback path) against
+// any other endpoint that accepts the same JSON fields. Two concrete
+// shapes in this codebase:
+//
+//   - A signed POST /provision body can be replayed against POST
+//     /deprovision: deprovision uses only lease_uuid and ignores every
+//     other field on the body, so the signature still verifies and the
+//     handler still acts.
+//   - Every empty-body GET shares the same signed payload (only the
+//     timestamp varies). A captured GET /info/{lease_uuid} signature can
+//     therefore be replayed against GET /logs/{lease_uuid} (and vice
+//     versa) for the same lease within the freshness window.
+//
+// This pattern (timestamp + body, no method/URI binding) matches
+// Stripe/GitHub/Slack webhook signing — correct for single-endpoint
+// webhook delivery, but too narrow for this codebase's multi-endpoint
+// shared-JSON-shape HTTP contract. The right fix is to rebind the
+// signature to "<timestamp>.<METHOD>.<uri>.<body>" across all four
+// senders (Fred → backend HTTP client, both backends' callback
+// senders, Fred's callback receiver) and all four verifiers in a
+// coordinated rollout. That work is tracked in ENG-191; the back-
+// compat strategy (header version + dual-verify window) lives in
+// the Linear issue.
+//
+// Until ENG-191 lands: callers should treat the 5-minute freshness
+// window as the effective replay attack surface for any captured
+// signature, and assume the JSON payload alone gates which method/URI
+// pair the attacker can substitute.
+//
 // # Used by
 //
 //   - Backend → Fred callbacks (internal/api/callback_auth.go)

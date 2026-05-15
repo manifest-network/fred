@@ -302,9 +302,11 @@ func relayOutput(t *testing.T, label string, r io.Reader) {
 // binary's listener accepting connections is the only invariant we need.
 func waitForListening(t *testing.T, port int) {
 	t.Helper()
-	// Per-attempt timeout shorter than the poll interval so a stuck
-	// connection on the loopback bind window doesn't eat the whole 3s
-	// deadline in a single try.
+	// Per-attempt timeout (500ms) is longer than the 100ms poll cadence
+	// but well under the overall 3s deadline — a stuck connection on the
+	// loopback bind window can't consume the whole 3s budget in a single
+	// try, so the polling loop keeps a fast cancel cadence and still has
+	// roughly six attempts before the deadline.
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	deadline := time.Now().Add(3 * time.Second)
 	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", port)

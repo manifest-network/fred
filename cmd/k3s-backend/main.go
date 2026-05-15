@@ -61,10 +61,16 @@ func main() {
 		Level: logLevel,
 	}))
 	slog.SetDefault(logger)
+	// Surface both KubeconfigPath and KubeconfigPathList so the operator
+	// can tell at startup which resolver tier will fire. Multi-path
+	// KUBECONFIG populates KubeconfigPathList and leaves KubeconfigPath
+	// empty — without logging both, the empty single-path field would
+	// hide which kubeconfig the backend is actually using.
 	logger.Info("starting k3s-backend",
 		"version", version,
 		"log_level", cfg.LogLevel,
 		"kubeconfig_path", cfg.KubeconfigPath,
+		"kubeconfig_path_list", cfg.KubeconfigPathList,
 	)
 
 	// Log SKU mappings for visibility

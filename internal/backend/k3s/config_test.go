@@ -235,8 +235,9 @@ func TestConfig_Validate_SKUMapping(t *testing.T) {
 	t.Run("unreachable profile", func(t *testing.T) {
 		cfg := validConfig()
 		// "k3s-small" remains mapped via "sku-uuid-1"; "orphan" has no mapping
-		// entry, so the bidirectional unreachability check at config.go:248-260
-		// rejects it.
+		// entry, so the bidirectional unreachability check inside
+		// Config.Validate (the "sku_profiles[...] has no sku_mapping entry"
+		// branch) rejects it.
 		cfg.SKUProfiles["orphan"] = SKUProfile{CPUCores: 1, MemoryMB: 1024, DiskMB: 1024}
 		err := cfg.Validate()
 		require.Error(t, err)

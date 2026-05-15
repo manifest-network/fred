@@ -238,8 +238,13 @@ func (b *Backend) Start(ctx context.Context) error {
 	// (unlike docker.recoverState which scans the daemon). ENG-134+'s
 	// real state-recovery loop will repopulate the map before Start
 	// returns; until then there's no useful count to log.
+	// Log both KubeconfigPath and KubeconfigPathList for the same reason
+	// the startup banner in cmd/k3s-backend/main.go does: multi-path
+	// KUBECONFIG populates only the list, so surfacing KubeconfigPath
+	// alone would obscure which resolver tier the backend will fire.
 	b.logger.Info("k3s backend started",
 		"kubeconfig_path", b.cfg.KubeconfigPath,
+		"kubeconfig_path_list", b.cfg.KubeconfigPathList,
 	)
 	return nil
 }
