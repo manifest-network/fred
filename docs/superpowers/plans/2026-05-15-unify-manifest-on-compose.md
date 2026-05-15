@@ -714,7 +714,7 @@ MigrationReadyTimeout time.Duration
 
 Default them in the same place existing durations are defaulted (search for the config constructor / `Defaults()` analogue). Add a TOML / env binding if the existing config supports that pattern.
 
-- [ ] **Step 8.2: Add `ContainerMount` type and `ContainerInfo.Mounts` field to `internal/backend/docker/lifecycle.go`. Populate from `resp.Mounts` in both `ContainerInspect` (around line 1371) and `ListManagedContainers`.**
+- [ ] **Step 8.2: Add `ContainerMount` type and extend `ContainerInfo` with `Name` and `Mounts` fields in `internal/backend/docker/lifecycle.go`. Populate from `resp.Name`/`c.Names[0]` and `resp.Mounts` in both `ContainerInspect` (around line 1371) and `ListManagedContainers`.**
 
 ```go
 // ContainerMount mirrors the subset of docker's Mount data fred needs for
@@ -727,7 +727,9 @@ type ContainerMount struct {
 }
 ```
 
-Extend `ContainerInfo` with `Mounts []ContainerMount`. In the inspect path, copy `resp.Mounts` into the slice. In `ListManagedContainers`, either issue an extra `ContainerInspect` per container (acceptable cost — runs only at startup) or filter `resp.Mounts` from the existing list-with-inspect helper if one exists.
+Extend `ContainerInfo` with two new fields:
+- `Name string` — populated from `strings.TrimPrefix(resp.Name, "/")` (inspect) or `strings.TrimPrefix(c.Names[0], "/")` (list). Needed by `isLegacyContainer` to apply the `-prev` suffix filter.
+- `Mounts []ContainerMount` — populated from `resp.Mounts`. In `ListManagedContainers`, either issue an extra `ContainerInspect` per container (acceptable cost — runs only at startup) or filter `resp.Mounts` from the existing list-with-inspect helper if one exists.
 
 - [ ] **Step 8.3: Add `RecordMigration` to `internal/backend/shared/releases.go`.**
 
@@ -815,7 +817,7 @@ func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo,
 
 func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID string, group []ContainerInfo, logger *slog.Logger) (*legacyMigration, error) {
     // Manifest source: release store. No in-container reconstruction.
-    rel, relErr := b.releases.LatestActive(leaseUUID)
+    rel, relErr := b.releaseStore.LatestActive(leaseUUID)
     if relErr != nil || rel == nil || len(rel.Manifest) == 0 {
         return nil, fmt.Errorf("release store has no active manifest for lease %s; cannot migrate (operator: investigate or deprovision)", leaseUUID)
     }
@@ -881,7 +883,7 @@ func sortInstancesByIndex(xs []legacyMigrationInstance) {
 }
 ```
 
-(Symbol notes verified against the codebase: the field is `b.compose`, the interface is unexported `volumeManager` with field `b.volumes`, the release store field is `b.releases`. The `ContainerInspect` return shape includes `Mounts` after Step 8.2. Use real names; do not invent.)
+(Symbol notes verified against the codebase: the field is `b.compose`, the interface is unexported `volumeManager` with field `b.volumes`, the release store field is `b.releaseStore`. The `ContainerInspect` return shape includes `Mounts` after Step 8.2. Use real names; do not invent.)
 
 - [ ] **Step 8.5: At the top of `recoverState` in `recover.go` (after the existing `ListManagedContainers` call near line 25), insert the pre-pass — plan only, no execution yet.**
 
@@ -940,7 +942,7 @@ git commit -m "feat(docker): scaffold legacy→stack recover-time migration (per
 - Modify: `internal/backend/docker/migrate.go`
 - Modify: `internal/backend/docker/recover.go`
 
-- [ ] **Step 9.1: Add `executeLegacyMigration` to `migrate.go`.** Real symbol names (`b.compose`, `b.volumes`, `b.releases`, `VolBinds`); per-lease atomic; stateless-safe.
+- [ ] **Step 9.1: Add `executeLegacyMigration` to `migrate.go`.** Real symbol names (`b.compose`, `b.volumes`, `b.releaseStore`, `VolBinds`); per-lease atomic; stateless-safe.
 
 ```go
 func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration, logger *slog.Logger) error {
@@ -1024,15 +1026,18 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
         return fmt.Errorf("compose up: %w", err)
     }
 
-    // 5. Wait for ready. Reuse waitForHealthy (provision.go:1133). It expects
-    //    container IDs; resolve them via b.docker.ListByName per new name.
+    // 5. Wait for ready. Reuse waitForHealthy (provision.go:1133), whose
+    //    real signature is waitForHealthy(ctx, containerIDs []string, logger *slog.Logger).
+    //    Resolve IDs by listing containers and matching new names; if a helper
+    //    doesn't exist, add a minimal `b.docker.ListByName(ctx, names)` (or scan
+    //    the result of `ListManagedContainers` and filter by ContainerInfo.Name).
     newIDs, err := b.resolveContainerIDsByName(ctx, namesOf(m.Instances))
     if err != nil {
         return fmt.Errorf("resolve new container IDs: %w", err)
     }
     readyCtx, cancel := context.WithTimeout(ctx, b.cfg.MigrationReadyTimeout)
     defer cancel()
-    if err := b.waitForHealthy(readyCtx, newIDs, svc.HealthCheck); err != nil {
+    if err := b.waitForHealthy(readyCtx, newIDs, logger); err != nil {
         return fmt.Errorf("wait for ready: %w", err)
     }
 
@@ -1054,7 +1059,7 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 
     // 7. Persist wrapped manifest into release store (idempotent).
     if data, mErr := json.Marshal(m.Stack); mErr == nil {
-        if persistErr := b.releases.RecordMigration(m.LeaseUUID, data); persistErr != nil {
+        if persistErr := b.releaseStore.RecordMigration(m.LeaseUUID, data); persistErr != nil {
             logger.Warn("release store update failed (migration still complete)", "error", persistErr)
         }
     }
@@ -1079,7 +1084,7 @@ func namesOf(insts []legacyMigrationInstance) []string {
 }
 ```
 
-(If `volumeManager.HostPath` does not exist, add a minimal accessor returning `filepath.Join(<rootDir>, name)` for xfs/btrfs and the dataset mountpoint for zfs. If `resolveContainerIDsByName` / `waitForHealthy` signatures differ, adapt — do not invent.)
+(`volumeManager.HostPath` is added in Task 10 Step 10.1b. `resolveContainerIDsByName` does not exist in the codebase today — add a minimal helper on `*Backend` that filters `ListManagedContainers` output by `ContainerInfo.Name` (the new field added in Task 8.2). `waitForHealthy`'s real signature is `waitForHealthy(ctx, containerIDs []string, logger *slog.Logger)` — pass the local `logger`, not the healthcheck spec.)
 
 - [ ] **Step 9.2: In `recover.go`, replace the placeholder `return fmt.Errorf("...pending Task 9...")` with the execution loop, followed by a re-list of managed containers so the main loop sees post-migration state.**
 
@@ -1158,14 +1163,14 @@ git commit -m "feat(docker): execute legacy→stack migration at recover time (p
 RenameVolume(oldName, newName string) error
 ```
 
-- [ ] **Step 10.1b: If Task 9 references it, add a `HostPath(name string) string` method on `volumeManager` returning the host directory for a given volume name. xfs/btrfs return `filepath.Join(<root>, name)`; zfs returns the dataset mountpoint (`<parentMount>/<name>` for the project's layout — verify in `volume_zfs.go`).**
+- [ ] **Step 10.1b: If Task 9 references it, add a `HostPath(name string) string` method on `volumeManager` returning the host directory for a given volume name. xfs/btrfs return `filepath.Join(b.dataPath, name)`; zfs returns the dataset mountpoint (resolve from `b.parentDataset` — verify in `volume_zfs.go`).**
 
 - [ ] **Step 10.2: Implement for xfs in `volume_xfs.go`:**
 
 ```go
-func (b *xfsVolumeBackend) RenameVolume(oldName, newName string) error {
-    oldPath := filepath.Join(b.root, oldName)
-    newPath := filepath.Join(b.root, newName)
+func (b *xfsVolumeManager) RenameVolume(oldName, newName string) error {
+    oldPath := filepath.Join(b.dataPath, oldName)
+    newPath := filepath.Join(b.dataPath, newName)
     return atomicRenameVolumeDir(oldPath, newPath)
 }
 ```
@@ -1206,9 +1211,9 @@ func pathExists(p string) (bool, error) {
 - [ ] **Step 10.3: Implement for btrfs in `volume_btrfs.go` — same as xfs (plain `os.Rename` works on btrfs subvolume roots).**
 
 ```go
-func (b *btrfsVolumeBackend) RenameVolume(oldName, newName string) error {
-    oldPath := filepath.Join(b.root, oldName)
-    newPath := filepath.Join(b.root, newName)
+func (b *btrfsVolumeManager) RenameVolume(oldName, newName string) error {
+    oldPath := filepath.Join(b.dataPath, oldName)
+    newPath := filepath.Join(b.dataPath, newName)
     return atomicRenameVolumeDir(oldPath, newPath)
 }
 ```
@@ -1216,9 +1221,9 @@ func (b *btrfsVolumeBackend) RenameVolume(oldName, newName string) error {
 - [ ] **Step 10.4: Implement for zfs in `volume_zfs.go` via `zfs rename` shellout (matching the style of other zfs commands in this file):**
 
 ```go
-func (b *zfsVolumeBackend) RenameVolume(oldName, newName string) error {
-    oldDataset := b.dataset + "/" + oldName
-    newDataset := b.dataset + "/" + newName
+func (b *zfsVolumeManager) RenameVolume(oldName, newName string) error {
+    oldDataset := b.parentDataset + "/" + oldName
+    newDataset := b.parentDataset + "/" + newName
     // Idempotency: check existence before issuing the rename.
     oldExists, _ := b.datasetExists(oldDataset)
     newExists, _ := b.datasetExists(newDataset)
@@ -1253,7 +1258,7 @@ Expected: PASS (where existing tests cover); add a new test asserting idempotenc
 ```go
 func TestRenameVolume_Idempotent_xfs(t *testing.T) {
     root := t.TempDir()
-    b := &xfsVolumeBackend{root: root}
+    b := &xfsVolumeManager{dataPath: root}
     require.NoError(t, os.MkdirAll(filepath.Join(root, "a"), 0o755))
     require.NoError(t, b.RenameVolume("a", "b"))
     // second call: 'a' is gone, 'b' exists — should succeed silently.
