@@ -1473,12 +1473,16 @@ git commit -m "refactor(docker): delete legacy doProvision/doRestart/doUpdate/do
 
 ## Task 15: Delete `IsStack` and finalize the manifest API
 
-**Goal:** Remove the now-unreferenced `IsStack` helper. Delete the transitional `type Manifest = flatManifest` alias introduced in Task 2 (commit `c5c27ad`). Clean up `prov.Image`-style legacy fields if they remain unused.
+**Goal:** Remove the now-unreferenced `IsStack` helper and its branches throughout the code. Drop the legacy `ProvisionState.Manifest` single-manifest field and clean up `prov.Image`-style legacy fields. **The `type Manifest = flatManifest` alias STAYS** (see scope note below).
+
+**Scope note on the `Manifest` alias:** The alias was introduced in Task 2 (`c5c27ad`) and originally framed as transitional pending Task 14's legacy-body deletion. That framing was wrong. The alias serves a **permanent architectural purpose** as the exported entry point for the per-service manifest type — every function/field that holds a `*<per-service-manifest>` across package boundaries needs an exported name (e.g., `composeServiceParams.Manifest`, `setupVolBinds`'s `services map[string]*manifest.Manifest`, `verifyStartup`, `CreateContainerParams.Manifest`, `ProvisionSuccessResult.Manifest` for the per-service result). Removing the alias would require either (a) re-promoting `flatManifest` to exported with a different name (e.g., `Service`), or (b) changing every signature to `*StackManifest, serviceName string` and doing internal lookups. Either is a separate, scoped refactor — out of scope for Task 15 and not covered by the spec. **Task 2's "Manifest demoted to flatManifest" remains accurate in spirit** (legacy single-service uses are gone; the exported name now only references the per-service type within a stack). Update the alias's docstring in this task to reflect its permanent role; do NOT delete it.
 
 **Files:**
-- Modify: `internal/backend/client.go`
-- Modify: `internal/backend/shared/manifest/manifest.go` (drop the `type Manifest = flatManifest` alias)
-- Modify: `internal/backend/shared/leasesm/leasesm.go`, `lease_sm.go`
+- Modify: `internal/backend/client.go` (delete `IsStack` function)
+- Modify: `internal/backend/shared/leasesm/lease_sm.go` (delete `ProvisionState.IsStack` method, drop `ProvisionState.Manifest` single-manifest field if unused)
+- Modify: `internal/backend/docker/info.go` (drop `prov.IsStack()` branch in `GetLogs`)
+- Modify: `internal/backend/docker/recover.go` (drop any `IsStack`-gated orphan volume cleanup branch)
+- Modify: `internal/backend/shared/manifest/manifest.go` (reframe alias docstring; do NOT delete)
 
 - [ ] **Step 15.1: Confirm no callers remain.**
 
@@ -1486,29 +1490,28 @@ git commit -m "refactor(docker): delete legacy doProvision/doRestart/doUpdate/do
 grep -rn "\.IsStack\b\|backend\.IsStack\b" --include="*.go" .
 ```
 
-Expected: no matches. If matches remain, update them to use the unified path.
+Expected: hits in `info.go` (GetLogs), possibly `recover.go` (orphan volume cleanup), and possibly `lifecycle.go` (`ContainerLogKeys`). All become unreachable after Step 15.4 deletes IsStack.
 
-- [ ] **Step 15.2: Delete `IsStack` (client.go:121-132).**
+- [ ] **Step 15.2: Delete `backend.IsStack`** (client.go:121-132) and `ProvisionState.IsStack` method.
 
-- [ ] **Step 15.3: Drop the transitional `Manifest` alias and confirm zero references.**
+- [ ] **Step 15.3: Reframe the `Manifest` alias docstring.**
 
-The alias `type Manifest = flatManifest` was introduced in Task 2 (commit `c5c27ad`) as a transitional shim so legacy `doProvision`/`doRestart`/`doUpdate` bodies could still reference `manifest.Manifest` until Task 14 deleted them. After Task 14 nothing should reference the alias anymore — **including test fixtures**, which the deletion below would break.
+Replace the `// Deprecated:` doc block on `type Manifest = flatManifest` with a docstring that honestly describes the alias's role:
 
-**Acceptance gate (must show zero hits, _test.go files included):**
-
-```bash
-# External references — must be zero (including tests; the alias deletion breaks them too).
-grep -rn "manifest\.Manifest\b" --include="*.go" . | grep -v 'internal/backend/shared/manifest/'
-
-# The alias declaration itself — exactly one hit (the line about to be deleted).
-grep -rn "^type Manifest\b\|^type Manifest " internal/backend/shared/manifest/
+```go
+// Manifest is the per-service manifest type referenced across package
+// boundaries. It is an exported alias for the internal flatManifest
+// (used as map values in StackManifest.Services). External code that
+// holds a per-service manifest pointer (e.g., composeServiceParams,
+// CreateContainerParams, ProvisionSuccessResult) references this name.
+//
+// Note: Manifest no longer represents a "legacy single-service" payload —
+// ParsePayload always returns a *StackManifest. Use *StackManifest for
+// any stack-level handle; use *Manifest only for per-service references.
+type Manifest = flatManifest
 ```
 
-If the first grep finds any hit — production OR test — fix the holdout before deleting the alias. Production code: migrate to `*manifest.StackManifest` (or destructure to a `*flatManifest` local inside the manifest package via a helper). Test code: typically `manifest.Manifest{Image: ...}` literals — convert to `&manifest.StackManifest{Services: map[string]*flatManifest{...}}` via a helper exposed from the manifest package, or fold the conversion into Task 16's rebaseline and run that part of Task 16 first.
-
-**Do NOT re-introduce the alias** to silence this gate — the whole point of Task 15 is to retire it.
-
-After confirming zero external hits, delete the `type Manifest = flatManifest` line and its `// Deprecated:` doc block from `internal/backend/shared/manifest/manifest.go`.
+Do NOT delete the alias.
 
 - [ ] **Step 15.4: Audit `ProvisionState.Image` and `prov.Manifest` (single).**
 
@@ -1540,7 +1543,7 @@ Expected: stack-format tests PASS.
 
 ```bash
 git add internal/backend/client.go internal/backend/shared/manifest/ internal/backend/shared/leasesm/ internal/backend/docker/
-git commit -m "refactor: delete IsStack and transitional Manifest alias; finalize manifest API surface"
+git commit -m "refactor: delete IsStack; finalize manifest API surface"
 ```
 
 ---
