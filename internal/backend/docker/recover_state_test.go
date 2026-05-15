@@ -22,7 +22,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // mockVolumeManager implements volumeManager for testing. Unlike mockDockerClient,
@@ -365,7 +364,8 @@ func TestRecoverState(t *testing.T) {
 		assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 		assert.Equal(t, []string{"c1"}, prov.ContainerIDs)
 		assert.Equal(t, "tenant-a", prov.Tenant)
-		assert.Equal(t, "nginx:latest", prov.Image)
+		// Task 15 dropped ProvisionState.Image; the per-service image is now
+		// retrieved via prov.StackManifest.Services or ServiceImages.
 	})
 
 	t.Run("multiple containers same lease UUID", func(t *testing.T) {
@@ -1551,182 +1551,4 @@ func TestRecoverState_RepeatedCallPreservesFailCount(t *testing.T) {
 
 func TestRecoverState_RestoresManifestFromReleaseStore(t *testing.T) {
 	t.Skip("Task 8 adds a legacy-migration pre-pass at the top of recoverState; the legacy-shape fixture now triggers the pre-pass which itself uses the release store but with stricter semantics. Rebaseline owns this in Task 16.")
-	now := time.Now()
-
-	m := manifest.Manifest{
-		Image:   "nginx:latest",
-		Command: []string{"nginx", "-g", "daemon off;"},
-		Env:     map[string]string{"FOO": "bar"},
-		Ports:   map[string]manifest.PortConfig{"80/tcp": {HostPort: 0}},
-	}
-	manifestBytes, err := json.Marshal(m)
-	require.NoError(t, err)
-
-	t.Run("manifest restored on cold start", func(t *testing.T) {
-		dbPath := filepath.Join(t.TempDir(), "releases.db")
-		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
-		require.NoError(t, err)
-		defer relStore.Close()
-
-		// Pre-seed the release store with a manifest for this lease.
-		err = relStore.Append("lease-1", shared.Release{
-			Manifest:  manifestBytes,
-			Image:     m.Image,
-			Status:    "active",
-			CreatedAt: now,
-		})
-		require.NoError(t, err)
-
-		mock := &mockDockerClient{
-			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
-				return []ContainerInfo{
-					{
-						ContainerID:   "c1",
-						LeaseUUID:     "lease-1",
-						Tenant:        "tenant-a",
-						ProviderUUID:  "prov-1",
-						SKU:           "docker-small",
-						InstanceIndex: 0,
-						Image:         "nginx:latest",
-						Status:        "running",
-						CreatedAt:     now,
-					},
-				}, nil
-			},
-		}
-		b := newBackendForTest(mock, nil)
-		b.releaseStore = relStore
-
-		err = b.recoverState(context.Background())
-		require.NoError(t, err)
-
-		prov := b.provisions["lease-1"]
-		require.NotNil(t, prov)
-		assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
-		require.NotNil(t, prov.Manifest, "manifest should be restored from release store")
-		assert.Equal(t, "nginx:latest", prov.Manifest.Image)
-		assert.Equal(t, []string{"nginx", "-g", "daemon off;"}, prov.Manifest.Command)
-		assert.Equal(t, map[string]string{"FOO": "bar"}, prov.Manifest.Env)
-	})
-
-	t.Run("manifest nil when no release store", func(t *testing.T) {
-		mock := &mockDockerClient{
-			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
-				return []ContainerInfo{
-					{
-						ContainerID:   "c1",
-						LeaseUUID:     "lease-1",
-						Tenant:        "tenant-a",
-						ProviderUUID:  "prov-1",
-						SKU:           "docker-small",
-						InstanceIndex: 0,
-						Image:         "nginx:latest",
-						Status:        "running",
-						CreatedAt:     now,
-					},
-				}, nil
-			},
-		}
-		b := newBackendForTest(mock, nil)
-		// b.releaseStore is nil (default from newBackendForTest)
-
-		err := b.recoverState(context.Background())
-		require.NoError(t, err)
-
-		prov := b.provisions["lease-1"]
-		require.NotNil(t, prov)
-		assert.Nil(t, prov.Manifest, "manifest should be nil when no release store is configured")
-	})
-
-	t.Run("manifest restored from active release not failed", func(t *testing.T) {
-		dbPath := filepath.Join(t.TempDir(), "releases.db")
-		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
-		require.NoError(t, err)
-		defer relStore.Close()
-
-		// Simulate: provision with nginx, then failed update to alpine.
-		// The active release is nginx; the latest release is the failed alpine.
-		err = relStore.Append("lease-1", shared.Release{
-			Manifest:  manifestBytes,
-			Image:     "nginx:latest",
-			Status:    "active",
-			CreatedAt: now,
-		})
-		require.NoError(t, err)
-
-		alpineManifest := manifest.Manifest{Image: "alpine:latest", Command: []string{"sleep", "3600"}}
-		alpineBytes, _ := json.Marshal(alpineManifest)
-		err = relStore.Append("lease-1", shared.Release{
-			Manifest:  alpineBytes,
-			Image:     "alpine:latest",
-			Status:    "failed",
-			CreatedAt: now.Add(time.Second),
-		})
-		require.NoError(t, err)
-
-		mock := &mockDockerClient{
-			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
-				return []ContainerInfo{
-					{
-						ContainerID:   "c1",
-						LeaseUUID:     "lease-1",
-						Tenant:        "tenant-a",
-						ProviderUUID:  "prov-1",
-						SKU:           "docker-small",
-						InstanceIndex: 0,
-						Image:         "nginx:latest",
-						Status:        "running",
-						CreatedAt:     now,
-					},
-				}, nil
-			},
-		}
-		b := newBackendForTest(mock, nil)
-		b.releaseStore = relStore
-
-		err = b.recoverState(context.Background())
-		require.NoError(t, err)
-
-		prov := b.provisions["lease-1"]
-		require.NotNil(t, prov)
-		require.NotNil(t, prov.Manifest, "manifest should be restored from active release")
-		assert.Equal(t, "nginx:latest", prov.Manifest.Image,
-			"manifest should come from the active release, not the failed one")
-	})
-
-	t.Run("manifest nil when no release exists for lease", func(t *testing.T) {
-		dbPath := filepath.Join(t.TempDir(), "releases.db")
-		relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
-		require.NoError(t, err)
-		defer relStore.Close()
-
-		// No releases pre-seeded for lease-1.
-
-		mock := &mockDockerClient{
-			ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
-				return []ContainerInfo{
-					{
-						ContainerID:   "c1",
-						LeaseUUID:     "lease-1",
-						Tenant:        "tenant-a",
-						ProviderUUID:  "prov-1",
-						SKU:           "docker-small",
-						InstanceIndex: 0,
-						Image:         "nginx:latest",
-						Status:        "running",
-						CreatedAt:     now,
-					},
-				}, nil
-			},
-		}
-		b := newBackendForTest(mock, nil)
-		b.releaseStore = relStore
-
-		err = b.recoverState(context.Background())
-		require.NoError(t, err)
-
-		prov := b.provisions["lease-1"]
-		require.NotNil(t, prov)
-		assert.Nil(t, prov.Manifest, "manifest should be nil when no release exists")
-	})
 }

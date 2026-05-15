@@ -454,9 +454,6 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		p.Status = backend.ProvisionStatusReady
 		p.ContainerIDs = result.ContainerIDs
 		p.LastError = ""
-		if result.Manifest != nil {
-			p.Manifest = result.Manifest
-		}
 		if result.StackManifest != nil {
 			p.StackManifest = result.StackManifest
 		}
@@ -721,7 +718,6 @@ type diagResult struct {
 // the value and returns it via the ProvisionRequestedMsg.Work signature.
 type ProvisionSuccessResult struct {
 	ContainerIDs      []string
-	Manifest          *manifest.Manifest
 	StackManifest     *manifest.StackManifest
 	ServiceContainers map[string][]string
 }
@@ -973,10 +969,7 @@ func DiagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
 // and stays stable across stack lifecycle events as long as the
 // ServiceContainers map is consistent.
 func ContainerLogKeys(prov *ProvisionState) map[string]string {
-	if prov == nil || !prov.IsStack() {
-		return nil
-	}
-	if len(prov.ServiceContainers) == 0 {
+	if prov == nil || len(prov.ServiceContainers) == 0 {
 		return nil
 	}
 	keys := make(map[string]string)

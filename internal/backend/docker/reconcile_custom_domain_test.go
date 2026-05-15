@@ -14,7 +14,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestReconcileCustomDomain_NoProvision(t *testing.T) {
@@ -266,13 +265,11 @@ func TestReconcileCustomDomain_Set(t *testing.T) {
 	// Empty → "foo.example.com": worker must rebuild containers with the
 	// new CustomDomain on CreateContainerParams; in-memory state must
 	// reflect the new value after success.
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
 		Status:       backend.ProvisionStatusReady,
-		Manifest:     manifest,
 		ContainerIDs: []string{"old-c1"},
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: ""},
@@ -301,13 +298,11 @@ func TestReconcileCustomDomain_Cleared(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; this test's legacy prov.Manifest fixture triggers a Restart that now exits with ErrInvalidState. Rebaseline owns this in Task 16.")
 	// "foo.example.com" → "": worker must rebuild containers with no
 	// secondary router; in-memory CustomDomain reverts to "".
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
 		Status:       backend.ProvisionStatusReady,
-		Manifest:     manifest,
 		ContainerIDs: []string{"old-c1"},
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
@@ -335,13 +330,11 @@ func TestReconcileCustomDomain_Cleared(t *testing.T) {
 func TestReconcileCustomDomain_Changed(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; this test's legacy prov.Manifest fixture triggers a Restart that now exits with ErrInvalidState. Rebaseline owns this in Task 16.")
 	// "foo.example.com" → "bar.example.com".
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
 	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
 		Status:       backend.ProvisionStatusReady,
-		Manifest:     manifest,
 		ContainerIDs: []string{"old-c1"},
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
@@ -374,7 +367,6 @@ func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
 		ProviderUUID:  "prov-1",
 		SKU:           "docker-small",
 		Status:        backend.ProvisionStatusReady,
-		Manifest:      nil, // no manifest → Restart() returns ErrInvalidState
 		StackManifest: nil,
 		ContainerIDs:  []string{"old-c1"},
 		Items: []backend.LeaseItem{
@@ -419,7 +411,6 @@ func TestReconcileCustomDomain_RollbackUsesServiceNameNotIndex(t *testing.T) {
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
 		Status:       backend.ProvisionStatusReady,
-		Manifest:     nil, // no manifest → Restart() returns ErrInvalidState synchronously
 		ContainerIDs: []string{"old-c1"},
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "db", CustomDomain: ""},
@@ -479,7 +470,6 @@ func TestReconcileCustomDomain_RollbackIsCASGated(t *testing.T) {
 		ProviderUUID: "prov-1",
 		SKU:          "docker-small",
 		Status:       backend.ProvisionStatusReady,
-		Manifest:     nil,
 		ContainerIDs: []string{"old-c1"},
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "old.example.com"},

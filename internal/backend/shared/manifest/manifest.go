@@ -43,14 +43,22 @@ import (
 // consistent.
 const DefaultServiceName = "app"
 
-// Manifest is a transitional alias for callers that still hold a per-service
-// type. New code should use *StackManifest and destructure via
-// stack.Services[DefaultServiceName].
+// Manifest is the exported alias for the per-service manifest type within
+// a StackManifest. Function signatures that operate on an individual
+// service inside a stack (compose project builders, container-create
+// params, readiness waiters) take *Manifest to receive a service's spec
+// by reference; the underlying type is the unexported flatManifest, kept
+// unexported so the JSON wire format stays single-rooted under "services"
+// (no external code can construct a top-level flat manifest by
+// value-literal).
 //
-// Deprecated: this alias exists only until Task 14/15 deletes the legacy
-// doProvision/doRestart/doUpdate code paths. Removal is tracked in the
-// "Sunset hard" follow-up and is non-negotiable — do not add new external
-// references to manifest.Manifest. The alias must be deleted in Task 15.
+// This alias is permanent — it is NOT transitional. The original Task 2
+// commit framed it as a "transitional shim" pending removal in Task 14/15,
+// but the Task 15 analysis surfaced that external packages legitimately
+// hold per-service references via this name and the alias serves an
+// ongoing role. The exported manifest API is StackManifest as the
+// top-level wire shape plus Manifest as the per-service handle for
+// in-process traversal.
 type Manifest = flatManifest
 
 // serviceNameRe restricts service names to DNS-label-safe characters.

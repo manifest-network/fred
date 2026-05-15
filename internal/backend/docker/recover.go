@@ -112,7 +112,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Tenant:       c.Tenant,
 					ProviderUUID: c.ProviderUUID,
 					SKU:          c.SKU,
-					Image:        c.Image,
 					Status:       containerStatusToProvisionStatus(c.Status),
 					CreatedAt:    c.CreatedAt,
 					FailCount:    c.FailCount,
@@ -126,34 +125,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// in labels). Using LatestActive avoids picking up a failed
 			// release (e.g., a failed update to a newer image).
 			//
-			// ParsePayload now always returns a *StackManifest (legacy flat
-			// payloads are auto-wrapped under DefaultServiceName). Until
-			// Tasks 4-7 collapse the legacy execution paths, the recovered
-			// provision state still wants prov.Manifest populated for
-			// 1-service auto-wrapped recoveries so legacy restart/update
-			// can run; multi-service stacks populate prov.StackManifest as
-			// before. Task 15 collapses prov.Manifest entirely.
+			// ParsePayload always returns a *StackManifest (legacy flat
+			// payloads are auto-wrapped under DefaultServiceName). After
+			// Task 9's recover-time migration runs, every recovered
+			// provision is stack-form on disk, so the populated field is
+			// always prov.StackManifest.
 			if b.releaseStore != nil {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
 					stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
-					switch {
-					case payloadErr != nil:
+					if payloadErr != nil {
 						b.logger.Warn("failed to parse recovered manifest",
 							"lease_uuid", c.LeaseUUID, "error", payloadErr)
-					case c.ServiceName != "":
-						// Stack-form container — store the full stack.
-						prov.StackManifest = stackM
-					case stackM != nil && len(stackM.Services) == 1:
-						// Legacy single-service container — auto-wrapped
-						// payload exposes the per-service manifest under
-						// DefaultServiceName. Populate prov.Manifest for
-						// the legacy code paths that still consume it.
-						if svc := stackM.Services[manifest.DefaultServiceName]; svc != nil {
-							prov.Manifest = svc
-						} else {
-							prov.StackManifest = stackM
-						}
-					default:
+					} else {
 						prov.StackManifest = stackM
 					}
 				}
@@ -509,19 +492,17 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 		return nil
 	}
 
-	// Build set of expected volume IDs from recovered provisions.
+	// Build set of expected volume IDs from recovered provisions. Volume
+	// IDs are always service-aware now (fred-{lease}-{service}-{idx});
+	// Task 9's recover-time migration renames any pre-existing legacy
+	// fred-{lease}-{idx} volumes onto this convention before the main
+	// loop sees them.
 	expected := make(map[string]bool)
 	b.provisionsMu.RLock()
 	for leaseUUID, prov := range b.provisions {
-		if prov.IsStack() {
-			for _, item := range prov.Items {
-				for i := range item.Quantity {
-					expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
-				}
-			}
-		} else {
-			for i := range prov.Quantity {
-				expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
+		for _, item := range prov.Items {
+			for i := range item.Quantity {
+				expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
 			}
 		}
 	}

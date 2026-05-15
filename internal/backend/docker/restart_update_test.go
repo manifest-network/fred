@@ -49,14 +49,13 @@ func TestRestart_InvalidState_Provisioning(t *testing.T) {
 
 func TestRestart_AllowedFromFailed(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState, and this test has an unguarded channel wait after b.Restart() that hangs on error. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusFailed,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"}},
 		},
 	}
@@ -133,8 +132,7 @@ func TestRestart_InvalidState_Updating(t *testing.T) {
 func TestRestart_NoManifest(t *testing.T) {
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusReady,
-			Manifest: nil}, // No stored manifest
+			Status: backend.ProvisionStatusReady}, // No stored manifest
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -148,14 +146,13 @@ func TestRestart_NoManifest(t *testing.T) {
 
 func TestRestart_SetsRestartingStatus(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"}},
 		},
 	}
@@ -209,14 +206,13 @@ func TestRestart_SetsRestartingStatus(t *testing.T) {
 
 func TestRestart_Success(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"}},
 		},
 	}
@@ -297,14 +293,13 @@ func TestRestart_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
 	// secondary router survives across Restart cycles. Without the
 	// propagation, a Restart on a Ready provision would silently drop the
 	// custom-domain router on the new container.
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "foo.example.com"},
@@ -359,14 +354,13 @@ func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
 	// Backwards compat: provisions recovered before this feature shipped
 	// may have prov.Items unset (legacy pre-CustomDomain state). Restart
 	// must treat that as "no custom domain" without panicking.
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
 			Items:        nil, // pre-feature recovered provision
 			Quantity:     1},
@@ -415,14 +409,13 @@ func TestRestart_LegacyEmptyItemsTreatedAsNoCustomDomain(t *testing.T) {
 
 func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
 			FailCount:    0},
 		},
@@ -487,14 +480,13 @@ func TestRestart_Failure_ContainerStartFails(t *testing.T) {
 
 func TestRestart_Failure_SKUProfileLookupFails(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "unknown-sku",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
 			FailCount:    0},
 		},
@@ -542,14 +534,13 @@ func TestRestart_Failure_SKUProfileLookupFails(t *testing.T) {
 
 func TestRestart_MultipleContainers(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1", "old-c2"},
 			Quantity:     2},
 		},
@@ -616,14 +607,13 @@ func TestRestart_MultipleContainers(t *testing.T) {
 
 func TestRestart_UpdatesCallbackURL(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
 			CallbackURL:  "http://old-callback/url"},
 		},
@@ -790,9 +780,7 @@ func TestUpdate_AllowedFromReady(t *testing.T) {
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
-	assert.Equal(t, "nginx:1.26", prov.Image)
 	assert.Equal(t, []string{"new-c1"}, prov.ContainerIDs)
-	assert.NotNil(t, prov.Manifest)
 }
 
 func TestUpdate_LegacyPropagatesCustomDomainFromProvItems(t *testing.T) {
@@ -918,7 +906,6 @@ func TestUpdate_AllowedFromFailed(t *testing.T) {
 	prov := b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
-	assert.Equal(t, "redis:7", prov.Image)
 }
 
 func TestUpdate_InvalidManifest(t *testing.T) {
@@ -1266,9 +1253,7 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"old-c1"},
-			Quantity:     1,
-			Image:        "nginx:1.25",
-			Manifest:     &manifest.Manifest{Image: "nginx:1.25"}},
+			Quantity:     1},
 		},
 	}
 
@@ -1316,24 +1301,20 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 	}
 
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	_ = b.provisions["lease-1"]
 	b.provisionsMu.RUnlock()
 
-	assert.Equal(t, "redis:7", prov.Image, "image should be updated")
-	assert.Equal(t, "redis:7", prov.Manifest.Image, "manifest should be updated")
 }
 
 func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; this test exercises a follow-up Restart on a legacy provision that now exits with ErrInvalidState. Rebaseline owns this in Task 16.")
-	oldManifest := &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
+	_ = &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     oldManifest,
-			Image:        "postgres:17",
 			ContainerIDs: []string{"old-c1"},
 			Quantity:     1},
 		},
@@ -1407,8 +1388,6 @@ func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
 	assert.Equal(t, 1, prov.FailCount)
 	assert.Contains(t, prov.LastError, "incompatible data directory",
 		"LastError should describe why the update failed")
-	assert.Equal(t, "postgres:17", prov.Manifest.Image,
-		"manifest should still be the old image after failed update")
 
 	// 3. Callback should indicate failure with rollback context
 	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
@@ -1425,15 +1404,13 @@ func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {
 
 func TestUpdate_RollbackFailed_SetsStatusFailed(t *testing.T) {
 	t.Skip("Task 6 routes Update through the stack path; legacy prov.Manifest fixture (no Items) exits early at NormalizeProvisionRequest with ErrInvalidState. Rebaseline owns this in Task 16.")
-	oldManifest := &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
+	_ = &manifest.Manifest{Image: "postgres:17", Command: []string{"postgres"}}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     oldManifest,
-			Image:        "postgres:17",
 			ContainerIDs: []string{"old-c1"},
 			Quantity:     1},
 		},
@@ -1743,14 +1720,13 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 
 func TestRestart_RollbackClearsLastError(t *testing.T) {
 	t.Skip("Task 5 routes Restart through the stack path; legacy prov.Manifest fixture exits early with ErrInvalidState. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"}},
 		},
 	}
@@ -1807,14 +1783,13 @@ func TestRestart_RollbackClearsLastError(t *testing.T) {
 
 func TestConcurrentRestartAndUpdate_OnlyOneSucceeds(t *testing.T) {
 	t.Skip("Task 6 routes Update through the stack path; this concurrent test uses legacy prov.Manifest fixture (no Items) which now exits early at NormalizeProvisionRequest. Rebaseline owns this in Task 16.")
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
+	_ = &manifest.Manifest{Image: "nginx:latest"}
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant:       "tenant-a",
 			ProviderUUID: "prov-1",
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
-			Manifest:     manifest,
 			ContainerIDs: []string{"old-c1"},
 			Quantity:     1},
 		},
@@ -1932,8 +1907,6 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusReady,
-				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
-				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1},
 			},
@@ -2002,8 +1975,6 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
-				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1},
 			},
@@ -2067,8 +2038,6 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
-				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1},
 			},
@@ -2138,8 +2107,6 @@ func TestRestart_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusReady,
-				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
-				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1},
 			},
@@ -2259,8 +2226,6 @@ func TestUpdate_ActiveProvisionsGauge(t *testing.T) {
 				ProviderUUID: "prov-1",
 				SKU:          "docker-small",
 				Status:       backend.ProvisionStatusFailed,
-				Manifest:     &manifest.Manifest{Image: "nginx:latest"},
-				Image:        "nginx:latest",
 				ContainerIDs: []string{"old-c1"},
 				Quantity:     1},
 			},

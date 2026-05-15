@@ -100,14 +100,6 @@ type DiagnosticsGatherer interface {
 	GatherDiagnostics(ctx context.Context, instanceID string, state *InstanceState) string
 }
 
-// IsStack returns true when this provision represents a stack
-// deployment (multi-service). Methods on ProvisionState are limited
-// to substrate-agnostic queries; substrate-specific behavior lives in
-// the substrate package's adapter or on a wrapper.
-func (p *ProvisionState) IsStack() bool {
-	return p.StackManifest != nil
-}
-
 // ProvisionState is the substrate-agnostic snapshot of a lease's
 // provision record. The lease state machine and actor reason about
 // these fields exclusively; substrate-specific state is kept
@@ -138,7 +130,6 @@ type ProvisionState struct {
 	Tenant            string
 	ProviderUUID      string
 	SKU               string
-	Image             string
 	Status            backend.ProvisionStatus
 	Quantity          int
 	CreatedAt         time.Time
@@ -147,7 +138,8 @@ type ProvisionState struct {
 	CallbackURL       string
 	Items             []backend.LeaseItem
 	ContainerIDs      []string
-	Manifest          *manifest.Manifest
+	// Manifest field deleted in Task 15 — all leases are stack-shaped
+	// post-migration; per-service refs go through StackManifest.Services.
 	StackManifest     *manifest.StackManifest
 	ServiceContainers map[string][]string
 }

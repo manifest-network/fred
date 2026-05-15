@@ -195,65 +195,44 @@ func (b *Backend) LookupProvisions(_ context.Context, uuids []string) ([]backend
 }
 
 // GetLogs returns the last N lines of stdout/stderr for each container in
-// a lease, keyed by instance index (e.g., "0", "1").
+// a lease, keyed by "serviceName/instanceIndex" (e.g., "web/0", "db/0").
 // Falls back to the diagnostics store when the provision is not in memory
 // (e.g., after deprovision). Returns ErrNotProvisioned only if both miss.
 // On partial failure (some containers succeed, some fail), the successful logs
 // are returned along with error placeholders, and the errors are logged.
+//
+// Post-Tasks-3-9 the live path always populates `prov.ServiceContainers`, so
+// the legacy "key by instance index only" branch is gone — every lease is
+// stack-shaped from the in-memory state's perspective.
 func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
 	if exists {
-		isStack := prov.IsStack()
 		containerIDs := append([]string(nil), prov.ContainerIDs...)
-		var serviceContainers map[string][]string
-		if isStack {
-			serviceContainers = make(map[string][]string, len(prov.ServiceContainers))
-			for k, v := range prov.ServiceContainers {
-				serviceContainers[k] = append([]string(nil), v...)
-			}
+		serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+		for k, v := range prov.ServiceContainers {
+			serviceContainers[k] = append([]string(nil), v...)
 		}
 		b.provisionsMu.RUnlock()
 
-		// Stack logs: key by "serviceName/instanceIndex" (e.g., "web/0", "db/0").
-		if isStack {
-			result := make(map[string]string, len(containerIDs))
-			for svcName, svcContainerIDs := range serviceContainers {
-				for i, containerID := range svcContainerIDs {
-					key := fmt.Sprintf("%s/%d", svcName, i)
-					logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
-					if err != nil {
-						b.logger.Warn("failed to retrieve container logs",
-							"lease_uuid", leaseUUID,
-							"service", svcName,
-							"instance", i,
-							"container_id", leasesm.ShortID(containerID),
-							"error", err,
-						)
-						result[key] = fmt.Sprintf("<error: %s>", err)
-						continue
-					}
-					result[key] = logs
-				}
-			}
-			return result, nil
-		}
-
-		// Non-stack logs: key by instance index ("0", "1", ...).
 		result := make(map[string]string, len(containerIDs))
-		for i, containerID := range containerIDs {
-			logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
-			if err != nil {
-				b.logger.Warn("failed to retrieve container logs",
-					"lease_uuid", leaseUUID,
-					"instance", i,
-					"container_id", leasesm.ShortID(containerID),
-					"error", err,
-				)
-				result[fmt.Sprintf("%d", i)] = fmt.Sprintf("<error: %s>", err)
-				continue
+		for svcName, svcContainerIDs := range serviceContainers {
+			for i, containerID := range svcContainerIDs {
+				key := fmt.Sprintf("%s/%d", svcName, i)
+				logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
+				if err != nil {
+					b.logger.Warn("failed to retrieve container logs",
+						"lease_uuid", leaseUUID,
+						"service", svcName,
+						"instance", i,
+						"container_id", leasesm.ShortID(containerID),
+						"error", err,
+					)
+					result[key] = fmt.Sprintf("<error: %s>", err)
+					continue
+				}
+				result[key] = logs
 			}
-			result[fmt.Sprintf("%d", i)] = logs
 		}
 		return result, nil
 	}
@@ -288,13 +267,14 @@ func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo 
 		LastError:    prov.LastError,
 		Quantity:     prov.Quantity,
 	}
-	if len(prov.Items) > 0 {
-		info.Items = append([]backend.LeaseItem(nil), prov.Items...)
-		info.ServiceImages = serviceImages(prov.StackManifest)
-	} else {
-		info.Image = prov.Image
-		info.SKU = prov.SKU
-	}
+	// Post-Task-15 every provision carries `prov.Items` (populated at
+	// Provision time by NormalizeProvisionRequest and rehydrated from
+	// container labels by recover.go). The Items + ServiceImages
+	// representation is the canonical workload-metadata shape for the
+	// ProvisionInfo response. The legacy single-image fields
+	// (prov.Image/prov.SKU) are gone.
+	info.Items = append([]backend.LeaseItem(nil), prov.Items...)
+	info.ServiceImages = serviceImages(prov.StackManifest)
 	return info
 }
 

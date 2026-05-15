@@ -737,7 +737,6 @@ func TestStackUpdate_PayloadTypeMismatch(t *testing.T) {
 		provisions := map[string]*provision{
 			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 				Status:   backend.ProvisionStatusReady,
-				Manifest: &manifest.Manifest{Image: "nginx"},
 				SKU:      "docker-small"},
 			},
 		}
