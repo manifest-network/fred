@@ -1,187 +1,39 @@
-// docker-backend is an HTTP server that implements the Fred backend protocol
-// for provisioning Docker containers.
+// Package main is the k3s-backend HTTP entry point. server.go (this file)
+// declares the Server type, the backendService interface every handler
+// calls into, the route table, the HMAC inbound middleware, the SSRF
+// guard on outbound callback URLs, and the response helpers. main.go
+// wires a *k3s.Backend instance into NewServer and runs the HTTP loop
+// with graceful shutdown.
 package main
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/yaml.v3"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/docker"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
-var version = "dev"
-
-func main() {
-	configPath := flag.String("config", "docker-backend.yaml", "Path to configuration file")
-	flag.Parse()
-
-	// Bootstrap logger for startup messages (before config is loaded).
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
-
-	// Load configuration
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		logger.Error("failed to load config", "error", err)
-		os.Exit(1)
-	}
-
-	// Apply environment variable overrides
-	applyEnvOverrides(&cfg)
-
-	// Re-configure logger with the configured log level.
-	logLevel, err := config.ParseLogLevel(cmp.Or(cfg.LogLevel, "info"))
-	if err != nil {
-		logger.Error("invalid log_level in config", "error", err)
-		os.Exit(1)
-	}
-	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
-	slog.SetDefault(logger)
-	logger.Info("starting docker-backend", "version", version, "log_level", cfg.LogLevel)
-
-	// Log SKU mappings for visibility
-	for uuid, profile := range cfg.SKUMapping {
-		logger.Info("SKU mapping", "uuid", uuid, "profile", profile)
-	}
-
-	// Create backend
-	b, err := docker.New(cfg, logger)
-	if err != nil {
-		logger.Error("failed to create backend", "error", err)
-		os.Exit(1)
-	}
-
-	// Start backend
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := b.Start(ctx); err != nil {
-		cancel()
-		logger.Error("failed to start backend", "error", err)
-		os.Exit(1)
-	}
-	cancel()
-
-	// Create server
-	server := NewServer(b, string(cfg.CallbackSecret), logger)
-
-	// Setup HTTP server
-	httpServer := &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      server.Handler(),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	// Start HTTP server
-	serverErr := make(chan error, 1)
-	go func() {
-		logger.Info("starting HTTP server", "addr", cfg.ListenAddr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
-		}
-	}()
-
-	// Wait for shutdown signal or server error
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	// startupErr captures a ListenAndServe failure (port in use, bind refused,
-	// etc.) so the process can exit non-zero after the graceful-shutdown path
-	// runs. Without this, supervisors / k8s liveness probes / CI would see the
-	// "binary that never bound" as a successful run.
-	var startupErr error
-	select {
-	case <-sigCh:
-		logger.Info("shutting down...")
-	case err := <-serverErr:
-		logger.Error("HTTP server error, shutting down", "error", err)
-		startupErr = err
-	}
-
-	// Graceful shutdown
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := httpServer.Shutdown(ctx); err != nil {
-		logger.Error("HTTP shutdown error", "error", err)
-	}
-
-	if err := b.Stop(); err != nil {
-		logger.Error("backend shutdown error", "error", err)
-	}
-
-	logger.Info("shutdown complete")
-
-	// Propagate ListenAndServe failure as a non-zero exit. The graceful-
-	// shutdown path above still runs (so the bbolt stores close cleanly) but
-	// we MUST NOT report success when the binary never accepted a single
-	// request — k8s liveness, systemd, and CI all key off exit code.
-	if startupErr != nil {
-		os.Exit(1)
-	}
-}
-
-func loadConfig(path string) (docker.Config, error) {
-	cfg := docker.DefaultConfig()
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return cfg, fmt.Errorf("config file not found: %s", path)
-		}
-		return cfg, fmt.Errorf("failed to read config: %w", err)
-	}
-
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return cfg, fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	return cfg, nil
-}
-
-func applyEnvOverrides(cfg *docker.Config) {
-	if addr := os.Getenv("DOCKER_BACKEND_ADDR"); addr != "" {
-		cfg.ListenAddr = addr
-	}
-	if secret := os.Getenv("DOCKER_BACKEND_CALLBACK_SECRET"); secret != "" {
-		cfg.CallbackSecret = config.Secret(secret)
-	}
-	if host := os.Getenv("DOCKER_BACKEND_HOST_ADDRESS"); host != "" {
-		cfg.HostAddress = host
-	}
-	if dockerHost := os.Getenv("DOCKER_HOST"); dockerHost != "" {
-		cfg.DockerHost = dockerHost
-	}
-}
-
 // backendService defines the methods that handlers call on the backend.
-// docker.Backend satisfies this interface structurally.
+// *k3s.Backend satisfies this interface structurally. The compile-time
+// guard in internal/backend/k3s/provision_stub.go re-states the contract
+// inline so any signature drift surfaces at the package boundary rather
+// than only at the NewServer call site.
 type backendService interface {
 	Provision(ctx context.Context, req backend.ProvisionRequest) error
 	Deprovision(ctx context.Context, leaseUUID string) error
@@ -198,14 +50,14 @@ type backendService interface {
 	Stats() shared.ResourceStats
 }
 
-// Server handles HTTP requests for the Docker backend.
+// Server handles HTTP requests for the K3s backend.
 type Server struct {
 	backend        backendService
 	callbackSecret string
 	logger         *slog.Logger
 }
 
-// NewServer creates a new HTTP server for the Docker backend.
+// NewServer creates a new HTTP server for the K3s backend.
 func NewServer(b backendService, callbackSecret string, logger *slog.Logger) *Server {
 	return &Server{
 		backend:        b,
@@ -414,13 +266,13 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := s.backend.ReconcileCustomDomain(r.Context(), req.LeaseUUID, req.Items); err != nil {
-		// Surface ErrNotProvisioned and ErrInvalidState as 404/409 so the
-		// HTTPClient can map them back to typed errors. Both signal benign
-		// races (lease just deprovisioned, or status flipped between our
-		// pre-check and Restart's own check) — the providerd-side circuit
-		// breaker exempts them from the trip count. Collapsing them into
-		// 500 here would cause the CB to count routine reconcile-tick
-		// races as backend failures.
+		// Forward-compat error mapping for ENG-134+. In the ENG-133 scaffold,
+		// ReconcileCustomDomain unconditionally returns nil (no-op) because
+		// ingress is rejected at config-Validate time, so the branches below
+		// are unreachable today. When ENG-134+ ships real custom-domain
+		// reconciliation, transient sentinels (lease just deprovisioned,
+		// status flipped mid-reconcile) must surface as 404/409 — not 500 —
+		// so providerd's circuit breaker exempts them from the trip count.
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
@@ -681,8 +533,23 @@ func validateCallbackURL(rawURL string) error {
 		return fmt.Errorf("host is required")
 	}
 
-	// Extract hostname (without port)
+	// Extract hostname (without port) and normalize for SSRF parsing.
+	//
+	// Trailing-dot trim mirrors internal/config.validateExternalURL — without
+	// it, "http://169.254.169.254./..." would make net.ParseIP return nil and
+	// skip the link-local block, despite resolving to the same metadata IP.
+	//
+	// Zone-suffix split handles RFC 6874 zone-scoped IPv6 literals like
+	// "http://[fe80::1%25eth0]/...". url.Hostname() returns "fe80::1%eth0"
+	// (URL-decodes %25 to %); net.ParseIP rejects zone-suffixed strings;
+	// Go's net.Dialer DOES dial them on Linux/BSD. Stripping the zone
+	// suffix before ParseIP makes the IP-class check see "fe80::1" and
+	// correctly trip IsLinkLocalUnicast.
 	hostname := parsed.Hostname()
+	hostname = strings.TrimSuffix(hostname, ".")
+	if i := strings.IndexByte(hostname, '%'); i >= 0 {
+		hostname = hostname[:i]
+	}
 
 	// Check if hostname is an IP address
 	ip := net.ParseIP(hostname)
@@ -691,6 +558,12 @@ func validateCallbackURL(rawURL string) error {
 		// include cloud metadata endpoints like 169.254.169.254.
 		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return fmt.Errorf("link-local addresses are not allowed")
+		}
+		// Block unspecified addresses (0.0.0.0, ::). These resolve to
+		// "any interface" on the target host and shouldn't be used as
+		// callback destinations. Matches internal/config.validateExternalURL.
+		if ip.IsUnspecified() {
+			return fmt.Errorf("unspecified addresses are not allowed")
 		}
 	}
 

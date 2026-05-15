@@ -276,6 +276,25 @@ backends:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
   #     - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
+  # ---------------------------------------------------------------------------
+  # Mixed substrate example: docker-backend + k3s-backend side-by-side
+  # ---------------------------------------------------------------------------
+  # Fred's router is SKU-string-based and treats any HTTP backend identically,
+  # so a docker-backend and a k3s-backend can run side-by-side on the same
+  # provider, each handling distinct SKU UUIDs. k3s-backend defaults to
+  # listen_addr :9002 so it doesn't collide with docker-backend's :9001 when
+  # both run on the same host.
+  #
+  # - name: docker-1
+  #   url: "http://10.0.0.1:9001"
+  #   skus:
+  #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+  #
+  # - name: k3s-1
+  #   url: "http://10.0.0.1:9002"
+  #   skus:
+  #     - "c3d4e5f6-a7b8-9012-cdef-3456789012cd"
+
 # =============================================================================
 # CALLBACK CONFIGURATION (required)
 # =============================================================================
