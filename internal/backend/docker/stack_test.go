@@ -1099,6 +1099,7 @@ func TestRecoverState_Stack(t *testing.T) {
 					Image:         "nginx:latest",
 					Status:        "running",
 					CreatedAt:     now,
+					CustomDomain:  "foo.example.com",
 				},
 				{
 					ContainerID:   "db-c1",
@@ -1141,6 +1142,19 @@ func TestRecoverState_Stack(t *testing.T) {
 	assert.Equal(t, 1, itemMap["web"].Quantity)
 	assert.Equal(t, "docker-small", itemMap["db"].SKU)
 	assert.Equal(t, 1, itemMap["db"].Quantity)
+
+	// Per-service CustomDomain must be restored from container labels.
+	// This seeds the reconciler's downstream label-emission path; without
+	// it a refactor to recover.go could silently break custom-domain
+	// routing for tenants. The reconciler tests assume
+	// prov.Items[*].CustomDomain is already populated, so they don't
+	// catch this either.
+	webItem := itemMap["web"]
+	assert.Equal(t, "foo.example.com", webItem.CustomDomain,
+		"recover.go must restore per-service CustomDomain from container labels")
+	dbItem := itemMap["db"]
+	assert.Equal(t, "", dbItem.CustomDomain,
+		"services without a CustomDomain label must restore with an empty CustomDomain")
 
 	// Resource allocations should use service-aware IDs.
 	stats := b.pool.Stats()
