@@ -708,7 +708,12 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			return
 		}
 		oldStopped = true
-		if renameErr := b.docker.RenameContainer(ctx, cid, prevContainerName(op.LeaseUUID, i)); renameErr != nil {
+		// Legacy doReplaceContainers is dead code post-Tasks-5/6; Task 14
+		// deletes it. The DefaultServiceName placeholder keeps the
+		// compile clean and aligns with Task 9's migration which already
+		// renames pre-existing legacy artefacts onto the service-aware
+		// naming convention under "app".
+		if renameErr := b.docker.RenameContainer(ctx, cid, prevContainerName(op.LeaseUUID, manifest.DefaultServiceName, i)); renameErr != nil {
 			err = fmt.Errorf("failed to rename old container %s: %w", leasesm.ShortID(cid), renameErr)
 			callbackErr = op.Operation + " failed"
 			return

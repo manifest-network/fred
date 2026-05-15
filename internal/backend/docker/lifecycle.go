@@ -1069,13 +1069,18 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		}
 	}
 
-	// Generate container name: stack uses service name, single-container uses instance index only.
-	var containerName string
-	if params.ServiceName != "" {
-		containerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, params.ServiceName, params.InstanceIndex)
-	} else {
-		containerName = fmt.Sprintf("fred-%s-%d", params.LeaseUUID, params.InstanceIndex)
+	// Container names are always service-aware:
+	// fred-{leaseUUID}-{serviceName}-{instanceIndex}. The legacy
+	// fred-{leaseUUID}-{instanceIndex} scheme is gone from the live path
+	// — Task 9's recover-time migration renames any on-disk artefacts
+	// that still carry it. An empty ServiceName here is a structural
+	// bug (NormalizeProvisionRequest auto-tags single unnamed items at
+	// the Provision entry); surface it loudly rather than silently
+	// fall back to the legacy form.
+	if params.ServiceName == "" {
+		return "", fmt.Errorf("internal: container create requested without service_name (lease %s, instance %d)", params.LeaseUUID, params.InstanceIndex)
 	}
+	containerName := fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, params.ServiceName, params.InstanceIndex)
 
 	networkConfig := params.NetworkConfig
 	if networkConfig == nil {
