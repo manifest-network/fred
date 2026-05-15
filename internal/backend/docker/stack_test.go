@@ -1293,6 +1293,113 @@ func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 		"Restart must preserve prov.Items[*].CustomDomain — downstream label-emission depends on it")
 }
 
+// TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed lifts the
+// rollback-itself-fails invariant from the deleted
+// TestUpdate_RollbackFailed_SetsStatusFailed. The existing
+// TestStackRestart_FailureRollsBack covers SUCCESSFUL rollback
+// (status returns to Ready); this test covers the orthogonal case
+// where rollback ITSELF fails and status must escalate to Failed.
+//
+// Targets Update specifically (rather than Restart) because the
+// deleted test was Update-shape. The code path is unified — both
+// doRestart and doUpdate call doReplaceContainers, which in turn
+// calls rollbackViaCompose — so this test also exercises the
+// Restart-rollback-failed path by construction. Restart-only
+// rollback-success coverage is in TestStackRestart_FailureRollsBack.
+func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
+	payload := validStackManifestJSON(map[string]string{
+		manifest.DefaultServiceName: "nginx:latest",
+	})
+	stack, err := manifest.ParsePayload(payload)
+	require.NoError(t, err)
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    "lease-1",
+			Tenant:       "tenant-a",
+			ProviderUUID: "prov-1",
+			SKU:          "docker-small",
+			Status:       backend.ProvisionStatusReady,
+			Quantity:     1,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName},
+			},
+			StackManifest:     stack,
+			ServiceContainers: map[string][]string{manifest.DefaultServiceName: {"old-c1"}},
+			ContainerIDs:      []string{"old-c1"},
+		}},
+	}
+
+	upCalls := 0
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			upCalls++
+			// Both attempts fail: the update's new-gen Up AND the rollback Up.
+			// This drives doReplaceContainers' rollbackViaCompose return false,
+			// which the SM escalates to Failed.
+			return fmt.Errorf("simulated compose up failure (attempt %d)", upCalls)
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return nil, nil
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return nil
+		},
+	}
+	mock := &mockDockerClient{
+		PullImageFn:        func(ctx context.Context, image string, t time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) { return &ContainerInfo{ContainerID: id, Status: "running"}, nil },
+		RemoveContainerFn:  func(ctx context.Context, id string) error { return nil },
+		ContainerLogsFn:    func(ctx context.Context, id string, tail int) (string, error) { return "", nil },
+	}
+
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&callbackPayload)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+		Payload:     payload,
+	}))
+	<-callbackReceived
+
+	// Up should be called twice: once for the new generation (fails),
+	// once for the rollback (also fails).
+	assert.GreaterOrEqual(t, upCalls, 2,
+		"compose.Up must be tried for both the update and the rollback before status escalates")
+
+	// Callback reports failure with rollback-failed context.
+	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
+	assert.Contains(t, callbackPayload.Error, "rollback failed",
+		"callback error must surface that rollback failed (operator triage signal)")
+
+	// Final status must be Failed — when rollback itself fails, neither
+	// the new nor the old generation is healthy; the lease is genuinely
+	// broken and the operator/tenant needs to know.
+	b.provisionsMu.RLock()
+	prov := b.provisions["lease-1"]
+	status := prov.Status
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusFailed, status,
+		"rollback failure must escalate status to Failed — not silently leave at the in-flight Updating state")
+}
+
 // TestStackRestart_RollbackClearsLastError lifts coverage from the
 // deleted TestRestart_RollbackClearsLastError. After a Restart's
 // compose.Up fails and the rollback reinstates the old containers,
