@@ -431,11 +431,14 @@ Binding the method and URI prevents cross-endpoint replay: a signature captured 
 
 ```go
 import (
+    "bytes"
     "crypto/hmac"
     "crypto/sha256"
     "encoding/hex"
+    "encoding/json"
     "fmt"
     "net/http"
+    "os"
     "time"
 )
 
@@ -462,7 +465,7 @@ sig := computeSignature(os.Getenv("CALLBACK_SECRET"), req.Method, req.URL.Reques
 req.Header.Set("X-Fred-Signature", sig)
 ```
 
-The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration. Backends written in Go can import `internal/hmacauth` and call `hmacauth.SignRequest(secret, req, body)` instead of computing the canonical string by hand.
+The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration. Backends that live inside this repository can import `internal/hmacauth` and call `hmacauth.SignRequest(secret, req, body)` instead of computing the canonical string by hand; Go's `internal/` rule makes that helper unavailable to external backends, which should use the standalone sample above.
 
 ### Security Notes
 
