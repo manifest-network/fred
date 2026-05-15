@@ -456,9 +456,6 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 		return
 	}
 
-	// Compute HMAC signature
-	signature := s.computeSignature(body)
-
 	slog.Info("sending callback",
 		"url", callbackURL,
 		"lease_uuid", payload.LeaseUUID,
@@ -470,6 +467,11 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 		slog.Error("failed to create callback request", "error", err, "url", callbackURL)
 		return
 	}
+
+	// Compute HMAC signature after the request is built so the signed
+	// canonical string includes the same method + URI the verifier will see.
+	signature := s.computeSignature(req.Method, req.URL.RequestURI(), body)
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Fred-Signature", signature)
 
@@ -488,19 +490,27 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 	slog.Info("callback sent successfully", "lease_uuid", payload.LeaseUUID)
 }
 
-// computeSignature computes the HMAC-SHA256 signature for a payload with timestamp.
-// Format: "t=<unix-timestamp>,sha256=<hex-encoded-hmac>"
-// The HMAC is computed over "<timestamp>.<payload>" to bind the timestamp to the signature.
+// computeSignature computes the HMAC-SHA256 signature for the given request
+// shape. method and uri must match what the verifier will see on the wire
+// (typically req.Method and req.URL.RequestURI() after the *http.Request
+// is built). Format: "t=<unix-timestamp>,sha256=<hex-encoded-hmac>".
 //
-// NOTE: This implementation is intentionally standalone (not imported from internal/api)
-// because this file serves as a reference for external backend implementers who cannot
-// import Fred's internal packages. See BACKEND_GUIDE.md for the portable implementation.
-func (s *MockBackendServer) computeSignature(payload []byte) string {
+// The HMAC is computed over the canonical string
+// "<timestamp>\n<method>\n<uri>\n<hex(sha256(body))>", which binds the
+// timestamp, HTTP method, URI, and body hash together — preventing
+// cross-endpoint replay of captured signatures.
+//
+// NOTE: This implementation is intentionally standalone (not imported from
+// internal/hmacauth) because this file serves as a reference for external
+// backend implementers who cannot import Fred's internal packages. See
+// BACKEND_GUIDE.md for the portable implementation.
+func (s *MockBackendServer) computeSignature(method, uri string, payload []byte) string {
 	timestamp := time.Now().Unix()
-	signedPayload := fmt.Sprintf("%d.%s", timestamp, payload)
+	bodyHash := sha256.Sum256(payload) // sha256.Sum256(nil) is well-defined
+	signed := fmt.Sprintf("%d\n%s\n%s\n%x", timestamp, method, uri, bodyHash[:])
 
 	mac := hmac.New(sha256.New, []byte(s.callbackSecret))
-	mac.Write([]byte(signedPayload))
+	mac.Write([]byte(signed))
 	sig := hex.EncodeToString(mac.Sum(nil))
 
 	return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)

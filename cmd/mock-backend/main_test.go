@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 const (
@@ -95,4 +97,48 @@ func TestMockBackend_HandleListProvisions_Unfiltered_StillWorks(t *testing.T) {
 	var resp backend.ListProvisionsResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Len(t, resp.Provisions, 2)
+}
+
+// TestComputeSignature_VerifiesAgainstHmacauth proves the standalone
+// reference implementation in computeSignature produces signatures that
+// the canonical internal/hmacauth.VerifyRequest accepts. Without this,
+// mock-backend's deliberately-decoupled signer could silently drift
+// from the canonical contract (e.g., wrong field separator, wrong body
+// encoding) and only fail in production once it talks to a real Fred.
+//
+// The standalone implementation is intentional — it is the reference
+// for external backend authors who cannot import internal/hmacauth.
+// This test is the safety net that locks the two implementations to
+// the same canonical string.
+func TestComputeSignature_VerifiesAgainstHmacauth(t *testing.T) {
+	const secret = "test-secret-that-is-at-least-32-chars!"
+	srv := &MockBackendServer{callbackSecret: secret}
+
+	cases := []struct {
+		name string
+		// callbackURL is the URL the mock backend will POST to; computeSignature
+		// is called with the request's method and URL.RequestURI() (i.e. path+query).
+		callbackURL string
+		body        []byte
+	}{
+		{"typical callback body", "http://fred.local/callbacks/provision", []byte(`{"lease_uuid":"abc","status":"success"}`)},
+		{"empty body", "http://fred.local/callbacks/provision", nil},
+		{"callback URL with query", "http://fred.local/callbacks/provision?retry=1", []byte(`{"lease_uuid":"abc"}`)},
+		{"binary-safe body", "http://fred.local/callbacks/provision", []byte{0x00, 0x0A, 0xFF}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, tc.callbackURL, nil)
+			require.NoError(t, err)
+
+			sig := srv.computeSignature(req.Method, req.URL.RequestURI(), tc.body)
+			require.NotEmpty(t, sig)
+
+			// The canonical Fred-side verifier must accept it.
+			assert.NoError(t,
+				hmacauth.VerifyRequest(secret, req, tc.body, sig, 5*time.Minute),
+				"standalone mock-backend signer drifted from the canonical contract")
+		})
+	}
 }

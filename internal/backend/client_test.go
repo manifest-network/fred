@@ -558,10 +558,12 @@ func TestHTTPClient_CircuitBreaker_ConsecutiveFailuresTrip(t *testing.T) {
 func TestHTTPClient_Provision_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-signing-provision"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	var capturedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		var err error
 		capturedBody, err = io.ReadAll(r.Body)
 		require.NoError(t, err)
@@ -586,17 +588,19 @@ func TestHTTPClient_Provision_WithHMAC(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
-	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature should verify successfully")
 }
 
 func TestHTTPClient_Deprovision_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-signing-deprovision"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	var capturedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		var err error
 		capturedBody, err = io.ReadAll(r.Body)
 		require.NoError(t, err)
@@ -615,7 +619,7 @@ func TestHTTPClient_Deprovision_WithHMAC(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
-	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature should verify successfully")
 }
 
@@ -649,9 +653,11 @@ func TestHTTPClient_Provision_NoHMAC_NoHeader(t *testing.T) {
 func TestHTTPClient_GetInfo_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-signing-getinfo!"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(LeaseInfo{Host: "example.com"})
 	}))
@@ -670,16 +676,18 @@ func TestHTTPClient_GetInfo_WithHMAC(t *testing.T) {
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present on GET /info")
 	// GET requests sign an empty body.
-	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, nil, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
 }
 
 func TestHTTPClient_ListProvisions_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-signing-listprov"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"provisions": []ProvisionInfo{},
@@ -698,7 +706,7 @@ func TestHTTPClient_ListProvisions_WithHMAC(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present on GET /provisions")
-	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, nil, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
 }
 
@@ -768,9 +776,11 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 	t.Run("HMAC signing on GET (nil body)", func(t *testing.T) {
 		const secret = "test-secret-for-lookup-provisions"
 
-		var capturedSig string
+		var capturedSig, capturedMethod, capturedURI string
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+			capturedMethod = r.Method
+			capturedURI = r.URL.RequestURI()
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{}})
 		}))
@@ -783,7 +793,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 		_, err := client.LookupProvisions(context.Background(), []string{"uuid-1"})
 		require.NoError(t, err)
 		assert.NotEmpty(t, capturedSig)
-		assert.NoError(t, hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute))
+		assert.NoError(t, hmacauth.Verify(secret, capturedMethod, capturedURI, nil, capturedSig, 5*time.Minute))
 	})
 
 	t.Run("stable URL ordering across permutations", func(t *testing.T) {
@@ -927,10 +937,12 @@ func TestHTTPClient_Restart_ServerError(t *testing.T) {
 func TestHTTPClient_Restart_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-restart"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	var capturedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		var err error
 		capturedBody, err = io.ReadAll(r.Body)
 		require.NoError(t, err)
@@ -952,7 +964,7 @@ func TestHTTPClient_Restart_WithHMAC(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
-	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature should verify successfully")
 }
 
@@ -1066,10 +1078,12 @@ func TestHTTPClient_ReconcileCustomDomain_ServerError(t *testing.T) {
 func TestHTTPClient_ReconcileCustomDomain_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-reconcile"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	var capturedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		var err error
 		capturedBody, err = io.ReadAll(r.Body)
 		require.NoError(t, err)
@@ -1089,7 +1103,7 @@ func TestHTTPClient_ReconcileCustomDomain_WithHMAC(t *testing.T) {
 	}))
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
-	require.NoError(t, hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute))
+	require.NoError(t, hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute))
 }
 
 func TestHTTPClient_Update(t *testing.T) {
@@ -1198,10 +1212,12 @@ func TestHTTPClient_Update_ServerError(t *testing.T) {
 func TestHTTPClient_Update_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-update"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	var capturedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		var err error
 		capturedBody, err = io.ReadAll(r.Body)
 		require.NoError(t, err)
@@ -1224,7 +1240,7 @@ func TestHTTPClient_Update_WithHMAC(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
-	err = hmacauth.Verify(secret, capturedBody, capturedSig, 5*time.Minute)
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature should verify successfully")
 }
 
@@ -1317,9 +1333,11 @@ func TestHTTPClient_GetReleases_EmptyList(t *testing.T) {
 func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-releases"
 
-	var capturedSig string
+	var capturedSig, capturedMethod, capturedURI string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode([]ReleaseInfo{})
 	}))
@@ -1336,7 +1354,7 @@ func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present on GET /releases")
-	err = hmacauth.Verify(secret, nil, capturedSig, 5*time.Minute)
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, nil, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature for GET request (nil body) should verify")
 }
 

@@ -93,8 +93,11 @@ func TestSendCallback_SuccessDelivery(t *testing.T) {
 	var received backend.CallbackPayload
 	var capturedBody []byte
 	var capturedSig string
+	var capturedMethod, capturedURI string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
 		capturedBody, _ = io.ReadAll(r.Body)
 		json.Unmarshal(capturedBody, &received)
 		w.WriteHeader(http.StatusOK)
@@ -110,7 +113,7 @@ func TestSendCallback_SuccessDelivery(t *testing.T) {
 
 	// Verify HMAC signature is present and valid
 	assert.NotEmpty(t, capturedSig, "HMAC signature header must be set")
-	assert.NoError(t, hmacauth.Verify(secret, capturedBody, capturedSig, time.Minute))
+	assert.NoError(t, hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, time.Minute))
 }
 
 func TestSendCallback_FailurePayload(t *testing.T) {

@@ -26,33 +26,35 @@ const testSecret = "test-secret-that-is-at-least-32-chars!"
 
 func TestVerifySignature(t *testing.T) {
 	body := []byte(`{"lease_uuid":"abc-123"}`)
+	const method = "POST"
+	const uri = "/provision"
 
 	t.Run("valid signature", func(t *testing.T) {
-		sig := hmacauth.Sign(testSecret, body)
-		assert.NoError(t, hmacauth.Verify(testSecret, body, sig, 5*time.Minute))
+		sig := hmacauth.Sign(testSecret, method, uri, body)
+		assert.NoError(t, hmacauth.Verify(testSecret, method, uri, body, sig, 5*time.Minute))
 	})
 
 	t.Run("expired timestamp", func(t *testing.T) {
-		sig := hmacauth.SignWithTime(testSecret, body, time.Now().Add(-10*time.Minute))
-		assert.Error(t, hmacauth.Verify(testSecret, body, sig, 5*time.Minute))
+		sig := hmacauth.SignWithTime(testSecret, method, uri, body, time.Now().Add(-10*time.Minute))
+		assert.Error(t, hmacauth.Verify(testSecret, method, uri, body, sig, 5*time.Minute))
 	})
 
 	t.Run("wrong secret", func(t *testing.T) {
-		sig := hmacauth.Sign("wrong-secret-wrong-secret-wrong!", body)
-		assert.Error(t, hmacauth.Verify(testSecret, body, sig, 5*time.Minute))
+		sig := hmacauth.Sign("wrong-secret-wrong-secret-wrong!", method, uri, body)
+		assert.Error(t, hmacauth.Verify(testSecret, method, uri, body, sig, 5*time.Minute))
 	})
 
 	t.Run("tampered body", func(t *testing.T) {
-		sig := hmacauth.Sign(testSecret, body)
-		assert.Error(t, hmacauth.Verify(testSecret, []byte(`{"lease_uuid":"TAMPERED"}`), sig, 5*time.Minute))
+		sig := hmacauth.Sign(testSecret, method, uri, body)
+		assert.Error(t, hmacauth.Verify(testSecret, method, uri, []byte(`{"lease_uuid":"TAMPERED"}`), sig, 5*time.Minute))
 	})
 
 	t.Run("malformed signature missing sha256", func(t *testing.T) {
-		assert.Error(t, hmacauth.Verify(testSecret, body, "t=1234567890", 5*time.Minute))
+		assert.Error(t, hmacauth.Verify(testSecret, method, uri, body, "t=1234567890", 5*time.Minute))
 	})
 
 	t.Run("malformed signature missing timestamp", func(t *testing.T) {
-		assert.Error(t, hmacauth.Verify(testSecret, body, "sha256=abc123", 5*time.Minute))
+		assert.Error(t, hmacauth.Verify(testSecret, method, uri, body, "sha256=abc123", 5*time.Minute))
 	})
 }
 
@@ -79,14 +81,14 @@ func newMockHandler(mb *mockBackend) http.Handler {
 func signedPostRequest(path, body string) *http.Request {
 	b := []byte(body)
 	req := httptest.NewRequest("POST", path, bytes.NewReader(b))
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, b))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), b))
 	return req
 }
 
 // signedGetRequest creates a GET request with a valid HMAC signature.
 func signedGetRequest(path string) *http.Request {
 	req := httptest.NewRequest("GET", path, nil)
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 	return req
 }
 
@@ -222,7 +224,7 @@ func TestProvision_RequiresAuth(t *testing.T) {
 
 	t.Run("wrong secret returns 401", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/provision", strings.NewReader(body))
-		req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign("wrong-secret-wrong-secret-wrong!", []byte(body)))
+		req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign("wrong-secret-wrong-secret-wrong!", req.Method, req.URL.RequestURI(), []byte(body)))
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -259,7 +261,7 @@ func TestGetInfo_RequiresAuth(t *testing.T) {
 
 	t.Run("wrong secret returns 401", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/info/lease-1", nil)
-		req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign("wrong-secret-wrong-secret-wrong!", nil))
+		req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign("wrong-secret-wrong-secret-wrong!", req.Method, req.URL.RequestURI(), nil))
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -378,7 +380,7 @@ func TestMetrics_NoAuthRequired(t *testing.T) {
 func TestGetLogs_TailExceedsMax(t *testing.T) {
 	handler := newTestHandler()
 	req := httptest.NewRequest("GET", fmt.Sprintf("/logs/lease-1?tail=%d", maxTailLines+1), nil)
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -388,7 +390,7 @@ func TestGetLogs_TailExceedsMax(t *testing.T) {
 func TestGetLogs_TailAtMax(t *testing.T) {
 	handler := newTestHandler()
 	req := httptest.NewRequest("GET", fmt.Sprintf("/logs/lease-1?tail=%d", maxTailLines), nil)
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 	w := httptest.NewRecorder()
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) },
 		"tail at limit passes validation, panics on nil-backend GetLogs")
@@ -397,7 +399,7 @@ func TestGetLogs_TailAtMax(t *testing.T) {
 func TestGetLogs_TailNegative(t *testing.T) {
 	handler := newTestHandler()
 	req := httptest.NewRequest("GET", "/logs/lease-1?tail=-5", nil)
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -407,7 +409,7 @@ func TestGetLogs_TailNegative(t *testing.T) {
 func TestGetLogs_TailDefault(t *testing.T) {
 	handler := newTestHandler()
 	req := httptest.NewRequest("GET", "/logs/lease-1", nil)
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, nil))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 	w := httptest.NewRecorder()
 	// No tail param → default 100, passes validation, panics on nil backend.
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
@@ -1365,4 +1367,79 @@ func TestValidateCallbackURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- ENG-191: cross-endpoint replay rejection (k3s parity) ---------------
+//
+// Mirrors the docker-backend replay tests against the k3s-backend's
+// hmacAuthMiddleware so the property holds across both backend
+// implementations.
+
+// TestHMACMiddleware_RejectsCrossEndpointReplay (k3s): a signed
+// POST /provision signature replayed on POST /deprovision (same body)
+// must be rejected.
+func TestHMACMiddleware_RejectsCrossEndpointReplay(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"lease-replay-1","callback_url":"http://localhost/cb","items":[{"sku":"k3s-micro","quantity":1}]}`)
+
+	srcReq := httptest.NewRequest("POST", "/provision", bytes.NewReader(body))
+	srcSig := hmacauth.Sign(testSecret, srcReq.Method, srcReq.URL.RequestURI(), body)
+
+	replayReq := httptest.NewRequest("POST", "/deprovision", bytes.NewReader(body))
+	replayReq.Header.Set(hmacauth.SignatureHeader, srcSig)
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, replayReq)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"signature for /provision must not verify when replayed against /deprovision; body=%q", w.Body.String())
+	assert.Contains(t, w.Body.String(), "invalid signature")
+}
+
+// TestHMACMiddleware_RejectsCrossPathReplay (k3s): a signed GET /info/abc
+// signature replayed on GET /logs/abc must be rejected.
+func TestHMACMiddleware_RejectsCrossPathReplay(t *testing.T) {
+	handler := newTestHandler()
+
+	srcReq := httptest.NewRequest("GET", "/info/abc", nil)
+	srcSig := hmacauth.Sign(testSecret, srcReq.Method, srcReq.URL.RequestURI(), nil)
+
+	replayReq := httptest.NewRequest("GET", "/logs/abc", nil)
+	replayReq.Header.Set(hmacauth.SignatureHeader, srcSig)
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, replayReq)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"signature for /info/abc must not verify when replayed against /logs/abc; body=%q", w.Body.String())
+	assert.Contains(t, w.Body.String(), "invalid signature")
+}
+
+// TestHMACMiddleware_RejectsCrossMethodReplay (k3s): a signed POST /provision
+// signature replayed with a different method on the same path must be
+// rejected by the HMAC middleware itself. We exercise the middleware in
+// isolation (not via the full handler stack) because chi's router returns
+// 405 for unknown methods *before* the middleware runs — the routing
+// short-circuit would mask the auth check.
+func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
+	mw := hmacAuthMiddleware(testSecret, slog.Default())
+	authed := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	body := []byte(`{"lease_uuid":"lease-replay-2","callback_url":"http://localhost/cb","items":[{"sku":"k3s-micro","quantity":1}]}`)
+
+	srcReq := httptest.NewRequest("POST", "/provision", bytes.NewReader(body))
+	srcSig := hmacauth.Sign(testSecret, srcReq.Method, srcReq.URL.RequestURI(), body)
+
+	replayReq := httptest.NewRequest("PUT", "/provision", bytes.NewReader(body))
+	replayReq.Header.Set(hmacauth.SignatureHeader, srcSig)
+
+	w := httptest.NewRecorder()
+	authed.ServeHTTP(w, replayReq)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"middleware must reject method-swapped signature; body=%q", w.Body.String())
+	assert.Contains(t, w.Body.String(), "invalid signature")
 }

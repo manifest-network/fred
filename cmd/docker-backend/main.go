@@ -718,7 +718,7 @@ func hmacAuthMiddleware(secret string, logger *slog.Logger) func(http.Handler) h
 				return
 			}
 
-			if err := hmacauth.Verify(secret, body, sig, 5*time.Minute); err != nil {
+			if err := hmacauth.VerifyRequest(secret, r, body, sig, 5*time.Minute); err != nil {
 				logger.Warn("signature verification failed",
 					"error", err,
 					"remote", r.RemoteAddr,

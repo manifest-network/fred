@@ -179,7 +179,7 @@ func (s *CallbackSender) trySendCallback(leaseUUID, callbackURL string, body []b
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(s.secret, body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.SignRequest(s.secret, req, body))
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {

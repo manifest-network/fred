@@ -376,7 +376,12 @@ Each callback carries an `X-Fred-Signature` header in the format:
 t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 ```
 
-The HMAC-SHA256 is computed over `<timestamp>.<body>` using the configured `CallbackSecret`.
+The HMAC-SHA256 is computed over the canonical string
+`<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>` using the
+configured `CallbackSecret`. Binding the method and URI prevents
+cross-endpoint replay of captured signatures; hashing the body keeps the
+canonical string binary-safe. See `internal/hmacauth` for the reference
+implementation.
 
 ### Error Message Sanitization
 

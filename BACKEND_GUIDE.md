@@ -417,11 +417,17 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 
 ### HMAC Signature with Replay Protection
 
-Fred verifies callbacks using HMAC-SHA256 with timestamp-based replay protection (following the Stripe pattern). Callbacks older than 5 minutes are rejected.
+Fred verifies callbacks using HMAC-SHA256 with timestamp-based replay protection. Callbacks older than 5 minutes are rejected.
 
 **Signature format:** `t=<unix-timestamp>,sha256=<hex-encoded-hmac>`
 
-The HMAC is computed over `<timestamp>.<body>` to bind the timestamp to the signature:
+The HMAC is computed over a four-field canonical string that binds the timestamp, HTTP method, request URI, and a hash of the body:
+
+```
+<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>
+```
+
+Binding the method and URI prevents cross-endpoint replay: a signature captured on (e.g.) `POST /callbacks/provision` cannot be replayed against any other endpoint. The body is included as a SHA-256 hash, so arbitrary bytes (including `\n`, NUL, or invalid UTF-8) cannot influence the canonical string.
 
 ```go
 import (
@@ -429,33 +435,41 @@ import (
     "crypto/sha256"
     "encoding/hex"
     "fmt"
+    "net/http"
     "time"
 )
 
-func computeSignature(body []byte, secret string) string {
+// computeSignature signs the given request shape. method and uri must
+// match what the verifier sees on the wire — typically req.Method and
+// req.URL.RequestURI() after the *http.Request is built.
+func computeSignature(secret, method, uri string, body []byte) string {
     timestamp := time.Now().Unix()
-    signedPayload := fmt.Sprintf("%d.%s", timestamp, body)
+    bodyHash := sha256.Sum256(body) // sha256.Sum256(nil) is stable
+    signed := fmt.Sprintf("%d\n%s\n%s\n%x", timestamp, method, uri, bodyHash[:])
 
     mac := hmac.New(sha256.New, []byte(secret))
-    mac.Write([]byte(signedPayload))
+    mac.Write([]byte(signed))
     sig := hex.EncodeToString(mac.Sum(nil))
 
     return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
 }
 
-// Usage:
+// Usage — build the *http.Request first, then sign using its method
+// and request-URI so sender and verifier hash identical bytes:
 body, _ := json.Marshal(callbackPayload)
-signature := computeSignature(body, os.Getenv("CALLBACK_SECRET"))
-req.Header.Set("X-Fred-Signature", signature)
+req, _ := http.NewRequest(http.MethodPost, callbackURL, bytes.NewReader(body))
+sig := computeSignature(os.Getenv("CALLBACK_SECRET"), req.Method, req.URL.RequestURI(), body)
+req.Header.Set("X-Fred-Signature", sig)
 ```
 
-The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration.
+The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration. Backends written in Go can import `internal/hmacauth` and call `hmacauth.SignRequest(secret, req, body)` instead of computing the canonical string by hand.
 
 ### Security Notes
 
 - **Replay protection**: Callbacks older than 5 minutes are rejected
+- **Cross-endpoint binding**: Signature is bound to HTTP method + request URI; a captured signature cannot be replayed against a different endpoint
 - **Clock skew tolerance**: Timestamps up to 1 minute in the future are accepted
-- **Industry standard**: Follows the same pattern as Stripe, GitHub, and Slack webhooks
+- **Binary-safe body**: Body is hashed (SHA-256), so the canonical string is unaffected by embedded `\n`, NUL, or non-UTF-8 bytes
 
 ## State Management
 
