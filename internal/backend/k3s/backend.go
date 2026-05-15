@@ -43,6 +43,19 @@ type provision struct {
 	// fail_count (BACKEND_GUIDE documents fail_count as a wire field).
 	FailCount int
 	CreatedAt time.Time
+
+	// ctx / cancel form the per-lease cancellable lifecycle wired in
+	// ENG-189. Provision creates the pair as a child of b.stopCtx and
+	// stores both here; Deprovision calls cancel() inside provisionsMu
+	// before deleting the map entry; runStubProvisioner captures ctx
+	// under the lock and checks ctx.Err() before each external write
+	// (diagnosticsStore.Store, callbackSender.SendCallback) so a
+	// concurrent Deprovision that wins the lock between the worker's
+	// unlock and its post-unlock store touches still aborts the writes
+	// for a torn-down lease. Mirrors docker-backend's leasesm.OnExit
+	// pattern (PR #79 / commit cc62f3b).
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // Backend implements the Fred backend protocol for K3s. The ENG-133
@@ -96,6 +109,19 @@ type Backend struct {
 	// kubeBuildErr captures the build outcome under kubeBuildOnce so
 	// subsequent Health() calls return the same wrapped error.
 	kubeBuildErr error
+
+	// beforeDiagnosticStore fires inside runStubProvisioner at checkpoint 1
+	// — after the worker has released provisionsMu and before the
+	// ctx.Err() check that guards diagnosticsStore.Store. Nil in
+	// production; set in tests (same-package access) to deterministically
+	// interleave a Deprovision-races-worker race for ENG-189 case (b).
+	beforeDiagnosticStore func()
+
+	// beforeCallbackSend fires inside runStubProvisioner at checkpoint 2
+	// — after the diagnostic write and before the ctx.Err() check that
+	// guards callbackSender.SendCallback. Nil in production; set in
+	// tests to interleave ENG-189 case (c).
+	beforeCallbackSend func()
 }
 
 // New creates a new K3s backend.
