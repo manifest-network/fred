@@ -177,12 +177,31 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			return state.containers, nil
+			// Splice in mounts from the shared state map so the
+			// list payload matches what production code receives
+			// from types.Container.Mounts inline.
+			out := make([]ContainerInfo, len(state.containers))
+			for i, c := range state.containers {
+				if ms, ok := state.mounts[c.ContainerID]; ok {
+					c.Mounts = append(c.Mounts, ms...)
+				}
+				out[i] = c
+			}
+			return out, nil
 		},
 		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
 			for i := range state.containers {
 				if state.containers[i].ContainerID == containerID {
 					c := state.containers[i]
+					// Splice in mounts from the shared state map.
+					// Production InspectContainer populates Mounts
+					// directly from resp.Mounts; the test mock has to
+					// merge the test-side mounts setup since
+					// state.containers entries are constructed with
+					// just label-bearing fields.
+					if ms, ok := state.mounts[containerID]; ok {
+						c.Mounts = append(c.Mounts, ms...)
+					}
 					return &c, nil
 				}
 			}

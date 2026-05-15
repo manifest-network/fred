@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -55,7 +56,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// the main loop with on-disk state the stack-only paths can't
 		// drive. After Task 9 ships, this branch becomes an executor
 		// invocation that runs to completion before the main loop.
-		return fmt.Errorf("recover-time migration required for %d lease(s) but executor is not yet implemented (Task 9)", len(legacyPlans))
+		//
+		// Surface each lease UUID in the error so operators can correlate
+		// "what's about to break on the next boot" with the planning logs
+		// above. Joining lease UUIDs keeps the error short on the common
+		// 1-lease case while still being useful when several legacy
+		// leases need migration.
+		leaseUUIDs := make([]string, 0, len(legacyPlans))
+		for _, p := range legacyPlans {
+			leaseUUIDs = append(leaseUUIDs, p.LeaseUUID)
+		}
+		return fmt.Errorf("recover-time migration required for %d lease(s) [%s] but executor is not yet implemented (Task 9)",
+			len(legacyPlans), strings.Join(leaseUUIDs, ", "))
 	}
 
 	allocsByLease := make(map[string][]shared.ResourceAllocation)

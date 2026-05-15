@@ -33,6 +33,7 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 		Target: "/data",
 	}}
 	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t) // flush the test-side releases map into the backing store
 
 	if err := b.recoverState(context.Background()); err != nil {
 		t.Fatalf("recoverState failed: %v", err)
@@ -53,13 +54,15 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 // if any legacy container fails to migrate, with the lease UUID surfaced in
 // the error so operators can locate it.
 func TestRecoverState_MigrationFailure_AbortsStartup(t *testing.T) {
-	b, fakeDocker, _, _ := newMigrationTestBackend(t)
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
 	fakeDocker.containers = []ContainerInfo{{
 		ContainerID: "legacy-cid",
 		LeaseUUID:   "lease-1",
 		SKU:         "docker-micro",
 	}}
 	fakeDocker.composeUpErr = errors.New("compose up failed")
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
 
 	err := b.recoverState(context.Background())
 	if err == nil {
