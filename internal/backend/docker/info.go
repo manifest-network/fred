@@ -253,9 +253,11 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 }
 
 // provisionToInfo converts a provision to a backend.ProvisionInfo.
-// For stack leases, Items are defensively copied and ServiceImages are
-// extracted from the StackManifest. For non-stack leases, the top-level
-// Image and SKU fields are set instead.
+// Items are defensively copied (each provision now carries them post-
+// Task-3 normalization) and ServiceImages are extracted from
+// prov.StackManifest. SKU is propagated unchanged. The legacy single-
+// service `Image` field was deleted in Task 15 — callers that need a
+// representative image consult ServiceImages or iterate Items.
 func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo {
 	info := backend.ProvisionInfo{
 		LeaseUUID:    prov.LeaseUUID,

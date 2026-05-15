@@ -1667,7 +1667,68 @@ func TestNormalizeProvisionRequest_RejectsMixed(t *testing.T) {
 			{SKU: "docker-small", Quantity: 1}, // missing
 		},
 	}
-	if err := NormalizeProvisionRequest(&req); err == nil {
-		t.Fatalf("expected error for mixed service_name, got nil")
+	err := NormalizeProvisionRequest(&req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidManifest,
+		"mixed service_name presence must surface as ErrInvalidManifest (caller filtering depends on it)")
+}
+
+// TestNormalizeProvisionRequest_RejectsEmptyItems covers the
+// zero-items edge case: every provision must carry at least one
+// LeaseItem after normalization, so an empty Items slice must be
+// rejected at the boundary rather than allowed to silently produce
+// a no-op provision downstream.
+func TestNormalizeProvisionRequest_RejectsEmptyItems(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: nil,
 	}
+	err := NormalizeProvisionRequest(&req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrValidation,
+		"empty items must surface as ErrValidation (a structural request error, not a manifest shape error)")
+}
+
+// TestNormalizeProvisionRequest_RejectsNilRequest covers the
+// programmer-error case where a nil *ProvisionRequest is passed in.
+// Should return ErrValidation rather than panicking with nil deref.
+func TestNormalizeProvisionRequest_RejectsNilRequest(t *testing.T) {
+	err := NormalizeProvisionRequest(nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrValidation,
+		"nil request must surface as ErrValidation rather than panicking")
+}
+
+// TestNormalizeProvisionRequest_RejectsMultipleUnnamed covers the
+// case where the request claims to be "legacy form" (no service
+// names) but carries multiple items. The legacy single-service
+// contract structurally allows only ONE item per lease; multiple
+// unnamed items have no defined semantics — reject rather than
+// auto-tag them all with the same service name (which would create
+// a name collision).
+func TestNormalizeProvisionRequest_RejectsMultipleUnnamed(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: []LeaseItem{
+			{SKU: "docker-micro", Quantity: 1},
+			{SKU: "docker-micro", Quantity: 1},
+		},
+	}
+	err := NormalizeProvisionRequest(&req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidManifest,
+		"multiple unnamed items must surface as ErrInvalidManifest (structurally ambiguous wire shape)")
+}
+
+// TestNormalizeProvisionRequest_AcceptsSingleNamedItem locks in the
+// boundary case adjacent to AutoTags: a single explicitly-named item
+// passes through unchanged (no auto-tagging, no rejection).
+func TestNormalizeProvisionRequest_AcceptsSingleNamedItem(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: []LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "custom"}},
+	}
+	require.NoError(t, NormalizeProvisionRequest(&req))
+	require.Equal(t, "custom", req.Items[0].ServiceName,
+		"single explicitly-named item must pass through unchanged")
 }

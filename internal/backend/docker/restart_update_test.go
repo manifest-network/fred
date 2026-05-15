@@ -1299,11 +1299,6 @@ func TestUpdate_UpdatesManifestAndImage(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for callback")
 	}
-
-	b.provisionsMu.RLock()
-	_ = b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-
 }
 
 func TestUpdate_RollbackToReady_AllowsRestart(t *testing.T) {

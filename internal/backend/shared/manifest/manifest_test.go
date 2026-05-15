@@ -653,6 +653,68 @@ func TestParsePayload_StackPassThrough(t *testing.T) {
 	}
 }
 
+// TestDefaultServiceName_MirrorMatches locks in the contract that
+// backend.NormalizeProvisionRequest tags unnamed lease items with the
+// SAME service name that manifest.ParsePayload wraps flat manifests
+// under. The two constants (backend.defaultServiceName and
+// manifest.DefaultServiceName) are duplicated to avoid an import
+// cycle; this test catches drift via behaviour (no direct constant
+// comparison needed, which is why the mirror lives here, not in the
+// backend package).
+//
+// If this test fails, either the backend's auto-tag was changed or
+// the manifest's auto-wrap was changed, and the two halves of the
+// boundary-normalization contract have separated — legacy
+// flat-manifest leases would have items whose ServiceName does NOT
+// match the wrapped manifest's only service key, and Task-4
+// stack-shape provisioning would fail to find the service.
+func TestDefaultServiceName_MirrorMatches(t *testing.T) {
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-mirror",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+	}
+	require.NoError(t, backend.NormalizeProvisionRequest(&req))
+	require.Equal(t, DefaultServiceName, req.Items[0].ServiceName,
+		"backend.NormalizeProvisionRequest must tag an unnamed item with manifest.DefaultServiceName; "+
+			"the duplicated constants have drifted and downstream Task-4 stack provisioning will fail "+
+			"to locate the service in the wrapped manifest's Services map")
+}
+
+// TestNormalizeAndWrap_OneServiceStackNamedApp_AgainstLegacyItem
+// locks the QA-flagged wire-shape edge case: a tenant submits a
+// 1-service stack manifest whose service is named exactly "app",
+// alongside legacy unnamed lease items. The backend normalizes the
+// items (auto-tagging with "app") and ParsePayload passes the stack
+// through unchanged. The two halves agree by construction in this
+// case — the test pins the agreement so a future change to either
+// half can't accidentally desynchronise on this specific shape.
+func TestNormalizeAndWrap_OneServiceStackNamedApp_AgainstLegacyItem(t *testing.T) {
+	// Wire: 1-service stack named "app".
+	payload := []byte(`{"services":{"app":{"image":"nginx:1.25"}}}`)
+	sm, err := ParsePayload(payload)
+	require.NoError(t, err)
+	require.Len(t, sm.Services, 1)
+	_, ok := sm.Services[DefaultServiceName]
+	require.True(t, ok, "stack with service named 'app' must pass through under DefaultServiceName")
+
+	// Wire: legacy unnamed item.
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-edge",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+	}
+	require.NoError(t, backend.NormalizeProvisionRequest(&req))
+	require.Equal(t, DefaultServiceName, req.Items[0].ServiceName)
+
+	// The two halves now reference the same service name, so the
+	// downstream stack-shape lookup will succeed:
+	_, ok = sm.Services[req.Items[0].ServiceName]
+	require.True(t, ok, "legacy item's auto-tagged ServiceName must locate the stack's only service")
+}
+
 func mapKeys[K comparable, V any](m map[K]V) []K {
 	out := make([]K, 0, len(m))
 	for k := range m {

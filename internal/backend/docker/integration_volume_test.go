@@ -594,6 +594,75 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 		"orphaned volume should be destroyed after backend restart, got err: %v", statErr)
 }
 
+// TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID verifies
+// the recover-time legacy→stack migration invariant on real btrfs:
+// when a managed volume directory is renamed (legacy name →
+// service-aware name), the underlying btrfs subvolume's UUID/ID
+// must be preserved. Renaming a btrfs subvolume via os.Rename
+// preserves the subvolume identity (Btrfs treats subvolumes as
+// special directories; renaming the directory does NOT copy or
+// reflink — it's a metadata-only operation that updates the parent
+// directory entry).
+//
+// If this test fails, it means a future change to the rename path
+// has accidentally substituted a copy-then-delete for the metadata
+// rename, which would re-id the subvolume (losing snapshot lineage,
+// quota assignment, and any subvol-id-keyed btrfs feature state).
+func TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+
+	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
+
+	const oldName = "fred-rename-legacy-0"
+	const newName = "fred-rename-legacy-app-0"
+
+	// Create a real btrfs subvolume at the legacy path.
+	oldPath := filepath.Join(mountPath, oldName)
+	out, err := exec.Command("btrfs", "subvolume", "create", oldPath).CombinedOutput()
+	require.NoError(t, err, "btrfs subvolume create: %s", out)
+
+	// Record original subvol id (line `Subvolume ID: NNN` in btrfs show output).
+	originalID := extractSubvolID(t, oldPath)
+	require.NotEmpty(t, originalID, "must extract subvol id before rename")
+
+	// Rename via the manager.
+	require.NoError(t, mgr.RenameVolume(oldName, newName))
+
+	// New path exists, old path is gone.
+	newPath := filepath.Join(mountPath, newName)
+	_, err = os.Stat(newPath)
+	require.NoError(t, err, "new path must exist after rename")
+	_, err = os.Stat(oldPath)
+	require.True(t, errors.Is(err, fs.ErrNotExist), "old path must be gone after rename")
+
+	// Subvol id must be unchanged at the new path.
+	renamedID := extractSubvolID(t, newPath)
+	require.NotEmpty(t, renamedID, "must extract subvol id after rename")
+	assert.Equal(t, originalID, renamedID,
+		"btrfs subvolume ID must be preserved across rename (rename is a metadata-only op; "+
+			"a re-id would indicate the rename was implemented as copy+delete, losing identity)")
+
+	// Cleanup: delete the renamed subvolume.
+	out, _ = exec.Command("btrfs", "subvolume", "delete", newPath).CombinedOutput()
+	t.Logf("cleanup btrfs subvolume delete: %s", out)
+}
+
+// extractSubvolID parses `btrfs subvolume show <path>` output for the
+// "Subvolume ID:" line and returns the numeric id as a string. The
+// raw string form (not parsed int) is fine for equality assertions.
+func extractSubvolID(t *testing.T, path string) string {
+	t.Helper()
+	out, err := exec.Command("btrfs", "subvolume", "show", path).CombinedOutput()
+	require.NoError(t, err, "btrfs subvolume show: %s", out)
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Subvolume ID:") {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, "Subvolume ID:"))
+		}
+	}
+	return ""
+}
+
 // TestIntegration_Docker_VolumeQuotaEnforced verifies that btrfs quota
 // enforcement actually prevents writes beyond the configured disk limit.
 // A small write should succeed; a large write should fail with ENOSPC/EDQUOT.

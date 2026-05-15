@@ -634,6 +634,49 @@ func TestBtrfsVolumeManager_RenameVolume_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged covers
+// the failure path of xfs RenameVolume: when atomicRenameVolumeDir
+// returns an error (e.g. neither path exists, or both exist), the
+// in-memory volumeToID / activeIDs maps must NOT be modified — a
+// partial map update on a failed rename would desynchronise the
+// in-memory state from the on-disk reality, and subsequent
+// Create/Destroy on either name would resolve to a stale project ID.
+func TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged(t *testing.T) {
+	root := t.TempDir()
+	mgr := &xfsVolumeManager{
+		dataPath:   root,
+		logger:     slog.Default(),
+		activeIDs:  make(map[uint32]string),
+		volumeToID: make(map[string]uint32),
+	}
+
+	const oldName = "fred-lease-1-0"
+	const newName = "fred-lease-1-app-0"
+	const projID = uint32(99)
+	// Both directories exist → atomicRenameVolumeDir refuses (manual intervention required).
+	require.NoError(t, os.MkdirAll(filepath.Join(root, oldName), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, newName), 0o755))
+	mgr.mu.Lock()
+	mgr.trackProjectID(oldName, projID)
+	mgr.mu.Unlock()
+
+	err := mgr.RenameVolume(oldName, newName)
+	require.Error(t, err, "rename of both-exist must fail")
+
+	// Maps must be unchanged: oldName still tracked, newName not.
+	mgr.mu.Lock()
+	oldID, oldOK := mgr.volumeToID[oldName]
+	_, newOK := mgr.volumeToID[newName]
+	activeName, activeOK := mgr.activeIDs[projID]
+	mgr.mu.Unlock()
+
+	require.True(t, oldOK, "oldName must still be tracked after a failed rename")
+	assert.Equal(t, projID, oldID, "oldName projID must be unchanged")
+	assert.False(t, newOK, "newName must not have been added on failure")
+	require.True(t, activeOK, "activeIDs entry must remain")
+	assert.Equal(t, oldName, activeName, "activeIDs[projID] must still point at oldName on failure")
+}
+
 func TestVolumeManager_HostPath(t *testing.T) {
 	t.Run("xfs", func(t *testing.T) {
 		mgr := &xfsVolumeManager{dataPath: "/var/lib/fred/volumes"}

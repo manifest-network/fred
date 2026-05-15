@@ -209,17 +209,25 @@ func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID str
 // binds (e.g., /etc/localtime) are filtered out — only fred-managed
 // volume directories need renaming. A stateless lease legitimately
 // returns zero results here.
+//
+// The prefix check uses `root + filepath.Separator` (or the exact
+// root path) so a configured root of `/var/lib/fred` does not match
+// sibling paths like `/var/lib/fred-other/...`. Without this, a
+// neighbouring directory whose name happens to begin with the root
+// string would be misclassified as managed and renamed under
+// migration.
 func filterManagedMounts(b *Backend, mounts []ContainerMount) []ContainerMount {
 	root := b.cfg.VolumeDataPath
 	if root == "" {
 		return nil
 	}
+	rootSep := strings.TrimRight(root, string(filepath.Separator)) + string(filepath.Separator)
 	var out []ContainerMount
 	for _, m := range mounts {
 		if m.Type != "bind" {
 			continue
 		}
-		if !strings.HasPrefix(m.Source, root) {
+		if !strings.HasPrefix(m.Source, rootSep) && m.Source != strings.TrimRight(root, string(filepath.Separator)) {
 			continue
 		}
 		out = append(out, m)
@@ -253,7 +261,7 @@ func sortInstancesByIndex(xs []legacyMigrationInstance) {
 //  3. Build a Compose project for the whole lease with per-instance
 //     VolBinds pointing at the just-renamed host paths.
 //  4. Compose.Up. Creates N stack-form containers in one shot.
-//  5. Wait for ready (waitForHealthy, bounded by
+//  5. Wait for ready (verifyStartup, bounded by
 //     b.cfg.MigrationReadyTimeout).
 //  6. Schedule background removal of all `-prev` containers after
 //     b.cfg.MigrationGracePeriod — preserves rollback inspection
@@ -263,10 +271,32 @@ func sortInstancesByIndex(xs []legacyMigrationInstance) {
 //     byte-equal payload.
 //
 // Failure semantics: any step error returns immediately. The caller
-// (recoverState) wraps with operator remediation guidance. The whole
-// migration is idempotent — interrupted runs resume on next boot
-// because each step's primitive is itself idempotent (RenameVolume,
-// RecordMigration, the rename-already-named tolerance below).
+// (recoverState) wraps with operator remediation guidance.
+//
+// Idempotency / crash resumability is bounded:
+//   - **Boundary 1 (before Stop+rename-to-prev):** a crash here leaves
+//     legacy containers and legacy-named volumes intact. Next boot
+//     re-runs the migration from scratch — fully resumable.
+//   - **Boundary 2 (after rename-to-prev, before compose.Up):**
+//     containers are stopped & renamed to `<name>-prev`, volumes may
+//     be partially renamed to new naming. The next boot's planner
+//     will not find a fresh legacy container under the original
+//     name (it's `-prev` now) and cannot replan the migration from
+//     state alone — operator intervention required (see CHANGELOG
+//     troubleshooting section). NOT resumable.
+//   - **Boundary 3 (after compose.Up, before RecordMigration):** new
+//     stack containers exist alongside `-prev` containers. The release
+//     store still has the legacy active entry, so the next boot will
+//     re-plan. The volume renames are already idempotent (the rename
+//     tolerance below skips already-renamed paths). Compose.Up is
+//     idempotent on container name. Resumable, but the operator may
+//     see two generations of containers transiently.
+//   - **Boundary 4 (after RecordMigration, before grace-window
+//     removal):** terminal state. Background removal of `-prev`
+//     containers is fire-and-forget; if fred restarts inside the
+//     grace window, orphan `-prev` containers linger on disk until
+//     manual cleanup. Forward progress is durable; cleanup is
+//     operator-territory.
 func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration, logger *slog.Logger) error {
 	logger = logger.With("lease_uuid", m.LeaseUUID, "instances", len(m.Instances))
 	logger.Info("legacy migration starting")
