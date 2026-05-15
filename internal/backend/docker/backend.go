@@ -623,41 +623,6 @@ func prevContainerName(leaseUUID, serviceName string, instanceIndex int) string 
 	return fmt.Sprintf("fred-%s-%s-%d-prev", leaseUUID, serviceName, instanceIndex)
 }
 
-// rollbackContainers renames old containers back to their canonical names and
-// restarts them. Handles partial-stop scenarios where some containers may still
-// be running (e.g., stop failed mid-loop for multi-container leases).
-// Returns true only if every container is confirmed running after rollback.
-func (b *Backend) rollbackContainers(leaseUUID string, containerIDs []string, logger *slog.Logger) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	restored := 0
-	for i, cid := range containerIDs {
-		// Check if container needs rollback — it might still be running if
-		// stop failed mid-loop for a multi-container lease.
-		info, inspectErr := b.docker.InspectContainer(ctx, cid)
-		if inspectErr != nil {
-			logger.Error("rollback: failed to inspect container", "container_id", leasesm.ShortID(cid), "error", inspectErr)
-			continue
-		}
-		if info.Status == "running" {
-			restored++ // Already running — no rollback needed
-			continue
-		}
-
-		canonicalName := fmt.Sprintf("fred-%s-%d", leaseUUID, i)
-		if renameErr := b.docker.RenameContainer(ctx, cid, canonicalName); renameErr != nil {
-			logger.Error("rollback: failed to rename container", "container_id", leasesm.ShortID(cid), "error", renameErr)
-		}
-		if err := b.docker.StartContainer(ctx, cid, 30*time.Second); err != nil {
-			logger.Error("rollback: failed to restart container", "container_id", leasesm.ShortID(cid), "error", err)
-		} else {
-			restored++
-		}
-	}
-	return restored == len(containerIDs)
-}
-
 // sendCallback resolves the callback URL from the provisions map and delegates
 // to sendCallbackWithURL. Use this when the provision is still in the map.
 func (b *Backend) sendCallback(leaseUUID string, status backend.CallbackStatus, errMsg string) {
