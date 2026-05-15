@@ -67,6 +67,17 @@ func (m *mockVolumeManager) Validate() error {
 	return nil
 }
 
+// RenameVolume is a no-op for tests that don't exercise migration; Task 9
+// tests use fakeVolumeBackend (in testsupport_test.go) which captures
+// rename calls.
+func (m *mockVolumeManager) RenameVolume(_, _ string) error { return nil }
+
+// HostPath returns a stable test-side path so any production code that
+// inadvertently calls it during a non-migration test does not blow up.
+func (m *mockVolumeManager) HostPath(name string) string {
+	return filepath.Join(m.defaultDir, name)
+}
+
 // mockDockerClient implements dockerClient for testing. Each method delegates to
 // the corresponding Fn field; an unexpected call (nil Fn) panics so tests fail
 // loudly rather than silently returning zero values.

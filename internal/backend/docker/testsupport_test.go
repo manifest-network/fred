@@ -122,6 +122,13 @@ func (f *fakeVolumeBackend) renamed(oldName, newName string) bool {
 	return false
 }
 
+// HostPath returns a deterministic test path under /var/lib/fred/volumes
+// matching the convention production code uses. Tests asserting on
+// migration bind paths can predict the value.
+func (f *fakeVolumeBackend) HostPath(name string) string {
+	return filepath.Join("/var/lib/fred/volumes", name)
+}
+
 // fakeReleaseStore wraps a real *shared.ReleaseStore with the test-side
 // helpers expected by the migration tests. The wrapped store is real so the
 // production code path (which talks to *shared.ReleaseStore directly) is

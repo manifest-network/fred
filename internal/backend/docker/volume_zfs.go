@@ -113,6 +113,70 @@ func (z *zfsVolumeManager) List() ([]string, error) {
 	return listVolumeIDs(z.dataPath)
 }
 
+// datasetExists reports whether the named child dataset exists under the
+// parent dataset. Used by RenameVolume for idempotency checks. A
+// non-existent dataset returns (false, nil) — only command failures
+// surface as errors.
+func (z *zfsVolumeManager) datasetExists(ctx context.Context, dataset string) (bool, error) {
+	out, err := exec.CommandContext(ctx, "zfs", "list", "-H", "-o", "name", dataset).CombinedOutput()
+	if err != nil {
+		// Treat "dataset does not exist" as a non-error; anything else is real.
+		if strings.Contains(string(out), "does not exist") || strings.Contains(string(out), "no datasets available") {
+			return false, nil
+		}
+		return false, fmt.Errorf("zfs list %s: %w: %s", dataset, err, out)
+	}
+	return strings.TrimSpace(string(out)) == dataset, nil
+}
+
+// RenameVolume issues a `zfs rename` for the underlying dataset. zfs
+// treats rename as a metadata-only operation: data blocks, snapshots,
+// quota, and the dataset's mountpoint inheritance all move atomically.
+//
+// Idempotency mirrors atomicRenameVolumeDir's semantics — if the old
+// dataset is gone and the new one exists, the rename was already done.
+func (z *zfsVolumeManager) RenameVolume(oldName, newName string) error {
+	oldDataset := z.parentDataset + "/" + oldName
+	newDataset := z.parentDataset + "/" + newName
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	oldExists, err := z.datasetExists(ctx, oldDataset)
+	if err != nil {
+		return fmt.Errorf("check old zfs dataset %s: %w", oldDataset, err)
+	}
+	newExists, err := z.datasetExists(ctx, newDataset)
+	if err != nil {
+		return fmt.Errorf("check new zfs dataset %s: %w", newDataset, err)
+	}
+	switch {
+	case !oldExists && newExists:
+		return nil // idempotent — previous run already renamed
+	case oldExists && newExists:
+		return fmt.Errorf("both old (%s) and new (%s) zfs datasets exist; manual intervention required", oldDataset, newDataset)
+	case !oldExists && !newExists:
+		return fmt.Errorf("neither old (%s) nor new (%s) zfs dataset exists", oldDataset, newDataset)
+	}
+
+	out, err := exec.CommandContext(ctx, "zfs", "rename", oldDataset, newDataset).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("zfs rename %s → %s: %w: %s", oldDataset, newDataset, err, out)
+	}
+	z.logger.Debug("renamed zfs dataset", "old", oldDataset, "new", newDataset)
+	return nil
+}
+
+// HostPath returns the conventional mountpoint for a volume under the
+// data path. Production-deployed ZFS dataset trees use default mountpoint
+// inheritance, so this matches the actual mountpoint zfs creates. If an
+// operator overrode the mountpoint property to a non-default location,
+// migrations would need to consult `zfs get mountpoint` instead — out
+// of scope for now.
+func (z *zfsVolumeManager) HostPath(name string) string {
+	return filepath.Join(z.dataPath, name)
+}
+
 func (z *zfsVolumeManager) Validate() error {
 	// Check zfs binary exists
 	if _, err := exec.LookPath("zfs"); err != nil {
