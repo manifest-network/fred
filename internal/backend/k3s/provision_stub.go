@@ -220,13 +220,34 @@ func (b *Backend) runStubProvisioner(p *provision) {
 // ENG-189 lifecycle: cancel the per-lease ctx INSIDE provisionsMu
 // before deleting the map entry. runStubProvisioner captures p.ctx
 // under the same lock and ctx.Err()-checks before each post-unlock
-// external write, so an in-flight worker that already released the
-// lock observes cancellation on its next checkpoint and aborts.
-// callbackStore.Remove is kept as belt-and-suspenders: it closes the
-// residual ns-scale TOCTOU between the checkpoint-2 ctx.Err() check
-// and SendCallback's bbolt write, and is forward-compatible with
-// ENG-134+'s real K8s worker. TestDeprovision_RemovesPendingCallback
-// remains the regression guard.
+// external write (diagnostic Store, callback send), so an in-flight
+// worker that already released the lock observes cancellation at its
+// next checkpoint and aborts.
+//
+// Residual TOCTOU (accepted scope, ENG-189 plan §7 / R1): cancellation
+// cannot stop an in-flight SendCallback once the worker's checkpoint-2
+// ctx.Err() check has passed. Between that check and SendCallback's
+// bbolt Store + outbound HTTP POST, nothing here can abort the
+// callback — shared.CallbackSender has no per-lease ctx today. The
+// callbackStore.Remove call below clears any pre-existing pending
+// entry (e.g., from a prior failed delivery on the same lease's replay
+// queue); it does NOT cancel an HTTP POST already in flight, and it
+// does NOT prevent a racing worker that passes its ctx.Err() check
+// from re-persisting its own status=failed entry after this Remove
+// runs as a no-op. The window is ns-scale by construction (the
+// worker's last instruction before SendCallback is the ctx.Err()
+// check). Closing it requires reshaping the seam — e.g., a
+// Deprovision-side barrier that waits for any in-flight SendCallback
+// to drain, or pairing a ctx-threaded SendCallback with
+// Store-under-provisionsMu discipline so the persist becomes part of
+// the cancellable critical section. Either approach is deferred to
+// ENG-134+, where the real K8s worker replaces runStubProvisioner and
+// reshapes this seam anyway.
+//
+// TestDeprovision_RemovesPendingCallback pins the replay-queue cleanup
+// regression: a failed delivery persists an entry; Deprovision must
+// clear it so a subsequent restart's ReplayPendingCallbacks does not
+// fire a stale status=failed callback for a torn-down lease.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	_ = ctx
 	b.provisionsMu.Lock()
