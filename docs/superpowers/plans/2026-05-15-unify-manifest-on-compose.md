@@ -1493,16 +1493,23 @@ Expected: no matches. If matches remain, update them to use the unified path.
 
 - [ ] **Step 15.3: Drop the transitional `Manifest` alias and confirm zero references.**
 
-The alias `type Manifest = flatManifest` was introduced in Task 2 (commit `c5c27ad`) as a transitional shim so legacy `doProvision`/`doRestart`/`doUpdate` bodies could still reference `manifest.Manifest` until Task 14 deleted them. After Task 14 nothing should reference the alias anymore.
+The alias `type Manifest = flatManifest` was introduced in Task 2 (commit `c5c27ad`) as a transitional shim so legacy `doProvision`/`doRestart`/`doUpdate` bodies could still reference `manifest.Manifest` until Task 14 deleted them. After Task 14 nothing should reference the alias anymore — **including test fixtures**, which the deletion below would break.
 
-**Acceptance gate (must show zero hits):**
+**Acceptance gate (must show zero hits, _test.go files included):**
 
 ```bash
-grep -rn "manifest\.Manifest\b" --include="*.go" . | grep -v _test.go
+# External references — must be zero (including tests; the alias deletion breaks them too).
+grep -rn "manifest\.Manifest\b" --include="*.go" . | grep -v 'internal/backend/shared/manifest/'
+
+# The alias declaration itself — exactly one hit (the line about to be deleted).
 grep -rn "^type Manifest\b\|^type Manifest " internal/backend/shared/manifest/
 ```
 
-The first command must return no matches outside test files; the second must return no matches at all (the alias declaration itself is deleted in this step). If either grep finds something, identify the holdout and either update it to `*manifest.StackManifest` or fold the legacy reference away — do NOT re-introduce the alias. After confirming zero hits, delete the `type Manifest = flatManifest` line and its doc comment from `internal/backend/shared/manifest/manifest.go`.
+If the first grep finds any hit — production OR test — fix the holdout before deleting the alias. Production code: migrate to `*manifest.StackManifest` (or destructure to a `*flatManifest` local inside the manifest package via a helper). Test code: typically `manifest.Manifest{Image: ...}` literals — convert to `&manifest.StackManifest{Services: map[string]*flatManifest{...}}` via a helper exposed from the manifest package, or fold the conversion into Task 16's rebaseline and run that part of Task 16 first.
+
+**Do NOT re-introduce the alias** to silence this gate — the whole point of Task 15 is to retire it.
+
+After confirming zero external hits, delete the `type Manifest = flatManifest` line and its `// Deprecated:` doc block from `internal/backend/shared/manifest/manifest.go`.
 
 - [ ] **Step 15.4: Audit `ProvisionState.Image` and `prov.Manifest` (single).**
 
