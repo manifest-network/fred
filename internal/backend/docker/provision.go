@@ -3,6 +3,7 @@ package docker
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -20,6 +21,22 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
+
+// isFlatPayload reports whether the raw payload bytes lack a top-level
+// "services" key — i.e., a legacy flat single-service manifest was
+// submitted. Used at the Provision/Update entry to fire the one-time
+// deprecation log per lease without re-deriving the format from the
+// post-wrap StackManifest. Best-effort: malformed JSON returns false so
+// the deprecation log silently skips (the upstream ParsePayload already
+// surfaced the parse error).
+func isFlatPayload(data []byte) bool {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	_, hasServices := probe["services"]
+	return !hasServices
+}
 
 // Provision starts async provisioning of containers.
 // For multi-unit leases (quantity > 1), multiple containers are created.
@@ -132,87 +149,48 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		return err
 	}
 
-	// Parse payload. ParsePayload always returns a *StackManifest now;
-	// legacy flat payloads are auto-wrapped under DefaultServiceName. After
-	// the normalization above, IsStack is structurally always true here.
-	// The variable is preserved so the unchanged downstream branching keeps
-	// compiling; Task 4 collapses it.
-	isStack, err := backend.IsStack(req.Items)
+	// Parse payload. ParsePayload always returns a *StackManifest;
+	// legacy flat payloads are auto-wrapped under DefaultServiceName.
+	stackManifest, err := manifest.ParsePayload(req.Payload)
 	if err != nil {
 		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 	}
-	stackManifest, parseErr := manifest.ParsePayload(req.Payload)
-	if parseErr != nil {
+	if isFlatPayload(req.Payload) {
+		logger.Warn("manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack",
+			"lease_uuid", req.LeaseUUID)
+	}
+
+	// Validate the manifest against the (now-normalized) lease items and
+	// every service's image against the registry allowlist. After Task 3
+	// these run unconditionally — there is no legacy single-service arm.
+	if err := manifest.ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
 		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 	}
-
-	// Dead branch after Task 3: NormalizeProvisionRequest guarantees every
-	// item carries a service name, so isStack is always true here. The
-	// block is retained so the legacy `m` variable stays in scope for the
-	// rest of the function until Tasks 4-7 collapse the legacy execution
-	// paths entirely.
-	var m *manifest.Manifest
-	if !isStack {
-		m = stackManifest.Services[manifest.DefaultServiceName]
-		if m == nil || len(stackManifest.Services) != 1 {
+	for svcName, svc := range stackManifest.Services {
+		if err := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); err != nil {
 			b.removeProvision(req.LeaseUUID)
-			return fmt.Errorf("%w: payload is a stack manifest but lease items have no service names", backend.ErrInvalidManifest)
+			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, err)
 		}
 	}
 
-	// Validate images against registry allowlist.
-	if isStack {
-		if err := manifest.ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
-			b.removeProvision(req.LeaseUUID)
-			return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
-		}
-		for svcName, svc := range stackManifest.Services {
-			if err := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); err != nil {
-				b.removeProvision(req.LeaseUUID)
-				return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, err)
-			}
-		}
-	} else {
-		if err := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); err != nil {
-			b.removeProvision(req.LeaseUUID)
-			return fmt.Errorf("%w: %w", backend.ErrValidation, err)
-		}
-	}
-
-	// Try to allocate resources for all instances.
-	// Stack uses service-aware allocation IDs: {leaseUUID}-{serviceName}-{instanceIndex}
+	// Allocation IDs are always service-aware now:
+	// {leaseUUID}-{serviceName}-{instanceIndex}. The legacy {leaseUUID}-{idx}
+	// scheme is gone from the live path; Task 9's recover-time migration
+	// converts on-disk artefacts that still carry it.
 	var allocatedIDs []string
-	if isStack {
-		for _, item := range req.Items {
-			for i := range item.Quantity {
-				instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
-					for _, id := range allocatedIDs {
-						b.pool.Release(id)
-					}
-					b.removeProvision(req.LeaseUUID)
-					return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
+	for _, item := range req.Items {
+		for i := range item.Quantity {
+			instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
+			if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
+				for _, id := range allocatedIDs {
+					b.pool.Release(id)
 				}
-				allocatedIDs = append(allocatedIDs, instanceID)
+				b.removeProvision(req.LeaseUUID)
+				return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
 			}
-		}
-	} else {
-		instanceIdx := 0
-		for _, item := range req.Items {
-			for range item.Quantity {
-				instanceID := fmt.Sprintf("%s-%d", req.LeaseUUID, instanceIdx)
-				if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
-					for _, id := range allocatedIDs {
-						b.pool.Release(id)
-					}
-					b.removeProvision(req.LeaseUUID)
-					return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
-				}
-				allocatedIDs = append(allocatedIDs, instanceID)
-				instanceIdx++
-			}
+			allocatedIDs = append(allocatedIDs, instanceID)
 		}
 	}
 
@@ -220,15 +198,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	b.provisionsMu.Lock()
 	if prov, ok := b.provisions[req.LeaseUUID]; ok {
 		prov.SKU = req.RoutingSKU()
-		// Items are populated for both stack and legacy: stack uses them at
-		// rebuild time, legacy uses Items[0].CustomDomain for the secondary
-		// router on Restart/Update.
 		prov.Items = req.Items
-		if isStack {
-			prov.StackManifest = stackManifest
-		} else {
-			prov.Image = m.Image
-		}
+		prov.StackManifest = stackManifest
 	}
 	b.provisionsMu.Unlock()
 
@@ -241,10 +212,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
 	work := func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
-		if isStack {
-			return b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
-		}
-		return b.doProvision(provCtx, req, m, profiles, logger)
+		return b.doProvisionStack(provCtx, req, stackManifest, profiles, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.ProvisionRequestedMsg{
