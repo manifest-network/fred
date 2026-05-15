@@ -447,3 +447,12 @@ type _backendServiceGuard interface {
 }
 
 var _ _backendServiceGuard = (*Backend)(nil)
+
+// Compile-time check: *Backend satisfies the full backend.Backend contract,
+// not just the narrower cmd/k3s-backend HTTP-handler interface above. The
+// local _backendServiceGuard only covers what the HTTP server consumes; the
+// reconciler / router consume the wider backend.Backend interface, and
+// drift between them (such as round-13's missing RefreshState) goes
+// undetected when only the narrow guard is in place. Any future addition
+// to backend.Backend that k3s does not implement will fail the build here.
+var _ backend.Backend = (*Backend)(nil)
