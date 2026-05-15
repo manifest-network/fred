@@ -27,6 +27,37 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		return err
 	}
 
+	// Recover-time migration pre-pass. Groups any legacy single-service
+	// containers by lease and produces a per-lease migration plan. Runs
+	// BEFORE the main recovery loop so all in-memory provision state
+	// observed by Update / Restart paths is post-migration consistent
+	// (per QA's Task 6 carry-over note: prov.Items mutation must not
+	// race ahead of prov.ServiceContainers population).
+	//
+	// Task 9 executes the plans atomically per lease. Until then this
+	// pre-pass plans and aborts startup — the legacy on-disk state
+	// would otherwise reach the stack-only downstream code that no
+	// longer understands it.
+	legacyPlans, planErr := b.planLegacyMigrations(ctx, containers, b.logger)
+	if planErr != nil {
+		return fmt.Errorf("plan legacy migrations: %w", planErr)
+	}
+	for _, plan := range legacyPlans {
+		b.logger.Info("legacy lease migration planned",
+			"lease_uuid", plan.LeaseUUID,
+			"tenant", plan.Tenant,
+			"sku", plan.SKU,
+			"instances", len(plan.Instances),
+		)
+	}
+	if len(legacyPlans) > 0 {
+		// Execution lives in Task 9; fail loudly so we don't proceed into
+		// the main loop with on-disk state the stack-only paths can't
+		// drive. After Task 9 ships, this branch becomes an executor
+		// invocation that runs to completion before the main loop.
+		return fmt.Errorf("recover-time migration required for %d lease(s) but executor is not yet implemented (Task 9)", len(legacyPlans))
+	}
+
 	allocsByLease := make(map[string][]shared.ResourceAllocation)
 	recovered := make(map[string]*provision)
 	// firstExitedByLease[uuid] is the container ID of the first container we

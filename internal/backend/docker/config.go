@@ -156,6 +156,18 @@ type Config struct {
 	// Defaults to 90 days.
 	ReleasesMaxAge time.Duration `yaml:"releases_max_age"`
 
+	// MigrationGracePeriod is how long the renamed `-prev` legacy container
+	// lingers after a successful recover-time migration before forced
+	// removal. Preserves rollback potential if the operator interrupts fred
+	// in the migration window to inspect. Defaults to 1m.
+	MigrationGracePeriod time.Duration `yaml:"migration_grace_period"`
+
+	// MigrationReadyTimeout caps how long the recover-time migration waits
+	// for the new stack-form container to reach `healthy` (or `running`
+	// when no health check is declared) before declaring the migration
+	// failed for that lease. Defaults to 90s.
+	MigrationReadyTimeout time.Duration `yaml:"migration_ready_timeout"`
+
 	// Ingress configures optional reverse proxy integration.
 	// When enabled, containers with routable TCP ports get proxy labels
 	// pointing Traefik at the per-tenant network for HTTPS auto-discovery.
@@ -245,6 +257,8 @@ func DefaultConfig() Config {
 		DiagnosticsMaxAge:       7 * 24 * time.Hour,
 		ReleasesDBPath:          "releases.db",
 		ReleasesMaxAge:          90 * 24 * time.Hour,
+		MigrationGracePeriod:    time.Minute,
+		MigrationReadyTimeout:   90 * time.Second,
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
 				CPUCores: 0.25,

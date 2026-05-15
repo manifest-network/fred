@@ -59,15 +59,6 @@ func (b *Backend) handleContainerDeath(containerID string) {
 // concurrent Up calls, partial Down failures) is not modelled because the
 // migration tests don't exercise it.
 
-// ContainerMount is a minimal mount descriptor used in test fixtures to
-// describe a legacy container's volume bindings without pulling in the
-// docker engine API types. Production migration code reads mounts directly
-// from `client.ContainerInspect`.
-type ContainerMount struct {
-	Source string
-	Target string
-}
-
 // fakeDocker is the shared test-side state object referenced from the
 // fakeDockerClient and fakeComposeExecutor wired into the Backend by
 // newMigrationTestBackend. Tests set fields on this struct to control mock
