@@ -1,5 +1,5 @@
 // Package manifest defines the tenant-facing container manifest schema
-// (single-container Manifest and multi-service StackManifest), JSON
+// (single-container flatManifest and multi-service StackManifest), JSON
 // parsing, and validation. It is consumed by every backend that
 // provisions tenant workloads (Docker, K3s, future substrates) so the
 // on-the-wire schema and validation stay identical across substrates.
@@ -26,6 +26,7 @@
 package manifest
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -36,6 +37,30 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 )
+
+// DefaultServiceName is the synthetic service name applied when fred wraps a
+// legacy flat manifest into a 1-service stack. Centralized so callers stay
+// consistent.
+const DefaultServiceName = "app"
+
+// Manifest is a transitional exported alias for flatManifest, the now-
+// internal per-service container specification type.
+//
+// Tasks 4–7 collapse the docker backend's legacy single-service execution
+// paths into a uniform stack path. Until those land, several external sites
+// still reference *manifest.Manifest in struct fields and function
+// signatures (compose project params, lease state, container-create params,
+// legacy doProvision/doRestart/doUpdate). Demoting Manifest outright would
+// break the build at this commit and force Tasks 4–7's work into Task 2.
+//
+// Keeping the alias preserves transitional source compatibility — external
+// code using `*manifest.Manifest` continues to resolve to the same struct —
+// without re-exporting the canonical name. Task 15 deletes this alias once
+// the legacy callers have been folded into the stack path.
+//
+// Deprecated: new code must use *StackManifest and access individual
+// services via Stack.Services[name].
+type Manifest = flatManifest
 
 // serviceNameRe restricts service names to DNS-label-safe characters.
 // This prevents path traversal, invalid Docker container names, and
@@ -49,9 +74,9 @@ var serviceNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 // excessive RAM via tmpfs mounts that bypass the container's cgroup memory limit.
 const MaxTmpfsMounts = 4
 
-// Manifest represents the tenant's container specification.
+// flatManifest represents the tenant's container specification.
 // Resource limits are determined by the SKU, not the manifest.
-type Manifest struct {
+type flatManifest struct {
 	// Image is the container image to run (required).
 	Image string `json:"image"`
 
@@ -192,15 +217,15 @@ func (d Duration) Duration() time.Duration {
 	return time.Duration(d)
 }
 
-// ParseManifest parses and validates a Manifest from JSON.
+// ParseManifest parses and validates a flatManifest from JSON.
 // Unknown fields are rejected to catch accidental misuse (e.g., passing
 // a stack manifest where a single-container manifest is expected).
-func ParseManifest(data []byte) (*Manifest, error) {
+func ParseManifest(data []byte) (*flatManifest, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("manifest is empty")
 	}
 
-	var m Manifest
+	var m flatManifest
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&m); err != nil {
@@ -216,20 +241,20 @@ func ParseManifest(data []byte) (*Manifest, error) {
 
 // Validate checks that the manifest is valid for single-container use.
 // It rejects stack-only fields like depends_on.
-func (m *Manifest) Validate() error {
+func (m *flatManifest) Validate() error {
 	return m.validate(false)
 }
 
 // ValidateInStack checks that the manifest is valid for use within a stack.
 // It allows stack-only fields like depends_on (cross-service validation is
 // done separately by StackManifest.Validate).
-func (m *Manifest) ValidateInStack() error {
+func (m *flatManifest) ValidateInStack() error {
 	return m.validate(true)
 }
 
 // validate is the shared validation logic. When inStack is false, stack-only
 // fields (depends_on) are rejected.
-func (m *Manifest) validate(inStack bool) error {
+func (m *flatManifest) validate(inStack bool) error {
 	if m.Image == "" {
 		return fmt.Errorf("image is required")
 	}
@@ -385,7 +410,7 @@ const (
 
 // HasActiveHealthCheck returns true when the manifest declares a health check
 // that is not disabled (i.e., Test[0] is not "NONE").
-func (m *Manifest) HasActiveHealthCheck() bool {
+func (m *flatManifest) HasActiveHealthCheck() bool {
 	return m.HealthCheck != nil && len(m.HealthCheck.Test) > 0 && HealthCheckTestType(m.HealthCheck.Test[0]) != HealthCheckTestNone
 }
 
@@ -516,10 +541,10 @@ func validateExposePorts(ports []string) error {
 }
 
 // StackManifest represents a multi-service deployment where each service
-// has its own Manifest. The services map is keyed by service name
+// has its own flatManifest. The services map is keyed by service name
 // (matching LeaseItem.ServiceName from the chain).
 type StackManifest struct {
-	Services map[string]*Manifest `json:"services"`
+	Services map[string]*flatManifest `json:"services"`
 }
 
 // Validate checks that the stack manifest is valid.
@@ -644,37 +669,62 @@ func (s *StackManifest) detectDependsOnCycles() error {
 	return nil
 }
 
-// ParsePayload auto-detects whether data is a single Manifest or a
-// StackManifest (contains a "services" key). Returns exactly one non-nil result.
-func ParsePayload(data []byte) (*Manifest, *StackManifest, error) {
+// ParsePayload parses a deployment manifest payload and always returns the
+// stack-shaped representation regardless of the input format.
+//
+// Stack-format input (`{"services": {...}}`) is parsed directly and
+// validated. Flat-format input is parsed via the internal flatManifest type
+// and wrapped as `{"services": {DefaultServiceName: <flat>}}`, then
+// validated as a 1-service stack. Empty payloads and unparseable JSON
+// return an error.
+//
+// Boundary-normalization contract: every downstream component consumes a
+// *StackManifest. The legacy single-service shape is preserved on the wire
+// for tenant compatibility but disappears at this seam. Deprecation
+// logging for flat payloads happens at the call site, which has access to
+// the logger and lease UUID; the parser stays pure.
+func ParsePayload(data []byte) (*StackManifest, error) {
 	if len(data) == 0 {
-		return nil, nil, fmt.Errorf("payload is empty")
+		return nil, fmt.Errorf("empty payload")
 	}
-
-	// Probe for the "services" key to detect stack format.
-	var probe struct {
-		Services json.RawMessage `json:"services"`
-	}
+	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err != nil {
-		return nil, nil, fmt.Errorf("invalid payload JSON: %w", err)
+		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
-
-	if probe.Services != nil {
+	if _, isStack := probe["services"]; isStack {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.DisallowUnknownFields()
 		var stack StackManifest
-		if err := json.Unmarshal(data, &stack); err != nil {
-			return nil, nil, fmt.Errorf("invalid stack manifest JSON: %w", err)
+		if err := dec.Decode(&stack); err != nil {
+			return nil, fmt.Errorf("parse stack manifest: %w", err)
 		}
 		if err := stack.Validate(); err != nil {
-			return nil, nil, err
+			return nil, fmt.Errorf("validate stack manifest: %w", err)
 		}
-		return nil, &stack, nil
+		return &stack, nil
 	}
 
-	manifest, err := ParseManifest(data)
-	if err != nil {
-		return nil, nil, err
+	// Flat (legacy) form — parse, validate, then auto-wrap.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var flat flatManifest
+	if err := dec.Decode(&flat); err != nil {
+		return nil, fmt.Errorf("parse flat manifest: %w", err)
 	}
-	return manifest, nil, nil
+	if err := flat.Validate(); err != nil {
+		return nil, fmt.Errorf("validate flat manifest: %w", err)
+	}
+	// depends_on is structurally impossible on a flat payload (no peers).
+	// flat.Validate already rejects it via the non-inStack path, but the
+	// guard documents the invariant at the wrap seam.
+	if len(flat.DependsOn) > 0 {
+		return nil, fmt.Errorf("depends_on is not valid in a flat manifest")
+	}
+	stack := &StackManifest{Services: map[string]*flatManifest{DefaultServiceName: &flat}}
+	if err := stack.Validate(); err != nil {
+		return nil, fmt.Errorf("validate auto-wrapped stack: %w", err)
+	}
+	return stack, nil
 }
 
 // ValidateStackAgainstItems ensures a 1:1 mapping between manifest service

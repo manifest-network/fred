@@ -833,28 +833,38 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 
 	isStack := prov.IsStack()
 
-	// Parse new payload (auto-detects single vs stack).
-	m, stackManifest, parseErr := manifest.ParsePayload(req.Payload)
+	// Parse new payload. ParsePayload always returns a *StackManifest now;
+	// legacy flat payloads are auto-wrapped under DefaultServiceName.
+	stackManifest, parseErr := manifest.ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
 	}
 
-	// Ensure payload type matches existing provision type.
-	if isStack && stackManifest == nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: stack lease requires a stack manifest (with services key)", backend.ErrInvalidManifest)
-	}
-	if !isStack && stackManifest != nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: non-stack lease cannot be updated with a stack manifest", backend.ErrInvalidManifest)
+	// For legacy provisions, derive the single per-service manifest from the
+	// auto-wrapped stack. A multi-service payload submitted against a legacy
+	// provision is a wire-level mismatch — surface it the same way the
+	// pre-Task-2 validator did. Tasks 3-7 collapse this branch.
+	var m *manifest.Manifest
+	if !isStack {
+		m = stackManifest.Services[manifest.DefaultServiceName]
+		if m == nil || len(stackManifest.Services) != 1 {
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("%w: non-stack lease cannot be updated with a stack manifest", backend.ErrInvalidManifest)
+		}
 	}
 
 	if isStack {
-		// Validate stack against stored items.
+		// Validate stack against stored items. Now that ParsePayload
+		// auto-wraps flat payloads under DefaultServiceName, a flat payload
+		// submitted against a stack lease falls through to this check
+		// (auto-wrapped service name "app" mismatches the lease's named
+		// services), so we wrap with ErrInvalidManifest — matching
+		// provision.go's pattern and preserving the pre-Task-2 error
+		// category for the payload-type-mismatch case.
 		if valErr := manifest.ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
 			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: %w", backend.ErrValidation, valErr)
+			return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, valErr)
 		}
 		// Validate all images.
 		for svcName, svc := range stackManifest.Services {

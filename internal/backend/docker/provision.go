@@ -122,26 +122,33 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		profiles[item.SKU] = profile
 	}
 
-	// Parse payload — auto-detects single manifest vs stack manifest.
+	// Parse payload. ParsePayload always returns a *StackManifest now;
+	// legacy flat payloads are auto-wrapped under DefaultServiceName.
 	isStack, err := backend.IsStack(req.Items)
 	if err != nil {
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
-	m, stackManifest, parseErr := manifest.ParsePayload(req.Payload)
+	stackManifest, parseErr := manifest.ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
 	}
 
-	// Validate payload type matches lease items.
-	if isStack && stackManifest == nil {
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: lease items have service names but payload is not a stack manifest", backend.ErrInvalidManifest)
-	}
-	if !isStack && stackManifest != nil {
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: payload is a stack manifest but lease items have no service names", backend.ErrInvalidManifest)
+	// For legacy lease items (no service_name on items), the auto-wrapped
+	// stack carries the single service under DefaultServiceName. If the
+	// tenant submitted a multi-service stack payload AND legacy items, that
+	// is a wire-level mismatch — surface it the same way the pre-Task-2
+	// validator did. After Task 3 folds NormalizeProvisionRequest in,
+	// legacy items get auto-tagged with the default service name and the
+	// branching below collapses (Tasks 4-7).
+	var m *manifest.Manifest
+	if !isStack {
+		m = stackManifest.Services[manifest.DefaultServiceName]
+		if m == nil || len(stackManifest.Services) != 1 {
+			b.removeProvision(req.LeaseUUID)
+			return fmt.Errorf("%w: payload is a stack manifest but lease items have no service names", backend.ErrInvalidManifest)
+		}
 	}
 
 	// Validate images against registry allowlist.

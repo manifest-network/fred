@@ -77,18 +77,36 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// restart/update work after a cold start (manifest is not stored
 			// in labels). Using LatestActive avoids picking up a failed
 			// release (e.g., a failed update to a newer image).
+			//
+			// ParsePayload now always returns a *StackManifest (legacy flat
+			// payloads are auto-wrapped under DefaultServiceName). Until
+			// Tasks 4-7 collapse the legacy execution paths, the recovered
+			// provision state still wants prov.Manifest populated for
+			// 1-service auto-wrapped recoveries so legacy restart/update
+			// can run; multi-service stacks populate prov.StackManifest as
+			// before. Task 15 collapses prov.Manifest entirely.
 			if b.releaseStore != nil {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
-					// Use ParsePayload to auto-detect single vs stack manifest.
-					singleM, stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
+					stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
 					switch {
 					case payloadErr != nil:
 						b.logger.Warn("failed to parse recovered manifest",
 							"lease_uuid", c.LeaseUUID, "error", payloadErr)
-					case stackM != nil:
+					case c.ServiceName != "":
+						// Stack-form container — store the full stack.
 						prov.StackManifest = stackM
-					case singleM != nil:
-						prov.Manifest = singleM
+					case stackM != nil && len(stackM.Services) == 1:
+						// Legacy single-service container — auto-wrapped
+						// payload exposes the per-service manifest under
+						// DefaultServiceName. Populate prov.Manifest for
+						// the legacy code paths that still consume it.
+						if svc := stackM.Services[manifest.DefaultServiceName]; svc != nil {
+							prov.Manifest = svc
+						} else {
+							prov.StackManifest = stackM
+						}
+					default:
+						prov.StackManifest = stackM
 					}
 				}
 			}

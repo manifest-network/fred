@@ -168,20 +168,21 @@ func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 }
 
 func TestParsePayload(t *testing.T) {
-	t.Run("single manifest", func(t *testing.T) {
+	t.Run("flat manifest auto-wraps under DefaultServiceName", func(t *testing.T) {
 		data := []byte(`{"image":"nginx:latest"}`)
-		m, s, err := ParsePayload(data)
+		s, err := ParsePayload(data)
 		require.NoError(t, err)
-		assert.NotNil(t, m)
-		assert.Nil(t, s)
-		assert.Equal(t, "nginx:latest", m.Image)
+		require.NotNil(t, s)
+		require.Len(t, s.Services, 1)
+		svc := s.Services[DefaultServiceName]
+		require.NotNil(t, svc, "auto-wrapped service should be keyed under DefaultServiceName")
+		assert.Equal(t, "nginx:latest", svc.Image)
 	})
 
-	t.Run("stack manifest", func(t *testing.T) {
+	t.Run("stack manifest passes through unchanged", func(t *testing.T) {
 		data := []byte(`{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`)
-		m, s, err := ParsePayload(data)
+		s, err := ParsePayload(data)
 		require.NoError(t, err)
-		assert.Nil(t, m)
 		require.NotNil(t, s)
 		assert.Len(t, s.Services, 2)
 		assert.Equal(t, "nginx:latest", s.Services["web"].Image)
@@ -189,21 +190,21 @@ func TestParsePayload(t *testing.T) {
 	})
 
 	t.Run("empty payload", func(t *testing.T) {
-		_, _, err := ParsePayload(nil)
+		_, err := ParsePayload(nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "empty")
 	})
 
 	t.Run("invalid JSON", func(t *testing.T) {
-		_, _, err := ParsePayload([]byte("{invalid"))
+		_, err := ParsePayload([]byte("{invalid"))
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid payload JSON")
+		assert.Contains(t, err.Error(), "invalid JSON")
 	})
 
 	t.Run("stack with invalid service name", func(t *testing.T) {
 		// Uppercase service name fails the service-name regex.
 		data := []byte(`{"services":{"Web":{"image":"nginx:latest"}}}`)
-		_, _, err := ParsePayload(data)
+		_, err := ParsePayload(data)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must match")
 	})
