@@ -86,18 +86,22 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, status)
 	}
-	if prov.Manifest == nil && prov.StackManifest == nil {
+	if prov.StackManifest == nil {
+		// Post-Task-5 every restartable provision must carry a stack
+		// manifest. Legacy-shape provisions recovered before Tasks 8-9's
+		// startup migration runs would only have prov.Manifest populated
+		// and end up here; surfacing it as InvalidState lets the operator
+		// know a recover-time migration is owed. After Task 9 lands, no
+		// in-tree path can produce a manifest-less restartable provision.
 		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: no stored manifest for restart", backend.ErrInvalidState)
+		return fmt.Errorf("%w: no stored manifest for restart (pre-migration legacy lease?)", backend.ErrInvalidState)
 	}
-	isStack := prov.IsStack()
 	prevStatus := prov.Status
 	prevCallbackURL := prov.CallbackURL
 	prov.Status = backend.ProvisionStatusRestarting
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
 	}
-	m := prov.Manifest
 	stackManifest := prov.StackManifest
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
 	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
@@ -105,23 +109,13 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		serviceContainers[k] = append([]string(nil), v...)
 	}
 	items := append([]backend.LeaseItem(nil), prov.Items...)
-	sku := prov.SKU
 	b.provisionsMu.Unlock()
 
 	// Record restart release as deploying. Abort if this fails — without a
 	// release record, ActivateLatest after success is a no-op, and a cold
 	// restart would recover the previous manifest (silently rolling back).
 	if b.releaseStore != nil {
-		var manifestBytes []byte
-		var marshalErr error
-		var releaseImage string
-		if isStack {
-			manifestBytes, marshalErr = json.Marshal(stackManifest)
-			releaseImage = "stack"
-		} else {
-			manifestBytes, marshalErr = json.Marshal(m)
-			releaseImage = m.Image
-		}
+		manifestBytes, marshalErr := json.Marshal(stackManifest)
 		if marshalErr != nil {
 			b.provisionsMu.Lock()
 			prov.Status = prevStatus
@@ -131,7 +125,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		}
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  manifestBytes,
-			Image:     releaseImage,
+			Image:     "stack",
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
@@ -148,17 +142,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	// workers barrier). See handleRestartRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
-		if isStack {
-			return b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
-		}
-		// Legacy single-item: items[0].CustomDomain holds the secondary-router
-		// domain. Items may be empty for provisions recovered without it (legacy
-		// pre-CustomDomain state); treat that as no custom domain.
-		var customDomain string
-		if len(items) > 0 {
-			customDomain = items[0].CustomDomain
-		}
-		return b.doRestart(opCtx, req.LeaseUUID, m, containerIDs, sku, customDomain, prevStatus, logger)
+		return b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
