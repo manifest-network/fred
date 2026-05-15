@@ -803,11 +803,16 @@ func TestGetInfo_Stack(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 
-	// Should have Host and Services (not Instances).
+	// Should have Host, Services, AND a flattened Instances view.
+	// Task 13 unified the LeaseInfo contract: Services is the primary
+	// source of truth, Instances is a flattened convenience view in
+	// deterministic service-name order (so "db" precedes "web" here).
 	assert.Equal(t, "10.0.0.1", info.Host)
-	assert.Empty(t, info.Instances, "stack GetInfo should not have flat instances")
 
 	require.Len(t, info.Services, 2)
+	require.Len(t, info.Instances, 2, "flattened Instances view should match the total service-instance count")
+	assert.Equal(t, "postgres:16", info.Instances[0].Image, "deterministic service-name order: db first")
+	assert.Equal(t, "nginx:latest", info.Instances[1].Image, "deterministic service-name order: web second")
 
 	// Verify web service.
 	webSvc, ok := info.Services["web"]

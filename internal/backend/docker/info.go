@@ -3,6 +3,8 @@ package docker
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -44,8 +46,11 @@ func (b *Backend) GetReleases(_ context.Context, leaseUUID string) ([]backend.Re
 }
 
 // GetInfo returns lease information including connection details.
-// For multi-unit leases, returns an "instances" array with each container's info.
-// For stack leases, returns a "services" map grouping instances by service name.
+// Always populates `Services` keyed by service name (the primary
+// post-Tasks-3-9 source of truth). `Instances` is a flattened
+// convenience view computed by concatenating service instances in
+// deterministic service-name order so older tooling that consumes the
+// flat array keeps working.
 func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.LeaseInfo, error) {
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
@@ -54,14 +59,9 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 		return nil, backend.ErrNotProvisioned
 	}
 	status := prov.Status
-	isStack := prov.IsStack()
-	containerIDs := append([]string(nil), prov.ContainerIDs...)
-	var serviceContainers map[string][]string
-	if isStack {
-		serviceContainers = make(map[string][]string, len(prov.ServiceContainers))
-		for k, v := range prov.ServiceContainers {
-			serviceContainers[k] = append([]string(nil), v...)
-		}
+	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+	for k, v := range prov.ServiceContainers {
+		serviceContainers[k] = append([]string(nil), v...)
 	}
 	b.provisionsMu.RUnlock()
 
@@ -69,43 +69,34 @@ func (b *Backend) GetInfo(ctx context.Context, leaseUUID string) (*backend.Lease
 		return nil, backend.ErrNotProvisioned
 	}
 
-	// Stack response: group instances by service name.
-	if isStack {
-		services := make(map[string]backend.LeaseService, len(serviceContainers))
-		for svcName, svcContainerIDs := range serviceContainers {
-			var instances []backend.LeaseInstance
-			for _, containerID := range svcContainerIDs {
-				info, err := b.docker.InspectContainer(ctx, containerID)
-				if err != nil {
-					return nil, fmt.Errorf("failed to inspect container: %w", err)
-				}
-				instances = append(instances, inspectToInstance(info))
+	// Build `Services` first; inspect every service-container exactly once.
+	services := make(map[string]backend.LeaseService, len(serviceContainers))
+	for svcName, svcContainerIDs := range serviceContainers {
+		svcInstances := make([]backend.LeaseInstance, 0, len(svcContainerIDs))
+		for _, containerID := range svcContainerIDs {
+			info, err := b.docker.InspectContainer(ctx, containerID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to inspect container: %w", err)
 			}
-			services[svcName] = backend.LeaseService{Instances: instances}
+			svcInstances = append(svcInstances, inspectToInstance(info))
 		}
-		leaseInfo := backend.LeaseInfo{
-			Host:     b.cfg.HostAddress,
-			Services: services,
-		}
-		return &leaseInfo, nil
+		services[svcName] = backend.LeaseService{Instances: svcInstances}
 	}
 
-	// Flat instances array.
+	// Derive `Instances` by flattening in deterministic service-name
+	// order — preserves backwards-compatibility for callers that still
+	// consume the flat slice (e.g., older tooling that pre-dates the
+	// Services map). Total length equals sum of per-service quantities.
 	var instances []backend.LeaseInstance
-	for _, containerID := range containerIDs {
-		info, err := b.docker.InspectContainer(ctx, containerID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to inspect container: %w", err)
-		}
-		instances = append(instances, inspectToInstance(info))
+	for _, name := range slices.Sorted(maps.Keys(services)) {
+		instances = append(instances, services[name].Instances...)
 	}
 
-	leaseInfo := backend.LeaseInfo{
+	return &backend.LeaseInfo{
 		Host:      b.cfg.HostAddress,
+		Services:  services,
 		Instances: instances,
-	}
-
-	return &leaseInfo, nil
+	}, nil
 }
 
 // inspectToInstance converts a ContainerInfo from Docker inspect into a backend LeaseInstance.
