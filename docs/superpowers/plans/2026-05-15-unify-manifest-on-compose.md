@@ -1278,28 +1278,27 @@ git commit -m "feat(volume): RenameVolume support per filesystem"
 
 ## Task 11: Collapse volume bind helpers
 
-**Goal:** Delete `setupVolumeBinds`; rename `setupStackVolBinds` → `setupVolBinds`.
+**Goal:** Rename `setupStackVolBinds` → `setupVolBinds` everywhere it's referenced; the canonical helper now wears the unsuffixed name. Deletion of the legacy `setupVolumeBinds` is **deferred to Task 14** because legacy `doProvision` / `doRestart` / `doUpdate` / `doReplaceContainers` (which call it) are not deleted until Task 14 either — earlier deletion would break compilation. Task 14 absorbs both function-body deletion AND the `setupVolumeBinds` deletion in a single atomic refactor.
 
 **Files:**
-- Modify: `internal/backend/docker/provision.go`
+- Modify: `internal/backend/docker/provision.go` (rename only)
+- Modify: any other docker/*.go file referencing `setupStackVolBinds`
 
-- [ ] **Step 11.1: Confirm no callers of `setupVolumeBinds` remain after Tasks 4-7.**
+- [ ] **Step 11.1: Confirm `setupVolumeBinds` is reachable only from soon-to-be-deleted legacy bodies.**
 
 ```bash
 grep -rn "setupVolumeBinds\b" internal/backend/docker/ --include="*.go" | grep -v _test.go
 ```
 
-Expected: only the function definition. If any caller remains, redirect it to the stack helper.
+Expected: callers in `doReplaceContainers` (called only by legacy `doRestart`/`doUpdate`) and possibly inside legacy `doProvision`. All are dead post-Tasks-5/6 (entry points dispatch only to stack-form versions) but compile-reachable until Task 14 deletes them. **DO NOT delete `setupVolumeBinds` here** — Task 14 owns that.
 
-- [ ] **Step 11.2: Delete the function (provision.go:421-516).**
-
-- [ ] **Step 11.3: Rename.**
+- [ ] **Step 11.2: Rename canonical helper.**
 
 ```bash
 grep -rln "setupStackVolBinds" internal/backend/docker/ --include="*.go" | xargs sed -i 's/setupStackVolBinds/setupVolBinds/g'
 ```
 
-- [ ] **Step 11.4: Build + test.**
+- [ ] **Step 11.3: Build + test.**
 
 ```bash
 go build ./...
@@ -1308,11 +1307,11 @@ go test ./internal/backend/docker/ -run "Volume" -count=1
 
 Expected: PASS.
 
-- [ ] **Step 11.5: Commit.**
+- [ ] **Step 11.4: Commit.**
 
 ```bash
 git add internal/backend/docker/
-git commit -m "refactor(docker): collapse volume bind helpers into one"
+git commit -m "refactor(docker): rename setupStackVolBinds to setupVolBinds (legacy helper deletion deferred to Task 14)"
 ```
 
 ---
@@ -1415,35 +1414,35 @@ git commit -m "refactor(docker): always populate LeaseInfo.Services; derive Inst
 
 ## Task 14: Delete legacy function bodies
 
-**Goal:** Now that nothing routes to them, delete the legacy `doProvision`, `doRestart`, `doUpdate`. Rename `*Stack` versions to drop the suffix.
+**Goal:** Now that nothing routes to them, delete the legacy `doProvision`, `doRestart`, `doUpdate`, `doReplaceContainers`, and `setupVolumeBinds` (deferred from Task 11). Rename `*Stack` versions to drop the suffix. This is a single atomic refactor: deleting the legacy bodies and the helper they uniquely call in the same commit so the tree compiles at every intermediate state.
 
 **Files:**
 - Modify: `internal/backend/docker/provision.go`
 - Modify: `internal/backend/docker/restart_update.go`
 
-- [ ] **Step 14.1: Identify the legacy `doProvision` function span (provision.go:608–876) and delete it entirely.**
+- [ ] **Step 14.1: Identify the legacy function spans.**
 
 ```bash
-grep -n "^func (b \*Backend) doProvision\b\|^func (b \*Backend) doProvisionStack" internal/backend/docker/provision.go
-```
-
-Use the line numbers to locate the function body. Delete the legacy version.
-
-- [ ] **Step 14.2: Rename `doProvisionStack`→`doProvision`.**
-
-```bash
-grep -rln "doProvisionStack" internal/backend/docker/ --include="*.go" | xargs sed -i 's/doProvisionStack/doProvision/g'
-```
-
-- [ ] **Step 14.3: Same for `doRestart` and `doUpdate` in `restart_update.go`.**
-
-```bash
+grep -n "^func (b \*Backend) doProvision\b\|^func (b \*Backend) doProvisionStack\|^func (b \*Backend) doReplaceContainers\b\|^func (b \*Backend) setupVolumeBinds\b" internal/backend/docker/provision.go
 grep -n "^func (b \*Backend) doRestart\b\|^func (b \*Backend) doRestartStack\|^func (b \*Backend) doUpdate\b\|^func (b \*Backend) doUpdateStack" internal/backend/docker/restart_update.go
 ```
 
-Delete legacy versions; rename stack versions:
+Use the line numbers to locate the function bodies. Each legacy function must be deleted; the helpers that became dead-only-via-them (`doReplaceContainers`, `setupVolumeBinds`) follow.
+
+- [ ] **Step 14.2: Delete legacy `doProvision` (provision.go ~608–876), legacy `doRestart`, legacy `doUpdate`, legacy `doReplaceContainers`, and `setupVolumeBinds` (provision.go ~421-516, deferred from Task 11).**
+
+Verify each helper has zero remaining callers:
 
 ```bash
+grep -rn "doReplaceContainers\b\|setupVolumeBinds\b" internal/backend/docker/ --include="*.go" | grep -v _test.go
+```
+
+Expected: zero hits after deletion. If a test file still calls these, it's a Task 16 rebaseline target — skip-marker it with the standard Task 16 anchor.
+
+- [ ] **Step 14.3: Rename `doProvisionStack`→`doProvision`, `doRestartStack`→`doRestart`, `doUpdateStack`→`doUpdate`.**
+
+```bash
+grep -rln "doProvisionStack" internal/backend/docker/ --include="*.go" | xargs sed -i 's/doProvisionStack/doProvision/g'
 sed -i 's/doRestartStack/doRestart/g; s/doUpdateStack/doUpdate/g' internal/backend/docker/restart_update.go
 ```
 
@@ -1467,7 +1466,7 @@ Expected: stack-format tests PASS. Legacy-only tests still failing (Task 16).
 
 ```bash
 git add internal/backend/docker/
-git commit -m "refactor(docker): delete legacy doProvision/doRestart/doUpdate; drop Stack suffix"
+git commit -m "refactor(docker): delete legacy doProvision/doRestart/doUpdate/doReplaceContainers/setupVolumeBinds; drop Stack suffix"
 ```
 
 ---
