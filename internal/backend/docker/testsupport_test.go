@@ -1,6 +1,17 @@
 package docker
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"path/filepath"
+	"testing"
+	"time"
+
+	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
@@ -34,4 +45,166 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	case <-done:
 	case <-b.stopCtx.Done():
 	}
+}
+
+// --- Migration test fixtures (Task 1, plan §Task 1.4) -----------------------
+//
+// These fakes back the recover-time-migration tests in migrate_test.go. They
+// model the three substrates that migration touches (docker engine + compose,
+// volume backend, release store) so tests can hand-craft legacy-shaped state
+// and assert what the migration pipeline did with it.
+//
+// The fakes intentionally implement just enough of each interface for the
+// migration paths to compile and run end-to-end; behaviour beyond that (e.g.
+// concurrent Up calls, partial Down failures) is not modelled because the
+// migration tests don't exercise it.
+
+// ContainerMount is a minimal mount descriptor used in test fixtures to
+// describe a legacy container's volume bindings without pulling in the
+// docker engine API types. Production migration code reads mounts directly
+// from `client.ContainerInspect`.
+type ContainerMount struct {
+	Source string
+	Target string
+}
+
+// fakeDocker is the shared test-side state object referenced from the
+// fakeDockerClient and fakeComposeExecutor wired into the Backend by
+// newMigrationTestBackend. Tests set fields on this struct to control mock
+// behaviour, and read them to assert what production code did.
+//
+// Lumping docker-engine and compose state into a single struct keeps the
+// migration tests in the plan readable (one fake to set up, one fake to
+// assert against).
+type fakeDocker struct {
+	// Docker engine side.
+	containers []ContainerInfo               // returned by ListManagedContainers
+	mounts     map[string][]ContainerMount   // containerID → mounts (test-only)
+
+	// Compose side.
+	composeUpErr           error  // returned by composeExecutor.Up if non-nil
+	lastComposeProjectName string // captured project.Name from the most recent Up call
+}
+
+// fakeVolumeBackend records RenameVolume calls and stubs the rest of the
+// volumeManager interface with no-ops. RenameVolume is the new method
+// introduced by Task 10; the migration logic (Task 9) will call it via a
+// type assertion so this fake compiles cleanly today.
+type fakeVolumeBackend struct {
+	renames [][2]string // (oldName, newName) pairs, in call order
+}
+
+// Create returns a deterministic path so any production code that calls it
+// during a test does not blow up; the migration tests do not assert on it.
+func (f *fakeVolumeBackend) Create(_ context.Context, id string, _ int64) (string, bool, error) {
+	return filepath.Join("/var/lib/fred/volumes", id), true, nil
+}
+
+func (f *fakeVolumeBackend) Destroy(_ context.Context, _ string) error { return nil }
+func (f *fakeVolumeBackend) List() ([]string, error)                   { return nil, nil }
+func (f *fakeVolumeBackend) Validate() error                           { return nil }
+
+// RenameVolume captures the rename request. Returns nil unconditionally —
+// migration tests assert on the recorded renames slice rather than on a
+// returned error.
+func (f *fakeVolumeBackend) RenameVolume(oldName, newName string) error {
+	f.renames = append(f.renames, [2]string{oldName, newName})
+	return nil
+}
+
+// renamed reports whether (oldName → newName) appears in the rename log.
+func (f *fakeVolumeBackend) renamed(oldName, newName string) bool {
+	for _, r := range f.renames {
+		if r[0] == oldName && r[1] == newName {
+			return true
+		}
+	}
+	return false
+}
+
+// fakeReleaseStore wraps a real *shared.ReleaseStore with the test-side
+// helpers expected by the migration tests. The wrapped store is real so the
+// production code path (which talks to *shared.ReleaseStore directly) is
+// exercised; `releases` is a setup map that tests populate and Seed flushes
+// into the backing store.
+type fakeReleaseStore struct {
+	Store    *shared.ReleaseStore
+	releases map[string][]byte // leaseUUID → manifest payload to pre-seed
+}
+
+// Seed flushes the test-side `releases` map into the backing release store
+// as "active" entries dated now. Call this after populating `releases` and
+// before invoking the production code under test.
+func (f *fakeReleaseStore) Seed(t *testing.T) {
+	t.Helper()
+	for uuid, data := range f.releases {
+		require.NoError(t, f.Store.Append(uuid, shared.Release{
+			Manifest:  data,
+			Status:    "active",
+			CreatedAt: time.Now(),
+		}))
+	}
+}
+
+// hasWrappedRelease reports whether the latest release for uuid carries a
+// stack-shaped manifest (auto-wrapped or natively stack). Heuristic: look
+// for the top-level "services" key in the stored JSON.
+func (f *fakeReleaseStore) hasWrappedRelease(uuid string) bool {
+	rel, err := f.Store.LatestActive(uuid)
+	if err != nil || rel == nil {
+		return false
+	}
+	return bytes.Contains(rel.Manifest, []byte(`"services"`))
+}
+
+// newMigrationTestBackend constructs a Backend wired with the migration-test
+// fakes. Returns the Backend plus pointers to each fake so the test can drive
+// its inputs and assert on captured outputs.
+//
+// The release store is real (backed by a bbolt DB in t.TempDir()) so any
+// production read/write goes through the same paths as in production; closed
+// automatically via t.Cleanup. Tests that seeded `fakeRel.releases` must
+// invoke `fakeRel.Seed(t)` before triggering recoverState.
+func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBackend, *fakeReleaseStore) {
+	t.Helper()
+
+	state := &fakeDocker{mounts: make(map[string][]ContainerMount)}
+	fakeVol := &fakeVolumeBackend{}
+
+	dbPath := filepath.Join(t.TempDir(), "releases.db")
+	relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = relStore.Close() })
+	fakeRel := &fakeReleaseStore{Store: relStore, releases: make(map[string][]byte)}
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return state.containers, nil
+		},
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			for i := range state.containers {
+				if state.containers[i].ContainerID == containerID {
+					c := state.containers[i]
+					return &c, nil
+				}
+			}
+			return nil, fmt.Errorf("not found: %s", containerID)
+		},
+	}
+
+	fakeCompose := &mockComposeExecutor{
+		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+			if project != nil {
+				state.lastComposeProjectName = project.Name
+			}
+			return state.composeUpErr
+		},
+	}
+
+	b := newBackendForTest(mock, nil)
+	b.compose = fakeCompose
+	b.volumes = fakeVol
+	b.releaseStore = relStore
+
+	return b, state, fakeVol, fakeRel
 }

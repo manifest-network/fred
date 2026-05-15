@@ -1692,3 +1692,52 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "get_info", "error")))
 	})
 }
+
+// --- Boundary-normalization contract (Task 1, plan §Task 1.2) ---
+//
+// These tests lock the contract for NormalizeProvisionRequest, the entry-point
+// helper that converts legacy single-item-without-service_name requests into
+// the stack-shaped form expected by every downstream code path.
+//
+// Will compile/pass only after Task 3 adds NormalizeProvisionRequest; until
+// then they are the RED that proves the contract.
+
+func TestNormalizeProvisionRequest_AutoTagsSingleUnnamedItem(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: []LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+	}
+	if err := NormalizeProvisionRequest(&req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := req.Items[0].ServiceName; got != "app" {
+		t.Fatalf("expected service_name=app, got %q", got)
+	}
+}
+
+func TestNormalizeProvisionRequest_PreservesNamedItems(t *testing.T) {
+	req := ProvisionRequest{
+		Items: []LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		},
+	}
+	if err := NormalizeProvisionRequest(&req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Items[0].ServiceName != "web" || req.Items[1].ServiceName != "db" {
+		t.Fatalf("service_name modified unexpectedly: %+v", req.Items)
+	}
+}
+
+func TestNormalizeProvisionRequest_RejectsMixed(t *testing.T) {
+	req := ProvisionRequest{
+		Items: []LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1}, // missing
+		},
+	}
+	if err := NormalizeProvisionRequest(&req); err == nil {
+		t.Fatalf("expected error for mixed service_name, got nil")
+	}
+}

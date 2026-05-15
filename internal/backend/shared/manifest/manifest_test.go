@@ -612,3 +612,50 @@ func TestManifest_Init_Valid(t *testing.T) {
 		assert.NoError(t, m.Validate())
 	})
 }
+
+// --- Boundary-normalization contract (Task 1, plan §Task 1.1) ---
+//
+// These tests lock the post-migration ParsePayload contract:
+//   - Returns (*StackManifest, error) always — flat input is auto-wrapped as
+//     a 1-service stack named DefaultServiceName ("app").
+//   - Stack-format input passes through unchanged.
+//
+// They will compile/pass only after Task 2 rewrites ParsePayload and adds
+// DefaultServiceName. Until then they are the RED that proves the contract.
+
+func TestParsePayload_WrapsFlat(t *testing.T) {
+	flat := []byte(`{"image":"nginx:1.25","ports":{"80/tcp":{}}}`)
+	sm, err := ParsePayload(flat)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sm == nil || len(sm.Services) != 1 {
+		t.Fatalf("expected 1 service, got %+v", sm)
+	}
+	svc, ok := sm.Services[DefaultServiceName]
+	if !ok {
+		t.Fatalf("expected service %q, got keys %v", DefaultServiceName, mapKeys(sm.Services))
+	}
+	if svc.Image != "nginx:1.25" {
+		t.Fatalf("image not preserved: %q", svc.Image)
+	}
+}
+
+func TestParsePayload_StackPassThrough(t *testing.T) {
+	stack := []byte(`{"services":{"web":{"image":"nginx:1.25"}}}`)
+	sm, err := ParsePayload(stack)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := sm.Services["web"]; !ok {
+		t.Fatalf("expected service 'web', got keys %v", mapKeys(sm.Services))
+	}
+}
+
+func mapKeys[K comparable, V any](m map[K]V) []K {
+	out := make([]K, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
