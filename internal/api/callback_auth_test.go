@@ -106,13 +106,13 @@ func TestCallbackAuthenticator_ComputeSignatureWithTime(t *testing.T) {
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 	fixedTime := time.Unix(1700000000, 0)
 
-	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,fixedTime)
+	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, fixedTime)
 
 	// Should have the fixed timestamp
 	assert.True(t, strings.HasPrefix(signature, "t=1700000000,"), "signature should have fixed timestamp, got %q", signature)
 
 	// Signature should be deterministic with same time
-	signature2 := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,fixedTime)
+	signature2 := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, fixedTime)
 	assert.Equal(t, signature, signature2)
 }
 
@@ -121,7 +121,7 @@ func TestCallbackAuthenticator_VerifySignature(t *testing.T) {
 
 	payload := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
 	now := time.Now()
-	validSignature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,now)
+	validSignature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, now)
 
 	tests := []struct {
 		name      string
@@ -154,14 +154,14 @@ func TestCallbackAuthenticator_VerifySignature(t *testing.T) {
 		{
 			name:      "future signature - too far ahead",
 			payload:   payload,
-			signature: auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,now.Add(2*time.Minute)),
+			signature: auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, now.Add(2*time.Minute)),
 			refTime:   now, // Signature is 2 minutes in the future (> 1 min tolerance)
 			wantValid: false,
 		},
 		{
 			name:      "future signature - within clock skew tolerance",
 			payload:   payload,
-			signature: auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,now.Add(30*time.Second)),
+			signature: auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, now.Add(30*time.Second)),
 			refTime:   now, // Signature is 30 seconds in the future (< 1 min tolerance)
 			wantValid: true,
 		},
@@ -328,19 +328,19 @@ func TestCallbackAuthenticator_ReplayProtection(t *testing.T) {
 
 	// Create a signature at time T
 	signedAt := time.Now()
-	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,signedAt)
+	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, signedAt)
 
 	// Should be valid immediately
-	assert.True(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature,signedAt))
+	assert.True(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature, signedAt))
 
 	// Should still be valid at T+4 minutes
-	assert.True(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature,signedAt.Add(4*time.Minute)))
+	assert.True(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature, signedAt.Add(4*time.Minute)))
 
 	// Should be invalid at T+6 minutes (replay attack)
-	assert.False(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature,signedAt.Add(6*time.Minute)))
+	assert.False(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature, signedAt.Add(6*time.Minute)))
 
 	// Should be invalid at T+1 hour (definitely expired)
-	assert.False(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature,signedAt.Add(time.Hour)))
+	assert.False(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature, signedAt.Add(time.Hour)))
 }
 
 func TestNewCallbackAuthenticatorWithMaxAge_Validation(t *testing.T) {
@@ -383,13 +383,13 @@ func TestCallbackAuthenticator_CustomMaxAge(t *testing.T) {
 
 	payload := []byte(`{"test":"data"}`)
 	signedAt := time.Now()
-	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,signedAt)
+	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, signedAt)
 
 	// Should be valid within 1 minute
-	assert.True(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature,signedAt.Add(30*time.Second)))
+	assert.True(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature, signedAt.Add(30*time.Second)))
 
 	// Should be invalid after 1 minute
-	assert.False(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature,signedAt.Add(2*time.Minute)))
+	assert.False(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature, signedAt.Add(2*time.Minute)))
 }
 
 func TestHandleProvisionCallback_Authentication(t *testing.T) {
@@ -471,7 +471,7 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 	body := `{"lease_uuid":"01234567-89ab-cdef-0123-456789abcdef","status":"success"}`
 
 	// Create a signature at the current time
-	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, []byte(body),currentTime)
+	signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, []byte(body), currentTime)
 
 	// First request should succeed (time hasn't advanced)
 	req1 := httptest.NewRequest(http.MethodPost, "/callbacks/provision", strings.NewReader(body))
@@ -558,7 +558,7 @@ func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
 		auth.nowFunc = func() time.Time { return fixedTime }
 
 		// Create signature at that time
-		signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,fixedTime)
+		signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, fixedTime)
 
 		// VerifySignature should use the injected time and succeed
 		assert.True(t, auth.VerifySignature(testCallbackMethod, testCallbackURI, payload, signature))
@@ -567,7 +567,7 @@ func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
 	t.Run("rejects_expired_signature", func(t *testing.T) {
 		// Create signature at old time
 		oldTime := time.Unix(1600000000, 0)
-		signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload,oldTime)
+		signature := auth.ComputeSignatureWithTime(testCallbackMethod, testCallbackURI, payload, oldTime)
 
 		// Set current time to much later
 		auth.nowFunc = func() time.Time { return time.Unix(1700000000, 0) }
