@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,23 +125,28 @@ func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionR
 
 func TestProvision_Success(t *testing.T) {
 	pullCalled := false
-	createCalls := 0
-	startCalls := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			pullCalled = true
 			return nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			createCalls++
-			return fmt.Sprintf("container-%d", createCalls), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			startCalls++
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	upCalled := false
+	psCalled := false
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			upCalled = true
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			psCalled = true
+			return []composeContainerSummary{
+				{ID: "container-1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
 		},
 	}
 
@@ -152,6 +158,7 @@ func TestProvision_Success(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -169,12 +176,15 @@ func TestProvision_Success(t *testing.T) {
 	require.NotNil(t, prov)
 	status := prov.Status
 	containerIDs := prov.ContainerIDs
+	serviceContainers := prov.ServiceContainers
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
-	assert.Len(t, containerIDs, 1)
-	assert.True(t, pullCalled)
-	assert.Equal(t, 1, createCalls)
-	assert.Equal(t, 1, startCalls)
+	assert.Len(t, containerIDs, 1, "stack-shape provision must record exactly one container ID for a 1-service stack")
+	require.NotNil(t, serviceContainers)
+	assert.Len(t, serviceContainers[manifest.DefaultServiceName], 1, "ServiceContainers must map 'app' → 1 container")
+	assert.True(t, pullCalled, "PullImage must fire before compose up")
+	assert.True(t, upCalled, "compose.Up must be invoked on the stack path")
+	assert.True(t, psCalled, "compose.PS must be invoked to discover container IDs")
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -3810,19 +3820,18 @@ func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
-	// Mock: PullImage/Create/Start succeed, Inspect returns exited so
-	// waitForHealthy treats the container as crashed. Cleanup removes
-	// the containers. The test's ContainerLogsFn must return the
-	// simulated output — captureContainerLogs calls it BEFORE cleanup.
+	// Mock: stack-shape provision flow.
+	// - PullImage succeeds.
+	// - compose.Up succeeds; PS returns 2 containers for the "app" service
+	//   (one per Quantity=2 fanned-out replica).
+	// - InspectContainer returns exited/exit 1 so verifyStartup treats
+	//   the containers as crashed and the worker enters the failure path.
+	// - RemoveContainer returns nil (cleanup path).
+	// - ContainerLogs returns the simulated output —
+	//   captureContainerLogs calls it BEFORE cleanup.
 	logsFetched := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return fmt.Sprintf("container-%d", params.InstanceIndex), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
 			return nil
 		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
@@ -3837,7 +3846,26 @@ func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 		},
 	}
 
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			// Quantity=2 fans out under DefaultServiceName as
+			// "app-0" and "app-1" (mapComposeContainers will
+			// strip the suffix back to base service "app").
+			return []composeContainerSummary{
+				{ID: "container-0", Service: manifest.DefaultServiceName + "-0", State: "exited"},
+				{ID: "container-1", Service: manifest.DefaultServiceName + "-1", State: "exited"},
+			}, nil
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return nil
+		},
+	}
+
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.diagnosticsStore = diagStore
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.httpClient = callbackServer.Client()
@@ -3864,9 +3892,11 @@ func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	require.NotEmpty(t, entry.Logs, "persisted diagnostic must contain the pre-captured logs")
-	// Index-based keys for single-manifest provisions.
-	assert.Contains(t, entry.Logs["0"], "boot error on container-0")
-	assert.Contains(t, entry.Logs["1"], "boot error on container-1")
+	// Stack-shape log keys: "svcName/idx" — every provision is
+	// stack-shaped post-Task-15, so the 1-service "app" stack with
+	// Quantity=2 produces "app/0" and "app/1" keys.
+	assert.Contains(t, entry.Logs["app/0"], "boot error on container-0")
+	assert.Contains(t, entry.Logs["app/1"], "boot error on container-1")
 }
 
 func TestGetLogs_FallsBackToDiagnosticsStore(t *testing.T) {
@@ -4436,9 +4466,13 @@ func TestInspectImageForSetup_WritablePathsErrorNotCached(t *testing.T) {
 }
 
 func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
-	// End-to-end: detected writable paths flow through to CreateContainerParams
-	// as WritablePathBinds (bind mounts from managed volume).
-	var capturedParams CreateContainerParams
+	// End-to-end: detected writable paths flow through to the compose
+	// ServiceConfig as bind-mount Volumes. Post-Task-15 every provision
+	// goes through compose.Up; the CreateContainerParams.WritablePathBinds
+	// field is no longer the integration boundary — the binds are
+	// applied to ServiceConfig.Volumes via applyVolumeBinds in
+	// compose_project.go.
+	var capturedProject *composetypes.Project
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4468,20 +4502,26 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
 			return []string{"/var/lib/grafana"}, nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
 	}
 
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			capturedProject = project
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "container-1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
+		},
+	}
+
 	tmpDir := t.TempDir()
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.SKUProfiles = map[string]SKUProfile{
@@ -4497,11 +4537,29 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 
 	<-callbackReceived
 
-	// WritablePathBinds should map host path → container path.
-	require.NotNil(t, capturedParams.WritablePathBinds)
-	assert.Contains(t, capturedParams.WritablePathBinds, filepath.Join(tmpDir, "_wp", "var/lib/grafana"))
-	assert.Equal(t, "/var/lib/grafana", capturedParams.WritablePathBinds[filepath.Join(tmpDir, "_wp", "var/lib/grafana")])
-	assert.Equal(t, "472:472", capturedParams.User)
+	// Detected writable paths must surface as bind-mount Volumes on the
+	// compose ServiceConfig. The expected host path is
+	// `{volumeRoot}/_wp/var/lib/grafana` — _wp is the writable-paths
+	// subdir on the managed volume.
+	require.NotNil(t, capturedProject, "compose.Up must have been invoked with a captured project")
+	require.Len(t, capturedProject.Services, 1)
+	svc := capturedProject.Services[manifest.DefaultServiceName]
+	require.NotNil(t, svc, "compose project must have the 'app' service")
+
+	wantHost := filepath.Join(tmpDir, "_wp", "var/lib/grafana")
+	wantContainer := "/var/lib/grafana"
+	foundBind := false
+	for _, v := range svc.Volumes {
+		if v.Type == "bind" && v.Source == wantHost && v.Target == wantContainer {
+			foundBind = true
+			break
+		}
+	}
+	assert.True(t, foundBind,
+		"writable-path bind not found in compose ServiceConfig.Volumes (want type=bind source=%q target=%q); got %#v",
+		wantHost, wantContainer, svc.Volumes)
+	assert.Equal(t, "472:472", svc.User,
+		"compose ServiceConfig.User must carry the resolved UID:GID")
 
 	b.stopCancel()
 	b.wg.Wait()

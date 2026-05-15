@@ -11,12 +11,14 @@ import (
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // TestLeaseActor_DirectDispatch exercises the async actor path without the
@@ -328,12 +330,6 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return "c1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
@@ -344,7 +340,21 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 			return "", nil
 		},
 	}
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "c1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return nil
+		},
+	}
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.httpClient = callbackServer.Client()
 	rebuildCallbackSender(b)

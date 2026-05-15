@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1668,14 +1669,19 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return "c1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "c1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
 		},
 	}
 
@@ -1687,6 +1693,7 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.releaseStore = releaseStore
 	b.httpClient = callbackServer.Client()
 	rebuildCallbackSender(b)
@@ -1704,13 +1711,19 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 		t.Fatal("timeout waiting for callback")
 	}
 
-	// Verify initial release was recorded
+	// Verify initial release was recorded.
+	// Post-Task-15 the Image field carries the marker "stack" (the
+	// per-service images live inside Manifest payload, which we
+	// verify contains the original image string).
 	releases, err := releaseStore.List("lease-1")
 	require.NoError(t, err)
 	require.Len(t, releases, 1)
 	assert.Equal(t, 1, releases[0].Version)
-	assert.Equal(t, "nginx:latest", releases[0].Image)
+	assert.Equal(t, "stack", releases[0].Image,
+		"post-Task-15 release.Image is the stack-marker; per-service images live in Manifest payload")
 	assert.Equal(t, "active", releases[0].Status)
+	assert.Contains(t, string(releases[0].Manifest), "nginx:latest",
+		"Manifest payload must carry the original tenant-submitted JSON, which includes the per-service image")
 }
 
 func TestRestart_RollbackClearsLastError(t *testing.T) {
