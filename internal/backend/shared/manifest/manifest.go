@@ -43,23 +43,14 @@ import (
 // consistent.
 const DefaultServiceName = "app"
 
-// Manifest is a transitional exported alias for flatManifest, the now-
-// internal per-service container specification type.
+// Manifest is a transitional alias for callers that still hold a per-service
+// type. New code should use *StackManifest and destructure via
+// stack.Services[DefaultServiceName].
 //
-// Tasks 4–7 collapse the docker backend's legacy single-service execution
-// paths into a uniform stack path. Until those land, several external sites
-// still reference *manifest.Manifest in struct fields and function
-// signatures (compose project params, lease state, container-create params,
-// legacy doProvision/doRestart/doUpdate). Demoting Manifest outright would
-// break the build at this commit and force Tasks 4–7's work into Task 2.
-//
-// Keeping the alias preserves transitional source compatibility — external
-// code using `*manifest.Manifest` continues to resolve to the same struct —
-// without re-exporting the canonical name. Task 15 deletes this alias once
-// the legacy callers have been folded into the stack path.
-//
-// Deprecated: new code must use *StackManifest and access individual
-// services via Stack.Services[name].
+// Deprecated: this alias exists only until Task 14/15 deletes the legacy
+// doProvision/doRestart/doUpdate code paths. Removal is tracked in the
+// "Sunset hard" follow-up and is non-negotiable — do not add new external
+// references to manifest.Manifest. The alias must be deleted in Task 15.
 type Manifest = flatManifest
 
 // serviceNameRe restricts service names to DNS-label-safe characters.
