@@ -89,28 +89,40 @@ The "depends_on forbidden in single-service" rule disappears (structurally impos
 
 ### Recover-time migration
 
-A new file `internal/backend/docker/migrate.go` owns the legacy → stack migration. On every call to `recoverState`, before the main recover loop, fred scans the managed-container list and dispatches each legacy container (label `fred.lease_uuid` present, `fred.service_name` absent or empty) through the migration pipeline:
+A new file `internal/backend/docker/migrate.go` owns the legacy → stack migration. On every call to `recoverState`, before the main recover loop, fred scans the managed-container list, **groups legacy containers by `fred.lease_uuid`, and migrates each lease as an atomic unit** — a legacy multi-instance lease is brought up in a single Compose project containing all N instances, because `b.compose.Up` is invoked with `RemoveOrphans: true` (compose.go:101) and would otherwise destroy already-migrated siblings.
 
-1. **Inspect.** Read the existing container's image, env, ports, labels, mounts, health-check, and stop-grace-period from `ContainerInspect`.
-2. **Reconstruct.** Read the persisted manifest from the release store; if missing, synthesize a minimal manifest from the inspected container (image + ports + env + healthcheck). Wrap as `{"services": {"app": <manifest>}}` and validate.
-3. **Plan.** Compute new artefact names: container `fred-{uuid}-app-{idx}`, volume `fred-{uuid}-app-{idx}`. Note: `{idx}` equals the legacy container's `fred.instance_index` label.
-4. **Rename volume directory.** Call `VolumeBackend.RenameVolume(oldName, newName)` for each volume bound to the legacy container. Skipped if the new path already exists and the old does not (idempotent under restart).
-5. **Stop and rename old container.** Stop the legacy container with its `stop_grace_period`; rename to `fred-{uuid}-app-{idx}-prev` (mirrors the existing restart-update flow at `backend.go:616`).
-6. **Build Compose project.** Use `buildComposeProject` with the wrapped manifest; the project's volume binds resolve to the just-renamed directories.
-7. **Compose Up.** Call `composeService.Up`. The new container starts under the stack-style name.
-8. **Wait for health.** If the manifest declares a health check, wait until the new container reports `healthy`; otherwise wait until `running`.
-9. **Remove `-prev`.** After `migration_grace_period` (config-defaulted to `1m`), force-remove the `-prev` container. The grace period preserves rollback potential if the operator interrupts fred and inspects.
-10. **Persist.** Write the wrapped manifest into the release store as a new release entry (idempotent if the same wrapped manifest already exists). Future recover sees the lease as stack-form and skips migration.
+**Legacy detection filter.** A container is "legacy" iff: `fred.lease_uuid` label present, `fred.service_name` label absent or empty, AND its name does NOT end in `-prev` (the `-prev` suffix marks already-migrated remnants pending grace-period cleanup, and must be excluded from re-migration).
+
+For each legacy lease (set of legacy containers sharing one `lease_uuid`):
+
+1. **Inspect.** For every legacy container in the lease, call `ContainerInspect` to read image, env, ports, labels, mounts, health-check, stop-grace-period. The `ContainerInfo` type gains a `Mounts []ContainerMount` field populated from `resp.Mounts` so `ListManagedContainers` results carry the bind sources/targets the planner needs.
+2. **Reconstruct.** Read the persisted manifest from the release store (`shared.ReleaseStore.LatestActive`); if missing, **fail loudly** (operator must investigate or deprovision). In-container reconstruction is intentionally out of scope — it cannot reliably infer tmpfs, user, init, expose, or arbitrary labels. Wrap the manifest as `{"services": {"app": <manifest>}}` and validate.
+3. **Plan.** For each instance in the lease, compute new artefact names: container `fred-{uuid}-app-{idx}`, volume `fred-{uuid}-app-{idx}`. `{idx}` equals the legacy container's `fred.instance_index` label.
+4. **Stop and rename old containers.** For every legacy instance in this lease, stop the container with its `stop_grace_period`, then rename to `fred-{uuid}-app-{idx}-prev` (mirrors the existing restart-update flow at `backend.go:616`). Stopping must precede volume rename: it releases the bind mount and any open file handles, which is required for `zfs rename` on a busy dataset and avoids dangling-inode confusion under xfs/btrfs.
+5. **Rename volume directories.** For each volume bound to a legacy instance (sourced from `ContainerInfo.Mounts`), call `volumeManager.RenameVolume(oldName, newName)`. **Skip per-volume when both: the instance has no managed volumes (stateless lease, e.g., `DiskMB <= 0` with no image VOLUMEs), or the new path already exists and the old does not (idempotent under crash-restart).**
+6. **Build Compose project.** Use `buildComposeProject` with the wrapped manifest and the full set of instances; the project's volume binds (`VolBinds map[string]map[int]serviceVolBinds`) resolve to the just-renamed directories.
+7. **Compose Up.** Call `b.compose.Up`. All instances of the lease come up under the stack-style names in one project.
+8. **Wait for health.** If the manifest declares a health check, wait until each new container reports `healthy`; otherwise wait until `running`. Reuses `waitForHealthy` (provision.go:1133); if the existing helper does not cover the running-only case, extend it rather than duplicate.
+9. **Schedule `-prev` removal.** After `migration_grace_period` (config-defaulted to `1m`), force-remove each `-prev` container. The grace window preserves rollback potential if the operator interrupts fred and inspects.
+10. **Persist.** Write the wrapped manifest into the release store via a new `ReleaseStore.RecordMigration(leaseUUID, payload []byte) error` method (idempotent if the same wrapped manifest already exists). Future recover sees the lease as stack-form and skips migration.
+
+**Race avoidance between pre-pass and main recover loop.** After the migration pre-pass completes, `recoverState` re-invokes `ListManagedContainers` before the main loop runs. The original `containers` slice held legacy container IDs that no longer exist post-migration; the fresh listing reflects the stack-form IDs and labels the main loop expects.
 
 Failure handling: any step error aborts startup with a clear log:
 ```
-legacy container migration FAILED: lease <uuid> container <id>: <error>
+legacy container migration FAILED: lease <uuid>: <error>
 fred refuses to start with unmigrated legacy containers.
 Remediation: investigate the failure cause; re-run fred (migration is idempotent), or
 deprovision the lease manually if data loss is acceptable.
 ```
 
 The fail-fast posture prevents half-migrated state.
+
+**New supporting infrastructure.** The migration pipeline depends on these additions, all introduced in Task 8 as prerequisites:
+
+- `internal/backend/docker/config.go`: `MigrationGracePeriod time.Duration` (default `1m`) and `MigrationReadyTimeout time.Duration` (default `90s`).
+- `internal/backend/docker/lifecycle.go`: `ContainerMount` type (`Source`, `Target`, `Type`) and `ContainerInfo.Mounts []ContainerMount`, populated from `resp.Mounts` in both `ContainerInspect` and `ListManagedContainers`.
+- `internal/backend/shared/releases.go`: `RecordMigration(leaseUUID string, manifest []byte) error` that appends an active release entry; idempotent on identical payload.
 
 ### Volume rename per filesystem
 
@@ -131,15 +143,17 @@ All three are idempotent: if old path doesn't exist and new path does, return ni
 | `internal/backend/docker/provision.go` | Call `NormalizeProvisionRequest` + `ParsePayload`; delete legacy `doProvision`; rename `doProvisionStack`→`doProvision`. Delete `setupVolumeBinds`; rename `setupStackVolBinds`→`setupVolBinds`. |
 | `internal/backend/docker/restart_update.go` | Same pattern: delete legacy `doRestart`, `doUpdate`; rename `doRestartStack`→`doRestart`, `doUpdateStack`→`doUpdate`. |
 | `internal/backend/docker/deprovision.go` | Drop `if isStack` branches. |
-| `internal/backend/docker/recover.go` | Pre-loop: dispatch legacy containers to migration. Main loop: drop legacy branch (all containers are stack-form after migration). |
+| `internal/backend/docker/recover.go` | Pre-pass: group legacy containers by lease and dispatch each lease to migration. Re-list managed containers between pre-pass and main loop. Main loop drops legacy branch. |
 | `internal/backend/docker/migrate.go` *(new)* | Owns the legacy→stack migration pipeline. |
 | `internal/backend/docker/info.go` | Always populate `Services`; derive `Instances` flattened view. |
-| `internal/backend/docker/lifecycle.go` | Only the stack form of container naming (line 1048-1050 simplified). |
+| `internal/backend/docker/lifecycle.go` | Service-aware container naming only (line 1048-1050 simplified). Add `ContainerMount` type and `ContainerInfo.Mounts []ContainerMount`; populate from `resp.Mounts` in `ContainerInspect` and `ListManagedContainers`. |
 | `internal/backend/docker/backend.go` | `prevContainerName` takes a `serviceName` parameter (line 618). |
-| `internal/backend/docker/volume.go` | Add `RenameVolume(oldName, newName string) error` to `VolumeBackend` interface. |
+| `internal/backend/docker/config.go` | Add `MigrationGracePeriod` (default `1m`) and `MigrationReadyTimeout` (default `90s`). |
+| `internal/backend/docker/volume.go` | Add `RenameVolume(oldName, newName string) error` to the existing `volumeManager` interface. |
 | `internal/backend/docker/volume_xfs.go` | Implement `RenameVolume` via `os.Rename`. |
 | `internal/backend/docker/volume_btrfs.go` | Implement `RenameVolume` via `os.Rename` (subvolume rename). |
 | `internal/backend/docker/volume_zfs.go` | Implement `RenameVolume` via `zfs rename`. |
+| `internal/backend/shared/releases.go` | Add `RecordMigration(leaseUUID string, manifest []byte) error`. |
 | `internal/backend/shared/leasesm/*.go` | Drop `IsStack` callers; `ProvisionState` always carries `StackManifest` + `ServiceContainers`. |
 | `internal/api/handlers.go` | (No structural change — `NormalizeProvisionRequest` handles it at the backend boundary; the API just passes through.) |
 | `docs/manifest-guide.md` | Add deprecation notice on the flat format; keep the section but mark legacy. |
@@ -157,8 +171,8 @@ All three are idempotent: if old path doesn't exist and new path does, return ni
 
 ## Risks
 
-1. **Recover-time migration is the riskiest piece.** Failure modes include missing release-store entry (mitigated by reconstruction from container inspect), volume rename failure on a specific filesystem (caught and reported), image no longer pullable (logged; lease aborts), Compose network conflict. Each is a fatal startup error with the offending lease identified, so operators never end up half-migrated.
-2. **Volume rename atomicity per filesystem.** `os.Rename` is atomic within a filesystem on xfs and btrfs; ZFS `rename` is a metadata operation and atomic. A migration interrupted between rename and container-recreate leaves an orphan directory plus a stopped container; recover-time migration is idempotent and resumes on the next startup.
+1. **Recover-time migration is the riskiest piece.** Failure modes include missing release-store entry (**fails loudly — in-container reconstruction is out of scope; operators must either repopulate the release store or `deprovision` the affected lease**), volume rename failure on a specific filesystem (caught and reported), image no longer pullable (logged; lease aborts), Compose network conflict. Each is a fatal startup error with the offending lease identified, so operators never end up half-migrated. Stateless leases (no managed volumes) skip the rename step but otherwise follow the full pipeline.
+2. **Volume rename atomicity per filesystem.** `os.Rename` is atomic within a filesystem on xfs and btrfs; ZFS `rename` is a metadata operation and atomic — but ZFS rejects rename of a busy dataset, which is why the pipeline stops the container *before* renaming. A migration interrupted between container stop+rename and Compose Up leaves a `-prev` container plus a renamed volume directory; recover-time migration is idempotent (volume rename short-circuits when old absent + new present; stop is no-op on a stopped container; rename-to-`-prev` is no-op when the container already carries that name) and resumes on the next startup. The `-prev` filter on legacy detection prevents the planner from looping on already-migrated containers within the grace window.
 3. **Brief downtime per legacy lease during startup.** Stateful tenants experience a restart. Operators communicate the upgrade window via the existing release-notes channel.
 4. **Container name change for previously single-service leases.** External monitoring tools keyed on `fred-{uuid}-{idx}` break. Release notes call this out.
 5. **Boundary-normalization log spam.** Every flat-manifest deploy logs a deprecation. The log is rate-limited per lease UUID (e.g., once per process restart).

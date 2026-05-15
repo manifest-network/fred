@@ -688,15 +688,66 @@ git commit -m "refactor(docker): drop legacy branch from deprovision"
 
 ---
 
-## Task 8: Recover-time migration — scaffolding
+## Task 8: Recover-time migration — supporting types and scaffolding
 
-**Goal:** Add the `migrate.go` file with the migration pipeline scaffolding (struct, plan-build, dry-run logging). No execution yet. Wire `recover.go` to call it (also no-op for now).
+**Goal:** Add the supporting infrastructure the migration pipeline needs (config fields, `ContainerMount`/`ContainerInfo.Mounts`, `ReleaseStore.RecordMigration`), then create `migrate.go` with the per-lease planner and wire a no-op pre-pass into `recover.go`. No execution yet (Task 9). All new symbols verified against current code, not invented.
 
 **Files:**
+- Modify: `internal/backend/docker/config.go`
+- Modify: `internal/backend/docker/lifecycle.go`
+- Modify: `internal/backend/shared/releases.go`
 - Create: `internal/backend/docker/migrate.go`
 - Modify: `internal/backend/docker/recover.go`
 
-- [ ] **Step 8.1: Create `internal/backend/docker/migrate.go` with the migration plan type and a `planLegacyMigration` function.**
+- [ ] **Step 8.1: Add migration config fields to `internal/backend/docker/config.go`.**
+
+```go
+// MigrationGracePeriod is how long a legacy container's `-prev` rename
+// lingers after a successful recover-time migration before forced removal.
+// Default: 1m. Preserves rollback potential under operator inspection.
+MigrationGracePeriod time.Duration
+
+// MigrationReadyTimeout caps how long the migration waits for the new
+// stack-form container to reach `healthy`/`running`. Default: 90s.
+MigrationReadyTimeout time.Duration
+```
+
+Default them in the same place existing durations are defaulted (search for the config constructor / `Defaults()` analogue). Add a TOML / env binding if the existing config supports that pattern.
+
+- [ ] **Step 8.2: Add `ContainerMount` type and `ContainerInfo.Mounts` field to `internal/backend/docker/lifecycle.go`. Populate from `resp.Mounts` in both `ContainerInspect` (around line 1371) and `ListManagedContainers`.**
+
+```go
+// ContainerMount mirrors the subset of docker's Mount data fred needs for
+// migration: where the host bind comes from, where it's mounted in the
+// container, and the mount type.
+type ContainerMount struct {
+    Source string
+    Target string
+    Type   string // bind | volume | tmpfs (string per docker API)
+}
+```
+
+Extend `ContainerInfo` with `Mounts []ContainerMount`. In the inspect path, copy `resp.Mounts` into the slice. In `ListManagedContainers`, either issue an extra `ContainerInspect` per container (acceptable cost — runs only at startup) or filter `resp.Mounts` from the existing list-with-inspect helper if one exists.
+
+- [ ] **Step 8.3: Add `RecordMigration` to `internal/backend/shared/releases.go`.**
+
+```go
+// RecordMigration appends an active release entry for a recover-time migration.
+// Idempotent: if the most-recent active entry for the lease already carries
+// the same manifest payload, this is a no-op.
+func (s *ReleaseStore) RecordMigration(leaseUUID string, manifest []byte) error {
+    latest, _ := s.LatestActive(leaseUUID)
+    if latest != nil && bytes.Equal(latest.Manifest, manifest) {
+        return nil
+    }
+    // Reuse Append semantics; status is "active".
+    return s.Append(leaseUUID, Release{Manifest: manifest, Status: StatusActive, ...})
+}
+```
+
+(Copy the active-release shape from the closest existing append site. If `Release` has additional required fields like timestamp/version, populate them with sensible defaults.)
+
+- [ ] **Step 8.4: Create `internal/backend/docker/migrate.go` with the per-lease planner.**
 
 ```go
 package docker
@@ -705,113 +756,156 @@ import (
     "context"
     "fmt"
     "log/slog"
+    "strings"
+    "time"
 
     "github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
-// legacyMigration describes the work needed to recreate one legacy
-// single-service container as a stack-form (1-service) Compose project.
+// legacyMigration describes the work needed to recreate ALL legacy
+// containers of one lease as a single stack-form (1-service, N-instance)
+// Compose project. Per-lease (not per-container) because b.compose.Up
+// runs with RemoveOrphans:true and would destroy already-migrated siblings.
 type legacyMigration struct {
-    LeaseUUID       string
-    LegacyContainer ContainerInfo
-    InspectedMounts []ContainerMount // existing volume binds from ContainerInspect
-    Stack           *manifest.StackManifest
-    NewContainerName  string // fred-{uuid}-app-{idx}
-    OldVolumeName     string // fred-{uuid}-{idx}
-    NewVolumeName     string // fred-{uuid}-app-{idx}
+    LeaseUUID  string
+    Tenant     string
+    SKU        string
+    Stack      *manifest.StackManifest
+    Instances  []legacyMigrationInstance
 }
 
-// planLegacyMigration assembles a legacyMigration for a given legacy container.
-// Reads the persisted manifest from the release store; if absent, reconstructs
-// from the container's existing config.
-func (b *Backend) planLegacyMigration(ctx context.Context, c ContainerInfo, logger *slog.Logger) (*legacyMigration, error) {
-    if c.ServiceName != "" {
-        return nil, fmt.Errorf("not a legacy container: service_name=%q", c.ServiceName)
-    }
+type legacyMigrationInstance struct {
+    LegacyContainer  ContainerInfo
+    Mounts           []ContainerMount // managed-volume binds; len==0 for stateless
+    NewContainerName string           // fred-{uuid}-app-{idx}
+    PrevName         string           // fred-{uuid}-app-{idx}-prev
+    VolRenames       []volRename      // {old, new} per managed volume
+}
 
-    inspected, err := b.docker.InspectContainer(ctx, c.ContainerID)
+type volRename struct{ Old, New, Target string }
+
+// isLegacyContainer: present in managed list, has lease_uuid, no service_name,
+// AND name doesn't end with -prev (already-migrated remnants are excluded).
+func isLegacyContainer(c ContainerInfo) bool {
+    if c.LeaseUUID == "" || c.ServiceName != "" {
+        return false
+    }
+    return !strings.HasSuffix(c.Name, "-prev")
+}
+
+// planLegacyMigrations groups legacy containers by lease and produces one
+// migration plan per lease.
+func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo, logger *slog.Logger) ([]*legacyMigration, error) {
+    byLease := map[string][]ContainerInfo{}
+    for _, c := range all {
+        if isLegacyContainer(c) {
+            byLease[c.LeaseUUID] = append(byLease[c.LeaseUUID], c)
+        }
+    }
+    plans := make([]*legacyMigration, 0, len(byLease))
+    for leaseUUID, group := range byLease {
+        plan, err := b.planLegacyMigrationForLease(ctx, leaseUUID, group, logger)
+        if err != nil {
+            return nil, fmt.Errorf("plan lease %s: %w", leaseUUID, err)
+        }
+        plans = append(plans, plan)
+    }
+    return plans, nil
+}
+
+func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID string, group []ContainerInfo, logger *slog.Logger) (*legacyMigration, error) {
+    // Manifest source: release store. No in-container reconstruction.
+    rel, relErr := b.releases.LatestActive(leaseUUID)
+    if relErr != nil || rel == nil || len(rel.Manifest) == 0 {
+        return nil, fmt.Errorf("release store has no active manifest for lease %s; cannot migrate (operator: investigate or deprovision)", leaseUUID)
+    }
+    stack, err := manifest.ParsePayload(rel.Manifest)
     if err != nil {
-        return nil, fmt.Errorf("inspect legacy container: %w", err)
+        return nil, fmt.Errorf("parse stored manifest: %w", err)
     }
 
-    // Reconstruct the manifest.
-    var rawManifest []byte
-    if b.releaseStore != nil {
-        if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
-            rawManifest = rel.Manifest
+    instances := make([]legacyMigrationInstance, 0, len(group))
+    for _, c := range group {
+        // c.Mounts populated in Task 8.2; if absent, fall back to an Inspect call.
+        mounts := c.Mounts
+        if mounts == nil {
+            inspected, ierr := b.docker.InspectContainer(ctx, c.ContainerID)
+            if ierr != nil {
+                return nil, fmt.Errorf("inspect %s: %w", c.ContainerID, ierr)
+            }
+            mounts = inspected.Mounts
         }
+        // Keep only managed-volume binds (host source under b.cfg.DataPath / equivalent
+        // root). tmpfs and unrelated binds are filtered.
+        managed := filterManagedMounts(b, mounts)
+
+        newName := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, manifest.DefaultServiceName, c.InstanceIndex)
+        prevName := newName + "-prev"
+
+        var renames []volRename
+        for _, m := range managed {
+            oldVol := fmt.Sprintf("fred-%s-%d", leaseUUID, c.InstanceIndex)
+            newVol := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, manifest.DefaultServiceName, c.InstanceIndex)
+            renames = append(renames, volRename{Old: oldVol, New: newVol, Target: m.Target})
+        }
+        instances = append(instances, legacyMigrationInstance{
+            LegacyContainer:  c,
+            Mounts:           managed,
+            NewContainerName: newName,
+            PrevName:         prevName,
+            VolRenames:       renames,
+        })
     }
-    var stack *manifest.StackManifest
-    if rawManifest != nil {
-        stack, err = manifest.ParsePayload(rawManifest)
-        if err != nil {
-            return nil, fmt.Errorf("parse stored manifest: %w", err)
-        }
-    } else {
-        // Reconstruct minimal manifest from container inspect.
-        stack, err = reconstructManifestFromContainer(inspected)
-        if err != nil {
-            return nil, fmt.Errorf("reconstruct manifest: %w", err)
-        }
-        logger.Warn("legacy migration: release store missing entry; reconstructed from container",
-            "lease_uuid", c.LeaseUUID, "container_id", c.ContainerID)
-    }
+    sortInstancesByIndex(instances) // deterministic order
 
     return &legacyMigration{
-        LeaseUUID:        c.LeaseUUID,
-        LegacyContainer:  c,
-        InspectedMounts:  inspected.Mounts,
-        Stack:            stack,
-        NewContainerName: fmt.Sprintf("fred-%s-%s-%d", c.LeaseUUID, manifest.DefaultServiceName, c.InstanceIndex),
-        OldVolumeName:    fmt.Sprintf("fred-%s-%d", c.LeaseUUID, c.InstanceIndex),
-        NewVolumeName:    fmt.Sprintf("fred-%s-%s-%d", c.LeaseUUID, manifest.DefaultServiceName, c.InstanceIndex),
+        LeaseUUID: leaseUUID,
+        Tenant:    group[0].Tenant,
+        SKU:       group[0].SKU,
+        Stack:     stack,
+        Instances: instances,
     }, nil
 }
 
-// reconstructManifestFromContainer builds a minimal 1-service stack manifest
-// from an inspected container. Falls back when the release store has no entry.
-func reconstructManifestFromContainer(inspected ContainerInspect) (*manifest.StackManifest, error) {
-    // Minimal: image + env + ports + healthcheck.
-    // Detailed implementation deferred to QA — extract ports from inspected.NetworkSettings.Ports,
-    // env from inspected.Config.Env, healthcheck from inspected.Config.Healthcheck.
-    // Return an error if the container has volumes but no manifest record exists, since the
-    // tmpfs/user/etc. cannot be safely inferred.
-    return nil, fmt.Errorf("manifest reconstruction not implemented; release store entry required for lease %s", inspected.LeaseUUID())
+// filterManagedMounts: keep only binds whose Source sits under the docker
+// volume root path. Stateless leases legitimately return zero results here.
+func filterManagedMounts(b *Backend, mounts []ContainerMount) []ContainerMount {
+    // Implementation: compare m.Source HasPrefix(b.volumes.Root()) — adjust to
+    // the actual API on volumeManager. If volumeManager doesn't expose a Root
+    // method today, add a minimal Root() accessor in volume.go.
+    return mounts // placeholder; replace with real filter
+}
+
+func sortInstancesByIndex(xs []legacyMigrationInstance) {
+    // sort.Slice on InstanceIndex; trivial.
 }
 ```
 
-(The `ContainerInspect`, `ContainerMount` types live in `lifecycle.go` — reuse rather than redefine. If `LeaseUUID()` is not a method on `ContainerInspect`, read it from `inspected.Config.Labels[LabelLeaseUUID]`.)
+(Symbol notes verified against the codebase: the field is `b.compose`, the interface is unexported `volumeManager` with field `b.volumes`, the release store field is `b.releases`. The `ContainerInspect` return shape includes `Mounts` after Step 8.2. Use real names; do not invent.)
 
-- [ ] **Step 8.2: At the top of `recoverState` in `recover.go` (after the `ListManagedContainers` call), iterate to find legacy containers and call `planLegacyMigration` for each — log the plan but do not execute yet.**
+- [ ] **Step 8.5: At the top of `recoverState` in `recover.go` (after the existing `ListManagedContainers` call near line 25), insert the pre-pass — plan only, no execution yet.**
 
 ```go
-    // Legacy migration pre-pass: detect any container missing fred.service_name
-    // and plan its migration. Actual execution lands in Task 9.
-    var legacyMigrations []*legacyMigration
-    for _, c := range containers {
-        if c.LeaseUUID != "" && c.ServiceName == "" {
-            plan, err := b.planLegacyMigration(ctx, c, b.logger)
-            if err != nil {
-                return fmt.Errorf("plan legacy migration for lease %s container %s: %w",
-                    c.LeaseUUID, c.ContainerID, err)
-            }
-            legacyMigrations = append(legacyMigrations, plan)
-            b.logger.Info("legacy container migration planned",
-                "lease_uuid", plan.LeaseUUID,
-                "container_id", plan.LegacyContainer.ContainerID,
-                "new_container_name", plan.NewContainerName,
-                "old_volume", plan.OldVolumeName,
-                "new_volume", plan.NewVolumeName,
-            )
-        }
+    // Legacy migration pre-pass: group legacy containers by lease and plan
+    // each lease's migration. Execution lands in Task 9.
+    legacyPlans, err := b.planLegacyMigrations(ctx, containers, b.logger)
+    if err != nil {
+        return fmt.Errorf("plan legacy migrations: %w", err)
     }
-    if len(legacyMigrations) > 0 {
-        // Execution lives in Task 9; for now, abort startup with a clear message.
+    for _, plan := range legacyPlans {
+        b.logger.Info("legacy lease migration planned",
+            "lease_uuid", plan.LeaseUUID,
+            "instances", len(plan.Instances),
+        )
+    }
+    if len(legacyPlans) > 0 {
+        // Execution lives in Task 9; for now, abort startup with a clear message
+        // so we don't proceed into the main loop with stale container metadata.
         return fmt.Errorf("legacy migration planning complete; execution pending (Task 9)")
     }
 ```
 
-- [ ] **Step 8.3: Build.**
+- [ ] **Step 8.6: Build.**
 
 ```bash
 go build ./...
@@ -819,7 +913,7 @@ go build ./...
 
 Expected: success.
 
-- [ ] **Step 8.4: Run migration plan tests.**
+- [ ] **Step 8.7: Run migration plan tests.**
 
 ```bash
 go test ./internal/backend/docker/ -run "TestRecoverState_MigratesLegacyContainer" -v
@@ -827,103 +921,141 @@ go test ./internal/backend/docker/ -run "TestRecoverState_MigratesLegacyContaine
 
 Expected: still failing (execution not implemented). That's acceptable — Task 9 makes it pass.
 
-- [ ] **Step 8.5: Commit.**
+- [ ] **Step 8.8: Commit.**
 
 ```bash
-git add internal/backend/docker/migrate.go internal/backend/docker/recover.go
-git commit -m "feat(docker): scaffold legacy→stack recover-time migration"
+git add internal/backend/docker/config.go internal/backend/docker/lifecycle.go \
+        internal/backend/shared/releases.go \
+        internal/backend/docker/migrate.go internal/backend/docker/recover.go
+git commit -m "feat(docker): scaffold legacy→stack recover-time migration (per-lease planner + supporting types)"
 ```
 
 ---
 
 ## Task 9: Recover-time migration — execution
 
-**Goal:** Implement `executeLegacyMigration` doing the full rename + recreate.
+**Goal:** Implement `executeLegacyMigration` (per lease, all instances atomically). Pipeline order is **stop → rename container to `-prev` → rename volumes → buildComposeProject → compose.Up → wait → schedule -prev removal → persist**. The container must be stopped *before* the volume rename: ZFS rejects rename of a busy dataset, and on xfs/btrfs renaming under a live bind risks dangling-inode confusion. Multi-instance leases migrate atomically in one Up call to avoid `RemoveOrphans:true` (compose.go:101) destroying already-migrated siblings.
 
 **Files:**
 - Modify: `internal/backend/docker/migrate.go`
 - Modify: `internal/backend/docker/recover.go`
 
-- [ ] **Step 9.1: Add `executeLegacyMigration` to `migrate.go`.**
+- [ ] **Step 9.1: Add `executeLegacyMigration` to `migrate.go`.** Real symbol names (`b.compose`, `b.volumes`, `b.releases`, `VolBinds`); per-lease atomic; stateless-safe.
 
 ```go
 func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration, logger *slog.Logger) error {
-    logger = logger.With("lease_uuid", m.LeaseUUID, "container_id", m.LegacyContainer.ContainerID)
+    logger = logger.With("lease_uuid", m.LeaseUUID, "instances", len(m.Instances))
     logger.Info("legacy migration starting")
 
-    // 1. Volume directory rename (idempotent).
-    if err := b.volumeBackend.RenameVolume(m.OldVolumeName, m.NewVolumeName); err != nil {
-        return fmt.Errorf("rename volume %s→%s: %w", m.OldVolumeName, m.NewVolumeName, err)
+    svc := m.Stack.Services[manifest.DefaultServiceName]
+    if svc == nil {
+        return fmt.Errorf("internal: wrapped stack missing default service %q", manifest.DefaultServiceName)
     }
-    logger.Info("volume renamed", "old", m.OldVolumeName, "new", m.NewVolumeName)
-
-    // 2. Stop + rename legacy container.
     stopGrace := 10 * time.Second
-    if svc := m.Stack.Services[manifest.DefaultServiceName]; svc != nil && svc.StopGracePeriod != nil {
+    if svc.StopGracePeriod != nil {
         stopGrace = time.Duration(*svc.StopGracePeriod)
     }
-    if err := b.docker.StopContainer(ctx, m.LegacyContainer.ContainerID, stopGrace); err != nil {
-        // Tolerate already-stopped.
-        logger.Warn("stop legacy container returned error (continuing)", "error", err)
-    }
-    prevName := m.NewContainerName + "-prev"
-    if err := b.docker.RenameContainer(ctx, m.LegacyContainer.ContainerID, prevName); err != nil {
-        return fmt.Errorf("rename legacy container to %s: %w", prevName, err)
+
+    // 1. Stop + rename every legacy container in the lease.
+    //    Stopping must precede volume rename (ZFS busy-dataset; xfs/btrfs sanity).
+    for _, inst := range m.Instances {
+        if err := b.docker.StopContainer(ctx, inst.LegacyContainer.ContainerID, stopGrace); err != nil {
+            // Tolerate already-stopped; the docker error type tells us.
+            logger.Warn("stop legacy container returned error (continuing)",
+                "container_id", inst.LegacyContainer.ContainerID, "error", err)
+        }
+        // Idempotency: if a previous run already renamed to PrevName, this errors;
+        // detect that case and continue.
+        if err := b.docker.RenameContainer(ctx, inst.LegacyContainer.ContainerID, inst.PrevName); err != nil {
+            if !isAlreadyNamedErr(err, inst.PrevName) {
+                return fmt.Errorf("rename %s to %s: %w", inst.LegacyContainer.ContainerID, inst.PrevName, err)
+            }
+        }
     }
 
-    // 3. Build the Compose project and bring it up.
-    profile, err := b.cfg.GetSKUProfile(m.LegacyContainer.SKU)
-    if err != nil {
-        return fmt.Errorf("load SKU profile: %w", err)
+    // 2. Rename managed volume directories (per-instance, per-volume).
+    //    Skipped naturally when an instance has no managed volumes (stateless lease).
+    for _, inst := range m.Instances {
+        for _, r := range inst.VolRenames {
+            if err := b.volumes.RenameVolume(r.Old, r.New); err != nil {
+                return fmt.Errorf("rename volume %s→%s (instance idx=%d): %w",
+                    r.Old, r.New, inst.LegacyContainer.InstanceIndex, err)
+            }
+        }
     }
+
+    // 3. Build the Compose project for the whole lease (all instances).
+    profile, err := b.cfg.GetSKUProfile(m.SKU)
+    if err != nil {
+        return fmt.Errorf("load SKU profile %s: %w", m.SKU, err)
+    }
+    quantity := len(m.Instances)
     items := []backend.LeaseItem{{
-        SKU: m.LegacyContainer.SKU, Quantity: 1, ServiceName: manifest.DefaultServiceName,
+        SKU: m.SKU, Quantity: quantity, ServiceName: manifest.DefaultServiceName,
     }}
+
+    // Compose project must use the just-renamed volume directories. Pass them
+    // via VolBinds: map[serviceName] map[instanceIndex] serviceVolBinds.
+    volBinds := map[string]map[int]serviceVolBinds{
+        manifest.DefaultServiceName: {},
+    }
+    for _, inst := range m.Instances {
+        binds := serviceVolBinds{} // populate per-target host paths from inst.VolRenames
+        for _, r := range inst.VolRenames {
+            binds.Add(r.Target, b.volumes.HostPath(r.New)) // HostPath: volumeManager helper to resolve host dir for a vol name
+        }
+        volBinds[manifest.DefaultServiceName][inst.LegacyContainer.InstanceIndex] = binds
+    }
+
     project, err := buildComposeProject(composeProjectParams{
-        LeaseUUID:  m.LeaseUUID,
-        Tenant:     m.LegacyContainer.Tenant,
-        Stack:      m.Stack,
-        Items:      items,
-        Profiles:   map[string]SKUProfile{m.LegacyContainer.SKU: profile},
-        // Reuse the volume path we just renamed: pass the bind override via
-        // composeProjectParams.VolumeBinds.
-        VolumeBinds: map[string]map[string]string{
-            manifest.DefaultServiceName: {
-                m.InspectedMounts[0].Target: filepath.Join(b.cfg.VolumeRoot, m.NewVolumeName),
-            },
-        },
+        LeaseUUID: m.LeaseUUID,
+        Tenant:    m.Tenant,
+        Stack:     m.Stack,
+        Items:     items,
+        Profiles:  map[string]SKUProfile{m.SKU: profile},
+        VolBinds:  volBinds,
     })
     if err != nil {
         return fmt.Errorf("build compose project: %w", err)
     }
-    if err := b.composeService.Up(ctx, project, composeUpOpts{}); err != nil {
+
+    // 4. Compose Up — brings up all instances under stack-form names.
+    if err := b.compose.Up(ctx, project, composeUpOpts{}); err != nil {
         return fmt.Errorf("compose up: %w", err)
     }
 
-    // 4. Wait for health/run.
-    if err := b.waitForServiceReady(ctx, m.LeaseUUID, manifest.DefaultServiceName, m.Stack.Services[manifest.DefaultServiceName].HealthCheck, defaultMigrationReadyTimeout); err != nil {
-        return fmt.Errorf("wait for service ready: %w", err)
+    // 5. Wait for ready. Reuse waitForHealthy (provision.go:1133). It expects
+    //    container IDs; resolve them via b.docker.ListByName per new name.
+    newIDs, err := b.resolveContainerIDsByName(ctx, namesOf(m.Instances))
+    if err != nil {
+        return fmt.Errorf("resolve new container IDs: %w", err)
+    }
+    readyCtx, cancel := context.WithTimeout(ctx, b.cfg.MigrationReadyTimeout)
+    defer cancel()
+    if err := b.waitForHealthy(readyCtx, newIDs, svc.HealthCheck); err != nil {
+        return fmt.Errorf("wait for ready: %w", err)
     }
 
-    // 5. Schedule removal of the -prev container after the grace window.
-    go func() {
-        select {
-        case <-time.After(b.cfg.MigrationGracePeriod):
-        case <-ctx.Done():
-            return
-        }
-        if err := b.docker.RemoveContainer(context.Background(), prevName, true); err != nil {
-            logger.Warn("remove -prev container after grace failed (manual cleanup may be needed)",
-                "name", prevName, "error", err)
-        }
-    }()
-
-    // 6. Persist wrapped manifest into release store.
-    if b.releaseStore != nil {
-        if data, mErr := json.Marshal(m.Stack); mErr == nil {
-            if persistErr := b.releaseStore.RecordMigration(m.LeaseUUID, data); persistErr != nil {
-                logger.Warn("release store update failed (migration still complete)", "error", persistErr)
+    // 6. Schedule removal of all -prev containers after the grace window.
+    for _, inst := range m.Instances {
+        inst := inst
+        go func() {
+            select {
+            case <-time.After(b.cfg.MigrationGracePeriod):
+            case <-ctx.Done():
+                return
             }
+            if err := b.docker.RemoveContainer(context.Background(), inst.PrevName, true); err != nil {
+                logger.Warn("remove -prev container after grace failed (manual cleanup may be needed)",
+                    "name", inst.PrevName, "error", err)
+            }
+        }()
+    }
+
+    // 7. Persist wrapped manifest into release store (idempotent).
+    if data, mErr := json.Marshal(m.Stack); mErr == nil {
+        if persistErr := b.releases.RecordMigration(m.LeaseUUID, data); persistErr != nil {
+            logger.Warn("release store update failed (migration still complete)", "error", persistErr)
         }
     }
 
@@ -931,15 +1063,28 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
     return nil
 }
 
-const defaultMigrationReadyTimeout = 90 * time.Second
+// isAlreadyNamedErr returns true when a rename failed because the source
+// container already carries the target name (idempotency under crash-restart).
+func isAlreadyNamedErr(err error, targetName string) bool {
+    // Match on docker error message; tolerant. Refine as needed.
+    return strings.Contains(err.Error(), targetName) && strings.Contains(err.Error(), "already")
+}
+
+func namesOf(insts []legacyMigrationInstance) []string {
+    out := make([]string, 0, len(insts))
+    for _, i := range insts {
+        out = append(out, i.NewContainerName)
+    }
+    return out
+}
 ```
 
-(`composeProjectParams.VolumeBinds`, `b.composeService`, `b.volumeBackend`, `b.cfg.MigrationGracePeriod`, `b.releaseStore.RecordMigration` are anticipated to exist; if not, add them in this same task in the relevant files. `waitForServiceReady` likewise — if the stack provision flow has an equivalent helper, factor it out and reuse.)
+(If `volumeManager.HostPath` does not exist, add a minimal accessor returning `filepath.Join(<rootDir>, name)` for xfs/btrfs and the dataset mountpoint for zfs. If `resolveContainerIDsByName` / `waitForHealthy` signatures differ, adapt — do not invent.)
 
-- [ ] **Step 9.2: In `recover.go`, replace the placeholder `return fmt.Errorf("...pending Task 9...")` with the execution loop.**
+- [ ] **Step 9.2: In `recover.go`, replace the placeholder `return fmt.Errorf("...pending Task 9...")` with the execution loop, followed by a re-list of managed containers so the main loop sees post-migration state.**
 
 ```go
-    for _, plan := range legacyMigrations {
+    for _, plan := range legacyPlans {
         if err := b.executeLegacyMigration(ctx, plan, b.logger); err != nil {
             return fmt.Errorf("legacy migration FAILED: lease %s: %w\n"+
                 "fred refuses to start with unmigrated legacy containers. "+
@@ -947,6 +1092,15 @@ const defaultMigrationReadyTimeout = 90 * time.Second
                 "deprovision the lease manually if data loss is acceptable.",
                 plan.LeaseUUID, err)
         }
+    }
+    if len(legacyPlans) > 0 {
+        // Re-list: migrated containers have new IDs/names/labels; the original
+        // `containers` slice is stale.
+        refreshed, err := b.docker.ListManagedContainers(ctx)
+        if err != nil {
+            return fmt.Errorf("re-list containers after migration: %w", err)
+        }
+        containers = refreshed
     }
 ```
 
@@ -956,7 +1110,7 @@ const defaultMigrationReadyTimeout = 90 * time.Second
 go build ./...
 ```
 
-Expected: success. Add any helper types/fields that `executeLegacyMigration` referenced if the compiler complains; do not silently delete references.
+Expected: success. If the compiler complains about `b.volumes.HostPath`, `serviceVolBinds.Add`, `b.resolveContainerIDsByName`, etc., add minimal real implementations in their owning files — do not paper over with TODOs.
 
 - [ ] **Step 9.4: Run migration tests.**
 
@@ -977,15 +1131,17 @@ Expected: PASS. (Legacy-format recover tests need updating — handled in Task 1
 - [ ] **Step 9.6: Commit.**
 
 ```bash
-git add internal/backend/docker/migrate.go internal/backend/docker/recover.go
-git commit -m "feat(docker): execute legacy→stack migration at recover time"
+git add internal/backend/docker/migrate.go internal/backend/docker/recover.go \
+        internal/backend/docker/volume.go internal/backend/docker/volume_xfs.go \
+        internal/backend/docker/volume_btrfs.go internal/backend/docker/volume_zfs.go
+git commit -m "feat(docker): execute legacy→stack migration at recover time (per-lease, stop-before-rename)"
 ```
 
 ---
 
-## Task 10: VolumeBackend.RenameVolume per filesystem
+## Task 10: volumeManager.RenameVolume per filesystem
 
-**Goal:** Add `RenameVolume` to the volume backend interface and implement it for xfs, btrfs, zfs. Idempotent.
+**Goal:** Add `RenameVolume` to the existing unexported `volumeManager` interface (`volume.go:16`) and implement it for xfs, btrfs, zfs. Idempotent. (Note: the spec/older drafts used the name `VolumeBackend` — the actual interface in the codebase is `volumeManager`. Add a `HostPath(name string) string` accessor here too if Task 9 needs it.)
 
 **Files:**
 - Modify: `internal/backend/docker/volume.go`
@@ -993,7 +1149,7 @@ git commit -m "feat(docker): execute legacy→stack migration at recover time"
 - Modify: `internal/backend/docker/volume_btrfs.go`
 - Modify: `internal/backend/docker/volume_zfs.go`
 
-- [ ] **Step 10.1: Add to the `VolumeBackend` interface in `volume.go`:**
+- [ ] **Step 10.1: Add to the `volumeManager` interface in `volume.go`:**
 
 ```go
 // RenameVolume atomically renames a managed volume from oldName to newName.
@@ -1001,6 +1157,8 @@ git commit -m "feat(docker): execute legacy→stack migration at recover time"
 // loudly if both exist (operator must intervene).
 RenameVolume(oldName, newName string) error
 ```
+
+- [ ] **Step 10.1b: If Task 9 references it, add a `HostPath(name string) string` method on `volumeManager` returning the host directory for a given volume name. xfs/btrfs return `filepath.Join(<root>, name)`; zfs returns the dataset mountpoint (`<parentMount>/<name>` for the project's layout — verify in `volume_zfs.go`).**
 
 - [ ] **Step 10.2: Implement for xfs in `volume_xfs.go`:**
 
