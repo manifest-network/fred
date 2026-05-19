@@ -80,8 +80,8 @@ The new code's lease lifecycle does not produce these orphans.
 
 No required configuration changes. New optional knobs:
 
-- `migration_ready_timeout`: per-lease compose-up + verifyStartup bound during the auto-migration. Default: 60 seconds.
-- `migration_grace_period`: how long `-prev` legacy containers are retained for operator rollback inspection before background cleanup. Default: 5 minutes.
+- `migration_ready_timeout`: per-lease compose-up + verifyStartup bound during the auto-migration. Default: 90 seconds.
+- `migration_grace_period`: how long `-prev` legacy containers are retained for operator rollback inspection before background cleanup. Default: 1 minute.
 
 ### Acknowledgements
 
