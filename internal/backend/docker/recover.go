@@ -34,10 +34,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// (per QA's Task 6 carry-over note: prov.Items mutation must not
 	// race ahead of prov.ServiceContainers population).
 	//
-	// Task 9 executes the plans atomically per lease. Until then this
-	// pre-pass plans and aborts startup — the legacy on-disk state
-	// would otherwise reach the stack-only downstream code that no
-	// longer understands it.
+	// Each plan is then executed atomically per lease by
+	// executeLegacyMigration in the loop below. Any per-lease
+	// failure aborts startup with operator-actionable guidance —
+	// fred refuses to run with half-migrated state because the
+	// stack-only downstream code can't drive a mixed cohort.
 	legacyPlans, planErr := b.planLegacyMigrations(ctx, containers)
 	if planErr != nil {
 		return fmt.Errorf("plan legacy migrations: %w", planErr)
