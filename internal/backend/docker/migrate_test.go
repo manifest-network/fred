@@ -122,6 +122,93 @@ func TestPlanLegacyMigration_RejectsWrongServiceName(t *testing.T) {
 	assert.Contains(t, err.Error(), "lease-1")
 }
 
+// TestRecoverState_SkipsPrevRemnants: a managed container with a "-prev"
+// suffix on its name is a transient migration rollback artifact — left
+// behind when fred is interrupted between the rename step and the
+// post-grace cleanup, or when recoverState runs while the grace timer
+// is still pending. The main recovery loop must skip it; otherwise the
+// legacy-single-item branch fires (the container has no service_name)
+// and inflates prov.Quantity / appends a spurious LeaseItem.
+func TestRecoverState_SkipsPrevRemnants(t *testing.T) {
+	b, fakeDocker, _, _ := newMigrationTestBackend(t)
+	fakeDocker.containers = []ContainerInfo{
+		{
+			// A healthy migrated container — the normal stack-form shape.
+			ContainerID:   "app-cid",
+			Name:          "fred-lease-1-app-0",
+			LeaseUUID:     "lease-1",
+			Tenant:        "tenant-a",
+			SKU:           "docker-micro",
+			ServiceName:   "app",
+			InstanceIndex: 0,
+			Status:        "running",
+		},
+		{
+			// A -prev remnant for the same lease: same lease_uuid label,
+			// no service_name, name ends in "-prev". The main loop must
+			// skip it. Without the skip, prov.Quantity would tick to 2 and
+			// a LeaseItem{ServiceName:""} would land in prov.Items.
+			ContainerID:   "prev-cid",
+			Name:          "fred-lease-1-app-0-prev",
+			LeaseUUID:     "lease-1",
+			Tenant:        "tenant-a",
+			SKU:           "docker-micro",
+			InstanceIndex: 0,
+			Status:        "exited",
+		},
+	}
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	prov, ok := b.provisions["lease-1"]
+	require.True(t, ok, "lease-1 should be recovered")
+	assert.Equal(t, 1, prov.Quantity, "prov.Quantity must not count the -prev remnant")
+	require.Len(t, prov.Items, 1, "exactly one LeaseItem for the stack-form service")
+	assert.Equal(t, "app", prov.Items[0].ServiceName)
+	assert.NotContains(t, prov.ContainerIDs, "prev-cid", "ContainerIDs must not include the -prev remnant")
+}
+
+// TestExecuteLegacyMigration_EnsuresTenantNetwork: when network
+// isolation is enabled (the production default), the migration
+// executor must call EnsureTenantNetwork before bringing the new
+// Compose project up — otherwise the migrated containers come up
+// off-network and Traefik / inter-container DNS break immediately.
+// Mirrors the doProvision flow.
+func TestExecuteLegacyMigration_EnsuresTenantNetwork(t *testing.T) {
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	// Opt the test backend into network isolation; newBackendForTest
+	// defaults to off so unrelated tests don't need network stubs.
+	b.cfg.NetworkIsolation = ptrBool(true)
+
+	var calls []string
+	fakeDocker.ensureTenantNetwork = func(_ context.Context, tenant string) (string, error) {
+		calls = append(calls, tenant)
+		return "net-id-" + tenant, nil
+	}
+
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID:   "legacy-cid",
+		Name:          "fred-lease-1-0",
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		SKU:           "docker-micro",
+		Image:         "nginx:1.25",
+		InstanceIndex: 0,
+	}}
+	fakeDocker.mounts["legacy-cid"] = []ContainerMount{{
+		Source: "/var/lib/fred/volumes/fred-lease-1-0/data",
+		Target: "/data",
+		Type:   "bind",
+	}}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	require.Len(t, calls, 1, "EnsureTenantNetwork must be called exactly once during migration")
+	assert.Equal(t, "tenant-a", calls[0])
+}
+
 // TestFilterManagedMounts_SeparatorBoundary verifies that the prefix
 // check uses a separator-terminated root so sibling directories whose
 // names happen to begin with the configured volume_data_path are NOT

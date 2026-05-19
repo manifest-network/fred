@@ -403,14 +403,28 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 		volBinds[manifest.DefaultServiceName][inst.LegacyContainer.InstanceIndex] = binds
 	}
 
+	// Ensure the per-tenant Docker network exists when isolation is enabled.
+	// Mirrors doProvision (provision.go) — without this, migrated containers
+	// come up off-network: Traefik routing breaks and inter-container DNS
+	// resolves nothing. The network create is idempotent; a concurrent or
+	// previous-startup creation is fine.
+	var networkName string
+	if b.cfg.IsNetworkIsolation() {
+		if _, netErr := b.ensureTenantNetwork(ctx, m.Tenant); netErr != nil {
+			return fmt.Errorf("ensure tenant network: %w", netErr)
+		}
+		networkName = TenantNetworkName(m.Tenant)
+	}
+
 	project := buildComposeProject(composeProjectParams{
-		LeaseUUID: m.LeaseUUID,
-		Tenant:    m.Tenant,
-		Stack:     m.Stack,
-		Items:     items,
-		Profiles:  map[string]SKUProfile{m.SKU: profile},
-		VolBinds:  volBinds,
-		Cfg:       &b.cfg,
+		LeaseUUID:   m.LeaseUUID,
+		Tenant:      m.Tenant,
+		Stack:       m.Stack,
+		Items:       items,
+		Profiles:    map[string]SKUProfile{m.SKU: profile},
+		NetworkName: networkName,
+		VolBinds:    volBinds,
+		Cfg:         &b.cfg,
 	})
 
 	// 4. Compose Up — brings up all instances at once.

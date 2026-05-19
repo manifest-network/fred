@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -90,6 +91,20 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// Skip containers without required labels
 		if c.LeaseUUID == "" || c.SKU == "" {
 			b.logger.Warn("skipping container with missing labels", "container_id", leasesm.ShortID(c.ContainerID))
+			continue
+		}
+
+		// Skip migration -prev remnants. These are legacy containers renamed
+		// by executeLegacyMigration's rollback window — they still carry the
+		// fred.lease_uuid + fred.managed labels but no fred.service_name, so
+		// without this guard the legacy-single-item branch below would
+		// process them as live leases (inflating prov.Quantity and appending
+		// a spurious LeaseItem{ServiceName:""}). The post-grace goroutine
+		// removes them, but recover can run inside the grace window or
+		// after an interrupted shutdown leaves orphans. isLegacyContainer
+		// (migrate.go) applies the same exclusion at planning time; this
+		// is the matching exclusion at recovery time.
+		if strings.HasSuffix(c.Name, "-prev") {
 			continue
 		}
 

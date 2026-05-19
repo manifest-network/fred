@@ -9,6 +9,7 @@ import (
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -71,6 +72,12 @@ type fakeDocker struct {
 	// Docker engine side.
 	containers []ContainerInfo             // returned by ListManagedContainers
 	mounts     map[string][]ContainerMount // containerID → mounts (test-only)
+
+	// EnsureTenantNetwork hook. Default is a silent-success no-op so tests
+	// that flip cfg.NetworkIsolation on (e.g. the migration-network test)
+	// don't have to wire the mock directly. Tests that need to *capture*
+	// the call can override this with a closure.
+	ensureTenantNetwork func(ctx context.Context, tenant string) (string, error)
 
 	// Compose side.
 	composeUpErr           error  // returned by composeExecutor.Up if non-nil
@@ -199,6 +206,22 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error {
 			return nil
+		},
+		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
+			if state.ensureTenantNetwork != nil {
+				return state.ensureTenantNetwork(ctx, tenant)
+			}
+			// Default: silent success. Mirrors production's idempotency:
+			// a network create on an existing network returns the existing
+			// ID without error.
+			return "net-id-" + tenant, nil
+		},
+		// recoverState's cleanupOrphanedNetworks sweep runs when isolation
+		// is enabled. Default to a clean network list so migration tests
+		// that enable isolation don't crash; tests that need a non-empty
+		// list can override on the mock directly.
+		ListManagedNetworksFn: func(_ context.Context) ([]networktypes.Inspect, error) {
+			return nil, nil
 		},
 		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
 			for i := range state.containers {
