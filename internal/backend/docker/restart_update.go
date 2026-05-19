@@ -158,7 +158,6 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	return nil
 }
 
-
 // doRestart performs an async stack restart: stops all service containers
 // and recreates them from the stored StackManifest.
 func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) leasesm.ReplaceResult {

@@ -126,18 +126,18 @@ type DiagnosticsGatherer interface {
 // though substrates translate them to substrate-specific shapes
 // (Docker compose-spec, K8s pod spec) at provision time.
 type ProvisionState struct {
-	LeaseUUID         string
-	Tenant            string
-	ProviderUUID      string
-	SKU               string
-	Status            backend.ProvisionStatus
-	Quantity          int
-	CreatedAt         time.Time
-	FailCount         int
-	LastError         string
-	CallbackURL       string
-	Items             []backend.LeaseItem
-	ContainerIDs      []string
+	LeaseUUID    string
+	Tenant       string
+	ProviderUUID string
+	SKU          string
+	Status       backend.ProvisionStatus
+	Quantity     int
+	CreatedAt    time.Time
+	FailCount    int
+	LastError    string
+	CallbackURL  string
+	Items        []backend.LeaseItem
+	ContainerIDs []string
 	// Manifest field deleted in Task 15 — all leases are stack-shaped
 	// post-migration; per-service refs go through StackManifest.Services.
 	StackManifest     *manifest.StackManifest

@@ -14,8 +14,6 @@ import (
 	"strings"
 	"time"
 
-	networktypes "github.com/docker/docker/api/types/network"
-
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
@@ -178,7 +176,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// Allocation IDs are always service-aware now:
 	// {leaseUUID}-{serviceName}-{instanceIndex}. The legacy {leaseUUID}-{idx}
 	// scheme is gone from the live path; Task 9's recover-time migration
-	// converts on-disk artefacts that still carry it.
+	// converts on-disk artifacts that still carry it.
 	var allocatedIDs []string
 	for _, item := range req.Items {
 		for i := range item.Quantity {
@@ -389,21 +387,6 @@ func filterSubpaths(candidates, parents []string) []string {
 	return result
 }
 
-// ensureNetworkConfig sets up per-tenant network isolation if enabled.
-// Returns nil config when isolation is disabled. Routes through
-// Backend.ensureTenantNetwork so the network cannot be removed by a
-// concurrent deprovision between here and ContainerCreate.
-func (b *Backend) ensureNetworkConfig(ctx context.Context, tenant string) (*networktypes.NetworkingConfig, error) {
-	if !b.cfg.IsNetworkIsolation() {
-		return nil, nil
-	}
-	networkID, err := b.ensureTenantNetwork(ctx, tenant)
-	if err != nil {
-		return nil, fmt.Errorf("tenant network setup failed: %w", err)
-	}
-	return buildNetworkConfig(networkID), nil
-}
-
 // buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
 // under hostPath and returns bind mount mappings. Returns an error if any
 // VOLUME path cannot be sanitized (unsupported path format).
@@ -556,7 +539,6 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 	}
 	return nil
 }
-
 
 // doProvision performs container creation for a stack (multi-service) lease
 // using Docker Compose. Compose handles container creation, start ordering, and

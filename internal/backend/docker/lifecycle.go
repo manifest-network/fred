@@ -1072,7 +1072,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 	// Container names are always service-aware:
 	// fred-{leaseUUID}-{serviceName}-{instanceIndex}. The legacy
 	// fred-{leaseUUID}-{instanceIndex} scheme is gone from the live path
-	// — Task 9's recover-time migration renames any on-disk artefacts
+	// — Task 9's recover-time migration renames any on-disk artifacts
 	// that still carry it. An empty ServiceName here is a structural
 	// bug (NormalizeProvisionRequest auto-tags single unnamed items at
 	// the Provision entry); surface it loudly rather than silently
@@ -1695,19 +1695,6 @@ func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error
 	b.provisionsMu.RUnlock()
 
 	return b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
-}
-
-// buildNetworkConfig returns a NetworkingConfig that attaches to the given network,
-// or an empty config if networkID is empty.
-func buildNetworkConfig(networkID string) *networktypes.NetworkingConfig {
-	if networkID == "" {
-		return &networktypes.NetworkingConfig{}
-	}
-	return &networktypes.NetworkingConfig{
-		EndpointsConfig: map[string]*networktypes.EndpointSettings{
-			networkID: {},
-		},
-	}
 }
 
 // HealthStatus represents the health check status of a Docker container.

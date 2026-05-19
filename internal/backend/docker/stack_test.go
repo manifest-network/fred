@@ -1361,10 +1361,12 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 		},
 	}
 	mock := &mockDockerClient{
-		PullImageFn:        func(ctx context.Context, image string, t time.Duration) error { return nil },
-		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) { return &ContainerInfo{ContainerID: id, Status: "running"}, nil },
-		RemoveContainerFn:  func(ctx context.Context, id string) error { return nil },
-		ContainerLogsFn:    func(ctx context.Context, id string, tail int) (string, error) { return "", nil },
+		PullImageFn: func(ctx context.Context, image string, t time.Duration) error { return nil },
+		InspectContainerFn: func(ctx context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
+		ContainerLogsFn:   func(ctx context.Context, id string, tail int) (string, error) { return "", nil },
 	}
 
 	var callbackPayload backend.CallbackPayload

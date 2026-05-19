@@ -98,7 +98,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// are always service-aware now ({lease}-{service}-{idx}); the legacy
 	// {lease}-{idx} scheme is gone from the live path. Task 9's recover-time
 	// migration releases / re-allocates legacy allocs as part of converting
-	// on-disk artefacts.
+	// on-disk artifacts.
 	for _, item := range items {
 		for i := range item.Quantity {
 			b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))

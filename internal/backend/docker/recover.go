@@ -38,7 +38,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// pre-pass plans and aborts startup — the legacy on-disk state
 	// would otherwise reach the stack-only downstream code that no
 	// longer understands it.
-	legacyPlans, planErr := b.planLegacyMigrations(ctx, containers, b.logger)
+	legacyPlans, planErr := b.planLegacyMigrations(ctx, containers)
 	if planErr != nil {
 		return fmt.Errorf("plan legacy migrations: %w", planErr)
 	}
@@ -57,11 +57,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// downstream can't drive a mixed cohort.
 		for _, plan := range legacyPlans {
 			if err := b.executeLegacyMigration(ctx, plan, b.logger); err != nil {
-				return fmt.Errorf("legacy migration FAILED: lease %s: %w\n"+
-					"fred refuses to start with unmigrated legacy containers. "+
-					"Investigate the failure cause; re-run fred (migration is idempotent), or "+
-					"deprovision the lease manually if data loss is acceptable.",
-					plan.LeaseUUID, err)
+				b.logger.Error("legacy migration failed; fred refuses to start with unmigrated legacy containers — "+
+					"investigate the failure cause and re-run fred (migration is idempotent), "+
+					"or deprovision the lease manually if data loss is acceptable",
+					"lease_uuid", plan.LeaseUUID, "error", err)
+				return fmt.Errorf("legacy migration failed: lease %s: %w", plan.LeaseUUID, err)
 			}
 		}
 		// Re-list managed containers: migration changed every container's

@@ -4,7 +4,7 @@
 // backend ran two parallel execution paths: a legacy single-service path
 // that drove the Docker Engine API directly and a stack path that drove
 // Docker Compose. Tasks 4-7 collapsed everything down to the Compose
-// path. The change leaves on-disk artefacts (containers, volume
+// path. The change leaves on-disk artifacts (containers, volume
 // directories) from legacy provisions in a name-space that no longer
 // matches the new code:
 //
@@ -108,7 +108,7 @@ func isLegacyContainer(c ContainerInfo) bool {
 // one migration plan per lease. Returns a nil-safe empty slice when
 // there are no legacy containers (the common steady-state path on a
 // post-migration fleet).
-func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo, logger *slog.Logger) ([]*legacyMigration, error) {
+func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo) ([]*legacyMigration, error) {
 	byLease := map[string][]ContainerInfo{}
 	for _, c := range all {
 		if isLegacyContainer(c) {
@@ -129,7 +129,7 @@ func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo,
 
 	plans := make([]*legacyMigration, 0, len(byLease))
 	for _, leaseUUID := range leaseUUIDs {
-		plan, err := b.planLegacyMigrationForLease(ctx, leaseUUID, byLease[leaseUUID], logger)
+		plan, err := b.planLegacyMigrationForLease(ctx, leaseUUID, byLease[leaseUUID])
 		if err != nil {
 			return nil, fmt.Errorf("plan lease %s: %w", leaseUUID, err)
 		}
@@ -142,7 +142,7 @@ func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo,
 // manifest is sourced exclusively from the release store; if the
 // store has no active entry, the migration fails loudly. See the
 // package doc for why in-container reconstruction is rejected.
-func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID string, group []ContainerInfo, logger *slog.Logger) (*legacyMigration, error) {
+func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID string, group []ContainerInfo) (*legacyMigration, error) {
 	if b.releaseStore == nil {
 		return nil, fmt.Errorf("no release store configured; cannot read stored manifest for legacy lease %s", leaseUUID)
 	}
@@ -213,7 +213,7 @@ func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID str
 // The prefix check uses `root + filepath.Separator` (or the exact
 // root path) so a configured root of `/var/lib/fred` does not match
 // sibling paths like `/var/lib/fred-other/...`. Without this, a
-// neighbouring directory whose name happens to begin with the root
+// neighboring directory whose name happens to begin with the root
 // string would be misclassified as managed and renamed under
 // migration.
 func filterManagedMounts(b *Backend, mounts []ContainerMount) []ContainerMount {

@@ -95,15 +95,6 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~17min
 	})
 
-	// containerCreateDurationSeconds tracks container creation duration.
-	containerCreateDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
-		Namespace: metricsNamespace,
-		Subsystem: metricsSubsystem,
-		Name:      "container_create_duration_seconds",
-		Help:      "Duration of container creation operations in seconds",
-		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 10), // 0.1s to ~51s
-	})
-
 	// reconciliationTotal tracks reconciliation runs by outcome.
 	reconciliationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,

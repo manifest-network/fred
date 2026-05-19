@@ -613,16 +613,6 @@ func (b *Backend) Health(ctx context.Context) error {
 	return b.docker.Ping(ctx)
 }
 
-// prevContainerName returns the temporary name used for old containers during
-// updates/restarts while the replacement is being verified, and by the
-// recover-time migration for the legacy→stack rename window.
-// Format: fred-{leaseUUID}-{serviceName}-{instanceIndex}-prev. Mirrors the
-// service-aware container naming convention enforced at the
-// CreateContainer site (lifecycle.go).
-func prevContainerName(leaseUUID, serviceName string, instanceIndex int) string {
-	return fmt.Sprintf("fred-%s-%s-%d-prev", leaseUUID, serviceName, instanceIndex)
-}
-
 // sendCallback resolves the callback URL from the provisions map and delegates
 // to sendCallbackWithURL. Use this when the provision is still in the map.
 func (b *Backend) sendCallback(leaseUUID string, status backend.CallbackStatus, errMsg string) {
