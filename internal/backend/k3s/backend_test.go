@@ -134,6 +134,25 @@ func newProvisionRequest(leaseUUID, callbackURL string) backend.ProvisionRequest
 	}
 }
 
+// newTestProvision builds a provision struct with ctx/cancel populated
+// against b.stopCtx, matching the invariant that production Provision
+// maintains. Tests that seed b.provisions directly must use this so
+// Deprovision's existing.cancel() and runStubProvisioner's ctx.Err()
+// checks behave correctly.
+func newTestProvision(b *Backend, leaseUUID, callbackURL string) *provision {
+	ctx, cancel := context.WithCancel(b.stopCtx)
+	return &provision{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "manifest1test",
+		ProviderUUID: "prov-1",
+		Status:       backend.ProvisionStatusProvisioning,
+		CallbackURL:  callbackURL,
+		CreatedAt:    time.Now(),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
+
 // --- Backend lifecycle ----------------------------------------------------
 
 func TestBackend_New_RejectsInvalidConfig(t *testing.T) {
@@ -223,11 +242,7 @@ func TestProvision_RejectsActiveDuplicate(t *testing.T) {
 	b := newBackendForTest(t, fred.URL)
 
 	b.provisionsMu.Lock()
-	b.provisions["lease-active"] = &provision{
-		LeaseUUID: "lease-active",
-		Status:    backend.ProvisionStatusProvisioning,
-		CreatedAt: time.Now(),
-	}
+	b.provisions["lease-active"] = newTestProvision(b, "lease-active", fred.URL)
 	b.provisionsMu.Unlock()
 
 	err := b.Provision(context.Background(), newProvisionRequest("lease-active", fred.URL))
@@ -570,14 +585,7 @@ func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
 	fred, callbacks := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
 
-	p := &provision{
-		LeaseUUID:    "lease-deleted",
-		Tenant:       "manifest1test",
-		ProviderUUID: "prov-1",
-		Status:       backend.ProvisionStatusProvisioning,
-		CallbackURL:  fred.URL,
-		CreatedAt:    time.Now(),
-	}
+	p := newTestProvision(b, "lease-deleted", fred.URL)
 	b.provisionsMu.Lock()
 	b.provisions[p.LeaseUUID] = p
 	b.provisionsMu.Unlock()
@@ -602,6 +610,119 @@ func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
 	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, diag, "no diagnostic should be persisted for a deprovisioned lease")
+}
+
+// TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic
+// covers ENG-189 case (b): a Deprovision that wins provisionsMu
+// BETWEEN the worker's unlock and the diagnostic store call must
+// cancel the per-lease ctx, and the worker's checkpoint-1 ctx.Err()
+// check must observe the cancellation and abort before persisting
+// the diagnostic OR sending the callback.
+//
+// Determinism: the beforeDiagnosticStore hook uses reached/release
+// channels to pause the worker goroutine at exactly that interleaving
+// point, so the test goroutine can run Deprovision and then release
+// the worker — no scheduler-timing dependencies, no time.Sleep.
+func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testing.T) {
+	fred, callbacks := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+
+	p := newTestProvision(b, "lease-1", fred.URL)
+	b.provisionsMu.Lock()
+	b.provisions[p.LeaseUUID] = p
+	b.provisionsMu.Unlock()
+	b.wg.Add(1)
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	b.beforeDiagnosticStore = func() {
+		close(reached)
+		<-release
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.runStubProvisioner(p)
+		close(done)
+	}()
+
+	// Worker is now blocked at checkpoint 1 with provisionsMu released.
+	<-reached
+	require.NoError(t, b.Deprovision(context.Background(), p.LeaseUUID))
+	close(release)
+	<-done
+
+	// Neither side effect should have occurred.
+	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
+	require.NoError(t, err)
+	assert.Nil(t, diag,
+		"diagnostic must not be persisted when ctx is canceled before the diagnostic write")
+
+	select {
+	case got := <-callbacks:
+		t.Fatalf("expected no callback after ctx cancel pre-diagnostic, got: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback
+// covers ENG-189 case (c): a Deprovision that wins the lock between
+// the diagnostic store call and the callback send must cancel the
+// per-lease ctx; the worker's checkpoint-2 ctx.Err() check must
+// observe the cancellation and skip SendCallback (and therefore
+// also skip the bbolt persist that SendCallback would otherwise do
+// before delivery).
+//
+// The diagnostic IS allowed to persist — it was written before the
+// cancel arrived. Asserting that explicitly proves the suppression
+// is at checkpoint 2, not at the earlier checkpoint 1.
+func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *testing.T) {
+	fred, callbacks := startFakeFred(t)
+	b := newBackendForTest(t, fred.URL)
+
+	p := newTestProvision(b, "lease-1", fred.URL)
+	b.provisionsMu.Lock()
+	b.provisions[p.LeaseUUID] = p
+	b.provisionsMu.Unlock()
+	b.wg.Add(1)
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	b.beforeCallbackSend = func() {
+		close(reached)
+		<-release
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.runStubProvisioner(p)
+		close(done)
+	}()
+
+	<-reached
+	require.NoError(t, b.Deprovision(context.Background(), p.LeaseUUID))
+	close(release)
+	<-done
+
+	// The diagnostic was written before the hook fired, so it survives.
+	// This proves the suppression is at checkpoint 2 (callback), not at
+	// checkpoint 1 (diagnostic).
+	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, diag, "diagnostic written before ctx cancel must survive")
+	assert.Equal(t, stubProvisionerErrMsg, diag.Error)
+
+	// The callback was guarded by ctx.Err() after the hook fired, so
+	// SendCallback must have been skipped — no bbolt persist, no HTTP POST.
+	select {
+	case got := <-callbacks:
+		t.Fatalf("expected no callback after ctx cancel pre-callback, got: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+	pending, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending,
+		"callbackStore must not contain a persisted entry for the canceled lease")
 }
 
 func TestReconcileCustomDomain_NoOpForUnhandledLease(t *testing.T) {

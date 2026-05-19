@@ -66,8 +66,20 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		// Carry forward FailCount across the replacement so the runStubProvisioner
 		// goroutine's increment lands on the cumulative count.
 		prevFailCount = existing.FailCount
+		// Cancel the prior entry's lifecycle so any zombie worker holding
+		// its pointer observes cancellation. Pointer-equality in the worker
+		// also catches this, but explicit cancel makes the invariant
+		// "delete from map ⇒ cancel ctx" structural rather than emergent.
+		existing.cancel()
 		delete(b.provisions, req.LeaseUUID)
 	}
+	// Per-lease cancellable context (ENG-189). Parent is b.stopCtx (the
+	// backend lifecycle context) so shutdown also cancels in-flight
+	// workers. Deprovision calls cancel inside provisionsMu before
+	// deleting the map entry; the worker captures p.ctx under the same
+	// lock and consults ctx.Err() before every post-unlock external
+	// write.
+	ctx, cancel := context.WithCancel(b.stopCtx)
 	p := &provision{
 		LeaseUUID:    req.LeaseUUID,
 		Tenant:       req.Tenant,
@@ -76,6 +88,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		CallbackURL:  req.CallbackURL,
 		FailCount:    prevFailCount,
 		CreatedAt:    time.Now(),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 	b.provisions[req.LeaseUUID] = p
 	// b.wg.Add(1) is called inside the lock-held region (before Unlock)
@@ -136,7 +150,26 @@ func (b *Backend) runStubProvisioner(p *provision) {
 	leaseUUID := p.LeaseUUID
 	tenant := p.Tenant
 	providerUUID := p.ProviderUUID
+	// Capture the lease ctx while still under provisionsMu: Deprovision
+	// will call cancel() inside the same lock before deleting the map
+	// entry, so this read is race-free and the worker sees the latest
+	// cancellation state on its next ctx.Err() check.
+	leaseCtx := p.ctx
 	b.provisionsMu.Unlock()
+
+	// Checkpoint 1: pre-diagnostic-write. ENG-189 case (b) — a
+	// Deprovision that wins the lock between unlock and Store would
+	// otherwise persist a failure diagnostic for a torn-down lease.
+	if hook := b.beforeDiagnosticStore; hook != nil {
+		hook()
+	}
+	if err := leaseCtx.Err(); err != nil {
+		b.logger.Debug("suppressing diagnostic persist for canceled provision",
+			"lease_uuid", leaseUUID,
+			"err", err,
+		)
+		return
+	}
 
 	if err := b.diagnosticsStore.Store(shared.DiagnosticEntry{
 		LeaseUUID:    leaseUUID,
@@ -150,6 +183,21 @@ func (b *Backend) runStubProvisioner(p *provision) {
 			"lease_uuid", leaseUUID,
 			"error", err,
 		)
+	}
+
+	// Checkpoint 2: pre-callback-send. ENG-189 case (c) —
+	// shared.CallbackSender.SendCallback persists to bbolt BEFORE
+	// delivery, so without this guard a torn-down lease can still
+	// have a stale status=failed callback queued for replay.
+	if hook := b.beforeCallbackSend; hook != nil {
+		hook()
+	}
+	if err := leaseCtx.Err(); err != nil {
+		b.logger.Debug("suppressing callback send for canceled provision",
+			"lease_uuid", leaseUUID,
+			"err", err,
+		)
+		return
 	}
 
 	b.callbackSender.SendCallback(
@@ -169,73 +217,46 @@ func (b *Backend) runStubProvisioner(p *provision) {
 // failure diagnostics for tenants and operators after the lease ends.
 // cfg.DiagnosticsMaxAge handles eventual cleanup.
 //
-// callbackStore.Remove IS called: shared.CallbackSender persists every
-// callback to bbolt BEFORE delivery and only Removes on successful
-// delivery (see shared/callback_sender.go). Without this cleanup, a
-// failed-delivery → Deprovision → restart sequence would let
-// ReplayPendingCallbacks fire a stale status=failed for a torn-down
-// lease — Fred would treat it as a real failure and trip its
-// circuit-breaker / fail-count metrics. The pattern mirrors the stale-
-// callback suppression in runStubProvisioner.
+// ENG-189 lifecycle: cancel the per-lease ctx INSIDE provisionsMu
+// before deleting the map entry. runStubProvisioner captures p.ctx
+// under the same lock and ctx.Err()-checks before each post-unlock
+// external write (diagnostic Store, callback send), so an in-flight
+// worker that already released the lock observes cancellation at its
+// next checkpoint and aborts.
 //
-// Remove is a bbolt Delete (no-op on missing key); any returned error
-// is a real I/O failure (disk full, db closed) — log it and continue
-// rather than failing the Deprovision call, since the in-memory record
-// is already gone and the lease state from the caller's perspective is
-// "deprovisioned".
+// Residual TOCTOU (accepted scope, ENG-189 plan §7 / R1): cancellation
+// cannot stop an in-flight SendCallback once the worker's checkpoint-2
+// ctx.Err() check has passed. Between that check and SendCallback's
+// bbolt Store + outbound HTTP POST, nothing here can abort the
+// callback — shared.CallbackSender has no per-lease ctx today. The
+// callbackStore.Remove call below clears any pre-existing pending
+// entry (e.g., from a prior failed delivery on the same lease's replay
+// queue); it does NOT cancel an HTTP POST already in flight, and it
+// does NOT prevent a racing worker that passes its ctx.Err() check
+// from re-persisting its own status=failed entry after this Remove
+// runs as a no-op. The window is ns-scale by construction (the
+// worker's last instruction before SendCallback is the ctx.Err()
+// check). Closing it requires reshaping the seam — e.g., a
+// Deprovision-side barrier that waits for any in-flight SendCallback
+// to drain, or pairing a ctx-threaded SendCallback with
+// Store-under-provisionsMu discipline so the persist becomes part of
+// the cancellable critical section. Either approach is deferred to
+// ENG-134+, where the real K8s worker replaces runStubProvisioner and
+// reshapes this seam anyway.
 //
-// # Systemic note on post-unlock races
-//
-// The store writes that runStubProvisioner performs AFTER releasing
-// provisionsMu — diagnosticsStore.Store (the failure-diagnostic
-// persist) and callbackSender.SendCallback (the signed status=failed
-// delivery) — both run outside the lock. bbolt has its own internal
-// locking, but it lives entirely outside provisionsMu's scope, so any
-// of those post-unlock store touches can race against a concurrent
-// Deprovision call that has already torn down the in-memory entry.
-// The callbackStore.Remove added above to Deprovision has the
-// symmetric shape: it runs inside provisionsMu but cannot prevent a
-// concurrent SendCallback that the prior worker has already started
-// (the worker captured callbackURL/leaseUUID into locals before
-// unlock; the Store-before-Send sequence in shared.CallbackSender
-// can therefore re-persist an entry that Deprovision is racing to
-// remove).
-//
-// The ENG-133 scaffold tolerates this because runStubProvisioner is
-// synchronous and trivial — the lock-protected pointer-equality check
-// at the top of runStubProvisioner (the `current != p` guard) covers
-// the WIDE race (worker not yet scheduled vs Provision/Deprovision).
-// What remains is a sub-millisecond post-unlock window with no real
-// I/O between the unlock and the external store writes; in
-// production this manifests as at most a stale diagnostic entry or a
-// single replayed callback after a tightly-timed Provision→
-// Deprovision sequence. cfg.DiagnosticsMaxAge / cfg.CallbackMaxAge
-// eventually clean up either way — but only when those knobs are
-// non-zero (the defaults are 7d / 24h respectively). Both stores
-// treat MaxAge=0 as "no expiry" (internal/backend/shared/diagnostics.go,
-// internal/backend/shared/callbacks.go), and Config.Validate accepts
-// 0 (it rejects only negative values), so an operator who sets either
-// to 0 disables cleanup entirely and stale entries from these races
-// persist for the process lifetime — the races become permanent
-// rather than time-bounded.
-//
-// The structural fix lives in ENG-189 (k3s-backend: per-lease
-// cancellable context for provisioner lifecycle). When ENG-134+
-// wires the real K8s provisioner — where every post-unlock step
-// performs real I/O on the millisecond-to-second timescale — the
-// worker will run under a per-lease context that Deprovision
-// cancels before returning, mirroring docker-backend's leasesm.OnExit
-// pattern (commit cc62f3b / PR #79). That converts the race window
-// from "implicit and tolerated" to "explicitly closed by ctx
-// cancellation" and lets every post-unlock store touch check
-// ctx.Err() before acting. Until then, additional per-call
-// re-checks here would be whack-a-mole — every new bbolt touch
-// would need its own guard — so we document the shape and defer the
-// fix to ENG-189.
+// TestDeprovision_RemovesPendingCallback pins the replay-queue cleanup
+// regression: a failed delivery persists an entry; Deprovision must
+// clear it so a subsequent restart's ReplayPendingCallbacks does not
+// fire a stale status=failed callback for a torn-down lease.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	_ = ctx
 	b.provisionsMu.Lock()
-	delete(b.provisions, leaseUUID)
+	if existing, ok := b.provisions[leaseUUID]; ok {
+		// Cancel before delete + before unlock so any in-flight worker
+		// observes ctx.Err() != nil at its next external-write checkpoint.
+		existing.cancel()
+		delete(b.provisions, leaseUUID)
+	}
 	if err := b.callbackStore.Remove(leaseUUID); err != nil {
 		b.logger.Error("failed to remove pending callback on deprovision",
 			"lease_uuid", leaseUUID,

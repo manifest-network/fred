@@ -79,6 +79,9 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 	}
 }
 
+// TODO(ENG-134): no per-lease ctx seam — see k3s.Deprovision doc for
+// the residual deprovision-vs-callback TOCTOU this enables.
+//
 // SendCallback sends a provision result callback with HMAC signature.
 // It persists the callback before delivery and removes it on success.
 // The caller must provide the callbackURL (resolved from its own state) and
