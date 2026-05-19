@@ -1,6 +1,6 @@
 // Package manifest defines the tenant-facing container manifest schema
-// (single-container flatManifest and multi-service StackManifest), JSON
-// parsing, and validation. It is consumed by every backend that
+// (StackManifest, holding a map of named per-service Manifest entries),
+// JSON parsing, and validation. It is consumed by every backend that
 // provisions tenant workloads (Docker, K3s, future substrates) so the
 // on-the-wire schema and validation stay identical across substrates.
 //
@@ -47,10 +47,11 @@ const DefaultServiceName = "app"
 // a StackManifest. Function signatures that operate on an individual
 // service inside a stack (compose project builders, container-create
 // params, readiness waiters) take *Manifest to receive a service's spec
-// by reference; the underlying type is the unexported flatManifest, kept
-// unexported so the JSON wire format stays single-rooted under "services"
-// (no external code can construct a top-level flat manifest by
-// value-literal).
+// by reference. The underlying type is the unexported flatManifest; the
+// alias gives external packages a stable exported name for the
+// per-service spec while leaving the underlying struct unexported so
+// downstream code refers to it through this name rather than the
+// internal identifier.
 //
 // This alias is permanent — it is NOT transitional. The original Task 2
 // commit framed it as a "transitional shim" pending removal in Task 14/15,
