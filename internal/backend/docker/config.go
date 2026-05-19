@@ -18,6 +18,17 @@ import (
 type SKUProfile = shared.SKUProfile
 type TenantQuotaConfig = shared.TenantQuotaConfig
 
+// Recover-time migration defaults. Shared by [DefaultConfig] and the
+// `cmp.Or` guards in [Backend.executeLegacyMigration] so a deployment
+// that constructs a [Config] without going through [DefaultConfig] (or
+// supplies an explicit 0 via YAML) still gets a sane safety window
+// instead of an immediately-canceled context or instant `-prev`
+// removal.
+const (
+	defaultMigrationReadyTimeout = 90 * time.Second
+	defaultMigrationGracePeriod  = time.Minute
+)
+
 // Config holds the configuration for the Docker backend.
 type Config struct {
 	// LogLevel controls the log verbosity (debug, info, warn, error).
@@ -156,6 +167,18 @@ type Config struct {
 	// Defaults to 90 days.
 	ReleasesMaxAge time.Duration `yaml:"releases_max_age"`
 
+	// MigrationGracePeriod is how long the renamed `-prev` legacy container
+	// lingers after a successful recover-time migration before forced
+	// removal. Preserves rollback potential if the operator interrupts fred
+	// in the migration window to inspect. Defaults to 1m.
+	MigrationGracePeriod time.Duration `yaml:"migration_grace_period"`
+
+	// MigrationReadyTimeout caps how long the recover-time migration waits
+	// for the new stack-form container to reach `healthy` (or `running`
+	// when no health check is declared) before declaring the migration
+	// failed for that lease. Defaults to 90s.
+	MigrationReadyTimeout time.Duration `yaml:"migration_ready_timeout"`
+
 	// Ingress configures optional reverse proxy integration.
 	// When enabled, containers with routable TCP ports get proxy labels
 	// pointing Traefik at the per-tenant network for HTTPS auto-discovery.
@@ -245,6 +268,8 @@ func DefaultConfig() Config {
 		DiagnosticsMaxAge:       7 * 24 * time.Hour,
 		ReleasesDBPath:          "releases.db",
 		ReleasesMaxAge:          90 * 24 * time.Hour,
+		MigrationGracePeriod:    defaultMigrationGracePeriod,
+		MigrationReadyTimeout:   defaultMigrationReadyTimeout,
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
 				CPUCores: 0.25,

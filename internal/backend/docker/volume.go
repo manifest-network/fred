@@ -30,6 +30,28 @@ type volumeManager interface {
 	// Validate checks filesystem support and permissions, and rebuilds any
 	// internal state (e.g. active project IDs) from on-disk volumes. Called at startup.
 	Validate() error
+
+	// RenameVolume atomically renames a managed volume from oldName to
+	// newName, preserving data and per-volume metadata (xfs project ID,
+	// btrfs subvolume identity, zfs dataset name). Idempotent: if the new
+	// name already exists and the old does not, returns nil; if both
+	// exist, returns an error so the operator can intervene; if neither
+	// exists, returns an error.
+	//
+	// Used by Task 9's recover-time migration to convert legacy
+	// fred-{leaseUUID}-{idx} volumes into the service-aware
+	// fred-{leaseUUID}-{service}-{idx} naming convention without copying
+	// data.
+	RenameVolume(oldName, newName string) error
+
+	// HostPath returns the absolute on-host path for a managed volume of
+	// the given name. The volume need not yet exist — this lets callers
+	// compute paths for not-yet-renamed or about-to-be-created volumes.
+	// The path returned is the conventional mount point under the
+	// configured volume_data_path; the actual mount target may differ on
+	// zfs if mountpoint properties were overridden, but production code
+	// expects default inheritance.
+	HostPath(name string) string
 }
 
 // noopVolumeManager is used when no SKUs have disk_mb > 0.
@@ -51,6 +73,21 @@ func (n *noopVolumeManager) List() ([]string, error) {
 
 func (n *noopVolumeManager) Validate() error {
 	return nil
+}
+
+// RenameVolume on the noop manager is a no-op so migrate code paths can
+// run on hosts with no stateful SKUs without a special case. The legacy
+// lease cannot have had a managed volume to begin with.
+func (n *noopVolumeManager) RenameVolume(_, _ string) error {
+	return nil
+}
+
+// HostPath on the noop manager returns an empty string — there is no
+// configured volume root. Callers should not invoke this; the migration
+// pipeline guards on stateful-volume presence before constructing host
+// paths.
+func (n *noopVolumeManager) HostPath(_ string) string {
+	return ""
 }
 
 // Filesystem magic numbers from statfs(2).
@@ -134,6 +171,52 @@ func listVolumeIDs(dataPath string) ([]string, error) {
 		}
 	}
 	return ids, nil
+}
+
+// atomicRenameVolumeDir renames oldPath → newPath via os.Rename with
+// idempotency guards. Shared by the xfs and btrfs backends, both of which
+// support os.Rename on their volume roots (xfs: a plain directory; btrfs:
+// a subvolume root, which the kernel renames as a metadata operation
+// without touching the contained data).
+//
+// Idempotency semantics:
+//   - neither exists  → error (caller asked to rename a non-existent volume)
+//   - only old exists → os.Rename
+//   - only new exists → nil (previous run already renamed; retry is safe)
+//   - both exist      → error (operator must reconcile; we won't merge or pick a winner)
+func atomicRenameVolumeDir(oldPath, newPath string) error {
+	oldExists, oldErr := pathExists(oldPath)
+	if oldErr != nil {
+		return fmt.Errorf("stat old volume path %s: %w", oldPath, oldErr)
+	}
+	newExists, newErr := pathExists(newPath)
+	if newErr != nil {
+		return fmt.Errorf("stat new volume path %s: %w", newPath, newErr)
+	}
+	switch {
+	case !oldExists && newExists:
+		return nil // idempotent
+	case oldExists && newExists:
+		return fmt.Errorf("both old (%s) and new (%s) volume paths exist; manual intervention required", oldPath, newPath)
+	case !oldExists && !newExists:
+		return fmt.Errorf("neither old (%s) nor new (%s) volume path exists", oldPath, newPath)
+	}
+	return os.Rename(oldPath, newPath)
+}
+
+// pathExists reports whether p exists on the filesystem. Distinct from
+// `_, err := os.Stat(p); err == nil` because it surfaces non-ENOENT stat
+// errors (permission denied, I/O failure) to the caller rather than
+// silently treating them as "doesn't exist".
+func pathExists(p string) (bool, error) {
+	_, err := os.Stat(p)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 // sanitizeVolumePath converts a container volume path to a safe subdirectory name.

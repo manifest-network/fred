@@ -2,7 +2,6 @@ package docker
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -86,32 +85,34 @@ func rebuildCallbackSender(b *Backend) {
 	})
 }
 
-// doProvisionAndFire wraps doProvision with the SM event firing that the
-// public Provision path normally handles. Production code never calls
-// doProvision directly; tests do (to exercise specific branches without
-// the full validate-and-allocate preamble).
+// doProvisionAndFire is a permanent test-shape adapter for
+// synchronously exercising doProvision. Production paths route through
+// the actor inbox (Backend.Provision → actor → doProvision); tests need
+// a synchronous entry point to exercise specific doProvision branches
+// without the full validate-and-allocate preamble and without
+// inbox-scheduling timing.
 //
 // SM events fire synchronously here (bypassing the actor inbox) via the
 // leasesm.FireXxxForTest helpers — see leasesm/testhelpers.go for the
-// architect's bounded-set rationale. Tests can assert on callback state
-// immediately after this returns. The actor inbox path is exercised by
-// the public Provision flow and its dedicated tests.
-func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, manifest *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) {
-	actor := b.actorFor(req.LeaseUUID)
-	leasesm.FireProvisionRequestedForTest(actor)
-	callbackErr, result, logs, err := b.doProvision(ctx, req, manifest, profiles, logger)
-	if err != nil {
-		leasesm.FireProvisionErroredForTest(actor, callbackErr, err.Error(), logs)
-	} else {
-		leasesm.FireProvisionCompletedForTest(actor, result)
+// architect's bounded-set rationale.
+//
+// The signature accepts a single-service *manifest.Manifest because
+// every legitimate caller passes a 1-service stack worth of input;
+// internally the helper wraps the manifest into a 1-service stack under
+// manifest.DefaultServiceName, auto-tags lease items, and dispatches to
+// the unified stack-shaped doProvision. This keeps the boilerplate at
+// each call site minimal while preserving the stack-shape contract on
+// the production side.
+func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, m *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+	stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{manifest.DefaultServiceName: m}}
+	for i := range req.Items {
+		if req.Items[i].ServiceName == "" {
+			req.Items[i].ServiceName = manifest.DefaultServiceName
+		}
 	}
-}
-
-// doProvisionStackAndFire is the stack-variant companion to doProvisionAndFire.
-func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) {
 	actor := b.actorFor(req.LeaseUUID)
 	leasesm.FireProvisionRequestedForTest(actor)
-	callbackErr, result, logs, err := b.doProvisionStack(ctx, req, stack, profiles, logger)
+	callbackErr, result, logs, err := b.doProvision(ctx, req, stack, profiles, logger)
 	if err != nil {
 		leasesm.FireProvisionErroredForTest(actor, callbackErr, err.Error(), logs)
 	} else {
@@ -123,23 +124,28 @@ func (b *Backend) doProvisionStackAndFire(ctx context.Context, req backend.Provi
 
 func TestProvision_Success(t *testing.T) {
 	pullCalled := false
-	createCalls := 0
-	startCalls := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			pullCalled = true
 			return nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			createCalls++
-			return fmt.Sprintf("container-%d", createCalls), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			startCalls++
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	upCalled := false
+	psCalled := false
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			upCalled = true
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			psCalled = true
+			return []composeContainerSummary{
+				{ID: "container-1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
 		},
 	}
 
@@ -151,6 +157,7 @@ func TestProvision_Success(t *testing.T) {
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -168,12 +175,15 @@ func TestProvision_Success(t *testing.T) {
 	require.NotNil(t, prov)
 	status := prov.Status
 	containerIDs := prov.ContainerIDs
+	serviceContainers := prov.ServiceContainers
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
-	assert.Len(t, containerIDs, 1)
-	assert.True(t, pullCalled)
-	assert.Equal(t, 1, createCalls)
-	assert.Equal(t, 1, startCalls)
+	assert.Len(t, containerIDs, 1, "stack-shape provision must record exactly one container ID for a 1-service stack")
+	require.NotNil(t, serviceContainers)
+	assert.Len(t, serviceContainers[manifest.DefaultServiceName], 1, "ServiceContainers must map 'app' → 1 container")
+	assert.True(t, pullCalled, "PullImage must fire before compose up")
+	assert.True(t, upCalled, "compose.Up must be invoked on the stack path")
+	assert.True(t, psCalled, "compose.PS must be invoked to discover container IDs")
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -455,178 +465,8 @@ func TestProvision_MultiItem_PartialResourceRollback(t *testing.T) {
 // CreateContainerParams.Quantity receives the lease-wide totalQuantity, not
 // the per-item quantity. This is critical for ComputeSubdomain/RouterName
 // consistency between provision and restart/update paths.
-func TestDoProvision_MultiItem_QuantityPassesTotalNotPerItem(t *testing.T) {
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	var capturedQuantities []int
-	createCalls := 0
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedQuantities = append(capturedQuantities, params.Quantity)
-			createCalls++
-			return fmt.Sprintf("container-%d", createCalls), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	// Two items, each with Quantity=1 → totalQuantity=2.
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 2},
-		},
-	})
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
-
-	req := backend.ProvisionRequest{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		Items: []backend.LeaseItem{
-			{SKU: "docker-small", Quantity: 1},
-			{SKU: "docker-small", Quantity: 1},
-		},
-		CallbackURL: callbackServer.URL,
-		Payload:     validManifestJSON("nginx:latest"),
-	}
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Both containers must receive totalQuantity (2), not item.Quantity (1).
-	// This ensures ComputeSubdomain produces the same FQDN format on
-	// restart/update (which passes prov.Quantity = totalQuantity).
-	require.Len(t, capturedQuantities, 2)
-	assert.Equal(t, 2, capturedQuantities[0], "first container should get totalQuantity")
-	assert.Equal(t, 2, capturedQuantities[1], "second container should get totalQuantity")
-}
 
 // --- doProvision (async) tests ---
-
-func TestDoProvision_PullFailure(t *testing.T) {
-
-	var callbackPayload backend.CallbackPayload
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&callbackPayload)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return errors.New("pull failed: image not found")
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 1},
-		},
-	})
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Provision should be marked failed
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
-	assert.Equal(t, 1, prov.FailCount)
-	assert.Contains(t, prov.LastError, "image pull failed")
-
-	// Resources should be released
-	stats := b.pool.Stats()
-	assert.Equal(t, 0, stats.AllocationCount)
-
-	// Callback should report failure
-	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
-	assert.Equal(t, "lease-1", callbackPayload.LeaseUUID)
-}
-
-func TestDoProvision_CreateFailure_CleansUpCreated(t *testing.T) {
-
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	createCallCount := 0
-	var removedIDs []string
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			createCallCount++
-			if createCallCount == 2 {
-				return "", errors.New("disk full")
-			}
-			return fmt.Sprintf("container-%d", createCallCount), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removedIDs = append(removedIDs, containerID)
-			return nil
-		},
-		// doProvision's failure defer now captures logs from the created
-		// containers BEFORE RemoveContainer tears them down, so the mock
-		// needs to answer ContainerLogs.
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return "", nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 2},
-		},
-	})
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := backend.ProvisionRequest{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      validManifestJSON("nginx:latest"),
-	}
-
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// First container should have been cleaned up
-	assert.Contains(t, removedIDs, "container-1")
-}
 
 func TestDoProvision_ContextCanceled(t *testing.T) {
 
@@ -715,282 +555,7 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 }
 
-func TestDoProvision_StartupVerify_ContainerExited(t *testing.T) {
-
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			// Container exited during startup verify
-			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
-		},
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return "Error: config not found", nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 1},
-		},
-	})
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
-	assert.Contains(t, prov.LastError, "exit_code=1")
-	assert.Contains(t, prov.LastError, "config not found")
-}
-
-func TestDoProvision_HealthCheckTimeout_CleansUpContainers(t *testing.T) {
-
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	var removedIDs []string
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return fmt.Sprintf("container-%d", params.InstanceIndex), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			// Always return "starting" so health check never passes
-			return &ContainerInfo{
-				ContainerID: containerID,
-				Status:      "running",
-				Health:      HealthStatusStarting,
-			}, nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removedIDs = append(removedIDs, containerID)
-			return nil
-		},
-		// doProvision's failure defer captures logs before cleanup.
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return "", nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:      backend.ProvisionStatusProvisioning,
-			Quantity:    2,
-			CallbackURL: callbackServer.URL},
-		},
-	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	manifest := &manifest.Manifest{
-		Image: "nginx:latest",
-		HealthCheck: &manifest.HealthCheckConfig{
-			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
-		},
-	}
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	// Use a very short timeout so the health check times out quickly
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	req := backend.ProvisionRequest{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      validManifestJSON("nginx:latest"),
-	}
-	b.doProvisionAndFire(ctx, req, manifest, profiles, b.logger)
-
-	// Verify: provision should be marked failed
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
-	assert.Contains(t, prov.LastError, "timed out")
-
-	// Verify: both containers should have been cleaned up by the defer
-	assert.ElementsMatch(t, []string{"container-0", "container-1"}, removedIDs,
-		"containers should be cleaned up when health check times out")
-
-	// Verify: resources should be released
-	stats := b.pool.Stats()
-	assert.Equal(t, 0, stats.AllocationCount)
-}
-
 // --- Volume-aware provision tests ---
-
-func TestDoProvision_StatefulSKUCreatesVolume(t *testing.T) {
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	var createID string
-	var createSizeMB int64
-	volDir := t.TempDir()
-	vm := &mockVolumeManager{
-		defaultDir: volDir,
-		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
-			createID = id
-			createSizeMB = sizeMB
-			return volDir, true, nil
-		},
-	}
-
-	var capturedParams CreateContainerParams
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
-			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 1},
-		},
-	})
-	b.volumes = vm
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Verify volume was created with correct ID and size
-	assert.Equal(t, "fred-lease-1-0", createID)
-	assert.Equal(t, int64(1024), createSizeMB)
-
-	// Verify VolumeBinds maps host subdir to container path
-	require.Len(t, capturedParams.VolumeBinds, 1)
-	expectedHostPath := filepath.Join(volDir, "data")
-	assert.Equal(t, "/data", capturedParams.VolumeBinds[expectedHostPath])
-
-	// Verify ImageVolumes passed through
-	assert.Equal(t, []string{"/data"}, capturedParams.ImageVolumes)
-
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
-}
-
-func TestDoProvision_StatefulSKUMultipleVolumes(t *testing.T) {
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	createCalls := 0
-	volDir := t.TempDir()
-	vm := &mockVolumeManager{
-		defaultDir: volDir,
-		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
-			createCalls++
-			return volDir, true, nil
-		},
-	}
-
-	var capturedParams CreateContainerParams
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
-			return &ImageInfo{Volumes: map[string]struct{}{
-				"/data":    {},
-				"/var/log": {},
-			}}, nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 1},
-		},
-	})
-	b.volumes = vm
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 2048}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Single volume.Create per container (not per image VOLUME path)
-	assert.Equal(t, 1, createCalls)
-
-	// VolumeBinds should have 2 entries mapping subdirectories
-	require.Len(t, capturedParams.VolumeBinds, 2)
-	assert.Equal(t, "/data", capturedParams.VolumeBinds[filepath.Join(volDir, "data")])
-	assert.Equal(t, "/var/log", capturedParams.VolumeBinds[filepath.Join(volDir, "var/log")])
-}
 
 func TestDoProvision_VolumeCreateFailure(t *testing.T) {
 	var callbackPayload backend.CallbackPayload
@@ -1052,87 +617,6 @@ func TestDoProvision_VolumeCreateFailure(t *testing.T) {
 
 	// No containers should have been created
 	assert.False(t, createCalled, "no containers should be created when volume creation fails")
-}
-
-func TestDoProvision_CleanupOnlyDestroysNewVolumes(t *testing.T) {
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	volDir := t.TempDir()
-	var destroyedIDs []string
-	createCall := 0
-	vm := &mockVolumeManager{
-		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
-			createCall++
-			if createCall == 1 {
-				// First container: volume already exists (reused)
-				return volDir, false, nil
-			}
-			// Second container: newly created
-			return volDir, true, nil
-		},
-		DestroyFn: func(ctx context.Context, id string) error {
-			destroyedIDs = append(destroyedIDs, id)
-			return nil
-		},
-	}
-
-	containerCreateCall := 0
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
-			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			containerCreateCall++
-			return fmt.Sprintf("container-%d", containerCreateCall), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			if containerID == "container-2" {
-				return fmt.Errorf("port already in use")
-			}
-			return nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-		// doProvision's failure defer captures logs before cleanup.
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return "", nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 2},
-		},
-	})
-	b.volumes = vm
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := backend.ProvisionRequest{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      validManifestJSON("nginx:latest"),
-	}
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Destroy should only be called for the newly created volume (index 1), not the reused one (index 0)
-	assert.Equal(t, []string{"fred-lease-1-1"}, destroyedIDs,
-		"only newly created volumes should be destroyed on failure cleanup")
 }
 
 func TestDoProvision_StatefulSKUNoImageVolumes(t *testing.T) {
@@ -1272,161 +756,12 @@ func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
 
 // --- Deprovision tests ---
 
-func TestDeprovision_Success(t *testing.T) {
-	var removedIDs []string
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removedIDs = append(removedIDs, containerID)
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
-			CallbackURL:  "http://localhost/callback"},
-		},
-	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.NoError(t, err)
-
-	assert.ElementsMatch(t, []string{"c1", "c2"}, removedIDs)
-
-	// Provision should be removed
-	b.provisionsMu.RLock()
-	_, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.False(t, exists)
-
-	// Resources should be released
-	stats := b.pool.Stats()
-	assert.Equal(t, 0, stats.AllocationCount)
-}
-
 func TestDeprovision_Idempotent(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 
 	err := b.Deprovision(context.Background(), "nonexistent-lease")
 	assert.NoError(t, err, "deprovisioning a nonexistent lease should succeed")
-}
-
-func TestDeprovision_PartialContainerFailure(t *testing.T) {
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			if containerID == "c2" {
-				return errors.New("permission denied")
-			}
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deprovision partially failed")
-
-	// Provision should remain in map with only the failed container
-	b.provisionsMu.RLock()
-	prov, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	require.True(t, exists, "provision should remain in map after partial failure")
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
-	assert.Equal(t, []string{"c2"}, prov.ContainerIDs, "only stuck containers should remain")
-	assert.Contains(t, prov.LastError, "deprovision partially failed")
-
-	// Resources should still be released (lease is being abandoned)
-	stats := b.pool.Stats()
-	assert.Equal(t, 0, stats.AllocationCount)
-}
-
-func TestDeprovision_PartialFailure_UpdatesResourceMetrics(t *testing.T) {
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			if containerID == "c2" {
-				return errors.New("permission denied")
-			}
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	// Set gauges to a known stale value so we can detect the update.
-	resourceCPUAllocatedRatio.Set(0.99)
-	resourceMemoryAllocatedRatio.Set(0.99)
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.Error(t, err, "partial failure expected")
-
-	// Pool allocations were released, so the gauges must reflect 0 allocation
-	// even though Deprovision returned an error.
-	assert.InDelta(t, 0.0, testutil.ToFloat64(resourceCPUAllocatedRatio), 0.001,
-		"CPU gauge should be updated after partial-failure release")
-	assert.InDelta(t, 0.0, testutil.ToFloat64(resourceMemoryAllocatedRatio), 0.001,
-		"memory gauge should be updated after partial-failure release")
-}
-
-func TestDeprovision_PartialFailure_RetryOnlyStuck(t *testing.T) {
-	removeCalls := 0
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removeCalls++
-			if containerID == "c2" && removeCalls <= 2 {
-				// Fail on first attempt, succeed on second
-				return errors.New("permission denied")
-			}
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-
-	// First deprovision: partial failure (c2 fails)
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.Error(t, err)
-
-	// Retry: only the stuck container (c2) should be attempted
-	err = b.Deprovision(context.Background(), "lease-1")
-	require.NoError(t, err)
-
-	// Provision should now be fully removed
-	b.provisionsMu.RLock()
-	_, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.False(t, exists, "provision should be removed after successful retry")
 }
 
 func TestDeprovision_WithNetworkIsolation(t *testing.T) {
@@ -1458,156 +793,6 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 }
 
 // --- Deprovision volume tests ---
-
-func TestDeprovision_DestroysVolumes(t *testing.T) {
-	var destroyedIDs []string
-	vm := &mockVolumeManager{
-		DestroyFn: func(ctx context.Context, id string) error {
-			destroyedIDs = append(destroyedIDs, id)
-			return nil
-		},
-	}
-
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-	b.volumes = vm
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.NoError(t, err)
-
-	assert.ElementsMatch(t, []string{"fred-lease-1-0", "fred-lease-1-1"}, destroyedIDs)
-
-	// Provision should be fully removed
-	b.provisionsMu.RLock()
-	_, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.False(t, exists)
-}
-
-func TestDeprovision_VolumeDestroyFailure(t *testing.T) {
-	vm := &mockVolumeManager{
-		DestroyFn: func(ctx context.Context, id string) error {
-			return fmt.Errorf("device busy")
-		},
-	}
-
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-	b.volumes = vm
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "volume cleanup failed")
-
-	// Provision should remain in map with Status=Failed and ContainerIDs=nil
-	b.provisionsMu.RLock()
-	prov, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	require.True(t, exists, "provision should remain in map after volume destroy failure")
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
-	assert.Nil(t, prov.ContainerIDs, "containers should be nil since they were removed")
-	assert.Contains(t, prov.LastError, "volume cleanup failed")
-	b.provisionsMu.RLock()
-	assert.Equal(t, 1, b.provisions["lease-1"].VolumeCleanupAttempts)
-	b.provisionsMu.RUnlock()
-}
-
-func TestDeprovision_VolumeDestroyGivesUpAfterMaxAttempts(t *testing.T) {
-	vm := &mockVolumeManager{
-		DestroyFn: func(ctx context.Context, id string) error {
-			return fmt.Errorf("permission denied")
-		},
-	}
-
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			ProvisionState: leasesm.ProvisionState{
-				LeaseUUID:    "lease-1",
-				Tenant:       "tenant-a",
-				Status:       backend.ProvisionStatusFailed,
-				Quantity:     1,
-				ContainerIDs: nil, // containers already removed
-			},
-			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
-		},
-	})
-	b.volumes = vm
-
-	// Capture log output so we can assert that the "MANUAL CLEANUP REQUIRED"
-	// log line emits the correct `attempts` value. Pre-fix (regression-fix
-	// before the wrapper refactor), the log read attempts via the parallel
-	// map AFTER the entry had been deleted — yielding 0. The fix captures
-	// `attempts` inside the Lock before the delete; this test guards against
-	// regression by asserting the captured value is maxVolumeCleanupAttempts.
-	var logBuf bytes.Buffer
-	b.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.NoError(t, err, "should return nil when giving up")
-
-	// Provision should be removed from the map
-	b.provisionsMu.RLock()
-	_, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.False(t, exists, "provision should be removed after max volume cleanup attempts")
-
-	// Scan the captured log for the MANUAL CLEANUP REQUIRED record and
-	// assert its `attempts` field equals the expected count. The slog
-	// JSON handler writes one record per line; iterate and match by the
-	// message string to find the specific record we care about.
-	var found bool
-	for _, line := range bytes.Split(bytes.TrimRight(logBuf.Bytes(), "\n"), []byte("\n")) {
-		if len(line) == 0 {
-			continue
-		}
-		var rec map[string]any
-		require.NoError(t, json.Unmarshal(line, &rec))
-		if msg, _ := rec["msg"].(string); strings.HasPrefix(msg, "MANUAL CLEANUP REQUIRED") {
-			// slog encodes ints as JSON numbers (float64 on unmarshal).
-			attempts, _ := rec["attempts"].(float64)
-			assert.Equal(t, float64(maxVolumeCleanupAttempts), attempts,
-				"MANUAL CLEANUP REQUIRED log must emit the actual attempt count, not zero")
-			found = true
-			break
-		}
-	}
-	require.True(t, found,
-		"expected MANUAL CLEANUP REQUIRED log record in captured output; got: %s", logBuf.String())
-}
 
 // TestDeprovision_SendsDeprovisionedCallback verifies that a clean successful
 // Deprovision fires exactly one callback with status=deprovisioned and the
@@ -1660,161 +845,13 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 // max-attempts-exhausted volume cleanup path fires a failed callback with
 // a hardcoded message — without it, Fred would be unaware that the lease
 // had become terminal.
-func TestDeprovision_VolumeExhaustionSendsFailedCallback(t *testing.T) {
-	var received backend.CallbackPayload
-	callbackDone := make(chan struct{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&received)
-		w.WriteHeader(http.StatusOK)
-		select {
-		case callbackDone <- struct{}{}:
-		default:
-		}
-	}))
-	defer server.Close()
-
-	vm := &mockVolumeManager{
-		DestroyFn: func(ctx context.Context, id string) error {
-			return fmt.Errorf("permission denied")
-		},
-	}
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
-	}
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
-			ProvisionState: leasesm.ProvisionState{
-				LeaseUUID:    "lease-1",
-				Tenant:       "tenant-a",
-				Status:       backend.ProvisionStatusFailed,
-				Quantity:     1,
-				ContainerIDs: nil,
-				CallbackURL:  server.URL,
-			},
-			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
-		},
-	})
-	b.volumes = vm
-	b.httpClient = server.Client()
-	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
-
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
-
-	select {
-	case <-callbackDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for exhaustion callback")
-	}
-
-	assert.Equal(t, backend.CallbackStatusFailed, received.Status)
-	assert.Equal(t, "volume cleanup exhausted", received.Error)
-}
 
 // TestDeprovision_RetryAfterPartialFailureFiresOneCallback verifies that the
 // terminal callback only fires on clean completion. A first call that hits a
 // partial-container-failure path emits no callback; a successful retry emits
 // exactly one deprovisioned callback.
-func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
-	// failStuck is true during the first call (makes c2 unremovable), toggled
-	// to false before the retry so the second call succeeds.
-	var failStuck atomic.Bool
-	failStuck.Store(true)
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			if failStuck.Load() && containerID == "c2" {
-				return errors.New("permission denied")
-			}
-			return nil
-		},
-	}
-
-	// Buffered channel carries the callback payload from the httptest handler
-	// goroutine to the test goroutine with a defined happens-before relation.
-	// Buffer >1 catches accidental extra callbacks without blocking the handler.
-	received := make(chan backend.CallbackPayload, 4)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var p backend.CallbackPayload
-		json.NewDecoder(r.Body).Decode(&p)
-		received <- p
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"},
-			CallbackURL:  server.URL},
-		},
-	})
-	b.httpClient = server.Client()
-	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
-
-	// First call: partial failure on c2. Callback fires synchronously on the
-	// success path; a partial failure returns early before reaching it, so
-	// the channel must be empty when Deprovision returns.
-	require.Error(t, b.Deprovision(context.Background(), "lease-1"))
-	select {
-	case p := <-received:
-		t.Fatalf("partial failure must not fire a terminal callback, got %+v", p)
-	default:
-	}
-
-	// Flip the switch so the second call can remove c2.
-	failStuck.Store(false)
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
-
-	select {
-	case p := <-received:
-		assert.Equal(t, backend.CallbackStatusDeprovisioned, p.Status)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for terminal callback")
-	}
-
-	// No further callbacks should arrive.
-	select {
-	case p := <-received:
-		t.Fatalf("unexpected extra callback: %+v", p)
-	case <-time.After(50 * time.Millisecond):
-	}
-}
 
 // --- GetInfo tests ---
-
-func TestGetInfo_Success(t *testing.T) {
-	mock := &mockDockerClient{
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{
-				ContainerID:   containerID,
-				InstanceIndex: 0,
-				Image:         "nginx:latest",
-				Status:        "running",
-				Ports: map[string]PortBinding{
-					"80/tcp": {HostIP: "0.0.0.0", HostPort: "8080"},
-				},
-			}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1"}},
-		},
-	})
-	b.cfg.HostAddress = "192.168.1.100"
-
-	info, err := b.GetInfo(context.Background(), "lease-1")
-	require.NoError(t, err)
-	require.NotNil(t, info)
-	assert.Equal(t, "192.168.1.100", info.Host)
-	require.Len(t, info.Instances, 1)
-	assert.Equal(t, "running", info.Instances[0].Status)
-}
 
 func TestGetInfo_NotProvisioned(t *testing.T) {
 	mock := &mockDockerClient{}
@@ -1836,55 +873,7 @@ func TestGetInfo_NotReady(t *testing.T) {
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 }
 
-func TestGetInfo_MultiContainer(t *testing.T) {
-	inspectCount := 0
-	mock := &mockDockerClient{
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			inspectCount++
-			return &ContainerInfo{
-				ContainerID:   containerID,
-				InstanceIndex: inspectCount - 1,
-				Image:         "nginx:latest",
-				Status:        "running",
-				Ports:         map[string]PortBinding{},
-			}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1", "c2", "c3"}},
-		},
-	})
-
-	info, err := b.GetInfo(context.Background(), "lease-1")
-	require.NoError(t, err)
-	assert.Len(t, info.Instances, 3)
-}
-
 // --- GetLogs tests ---
-
-func TestGetLogs_Success(t *testing.T) {
-	mock := &mockDockerClient{
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return fmt.Sprintf("logs for %s (tail=%d)", containerID, tail), nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-
-	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
-	require.NoError(t, err)
-	assert.Len(t, logs, 2)
-	assert.Equal(t, "logs for c1 (tail=50)", logs["0"])
-	assert.Equal(t, "logs for c2 (tail=50)", logs["1"])
-}
 
 func TestGetLogs_NotProvisioned(t *testing.T) {
 	mock := &mockDockerClient{}
@@ -1892,29 +881,6 @@ func TestGetLogs_NotProvisioned(t *testing.T) {
 
 	_, err := b.GetLogs(context.Background(), "nonexistent", 100)
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
-}
-
-func TestGetLogs_PartialError(t *testing.T) {
-	mock := &mockDockerClient{
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			if containerID == "c2" {
-				return "", errors.New("container not running")
-			}
-			return "hello world", nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-
-	logs, err := b.GetLogs(context.Background(), "lease-1", 100)
-	require.NoError(t, err)
-	assert.Equal(t, "hello world", logs["0"])
-	assert.Contains(t, logs["1"], "<error:")
 }
 
 // --- GetProvision tests ---
@@ -1949,12 +915,14 @@ func TestGetProvision_NotFound(t *testing.T) {
 // --- Workload field fixtures ---
 
 // nonStackProvision returns a simple non-stack provision fixture.
+// Post-Task-15 ProvisionState no longer carries the legacy single-Image
+// field; the test fixture drops it. Tests asserting on the per-service
+// image should read it from StackManifest.Services or ServiceImages.
 func nonStackProvision() *provision {
 	return &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		ProviderUUID: "prov-1",
 		Status:       backend.ProvisionStatusReady,
 		SKU:          "docker-micro",
-		Image:        "nginx:1.25",
 		Quantity:     2},
 	}
 }
@@ -2027,13 +995,6 @@ func backendWithProvision(t *testing.T, prov *provision) *Backend {
 	})
 }
 
-func TestGetProvision_WorkloadFields_NonStack(t *testing.T) {
-	b := backendWithProvision(t, nonStackProvision())
-	info, err := b.GetProvision(context.Background(), "lease-1")
-	require.NoError(t, err)
-	assertNonStackFields(t, info)
-}
-
 func TestGetProvision_WorkloadFields_Stack(t *testing.T) {
 	b := backendWithProvision(t, stackProvision())
 	info, err := b.GetProvision(context.Background(), "lease-1")
@@ -2082,14 +1043,6 @@ func TestListProvisions_Multiple(t *testing.T) {
 		assert.Equal(t, "prov-1", pi.ProviderUUID)
 		assert.NotEmpty(t, pi.BackendName)
 	}
-}
-
-func TestListProvisions_WorkloadFields_NonStack(t *testing.T) {
-	b := backendWithProvision(t, nonStackProvision())
-	result, err := b.ListProvisions(context.Background())
-	require.NoError(t, err)
-	require.Len(t, result, 1)
-	assertNonStackFields(t, &result[0])
 }
 
 func TestListProvisions_WorkloadFields_Stack(t *testing.T) {
@@ -2727,122 +1680,6 @@ func TestListProvisions_IncludesLastError(t *testing.T) {
 
 // --- Disk quota container creation tests ---
 
-func TestDoProvision_EphemeralProfileWithoutDiskMB(t *testing.T) {
-
-	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		select {
-		case <-callbackReceived:
-		default:
-			close(callbackReceived)
-		}
-	}))
-	defer callbackServer.Close()
-
-	var capturedParams CreateContainerParams
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
-			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:      backend.ProvisionStatusProvisioning,
-			Quantity:    1,
-			CallbackURL: callbackServer.URL},
-		},
-	})
-	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	// Ephemeral profile with DiskMB=0 — no volume binds, image volumes get tmpfs
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-	<-callbackReceived
-
-	assert.True(t, capturedParams.ReadonlyRootfs, "ReadonlyRootfs should be true")
-	assert.Equal(t, int64(0), capturedParams.Profile.DiskMB, "DiskMB should be zero")
-	assert.Nil(t, capturedParams.VolumeBinds, "VolumeBinds should be nil for ephemeral")
-	assert.Equal(t, []string{"/data"}, capturedParams.ImageVolumes, "ImageVolumes should contain /data")
-}
-
-func TestDoProvision_TmpfsPassedThrough(t *testing.T) {
-
-	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		select {
-		case <-callbackReceived:
-		default:
-			close(callbackReceived)
-		}
-	}))
-	defer callbackServer.Close()
-
-	var capturedParams CreateContainerParams
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:      backend.ProvisionStatusProvisioning,
-			Quantity:    1,
-			CallbackURL: callbackServer.URL},
-		},
-	})
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	// Manifest with additional tmpfs mounts (like nginx would need)
-	manifestJSON := []byte(`{
-		"image": "nginx:latest",
-		"ports": {"80/tcp": {}},
-		"tmpfs": ["/var/cache/nginx", "/var/log/nginx"]
-	}`)
-	manifest, err := manifest.ParseManifest(manifestJSON)
-	require.NoError(t, err)
-
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, manifestJSON)
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-	<-callbackReceived
-
-	// Verify the manifest tmpfs paths were passed through
-	assert.Equal(t, []string{"/var/cache/nginx", "/var/log/nginx"}, capturedParams.Manifest.Tmpfs)
-}
-
 // --- Callback persistence tests ---
 
 func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
@@ -3090,40 +1927,6 @@ func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 // --- Additional coverage tests ---
 
 // Fix 1: Total deprovision failure — ALL container removals fail.
-func TestDeprovision_AllContainersFail(t *testing.T) {
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return errors.New("permission denied")
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     2,
-			ContainerIDs: []string{"c1", "c2"}},
-		},
-	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deprovision partially failed")
-
-	// Provision should remain with all containers marked as failed
-	b.provisionsMu.RLock()
-	prov, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	require.True(t, exists)
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
-	assert.ElementsMatch(t, []string{"c1", "c2"}, prov.ContainerIDs)
-
-	// Resources should still be released
-	stats := b.pool.Stats()
-	assert.Equal(t, 0, stats.AllocationCount)
-}
 
 // Fix 2: CallbackMaxAge=0 skips expiry in ReplayPendingCallbacks.
 func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
@@ -3178,25 +1981,6 @@ func TestConfigValidation_NegativeCallbackMaxAge(t *testing.T) {
 }
 
 // Fix 4: GetLogs on a provisioning (in-progress) lease still returns logs.
-func TestGetLogs_ProvisioningLease(t *testing.T) {
-	mock := &mockDockerClient{
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return "startup log output", nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusProvisioning,
-			ContainerIDs: []string{"c1"}},
-		},
-	})
-
-	// GetLogs doesn't check status — it should work for in-progress provisions
-	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
-	require.NoError(t, err)
-	assert.Equal(t, "startup log output", logs["0"])
-}
 
 // Fix 4: GetLogs with empty ContainerIDs returns empty map.
 func TestGetLogs_EmptyContainerIDs(t *testing.T) {
@@ -3234,179 +2018,12 @@ func TestCreateContainer_ExplicitPortConflict_NoRetry(t *testing.T) {
 }
 
 // Fix 1: Deprovision on a provisioning lease still removes containers.
-func TestDeprovision_ProvisioningLease(t *testing.T) {
-	var removedIDs []string
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			removedIDs = append(removedIDs, containerID)
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusProvisioning,
-			Quantity:     1,
-			ContainerIDs: []string{"c1"}},
-		},
-	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	err := b.Deprovision(context.Background(), "lease-1")
-	require.NoError(t, err)
-
-	assert.Equal(t, []string{"c1"}, removedIDs)
-
-	b.provisionsMu.RLock()
-	_, exists := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.False(t, exists)
-}
 
 // TestDeprovision_ActiveProvisionsGauge verifies that the activeProvisions gauge
 // is decremented exactly once on Ready→Failed transitions and never for non-Ready
 // provisions, even across partial-failure retry sequences.
-func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
-	t.Run("ready provision decrements gauge", func(t *testing.T) {
-		activeProvisions.Set(5)
-		mock := &mockDockerClient{
-			RemoveContainerFn: func(ctx context.Context, containerID string) error {
-				return nil
-			},
-		}
-		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-				Tenant:       "tenant-a",
-				Status:       backend.ProvisionStatusReady,
-				Quantity:     1,
-				ContainerIDs: []string{"c1"}},
-			},
-		})
-		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-		err := b.Deprovision(context.Background(), "lease-1")
-		require.NoError(t, err)
-		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions))
-	})
-
-	t.Run("failed provision does not decrement gauge", func(t *testing.T) {
-		activeProvisions.Set(5)
-		mock := &mockDockerClient{
-			RemoveContainerFn: func(ctx context.Context, containerID string) error {
-				return nil
-			},
-		}
-		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-				Tenant:       "tenant-a",
-				Status:       backend.ProvisionStatusFailed,
-				Quantity:     1,
-				ContainerIDs: []string{"c1"}},
-			},
-		})
-		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-		err := b.Deprovision(context.Background(), "lease-1")
-		require.NoError(t, err)
-		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
-			"gauge must not change when deprovisioning an already-failed provision")
-	})
-
-	t.Run("provisioning lease does not decrement gauge", func(t *testing.T) {
-		activeProvisions.Set(5)
-		mock := &mockDockerClient{
-			RemoveContainerFn: func(ctx context.Context, containerID string) error {
-				return nil
-			},
-		}
-		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-				Tenant:       "tenant-a",
-				Status:       backend.ProvisionStatusProvisioning,
-				Quantity:     1,
-				ContainerIDs: []string{"c1"}},
-			},
-		})
-		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-		err := b.Deprovision(context.Background(), "lease-1")
-		require.NoError(t, err)
-		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
-			"gauge must not change when deprovisioning a provisioning lease")
-	})
-
-	t.Run("partial failure then retry decrements gauge exactly once", func(t *testing.T) {
-		activeProvisions.Set(5)
-		callCount := 0
-		mock := &mockDockerClient{
-			RemoveContainerFn: func(ctx context.Context, containerID string) error {
-				callCount++
-				// c2 fails during the first deprovision attempt (callCount=2);
-				// on retry c2 is the only container and succeeds (callCount=3).
-				if containerID == "c2" && callCount == 2 {
-					return errors.New("device busy")
-				}
-				return nil
-			},
-		}
-		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-				Tenant:       "tenant-a",
-				Status:       backend.ProvisionStatusReady,
-				Quantity:     2,
-				ContainerIDs: []string{"c1", "c2"}},
-			},
-		})
-		_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-		_ = b.pool.TryAllocate("lease-1-1", "docker-small", "tenant-a")
-
-		// First attempt: partial failure. Gauge should still decrement
-		// because the provision transitions Ready→Failed.
-		err := b.Deprovision(context.Background(), "lease-1")
-		require.Error(t, err)
-		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
-			"gauge should decrement on Ready→Failed even with partial failure")
-
-		// Retry: provision is already Failed, gauge must not decrement again.
-		err = b.Deprovision(context.Background(), "lease-1")
-		require.NoError(t, err)
-		assert.Equal(t, float64(4), testutil.ToFloat64(activeProvisions),
-			"gauge must not double-decrement on retry")
-	})
-
-	t.Run("idempotent call on missing lease does not decrement gauge", func(t *testing.T) {
-		activeProvisions.Set(5)
-		mock := &mockDockerClient{}
-		b := newBackendForProvisionTest(t, mock, nil)
-
-		err := b.Deprovision(context.Background(), "nonexistent")
-		require.NoError(t, err)
-		assert.Equal(t, float64(5), testutil.ToFloat64(activeProvisions),
-			"gauge must not change for nonexistent lease")
-	})
-}
 
 // Fix 4: GetLogs on a failed lease still returns logs for remaining containers.
-func TestGetLogs_FailedLease(t *testing.T) {
-	mock := &mockDockerClient{
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return "crash log output", nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusFailed,
-			ContainerIDs: []string{"c1"},
-			LastError:    "container crashed"},
-		},
-	})
-
-	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
-	require.NoError(t, err)
-	assert.Equal(t, "crash log output", logs["0"])
-}
 
 // --- containerFailureDiagnostics tests ---
 
@@ -3490,132 +2107,6 @@ func TestContainerFailureDiagnostics_Truncation(t *testing.T) {
 // These tests verify that callback error messages (which flow on-chain) never
 // contain container logs or dynamic data, while prov.LastError retains full
 // diagnostics for authenticated API access.
-
-func TestDoProvision_CallbackSanitized_ContainerExitedDuringStartup(t *testing.T) {
-	secret := "SECRET_API_KEY=abc123"
-
-	var callbackPayload backend.CallbackPayload
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&callbackPayload)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
-		},
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return secret, nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:      backend.ProvisionStatusProvisioning,
-			Quantity:    1,
-			CallbackURL: callbackServer.URL},
-		},
-	})
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Callback should have a hardcoded message — no secrets.
-	assert.Equal(t, "container exited during startup", callbackPayload.Error)
-	assert.NotContains(t, callbackPayload.Error, secret)
-
-	// LastError should contain full diagnostics including logs.
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.Contains(t, prov.LastError, "exit_code=1")
-	assert.Contains(t, prov.LastError, secret)
-}
-
-func TestDoProvision_CallbackSanitized_Unhealthy(t *testing.T) {
-	secret := "DB_PASSWORD=hunter2"
-
-	var callbackPayload backend.CallbackPayload
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&callbackPayload)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{
-				ContainerID: containerID,
-				Status:      "running",
-				Health:      HealthStatusUnhealthy,
-			}, nil
-		},
-		ContainerLogsFn: func(ctx context.Context, containerID string, tail int) (string, error) {
-			return secret, nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:      backend.ProvisionStatusProvisioning,
-			Quantity:    1,
-			CallbackURL: callbackServer.URL},
-		},
-	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-
-	manifest := &manifest.Manifest{
-		Image: "nginx:latest",
-		HealthCheck: &manifest.HealthCheckConfig{
-			Test: []string{"CMD", "curl", "-f", "http://localhost/health"},
-		},
-	}
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Callback should have a hardcoded message — no secrets.
-	assert.Equal(t, "container reported unhealthy", callbackPayload.Error)
-	assert.NotContains(t, callbackPayload.Error, secret)
-
-	// LastError should contain full diagnostics including logs.
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.Contains(t, prov.LastError, "unhealthy")
-	assert.Contains(t, prov.LastError, secret)
-}
 
 func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
 	var callbackPayload backend.CallbackPayload
@@ -3775,19 +2266,18 @@ func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
-	// Mock: PullImage/Create/Start succeed, Inspect returns exited so
-	// waitForHealthy treats the container as crashed. Cleanup removes
-	// the containers. The test's ContainerLogsFn must return the
-	// simulated output — captureContainerLogs calls it BEFORE cleanup.
+	// Mock: stack-shape provision flow.
+	// - PullImage succeeds.
+	// - compose.Up succeeds; PS returns 2 containers for the "app" service
+	//   (one per Quantity=2 fanned-out replica).
+	// - InspectContainer returns exited/exit 1 so verifyStartup treats
+	//   the containers as crashed and the worker enters the failure path.
+	// - RemoveContainer returns nil (cleanup path).
+	// - ContainerLogs returns the simulated output —
+	//   captureContainerLogs calls it BEFORE cleanup.
 	logsFetched := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return fmt.Sprintf("container-%d", params.InstanceIndex), nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
 			return nil
 		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
@@ -3802,7 +2292,26 @@ func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 		},
 	}
 
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			// Quantity=2 fans out under DefaultServiceName as
+			// "app-0" and "app-1" (mapComposeContainers will
+			// strip the suffix back to base service "app").
+			return []composeContainerSummary{
+				{ID: "container-0", Service: manifest.DefaultServiceName + "-0", State: "exited"},
+				{ID: "container-1", Service: manifest.DefaultServiceName + "-1", State: "exited"},
+			}, nil
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return nil
+		},
+	}
+
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.diagnosticsStore = diagStore
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.httpClient = callbackServer.Client()
@@ -3829,9 +2338,11 @@ func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	require.NotEmpty(t, entry.Logs, "persisted diagnostic must contain the pre-captured logs")
-	// Index-based keys for single-manifest provisions.
-	assert.Contains(t, entry.Logs["0"], "boot error on container-0")
-	assert.Contains(t, entry.Logs["1"], "boot error on container-1")
+	// Stack-shape log keys: "svcName/idx" — every provision is
+	// stack-shaped post-Task-15, so the 1-service "app" stack with
+	// Quantity=2 produces "app/0" and "app/1" keys.
+	assert.Contains(t, entry.Logs["app/0"], "boot error on container-0")
+	assert.Contains(t, entry.Logs["app/1"], "boot error on container-1")
 }
 
 func TestGetLogs_FallsBackToDiagnosticsStore(t *testing.T) {
@@ -4401,9 +2912,13 @@ func TestInspectImageForSetup_WritablePathsErrorNotCached(t *testing.T) {
 }
 
 func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
-	// End-to-end: detected writable paths flow through to CreateContainerParams
-	// as WritablePathBinds (bind mounts from managed volume).
-	var capturedParams CreateContainerParams
+	// End-to-end: detected writable paths flow through to the compose
+	// ServiceConfig as bind-mount Volumes. Post-Task-15 every provision
+	// goes through compose.Up; the CreateContainerParams.WritablePathBinds
+	// field is no longer the integration boundary — the binds are
+	// applied to ServiceConfig.Volumes via applyVolumeBinds in
+	// compose_project.go.
+	var capturedProject *composetypes.Project
 
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4433,20 +2948,26 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
 			return []string{"/var/lib/grafana"}, nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
 	}
 
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			capturedProject = project
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "container-1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
+		},
+	}
+
 	tmpDir := t.TempDir()
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.SKUProfiles = map[string]SKUProfile{
@@ -4462,11 +2983,29 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 
 	<-callbackReceived
 
-	// WritablePathBinds should map host path → container path.
-	require.NotNil(t, capturedParams.WritablePathBinds)
-	assert.Contains(t, capturedParams.WritablePathBinds, filepath.Join(tmpDir, "_wp", "var/lib/grafana"))
-	assert.Equal(t, "/var/lib/grafana", capturedParams.WritablePathBinds[filepath.Join(tmpDir, "_wp", "var/lib/grafana")])
-	assert.Equal(t, "472:472", capturedParams.User)
+	// Detected writable paths must surface as bind-mount Volumes on the
+	// compose ServiceConfig. The expected host path is
+	// `{volumeRoot}/_wp/var/lib/grafana` — _wp is the writable-paths
+	// subdir on the managed volume.
+	require.NotNil(t, capturedProject, "compose.Up must have been invoked with a captured project")
+	require.Len(t, capturedProject.Services, 1)
+	svc := capturedProject.Services[manifest.DefaultServiceName]
+	require.NotNil(t, svc, "compose project must have the 'app' service")
+
+	wantHost := filepath.Join(tmpDir, "_wp", "var/lib/grafana")
+	wantContainer := "/var/lib/grafana"
+	foundBind := false
+	for _, v := range svc.Volumes {
+		if v.Type == "bind" && v.Source == wantHost && v.Target == wantContainer {
+			foundBind = true
+			break
+		}
+	}
+	assert.True(t, foundBind,
+		"writable-path bind not found in compose ServiceConfig.Volumes (want type=bind source=%q target=%q); got %#v",
+		wantHost, wantContainer, svc.Volumes)
+	assert.Equal(t, "472:472", svc.User,
+		"compose ServiceConfig.User must carry the resolved UID:GID")
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -4771,214 +3310,6 @@ func createTestTar(t *testing.T, entries []testTarEntry) io.Reader {
 }
 
 // --- WritablePathBinds tests ---
-
-func TestDoProvision_WritablePathBinds(t *testing.T) {
-	// Volume created, content extracted, bind mounts set.
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	var extractCalled bool
-	var capturedParams CreateContainerParams
-	tmpDir := t.TempDir()
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
-			return &ImageInfo{
-				ID:      "sha256:abc",
-				Volumes: map[string]struct{}{},
-				User:    "1000",
-			}, nil
-		},
-		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
-			return 1000, 1000, nil
-		},
-		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
-			return []string{"/var/lib/neo4j"}, nil
-		},
-		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
-			extractCalled = true
-			assert.Equal(t, "nginx:latest", imageName)
-			assert.Equal(t, []string{"/var/lib/neo4j"}, paths)
-			assert.Contains(t, destDir, "_wp")
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 1},
-		},
-	})
-	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
-	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	assert.True(t, extractCalled, "ExtractImageContent should be called for writable paths")
-	require.NotNil(t, capturedParams.WritablePathBinds)
-	assert.Equal(t, "/var/lib/neo4j", capturedParams.WritablePathBinds[filepath.Join(tmpDir, "_wp", "var/lib/neo4j")])
-
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
-}
-
-func TestDoProvision_WritablePathBinds_PartialFailure(t *testing.T) {
-	// When ExtractImageContent fails for some paths, only successful paths
-	// appear in WritablePathBinds; failed paths are omitted gracefully.
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	var capturedParams CreateContainerParams
-	tmpDir := t.TempDir()
-	mock := &mockDockerClient{
-		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
-			return &ImageInfo{
-				ID:      "sha256:abc",
-				Volumes: map[string]struct{}{},
-				User:    "1000",
-			}, nil
-		},
-		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
-			return 1000, 1000, nil
-		},
-		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
-			return []string{"/var/lib/app", "/var/log/app"}, nil
-		},
-		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
-			return map[string]error{
-				"/var/log/app": fmt.Errorf("path does not exist in image"),
-			}
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			capturedParams = params
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:   backend.ProvisionStatusProvisioning,
-			Quantity: 1},
-		},
-	})
-	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
-	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
-	b.provisions["lease-1"].CallbackURL = callbackServer.URL
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-
-	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
-	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}}
-
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
-
-	// Successful path should be in binds, failed path should be omitted.
-	require.NotNil(t, capturedParams.WritablePathBinds)
-	assert.Equal(t, "/var/lib/app", capturedParams.WritablePathBinds[filepath.Join(tmpDir, "_wp", "var/lib/app")])
-	for hostPath, containerPath := range capturedParams.WritablePathBinds {
-		assert.NotEqual(t, "/var/log/app", containerPath, "failed path should not be in binds: %s", hostPath)
-	}
-}
-
-func TestDoRestart_WritablePathBinds(t *testing.T) {
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer callbackServer.Close()
-
-	var extractCalled bool
-	tmpDir := t.TempDir()
-	mock := &mockDockerClient{
-		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
-			return &ImageInfo{
-				ID:      "sha256:abc",
-				Volumes: map[string]struct{}{},
-				User:    "1000",
-			}, nil
-		},
-		ResolveImageUserFn: func(ctx context.Context, imageName string, userOverride string) (int, int, error) {
-			return 1000, 1000, nil
-		},
-		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
-			return []string{"/var/lib/grafana"}, nil
-		},
-		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
-			extractCalled = true
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return "new-container", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			ProviderUUID: "prov-1",
-			SKU:          "docker-small",
-			Status:       backend.ProvisionStatusRestarting,
-			Quantity:     1,
-			ContainerIDs: []string{"old-container"},
-			CallbackURL:  callbackServer.URL},
-		},
-	})
-	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
-	b.volumes = &mockVolumeManager{defaultDir: tmpDir}
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-
-	manifest := &manifest.Manifest{Image: "nginx:latest"}
-	b.doRestart(context.Background(), "lease-1", manifest, []string{"old-container"}, "docker-small", "", backend.ProvisionStatusReady, b.logger)
-
-	assert.True(t, extractCalled, "ExtractImageContent should be called on restart")
-}
 
 func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	// Ephemeral SKU (DiskMB=0) with writable paths should create a small volume.

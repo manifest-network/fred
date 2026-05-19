@@ -11,12 +11,14 @@ import (
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // TestLeaseActor_DirectDispatch exercises the async actor path without the
@@ -328,12 +330,6 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			return "c1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
@@ -344,7 +340,21 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 			return "", nil
 		},
 	}
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "c1", Service: manifest.DefaultServiceName, State: "running"},
+			}, nil
+		},
+		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
+			return nil
+		},
+	}
 	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.httpClient = callbackServer.Client()
 	rebuildCallbackSender(b)
@@ -879,47 +889,6 @@ func TestOnEnterFailing_RaceWithConcurrentStatusFlip(t *testing.T) {
 // for evContainerDied — but that has no reply). The cleanest proof is
 // to synthesize a deprovisionMsg directly and drive the actor, making
 // the handler panic and asserting the reply channel receives an error.
-func TestHandlerPanic_UnblocksReplyChannel(t *testing.T) {
-	// A mock whose InspectContainer panics — handleDeprovision calls
-	// doDeprovision which reads ContainerIDs and calls RemoveContainer;
-	// panicking RemoveContainer causes the handler to panic after the
-	// actor has entered its SM transition to Deprovisioning.
-	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			panic("synthetic handler panic")
-		},
-	}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1"}},
-		},
-	})
-	defer b.stopCancel()
-
-	panicsBefore := testutil.ToFloat64(leaseActorPanicsTotal)
-
-	// Deprovision must return within a short window — not hang on the
-	// reply channel waiting for a message that will never arrive.
-	done := make(chan error, 1)
-	go func() {
-		done <- b.Deprovision(context.Background(), "lease-1")
-	}()
-
-	select {
-	case err := <-done:
-		// Panic recovered; reply channel received the panic-error.
-		// Any error value is fine; what matters is NOT hanging.
-		_ = err
-	case <-time.After(3 * time.Second):
-		t.Fatal("Backend.Deprovision hung after handler panic — onPanic hook did not unblock the reply channel")
-	}
-
-	panicsAfter := testutil.ToFloat64(leaseActorPanicsTotal)
-	assert.Greater(t, panicsAfter, panicsBefore,
-		"leaseActorPanicsTotal must increment for handler panic")
-}
 
 // TestAckOrAbort_HonorsAckEvenWhenCtxCanceled pins the ctx-vs-ack race
 // fix. Go's select picks pseudo-randomly when multiple arms are ready,

@@ -168,20 +168,21 @@ func TestValidateStackAgainstItems_DuplicateServiceNames(t *testing.T) {
 }
 
 func TestParsePayload(t *testing.T) {
-	t.Run("single manifest", func(t *testing.T) {
+	t.Run("flat manifest auto-wraps under DefaultServiceName", func(t *testing.T) {
 		data := []byte(`{"image":"nginx:latest"}`)
-		m, s, err := ParsePayload(data)
+		s, err := ParsePayload(data)
 		require.NoError(t, err)
-		assert.NotNil(t, m)
-		assert.Nil(t, s)
-		assert.Equal(t, "nginx:latest", m.Image)
+		require.NotNil(t, s)
+		require.Len(t, s.Services, 1)
+		svc := s.Services[DefaultServiceName]
+		require.NotNil(t, svc, "auto-wrapped service should be keyed under DefaultServiceName")
+		assert.Equal(t, "nginx:latest", svc.Image)
 	})
 
-	t.Run("stack manifest", func(t *testing.T) {
+	t.Run("stack manifest passes through unchanged", func(t *testing.T) {
 		data := []byte(`{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`)
-		m, s, err := ParsePayload(data)
+		s, err := ParsePayload(data)
 		require.NoError(t, err)
-		assert.Nil(t, m)
 		require.NotNil(t, s)
 		assert.Len(t, s.Services, 2)
 		assert.Equal(t, "nginx:latest", s.Services["web"].Image)
@@ -189,21 +190,21 @@ func TestParsePayload(t *testing.T) {
 	})
 
 	t.Run("empty payload", func(t *testing.T) {
-		_, _, err := ParsePayload(nil)
+		_, err := ParsePayload(nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "empty")
 	})
 
 	t.Run("invalid JSON", func(t *testing.T) {
-		_, _, err := ParsePayload([]byte("{invalid"))
+		_, err := ParsePayload([]byte("{invalid"))
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid payload JSON")
+		assert.Contains(t, err.Error(), "invalid JSON")
 	})
 
 	t.Run("stack with invalid service name", func(t *testing.T) {
 		// Uppercase service name fails the service-name regex.
 		data := []byte(`{"services":{"Web":{"image":"nginx:latest"}}}`)
-		_, _, err := ParsePayload(data)
+		_, err := ParsePayload(data)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must match")
 	})
@@ -611,4 +612,113 @@ func TestManifest_Init_Valid(t *testing.T) {
 		m := &Manifest{Image: "nginx"}
 		assert.NoError(t, m.Validate())
 	})
+}
+
+// --- Boundary-normalization contract (Task 1, plan §Task 1.1) ---
+//
+// These tests lock the post-migration ParsePayload contract:
+//   - Returns (*StackManifest, error) always — flat input is auto-wrapped as
+//     a 1-service stack named DefaultServiceName ("app").
+//   - Stack-format input passes through unchanged.
+//
+// They will compile/pass only after Task 2 rewrites ParsePayload and adds
+// DefaultServiceName. Until then they are the RED that proves the contract.
+
+func TestParsePayload_WrapsFlat(t *testing.T) {
+	flat := []byte(`{"image":"nginx:1.25","ports":{"80/tcp":{}}}`)
+	sm, err := ParsePayload(flat)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sm == nil || len(sm.Services) != 1 {
+		t.Fatalf("expected 1 service, got %+v", sm)
+	}
+	svc, ok := sm.Services[DefaultServiceName]
+	if !ok {
+		t.Fatalf("expected service %q, got keys %v", DefaultServiceName, mapKeys(sm.Services))
+	}
+	if svc.Image != "nginx:1.25" {
+		t.Fatalf("image not preserved: %q", svc.Image)
+	}
+}
+
+func TestParsePayload_StackPassThrough(t *testing.T) {
+	stack := []byte(`{"services":{"web":{"image":"nginx:1.25"}}}`)
+	sm, err := ParsePayload(stack)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := sm.Services["web"]; !ok {
+		t.Fatalf("expected service 'web', got keys %v", mapKeys(sm.Services))
+	}
+}
+
+// TestDefaultServiceName_MirrorMatches locks in the contract that
+// backend.NormalizeProvisionRequest tags unnamed lease items with the
+// SAME service name that manifest.ParsePayload wraps flat manifests
+// under. The two constants (backend.defaultServiceName and
+// manifest.DefaultServiceName) are duplicated to avoid an import
+// cycle; this test catches drift via behaviour (no direct constant
+// comparison needed, which is why the mirror lives here, not in the
+// backend package).
+//
+// If this test fails, either the backend's auto-tag was changed or
+// the manifest's auto-wrap was changed, and the two halves of the
+// boundary-normalization contract have separated — legacy
+// flat-manifest leases would have items whose ServiceName does NOT
+// match the wrapped manifest's only service key, and Task-4
+// stack-shape provisioning would fail to find the service.
+func TestDefaultServiceName_MirrorMatches(t *testing.T) {
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-mirror",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+	}
+	require.NoError(t, backend.NormalizeProvisionRequest(&req))
+	require.Equal(t, DefaultServiceName, req.Items[0].ServiceName,
+		"backend.NormalizeProvisionRequest must tag an unnamed item with manifest.DefaultServiceName; "+
+			"the duplicated constants have drifted and downstream Task-4 stack provisioning will fail "+
+			"to locate the service in the wrapped manifest's Services map")
+}
+
+// TestNormalizeAndWrap_OneServiceStackNamedApp_AgainstLegacyItem
+// locks the QA-flagged wire-shape edge case: a tenant submits a
+// 1-service stack manifest whose service is named exactly "app",
+// alongside legacy unnamed lease items. The backend normalizes the
+// items (auto-tagging with "app") and ParsePayload passes the stack
+// through unchanged. The two halves agree by construction in this
+// case — the test pins the agreement so a future change to either
+// half can't accidentally desynchronise on this specific shape.
+func TestNormalizeAndWrap_OneServiceStackNamedApp_AgainstLegacyItem(t *testing.T) {
+	// Wire: 1-service stack named "app".
+	payload := []byte(`{"services":{"app":{"image":"nginx:1.25"}}}`)
+	sm, err := ParsePayload(payload)
+	require.NoError(t, err)
+	require.Len(t, sm.Services, 1)
+	_, ok := sm.Services[DefaultServiceName]
+	require.True(t, ok, "stack with service named 'app' must pass through under DefaultServiceName")
+
+	// Wire: legacy unnamed item.
+	req := backend.ProvisionRequest{
+		LeaseUUID:    "lease-edge",
+		Tenant:       "tenant-a",
+		ProviderUUID: "prov-1",
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+	}
+	require.NoError(t, backend.NormalizeProvisionRequest(&req))
+	require.Equal(t, DefaultServiceName, req.Items[0].ServiceName)
+
+	// The two halves now reference the same service name, so the
+	// downstream stack-shape lookup will succeed:
+	_, ok = sm.Services[req.Items[0].ServiceName]
+	require.True(t, ok, "legacy item's auto-tagged ServiceName must locate the stack's only service")
+}
+
+func mapKeys[K comparable, V any](m map[K]V) []K {
+	out := make([]K, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

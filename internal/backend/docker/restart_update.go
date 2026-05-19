@@ -1,7 +1,6 @@
 package docker
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -86,18 +85,22 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, status)
 	}
-	if prov.Manifest == nil && prov.StackManifest == nil {
+	if prov.StackManifest == nil {
+		// Post-Task-5 every restartable provision must carry a stack
+		// manifest. Legacy-shape provisions recovered before Tasks 8-9's
+		// startup migration runs would only have prov.Manifest populated
+		// and end up here; surfacing it as InvalidState lets the operator
+		// know a recover-time migration is owed. After Task 9 lands, no
+		// in-tree path can produce a manifest-less restartable provision.
 		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: no stored manifest for restart", backend.ErrInvalidState)
+		return fmt.Errorf("%w: no stored manifest for restart (pre-migration legacy lease?)", backend.ErrInvalidState)
 	}
-	isStack := prov.IsStack()
 	prevStatus := prov.Status
 	prevCallbackURL := prov.CallbackURL
 	prov.Status = backend.ProvisionStatusRestarting
 	if req.CallbackURL != "" {
 		prov.CallbackURL = req.CallbackURL
 	}
-	m := prov.Manifest
 	stackManifest := prov.StackManifest
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
 	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
@@ -105,23 +108,13 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		serviceContainers[k] = append([]string(nil), v...)
 	}
 	items := append([]backend.LeaseItem(nil), prov.Items...)
-	sku := prov.SKU
 	b.provisionsMu.Unlock()
 
 	// Record restart release as deploying. Abort if this fails — without a
 	// release record, ActivateLatest after success is a no-op, and a cold
 	// restart would recover the previous manifest (silently rolling back).
 	if b.releaseStore != nil {
-		var manifestBytes []byte
-		var marshalErr error
-		var releaseImage string
-		if isStack {
-			manifestBytes, marshalErr = json.Marshal(stackManifest)
-			releaseImage = "stack"
-		} else {
-			manifestBytes, marshalErr = json.Marshal(m)
-			releaseImage = m.Image
-		}
+		manifestBytes, marshalErr := json.Marshal(stackManifest)
 		if marshalErr != nil {
 			b.provisionsMu.Lock()
 			prov.Status = prevStatus
@@ -131,7 +124,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		}
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  manifestBytes,
-			Image:     releaseImage,
+			Image:     "stack",
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
@@ -148,17 +141,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	// workers barrier). See handleRestartRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
-		if isStack {
-			return b.doRestartStack(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
-		}
-		// Legacy single-item: items[0].CustomDomain holds the secondary-router
-		// domain. Items may be empty for provisions recovered without it (legacy
-		// pre-CustomDomain state); treat that as no custom domain.
-		var customDomain string
-		if len(items) > 0 {
-			customDomain = items[0].CustomDomain
-		}
-		return b.doRestart(opCtx, req.LeaseUUID, m, containerIDs, sku, customDomain, prevStatus, logger)
+		return b.doRestart(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
@@ -175,51 +158,9 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	return nil
 }
 
-// (Outcome dispatch lives in leaseActor.spawnReplaceWorker so the worker
-// goroutine is owned by the actor via workers barrier — see lease_actor.go.)
-
-// doRestart performs the actual container restart asynchronously.
-func (b *Backend) doRestart(ctx context.Context, leaseUUID string, m *manifest.Manifest, oldContainerIDs []string, sku, customDomain string, prevStatus backend.ProvisionStatus, logger *slog.Logger) leasesm.ReplaceResult {
-	profile, profErr := b.cfg.GetSKUProfile(sku)
-	if profErr != nil {
-		err := fmt.Errorf("SKU profile lookup failed: %w", profErr)
-		b.recordPreflightFailure(leaseUUID, err, logger)
-		// Preflight failure restored the lease to prevStatus. Treat this
-		// as a recovery (restored=true): the lease is back to its
-		// pre-operation state, so the SM goes to Ready or Failed based on
-		// prevStatus. The fireReplaceOutcome dispatcher will pick the
-		// right event.
-		return leasesm.ReplaceResult{
-			CallbackErr: "restart failed",
-			Err:         err,
-			Restored:    prevStatus == backend.ProvisionStatusReady,
-			Failure: leasesm.ReplaceFailureInfo{
-				PrevStatus:  prevStatus,
-				Operation:   "restart",
-				OldStopped:  false, // preflight never stopped containers
-				CallbackErr: "restart failed",
-				LastError:   err.Error(),
-			},
-		}
-	}
-
-	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID:       leaseUUID,
-		Manifest:        m,
-		SKU:             sku,
-		Profile:         profile,
-		OldContainerIDs: oldContainerIDs,
-		Quantity:        len(oldContainerIDs),
-		Operation:       "restart",
-		PrevStatus:      prevStatus,
-		Logger:          logger,
-		CustomDomain:    customDomain,
-	})
-}
-
-// doRestartStack performs an async stack restart: stops all service containers
+// doRestart performs an async stack restart: stops all service containers
 // and recreates them from the stored StackManifest.
-func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) leasesm.ReplaceResult {
+func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) leasesm.ReplaceResult {
 	profiles := make(map[string]SKUProfile, len(items))
 	for _, item := range items {
 		if _, ok := profiles[item.SKU]; ok {
@@ -244,7 +185,7 @@ func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *m
 		profiles[item.SKU] = profile
 	}
 
-	return b.doReplaceStackContainers(ctx, replaceStackContainersOp{
+	return b.doReplaceContainers(ctx, replaceContainersOp{
 		LeaseUUID:         leaseUUID,
 		Stack:             stack,
 		Items:             items,
@@ -257,8 +198,8 @@ func (b *Backend) doRestartStack(ctx context.Context, leaseUUID string, stack *m
 	})
 }
 
-// replaceStackContainersOp describes a stack container replacement operation.
-type replaceStackContainersOp struct {
+// replaceContainersOp describes a stack container replacement operation.
+type replaceContainersOp struct {
 	LeaseUUID         string
 	Stack             *manifest.StackManifest
 	Items             []backend.LeaseItem
@@ -273,14 +214,14 @@ type replaceStackContainersOp struct {
 	OnSuccess func(prov *leasesm.ProvisionState)
 }
 
-// doReplaceStackContainers performs the stack container replacement lifecycle
+// doReplaceContainers performs the stack container replacement lifecycle
 // using Docker Compose. Compose handles stopping old containers and starting
 // new ones via a single Up call, with rollback via Up with the previous manifest.
 //
 // Returns leasesm.ReplaceResult — see doReplaceContainers for the protocol.
 // Stack variant's OnSuccess typically sets StackManifest; this function
 // populates the leasesm.ReplaceResult's fields for the SM entry action.
-func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackContainersOp) (resultRet leasesm.ReplaceResult) {
+func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersOp) (resultRet leasesm.ReplaceResult) {
 	var err error
 	var callbackErr string
 	var newContainerIDs []string
@@ -307,7 +248,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 
 			// Rollback: rebuild the Project from the previous StackManifest and
 			// Compose Up to restore the old containers.
-			restored := b.rollbackStackViaCompose(op)
+			restored := b.rollbackViaCompose(op)
 			if restored {
 				op.Logger.Info("rolled back to previous containers via compose (stack)")
 				callbackErr += "; rolled back to previous version"
@@ -389,7 +330,7 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	}
 
 	// Ensure volumes exist for all services/instances.
-	volBinds, _, volErr := b.setupStackVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
+	volBinds, _, volErr := b.setupVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
 	if volErr != nil {
 		err = volErr
 		callbackErr = op.Operation + " failed"
@@ -446,10 +387,10 @@ func (b *Backend) doReplaceStackContainers(ctx context.Context, op replaceStackC
 	return
 }
 
-// rollbackStackViaCompose restores the previous stack state by rebuilding a
+// rollbackViaCompose restores the previous stack state by rebuilding a
 // Compose project from the previous StackManifest (still in the provision,
 // since OnSuccess hasn't run) and calling Compose Up. Returns true on success.
-func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
+func (b *Backend) rollbackViaCompose(op replaceContainersOp) bool {
 	rollbackCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -492,7 +433,7 @@ func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
 	}
 
 	// Re-use existing volumes (already created during original provision).
-	volBinds, _, volErr := b.setupStackVolBinds(rollbackCtx, op.LeaseUUID, op.Items, op.Profiles, prevImageSetups, prevStack.Services, op.Logger)
+	volBinds, _, volErr := b.setupVolBinds(rollbackCtx, op.LeaseUUID, op.Items, op.Profiles, prevImageSetups, prevStack.Services, op.Logger)
 	if volErr != nil {
 		op.Logger.Error("rollback: volume setup failed", "error", volErr)
 		return false
@@ -540,31 +481,12 @@ func (b *Backend) rollbackStackViaCompose(op replaceStackContainersOp) bool {
 	return true
 }
 
-// replaceContainersOp describes a container replacement operation with rollback.
-// Used by both restart and update to share the stop → create → verify lifecycle.
-type replaceContainersOp struct {
-	LeaseUUID       string
-	Manifest        *manifest.Manifest
-	SKU             string
-	Profile         SKUProfile
-	OldContainerIDs []string
-	Quantity        int                     // Number of new containers to create
-	Operation       string                  // "restart" or "update" — used in log and callback messages
-	PrevStatus      backend.ProvisionStatus // status before the operation began, for gauge accuracy
-	Logger          *slog.Logger
-	CustomDomain    string // Legacy single-item lease's custom domain (empty when not set)
-
-	// OnSuccess is called under provisionsMu lock after successful replacement.
-	// Used by update to set Image/Manifest on the provision. May be nil.
-	OnSuccess func(prov *leasesm.ProvisionState)
-}
-
 // recordPreflightFailure logs the preflight error (e.g., profile lookup,
 // image pull) and marks the latest release as failed. Provision-state
 // mutations (LastError, FailCount, Status, persistDiagnostics) are
 // handled by the SM entry action that fires when the caller returns its
-// leasesm.ReplaceResult — see the preflight branches of doRestart / doRestartStack
-// / doUpdate / doUpdateStack.
+// leasesm.ReplaceResult — see the preflight branches of doRestart /
+// doUpdate (post-Task-14, the unified stack-shaped versions).
 func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *slog.Logger) {
 	logger.Error("preflight failed", "error", err)
 
@@ -573,236 +495,6 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *sl
 			logger.Warn("failed to update release status", "error", relErr)
 		}
 	}
-}
-
-// doReplaceContainers performs the container replacement lifecycle:
-// inspect image → read metadata → setup networking → stop and rename old →
-// create and start new → verify startup.
-// Old containers are kept stopped for rollback on failure.
-//
-// Returns a leasesm.ReplaceResult (see lease_sm.go) carrying:
-//   - err: non-nil on failure
-//   - callbackErr: hardcoded on-chain-safe error string (failure path)
-//   - restored: true if rollback succeeded (only meaningful when err != nil)
-//   - success: containerIDs + OnSuccess populated when err == nil; the SM's
-//     Ready entry action applies them
-//   - failure: prevStatus, operation, oldStopped, callbackErr, lastError
-//     populated when err != nil
-//
-// The goroutine wrapper picks the SM event from (err == nil, restored):
-//   - err == nil               → evReplaceCompleted (Status → Ready)
-//   - err != nil && restored   → evReplaceRecovered (Status → Ready, Failed callback)
-//   - err != nil && !restored  → evReplaceFailed    (Status → Failed)
-//
-// All provision-struct mutations (Status, FailCount, LastError,
-// ContainerIDs, OnSuccess) and the persistDiagnostics call live in
-// the SM entry actions now — this function only does I/O (container
-// ops, rollback attempt, release-store updates).
-func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersOp) (resultRet leasesm.ReplaceResult) {
-	var err error
-	var callbackErr string
-	var newContainerIDs []string
-	var oldStopped bool
-
-	defer func() {
-		if err != nil {
-			op.Logger.Error(op.Operation+" failed", "error", err)
-
-			// Mark release as failed.
-			if b.releaseStore != nil {
-				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", err.Error()); relErr != nil {
-					op.Logger.Warn("failed to update release status", "error", relErr)
-				}
-			}
-
-			// Capture logs from the failed new containers BEFORE the
-			// cleanup loop removes them. Index-based keys (nil keys
-			// map → "0", "1", ...) for the single-manifest case.
-			failureLogs := b.captureContainerLogs(newContainerIDs, nil)
-
-			// Clean up failed new containers.
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cleanupCancel()
-			for _, cid := range newContainerIDs {
-				if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-					op.Logger.Warn("failed to cleanup container after "+op.Operation+" error", "container_id", leasesm.ShortID(cid), "error", rmErr)
-				}
-			}
-
-			// Rollback: restart old containers to restore service.
-			restored := !oldStopped || b.rollbackContainers(op.LeaseUUID, op.OldContainerIDs, op.Logger)
-			if restored {
-				op.Logger.Info("rolled back to previous containers", "containers", len(op.OldContainerIDs))
-				callbackErr += "; rolled back to previous version"
-			} else if oldStopped {
-				callbackErr += "; rollback failed"
-			}
-
-			resultRet = leasesm.ReplaceResult{
-				CallbackErr: callbackErr,
-				Err:         err,
-				Restored:    restored,
-				Failure: leasesm.ReplaceFailureInfo{
-					PrevStatus:  op.PrevStatus,
-					Operation:   op.Operation,
-					OldStopped:  oldStopped,
-					CallbackErr: callbackErr,
-					LastError:   err.Error(),
-					Logs:        failureLogs,
-				},
-			}
-			return
-		}
-
-		// Success: remove old containers. Provision-struct mutations happen
-		// in onEnterReadyFromReplaceCompleted.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		for _, cid := range op.OldContainerIDs {
-			if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-				op.Logger.Warn("failed to remove old container after "+op.Operation, "container_id", leasesm.ShortID(cid), "error", rmErr)
-			}
-		}
-
-		// Mark release as active, previous as superseded.
-		if b.releaseStore != nil {
-			if relErr := b.releaseStore.ActivateLatest(op.LeaseUUID); relErr != nil {
-				op.Logger.Warn("failed to update release status", "error", relErr)
-			}
-		}
-
-		resultRet = leasesm.ReplaceResult{
-			Success: leasesm.ReplaceSuccessResult{
-				PrevStatus:   op.PrevStatus,
-				ContainerIDs: newContainerIDs,
-				OnSuccess:    op.OnSuccess,
-			},
-		}
-	}()
-
-	// Inspect image and resolve user.
-	imgSetup, setupErr := b.inspectImageForSetup(ctx, op.Manifest.Image, op.Manifest.User)
-	if setupErr != nil {
-		err = setupErr
-		callbackErr = op.Operation + " failed"
-		return
-	}
-	if len(imgSetup.WritablePaths) > 0 {
-		op.Logger.Info("auto-detected writable paths", "paths", imgSetup.WritablePaths, "uid", imgSetup.VolumeUID)
-	}
-
-	// Read provision metadata.
-	b.provisionsMu.RLock()
-	failCount := 0
-	tenant := ""
-	providerUUID := ""
-	callbackURL := ""
-	if prov, ok := b.provisions[op.LeaseUUID]; ok {
-		failCount = prov.FailCount
-		tenant = prov.Tenant
-		providerUUID = prov.ProviderUUID
-		callbackURL = prov.CallbackURL
-	}
-	b.provisionsMu.RUnlock()
-
-	// Set up networking.
-	networkConfig, netErr := b.ensureNetworkConfig(ctx, tenant)
-	if netErr != nil {
-		err = netErr
-		callbackErr = op.Operation + " failed"
-		return
-	}
-
-	// Stop and rename old containers to free the canonical name for replacements.
-	// Old containers are kept stopped for rollback on failure.
-	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	for i, cid := range op.OldContainerIDs {
-		op.Logger.Info("stopping container for "+op.Operation, "container_id", leasesm.ShortID(cid))
-		if stopErr := b.docker.StopContainer(ctx, cid, stopTimeout); stopErr != nil {
-			err = fmt.Errorf("failed to stop container %s: %w", leasesm.ShortID(cid), stopErr)
-			callbackErr = op.Operation + " failed"
-			return
-		}
-		oldStopped = true
-		if renameErr := b.docker.RenameContainer(ctx, cid, prevContainerName(op.LeaseUUID, i)); renameErr != nil {
-			err = fmt.Errorf("failed to rename old container %s: %w", leasesm.ShortID(cid), renameErr)
-			callbackErr = op.Operation + " failed"
-			return
-		}
-	}
-
-	// Create and start new containers.
-	newContainerIDs = make([]string, 0, op.Quantity)
-	for i := range op.Quantity {
-		volumeBinds, volErr := b.setupVolumeBinds(ctx, op.LeaseUUID, i, op.Profile.DiskMB, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
-		if volErr != nil {
-			err = volErr
-			callbackErr = op.Operation + " failed"
-			return
-		}
-
-		var writablePathBinds map[string]string
-		if len(imgSetup.WritablePaths) > 0 {
-			volumeID := fmt.Sprintf("fred-%s-%d", op.LeaseUUID, i)
-			sizeMB := op.Profile.DiskMB
-			if sizeMB <= 0 {
-				sizeMB = int64(b.cfg.GetTmpfsSizeMB())
-			}
-			hostPath, _, wpVolErr := b.volumes.Create(ctx, volumeID, sizeMB)
-			if wpVolErr == nil {
-				writablePathBinds = b.setupWritablePathBinds(ctx, op.Manifest.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
-			} else {
-				op.Logger.Warn("writable path content seeding unavailable on "+op.Operation, "error", wpVolErr)
-			}
-		}
-
-		containerID, createErr := b.docker.CreateContainer(ctx, CreateContainerParams{
-			LeaseUUID:         op.LeaseUUID,
-			Tenant:            tenant,
-			ProviderUUID:      providerUUID,
-			SKU:               op.SKU,
-			Manifest:          op.Manifest,
-			Profile:           op.Profile,
-			InstanceIndex:     i,
-			FailCount:         failCount,
-			CallbackURL:       callbackURL,
-			HostBindIP:        b.cfg.GetHostBindIP(),
-			ReadonlyRootfs:    b.cfg.IsReadonlyRootfs(),
-			PidsLimit:         b.cfg.GetPidsLimit(),
-			TmpfsSizeMB:       b.cfg.GetTmpfsSizeMB(),
-			NetworkConfig:     networkConfig,
-			VolumeBinds:       volumeBinds,
-			ImageVolumes:      imgSetup.Volumes,
-			WritablePathBinds: writablePathBinds,
-			User:              imgSetup.ContainerUser,
-			BackendName:       b.cfg.Name,
-			Ingress:           b.cfg.Ingress,
-			NetworkName:       TenantNetworkName(tenant),
-			Quantity:          op.Quantity,
-			CustomDomain:      op.CustomDomain,
-		}, b.cfg.ContainerCreateTimeout)
-		if createErr != nil {
-			err = fmt.Errorf("container creation failed (instance %d): %w", i, createErr)
-			callbackErr = op.Operation + " failed"
-			return
-		}
-		newContainerIDs = append(newContainerIDs, containerID)
-
-		if startErr := b.docker.StartContainer(ctx, containerID, b.cfg.ContainerStartTimeout); startErr != nil {
-			err = fmt.Errorf("container start failed (instance %d): %w", i, startErr)
-			callbackErr = op.Operation + " failed"
-			return
-		}
-	}
-
-	// Startup verification.
-	if err = b.verifyStartup(ctx, op.Manifest, newContainerIDs, op.Logger); err != nil {
-		callbackErr = startupErrorToCallbackMsg(err)
-		return
-	}
-
-	op.Logger.Info(op.Operation+" completed", "containers", len(newContainerIDs))
-	return
 }
 
 // Update deploys a new manifest for a lease, replacing containers.
@@ -831,117 +523,65 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, status)
 	}
 
-	isStack := prov.IsStack()
+	// Boundary normalization: prov.Items must be populated (it is set at
+	// Provision time and rehydrated from container labels by recover.go).
+	// Task 3's `len(prov.Items) > 0` guard is removed here per the Task 3
+	// review carry-over; after Task 8-9's recover-time migration every
+	// recovered provision will have Items populated. A surviving empty
+	// Items now surfaces immediately as ErrInvalidState rather than
+	// silently routing into the (now-gone) legacy path.
+	if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: prov.Items}); err != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrInvalidState, err)
+	}
 
-	// Parse new payload (auto-detects single vs stack).
-	m, stackManifest, parseErr := manifest.ParsePayload(req.Payload)
+	// Parse new payload. ParsePayload always returns a *StackManifest;
+	// legacy flat payloads are auto-wrapped under DefaultServiceName.
+	stackManifest, parseErr := manifest.ParsePayload(req.Payload)
 	if parseErr != nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, parseErr)
 	}
-
-	// Ensure payload type matches existing provision type.
-	if isStack && stackManifest == nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: stack lease requires a stack manifest (with services key)", backend.ErrInvalidManifest)
-	}
-	if !isStack && stackManifest != nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: non-stack lease cannot be updated with a stack manifest", backend.ErrInvalidManifest)
+	if isFlatPayload(req.Payload) {
+		logger.Warn("manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack",
+			"lease_uuid", req.LeaseUUID)
 	}
 
-	if isStack {
-		// Validate stack against stored items.
-		if valErr := manifest.ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
+	// Validate stack against stored items. A flat payload submitted against
+	// a multi-service stack lease auto-wraps to {"app": <flat>} and falls
+	// through here as a service-name mismatch — preserving the pre-Task-2
+	// error category via ErrInvalidManifest (mirrors provision.go).
+	if valErr := manifest.ValidateStackAgainstItems(stackManifest, prov.Items); valErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, valErr)
+	}
+	// Validate all images.
+	for svcName, svc := range stackManifest.Services {
+		if imgErr := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); imgErr != nil {
 			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: %w", backend.ErrValidation, valErr)
+			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, imgErr)
 		}
-		// Validate all images.
-		for svcName, svc := range stackManifest.Services {
-			if imgErr := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); imgErr != nil {
-				b.provisionsMu.Unlock()
-				return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, imgErr)
-			}
-		}
-		// Validate all SKU profiles.
-		profiles := make(map[string]SKUProfile, len(prov.Items))
-		for _, item := range prov.Items {
-			if _, ok := profiles[item.SKU]; ok {
-				continue
-			}
-			profile, profErr := b.cfg.GetSKUProfile(item.SKU)
-			if profErr != nil {
-				b.provisionsMu.Unlock()
-				return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
-			}
-			profiles[item.SKU] = profile
-		}
-
-		oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
-		serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
-		for k, v := range prov.ServiceContainers {
-			serviceContainers[k] = append([]string(nil), v...)
-		}
-		items := append([]backend.LeaseItem(nil), prov.Items...)
-		prevStatus := prov.Status
-		prevCallbackURL := prov.CallbackURL
-		prov.Status = backend.ProvisionStatusUpdating
-		if req.CallbackURL != "" {
-			prov.CallbackURL = req.CallbackURL
-		}
-		b.provisionsMu.Unlock()
-
-		// Record release.
-		releaseImage := "stack"
-		if b.releaseStore != nil {
-			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
-				Manifest:  req.Payload,
-				Image:     releaseImage,
-				Status:    "deploying",
-				CreatedAt: time.Now(),
-			}); relErr != nil {
-				b.provisionsMu.Lock()
-				prov.Status = prevStatus
-				prov.CallbackURL = prevCallbackURL
-				b.provisionsMu.Unlock()
-				return fmt.Errorf("failed to record release: %w", relErr)
-			}
-		}
-
-		// Hand off to the actor. See handleUpdateRequested /
-		// spawnReplaceWorker.
-		opCtx, opCancel := b.shutdownAwareContext()
-		work := func() leasesm.ReplaceResult {
-			return b.doUpdateStack(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
-		}
-		ack := make(chan error, 1)
-		if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
-			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
-			return routeErr
-		}
-		// See ackOrAbort's comment for the ctx-vs-ack race rationale.
-		if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
-			opCancel()
-			b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
-			return err
-		}
-		return nil
 	}
-
-	// Single-manifest path.
-	if imgErr := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); imgErr != nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: %w", backend.ErrValidation, imgErr)
-	}
-
-	profile, profErr := b.cfg.GetSKUProfile(prov.SKU)
-	if profErr != nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
+	// Validate all SKU profiles.
+	profiles := make(map[string]SKUProfile, len(prov.Items))
+	for _, item := range prov.Items {
+		if _, ok := profiles[item.SKU]; ok {
+			continue
+		}
+		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
+		if profErr != nil {
+			b.provisionsMu.Unlock()
+			return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
+		}
+		profiles[item.SKU] = profile
 	}
 
 	oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
+	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
+	for k, v := range prov.ServiceContainers {
+		serviceContainers[k] = append([]string(nil), v...)
+	}
+	items := append([]backend.LeaseItem(nil), prov.Items...)
 	prevStatus := prov.Status
 	prevCallbackURL := prov.CallbackURL
 	prov.Status = backend.ProvisionStatusUpdating
@@ -950,10 +590,14 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	}
 	b.provisionsMu.Unlock()
 
+	// Record release. Image:"stack" is the existing stack-path sentinel
+	// (pre-Task-2 behavior for multi-service leases); after Task 6 it
+	// also covers auto-wrapped 1-service leases. GetReleases tenants
+	// already see this sentinel for stack-shaped leases.
 	if b.releaseStore != nil {
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
 			Manifest:  req.Payload,
-			Image:     m.Image,
+			Image:     "stack",
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
@@ -969,7 +613,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	// spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
-		return b.doUpdate(opCtx, req.LeaseUUID, m, profile, oldContainerIDs, prevStatus, logger)
+		return b.doUpdate(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
@@ -986,68 +630,8 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return nil
 }
 
-// doUpdate performs the actual container update asynchronously.
-func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, m *manifest.Manifest, profile SKUProfile, oldContainerIDs []string, prevStatus backend.ProvisionStatus, logger *slog.Logger) leasesm.ReplaceResult {
-	// Pull new image — this is the only update-specific pre-flight step.
-	logger.Info("pulling image for update", "image", m.Image)
-	if pullErr := b.docker.PullImage(ctx, m.Image, b.cfg.ImagePullTimeout); pullErr != nil {
-		err := fmt.Errorf("image pull failed: %w", pullErr)
-		b.recordPreflightFailure(leaseUUID, err, logger)
-		// Update preflight failure: force Status=Failed unconditionally
-		// even though the old containers are still running. The user's
-		// desired state (the new image) was not achieved; the lease is
-		// semantically Failed until the user retries with a good image.
-		// This differs from Restart preflight, where Status stays at
-		// prevStatus because the operation's goal (a fresh container
-		// start with the SAME image) is independent of whether the
-		// operator's intent-to-update was achievable.
-		return leasesm.ReplaceResult{
-			CallbackErr: "image pull failed",
-			Err:         err,
-			Restored:    false,
-			Failure: leasesm.ReplaceFailureInfo{
-				PrevStatus:  prevStatus,
-				Operation:   "update",
-				CallbackErr: "image pull failed",
-				LastError:   err.Error(),
-			},
-		}
-	}
-
-	// Read SKU, quantity, and (legacy) custom domain from provision.
-	b.provisionsMu.RLock()
-	sku := ""
-	quantity := len(oldContainerIDs)
-	customDomain := ""
-	if prov, ok := b.provisions[leaseUUID]; ok {
-		sku = prov.SKU
-		quantity = prov.Quantity
-		if len(prov.Items) > 0 {
-			customDomain = prov.Items[0].CustomDomain
-		}
-	}
-	b.provisionsMu.RUnlock()
-
-	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID:       leaseUUID,
-		Manifest:        m,
-		SKU:             sku,
-		Profile:         profile,
-		OldContainerIDs: oldContainerIDs,
-		Quantity:        quantity,
-		Operation:       "update",
-		PrevStatus:      prevStatus,
-		Logger:          logger,
-		CustomDomain:    customDomain,
-		OnSuccess: func(prov *leasesm.ProvisionState) {
-			prov.Image = m.Image
-			prov.Manifest = m
-		},
-	})
-}
-
-// doUpdateStack performs the actual stack container update asynchronously.
-func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) leasesm.ReplaceResult {
+// doUpdate performs the actual stack container update asynchronously.
+func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, prevStatus backend.ProvisionStatus, logger *slog.Logger) leasesm.ReplaceResult {
 	// Pull each unique image (deduplicated).
 	pulledImages := make(map[string]bool)
 	for svcName, svc := range stack.Services {
@@ -1076,7 +660,7 @@ func (b *Backend) doUpdateStack(ctx context.Context, leaseUUID string, stack *ma
 		pulledImages[svc.Image] = true
 	}
 
-	return b.doReplaceStackContainers(ctx, replaceStackContainersOp{
+	return b.doReplaceContainers(ctx, replaceContainersOp{
 		LeaseUUID:         leaseUUID,
 		Stack:             stack,
 		Items:             items,

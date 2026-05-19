@@ -210,6 +210,43 @@ func (x *xfsVolumeManager) List() ([]string, error) {
 	return listVolumeIDs(x.dataPath)
 }
 
+// RenameVolume renames the volume directory and updates the in-memory
+// projectID maps so subsequent Create/Destroy calls on the new name
+// resolve to the same XFS project ID (preserving the quota and the
+// .fred-project-id marker file inside the directory).
+//
+// xfs project metadata is keyed by inode and survives a directory
+// rename, so no xfs_quota reapplication is needed. The maps are updated
+// atomically under x.mu after a successful os.Rename so a concurrent
+// Create on the new name cannot observe an inconsistent state.
+func (x *xfsVolumeManager) RenameVolume(oldName, newName string) error {
+	oldPath := filepath.Join(x.dataPath, oldName)
+	newPath := filepath.Join(x.dataPath, newName)
+	if err := atomicRenameVolumeDir(oldPath, newPath); err != nil {
+		return err
+	}
+
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if projID, ok := x.volumeToID[oldName]; ok {
+		delete(x.volumeToID, oldName)
+		x.volumeToID[newName] = projID
+		x.activeIDs[projID] = newName
+	}
+	// If oldName wasn't in the map (idempotent rerun, or volume created
+	// outside the live process), the next Create/Destroy on newName will
+	// rebuild the entry via the marker-file read path.
+	return nil
+}
+
+// HostPath returns the absolute path of the volume directory under the
+// configured data path. The directory may or may not exist; callers use
+// this to compute paths for not-yet-renamed or about-to-be-created
+// volumes (see migrate.go in Task 9).
+func (x *xfsVolumeManager) HostPath(name string) string {
+	return filepath.Join(x.dataPath, name)
+}
+
 func (x *xfsVolumeManager) Validate() error {
 	// Check xfs_quota binary exists.
 	if _, err := exec.LookPath("xfs_quota"); err != nil {

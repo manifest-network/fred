@@ -82,6 +82,33 @@ type ContainerInfo struct {
 	Ports         map[string]PortBinding
 	FQDN          string
 	CustomDomain  string // Tenant-supplied custom FQDN (empty when not set)
+
+	// Name is the human-readable container name (without the leading "/"
+	// the Docker API prepends). Populated by both InspectContainer and
+	// ListManagedContainers. Used by the recover-time migration to filter
+	// out already-migrated `-prev` remnants.
+	Name string
+
+	// Mounts is the set of bind/volume mounts attached to the container.
+	// Populated by InspectContainer always; populated by
+	// ListManagedContainers from `types.Container.Mounts` (which the
+	// list-containers API includes inline, so no extra Inspect round-trip
+	// is needed at startup). Used by the recover-time migration to locate
+	// managed volumes that need renaming under the new naming convention.
+	Mounts []ContainerMount
+}
+
+// ContainerMount mirrors the subset of docker's Mount data fred needs for
+// the recover-time migration: where the host bind comes from, where it's
+// mounted inside the container, and the type discriminator (bind / volume
+// / tmpfs). Type is a string per the docker API rather than the typed
+// `mount.Type` because the list-containers and inspect-container APIs
+// surface it as a free-form string and copying that semantics here keeps
+// callers from caring about which API shape they're consuming.
+type ContainerMount struct {
+	Source string
+	Target string
+	Type   string // "bind" | "volume" | "tmpfs"
 }
 
 // PortBinding represents a port mapping.
@@ -1042,13 +1069,18 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		}
 	}
 
-	// Generate container name: stack uses service name, single-container uses instance index only.
-	var containerName string
-	if params.ServiceName != "" {
-		containerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, params.ServiceName, params.InstanceIndex)
-	} else {
-		containerName = fmt.Sprintf("fred-%s-%d", params.LeaseUUID, params.InstanceIndex)
+	// Container names are always service-aware:
+	// fred-{leaseUUID}-{serviceName}-{instanceIndex}. The legacy
+	// fred-{leaseUUID}-{instanceIndex} scheme is gone from the live path
+	// — Task 9's recover-time migration renames any on-disk artifacts
+	// that still carry it. An empty ServiceName here is a structural
+	// bug (NormalizeProvisionRequest auto-tags single unnamed items at
+	// the Provision entry); surface it loudly rather than silently
+	// fall back to the legacy form.
+	if params.ServiceName == "" {
+		return "", fmt.Errorf("internal: container create requested without service_name (lease %s, instance %d)", params.LeaseUUID, params.InstanceIndex)
 	}
+	containerName := fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, params.ServiceName, params.InstanceIndex)
 
 	networkConfig := params.NetworkConfig
 	if networkConfig == nil {
@@ -1387,6 +1419,17 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		Ports:         make(map[string]PortBinding),
 		FQDN:          resp.Config.Labels[LabelFQDN],
 		CustomDomain:  resp.Config.Labels[LabelCustomDomain],
+		Name:          strings.TrimPrefix(resp.Name, "/"),
+	}
+
+	// Extract mounts (used by recover-time migration to locate managed
+	// volumes that need renaming).
+	for _, m := range resp.Mounts {
+		info.Mounts = append(info.Mounts, ContainerMount{
+			Source: m.Source,
+			Target: m.Destination,
+			Type:   string(m.Type),
+		})
 	}
 
 	// Extract port bindings
@@ -1433,6 +1476,11 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			continue
 		}
 
+		var name string
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+
 		info := ContainerInfo{
 			ContainerID:   c.ID,
 			LeaseUUID:     c.Labels[LabelLeaseUUID],
@@ -1449,6 +1497,17 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			Ports:         make(map[string]PortBinding),
 			FQDN:          c.Labels[LabelFQDN],
 			CustomDomain:  c.Labels[LabelCustomDomain],
+			Name:          name,
+		}
+
+		// Extract mounts from the list-containers payload (the API includes
+		// MountPoint inline, no extra Inspect round-trip needed at startup).
+		for _, m := range c.Mounts {
+			info.Mounts = append(info.Mounts, ContainerMount{
+				Source: m.Source,
+				Target: m.Destination,
+				Type:   string(m.Type),
+			})
 		}
 
 		// Extract port bindings from container ports
@@ -1636,19 +1695,6 @@ func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error
 	b.provisionsMu.RUnlock()
 
 	return b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
-}
-
-// buildNetworkConfig returns a NetworkingConfig that attaches to the given network,
-// or an empty config if networkID is empty.
-func buildNetworkConfig(networkID string) *networktypes.NetworkingConfig {
-	if networkID == "" {
-		return &networktypes.NetworkingConfig{}
-	}
-	return &networktypes.NetworkingConfig{
-		EndpointsConfig: map[string]*networktypes.EndpointSettings{
-			networkID: {},
-		},
-	}
 }
 
 // HealthStatus represents the health check status of a Docker container.

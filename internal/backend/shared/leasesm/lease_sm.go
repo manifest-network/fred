@@ -454,9 +454,6 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		p.Status = backend.ProvisionStatusReady
 		p.ContainerIDs = result.ContainerIDs
 		p.LastError = ""
-		if result.Manifest != nil {
-			p.Manifest = result.Manifest
-		}
 		if result.StackManifest != nil {
 			p.StackManifest = result.StackManifest
 		}
@@ -713,15 +710,14 @@ type diagResult struct {
 	diag        string
 }
 
-// ProvisionSuccessResult carries doProvision / doProvisionStack output
-// into Ready.OnEntryFrom(evProvisionCompleted) via Fire args. Manifest
-// and StackManifest are mutually exclusive — single-manifest provisions
-// populate Manifest; stacks populate StackManifest + ServiceContainers.
-// Exported because the substrate's provision worker closure constructs
+// ProvisionSuccessResult carries doProvision output into
+// Ready.OnEntryFrom(evProvisionCompleted) via Fire args. Every provision
+// is stack-shaped post-Task-15; StackManifest + ServiceContainers are
+// always populated. Exported because the substrate's provision worker
+// closure constructs
 // the value and returns it via the ProvisionRequestedMsg.Work signature.
 type ProvisionSuccessResult struct {
 	ContainerIDs      []string
-	Manifest          *manifest.Manifest
 	StackManifest     *manifest.StackManifest
 	ServiceContainers map[string][]string
 }
@@ -973,10 +969,7 @@ func DiagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
 // and stays stable across stack lifecycle events as long as the
 // ServiceContainers map is consistent.
 func ContainerLogKeys(prov *ProvisionState) map[string]string {
-	if prov == nil || !prov.IsStack() {
-		return nil
-	}
-	if len(prov.ServiceContainers) == 0 {
+	if prov == nil || len(prov.ServiceContainers) == 0 {
 		return nil
 	}
 	keys := make(map[string]string)

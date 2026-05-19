@@ -1,12 +1,23 @@
 # Fred Deployment Manifest Guide
 
-Fred accepts deployment manifests as JSON payloads that describe how containers should be provisioned. There are two formats: **single-service** manifests for standalone containers, and **stack** manifests for multi-service deployments.
+> **Deprecation notice (flat single-service manifest).**
+>
+> The flat single-service manifest format documented below is **deprecated** and remains supported only for backwards compatibility with leases that pre-date the stack-shape migration. **Prefer the stack manifest format** for all new deployments — it is the only format that supports multi-service compositions, per-service health checks, `depends_on` graphs, and the service-aware container/volume naming Fred now uses end-to-end.
+>
+> When Fred receives a flat manifest:
+>
+> - **At provision time:** the manifest is silently auto-wrapped into a 1-service stack under the synthetic service name `app`. The submitting tenant sees no behavioural difference except a `manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack` warning in operator logs.
+> - **At fred startup:** any pre-existing containers from leases provisioned under the legacy single-service execution path (Fred releases before this migration) are migrated in-place to the stack-shape naming convention. Migration is per-lease atomic and crash-resumable across most boundaries; see the CHANGELOG's *Recover-time migration troubleshooting* section for the one narrow non-resumable window and the operator remediation.
+>
+> The flat format will be removed in a future major release. Until then, both formats remain valid wire input.
+
+Fred accepts deployment manifests as JSON payloads that describe how containers should be provisioned. There are two formats: **single-service** manifests for standalone containers (**deprecated**), and **stack** manifests for multi-service deployments (**preferred**).
 
 ## Manifest Formats
 
-### Single-Service Manifest
+### Single-Service Manifest *(deprecated)*
 
-A flat JSON object with `image` as the only required field. Used when a lease has a single item with no `service_name`.
+A flat JSON object with `image` as the only required field. Used when a lease has a single item with no `service_name`. **Deprecated** — auto-wrapped into a 1-service stack named `app` at the wire boundary.
 
 ```json
 {

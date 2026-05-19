@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -180,6 +181,27 @@ func (s *ReleaseStore) ActivateLatest(leaseUUID string) error {
 			return fmt.Errorf("failed to marshal releases: %w", err)
 		}
 		return b.Put([]byte(leaseUUID), encoded)
+	})
+}
+
+// RecordMigration appends an "active" release entry for a recover-time
+// migration so the lease's release history captures the wrap-and-rename
+// step. Idempotent: if the most-recent active entry already carries the
+// same wrapped manifest bytes (byte-equal), the call is a no-op. This
+// lets the migration pipeline re-run on the next startup if it was
+// interrupted between rename and recover-loop completion without
+// inflating release history.
+//
+// Used exclusively by the docker backend's migrate.go (Task 9).
+func (s *ReleaseStore) RecordMigration(leaseUUID string, manifest []byte) error {
+	if latest, _ := s.LatestActive(leaseUUID); latest != nil && bytes.Equal(latest.Manifest, manifest) {
+		return nil
+	}
+	return s.Append(leaseUUID, Release{
+		Manifest:  manifest,
+		Image:     "stack",
+		Status:    "active",
+		CreatedAt: time.Now(),
 	})
 }
 

@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -27,6 +28,55 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		return err
 	}
 
+	// Recover-time migration pre-pass. Groups any legacy single-service
+	// containers by lease and produces a per-lease migration plan. Runs
+	// BEFORE the main recovery loop so all in-memory provision state
+	// observed by Update / Restart paths is post-migration consistent
+	// (per QA's Task 6 carry-over note: prov.Items mutation must not
+	// race ahead of prov.ServiceContainers population).
+	//
+	// Each plan is then executed atomically per lease by
+	// executeLegacyMigration in the loop below. Any per-lease
+	// failure aborts startup with operator-actionable guidance —
+	// fred refuses to run with half-migrated state because the
+	// stack-only downstream code can't drive a mixed cohort.
+	legacyPlans, planErr := b.planLegacyMigrations(ctx, containers)
+	if planErr != nil {
+		return fmt.Errorf("plan legacy migrations: %w", planErr)
+	}
+	for _, plan := range legacyPlans {
+		b.logger.Info("legacy lease migration planned",
+			"lease_uuid", plan.LeaseUUID,
+			"tenant", plan.Tenant,
+			"sku", plan.SKU,
+			"instances", len(plan.Instances),
+		)
+	}
+	if len(legacyPlans) > 0 {
+		// Execute each plan atomically per lease. Any per-lease failure
+		// aborts startup with operator-actionable guidance — fred refuses
+		// to run with half-migrated state because the stack-only code
+		// downstream can't drive a mixed cohort.
+		for _, plan := range legacyPlans {
+			if err := b.executeLegacyMigration(ctx, plan, b.logger); err != nil {
+				b.logger.Error("legacy migration failed; fred refuses to start with unmigrated legacy containers — "+
+					"investigate the failure cause and re-run fred (migration is idempotent), "+
+					"or deprovision the lease manually if data loss is acceptable",
+					"lease_uuid", plan.LeaseUUID, "error", err)
+				return fmt.Errorf("legacy migration failed: lease %s: %w", plan.LeaseUUID, err)
+			}
+		}
+		// Re-list managed containers: migration changed every container's
+		// name + label set, so the slice captured at the top of this
+		// function is stale and the main loop below would otherwise see
+		// the old names.
+		refreshed, err := b.docker.ListManagedContainers(ctx)
+		if err != nil {
+			return fmt.Errorf("re-list managed containers after migration: %w", err)
+		}
+		containers = refreshed
+	}
+
 	allocsByLease := make(map[string][]shared.ResourceAllocation)
 	recovered := make(map[string]*provision)
 	// firstExitedByLease[uuid] is the container ID of the first container we
@@ -41,6 +91,20 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// Skip containers without required labels
 		if c.LeaseUUID == "" || c.SKU == "" {
 			b.logger.Warn("skipping container with missing labels", "container_id", leasesm.ShortID(c.ContainerID))
+			continue
+		}
+
+		// Skip migration -prev remnants. These are legacy containers renamed
+		// by executeLegacyMigration's rollback window — they still carry the
+		// fred.lease_uuid + fred.managed labels but no fred.service_name, so
+		// without this guard the legacy-single-item branch below would
+		// process them as live leases (inflating prov.Quantity and appending
+		// a spurious LeaseItem{ServiceName:""}). The post-grace goroutine
+		// removes them, but recover can run inside the grace window or
+		// after an interrupted shutdown leaves orphans. isLegacyContainer
+		// (migrate.go) applies the same exclusion at planning time; this
+		// is the matching exclusion at recovery time.
+		if strings.HasSuffix(c.Name, "-prev") {
 			continue
 		}
 
@@ -64,7 +128,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Tenant:       c.Tenant,
 					ProviderUUID: c.ProviderUUID,
 					SKU:          c.SKU,
-					Image:        c.Image,
 					Status:       containerStatusToProvisionStatus(c.Status),
 					CreatedAt:    c.CreatedAt,
 					FailCount:    c.FailCount,
@@ -77,18 +140,20 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// restart/update work after a cold start (manifest is not stored
 			// in labels). Using LatestActive avoids picking up a failed
 			// release (e.g., a failed update to a newer image).
+			//
+			// ParsePayload always returns a *StackManifest (legacy flat
+			// payloads are auto-wrapped under DefaultServiceName). After
+			// Task 9's recover-time migration runs, every recovered
+			// provision is stack-form on disk, so the populated field is
+			// always prov.StackManifest.
 			if b.releaseStore != nil {
 				if rel, relErr := b.releaseStore.LatestActive(c.LeaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
-					// Use ParsePayload to auto-detect single vs stack manifest.
-					singleM, stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
-					switch {
-					case payloadErr != nil:
+					stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
+					if payloadErr != nil {
 						b.logger.Warn("failed to parse recovered manifest",
 							"lease_uuid", c.LeaseUUID, "error", payloadErr)
-					case stackM != nil:
+					} else {
 						prov.StackManifest = stackM
-					case singleM != nil:
-						prov.Manifest = singleM
 					}
 				}
 			}
@@ -443,19 +508,17 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 		return nil
 	}
 
-	// Build set of expected volume IDs from recovered provisions.
+	// Build set of expected volume IDs from recovered provisions. Volume
+	// IDs are always service-aware now (fred-{lease}-{service}-{idx});
+	// Task 9's recover-time migration renames any pre-existing legacy
+	// fred-{lease}-{idx} volumes onto this convention before the main
+	// loop sees them.
 	expected := make(map[string]bool)
 	b.provisionsMu.RLock()
 	for leaseUUID, prov := range b.provisions {
-		if prov.IsStack() {
-			for _, item := range prov.Items {
-				for i := range item.Quantity {
-					expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
-				}
-			}
-		} else {
-			for i := range prov.Quantity {
-				expected[fmt.Sprintf("fred-%s-%d", leaseUUID, i)] = true
+		for _, item := range prov.Items {
+			for i := range item.Quantity {
+				expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
 			}
 		}
 	}

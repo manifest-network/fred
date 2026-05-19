@@ -1573,76 +1573,6 @@ func TestNewHTTPClient_NegativeLimitsNormalized(t *testing.T) {
 	assert.Equal(t, DefaultMaxReleasesBytes, client.maxReleasesBytes)
 }
 
-func TestIsStack(t *testing.T) {
-	t.Run("empty items", func(t *testing.T) {
-		result, err := IsStack(nil)
-		require.NoError(t, err)
-		assert.False(t, result)
-
-		result, err = IsStack([]LeaseItem{})
-		require.NoError(t, err)
-		assert.False(t, result)
-	})
-
-	t.Run("all with ServiceName", func(t *testing.T) {
-		items := []LeaseItem{
-			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
-			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
-		}
-		result, err := IsStack(items)
-		require.NoError(t, err)
-		assert.True(t, result)
-	})
-
-	t.Run("none with ServiceName", func(t *testing.T) {
-		items := []LeaseItem{
-			{SKU: "docker-small", Quantity: 1},
-			{SKU: "docker-small", Quantity: 2},
-		}
-		result, err := IsStack(items)
-		require.NoError(t, err)
-		assert.False(t, result)
-	})
-
-	t.Run("single item with ServiceName", func(t *testing.T) {
-		items := []LeaseItem{
-			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
-		}
-		result, err := IsStack(items)
-		require.NoError(t, err)
-		assert.True(t, result)
-	})
-
-	t.Run("single item without ServiceName", func(t *testing.T) {
-		items := []LeaseItem{
-			{SKU: "docker-small", Quantity: 1},
-		}
-		result, err := IsStack(items)
-		require.NoError(t, err)
-		assert.False(t, result)
-	})
-
-	t.Run("mixed: first has, second doesn't", func(t *testing.T) {
-		items := []LeaseItem{
-			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
-			{SKU: "docker-small", Quantity: 1},
-		}
-		_, err := IsStack(items)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "mixed")
-	})
-
-	t.Run("mixed: first doesn't, second has", func(t *testing.T) {
-		items := []LeaseItem{
-			{SKU: "docker-small", Quantity: 1},
-			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
-		}
-		_, err := IsStack(items)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "mixed")
-	})
-}
-
 func TestRecordMetrics_NilCollectors(t *testing.T) {
 	t.Run("both nil — no panic", func(t *testing.T) {
 		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: "http://localhost"})
@@ -1709,4 +1639,114 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "get_info", "success")))
 		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "get_info", "error")))
 	})
+}
+
+// --- Boundary-normalization contract (Task 1, plan §Task 1.2) ---
+//
+// These tests lock the contract for NormalizeProvisionRequest, the entry-point
+// helper that converts legacy single-item-without-service_name requests into
+// the stack-shaped form expected by every downstream code path.
+//
+// Will compile/pass only after Task 3 adds NormalizeProvisionRequest; until
+// then they are the RED that proves the contract.
+
+func TestNormalizeProvisionRequest_AutoTagsSingleUnnamedItem(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: []LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+	}
+	if err := NormalizeProvisionRequest(&req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := req.Items[0].ServiceName; got != "app" {
+		t.Fatalf("expected service_name=app, got %q", got)
+	}
+}
+
+func TestNormalizeProvisionRequest_PreservesNamedItems(t *testing.T) {
+	req := ProvisionRequest{
+		Items: []LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		},
+	}
+	if err := NormalizeProvisionRequest(&req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Items[0].ServiceName != "web" || req.Items[1].ServiceName != "db" {
+		t.Fatalf("service_name modified unexpectedly: %+v", req.Items)
+	}
+}
+
+func TestNormalizeProvisionRequest_RejectsMixed(t *testing.T) {
+	req := ProvisionRequest{
+		Items: []LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1}, // missing
+		},
+	}
+	err := NormalizeProvisionRequest(&req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidManifest,
+		"mixed service_name presence must surface as ErrInvalidManifest (caller filtering depends on it)")
+}
+
+// TestNormalizeProvisionRequest_RejectsEmptyItems covers the
+// zero-items edge case: every provision must carry at least one
+// LeaseItem after normalization, so an empty Items slice must be
+// rejected at the boundary rather than allowed to silently produce
+// a no-op provision downstream.
+func TestNormalizeProvisionRequest_RejectsEmptyItems(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: nil,
+	}
+	err := NormalizeProvisionRequest(&req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrValidation,
+		"empty items must surface as ErrValidation (a structural request error, not a manifest shape error)")
+}
+
+// TestNormalizeProvisionRequest_RejectsNilRequest covers the
+// programmer-error case where a nil *ProvisionRequest is passed in.
+// Should return ErrValidation rather than panicking with nil deref.
+func TestNormalizeProvisionRequest_RejectsNilRequest(t *testing.T) {
+	err := NormalizeProvisionRequest(nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrValidation,
+		"nil request must surface as ErrValidation rather than panicking")
+}
+
+// TestNormalizeProvisionRequest_RejectsMultipleUnnamed covers the
+// case where the request claims to be "legacy form" (no service
+// names) but carries multiple items. The legacy single-service
+// contract structurally allows only ONE item per lease; multiple
+// unnamed items have no defined semantics — reject rather than
+// auto-tag them all with the same service name (which would create
+// a name collision).
+func TestNormalizeProvisionRequest_RejectsMultipleUnnamed(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: []LeaseItem{
+			{SKU: "docker-micro", Quantity: 1},
+			{SKU: "docker-micro", Quantity: 1},
+		},
+	}
+	err := NormalizeProvisionRequest(&req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidManifest,
+		"multiple unnamed items must surface as ErrInvalidManifest (structurally ambiguous wire shape)")
+}
+
+// TestNormalizeProvisionRequest_AcceptsSingleNamedItem locks in the
+// boundary case adjacent to AutoTags: a single explicitly-named item
+// passes through unchanged (no auto-tagging, no rejection).
+func TestNormalizeProvisionRequest_AcceptsSingleNamedItem(t *testing.T) {
+	req := ProvisionRequest{
+		LeaseUUID: "u", Tenant: "t",
+		Items: []LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "custom"}},
+	}
+	require.NoError(t, NormalizeProvisionRequest(&req))
+	require.Equal(t, "custom", req.Items[0].ServiceName,
+		"single explicitly-named item must pass through unchanged")
 }

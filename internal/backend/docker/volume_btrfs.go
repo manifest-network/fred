@@ -85,6 +85,25 @@ func (b *btrfsVolumeManager) List() ([]string, error) {
 	return listVolumeIDs(b.dataPath)
 }
 
+// RenameVolume renames a btrfs subvolume root via plain os.Rename. The
+// btrfs kernel module treats a subvolume root as a directory for rename
+// purposes — the underlying subvolume identity (subvol-id), data, and
+// qgroup attachment are preserved across the rename. No btrfs CLI call
+// is needed.
+func (b *btrfsVolumeManager) RenameVolume(oldName, newName string) error {
+	oldPath := filepath.Join(b.dataPath, oldName)
+	newPath := filepath.Join(b.dataPath, newName)
+	return atomicRenameVolumeDir(oldPath, newPath)
+}
+
+// HostPath returns the absolute path of the subvolume under the
+// configured data path. The subvolume may or may not exist; callers use
+// this to compute paths for not-yet-renamed or about-to-be-created
+// volumes.
+func (b *btrfsVolumeManager) HostPath(name string) string {
+	return filepath.Join(b.dataPath, name)
+}
+
 func (b *btrfsVolumeManager) Validate() error {
 	// Check btrfs binary exists
 	if _, err := exec.LookPath("btrfs"); err != nil {
