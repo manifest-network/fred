@@ -78,6 +78,50 @@ func TestRecoverState_MigrationFailure_AbortsStartup(t *testing.T) {
 	}
 }
 
+// TestPlanLegacyMigration_RejectsMultiServiceStack: a legacy-labeled
+// container whose release-store entry is stack-shaped with multiple
+// services is unproducible state (legacy writers only emitted flat
+// manifests). The planner must fail loudly rather than letting the
+// executor silently pick "app" and ignore the rest.
+func TestPlanLegacyMigration_RejectsMultiServiceStack(t *testing.T) {
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID: "legacy-cid",
+		LeaseUUID:   "lease-1",
+		SKU:         "docker-micro",
+	}}
+	fakeRelStore.releases["lease-1"] = []byte(
+		`{"services":{"app":{"image":"nginx:1.25"},"sidecar":{"image":"redis:7"}}}`)
+	fakeRelStore.Seed(t)
+
+	err := b.recoverState(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has 2 services")
+	assert.Contains(t, err.Error(), "lease-1")
+}
+
+// TestPlanLegacyMigration_RejectsWrongServiceName: a stack-shaped
+// release with a single service whose name is not the synthetic
+// "app" wrap-target is also unproducible state — the executor and
+// buildComposeProject downstream assume manifest.DefaultServiceName.
+func TestPlanLegacyMigration_RejectsWrongServiceName(t *testing.T) {
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID: "legacy-cid",
+		LeaseUUID:   "lease-1",
+		SKU:         "docker-micro",
+	}}
+	fakeRelStore.releases["lease-1"] = []byte(
+		`{"services":{"web":{"image":"nginx:1.25"}}}`)
+	fakeRelStore.Seed(t)
+
+	err := b.recoverState(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `with service "web"`)
+	assert.Contains(t, err.Error(), `expected "app"`)
+	assert.Contains(t, err.Error(), "lease-1")
+}
+
 // TestFilterManagedMounts_SeparatorBoundary verifies that the prefix
 // check uses a separator-terminated root so sibling directories whose
 // names happen to begin with the configured volume_data_path are NOT

@@ -161,6 +161,30 @@ func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID str
 		return nil, fmt.Errorf("parse stored manifest for lease %s: %w", leaseUUID, err)
 	}
 
+	// Defense-in-depth: a legacy lease's stored manifest must resolve to
+	// exactly one service named manifest.DefaultServiceName. ParsePayload
+	// auto-wraps flat input into {"app": ...}; a stack-shaped stored
+	// payload for a legacy-labeled container is unproducible state
+	// (legacy writers only ever emitted flat manifests, and post-Task-2
+	// stack writers emit either the same flat shape or a 1-service "app"
+	// wrap). Fail loudly at planning time so the failure stays adjacent
+	// to the release-store read — see the "manifest sourcing is fail-
+	// loud" rule in the package doc above.
+	if len(stack.Services) != 1 {
+		return nil, fmt.Errorf("release store for legacy lease %s has %d services; "+
+			"legacy leases must have exactly 1 (operator: investigate corrupted release-store "+
+			"entry or deprovision the lease)", leaseUUID, len(stack.Services))
+	}
+	if _, ok := stack.Services[manifest.DefaultServiceName]; !ok {
+		names := make([]string, 0, len(stack.Services))
+		for n := range stack.Services {
+			names = append(names, n)
+		}
+		return nil, fmt.Errorf("release store for legacy lease %s has stack-shaped manifest "+
+			"with service %q; expected %q (operator: this indicates corrupted release-store "+
+			"state — investigate or deprovision)", leaseUUID, names[0], manifest.DefaultServiceName)
+	}
+
 	instances := make([]legacyMigrationInstance, 0, len(group))
 	for _, c := range group {
 		// Mounts: prefer the inline list-containers value populated in
