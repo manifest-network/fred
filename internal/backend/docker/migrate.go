@@ -30,10 +30,11 @@
 //
 // The pre-pass invocation lives in recover.go and runs before the main
 // recovery loop, so all in-memory provision state observed by Update /
-// Restart paths is post-migration consistent. Until Task 9 ships an
-// execution implementation, the pre-pass plans and then aborts startup
-// with a clear error so unmigrated legacy state never reaches the
-// downstream Compose path that no longer understands it.
+// Restart paths is post-migration consistent. Each plan is then executed
+// atomically per lease by executeLegacyMigration; any per-lease failure
+// aborts startup with operator-actionable guidance so unmigrated legacy
+// state never reaches the downstream Compose path that no longer
+// understands it.
 
 package docker
 
