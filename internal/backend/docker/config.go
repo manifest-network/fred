@@ -18,6 +18,17 @@ import (
 type SKUProfile = shared.SKUProfile
 type TenantQuotaConfig = shared.TenantQuotaConfig
 
+// Recover-time migration defaults. Shared by [DefaultConfig] and the
+// `cmp.Or` guards in [Backend.executeLegacyMigration] so a deployment
+// that constructs a [Config] without going through [DefaultConfig] (or
+// supplies an explicit 0 via YAML) still gets a sane safety window
+// instead of an immediately-canceled context or instant `-prev`
+// removal.
+const (
+	defaultMigrationReadyTimeout = 90 * time.Second
+	defaultMigrationGracePeriod  = time.Minute
+)
+
 // Config holds the configuration for the Docker backend.
 type Config struct {
 	// LogLevel controls the log verbosity (debug, info, warn, error).
@@ -257,8 +268,8 @@ func DefaultConfig() Config {
 		DiagnosticsMaxAge:       7 * 24 * time.Hour,
 		ReleasesDBPath:          "releases.db",
 		ReleasesMaxAge:          90 * 24 * time.Hour,
-		MigrationGracePeriod:    time.Minute,
-		MigrationReadyTimeout:   90 * time.Second,
+		MigrationGracePeriod:    defaultMigrationGracePeriod,
+		MigrationReadyTimeout:   defaultMigrationReadyTimeout,
 		SKUProfiles: map[string]SKUProfile{
 			"docker-micro": {
 				CPUCores: 0.25,

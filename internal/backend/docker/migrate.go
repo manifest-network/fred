@@ -38,6 +38,7 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -402,7 +403,7 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	if err != nil {
 		return fmt.Errorf("resolve new container IDs: %w", err)
 	}
-	readyCtx, cancel := context.WithTimeout(ctx, b.cfg.MigrationReadyTimeout)
+	readyCtx, cancel := context.WithTimeout(ctx, cmp.Or(b.cfg.MigrationReadyTimeout, defaultMigrationReadyTimeout))
 	defer cancel()
 	if err := b.verifyStartup(readyCtx, svc, newIDs, logger); err != nil {
 		return fmt.Errorf("wait for ready: %w", err)
@@ -414,7 +415,7 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 		inst := inst
 		go func() {
 			select {
-			case <-time.After(b.cfg.MigrationGracePeriod):
+			case <-time.After(cmp.Or(b.cfg.MigrationGracePeriod, defaultMigrationGracePeriod)):
 			case <-ctx.Done():
 				return
 			}

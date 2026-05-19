@@ -570,6 +570,16 @@ func TestConfig_DefaultConfig_Validates(t *testing.T) {
 	require.NoError(t, cfg.Validate())
 }
 
+// TestConfig_DefaultConfig_MigrationDefaults locks in the single source of
+// truth shared by DefaultConfig and the cmp.Or fallbacks inside
+// executeLegacyMigration: changes to either side must update the const so the
+// configured default and the safety-net default never diverge.
+func TestConfig_DefaultConfig_MigrationDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.Equal(t, defaultMigrationReadyTimeout, cfg.MigrationReadyTimeout)
+	assert.Equal(t, defaultMigrationGracePeriod, cfg.MigrationGracePeriod)
+}
+
 func TestConfig_GetSKUProfile(t *testing.T) {
 	cfg := validConfig()
 
