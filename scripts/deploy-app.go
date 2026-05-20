@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -73,7 +74,7 @@ func main() {
 	flag.StringVar(&chainID, "chain-id", "manifest-ledger-beta", "chain ID")
 	flag.StringVar(&manifestd, "manifestd", os.ExpandEnv("$HOME/go/bin/manifestd"), "path to manifestd")
 	flag.StringVar(&fundAmount, "fund-amount", "1000000000factory/manifest1afk9zr2hn2jsac63h4hm60vl9z3e5u69gndzf7c99cqge3vzwjzsfmy9qj/upwr", "amount to fund tenant credit")
-	flag.BoolVar(&insecure, "insecure", true, "skip TLS verification for Fred")
+	flag.BoolVar(&insecure, "insecure", true, "skip TLS verification for Fred (default on for self-signed devnet/testnet certs; set false for production)")
 	flag.StringVar(&node, "node", "tcp://localhost:26657", "chain RPC endpoint")
 	flag.StringVar(&serviceName, "service-name", "", "optional service_name (RFC 1123 DNS label); required to attach custom domains")
 	flag.StringVar(&portsCSV, "ports", "8080/tcp", "comma-separated ports (e.g. '8080/tcp,9090/tcp')")
@@ -353,7 +354,7 @@ func createPayloadToken(kr keyring.Keyring, keyName, tenantAddr, leaseUUID, meta
 
 func uploadPayload(client *http.Client, fredURL, leaseUUID, token string, payload []byte) bool {
 	url := fmt.Sprintf("%s/v1/leases/%s/data", fredURL, leaseUUID)
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(payload)))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("failed to create request: %v", err)
 		return false
