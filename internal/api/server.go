@@ -72,26 +72,27 @@ type Server struct {
 
 // ServerConfig holds configuration for the API server.
 type ServerConfig struct {
-	Addr                 string
-	ProviderUUID         string
-	Bech32Prefix         string
-	TLSCertFile          string
-	TLSKeyFile           string
-	RateLimitRPS         float64
-	RateLimitBurst       int
-	TenantRateLimitRPS   float64  // Per-tenant rate limit (requests per second), 0 = disabled
-	TenantRateLimitBurst int      // Per-tenant burst limit
-	TrustedProxies       []string // CIDR blocks of trusted reverse proxies for X-Forwarded-For
-	CORSOrigins          []string // Allowed CORS origins (e.g. ["*"] for all). Empty or nil disables CORS middleware.
-	ReadTimeout          time.Duration
-	WriteTimeout         time.Duration
-	IdleTimeout          time.Duration
-	RequestTimeout       time.Duration // Timeout for individual request processing (default: 30s)
-	ShutdownTimeout      time.Duration // Timeout for graceful shutdown (default: 30s)
-	MaxRequestBodySize   int64
-	CallbackSecret       string // HMAC secret for callback authentication
-	TokenTrackerDBPath   string // Path to token tracker database (enables replay protection)
-	CallbackBaseURL      string // Base URL for backend callbacks (used by restart/update)
+	Addr                        string
+	ProviderUUID                string
+	Bech32Prefix                string
+	TLSCertFile                 string
+	TLSKeyFile                  string
+	RateLimitRPS                float64
+	RateLimitBurst              int
+	TenantRateLimitRPS          float64  // Per-tenant rate limit (requests per second), 0 = disabled
+	TenantRateLimitBurst        int      // Per-tenant burst limit
+	TrustedProxies              []string // CIDR blocks of trusted reverse proxies for X-Forwarded-For
+	CORSOrigins                 []string // Allowed CORS origins (e.g. ["*"] for all). Empty or nil disables CORS middleware.
+	ReadTimeout                 time.Duration
+	WriteTimeout                time.Duration
+	IdleTimeout                 time.Duration
+	RequestTimeout              time.Duration // Timeout for individual request processing (default: 30s)
+	ShutdownTimeout             time.Duration // Timeout for graceful shutdown (default: 30s)
+	MaxRequestBodySize          int64
+	CallbackSecret              string // HMAC secret for callback authentication
+	CallbackCanonicalPathPrefix string // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
+	TokenTrackerDBPath          string // Path to token tracker database (enables replay protection)
+	CallbackBaseURL             string // Base URL for backend callbacks (used by restart/update)
 }
 
 // ServerDeps holds the runtime dependencies for the API server.
@@ -181,6 +182,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create callback authenticator: %w", err)
 		}
+		callbackAuth = callbackAuth.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
 	}
 
 	// Create payload handler if publisher is provided

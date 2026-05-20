@@ -311,6 +311,16 @@ callback_base_url: "http://localhost:8080"
 # Must be at least 32 characters. Must match the secret configured in your backends.
 callback_secret: "your-secret-key-at-least-32-characters-long"
 
+# Path prefix prepended to inbound callback URIs before HMAC verification.
+# Set this when fred sits behind a path-stripping reverse proxy (e.g., Traefik
+# stripPrefix middleware mapping /api/fred/* → fred's bare /*). Must match the
+# prefix the proxy strips so signer (backend, full external URL) and verifier
+# (fred, post-strip URL) agree on the canonical URI.
+# Leave empty for direct-call deployments.
+# Validation: when set, must start with "/" and must not end with "/".
+# See docs/security-callback-auth.md.
+# callback_canonical_path_prefix: "/api/fred"
+
 # =============================================================================
 # PARALLEL SIGNING (optional — improves transaction throughput)
 # =============================================================================

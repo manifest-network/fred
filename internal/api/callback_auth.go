@@ -42,9 +42,15 @@ const (
 // not in CallbackPayload coming back. If signing large data becomes necessary,
 // consider writing to the HMAC incrementally to avoid copying the payload.
 type CallbackAuthenticator struct {
-	secret  string
-	maxAge  time.Duration
-	nowFunc func() time.Time // For testing; defaults to time.Now
+	secret string
+	maxAge time.Duration
+	// canonicalPathPrefix is prepended to r.URL.RequestURI() before HMAC
+	// verification. Set this when fred sits behind a path-stripping reverse
+	// proxy (e.g., Traefik stripPrefix) so the verifier's canonical URI
+	// matches what the signer used. Empty means no prepend — byte-identical
+	// to the pre-prefix behavior.
+	canonicalPathPrefix string
+	nowFunc             func() time.Time // For testing; defaults to time.Now
 }
 
 // validateCallbackSecret checks that the secret meets minimum length requirements.
@@ -67,6 +73,17 @@ func NewCallbackAuthenticator(secret string) (*CallbackAuthenticator, error) {
 		maxAge:  DefaultCallbackMaxAge,
 		nowFunc: time.Now,
 	}, nil
+}
+
+// WithCanonicalPathPrefix configures a static path prefix that is prepended to
+// r.URL.RequestURI() before HMAC verification. Set this when fred is deployed
+// behind a path-stripping reverse proxy (e.g., Traefik stripPrefix mapping
+// /api/fred/* → /*) so the verifier's canonical URI matches what the signer
+// used. Passing the empty string is a no-op and preserves the default direct-
+// call behavior. Returns the receiver for chaining.
+func (a *CallbackAuthenticator) WithCanonicalPathPrefix(prefix string) *CallbackAuthenticator {
+	a.canonicalPathPrefix = prefix
+	return a
 }
 
 // NewCallbackAuthenticatorWithMaxAge creates a callback authenticator with a custom max age.
@@ -149,7 +166,8 @@ func (a *CallbackAuthenticator) VerifyRequest(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
 
-	if err := a.verifySignatureWithError(r.Method, r.URL.RequestURI(), body, signature, a.now()); err != nil {
+	uri := a.canonicalPathPrefix + r.URL.RequestURI()
+	if err := a.verifySignatureWithError(r.Method, uri, body, signature, a.now()); err != nil {
 		return nil, err
 	}
 
