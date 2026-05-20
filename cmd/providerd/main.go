@@ -351,9 +351,10 @@ func run(cmd *cobra.Command, args []string) error {
 		IdleTimeout:          cfg.HTTPIdleTimeout,
 		ShutdownTimeout:      cfg.ShutdownTimeout,
 		MaxRequestBodySize:   cfg.MaxRequestBodySize,
-		CallbackSecret:       string(cfg.CallbackSecret),
-		TokenTrackerDBPath:   cfg.TokenTrackerDBPath,
-		CallbackBaseURL:      cfg.CallbackBaseURL,
+		CallbackSecret:              string(cfg.CallbackSecret),
+		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
+		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
+		CallbackBaseURL:             cfg.CallbackBaseURL,
 	}, api.ServerDeps{
 		ChainClient:       chainClient,
 		BackendRouter:     backendRouter,

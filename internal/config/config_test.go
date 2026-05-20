@@ -300,6 +300,94 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_CallbackCanonicalPathPrefix(t *testing.T) {
+	baseConfig := func() Config {
+		return Config{
+			ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+			ProviderAddress:           "manifest1abc",
+			KeyName:                   "provider",
+			KeyringDir:                "/home/provider/.manifest",
+			Bech32Prefix:              "manifest",
+			WithdrawInterval:          time.Hour,
+			RateLimitRPS:              10,
+			RateLimitBurst:            20,
+			GasLimit:                  500000,
+			GasPrice:                  25,
+			GasAdjustment:             1.2,
+			FeeDenom:                  "umfx",
+			HTTPReadTimeout:           15 * time.Second,
+			HTTPWriteTimeout:          15 * time.Second,
+			HTTPIdleTimeout:           60 * time.Second,
+			WebSocketPingInterval:     30 * time.Second,
+			TxPollInterval:            500 * time.Millisecond,
+			TxTimeout:                 30 * time.Second,
+			QueryPageLimit:            100,
+			MaxWithdrawIterations:     100,
+			WebSocketReconnectInitial: time.Second,
+			WebSocketReconnectMax:     60 * time.Second,
+			MaxRequestBodySize:        1 << 20,
+			CreditCheckErrorThreshold: 3,
+			CreditCheckRetryInterval:  30 * time.Second,
+			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://localhost:8080",
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+		}
+	}
+
+	tests := []struct {
+		name    string
+		prefix  string
+		wantErr string
+	}{
+		{
+			name:    "empty (default) is valid",
+			prefix:  "",
+			wantErr: "",
+		},
+		{
+			name:    "single-segment prefix is valid",
+			prefix:  "/api",
+			wantErr: "",
+		},
+		{
+			name:    "multi-segment prefix is valid",
+			prefix:  "/api/fred",
+			wantErr: "",
+		},
+		{
+			name:    "missing leading slash is rejected",
+			prefix:  "api/fred",
+			wantErr: "callback_canonical_path_prefix must start with \"/\"",
+		},
+		{
+			name:    "trailing slash is rejected",
+			prefix:  "/api/fred/",
+			wantErr: "callback_canonical_path_prefix must not end with \"/\"",
+		},
+		{
+			name:    "single slash is rejected (ends with slash)",
+			prefix:  "/",
+			wantErr: "callback_canonical_path_prefix must not end with \"/\"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.CallbackCanonicalPathPrefix = tt.prefix
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err, "Validate() = nil, want error containing %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestConfig_Validate_NumericFields(t *testing.T) {
 	baseConfig := func() Config {
 		return Config{

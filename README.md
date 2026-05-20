@@ -212,6 +212,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 - Backend URLs must be absolute `http://` or `https://` URLs with a host
 - `callback_base_url` must be an absolute `http://` or `https://` URL
 - Trailing slashes on `callback_base_url` are automatically stripped
+- `callback_canonical_path_prefix`, when set, must start with `/` and must not end with `/`
 
 ### Full Configuration Reference
 
@@ -244,6 +245,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `backends` | List of backend configurations | (required) |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
 | `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
+| `callback_canonical_path_prefix` | Path prefix prepended to inbound callback URIs before HMAC verification. Set this when fred is behind a path-stripping reverse proxy (e.g., Traefik `stripPrefix` mapping `/api/fred/*` → `/*`); must match the prefix the proxy strips. Leave empty for direct-call deployments. See [SECURITY.md](SECURITY.md) and [docs/security-callback-auth.md](docs/security-callback-auth.md). | `""` |
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |

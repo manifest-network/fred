@@ -704,6 +704,86 @@ func TestCallbackAuthenticator_RejectsCrossEndpointReplay(t *testing.T) {
 	})
 }
 
+// TestCallbackAuthenticator_VerifyRequest_CanonicalPathPrefix covers the
+// ENG-198 fix: when fred sits behind a path-stripping reverse proxy, the
+// signer (backend) sees the full external URL while the verifier (fred) only
+// sees the stripped path. The canonical-path-prefix config tells the verifier
+// what prefix to prepend so signer and verifier agree on the canonical URI.
+func TestCallbackAuthenticator_VerifyRequest_CanonicalPathPrefix(t *testing.T) {
+	const (
+		prefix     = "/api/fred"
+		strippedPath = "/callbacks/provision"
+	)
+	body := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
+
+	t.Run("signer used prefix + path, verifier configured with prefix → succeeds", func(t *testing.T) {
+		auth := newTestCallbackAuthenticator(t, testCallbackSecret).WithCanonicalPathPrefix(prefix)
+
+		// Signer (backend) computes the signature over the full external URI.
+		sig := auth.ComputeSignature(http.MethodPost, prefix+strippedPath, body)
+
+		// Verifier (fred) receives the stripped URI post-proxy.
+		req := httptest.NewRequest(http.MethodPost, strippedPath, bytes.NewReader(body))
+		req.Header.Set(CallbackSignatureHeader, sig)
+
+		got, err := auth.VerifyRequest(req)
+		require.NoError(t, err)
+		assert.Equal(t, body, got)
+	})
+
+	t.Run("signer used bare path, verifier configured with prefix → mismatch", func(t *testing.T) {
+		auth := newTestCallbackAuthenticator(t, testCallbackSecret).WithCanonicalPathPrefix(prefix)
+
+		// Signer used the bare (stripped) path — this is the pre-fix bug.
+		sig := auth.ComputeSignature(http.MethodPost, strippedPath, body)
+
+		req := httptest.NewRequest(http.MethodPost, strippedPath, bytes.NewReader(body))
+		req.Header.Set(CallbackSignatureHeader, sig)
+
+		_, err := auth.VerifyRequest(req)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mismatch")
+	})
+
+	t.Run("empty prefix is bit-for-bit backward compatible", func(t *testing.T) {
+		// Two authenticators with the same secret: one without ever touching the
+		// prefix API (today's behaviour), one with an explicit empty prefix.
+		// Both must verify the same signature.
+		auth1 := newTestCallbackAuthenticator(t, testCallbackSecret)
+		auth2 := newTestCallbackAuthenticator(t, testCallbackSecret).WithCanonicalPathPrefix("")
+
+		sig := auth1.ComputeSignature(http.MethodPost, strippedPath, body)
+
+		for name, auth := range map[string]*CallbackAuthenticator{
+			"untouched":      auth1,
+			"explicit-empty": auth2,
+		} {
+			t.Run(name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodPost, strippedPath, bytes.NewReader(body))
+				req.Header.Set(CallbackSignatureHeader, sig)
+
+				got, err := auth.VerifyRequest(req)
+				require.NoError(t, err)
+				assert.Equal(t, body, got)
+			})
+		}
+	})
+
+	t.Run("prefix prepends to RequestURI (path + query), not just path", func(t *testing.T) {
+		auth := newTestCallbackAuthenticator(t, testCallbackSecret).WithCanonicalPathPrefix(prefix)
+
+		const query = "?foo=bar&baz=qux"
+		sig := auth.ComputeSignature(http.MethodPost, prefix+strippedPath+query, body)
+
+		req := httptest.NewRequest(http.MethodPost, strippedPath+query, bytes.NewReader(body))
+		req.Header.Set(CallbackSignatureHeader, sig)
+
+		got, err := auth.VerifyRequest(req)
+		require.NoError(t, err)
+		assert.Equal(t, body, got)
+	})
+}
+
 // Example showing the signature format
 func ExampleCallbackAuthenticator_ComputeSignature() {
 	auth, err := NewCallbackAuthenticator("my-secret-key-at-least-32-characters")

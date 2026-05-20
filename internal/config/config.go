@@ -92,9 +92,10 @@ type Config struct {
 	CreditCheckRetryInterval  time.Duration `mapstructure:"credit_check_retry_interval"`
 
 	// Backend configuration
-	Backends        []BackendConfig `mapstructure:"backends"`
-	CallbackBaseURL string          `mapstructure:"callback_base_url"`
-	CallbackSecret  Secret          `mapstructure:"callback_secret"` // HMAC secret for callback authentication
+	Backends                    []BackendConfig `mapstructure:"backends"`
+	CallbackBaseURL             string          `mapstructure:"callback_base_url"`
+	CallbackSecret              Secret          `mapstructure:"callback_secret"`                // HMAC secret for callback authentication
+	CallbackCanonicalPathPrefix string          `mapstructure:"callback_canonical_path_prefix"` // Path prefix prepended to inbound URIs before HMAC verification (set when fred is behind a path-stripping reverse proxy)
 
 	// Parallel signing (authz sub-signers)
 	SubSignerCount             int           `mapstructure:"sub_signer_count"`               // 0 = single signer (default)
@@ -452,6 +453,18 @@ func (c *Config) Validate() error {
 	}
 	if len(c.CallbackSecret) < 32 {
 		return fmt.Errorf("callback_secret must be at least 32 characters")
+	}
+
+	// callback_canonical_path_prefix is optional; empty preserves direct-call behaviour.
+	// When set, it must start with "/" and must not end with "/" so that
+	// `prefix + r.URL.RequestURI()` always yields exactly one slash at the join.
+	if c.CallbackCanonicalPathPrefix != "" {
+		if !strings.HasPrefix(c.CallbackCanonicalPathPrefix, "/") {
+			return fmt.Errorf("callback_canonical_path_prefix must start with \"/\"")
+		}
+		if strings.HasSuffix(c.CallbackCanonicalPathPrefix, "/") {
+			return fmt.Errorf("callback_canonical_path_prefix must not end with \"/\"")
+		}
 	}
 
 	// Production mode security enforcement (runs after all basic validation)

@@ -89,9 +89,10 @@ type ServerConfig struct {
 	RequestTimeout       time.Duration // Timeout for individual request processing (default: 30s)
 	ShutdownTimeout      time.Duration // Timeout for graceful shutdown (default: 30s)
 	MaxRequestBodySize   int64
-	CallbackSecret       string // HMAC secret for callback authentication
-	TokenTrackerDBPath   string // Path to token tracker database (enables replay protection)
-	CallbackBaseURL      string // Base URL for backend callbacks (used by restart/update)
+	CallbackSecret              string // HMAC secret for callback authentication
+	CallbackCanonicalPathPrefix string // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
+	TokenTrackerDBPath          string // Path to token tracker database (enables replay protection)
+	CallbackBaseURL             string // Base URL for backend callbacks (used by restart/update)
 }
 
 // ServerDeps holds the runtime dependencies for the API server.
@@ -181,6 +182,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create callback authenticator: %w", err)
 		}
+		callbackAuth = callbackAuth.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
 	}
 
 	// Create payload handler if publisher is provided
