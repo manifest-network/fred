@@ -711,7 +711,7 @@ func TestCallbackAuthenticator_RejectsCrossEndpointReplay(t *testing.T) {
 // what prefix to prepend so signer and verifier agree on the canonical URI.
 func TestCallbackAuthenticator_VerifyRequest_CanonicalPathPrefix(t *testing.T) {
 	const (
-		prefix     = "/api/fred"
+		prefix       = "/api/fred"
 		strippedPath = "/callbacks/provision"
 	)
 	body := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
@@ -747,7 +747,7 @@ func TestCallbackAuthenticator_VerifyRequest_CanonicalPathPrefix(t *testing.T) {
 
 	t.Run("empty prefix is bit-for-bit backward compatible", func(t *testing.T) {
 		// Two authenticators with the same secret: one without ever touching the
-		// prefix API (today's behaviour), one with an explicit empty prefix.
+		// prefix API (today's behavior), one with an explicit empty prefix.
 		// Both must verify the same signature.
 		auth1 := newTestCallbackAuthenticator(t, testCallbackSecret)
 		auth2 := newTestCallbackAuthenticator(t, testCallbackSecret).WithCanonicalPathPrefix("")

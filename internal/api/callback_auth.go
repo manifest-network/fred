@@ -48,7 +48,7 @@ type CallbackAuthenticator struct {
 	// verification. Set this when fred sits behind a path-stripping reverse
 	// proxy (e.g., Traefik stripPrefix) so the verifier's canonical URI
 	// matches what the signer used. Empty means no prepend — byte-identical
-	// to the pre-prefix behaviour.
+	// to the pre-prefix behavior.
 	canonicalPathPrefix string
 	nowFunc             func() time.Time // For testing; defaults to time.Now
 }
@@ -80,7 +80,7 @@ func NewCallbackAuthenticator(secret string) (*CallbackAuthenticator, error) {
 // behind a path-stripping reverse proxy (e.g., Traefik stripPrefix mapping
 // /api/fred/* → /*) so the verifier's canonical URI matches what the signer
 // used. Passing the empty string is a no-op and preserves the default direct-
-// call behaviour. Returns the receiver for chaining.
+// call behavior. Returns the receiver for chaining.
 func (a *CallbackAuthenticator) WithCanonicalPathPrefix(prefix string) *CallbackAuthenticator {
 	a.canonicalPathPrefix = prefix
 	return a

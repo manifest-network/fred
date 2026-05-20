@@ -455,7 +455,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("callback_secret must be at least 32 characters")
 	}
 
-	// callback_canonical_path_prefix is optional; empty preserves direct-call behaviour.
+	// callback_canonical_path_prefix is optional; empty preserves direct-call behavior.
 	// When set, it must start with "/" and must not end with "/" so that
 	// `prefix + r.URL.RequestURI()` always yields exactly one slash at the join.
 	if c.CallbackCanonicalPathPrefix != "" {
