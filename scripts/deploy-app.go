@@ -1,15 +1,19 @@
 //go:build ignore
 
-// create-test-leases.go creates N leases on a local chain and uploads payloads to Fred.
+// deploy-app.go deploys a single container image to a given SKU: creates the
+// lease on-chain, builds a minimal manifest, and uploads it to Fred.
 //
 // Usage:
 //
-//	go run scripts/create-test-leases.go \
-//	  -n 10 \
-//	  -fred-url https://localhost:8080 \
+//	go run scripts/deploy-app.go \
+//	  -image docker.io/library/nginx:alpine \
 //	  -sku 019c9b96-7a19-7000-8986-6999995a0c88 \
-//	  -tenant-key user2 \
-//	  -keyring-dir ~/.manifest-billing
+//	  -fred-url https://fred.testnet.example \
+//	  -node https://primary.testnet.example/api/chain/rpc \
+//	  -chain-id manifest-ledger-beta
+//
+// On success the lease UUID is printed to stdout on its own line for easy
+// capture (everything else goes to stderr via log).
 package main
 
 import (
@@ -43,45 +47,50 @@ const blockWait = 7 * time.Second
 
 func main() {
 	var (
-		count        int
-		fredURL      string
-		skuUUID      string
-		tenantKey    string
-		fundFrom     string
-		keyringDir   string
-		chainID      string
-		manifestd    string
-		fundAmount   string
-		insecure     bool
-		node         string
-		serviceName  string
-		serviceNames string
+		image       string
+		skuUUID     string
+		fredURL     string
+		tenantKey   string
+		fundFrom    string
+		keyringDir  string
+		chainID     string
+		manifestd   string
+		fundAmount  string
+		insecure    bool
+		node        string
+		serviceName string
+		portsCSV    string
+		envCSV      string
+		skipFund    bool
 	)
 
-	flag.IntVar(&count, "n", 10, "number of leases to create")
-	flag.StringVar(&fredURL, "fred-url", "https://localhost:8080", "Fred API URL")
+	flag.StringVar(&image, "image", "", "container image to deploy (required)")
 	flag.StringVar(&skuUUID, "sku", "", "SKU UUID (required)")
+	flag.StringVar(&fredURL, "fred-url", "https://localhost:8080", "Fred API URL")
 	flag.StringVar(&tenantKey, "tenant-key", "user2", "tenant key name in keyring")
 	flag.StringVar(&fundFrom, "fund-from", "user1", "key to fund tenant credit from")
 	flag.StringVar(&keyringDir, "keyring-dir", os.ExpandEnv("$HOME/.manifest-billing"), "keyring directory")
 	flag.StringVar(&chainID, "chain-id", "manifest-ledger-beta", "chain ID")
 	flag.StringVar(&manifestd, "manifestd", os.ExpandEnv("$HOME/go/bin/manifestd"), "path to manifestd")
-	flag.StringVar(&fundAmount, "fund-amount", "1000000000factory/manifest1afk9zr2hn2jsac63h4hm60vl9z3e5u69gndzf7c99cqge3vzwjzsfmy9qj/upwr", "amount to fund tenant credit (default 1000 PWR)")
+	flag.StringVar(&fundAmount, "fund-amount", "1000000000factory/manifest1afk9zr2hn2jsac63h4hm60vl9z3e5u69gndzf7c99cqge3vzwjzsfmy9qj/upwr", "amount to fund tenant credit")
 	flag.BoolVar(&insecure, "insecure", true, "skip TLS verification for Fred")
-	flag.StringVar(&node, "node", "tcp://localhost:26657", "chain RPC endpoint (e.g. https://primary.example/api/chain/rpc)")
-	flag.StringVar(&serviceName, "service-name", "", "optional service_name (RFC 1123 DNS label) per LeaseItem; required to attach custom domains")
-	flag.StringVar(&serviceNames, "service-names", "", "comma-separated service entries for a stack lease. Each entry is 'name' or 'name=image' (e.g. 'web,api' or 'web=docker.io/library/nginx:alpine,api=docker.io/library/httpd:alpine'). Overrides --service-name and uses a stack manifest payload.")
+	flag.StringVar(&node, "node", "tcp://localhost:26657", "chain RPC endpoint")
+	flag.StringVar(&serviceName, "service-name", "", "optional service_name (RFC 1123 DNS label); required to attach custom domains")
+	flag.StringVar(&portsCSV, "ports", "8080/tcp", "comma-separated ports (e.g. '8080/tcp,9090/tcp')")
+	flag.StringVar(&envCSV, "env", "", "comma-separated KEY=VAL env vars")
+	flag.BoolVar(&skipFund, "skip-fund", false, "skip the tenant credit funding step")
 	flag.Parse()
 
+	if image == "" {
+		log.Fatal("--image is required")
+	}
 	if skuUUID == "" {
 		log.Fatal("--sku is required")
 	}
 
-	// Set bech32 prefix before any address operations
 	sdkConfig := sdk.GetConfig()
 	sdkConfig.SetBech32PrefixForAccount("manifest", "manifestpub")
 
-	// Open keyring and get tenant key
 	interfaceRegistry := codectypes.NewInterfaceRegistry()
 	cryptocodec.RegisterInterfaces(interfaceRegistry)
 	authtypes.RegisterInterfaces(interfaceRegistry)
@@ -91,12 +100,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open keyring: %v", err)
 	}
-
 	keyInfo, err := kr.Key(tenantKey)
 	if err != nil {
 		log.Fatalf("tenant key %q not found: %v", tenantKey, err)
 	}
-
 	tenantAddr, err := keyInfo.GetAddress()
 	if err != nil {
 		log.Fatalf("failed to get tenant address: %v", err)
@@ -122,124 +129,104 @@ func main() {
 		"--yes",
 	}
 
-	// Step 1: Fund tenant credit account
-	log.Printf("funding tenant credit account with %s...", fundAmount)
-	fundArgs := append([]string{"tx", "billing", "fund-credit",
-		tenantAddr.String(), fundAmount,
-		"--from", fundFrom,
-	}, txFlags...)
-	if out, err := runCmd(manifestd, fundArgs...); err != nil {
-		log.Printf("fund-credit failed (may already be funded): %s", truncate(out, 200))
-	} else {
-		log.Printf("fund-credit tx broadcast, waiting for block...")
-		waitForTx(manifestd, node, extractTxHash(out))
+	if !skipFund {
+		log.Printf("funding tenant credit account with %s...", fundAmount)
+		fundArgs := append([]string{"tx", "billing", "fund-credit",
+			tenantAddr.String(), fundAmount,
+			"--from", fundFrom,
+		}, txFlags...)
+		if out, err := runCmd(manifestd, fundArgs...); err != nil {
+			log.Printf("fund-credit failed (may already be funded): %s", truncate(out, 200))
+		} else {
+			log.Printf("fund-credit tx broadcast, waiting for block...")
+			waitForTx(manifestd, node, extractTxHash(out))
+		}
 	}
 
-	// Step 2: Create leases sequentially (each must wait for block inclusion)
-	log.Printf("creating %d leases...", count)
-	start := time.Now()
-	var created int
+	payload := buildManifest(image, portsCSV, envCSV)
+	hash := sha256.Sum256(payload)
+	metaHashHex := hex.EncodeToString(hash[:])
 
-	// Stack mode: split serviceNames into name[=image] entries. Empty slice =
-	// single-service mode. Default image is the existing demo container.
-	const defaultImage = "docker.io/lifted/demo-games:tetris"
-	type stackService struct{ Name, Image string }
-	var stackServices []stackService
-	if serviceNames != "" {
-		for _, raw := range strings.Split(serviceNames, ",") {
-			raw = strings.TrimSpace(raw)
-			if raw == "" {
+	itemArg := skuUUID + ":1"
+	if serviceName != "" {
+		itemArg = itemArg + ":" + serviceName
+	}
+
+	log.Printf("creating lease for sku %s (image %s)...", skuUUID, image)
+	createArgs := append([]string{"tx", "billing", "create-lease", itemArg,
+		"--meta-hash", metaHashHex,
+		"--from", tenantKey,
+	}, txFlags...)
+
+	var txHash string
+	for attempt := range 3 {
+		if attempt > 0 {
+			log.Printf("retrying create-lease (attempt %d)...", attempt+1)
+			time.Sleep(blockWait)
+		}
+		out, err := runCmd(manifestd, createArgs...)
+		if err != nil {
+			if strings.Contains(out, "account sequence mismatch") {
 				continue
 			}
-			name, image, hasImage := strings.Cut(raw, "=")
-			if !hasImage || image == "" {
-				image = defaultImage
-			}
-			stackServices = append(stackServices, stackService{Name: name, Image: image})
+			log.Fatalf("create-lease failed: %s", truncate(out, 400))
+		}
+		txHash = extractTxHash(out)
+		break
+	}
+	if txHash == "" {
+		log.Fatal("create-lease produced no tx hash")
+	}
+	log.Printf("tx broadcast: %s, waiting for block...", txHash)
+
+	leaseUUID := waitAndExtractLeaseUUID(manifestd, node, txHash)
+	if leaseUUID == "" {
+		log.Fatal("could not extract lease UUID from tx events")
+	}
+	log.Printf("lease: %s", leaseUUID)
+
+	token := createPayloadToken(kr, tenantKey, tenantAddr.String(), leaseUUID, metaHashHex)
+	if !uploadPayload(httpClient, fredURL, leaseUUID, token, payload) {
+		log.Fatal("payload upload failed")
+	}
+	log.Printf("deployed %s to lease %s", image, leaseUUID)
+	fmt.Println(leaseUUID)
+}
+
+func buildManifest(image, portsCSV, envCSV string) []byte {
+	ports := map[string]struct{}{}
+	for _, p := range strings.Split(portsCSV, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			ports[p] = struct{}{}
 		}
 	}
-
-	// Build the per-service docker manifest. The leaseIndex is interpolated
-	// into the env so re-runs of -n>1 each produce a distinguishable lease.
-	buildSvcManifest := func(image string, leaseIndex int) string {
-		return fmt.Sprintf(`{"image":%q,"ports":{"8080/tcp":{}},"env":{"LEASE_INDEX":"%d"},"tmpfs":["/var/cache/nginx","/var/run"]}`, image, leaseIndex)
-	}
-
-	for i := range count {
-		var payload []byte
-		var itemArgs []string
-		if len(stackServices) > 0 {
-			// Stack manifest: {"services": {"web": {...}, "api": {...}}}
-			services := make(map[string]json.RawMessage, len(stackServices))
-			for _, svc := range stackServices {
-				services[svc.Name] = json.RawMessage(buildSvcManifest(svc.Image, i))
-				itemArgs = append(itemArgs, fmt.Sprintf("%s:1:%s", skuUUID, svc.Name))
+	env := map[string]string{}
+	if envCSV != "" {
+		for _, kv := range strings.Split(envCSV, ",") {
+			kv = strings.TrimSpace(kv)
+			if kv == "" {
+				continue
 			}
-			payload, err = json.Marshal(map[string]any{"services": services})
-			if err != nil {
-				log.Fatalf("failed to marshal stack manifest: %v", err)
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok {
+				log.Fatalf("bad --env entry %q (expected KEY=VAL)", kv)
 			}
-		} else {
-			payload = []byte(buildSvcManifest(defaultImage, i))
-			itemArg := skuUUID + ":1"
-			if serviceName != "" {
-				itemArg = itemArg + ":" + serviceName
-			}
-			itemArgs = []string{itemArg}
-		}
-		hash := sha256.Sum256(payload)
-		metaHashHex := hex.EncodeToString(hash[:])
-
-		log.Printf("[%d/%d] creating lease (%d item(s))...", i+1, count, len(itemArgs))
-		createArgs := append([]string{"tx", "billing", "create-lease"}, itemArgs...)
-		createArgs = append(createArgs,
-			"--meta-hash", metaHashHex,
-			"--from", tenantKey,
-		)
-		createArgs = append(createArgs, txFlags...)
-
-		// Retry up to 3 times on sequence mismatch
-		var txHash string
-		for attempt := range 3 {
-			if attempt > 0 {
-				log.Printf("[%d/%d] retrying after sequence mismatch (attempt %d)...", i+1, count, attempt+1)
-				time.Sleep(blockWait)
-			}
-			out, err := runCmd(manifestd, createArgs...)
-			if err != nil {
-				if strings.Contains(out, "account sequence mismatch") {
-					continue // retry
-				}
-				log.Printf("[%d/%d] create-lease failed: %s", i+1, count, truncate(out, 200))
-				break
-			}
-			txHash = extractTxHash(out)
-			break
-		}
-
-		if txHash == "" {
-			log.Printf("[%d/%d] no tx hash, skipping", i+1, count)
-			continue
-		}
-		log.Printf("[%d/%d] tx broadcast: %s, waiting for block...", i+1, count, txHash)
-
-		// Wait for tx inclusion and extract lease UUID from events
-		leaseUUID := waitAndExtractLeaseUUID(manifestd, node, txHash)
-		if leaseUUID == "" {
-			log.Printf("[%d/%d] could not extract lease UUID", i+1, count)
-			continue
-		}
-		log.Printf("[%d/%d] lease: %s", i+1, count, leaseUUID)
-
-		// Step 3: Upload payload to Fred
-		token := createPayloadToken(kr, tenantKey, tenantAddr.String(), leaseUUID, metaHashHex)
-		if uploadPayload(httpClient, fredURL, leaseUUID, token, payload, i+1, count) {
-			created++
+			env[k] = v
 		}
 	}
-
-	elapsed := time.Since(start)
-	log.Printf("done: %d/%d leases created+uploaded in %s", created, count, elapsed)
+	m := map[string]any{
+		"image": image,
+		"ports": ports,
+	}
+	if len(env) > 0 {
+		m["env"] = env
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		log.Fatalf("failed to marshal manifest: %v", err)
+	}
+	return b
 }
 
 func runCmd(bin string, args ...string) (string, error) {
@@ -268,7 +255,6 @@ func waitForTx(manifestd, node, txHash string) {
 		time.Sleep(blockWait)
 		return
 	}
-	// Poll for tx inclusion
 	for range 10 {
 		time.Sleep(2 * time.Second)
 		out, err := runCmd(manifestd, "q", "tx", txHash, "--node", node, "--output", "json")
@@ -291,9 +277,6 @@ func waitAndExtractLeaseUUID(manifestd, node, txHash string) string {
 		if jsonStart < 0 {
 			continue
 		}
-
-		// Look for lease_uuid in the events
-		// Events contain key-value pairs like {"key":"lease_uuid","value":"..."}
 		type Event struct {
 			Type       string `json:"type"`
 			Attributes []struct {
@@ -316,8 +299,6 @@ func waitAndExtractLeaseUUID(manifestd, node, txHash string) string {
 			log.Printf("tx %s failed with code %d", txHash, resp.Code)
 			return ""
 		}
-
-		// Search events for lease_uuid
 		for _, evt := range resp.Events {
 			for _, attr := range evt.Attributes {
 				if attr.Key == "lease_uuid" {
@@ -325,7 +306,6 @@ func waitAndExtractLeaseUUID(manifestd, node, txHash string) string {
 				}
 			}
 		}
-		// Also check logs.events
 		for _, logEntry := range resp.Logs {
 			for _, evt := range logEntry.Events {
 				for _, attr := range evt.Attributes {
@@ -367,16 +347,15 @@ func createPayloadToken(kr keyring.Keyring, keyName, tenantAddr, leaseUUID, meta
 		"pub_key":    pubKeyB64,
 		"signature":  base64.StdEncoding.EncodeToString(sig),
 	}
-
 	jsonBytes, _ := json.Marshal(token)
 	return base64.StdEncoding.EncodeToString(jsonBytes)
 }
 
-func uploadPayload(client *http.Client, fredURL, leaseUUID, token string, payload []byte, idx, total int) bool {
+func uploadPayload(client *http.Client, fredURL, leaseUUID, token string, payload []byte) bool {
 	url := fmt.Sprintf("%s/v1/leases/%s/data", fredURL, leaseUUID)
 	req, err := http.NewRequest("POST", url, strings.NewReader(string(payload)))
 	if err != nil {
-		log.Printf("[%d/%d] failed to create request: %v", idx, total, err)
+		log.Printf("failed to create request: %v", err)
 		return false
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -384,17 +363,16 @@ func uploadPayload(client *http.Client, fredURL, leaseUUID, token string, payloa
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[%d/%d] upload failed: %v", idx, total, err)
+		log.Printf("upload failed: %v", err)
 		return false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		log.Printf("[%d/%d] payload uploaded for %s", idx, total, leaseUUID)
 		return true
 	}
-	log.Printf("[%d/%d] upload returned %d: %s", idx, total, resp.StatusCode, truncate(string(body), 200))
+	log.Printf("upload returned %d: %s", resp.StatusCode, truncate(string(body), 400))
 	return false
 }
 
