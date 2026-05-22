@@ -96,7 +96,7 @@ func main() {
 	flag.StringVar(&chainID, "chain-id", "manifest-ledger-beta", "chain ID")
 	flag.StringVar(&manifestd, "manifestd", os.ExpandEnv("$HOME/go/bin/manifestd"), "path to manifestd")
 	flag.StringVar(&fundAmount, "fund-amount", "1000000000factory/manifest1afk9zr2hn2jsac63h4hm60vl9z3e5u69gndzf7c99cqge3vzwjzsfmy9qj/upwr", "amount to fund tenant credit")
-	flag.BoolVar(&insecure, "insecure", true, "skip TLS verification for Fred (default on for self-signed devnet/testnet certs; set false for production)")
+	flag.BoolVar(&insecure, "insecure", true, "skip TLS verification for Fred and faucet HTTP calls (default on for self-signed devnet/testnet certs; set false for production)")
 	flag.StringVar(&node, "node", "tcp://localhost:26657", "chain RPC endpoint")
 	flag.StringVar(&serviceName, "service-name", "", "optional service_name (RFC 1123 DNS label); required to attach custom domains")
 	flag.StringVar(&portsCSV, "ports", "8080/tcp", "comma-separated ports (e.g. '8080/tcp,9090/tcp')")
@@ -225,9 +225,19 @@ func main() {
 			if strings.Contains(out, "account sequence mismatch") {
 				continue
 			}
-			log.Fatalf("create-lease failed: %s", truncate(out, 2000))
+			log.Fatalf("create-lease broadcast failed: %s", truncate(out, 2000))
 		}
-		txHash = extractTxHash(out)
+		h, code, rawLog, ok := extractTxResult(out)
+		if !ok {
+			log.Fatalf("create-lease returned unparseable response: %s", truncate(out, 2000))
+		}
+		if code != 0 {
+			if strings.Contains(rawLog, "account sequence mismatch") {
+				continue
+			}
+			log.Fatalf("create-lease rejected at broadcast (code %d): %s", code, truncate(rawLog, 1000))
+		}
+		txHash = h
 		break
 	}
 	if txHash == "" {
@@ -235,9 +245,9 @@ func main() {
 	}
 	log.Printf("tx broadcast: %s, waiting for block...", txHash)
 
-	leaseUUID := waitAndExtractLeaseUUID(manifestd, node, txHash)
-	if leaseUUID == "" {
-		log.Fatal("could not extract lease UUID from tx events")
+	leaseUUID, err := waitAndExtractLeaseUUID(manifestd, node, txHash)
+	if err != nil {
+		log.Fatalf("create-lease failed on-chain: %v", err)
 	}
 	log.Printf("lease: %s", leaseUUID)
 
@@ -336,9 +346,9 @@ func waitForTx(manifestd, node, txHash string) error {
 	return fmt.Errorf("timeout waiting for tx %s", txHash)
 }
 
-func waitAndExtractLeaseUUID(manifestd, node, txHash string) string {
+func waitAndExtractLeaseUUID(manifestd, node, txHash string) (string, error) {
 	if txHash == "" {
-		return ""
+		return "", fmt.Errorf("empty tx hash")
 	}
 	for range 10 {
 		time.Sleep(2 * time.Second)
@@ -357,6 +367,7 @@ func waitAndExtractLeaseUUID(manifestd, node, txHash string) string {
 		}
 		type TxResponse struct {
 			Code   int     `json:"code"`
+			RawLog string  `json:"raw_log"`
 			Events []Event `json:"events"`
 			Logs   []struct {
 				Events []Event `json:"events"`
@@ -367,13 +378,12 @@ func waitAndExtractLeaseUUID(manifestd, node, txHash string) string {
 			continue
 		}
 		if resp.Code != 0 {
-			log.Printf("tx %s failed with code %d", txHash, resp.Code)
-			return ""
+			return "", fmt.Errorf("tx %s on-chain code %d: %s", txHash, resp.Code, truncate(resp.RawLog, 1000))
 		}
 		for _, evt := range resp.Events {
 			for _, attr := range evt.Attributes {
 				if attr.Key == "lease_uuid" {
-					return attr.Value
+					return attr.Value, nil
 				}
 			}
 		}
@@ -381,13 +391,13 @@ func waitAndExtractLeaseUUID(manifestd, node, txHash string) string {
 			for _, evt := range logEntry.Events {
 				for _, attr := range evt.Attributes {
 					if attr.Key == "lease_uuid" {
-						return attr.Value
+						return attr.Value, nil
 					}
 				}
 			}
 		}
 	}
-	return ""
+	return "", fmt.Errorf("timeout waiting for lease_uuid event in tx %s", txHash)
 }
 
 func createPayloadToken(kr keyring.Keyring, keyName, tenantAddr, leaseUUID, metaHashHex string) string {
