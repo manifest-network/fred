@@ -196,6 +196,36 @@ func main() {
 		if !json.Valid(payload) {
 			log.Fatalf("manifest file %s is not valid JSON", manifestFile)
 		}
+		// TODO(ENG-202): support multi-service stack manifests by emitting one
+		// create-lease item per service. Until then, reject anything but a
+		// single-service stack to avoid wasted create-lease gas (Fred enforces
+		// a 1:1 manifest-service ↔ LeaseItem.ServiceName mapping at upload —
+		// see internal/backend/shared/manifest/manifest.go ValidateStackAgainstItems).
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &probe); err == nil {
+			if servicesRaw, isStack := probe["services"]; isStack {
+				var services map[string]json.RawMessage
+				if err := json.Unmarshal(servicesRaw, &services); err != nil {
+					log.Fatalf("manifest file %s has invalid services field: %v", manifestFile, err)
+				}
+				if len(services) == 0 {
+					log.Fatalf("manifest file %s has empty services map", manifestFile)
+				}
+				if len(services) > 1 {
+					log.Fatalf("manifest file %s has %d services; multi-service stacks not yet supported by this script (see ENG-202)", manifestFile, len(services))
+				}
+				var single string
+				for k := range services {
+					single = k
+				}
+				if serviceName == "" {
+					serviceName = single
+					log.Printf("auto-set -service-name to %q from stack manifest", single)
+				} else if serviceName != single {
+					log.Fatalf("-service-name %q does not match the manifest's single service %q", serviceName, single)
+				}
+			}
+		}
 		source = "manifest " + manifestFile
 	} else {
 		payload = buildManifest(image, portsCSV, envCSV)
