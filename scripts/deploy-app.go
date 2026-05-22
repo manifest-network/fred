@@ -101,7 +101,7 @@ func main() {
 	flag.StringVar(&serviceName, "service-name", "", "optional service_name (RFC 1123 DNS label); required to attach custom domains")
 	flag.StringVar(&portsCSV, "ports", "8080/tcp", "comma-separated ports (e.g. '8080/tcp,9090/tcp')")
 	flag.StringVar(&envCSV, "env", "", "comma-separated KEY=VAL env vars")
-	flag.StringVar(&manifestFile, "manifest-file", "", "path to a JSON manifest file (flat or stack shape); when set, -image/-ports/-env/-service-name are ignored")
+	flag.StringVar(&manifestFile, "manifest-file", "", "path to a JSON manifest file (flat or stack shape); when set, -image/-ports/-env are ignored (-service-name still applies to the on-chain lease item)")
 	flag.BoolVar(&skipFund, "skip-fund", false, "skip the tenant credit funding step")
 	flag.Parse()
 
@@ -418,7 +418,10 @@ func createPayloadToken(kr keyring.Keyring, keyName, tenantAddr, leaseUUID, meta
 		"pub_key":    pubKeyB64,
 		"signature":  base64.StdEncoding.EncodeToString(sig),
 	}
-	jsonBytes, _ := json.Marshal(token)
+	jsonBytes, err := json.Marshal(token)
+	if err != nil {
+		log.Fatalf("failed to marshal payload token: %v", err)
+	}
 	return base64.StdEncoding.EncodeToString(jsonBytes)
 }
 
@@ -438,12 +441,16 @@ func uploadPayload(client *http.Client, fredURL, leaseUUID, token string, payloa
 		return false
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return true
 	}
-	log.Printf("upload returned %d: %s", resp.StatusCode, truncate(string(body), 400))
+	if readErr != nil {
+		log.Printf("upload returned %d (response body read error: %v)", resp.StatusCode, readErr)
+	} else {
+		log.Printf("upload returned %d: %s", resp.StatusCode, truncate(string(body), 400))
+	}
 	return false
 }
 
@@ -456,7 +463,10 @@ func truncate(s string, n int) string {
 
 func dripFromFaucet(client *http.Client, faucetURL, address, denom string) error {
 	url := strings.TrimRight(faucetURL, "/") + "/credit"
-	body, _ := json.Marshal(map[string]string{"denom": denom, "address": address})
+	body, err := json.Marshal(map[string]string{"denom": denom, "address": address})
+	if err != nil {
+		return fmt.Errorf("marshal faucet request: %w", err)
+	}
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -467,9 +477,12 @@ func dripFromFaucet(client *http.Client, faucetURL, address, denom string) error
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
+	}
+	if readErr != nil {
+		return fmt.Errorf("faucet %d (response body read error: %w)", resp.StatusCode, readErr)
 	}
 	return fmt.Errorf("faucet %d: %s", resp.StatusCode, truncate(string(respBody), 200))
 }
