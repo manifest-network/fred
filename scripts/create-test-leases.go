@@ -1,3 +1,5 @@
+//go:build ignore
+
 // create-test-leases.go creates N leases on a local chain and uploads payloads to Fred.
 //
 // Usage:
@@ -11,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -372,7 +375,7 @@ func createPayloadToken(kr keyring.Keyring, keyName, tenantAddr, leaseUUID, meta
 
 func uploadPayload(client *http.Client, fredURL, leaseUUID, token string, payload []byte, idx, total int) bool {
 	url := fmt.Sprintf("%s/v1/leases/%s/data", fredURL, leaseUUID)
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(payload)))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("[%d/%d] failed to create request: %v", idx, total, err)
 		return false
