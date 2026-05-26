@@ -26,12 +26,6 @@ func (dockerSMMetrics) ActorCreated() {
 	leaseActorsCreatedTotal.Inc()
 }
 
-// FailingRaceSkipped records a Failing-entry race where prov.Status was
-// no longer Ready by the time the entry action ran (Restart preempted).
-func (dockerSMMetrics) FailingRaceSkipped() {
-	leaseFailingRaceSkippedTotal.Inc()
-}
-
 // WorkerPanic records a worker-goroutine panic recovered by the actor's
 // defer. workerType identifies the worker category
 // ("provision" / "replace" / "diag").

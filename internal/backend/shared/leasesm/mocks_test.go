@@ -87,7 +87,6 @@ type mockSMMetrics struct{}
 
 func (mockSMMetrics) SMTransition(_, _, _ string)   {}
 func (mockSMMetrics) ActorCreated()                 {}
-func (mockSMMetrics) FailingRaceSkipped()           {}
 func (mockSMMetrics) WorkerPanic(_ string)          {}
 func (mockSMMetrics) ActorPanic()                   {}
 func (mockSMMetrics) TerminalEventDropped(_ string) {}

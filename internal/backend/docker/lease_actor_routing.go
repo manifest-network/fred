@@ -116,9 +116,11 @@ const routeToLeaseRetryInterval = 10 * time.Millisecond
 // non-blocking read of ack after observing cancellation; if the actor
 // already committed, we honor its decision and skip the rollback.
 //
-// The caller is responsible for the rollback (removeProvision /
-// restartRollback / etc.) when accepted=false, since the compensating
-// action varies per site.
+// The caller is responsible for any compensating action (e.g.
+// removeProvision on the Provision path) when accepted=false. The
+// Restart/Update paths have nothing to compensate post-ENG-230 — they
+// no longer write prov.Status/CallbackURL before the ack — so they just
+// cancel the op context and return the error.
 func (b *Backend) ackOrAbort(ctx context.Context, ack <-chan error) (accepted bool, err error) {
 	select {
 	case ackErr := <-ack:

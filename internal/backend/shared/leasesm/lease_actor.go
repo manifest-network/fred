@@ -151,6 +151,10 @@ type RestartRequestedMsg struct {
 	Cancel context.CancelFunc
 	Work   func() ReplaceResult
 	Ack    chan error
+	// CallbackURL is applied to prov.CallbackURL by onEnterRestarting
+	// before the actor acks — the actor, not the HTTP prelude, is the
+	// sole writer of that field for the restart path (ENG-230).
+	CallbackURL string
 }
 
 func (RestartRequestedMsg) isLeaseMessage()         {}
@@ -166,6 +170,10 @@ type UpdateRequestedMsg struct {
 	Cancel context.CancelFunc
 	Work   func() ReplaceResult
 	Ack    chan error
+	// CallbackURL is applied to prov.CallbackURL by onEnterUpdating
+	// before the actor acks — the actor, not the HTTP prelude, is the
+	// sole writer of that field for the update path (ENG-230).
+	CallbackURL string
 }
 
 func (UpdateRequestedMsg) isLeaseMessage()         {}
@@ -554,14 +562,47 @@ func (a *LeaseActor) handleDiagGathered(result diagResult) {
 // Returns nil iff the SM is in wantState after Fire; otherwise returns
 // the Fire error (unhandled trigger) OR an errFireIgnored wrapping the
 // actual state (Ignore-returns-nil).
-func (a *LeaseActor) fireAndVerify(ev leaseEvent, wantState backend.ProvisionStatus) error {
-	if err := a.sm.Fire(a.cfg.StopCtx, ev); err != nil {
+func (a *LeaseActor) fireAndVerify(ev leaseEvent, wantState backend.ProvisionStatus, args ...any) error {
+	if err := a.sm.Fire(a.cfg.StopCtx, ev, args...); err != nil {
 		return err
 	}
 	if state := a.sm.State(); state != wantState {
 		return fmt.Errorf("%v not accepted by SM from state %v", ev, state)
 	}
 	return nil
+}
+
+// classifyReplaceReject maps a failed restart/update fireAndVerify into the
+// error the caller (Backend.Restart/Update → HTTP handler) should see.
+//
+// The safety basis for restart/update is NOT the HTTP prelude's fast-fail
+// (that is only a route-time precondition — the lease can change state
+// between routing and the actor dequeuing the message). It is that the
+// actor inbox is the ONLY path mutating prov.Status, processed serially on
+// the actor goroutine. So when fireAndVerify fails here, the SM is
+// authoritatively in some non-restartable state, and we classify by that
+// state rather than by parsing stateless's untyped unhandled-trigger error
+// string (which has no exported sentinel and could change across versions):
+//
+//   - State ∈ {Restarting, Updating, Deprovisioning, Provisioning} — the
+//     lease is busy. This is the concurrent-duplicate / lost-the-race case
+//     (e.g. two same-lease restarts: the loser arrives after the winner's
+//     onEnterRestarting). Wrap as backend.ErrInvalidState so the HTTP
+//     handler returns a clean 409 (not a 500). The duplicate is REJECTED
+//     here, not prevented earlier.
+//   - State ∈ {Ready, Failed} — restartable; a fireAndVerify failure is
+//     unexpected (defensive), so forward the raw error unchanged.
+//
+// NOTE: callers must NOT route the a.terminated early-return through this —
+// that path returns errActorTerminated (caller retries against a fresh
+// actor) and must stay distinct from a 409.
+func (a *LeaseActor) classifyReplaceReject(err error) error {
+	switch a.sm.State() {
+	case backend.ProvisionStatusReady, backend.ProvisionStatusFailed:
+		return err
+	default:
+		return fmt.Errorf("%w: lease not in a restartable state (%s)", backend.ErrInvalidState, a.sm.State())
+	}
 }
 
 // handleProvisionRequested transitions the SM into Provisioning (or from
@@ -691,11 +732,21 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	a.workCancel = msg.Cancel
-	if err := a.fireAndVerify(evRestartRequested, backend.ProvisionStatusRestarting); err != nil {
-		msg.Ack <- err
+	// onEnterRestarting writes Status=Restarting (+ CallbackURL) inside
+	// this Fire, before the ack — preserving the handler-publish contract.
+	if err := a.fireAndVerify(evRestartRequested, backend.ProvisionStatusRestarting,
+		replaceEntryArgs{CallbackURL: msg.CallbackURL}); err != nil {
+		// A concurrent same-lease restart that lost the race finds the SM
+		// already busy → classifyReplaceReject returns ErrInvalidState (409).
+		msg.Ack <- a.classifyReplaceReject(err)
 		return
 	}
+	// Set workCancel only AFTER a successful fire (ENG-230 §4): a rejected
+	// concurrent restart must not clobber the in-flight worker's cancel
+	// func, which onExitProvisioning uses on Deprovision-preempt. workCancel
+	// is consumed only by onExitProvisioning, which can run only after the
+	// state was entered (i.e. after a successful fire).
+	a.workCancel = msg.Cancel
 	msg.Ack <- nil
 	a.spawnReplaceWorker(msg.Work)
 }
@@ -705,11 +756,18 @@ func (a *LeaseActor) handleUpdateRequested(msg UpdateRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	a.workCancel = msg.Cancel
-	if err := a.fireAndVerify(evUpdateRequested, backend.ProvisionStatusUpdating); err != nil {
-		msg.Ack <- err
+	// onEnterUpdating writes Status=Updating (+ CallbackURL) inside this
+	// Fire, before the ack — preserving the handler-publish contract.
+	if err := a.fireAndVerify(evUpdateRequested, backend.ProvisionStatusUpdating,
+		replaceEntryArgs{CallbackURL: msg.CallbackURL}); err != nil {
+		// A concurrent same-lease update that lost the race finds the SM
+		// already busy → classifyReplaceReject returns ErrInvalidState (409).
+		msg.Ack <- a.classifyReplaceReject(err)
 		return
 	}
+	// Set workCancel only AFTER a successful fire (ENG-230 §4); see
+	// handleRestartRequested for the rationale.
+	a.workCancel = msg.Cancel
 	msg.Ack <- nil
 	a.spawnReplaceWorker(msg.Work)
 }

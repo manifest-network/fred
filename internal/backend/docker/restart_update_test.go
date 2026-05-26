@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -419,3 +420,173 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 
 // TestUpdate_ActiveProvisionsGauge verifies that the activeProvisions gauge
 // is adjusted correctly when an update image pull fails (preflight failure).
+
+// --- ENG-230: prelude no longer speculatively writes prov.Status/CallbackURL ---
+
+// TestRestart_RoutingFailureLeavesStatusUnchanged pins that the Restart
+// prelude performs NO speculative write of prov.Status / prov.CallbackURL:
+// when the handoff to the lease actor fails (here: backend shutting down,
+// so routeToLeaseBlocking fails fast), the lease must remain exactly as it
+// was. Pre-ENG-230 this invariant was upheld by restartRollback restoring
+// the fields; post-ENG-230 it holds because the prelude never wrote them.
+func TestRestart_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "lease-1",
+			Status:        backend.ProvisionStatusReady,
+			CallbackURL:   "old-cb",
+			StackManifest: &manifest.StackManifest{},
+		}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, provisions)
+	// Cancel stopCtx so routeToLeaseBlocking fails fast with "backend
+	// shutting down" before any actor work — exercising the routing-fail
+	// error path that previously triggered restartRollback.
+	b.stopCancel()
+
+	err := b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "new-cb",
+	})
+	require.Error(t, err)
+
+	b.provisionsMu.RLock()
+	status := b.provisions["lease-1"].Status
+	callbackURL := b.provisions["lease-1"].CallbackURL
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, status,
+		"routing failure must leave Status unchanged (no speculative write)")
+	assert.Equal(t, "old-cb", callbackURL,
+		"routing failure must leave CallbackURL unchanged (no speculative write)")
+}
+
+// blockingDiagGatherer pins a lease in Failing for the duration of a test by
+// blocking GatherDiagnostics until the diag context is cancelled — which
+// onExitFailing does on any transition out of Failing. Returning "" then lets
+// gatherDiagAsync's Canceled path suppress the diagGatheredMsg, so the lease
+// stays in Failing instead of racing to Failed.
+type blockingDiagGatherer struct{}
+
+func (blockingDiagGatherer) GatherDiagnostics(ctx context.Context, _ string, _ *leasesm.InstanceState) string {
+	<-ctx.Done()
+	return ""
+}
+
+// TestContainerDiedThenRestart_Succeeds is the ENG-230 §6.3(c) matrix case:
+// it proves the ContainerDied-races-Restart case is resolved by the actor's
+// serial message ordering, NOT by the (now-removed) onEnterFailing Status
+// recheck. A container death drives Ready→Failing (onEnterFailing runs to
+// completion: Status=Failing, FailCount=1); a subsequent restart then SUCCEEDS
+// via Failing.Permit(evRestartRequested) — Failing intentionally permits
+// restart retries — driving Failing→Restarting with onEnterRestarting writing
+// Status=Restarting and exactly one replace worker spawned. (Contrast with
+// §6.3(a)/(b): a restart from Restarting/Updating/Deprovisioning is rejected
+// 409; from Failing it succeeds.)
+func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			// Guard sees a terminally-exited container → Ready→Failing.
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+		},
+	}
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "lease-1",
+			Tenant:        "tenant-a",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   callbackServer.URL,
+			StackManifest: &manifest.StackManifest{},
+		}},
+	}
+	b := newBackendForTest(mock, provisions)
+	defer b.stopCancel()
+	// Inject the blocking gatherer BEFORE the actor is created (first
+	// routeToLease below) so the diag goroutine spawned by onEnterFailing
+	// can't fire diagGatheredMsg and flip Failing→Failed before the restart.
+	b.gatherer = blockingDiagGatherer{}
+
+	// 1) Container death: Ready→Failing, onEnterFailing runs to completion.
+	b.handleContainerDeath("c1")
+
+	b.provisionsMu.RLock()
+	statusAfterDeath := b.provisions["lease-1"].Status
+	failCount := b.provisions["lease-1"].FailCount
+	b.provisionsMu.RUnlock()
+	require.Equal(t, backend.ProvisionStatusFailing, statusAfterDeath,
+		"container death must drive the lease to Failing")
+	require.Equal(t, 1, failCount, "onEnterFailing must bump FailCount to 1")
+
+	// 2) Restart: route directly to the actor. (The b.Restart prelude
+	// fast-fails a Failing lease, but the SM permits Failing→Restarting —
+	// exactly the serial-ordering path this test exercises.)
+	var workerCount atomic.Int64
+	workerRelease := make(chan struct{})
+	ack := make(chan error, 1)
+	require.True(t, b.routeToLease("lease-1", leasesm.RestartRequestedMsg{
+		Cancel:      func() {},
+		CallbackURL: callbackServer.URL,
+		Work: func() leasesm.ReplaceResult {
+			workerCount.Add(1)
+			<-workerRelease
+			return leasesm.ReplaceResult{Success: leasesm.ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusFailed}}
+		},
+		Ack: ack,
+	}))
+
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "Failing→Restarting must be accepted by the SM (Permit, not Ignore)")
+	case <-time.After(2 * time.Second):
+		t.Fatal("no ack from handleRestartRequested")
+	}
+
+	b.provisionsMu.RLock()
+	statusAfterRestart := b.provisions["lease-1"].Status
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusRestarting, statusAfterRestart,
+		"restart from Failing must end in Restarting via serial ordering (no recheck)")
+	assert.Equal(t, backend.ProvisionStatusRestarting, b.actorFor("lease-1").State(),
+		"SM must be in Restarting with the replace worker spawned")
+
+	close(workerRelease) // let the worker complete so the actor can quiesce
+	require.Eventually(t, func() bool { return workerCount.Load() == 1 }, time.Second, 5*time.Millisecond,
+		"exactly one replace worker must be spawned")
+}
+
+// TestUpdate_RoutingFailureLeavesStatusUnchanged is the Update mirror of
+// TestRestart_RoutingFailureLeavesStatusUnchanged.
+func TestUpdate_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusReady,
+			SKU:         "docker-small",
+			CallbackURL: "old-cb",
+			Items:       []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, provisions)
+	b.stopCancel()
+
+	err := b.Update(context.Background(), backend.UpdateRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "new-cb",
+		Payload:     validManifestJSON("nginx:latest"),
+	})
+	require.Error(t, err)
+
+	b.provisionsMu.RLock()
+	status := b.provisions["lease-1"].Status
+	callbackURL := b.provisions["lease-1"].CallbackURL
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, status,
+		"routing failure must leave Status unchanged (no speculative write)")
+	assert.Equal(t, "old-cb", callbackURL,
+		"routing failure must leave CallbackURL unchanged (no speculative write)")
+}

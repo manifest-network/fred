@@ -13,67 +13,41 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
-// restartRollback undoes the synchronous Status/CallbackURL mutation that
-// Restart/Update made before handing off to the actor, and marks the
-// just-Append'd release "failed" with the supplied cause so the release
-// history records why the handoff did not complete. Called from every
-// send-refusal / ack-error / ctx-cancel branch in the three replace-
-// starting paths — the cause differentiates shutdown, caller ctx cancel,
-// and SM rejection.
-func (b *Backend) restartRollback(leaseUUID string, prevStatus backend.ProvisionStatus, prevCallbackURL string, cause error, logger *slog.Logger) {
-	b.provisionsMu.Lock()
-	if p, ok := b.provisions[leaseUUID]; ok {
-		p.Status = prevStatus
-		p.CallbackURL = prevCallbackURL
-	}
-	b.provisionsMu.Unlock()
-	if b.releaseStore != nil {
-		msg := "rollback"
-		if cause != nil {
-			msg = cause.Error()
-		}
-		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", msg); relErr != nil {
-			logger.Warn("failed to update release status during rollback", "error", relErr, "rollback_cause", msg)
-		}
-	}
-}
-
 // Restart restarts containers for a lease without changing the manifest.
 // State machine: Ready|Failed → Restarting → Ready|Failed
 //
-// ARCHITECTURAL SEAM — intentional. This function writes prov.Status to
-// Restarting synchronously under provisionsMu BEFORE routing to the
-// lease actor. Most Status writes live inside the actor's goroutine
-// (SM entry/exit actions and doDeprovision); Restart and Update are
-// the two places where a Status write happens outside the actor.
+// SEAM CLOSED (ENG-230). This prelude is read-only: it fast-fails on
+// ErrNotProvisioned / ErrInvalidState under provisionsMu, snapshots the
+// fields the worker needs, then does pure work (manifest marshal +
+// release-store Append). It performs NO write to prov.Status /
+// prov.CallbackURL — the lease actor's onEnterRestarting entry action is
+// the sole writer of those fields, firing inside handleRestartRequested
+// BEFORE the ack. Because Restart() returns only after observing that
+// ack, the "Restart() returns => prov.Status == Restarting" invariant
+// the HTTP handler's event-broker publish depends on (api/handlers.go:
+// RestartLease) is preserved without an off-actor write.
 //
-// Why the seam exists:
-//   - Fast-fail semantics: concurrent Restart calls (or a Restart racing
-//     a Container-died transition to Failing) get ErrInvalidState
-//     immediately under the mutex, not after an inbox round-trip.
-//   - The invariant "Restart() returns => prov.Status == Restarting"
-//     is depended on by the HTTP handler's event-broker publish
-//     (api/handlers.go: RestartLease). A caller observing the lease
-//     state after Restart() returns sees Restarting atomically.
+// The prelude's fast-fail is only a route-time precondition — it does NOT
+// guarantee the lease is still Ready/Failed when the actor dequeues the
+// message. The real serialization is the actor inbox (the only path that
+// mutates prov.Status). So a same-lease concurrent restart that passes the
+// route-time check but loses the race (the winner already ran
+// onEnterRestarting) is REJECTED by the actor, not prevented here:
+// handleRestartRequested's classifyReplaceReject returns ErrInvalidState
+// for the busy SM, which this function forwards and api/handlers.go maps
+// to a clean 409.
 //
-// Compensation: the narrow race between the SM guard's RLock-release
-// and onEnterFailing's Lock-acquire (a Restart can slip in during the
-// guard's 10s InspectContainer) is handled by an explicit Status
-// recheck in onEnterFailing (lease_sm.go) that bails on !Ready and
-// bumps lease_failing_race_skipped_total.
-//
-// To close the seam: move the Status write + SM fire into the actor's
-// handleRestartRequested, ensuring the actor writes Status BEFORE
-// acking so the contract above is preserved. Expected to eliminate
-// the recheck/metric but not the other edge-case rules (Failing.Permit
-// retries, Deprovisioning.Ignore, restored:false on Update preflight)
-// which exist for independent reasons. Don't refactor without an
-// operational trigger — the metric climbing in production, a new bug,
-// or a broader rewrite of the Restart/Update path.
+// Since no off-actor Status write remains, there is nothing to roll back
+// on a marshal / Append / routing / ack failure: the error paths just
+// return (the release-store Append is on a separate bbolt store; a
+// "deploying" record left behind on routing/ack failure is cosmetic —
+// recover.go skips non-active releases and deprovision deletes them).
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
 
-	// Synchronous phase: validate state and transition to Restarting
+	// Synchronous phase: read-only validation + field snapshot. No
+	// prov.Status / prov.CallbackURL write (ENG-230) — see the function
+	// doc comment.
 	b.provisionsMu.Lock()
 	prov, exists := b.provisions[req.LeaseUUID]
 	if !exists {
@@ -95,12 +69,11 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: no stored manifest for restart (pre-migration legacy lease?)", backend.ErrInvalidState)
 	}
+	// prevStatus is still consumed by the worker (doRestart →
+	// ReplaceResult.Failure.PrevStatus) to drive the activeProvisions
+	// gauge accurately. The Status/CallbackURL writes are now the actor's
+	// (onEnterRestarting), applying req.CallbackURL passed on the message.
 	prevStatus := prov.Status
-	prevCallbackURL := prov.CallbackURL
-	prov.Status = backend.ProvisionStatusRestarting
-	if req.CallbackURL != "" {
-		prov.CallbackURL = req.CallbackURL
-	}
 	stackManifest := prov.StackManifest
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
 	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
@@ -116,10 +89,6 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	if b.releaseStore != nil {
 		manifestBytes, marshalErr := json.Marshal(stackManifest)
 		if marshalErr != nil {
-			b.provisionsMu.Lock()
-			prov.Status = prevStatus
-			prov.CallbackURL = prevCallbackURL
-			b.provisionsMu.Unlock()
 			return fmt.Errorf("failed to marshal manifest for release: %w", marshalErr)
 		}
 		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
@@ -128,31 +97,26 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
-			b.provisionsMu.Lock()
-			prov.Status = prevStatus
-			prov.CallbackURL = prevCallbackURL
-			b.provisionsMu.Unlock()
 			return fmt.Errorf("failed to record release: %w", relErr)
 		}
 	}
 
-	// Hand off to the lease actor. Actor fires the Restarting
-	// transition, acks, and spawns the replace worker (tracked by
-	// workers barrier). See handleRestartRequested / spawnReplaceWorker.
+	// Hand off to the lease actor. The actor's onEnterRestarting writes
+	// Status=Restarting (+ CallbackURL) BEFORE acking, then spawns the
+	// replace worker (tracked by the workers barrier). See
+	// handleRestartRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
 		return b.doRestart(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: req.CallbackURL}); routeErr != nil {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
 		return routeErr
 	}
 	// See ackOrAbort's comment for the ctx-vs-ack race rationale.
 	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 		return err
 	}
 	return nil
@@ -500,17 +464,19 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *sl
 // Update deploys a new manifest for a lease, replacing containers.
 // State machine: Ready|Failed → Updating → Ready|Failed
 //
-// ARCHITECTURAL SEAM — see the extended comment on Backend.Restart for
-// the rationale. Like Restart, Update writes prov.Status to Updating
-// synchronously under provisionsMu BEFORE routing to the lease actor,
-// for fast-fail semantics and the "Update() returns => Status is
-// Updating" contract. Compensated by onEnterFailing's Status recheck
-// (lease_sm.go) + lease_failing_race_skipped_total metric. Don't
-// refactor without an operational trigger.
+// SEAM CLOSED (ENG-230) — see the extended comment on Backend.Restart.
+// Like Restart, the prelude is read-only: it fast-fails / validates
+// under provisionsMu, snapshots fields, then records the release. It
+// performs NO write to prov.Status / prov.CallbackURL — the actor's
+// onEnterUpdating entry action is the sole writer, firing inside
+// handleUpdateRequested BEFORE the ack, so the "Update() returns =>
+// Status is Updating" contract holds without an off-actor write. No
+// rollback is needed on any failure path (nothing on prov was mutated).
 func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
 
-	// Synchronous phase: validate state and new manifest
+	// Synchronous phase: read-only validation + field snapshot (no
+	// prov.Status / prov.CallbackURL write — ENG-230).
 	b.provisionsMu.Lock()
 	prov, exists := b.provisions[req.LeaseUUID]
 	if !exists {
@@ -582,12 +548,11 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		serviceContainers[k] = append([]string(nil), v...)
 	}
 	items := append([]backend.LeaseItem(nil), prov.Items...)
+	// prevStatus is still consumed by the worker (doUpdate →
+	// ReplaceResult.Failure.PrevStatus) for gauge accuracy. The
+	// Status/CallbackURL writes are now the actor's (onEnterUpdating),
+	// applying req.CallbackURL passed on the message.
 	prevStatus := prov.Status
-	prevCallbackURL := prov.CallbackURL
-	prov.Status = backend.ProvisionStatusUpdating
-	if req.CallbackURL != "" {
-		prov.CallbackURL = req.CallbackURL
-	}
 	b.provisionsMu.Unlock()
 
 	// Record release. Image:"stack" is the existing stack-path sentinel
@@ -601,30 +566,25 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}); relErr != nil {
-			b.provisionsMu.Lock()
-			prov.Status = prevStatus
-			prov.CallbackURL = prevCallbackURL
-			b.provisionsMu.Unlock()
 			return fmt.Errorf("failed to record release: %w", relErr)
 		}
 	}
 
-	// Hand off to the actor. See handleUpdateRequested /
-	// spawnReplaceWorker.
+	// Hand off to the actor. The actor's onEnterUpdating writes
+	// Status=Updating (+ CallbackURL) BEFORE acking. See
+	// handleUpdateRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
 		return b.doUpdate(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, prevStatus, logger)
 	}
 	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack}); routeErr != nil {
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: req.CallbackURL}); routeErr != nil {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, routeErr, logger)
 		return routeErr
 	}
 	// See ackOrAbort's comment for the ctx-vs-ack race rationale.
 	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 		opCancel()
-		b.restartRollback(req.LeaseUUID, prevStatus, prevCallbackURL, err, logger)
 		return err
 	}
 	return nil

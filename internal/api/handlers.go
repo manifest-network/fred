@@ -536,9 +536,10 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Publish "restarting" event after the backend accepts the request.
-	// This is safe: the backend transitions to Restarting synchronously and
-	// spawns the async work in a goroutine, so the completion callback cannot
-	// arrive before Restart() returns.
+	// This is safe: the lease actor writes prov.Status=Restarting before
+	// acking the request, so after Restart() returns the lease is already
+	// Restarting and the async work runs in a worker goroutine — the
+	// completion callback cannot arrive before Restart() returns.
 	if h.eventBroker != nil {
 		h.eventBroker.Publish(backend.LeaseStatusEvent{
 			LeaseUUID: leaseUUID,
@@ -600,9 +601,10 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Publish "updating" event after the backend accepts the request.
-	// This is safe: the backend transitions to Updating synchronously and
-	// spawns the async work in a goroutine, so the completion callback cannot
-	// arrive before Update() returns.
+	// This is safe: the lease actor writes prov.Status=Updating before
+	// acking the request, so after Update() returns the lease is already
+	// Updating and the async work runs in a worker goroutine — the
+	// completion callback cannot arrive before Update() returns.
 	if h.eventBroker != nil {
 		h.eventBroker.Publish(backend.LeaseStatusEvent{
 			LeaseUUID: leaseUUID,

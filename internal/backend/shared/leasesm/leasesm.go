@@ -178,23 +178,13 @@ type ProvisionState struct {
 // variables. The pattern:
 //
 //	var callbackURL string
-//	var raceSkipped bool
 //	cfg.ProvisionStore.UpdateFn(uuid, func(p *ProvisionState) {
-//	    if p.Status != backend.ProvisionStatusReady {
-//	        raceSkipped = true
-//	        return
-//	    }
-//	    p.Status = backend.ProvisionStatusFailing
-//	    p.FailCount++
-//	    p.LastError = errMsg
-//	    callbackURL = p.CallbackURL
+//	    p.Status = backend.ProvisionStatusReady
+//	    p.LastError = ""
+//	    callbackURL = p.CallbackURL // capture for post-Unlock use
 //	})
-//	if raceSkipped {
-//	    metrics.RaceSkipped.Inc()
-//	    return nil
-//	}
 //	// post-Unlock work uses the captured callbackURL
-//	cfg.SendCallbackFn(uuid, callbackURL, ...)
+//	cfg.SendCallbackFn(uuid, callbackURL, backend.CallbackStatusSuccess, "")
 //
 // Pick outer-capture for ALL UpdateFn call sites — mixing capture-style
 // and a hypothetical "UpdateFn returns values" extension is a
@@ -257,7 +247,6 @@ type LeaseProvisionStore interface {
 type SMMetrics interface {
 	SMTransition(source, dest, trigger string)
 	ActorCreated()
-	FailingRaceSkipped()
 	WorkerPanic(workerType string)
 	ActorPanic()
 	TerminalEventDropped(event string)

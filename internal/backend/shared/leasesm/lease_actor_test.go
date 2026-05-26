@@ -873,6 +873,312 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 		"doDeprovision must see the pre-published ContainerIDs published by the worker")
 }
 
+// TestRestartRequested_WritesStatusBeforeAck pins the ENG-230
+// handler-publish contract: the actor must write prov.Status=Restarting
+// (and apply the request's CallbackURL) BEFORE acking the
+// RestartRequestedMsg, so api/handlers.go can publish a "restarting"
+// event after Restart() returns and have it reflect already-committed
+// state. The Status/CallbackURL writes now live in onEnterRestarting
+// (the actor goroutine), not the HTTP prelude.
+func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-a",
+		Status:      backend.ProvisionStatusReady,
+		CallbackURL: "old-cb",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actor := newTestActor(t, "lease-1", testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+	})
+
+	// Block the worker so the lease stays in Restarting while we assert —
+	// otherwise the replace worker could flip it to Ready before we read.
+	workerRelease := make(chan struct{})
+	ack := make(chan error, 1)
+	require.True(t, actor.TryEnqueue(RestartRequestedMsg{
+		Cancel:      func() {},
+		CallbackURL: "new-cb",
+		Work: func() ReplaceResult {
+			<-workerRelease
+			return ReplaceResult{Success: ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusReady}}
+		},
+		Ack: ack,
+	}))
+
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "restart from Ready must be accepted by the SM")
+	case <-time.After(2 * time.Second):
+		t.Fatal("no ack received from handleRestartRequested")
+	}
+
+	prov, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
+		"actor must write Status=Restarting BEFORE acking (handler-publish contract)")
+	assert.Equal(t, "new-cb", prov.CallbackURL,
+		"actor must apply the message CallbackURL before acking")
+
+	close(workerRelease) // let the worker finish so the actor can quiesce
+}
+
+// TestUpdateRequested_WritesStatusBeforeAck is the Update mirror of
+// TestRestartRequested_WritesStatusBeforeAck.
+func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-a",
+		Status:      backend.ProvisionStatusReady,
+		CallbackURL: "old-cb",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actor := newTestActor(t, "lease-1", testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+	})
+
+	workerRelease := make(chan struct{})
+	ack := make(chan error, 1)
+	require.True(t, actor.TryEnqueue(UpdateRequestedMsg{
+		Cancel:      func() {},
+		CallbackURL: "new-cb",
+		Work: func() ReplaceResult {
+			<-workerRelease
+			return ReplaceResult{Success: ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusReady}}
+		},
+		Ack: ack,
+	}))
+
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "update from Ready must be accepted by the SM")
+	case <-time.After(2 * time.Second):
+		t.Fatal("no ack received from handleUpdateRequested")
+	}
+
+	prov, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusUpdating, prov.Status,
+		"actor must write Status=Updating BEFORE acking (handler-publish contract)")
+	assert.Equal(t, "new-cb", prov.CallbackURL,
+		"actor must apply the message CallbackURL before acking")
+
+	close(workerRelease)
+}
+
+// routeReplace enqueues the op-appropriate replace request ("restart" or
+// "update") onto the actor's inbox. Shared by the ENG-230 §6.3 matrix tests
+// so the restart and update paths are exercised by identical logic.
+func routeReplace(actor *LeaseActor, op, callbackURL string, cancelFn func(), work func() ReplaceResult, ack chan error) bool {
+	if op == "update" {
+		return actor.TryEnqueue(UpdateRequestedMsg{Cancel: cancelFn, CallbackURL: callbackURL, Work: work, Ack: ack})
+	}
+	return actor.TryEnqueue(RestartRequestedMsg{Cancel: cancelFn, CallbackURL: callbackURL, Work: work, Ack: ack})
+}
+
+// busyStateFor maps a replace op to the busy SM state its entry action sets.
+func busyStateFor(op string) backend.ProvisionStatus {
+	if op == "update" {
+		return backend.ProvisionStatusUpdating
+	}
+	return backend.ProvisionStatusRestarting
+}
+
+// runConcurrentReplaceRejectedTest is the ENG-230 §6.3(a) matrix case: with
+// one replace worker in flight (SM busy), a second same-lease replace request
+// that lost the TOCTOU race must (1) be rejected with backend.ErrInvalidState
+// (→ HTTP 409, not 500), (2) NOT spawn a second worker, and (3) NOT clobber
+// the in-flight worker's cancel func — proven by then routing a real
+// Deprovision that drives onExitProvisioning → workCancel and asserting the
+// FIRST request's cancel marker fired (func values aren't comparable, so we
+// prove identity via distinct side-effecting markers, not pointer equality).
+func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
+	t.Helper()
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady})
+
+	doDeprovision := func(ctx context.Context, leaseUUID string) error {
+		store.remove(leaseUUID)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actor := newTestActor(t, "lease-1", testActorOpts{
+		StopCtx:         ctx,
+		ProvisionStore:  store,
+		DoDeprovisionFn: doDeprovision,
+	})
+
+	var workerCount atomic.Int64
+	var firstCancelCalled, secondCancelCalled atomic.Bool
+	worker1Release := make(chan struct{})
+
+	// Request #1 wins: SM → busy, worker #1 spawned and blocks.
+	ack1 := make(chan error, 1)
+	require.True(t, routeReplace(actor, op, "",
+		func() { firstCancelCalled.Store(true) },
+		func() ReplaceResult {
+			workerCount.Add(1)
+			<-worker1Release
+			return ReplaceResult{Success: ReplaceSuccessResult{}}
+		},
+		ack1,
+	))
+	select {
+	case err := <-ack1:
+		require.NoError(t, err, "first %s must be accepted", op)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no ack from first %s", op)
+	}
+	require.Equal(t, busyStateFor(op), actor.State())
+
+	// Request #2 loses the race: SM already busy → rejected with 409.
+	ack2 := make(chan error, 1)
+	require.True(t, routeReplace(actor, op, "",
+		func() { secondCancelCalled.Store(true) },
+		func() ReplaceResult {
+			workerCount.Add(1)
+			return ReplaceResult{Success: ReplaceSuccessResult{}}
+		},
+		ack2,
+	))
+	select {
+	case err := <-ack2:
+		require.ErrorIs(t, err, backend.ErrInvalidState,
+			"second concurrent %s must be rejected with ErrInvalidState (→409)", op)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no ack from second %s", op)
+	}
+
+	// Deprovision preempts: onExitProvisioning cancels the in-flight worker
+	// (whose workCancel must still be request #1's) then waits for it.
+	reply := make(chan error, 1)
+	require.True(t, actor.TryEnqueue(DeprovisionMsg{Ctx: context.Background(), Reply: reply}))
+
+	require.Eventually(t, firstCancelCalled.Load, 1*time.Second, 5*time.Millisecond,
+		"onExitProvisioning must cancel the FIRST (in-flight) %s worker", op)
+	assert.False(t, secondCancelCalled.Load(),
+		"the rejected second %s must NOT have clobbered workCancel", op)
+
+	// Release worker #1 so waitForWorkers unblocks and the deprovision completes.
+	close(worker1Release)
+	select {
+	case err := <-reply:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("deprovision did not complete after the worker was released")
+	}
+
+	assert.Equal(t, int64(1), workerCount.Load(),
+		"exactly one %s worker must have been spawned (the rejected duplicate must not spawn one)", op)
+}
+
+func TestSecondConcurrentRestartRejected(t *testing.T) {
+	runConcurrentReplaceRejectedTest(t, "restart")
+}
+func TestSecondConcurrentUpdateRejected(t *testing.T) { runConcurrentReplaceRejectedTest(t, "update") }
+
+// runReplaceLosesToDeprovisionTest is the ENG-230 §6.3(b) matrix case: a
+// replace request arriving while the SM is already Deprovisioning (not the
+// exact duplicate of §6.3(a)) must also be rejected with ErrInvalidState
+// (→409) and spawn NO worker — proving classifyReplaceReject is general
+// across busy states, not duplicate-only.
+func runReplaceLosesToDeprovisionTest(t *testing.T, op string) {
+	t.Helper()
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady})
+
+	// No-spawn: drive the handlers synchronously. The default DoDeprovisionFn
+	// is a no-op that leaves the provision in place, so the SM stays in
+	// Deprovisioning with terminated=false (the partial-deprovision actor).
+	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	require.NoError(t, actor.handleDeprovision(context.Background()))
+	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
+		"test precondition: SM must be Deprovisioning")
+
+	var workerCount atomic.Int64
+	ack := make(chan error, 1)
+	work := func() ReplaceResult { workerCount.Add(1); return ReplaceResult{} }
+	if op == "update" {
+		actor.handleUpdateRequested(UpdateRequestedMsg{Cancel: func() {}, Work: work, Ack: ack})
+	} else {
+		actor.handleRestartRequested(RestartRequestedMsg{Cancel: func() {}, Work: work, Ack: ack})
+	}
+
+	select {
+	case err := <-ack:
+		require.ErrorIs(t, err, backend.ErrInvalidState,
+			"%s against a deprovisioning lease must be rejected with ErrInvalidState (→409)", op)
+	default:
+		t.Fatalf("handler did not ack the rejected %s", op)
+	}
+	assert.Equal(t, int64(0), workerCount.Load(),
+		"no %s worker may be spawned when the lease is deprovisioning", op)
+}
+
+func TestRestartLosesToDeprovision(t *testing.T) { runReplaceLosesToDeprovisionTest(t, "restart") }
+func TestUpdateLosesToDeprovision(t *testing.T)  { runReplaceLosesToDeprovisionTest(t, "update") }
+
+// runReplaceFromFailedSucceedsTest is the ENG-230 §6.3 case covering the
+// fresh-actor-init-in-Failed path that this change unmasks (the old off-actor
+// pre-write hid it by initializing the SM in Restarting). A replace from
+// Status=Failed must SUCCEED: SM → Restarting/Updating via the Failed Permits
+// (lease_sm.go:236-240), Status (+CallbackURL) written before the ack, exactly
+// one worker spawned.
+func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
+	t.Helper()
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID:   "lease-1",
+		Status:      backend.ProvisionStatusFailed,
+		CallbackURL: "old-cb",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actor := newTestActor(t, "lease-1", testActorOpts{StopCtx: ctx, ProvisionStore: store})
+
+	var workerCount atomic.Int64
+	workerRelease := make(chan struct{})
+	ack := make(chan error, 1)
+	require.True(t, routeReplace(actor, op, "new-cb",
+		func() {},
+		func() ReplaceResult {
+			workerCount.Add(1)
+			<-workerRelease
+			return ReplaceResult{Success: ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusFailed}}
+		},
+		ack,
+	))
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "%s from Failed must be accepted (fresh-actor-init-in-Failed path)", op)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no ack from %s-from-Failed", op)
+	}
+
+	prov, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, busyStateFor(op), prov.Status, "Status must be written before the ack")
+	assert.Equal(t, "new-cb", prov.CallbackURL, "CallbackURL must be applied by the entry action")
+
+	close(workerRelease) // let the worker finish so the actor can quiesce
+	require.Eventually(t, func() bool { return workerCount.Load() == 1 }, time.Second, 5*time.Millisecond,
+		"exactly one %s worker must be spawned", op)
+}
+
+func TestRestartFromFailed_Succeeds(t *testing.T) { runReplaceFromFailedSucceedsTest(t, "restart") }
+func TestUpdateFromFailed_Succeeds(t *testing.T)  { runReplaceFromFailedSucceedsTest(t, "update") }
+
 // countingMetrics implements SMMetrics with atomic counters so tests
 // can assert on metric calls without needing the docker prometheus
 // adapter. Useful for tests that verify panic-recovery hooks or other
@@ -882,7 +1188,6 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 type countingMetrics struct {
 	smTransition         atomic.Int64
 	actorCreated         atomic.Int64
-	failingRaceSkipped   atomic.Int64
 	workerPanic          atomic.Int64
 	actorPanic           atomic.Int64
 	terminalEventDropped atomic.Int64
@@ -892,7 +1197,6 @@ type countingMetrics struct {
 
 func (m *countingMetrics) SMTransition(_, _, _ string)   { m.smTransition.Add(1) }
 func (m *countingMetrics) ActorCreated()                 { m.actorCreated.Add(1) }
-func (m *countingMetrics) FailingRaceSkipped()           { m.failingRaceSkipped.Add(1) }
 func (m *countingMetrics) WorkerPanic(_ string)          { m.workerPanic.Add(1) }
 func (m *countingMetrics) ActorPanic()                   { m.actorPanic.Add(1) }
 func (m *countingMetrics) TerminalEventDropped(_ string) { m.terminalEventDropped.Add(1) }

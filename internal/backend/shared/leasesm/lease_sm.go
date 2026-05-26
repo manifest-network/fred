@@ -183,28 +183,35 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// evReplaceCompleted (full success), evReplaceRecovered (failure but
 	// lease ended up Ready via rollback / preflight-restored), or
 	// evReplaceFailed (ended up Failed).
+	//
+	// onEnterRestarting/onEnterUpdating are the SOLE writers of
+	// prov.Status (Restarting/Updating) + prov.CallbackURL for these
+	// paths post-ENG-230. They run inside Fire on the actor goroutine,
+	// before handleRestartRequested/handleUpdateRequested ack the
+	// request — preserving the "Restart()/Update() returns ⇒ Status is
+	// Restarting/Updating" contract the HTTP handler's event publish
+	// depends on. No Ignore(evRestartRequested/evUpdateRequested) guard
+	// is needed any more: with the off-actor prelude flip gone (and
+	// recover.go never resting a lease in Restarting/Updating), the SM
+	// always initializes in Ready/Failed, so the event is always a real
+	// Permit transition rather than a self-event into an already-matching
+	// state.
 	sm.Configure(backend.ProvisionStatusRestarting).
+		OnEntryFrom(evRestartRequested, lsm.onEnterRestarting).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
-		Ignore(evContainerDied).
-		// Ignore evRestartRequested: Backend.Restart's synchronous section
-		// sets prov.Status to Restarting BEFORE the msg reaches the actor,
-		// so newLeaseSM initializes the SM in Restarting. The event
-		// arrives to a state already matching the target — treat as a
-		// no-op rather than an unhandled trigger error. Same pattern
-		// as Provisioning.Ignore(evProvisionRequested).
-		Ignore(evRestartRequested)
+		Ignore(evContainerDied)
 	sm.Configure(backend.ProvisionStatusUpdating).
+		OnEntryFrom(evUpdateRequested, lsm.onEnterUpdating).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
-		Ignore(evContainerDied).
-		Ignore(evUpdateRequested) // See Restarting.Ignore comment above.
+		Ignore(evContainerDied)
 
 	// Ready entry actions: emit Success from a Provision or Replace success,
 	// or emit Failed-with-rollback-suffix from a Replace recovery. Status
@@ -327,44 +334,26 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
 
-	// Re-check Status under the write lock. Backend.Restart and
-	// Backend.Update flip prov.Status synchronously outside the actor
-	// before routing their message (restart_update.go), so a Restart
-	// can slip in between the SM guard's RLock-release (after the
-	// 10s InspectContainer) and this entry action's Lock-acquire.
-	// If Status is no longer Ready, skip all side effects — the operator
-	// has taken over, the queued restart/update message will drive the
-	// actual transition, and bumping FailCount / decrementing
-	// activeProvisions here would double-count.
-	//
-	// NOTE: the SM has already committed to Failing by the time this
-	// runs, so bailing here creates transient drift (SM=Failing,
-	// prov.Status=Restarting). The drift resolves on the next message —
-	// Failing.Permit(evRestartRequested/Update/Provision) moves the SM
-	// to the state prov.Status already reflects. Failing.Ignore on
-	// ContainerDied/DiagGathered prevents stray events from doing
-	// anything during the drift window.
-	var raceSkipped, applied bool
+	// No Status recheck needed (ENG-230). Off-actor Status writes for
+	// restart/update are eliminated — onEnterRestarting/onEnterUpdating
+	// now own those writes on the actor goroutine — so every write to
+	// prov.Status is actor-serial. A Ready→Failing entry therefore always
+	// observes Status == Ready: nothing off-actor can flip it between the
+	// SM guard's read and this entry action. The previous recheck +
+	// lease_failing_race_skipped_total metric defended against the
+	// off-actor prelude flip that no longer exists. The `exists` guard is
+	// kept (cheap nil-guard: UpdateFn returns false if the lease was
+	// removed); ActiveProvisionsDec is now unconditional on the applied
+	// path.
 	exists := lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		if p.Status != backend.ProvisionStatusReady {
-			raceSkipped = true
-			return
-		}
 		p.Status = backend.ProvisionStatusFailing
 		p.FailCount++
 		p.LastError = errMsgContainerExited
-		applied = true
 	})
 	if !exists {
 		return nil
 	}
-	if raceSkipped {
-		lsm.actor.cfg.Metrics.FailingRaceSkipped()
-		return nil
-	}
-	if applied {
-		lsm.actor.cfg.Metrics.ActiveProvisionsDec()
-	}
+	lsm.actor.cfg.Metrics.ActiveProvisionsDec()
 
 	// Spawn the async diag gather. Its context is derived from
 	// context.Background() with a bounded timeout — NOT from stopCtx —
@@ -382,6 +371,41 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	lsm.actor.cfg.WG.Go(func() {
 		defer lsm.actor.workers.Done()
 		lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
+	})
+	return nil
+}
+
+// onEnterRestarting / onEnterUpdating are the Ready|Failed|Failing →
+// Restarting|Updating entry actions. They are the SOLE writers of
+// prov.Status (Restarting/Updating) and prov.CallbackURL for the
+// restart/update paths (ENG-230). Fired synchronously inside
+// handleRestartRequested/handleUpdateRequested's fireAndVerify, BEFORE
+// the ack, so the "Restart()/Update() returns ⇒ Status is
+// Restarting/Updating" contract relied on by api/handlers.go holds.
+func (lsm *leaseSM) onEnterRestarting(ctx context.Context, args ...any) error {
+	return lsm.applyReplaceEntry(args, backend.ProvisionStatusRestarting)
+}
+
+func (lsm *leaseSM) onEnterUpdating(ctx context.Context, args ...any) error {
+	return lsm.applyReplaceEntry(args, backend.ProvisionStatusUpdating)
+}
+
+// applyReplaceEntry flips Status to the requested replace state and, when
+// the request carried a non-empty CallbackURL, applies it — all under one
+// UpdateFn critical section. No metric/log side effect inside the closure,
+// per the LeaseProvisionStore idempotence contract.
+func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus) error {
+	var callbackURL string
+	if len(args) > 0 {
+		if a, ok := args[0].(replaceEntryArgs); ok {
+			callbackURL = a.CallbackURL
+		}
+	}
+	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		p.Status = status
+		if callbackURL != "" {
+			p.CallbackURL = callbackURL
+		}
 	})
 	return nil
 }
@@ -736,6 +760,12 @@ type provisionErrorInfo struct {
 	lastError   string
 	logs        map[string]string
 }
+
+// replaceEntryArgs carries the new CallbackURL from a Restart/Update
+// request message into the onEnterRestarting / onEnterUpdating entry
+// actions via Fire args, so the actor (not the HTTP prelude) is the
+// sole writer of prov.CallbackURL for these paths.
+type replaceEntryArgs struct{ CallbackURL string }
 
 // ReplaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
 // success output into onEnterReadyFromReplace. The goroutine returns these;
