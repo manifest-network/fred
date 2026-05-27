@@ -572,3 +572,446 @@ rejects evRestart/UpdateRequested from busy states and correctly permits it from
   the `classifyReplaceReject` comment (QA-checked).
 - **C. CONFIRMED → remove.** Full removal of `lease_failing_race_skipped_total` + the
   `SMMetrics.FailingRaceSkipped` interface method; no out-of-Go references to the metric.
+
+---
+
+## 9. PR #93 review-fix addendum (Copilot findings 1–3) — design for the engineer
+
+Three valid Copilot comments on PR #93 (commit 3665df9). Architect designs (this section);
+engineer implements; QA re-verifies full gates + the red-first proof. Do NOT commit; owner
+integrates onto PR #93.
+
+### 9.1 Finding #1 — false rationale comment (lease_sm.go 193–198)
+The implemented comment says "*(and recover.go never resting a lease in
+Restarting/Updating)*". That is **factually wrong** (it echoes the architect's original §0
+claim, later corrected): recover.go **preserves** Restarting/Updating (recover.go:301–307,
+317–320) and only normalizes `Failing→Failed` (332). **Replace the comment block** with:
+```go
+// No Ignore(evRestartRequested/evUpdateRequested) guard is needed any more.
+// Those guards existed only because the off-actor prelude pre-wrote
+// prov.Status=Restarting/Updating, so newLeaseSM initialized a freshly-
+// created actor's SM directly in Restarting/Updating and the incoming
+// request event had to be Ignored as a self-event. With the prelude flip
+// gone, readProvisionStatus reads the lease's TRUE status (Ready/Failed)
+// and the event is a real Permit transition. recover.go can still leave a
+// lease at rest in Restarting/Updating (it PRESERVES those statuses; only
+// Failing is normalized to Failed) — but such a lease is unreachable by a
+// restart/update event: the prelude fast-fail is a ROUTE-TIME precondition
+// that refuses to route on a non-Ready/Failed lease. The one case where
+// evRestartRequested meets an already-Restarting SM is a concurrent
+// duplicate (handleRestartRequested TOCTOU), correctly rejected as an
+// invalid transition → ErrInvalidState (409); keeping Ignore would instead
+// no-op it and spawn a second worker. NOTE: this comment must NOT claim the
+// prelude guarantees processing-time state — it is only a route-time
+// precondition; the actor's serial inbox is what guarantees Status
+// consistency.
+```
+
+### 9.2 Finding #2 — activeProvisions gauge drift (under-count) — THE FIX
+**Bug:** in the container-death-before-queued-restart ordering, the gauge under-counts.
+Walk:
+1. `Ready→Failing` (`onEnterFailing`) → `ActiveProvisionsDec()` (−1).
+2. `Failing→Restarting` (`onEnterRestarting`) → no gauge change.
+3. `Restarting→Ready` (`onEnterReadyFromReplaceCompleted`) → re-Inc is gated on
+   `result.PrevStatus == Failed` (lease_sm.go:522). But `PrevStatus` was captured by the
+   **prelude** (route-time) as **Ready** in this ordering, so **no Inc** → the lease ends
+   `Ready` but the gauge stayed −1 → **drift**.
+
+**Root cause:** `PrevStatus` reflects the prelude's route-time view and is **stale** with
+respect to the intervening, actor-serial `Ready→Failing` Dec. The same staleness also means
+`onEnterReadyFromReplaceRecovered` (which today does **no** gauge op at all) under-counts a
+recovered-from-Failed/Failing lease.
+
+**Fix — make gauge accounting actor-authoritative, keyed on the TRUE pre-replace state:**
+
+(a) **Add an actor field** (lease_actor.go, near `workCancel`):
+```go
+// replaceWasActive records whether the lease was counted in activeProvisions
+// (i.e. Status==Ready) at the instant the replace transition began — captured
+// by onEnterRestarting/onEnterUpdating reading prov.Status BEFORE overwriting
+// it. The replace-outcome entry actions key the gauge on THIS (actor-observed,
+// serial) value instead of the prelude-captured PrevStatus, which is stale when
+// an intervening Ready→Failing already Dec'd the gauge (the death-before-queued-
+// restart ordering). Single-field handoff is safe: the SM allows at most one
+// in-flight replace at a time and the actor is serial, mirroring pendingDeathInfo.
+replaceWasActive bool
+```
+
+(b) **Capture it in `applyReplaceEntry`** (lease_sm.go ~397) — read `p.Status` BEFORE the
+overwrite, assign the actor field AFTER the closure (keep the closure side-effect-free):
+```go
+func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus) error {
+    var callbackURL string
+    if len(args) > 0 {
+        if a, ok := args[0].(replaceEntryArgs); ok {
+            callbackURL = a.CallbackURL
+        }
+    }
+    var wasActive bool
+    lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+        wasActive = p.Status == backend.ProvisionStatusReady // capture BEFORE overwrite
+        p.Status = status
+        if callbackURL != "" {
+            p.CallbackURL = callbackURL
+        }
+    })
+    lsm.actor.replaceWasActive = wasActive
+    return nil
+}
+```
+
+(c) **Key the three replace-outcome entry actions on `replaceWasActive`**, replacing the
+`PrevStatus` comparisons:
+- `onEnterReadyFromReplaceCompleted` (522): `incActive := !lsm.actor.replaceWasActive`
+  (computed OUTSIDE the UpdateFn closure — it's an actor field, not ProvisionState); drop
+  the `result.PrevStatus == Failed` check.
+- `onEnterReadyFromReplaceRecovered` (544–580): **add** `if !lsm.actor.replaceWasActive {
+  cfg.Metrics.ActiveProvisionsInc() }` after the UpdateFn (it currently does no gauge op).
+- `onEnterFailedFromReplace` (604): `decActive := lsm.actor.replaceWasActive`; drop the
+  `info.PrevStatus == Ready` check.
+
+Resulting symmetric invariant: **Inc on entering Ready iff the lease was NOT active at
+replace-start; Dec on entering Failed iff it WAS active.** Verified across ALL orderings the
+lead enumerated (gauge contribution of this lease, where the gauge counts **Status==Ready
+only** — see below):
+| ordering | path | net |
+|---|---|---|
+| restart-from-Ready, success | Ready(+1)→Restarting(wasActive=T, no-op)→Ready(!T⇒no Inc) | +1 ✓ |
+| restart-from-Ready, fail→Failed | Ready(+1)→Restarting(T)→Failed(T⇒Dec) | 0 ✓ |
+| restart-from-Failed, success | Failed(0)→Restarting(F)→Ready(!F⇒Inc) | +1 ✓ |
+| restart-from-Failed, fail→Failed | Failed(0)→Restarting(F)→Failed(F⇒no Dec) | 0 ✓ |
+| death-then-restart, success | Ready(+1)→Failing(Dec,0)→Restarting(F)→Ready(Inc) | +1 ✓ (was −1 drift) |
+| death-then-restart, fail→Failed | Ready(+1)→Failing(Dec,0)→Restarting(F)→Failed(no Dec) | 0 ✓ (no double-Dec) |
+| death-then-restart, recovered→Ready | Ready(+1)→Failing(Dec,0)→Restarting(F)→Ready-recovered(Inc) | +1 ✓ |
+| restart-then-death | Ready(+1)→Restarting(T); ContainerDied Ignored in Restarting | +1 ✓ |
+
+**Gauge definition + why the corrective Inc lands on →Ready:** the reconcile authority
+(`recover.go:362–380`) computes `activeProvisions.Set(readyCount)` counting **only
+`Status==Ready`** leases. So the gauge tracks "# Ready leases," and the corrective re-Inc for
+a death-then-restart fires on the `Restarting→Ready` transition (`onEnterReadyFromReplace*`),
+not on entry to Restarting/Updating. This matches `replaceWasActive` (captured = source was
+Ready). The periodic `Set` is also the **self-heal**: the drift is transient (corrected on
+the next reconcile tick), so this is a correctness fix, **not** corruption recovery.
+
+**Out of scope (do NOT add):** in the normal restart-from-Ready case the lease stays counted
+during `Restarting` (no Dec on `Ready→Restarting`), which transiently disagrees with the
+reconcile `Set` (which excludes `Restarting`). This is **pre-existing** behavior, unchanged
+by this fix, and self-heals via `Set`. Do **not** "fix" it by adding a Dec to
+`onEnterRestarting/Updating` — that is the big-rewrite the lead warned against and is not what
+Copilot flagged.
+
+**Scope note on `PrevStatus` (RESOLVED — owner ruled (a) FULL REMOVAL, this PR):** after (c),
+`PrevStatus`'s only two readers (lease_sm.go:522, :604) are gone, so the field is **write-only
+dead** (NOT "retained for diagnostics" — there is no diagnostic reader). The owner chose full
+removal this pass. **Remove `PrevStatus` end-to-end** via a compiler-guided cascade:
+  - the `PrevStatus` field on `ReplaceSuccessResult` and `ReplaceFailureInfo` (lease_sm.go);
+  - the `PrevStatus` field on `replaceContainersOp` and every populating site
+    (restart_update.go:142/160/232/251/613/631);
+  - the prelude `prevStatus := prov.Status` captures and the `doRestart`/`doUpdate` signature
+    params that thread it;
+  - the related doc comments (restart_update.go:73/174/552; lease_sm.go:777/787/790);
+  - any test sites that set `PrevStatus:` (incl. the §9.3 test — drop the field there; the
+    test no longer needs it since the gauge keys on `replaceWasActive`).
+Gauge correctness (`replaceWasActive`) is independent of this removal. Let the compiler drive
+the cascade (build will flag every site).
+
+### 9.3 Finding #3 — red-first test (restart_update_test.go ~537)
+The existing `ContainerDiedThenRestart_Succeeds` test's Work closure returns
+`ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusFailed}` — which **masks** the
+drift, because the old `PrevStatus==Failed` gate happens to Inc and balance the Dec.
+
+**Sequencing matters because `PrevStatus` is being removed this pass (owner ruling):**
+1. **Red step (against current code, field still present):** **remove** the masking
+   `PrevStatus: backend.ProvisionStatusFailed` from the Work result — do **NOT** replace it
+   with `PrevStatus: Ready` (the field is going away). With it absent, `result.PrevStatus`
+   is the zero value, the old gauge gate (`== Failed`) is false → no Inc → drift. Add:
+   capture `activeBefore := testutil.ToFloat64(activeProvisions)` at the top; after the
+   restart completes (release the blocked worker, await ack/terminal), assert
+   `testutil.ToFloat64(activeProvisions) == activeBefore` (net-zero: lease started Ready,
+   ends Ready). Optionally assert the intermediate value is `activeBefore-1` right after the
+   death. → **RED** (ends `activeBefore-1`). (Either omitting `PrevStatus` or setting it to
+   `Ready` is red here; omit it so the test already matches the post-removal struct shape.)
+2. **Green step:** after the §9.2 rekey + the PrevStatus full removal, the `PrevStatus` field
+   no longer exists on `ReplaceSuccessResult`, the Work result simply omits it, and the gauge
+   (now keyed on `replaceWasActive`) re-Incs on `Restarting→Ready` → assertion passes.
+Keep the existing success assertions (ack==nil, ends Restarting, exactly one worker via the
+atomic counter). The test must never reference `PrevStatus` in its final (green) form.
+
+### 9.4 Ordered tasks (engineer)
+1. **(red)** Apply the 9.3 test edit; confirm it FAILS on the gauge assertion for the right
+   reason (off-by-one under-count), success assertions still pass.
+2. lease_actor.go: add the `replaceWasActive` field (9.2a).
+3. lease_sm.go: capture in `applyReplaceEntry` (9.2b); rekey the three outcome actions
+   (9.2c); update `PrevStatus` doc comments (9.2 scope note); fix the 9.1 comment.
+   → 9.3 test now green.
+4. Re-run full gates: `go build ./...`, `go vet ./...`, `golangci-lint run ./...` (v2.8.0),
+   `go test ./internal/backend/shared/leasesm/... ./internal/backend/docker/... ./internal/api/...`,
+   `go test -race` on leasesm + docker. Watch for any existing test that over-asserted "no
+   Inc on recovered" (9.2c adds a correct Inc on recovered-from-non-active).
+
+### 9.5 Finding #1 secondary investigation — can a restart/update reach a RECOVERED Restarting/Updating lease? (RESULT: NO)
+**Question (lead):** if any path re-routes a restart/update to a lease that recovery left in
+`Restarting`/`Updating`, dropping `Ignore` turns an old silent no-op into a 409 — behavior
+change worth handling?
+
+**Investigated the actual code; answer: it cannot happen, and there is zero behavior change.**
+- `RestartRequestedMsg` / `UpdateRequestedMsg` are constructed in **exactly one place each** —
+  `Backend.Restart` (restart_update.go:113) and `Backend.Update` (restart_update.go:581) —
+  both **after** the prelude read-only fast-fail (`Status ∈ {Ready, Failed}`, else
+  `ErrInvalidState`). No other production code builds or routes these messages (grep-verified).
+- The **only** non-HTTP caller of restart is `ReconcileCustomDomain`
+  (reconcile_custom_domain.go:125), and it calls the **public `b.Restart`** — i.e. it goes
+  through the same prelude fast-fail. It does not bypass it.
+- The `reconcileLoop` / `containerEventLoop` (recover.go:471, 620) route **only**
+  `ContainerDiedMsg` — never restart/update.
+- Therefore a recovered lease at rest in `Restarting`/`Updating` (Status ∉ {Ready, Failed})
+  is **refused at the prelude** (`ErrInvalidState`→409) and `evRestartRequested`/`evUpdateRequested`
+  is **never fired into its SM**. It never reaches `classifyReplaceReject` and never reaches
+  the (now-deleted) `Ignore`.
+
+**Behavior-change assessment: NONE.** The prelude fast-fail **predates ENG-230** (it was
+always the first thing `Backend.Restart/Update` did). So a restart on a recovered-Restarting
+lease was a prelude 409 *before* this work and remains a prelude 409 after. The `Ignore`
+guards never covered this path — they only absorbed the *fresh-actor-init-in-Restarting*
+self-event caused by the prelude's **own** pre-write (which ENG-230 deletes). Dropping
+`Ignore` is therefore safe with no observable change for the recovered-rest case; the only
+path that now produces a 409 *via the actor* (`classifyReplaceReject`) is the concurrent
+TOCTOU duplicate, where the prelude legitimately saw `Ready`. This confirms the §9.1 comment
+and needs no extra handling.
+
+### 9.6 THIRD `prevStatus` reader (assessment) — `doRestart` preflight `Restored` (same staleness as #2)
+The engineer found a third reader the §9.2 cascade missed (grep case-sensitivity: lowercase
+`prevStatus`): **restart_update.go `doRestart`:143 → `Restored: prevStatus == ProvisionStatusReady`**.
+It drives the **restart preflight-failure** recovered-vs-failed choice (SKU-profile lookup
+fails *before any container is touched*): `Restored`→`evReplaceRecovered` (Ready) vs
+`!Restored`→`evReplaceFailed` (Failed). (The post-container-replace path at `:233` uses the
+real rollback result `restored`, NOT `prevStatus` — fine. `doUpdate` preflight is
+`Restored:false` unconditionally — see asymmetry below.)
+
+**(1) Is `Restored = replaceWasActive` correct, and does it fix the race? — CONFIRMED, for
+the restart-preflight branch only.** A preflight failure touches no containers, so the lease
+is left in exactly its replace-start state; "recovered to Ready" is correct iff its
+containers were running at replace-start, i.e. iff the SM source was `Ready` — which is
+exactly `replaceWasActive`:
+| source | containers at start | correct outcome | replaceWasActive | ✓ |
+|---|---|---|---|---|
+| Ready | running | recovered→Ready | true | ✓ |
+| Failed | dead | failed→Failed | false | ✓ |
+| Failing (death-then-restart) | just died | failed→Failed | false | ✓ **(the fix)** |
+Today, the death-then-restart+preflight-fail case captures `prevStatus=Ready` at the prelude
+(before the death) → `Restored=true` → lease wrongly ends **Ready with dead containers**.
+`replaceWasActive` (actor-observed source = `Failing`) → `false` → correctly **Failed**.
+**Scope caveat:** this equivalence holds for the **restart-preflight** branch. It does NOT
+generalize: the **post-replace** path must keep `result.Restored` (the real `rollbackViaCompose`
+result, not stale), and **`doUpdate` preflight must stay `Restored:false` unconditionally** —
+that is an intentional policy (an update that never pulled the new image did not achieve the
+desired state ⇒ Failed even from a Ready source), NOT a staleness bug. Do not "unify" update
+onto `replaceWasActive`.
+
+**(2) Severity — reachable but rare; transient/self-healing; bounded.** Reachable only with
+BOTH (a) a SKU profile removed/renamed in config between provision and restart (config drift)
+AND (b) the death-then-queued-restart ordering (death detected → `Failing` before the restart
+dequeues). Self-heal: confirmed — `reconcileLoop`→`recoverState` (every `ReconcileInterval`)
+reconciles in-memory Status against actual container state (Ready→actual when containers are
+dead, recover.go:223–226) and re-`Set`s the gauge (380); so the wrongly-`Ready` lease is
+corrected within one reconcile tick — same transient class as the #2 gauge drift. Note the
+**on-chain callback is `CallbackStatusFailed` in BOTH the recovered and failed paths**
+(lease_sm.go onEnterReadyFromReplaceRecovered / onEnterFailedFromReplace), so there is **no
+wrong on-chain success**; the symptom is a wrongly-`Ready` API status (+ gauge over-count) for
+≤ one `ReconcileInterval`. So: real bug, same root cause as #2, low severity, self-healing.
+
+**(3) Option-(a) protocol sketch (enables full `prevStatus` removal AND fixes the staleness).**
+Recommended minimal shape — thread the actor-observed flag as a `work` argument (no
+worker→actor-field read, no terminal-message protocol change, existing recovered/failed
+switch untouched):
+- `RestartRequestedMsg.Work` / `UpdateRequestedMsg.Work`: `func() ReplaceResult` →
+  `func(wasActive bool) ReplaceResult`.
+- `spawnReplaceWorker`: read `wasActive := a.replaceWasActive` **on the actor goroutine**
+  (before `a.cfg.WG.Go`), then call `work(wasActive)` inside the worker. (Actor owns the read;
+  worker receives a plain arg.)
+- `doRestart` preflight branch: `Restored: wasActive` (replaces `prevStatus == Ready`).
+- `doUpdate` preflight branch: keep `Restored: false` (ignores `wasActive` — preserve the
+  intentional update asymmetry).
+- `doReplaceContainers` post-replace path: unchanged (`Restored` = `rollbackViaCompose` result).
+- The actor's `spawnReplaceWorker` switch (`case result.Restored:` → recovered) is **unchanged** —
+  `result.Restored` now carries the correct value in every branch.
+- This removes the LAST `prevStatus` reader, so `prevStatus`/`PrevStatus` can be deleted
+  end-to-end (completing the owner's (a) full-removal) AND the death-then-restart+preflight
+  race is fixed in the same pass.
+- (Smaller-diff alternative if the owner prefers no signature change: have the switch in
+  `spawnReplaceWorker` compute the preflight branch as `result.Failure.Operation == "restart"
+  && a.replaceWasActive` when `!result.Failure.OldStopped`. Race-free via the write-before-spawn
+  happens-before, but reads an actor field from the worker — slightly less clean. Either works.)
+
+**Recommendation:** option **(a)** via the `work(wasActive)` arg. It is the *same* root cause
+as #2 (stale prelude `prevStatus`), the marginal cost is small (we already add
+`replaceWasActive`), and it both completes the clean full-removal and removes a latent
+wrong-`Ready` race. Severity is low/self-healing, so it is not urgent on its own — but since
+the full removal the owner chose **cannot complete without relocating this decision** anyway
+(it is the third reader), folding the fix in here is the coherent move. Option (b)
+partial-removal (keep `doRestart`'s local `prevStatus` for this one decision, honest comment)
+is viable if the owner wants to defer the protocol tweak — but it leaves the (self-healing)
+race in place and keeps one `prevStatus` reader.
+
+### 9.7 LOCKED DESIGN — owner ruled (a): relocate `doRestart`-preflight `Restored` to the actor + full `prevStatus` removal
+Owner approved option (a). This is the authoritative spec (supersedes the §9.6 sketch).
+Engineer implements via this spec + echo-back; do not deviate without re-gating.
+
+**Mechanism — a dedicated flag, NOT `OldStopped`.** `OldStopped=false` is true for BOTH
+restart-preflight (want `Restored = replaceWasActive`) AND update-preflight (must stay
+`Restored=false`), so it cannot drive the decision. Add a flag set by **exactly one site**
+(`doRestart`'s preflight branch); every other path leaves it false and is byte-for-byte
+unchanged.
+
+**Per-site changes (relocation):**
+1. `leasesm/lease_sm.go` `ReplaceResult` (currently `{CallbackErr, Err, Restored, Success,
+   Failure}`): **add** field
+   ```go
+   // RecoveredIfSourceActive, when true, tells the actor to derive the
+   // recovered-vs-failed outcome from LeaseActor.replaceWasActive (the
+   // actor-observed SM source) INSTEAD of Restored. Set ONLY by doRestart's
+   // preflight-failure branch (no container was touched, so "recovered to
+   // Ready" is correct iff the lease was Ready/running at replace-start —
+   // which the prelude's route-time prevStatus snapshot got wrong under the
+   // death-before-queued-restart ordering, ENG-230 PR#93 finding #6). Every
+   // other failure leaves this false: update-preflight stays Restored=false
+   // (intentional), post-replace keeps Restored=rollback result.
+   RecoveredIfSourceActive bool
+   ```
+2. `leasesm/lease_actor.go` `spawnReplaceWorker`: capture the actor field **on the actor
+   goroutine, before `a.cfg.WG.Go`**, and apply it in the existing switch (do NOT read
+   `a.replaceWasActive` inside the worker closure):
+   ```go
+   func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
+       wasActive := a.replaceWasActive // actor goroutine; happens-before the worker
+       a.workers.Add()
+       a.cfg.WG.Go(func() {
+           ...
+           result := work()
+           ... (success pre-publish unchanged) ...
+           recovered := result.Restored
+           if result.RecoveredIfSourceActive {
+               recovered = wasActive
+           }
+           switch {
+           case result.Err == nil:
+               terminalMsg = replaceCompletedMsg{result: result.Success}; event = "replace_completed"
+           case recovered:
+               terminalMsg = replaceRecoveredMsg{info: result.Failure}; event = "replace_recovered"
+           default:
+               terminalMsg = replaceFailedMsg{info: result.Failure}; event = "replace_failed"
+           }
+       })
+   }
+   ```
+   (The work-closure signature is **unchanged** — `func() ReplaceResult`. No message-protocol
+   change. The post-replace and update-preflight branches never set the flag, so `recovered`
+   == their existing `result.Restored` → provably unaffected.)
+3. `docker/restart_update.go` `doRestart` preflight branch (:140–150): drop
+   `Restored: prevStatus == backend.ProvisionStatusReady` (:143) and `PrevStatus: prevStatus`
+   (:145); **set `RecoveredIfSourceActive: true`** on the returned `ReplaceResult`. (`doRestart`
+   no longer needs `prevStatus` at all.)
+
+**Full `prevStatus`/`PrevStatus` removal map (owner-confirmed; do after the relocation so the
+compiler guides the cascade) — current PR#93 line refs:**
+- `docker/restart_update.go`: comment :72–73 and :554–555; captures `prevStatus := prov.Status`
+  at :79 (Restart) and :559 (Update); param passes at :113 and :582; `doRestart` (:130) and
+  `doUpdate` (:598) signature params; write-only stores at :145 (already gone via step 3),
+  :163, :235, :254, :617, :635; `replaceContainersOp.PrevStatus` field :177.
+- `leasesm/lease_sm.go`: `ReplaceSuccessResult.PrevStatus` (:816 + comment :811–815) and
+  `ReplaceFailureInfo.PrevStatus` (:832 + comment :830–831).
+- Remove every "route-time view / diagnostics / NOT the gauge key" comment that referenced
+  `PrevStatus`.
+- **Acceptance:** case-insensitive `grep -rin prevstatus internal/` → **ZERO**. (`replaceWasActive`
+  is the only remaining source-activeness signal; `RecoveredIfSourceActive` is the only flag.)
+- Note `doUpdate` preflight (:615 area) stays `Restored: false` (no flag, no `prevStatus`) —
+  unchanged behavior, just loses its write-only `PrevStatus` store.
+
+**Red-first test matrix (`leasesm` and/or `docker`; all 4 committed in final-protocol shape).**
+Set the SM source by seeding status (+ driving a real `ContainerDied` for the Failing case),
+route the request directly to the actor with a `Work` closure returning a **preflight**
+`ReplaceResult`, assert the terminal Status:
+| # | source | request | Work returns | assert | role |
+|---|---|---|---|---|---|
+| 1 | **Failing** (drive ContainerDied first) | restart | `{Err, RecoveredIfSourceActive:true, Failure:{Operation:"restart"}}` | lease **Failed** (not Ready) | **the latent bug** |
+| 2 | Ready | restart | `{Err, RecoveredIfSourceActive:true, Failure:{Operation:"restart"}}` | lease **Ready** (recovered) | guard |
+| 3 | Failed | restart | `{Err, RecoveredIfSourceActive:true, Failure:{Operation:"restart"}}` | lease **Failed** | guard |
+| 4 | Ready | update | `{Err, Restored:false, Failure:{Operation:"update"}}` (NO flag) | lease **Failed** | regression guard: update-preflight unaffected |
+
+- After relocation: actor maps `RecoveredIfSourceActive`→`wasActive` (= source was Ready):
+  case1 Failing→false→Failed ✓; case2 Ready→true→Ready ✓; case3 Failed→false→Failed ✓;
+  case4 no flag→`result.Restored`=false→Failed ✓.
+- **RED demonstration (case 1):** before wiring, reproduce today's behavior by having case-1's
+  Work return the CURRENT-protocol output `{Err, Restored:true, Failure:{Operation:"restart"}}`
+  (faithful to doRestart-preflight when the prelude captured `Ready` before the death) → the
+  current actor takes `case result.Restored:` → `evReplaceRecovered` → lease **Ready** → the
+  `assert Failed` **FAILS**. Then implement steps 1–3 and switch case-1's Work to the
+  final-protocol `RecoveredIfSourceActive:true` shape → **PASSES**. Engineer shows red→green.
+- Optional gauge tie-in on case 1: assert final `activeProvisions == activeBefore-1` (death
+  Dec'd; ends Failed so no re-Inc) — links #2 and #6.
+
+**Provably-unaffected check (state in the echo-back):** update-preflight (no flag → `recovered
+= result.Restored = false`) and post-replace-rollback (no flag → `recovered = result.Restored
+= rollbackViaCompose result`) both bypass the new branch entirely; only `doRestart` preflight
+sets the flag.
+
+**PRODUCER-side test (REQUIRED — lead's fidelity note).** Cases 1–4 use test-supplied `Work`
+closures, so they verify only the ACTOR's *consumption* of the flag — a regression where
+`doRestart` stops *setting* it would still pass them. Add a fifth, producer-side test:
+- `TestDoRestartPreflight_SetsRecoveredIfSourceActive` (docker pkg): invoke the **real**
+  `doRestart` (or `b.Restart` driving it) with a SKU profile that `GetSKUProfile` cannot
+  resolve (config drift) so the preflight branch fires; assert the returned `ReplaceResult`
+  has `RecoveredIfSourceActive == true`, `Err != nil`, and does NOT derive `Restored` from any
+  status. This pins the producer half so the two halves (doRestart SETS the flag ↔ actor MAPS
+  it to `wasActive`) are independently regression-guarded.
+
+### 9.8 DECIDING FACTOR for descope — is `doRestart:143` staleness NEW (ENG-230 regression) or PRE-EXISTING?
+**DETERMINATION: PRE-EXISTING. Confirms the lead's analysis. The pre-ENG-230 recheck-bail
+NEVER prevented the wrong-Ready-on-preflight-fail outcome — answer to the pointed question is
+NO.** Therefore :143 + full removal is a clean, defer-able follow-up; only the #2 gauge
+under-count is a genuine ENG-230 regression (already fixed in core).
+
+The two are independent axes:
+- The `onEnterFailing` recheck governed the **gauge/FailCount** axis only: it `raceSkipped`ed
+  (no `Dec`, no `FailCount++`) when a concurrent off-actor Restart had flipped `Status` off
+  `Ready`. Removing it made `onEnterFailing` `Dec` unconditionally → the #2 under-count. **#2
+  is genuinely new.** ✓ (lead's point 1).
+- `doRestart:143` `Restored = prevStatus==Ready` reads the **prelude-captured `prevStatus`
+  snapshot**, computed in `doRestart` entirely **independent** of the recheck. The recheck
+  lives in the death path (`onEnterFailing`); it never gated the restart message, which is a
+  separate inbox message that proceeds to `doRestart` regardless.
+
+**Both-eras trace of the triggering window** (death races a Ready-lease restart; preflight
+then fails). The window that triggers :143 is: *the restart prelude reads `Status==Ready`
+(so `prevStatus=Ready`) before `onEnterFailing` flips it.* (If the death fully completes to
+`Failing` first, the prelude fast-fails `ErrInvalidState` — Failing ∉ {Ready,Failed} — and
+`doRestart` never runs; that bound is identical in both eras and is not the bug.)
+
+- **PRE-ENG-230:** prelude reads `Ready` → `prevStatus=Ready`, writes `Status=Restarting`
+  off-actor, routes the restart (Work carries `prevStatus=Ready`). The container dies; the
+  death's `onEnterFailing`, when it runs, reads `Status==Restarting` (the prelude wrote it) →
+  **recheck BAILS** (no `Dec`/`FailCount++`). The restart proceeds anyway → `doRestart`
+  preflight fails → `Restored = prevStatus(Ready) == Ready = true` → `evReplaceRecovered` →
+  **lease ends Ready with dead containers.** The bail prevented the gauge double-count, **not**
+  the wrong-Ready.
+- **POST-ENG-230 (pre-#6-fix):** prelude reads `Ready` → `prevStatus=Ready`, routes (no
+  off-actor write). Death dequeued first → `Ready→Failing` (`onEnterFailing` `Dec`s, no
+  recheck) → restart dequeued → `Failing→Restarting` → `doRestart` preflight fails →
+  `Restored = prevStatus(Ready) == Ready = true` → `evReplaceRecovered` → **lease ends Ready
+  with dead containers.**
+
+**Identical :143 result in both eras.** ENG-230 changed the *intermediate SM path*
+(bail-and-stay-`Restarting` vs `Failing`-then-`Restarting`) and the *gauge/FailCount* bookkeeping
+(the new #2 axis) — but the `prevStatus`-snapshot fed to `:143`, and the resulting
+recovered→wrong-Ready outcome, are unchanged. The recheck-bail operated on a different field
+(`Status`/`FailCount`/gauge) and at a different site (`onEnterFailing`); it had no causal path
+to the `doRestart` `Restored` decision. So it never prevented the wrong-Ready.
+
+**Recommendation for the owner:** DESCOPE-SAFE. Shipping the green core now (with #1 doc + #2
+gauge fix + their tests) and deferring `:143` relocation + full `prevStatus` removal (§9.7) as
+a clean follow-up does **not** ship a new ENG-230 regression — `:143` is a pre-existing,
+rare, self-healing (reconcile re-detects within one `ReconcileInterval`), no-wrong-on-chain-
+success bug (callback is `Failed` in both recovered/failed paths, §9.6). Caveat to record in
+the follow-up: until §9.7 lands, the now-write-only `prevStatus` field remains (the §9.6
+"write-only dead" comment must say so honestly — NOT "diagnostics"), and `grep prevstatus`
+will be non-zero by design until the follow-up.

@@ -285,6 +285,17 @@ type LeaseActor struct {
 	// handleUpdateRequested, and called by Provisioning/Restarting/
 	// Updating.OnExit on DeprovisionRequested preemption.
 	workCancel context.CancelFunc
+	// replaceWasActive records whether the lease was counted in
+	// activeProvisions (i.e. Status == Ready) at the instant a restart/update
+	// transition began — captured by onEnterRestarting/onEnterUpdating reading
+	// prov.Status BEFORE overwriting it. The replace-outcome entry actions key
+	// the activeProvisions gauge on THIS actor-observed (serial) value instead
+	// of a prelude-captured route-time status snapshot, which is stale when an
+	// intervening Ready→Failing already Dec'd the gauge (the death-before-queued-restart
+	// ordering, ENG-230 / PR#93 finding #2). Single-field handoff is safe: the
+	// SM permits at most one in-flight replace at a time and the actor is
+	// serial — same discipline as pendingDeathInfo.
+	replaceWasActive bool
 	// workers tracks every worker goroutine spawned by this actor
 	// (provision, restart, update, diag). The actor's run-loop exit path
 	// waits on workers.Zero() BEFORE the registry-delete / close-done /
@@ -773,10 +784,18 @@ func (a *LeaseActor) handleUpdateRequested(msg UpdateRequestedMsg) {
 }
 
 // spawnReplaceWorker runs a replace operation (restart or update) and
-// dispatches the correct terminal SM event based on (err, restored).
+// dispatches the correct terminal SM event based on (err, recovered).
 // Pre-publishes new ContainerIDs / ServiceContainers on success so a
 // preempting Deprovision reading prov observes the new set under lock.
+//
+// wasActive (whether the lease was Status==Ready at replace-start) is read
+// HERE, on the actor goroutine, before spawning the worker — never inside
+// the worker closure. It is used only when the worker's result sets
+// RecoveredIfSourceActive (the doRestart preflight branch): there the
+// recovered-vs-failed decision keys on wasActive (the actor-observed source)
+// instead of result.Restored, fixing the stale-route-time-snapshot edge.
 func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
+	wasActive := a.replaceWasActive
 	a.workers.Add()
 	a.cfg.WG.Go(func() {
 		// Same defer structure as spawnProvisionWorker — see that
@@ -826,11 +845,21 @@ func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
 				}
 			})
 		}
+		// recovered-vs-failed: normally result.Restored, but a doRestart
+		// preflight failure (no container touched) sets RecoveredIfSourceActive
+		// so the decision keys on the actor-observed pre-replace activeness
+		// (wasActive, captured above on the actor goroutine) — recovered iff
+		// the lease was Ready/running at replace-start. Every other path
+		// leaves the flag false → recovered == result.Restored (unchanged).
+		recovered := result.Restored
+		if result.RecoveredIfSourceActive {
+			recovered = wasActive
+		}
 		switch {
 		case result.Err == nil:
 			terminalMsg = replaceCompletedMsg{result: result.Success}
 			event = "replace_completed"
-		case result.Restored:
+		case recovered:
 			terminalMsg = replaceRecoveredMsg{info: result.Failure}
 			event = "replace_recovered"
 		default:

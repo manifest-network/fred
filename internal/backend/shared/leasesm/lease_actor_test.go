@@ -905,7 +905,7 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 		CallbackURL: "new-cb",
 		Work: func() ReplaceResult {
 			<-workerRelease
-			return ReplaceResult{Success: ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusReady}}
+			return ReplaceResult{Success: ReplaceSuccessResult{}}
 		},
 		Ack: ack,
 	}))
@@ -952,7 +952,7 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 		CallbackURL: "new-cb",
 		Work: func() ReplaceResult {
 			<-workerRelease
-			return ReplaceResult{Success: ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusReady}}
+			return ReplaceResult{Success: ReplaceSuccessResult{}}
 		},
 		Ack: ack,
 	}))
@@ -1155,7 +1155,7 @@ func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 		func() ReplaceResult {
 			workerCount.Add(1)
 			<-workerRelease
-			return ReplaceResult{Success: ReplaceSuccessResult{PrevStatus: backend.ProvisionStatusFailed}}
+			return ReplaceResult{Success: ReplaceSuccessResult{}}
 		},
 		ack,
 	))
