@@ -702,9 +702,14 @@ func awaitSettled(t *testing.T, b *Backend, status backend.ProvisionStatus, fail
 // distinguishes the settled recovered state from the initial Ready.
 func TestRestartPreflight_FromReady_Recovers(t *testing.T) {
 	b := newPreflightBackend(t, &mockDockerClient{}, backend.ProvisionStatusReady)
+	activeBefore := testutil.ToFloat64(activeProvisions)
 	routeRestartStub(t, b, restartPreflightResult(true))
 	awaitSettled(t, b, backend.ProvisionStatusReady, 1,
 		"restart preflight from Ready (wasActive=true) must recover→Ready")
+	// Gauge (FIX #1c): the lease was active (Ready) at replace-start and ends
+	// Ready, so activeProvisions must be UNCHANGED — catches a spurious Inc.
+	assert.Equal(t, activeBefore, testutil.ToFloat64(activeProvisions),
+		"recovered-from-active (Ready→Ready) must NOT change activeProvisions")
 }
 
 // (3) source=Failed (wasActive=false): restart preflight failure → failed →
@@ -721,6 +726,7 @@ func TestRestartPreflight_FromFailed_StaysFailed(t *testing.T) {
 // update asymmetry (a missed image pull never achieved the desired state).
 func TestUpdatePreflight_StaysFailed(t *testing.T) {
 	b := newPreflightBackend(t, &mockDockerClient{}, backend.ProvisionStatusReady)
+	activeBefore := testutil.ToFloat64(activeProvisions)
 	ack := make(chan error, 1)
 	require.True(t, b.routeToLease("lease-1", leasesm.UpdateRequestedMsg{
 		Cancel: func() {},
@@ -741,6 +747,39 @@ func TestUpdatePreflight_StaysFailed(t *testing.T) {
 	require.NoError(t, <-ack, "update must be accepted by the SM")
 	awaitSettled(t, b, backend.ProvisionStatusFailed, 1,
 		"update preflight must stay Failed regardless of source (no flag; intentional asymmetry)")
+	// Gauge (FIX #1a): the lease was active (Ready) at replace-start and ends
+	// Failed, so activeProvisions must be decremented by 1.
+	assert.Equal(t, activeBefore-1, testutil.ToFloat64(activeProvisions),
+		"update preflight from Ready (active) → Failed must Dec activeProvisions by 1")
+}
+
+// (b) recovered-from-non-active via POST-replace rollback (NOT preflight):
+// a restart from Failed whose replace fails but whose rollback restores the
+// lease to Ready must INCREMENT activeProvisions (the lease was not counted at
+// replace-start and now ends Ready). This path previously did no gauge op.
+// Restored:true with NO RecoveredIfSourceActive flag drives the recovered
+// outcome via result.Restored (post-replace rollback semantics), distinct
+// from the preflight cases above.
+func TestRestartRecovered_FromFailed_IncsGauge(t *testing.T) {
+	b := newPreflightBackend(t, &mockDockerClient{}, backend.ProvisionStatusFailed)
+	activeBefore := testutil.ToFloat64(activeProvisions)
+	routeRestartStub(t, b, leasesm.ReplaceResult{
+		CallbackErr: "restart failed",
+		Err:         fmt.Errorf("replace failed but rolled back to previous (test)"),
+		Restored:    true, // post-replace rollback restored the old containers; NO preflight flag
+		Failure: leasesm.ReplaceFailureInfo{
+			Operation:   "restart",
+			OldStopped:  true,
+			CallbackErr: "restart failed",
+			LastError:   "replace failed but rolled back to previous (test)",
+		},
+	})
+	awaitSettled(t, b, backend.ProvisionStatusReady, 1,
+		"recovered-from-Failed (rollback restored Ready) must settle Ready with FailCount=1")
+	// Gauge (FIX #1b): the lease was NOT active (Failed) at replace-start and
+	// ends Ready, so activeProvisions must be incremented by 1.
+	assert.Equal(t, activeBefore+1, testutil.ToFloat64(activeProvisions),
+		"recovered-from-non-active (Failed→Ready) must Inc activeProvisions by 1")
 }
 
 // (1) source=Failing (death-then-restart) — the latent-bug case, RED→GREEN.

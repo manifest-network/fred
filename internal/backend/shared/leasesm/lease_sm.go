@@ -541,7 +541,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 	// ProvisionState.
 	incActive := !lsm.actor.replaceWasActive
 	var callbackURL string
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.ContainerIDs = result.ContainerIDs
 		if result.ServiceContainers != nil {
 			p.ServiceContainers = result.ServiceContainers
@@ -553,7 +553,13 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		}
 		callbackURL = p.CallbackURL
 	})
-	if incActive {
+	// Gate the gauge on applied (UpdateFn ran ⇒ lease still exists): never
+	// move the gauge for a lease the closure didn't touch. On every reachable
+	// path applied is true (entry action runs inside Fire after the SM
+	// transitioned, on the serial actor goroutine), so this is behavior-
+	// identical; it only closes the unreachable lease-removed drift, matching
+	// onEnterReadyFromProvision.
+	if applied && incActive {
 		cfg.Metrics.ActiveProvisionsInc()
 	}
 
@@ -586,7 +592,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	incActive := !lsm.actor.replaceWasActive
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusReady
@@ -599,7 +605,9 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
-	if incActive {
+	// Gate the gauge on applied (lease still exists); behavior-identical on
+	// reachable paths — see onEnterReadyFromReplaceCompleted.
+	if applied && incActive {
 		cfg.Metrics.ActiveProvisionsInc()
 	}
 
@@ -635,14 +643,16 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	decActive := lsm.actor.replaceWasActive
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
-	if decActive {
+	// Gate the gauge on applied (lease still exists); behavior-identical on
+	// reachable paths — see onEnterReadyFromReplaceCompleted.
+	if applied && decActive {
 		cfg.Metrics.ActiveProvisionsDec()
 	}
 
