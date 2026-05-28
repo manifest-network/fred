@@ -21,12 +21,14 @@ const (
 )
 
 // SignerBalanceCollector implements prometheus.Collector and emits the
-// `fred_signer_balance_umfx` gauge on every /metrics scrape.
+// `fred_signer_balance` gauge on every /metrics scrape.
 //
 // On Collect, the pool is snapshotted (live reads of ProviderAddress and
 // SubSignerAddresses), one balance query is fanned out per address against
 // the bank module, and each successful response yields one gauge series.
-// Per-address failures drop only that address's series and bump
+// The configured denom is both queried from bank and emitted as the `denom`
+// label so the gauge is accurate on any deployment (not just umfx-denominated
+// networks). Per-address failures drop only that address's series and bump
 // metrics.SignerBalanceQueryFailures (no per-index counter cardinality).
 //
 // The collector is intentionally stateless across scrapes — it does not
@@ -43,8 +45,10 @@ type SignerBalanceCollector struct {
 }
 
 // NewSignerBalanceCollector constructs a per-scrape signer balance collector.
-// denom is the bank module denom to query (e.g. "umfx"). scrapeTimeout bounds
-// the wall time of a single Collect call across all fanned-out queries.
+// denom is the bank module denom to query (e.g. "umfx") and is also emitted as
+// the `denom` label on each series so the metric stays accurate when the
+// network uses a non-umfx fee denom. scrapeTimeout bounds the wall time of a
+// single Collect call across all fanned-out queries.
 func NewSignerBalanceCollector(bankQ bankQuerier, pool *SignerPool, denom string, scrapeTimeout time.Duration) *SignerBalanceCollector {
 	return &SignerBalanceCollector{
 		bankQ:         bankQ,
@@ -52,9 +56,9 @@ func NewSignerBalanceCollector(bankQ bankQuerier, pool *SignerPool, denom string
 		denom:         denom,
 		scrapeTimeout: scrapeTimeout,
 		desc: prometheus.NewDesc(
-			"fred_signer_balance_umfx",
-			"Per-signer balance in umfx, sampled on each /metrics scrape. Labels: role (provider|sub_signer), bech32 address, index (slice position for sub_signer, empty for provider).",
-			[]string{"role", "address", "index"},
+			"fred_signer_balance",
+			"Per-signer balance in the configured fee denom, sampled on each /metrics scrape. Labels: role (provider|sub_signer), bech32 address, index (slice position for sub_signer, empty for provider), denom (bank denom queried).",
+			[]string{"role", "address", "index", "denom"},
 			nil,
 		),
 		failuresCounter: metrics.SignerBalanceQueryFailures,
@@ -119,9 +123,10 @@ func (c *SignerBalanceCollector) Collect(ch chan<- prometheus.Metric) {
 			slog.Warn("signer balance query failed",
 				"role", t.role,
 				"address", t.addr,
+				"denom", c.denom,
 				"error", r.err,
 			)
-			c.failuresCounter.WithLabelValues(t.role, t.addr).Inc()
+			c.failuresCounter.WithLabelValues(t.role, t.addr, c.denom).Inc()
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(
@@ -131,6 +136,7 @@ func (c *SignerBalanceCollector) Collect(ch chan<- prometheus.Metric) {
 			t.role,
 			t.addr,
 			t.index,
+			c.denom,
 		)
 	}
 }

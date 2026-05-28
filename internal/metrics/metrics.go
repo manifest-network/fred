@@ -383,16 +383,18 @@ var (
 
 	// SignerBalanceQueryFailures counts per-address bank balance query failures
 	// observed by the SignerBalanceCollector during a /metrics scrape. The
-	// matching `fred_signer_balance_umfx` gauge series is dropped for the
-	// failing address on that scrape. Labeled by role ("provider" or
-	// "sub_signer") and bech32 address (no index — the index is a gauge-only
-	// label that would inflate counter cardinality without adding signal).
+	// matching `fred_signer_balance` gauge series is dropped for the failing
+	// address on that scrape. Labeled by role ("provider" or "sub_signer"),
+	// bech32 address, and bank denom queried (no index — the index is a
+	// gauge-only label that would inflate counter cardinality without adding
+	// signal; denom is included so an operator scraping a deployment with a
+	// non-umfx fee denom can still correlate the counter to the gauge).
 	SignerBalanceQueryFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "signer",
 		Name:      "balance_query_failures_total",
 		Help:      "Total per-address signer balance query failures during /metrics scrapes",
-	}, []string{"role", "address"})
+	}, []string{"role", "address", "denom"})
 )
 
 // Outcome constants for consistent labeling

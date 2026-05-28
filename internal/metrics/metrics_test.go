@@ -145,10 +145,10 @@ func TestCounterVecLabels(t *testing.T) {
 		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")
 	})
 	assert.NotPanics(t, func() {
-		SignerBalanceQueryFailures.WithLabelValues("provider", "manifest1abc")
+		SignerBalanceQueryFailures.WithLabelValues("provider", "manifest1abc", "umfx")
 	})
 	assert.NotPanics(t, func() {
-		SignerBalanceQueryFailures.WithLabelValues("sub_signer", "manifest1xyz")
+		SignerBalanceQueryFailures.WithLabelValues("sub_signer", "manifest1xyz", "umfx")
 	})
 }
 

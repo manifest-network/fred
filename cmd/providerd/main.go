@@ -207,13 +207,14 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Register the per-signer balance collector. Must run after any
 	// DemoteToSingleSigner above so the collector sees the live (possibly
-	// demoted) pool shape on every scrape. Denom is hard-coded to "umfx" —
-	// the fee/balance denom for this network — to avoid coupling the gauge
-	// to cfg.SubSignerMinBalance (which is gated on HasSubSigners).
+	// demoted) pool shape on every scrape. Denom comes from cfg.FeeDenom (the
+	// network-level fee/balance denom, always set — defaults to "umfx") and
+	// is emitted as the `denom` gauge label so the metric is accurate on any
+	// deployment, not just umfx-denominated networks.
 	signerBalanceCollector := chain.NewSignerBalanceCollector(
 		banktypes.NewQueryClient(chainClient.Conn()),
 		signerPool,
-		"umfx",
+		cfg.FeeDenom,
 		5*time.Second,
 	)
 	prometheus.DefaultRegisterer.MustRegister(signerBalanceCollector)
