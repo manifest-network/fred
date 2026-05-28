@@ -30,9 +30,11 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 | Field | YAML Key | Type | Default | Description |
 |---|---|---|---|---|
 | SKUMapping | `sku_mapping` | map[string]string | *(empty)* | Maps on-chain SKU UUIDs to profile names |
-| SKUProfiles | `sku_profiles` | map[string]SKUProfile | *(see below)* | Maps profile names to resource limits |
+| SKUProfiles | `sku_profiles` | map[string]SKUProfile | *(required, non-empty)* | Maps profile names to resource limits. Operator-declared; no defaults |
 
-Default SKU profiles:
+`sku_profiles` is required and authoritative — `DefaultConfig()` deliberately does not seed it, because yaml.v3 merges map keys during Unmarshal and a partial operator config would silently inherit defaults (see ENG-238). Validate rejects an empty map with `"at least one SKU profile is required"`.
+
+Recommended starter profiles (copy these into your config if you want the previous four-tier shape):
 
 | Profile | CPU Cores | Memory MB | Disk MB |
 |---|---|---|---|

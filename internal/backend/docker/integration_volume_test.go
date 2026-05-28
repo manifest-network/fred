@@ -495,6 +495,7 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 
 	// Build config manually to control backend lifecycle (like ColdStartRecovery tests)
 	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-orphan-vol-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
 	cfg.HostAddress = "127.0.0.1"

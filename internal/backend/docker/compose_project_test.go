@@ -13,6 +13,7 @@ import (
 
 func testConfig() *Config {
 	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.HostBindIP = "0.0.0.0"
 	return &cfg
 }

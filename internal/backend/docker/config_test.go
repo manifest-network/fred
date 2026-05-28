@@ -557,7 +557,10 @@ func TestConfig_Validate_IngressRequiresNetworkIsolation(t *testing.T) {
 
 func TestConfig_DefaultConfig_Validates(t *testing.T) {
 	cfg := DefaultConfig()
-	// DefaultConfig is missing required secrets/addresses — set them
+	// DefaultConfig is missing required secrets/addresses/sku_profiles — set them.
+	// As of ENG-238, SKUProfiles is no longer pre-populated by DefaultConfig
+	// (tier sizing is operator policy, not a code default).
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.CallbackSecret = config.Secret(strings.Repeat("s", 32))
 	cfg.HostAddress = "192.168.1.1"
 	cfg.SKUMapping = map[string]string{
