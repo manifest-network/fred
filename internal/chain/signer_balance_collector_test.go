@@ -66,10 +66,10 @@ func gatherGaugeSeries(t *testing.T, reg *prometheus.Registry) []gaugeSample {
 // can gather/assert without polluting prometheus.DefaultRegisterer. The
 // failures counter (metrics.SignerBalanceQueryFailures) is global; tests
 // Reset it before use.
-func newCollectorForTest(t *testing.T, bankQ bankQuerier, pool *SignerPool, timeout time.Duration) (*SignerBalanceCollector, *prometheus.Registry) {
+func newCollectorForTest(t *testing.T, bankQ bankQuerier, pool *SignerPool, denom string, timeout time.Duration) (*SignerBalanceCollector, *prometheus.Registry) {
 	t.Helper()
 	metrics.SignerBalanceQueryFailures.Reset()
-	collector := NewSignerBalanceCollector(bankQ, pool, "umfx", timeout)
+	collector := NewSignerBalanceCollector(bankQ, pool, denom, timeout)
 	reg := prometheus.NewRegistry()
 	require.NoError(t, reg.Register(collector))
 	return collector, reg
@@ -85,7 +85,7 @@ func TestSignerBalanceCollector_SingleSignerMode_EmitsOnlyProvider(t *testing.T)
 		},
 	}
 
-	_, reg := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	_, reg := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 	samples := gatherGaugeSeries(t, reg)
 	require.Len(t, samples, 1, "should emit only the provider series in single-signer mode")
 	assert.Equal(t, "provider", samples[0].role)
@@ -118,7 +118,7 @@ func TestSignerBalanceCollector_MultiSigner_EmitsAllSeries(t *testing.T) {
 		},
 	}
 
-	_, reg := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	_, reg := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 	samples := gatherGaugeSeries(t, reg)
 	require.Len(t, samples, 4, "should emit 1 provider + 3 sub_signer series")
 
@@ -158,7 +158,7 @@ func TestSignerBalanceCollector_PerAddressFailure_DropsSeriesAndIncrementsCounte
 		},
 	}
 
-	collector, reg := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	collector, reg := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 
 	// First scrape: 3 series emitted (no index=1), counter at 1 for that role/address.
 	samples := gatherGaugeSeries(t, reg)
@@ -192,7 +192,7 @@ func TestSignerBalanceCollector_AllQueriesFail_NoGaugeSeries(t *testing.T) {
 		},
 	}
 
-	_, reg := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	_, reg := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 	samples := gatherGaugeSeries(t, reg)
 	require.Empty(t, samples, "no gauge series when all queries fail")
 
@@ -213,7 +213,7 @@ func TestSignerBalanceCollector_ContextTimeout_DoesNotBlockScrape(t *testing.T) 
 	}
 
 	// Use a short timeout so the test runs fast; production passes 5s.
-	_, reg := newCollectorForTest(t, bankQ, pool, 100*time.Millisecond)
+	_, reg := newCollectorForTest(t, bankQ, pool, "umfx", 100*time.Millisecond)
 
 	start := time.Now()
 	samples := gatherGaugeSeries(t, reg)
@@ -241,7 +241,7 @@ func TestSignerBalanceCollector_DemotedPool_OnlyProviderSeries(t *testing.T) {
 		},
 	}
 
-	_, reg := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	_, reg := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 
 	pool.DemoteToSingleSigner()
 
@@ -264,7 +264,7 @@ func TestSignerBalanceCollector_RaceFreeUnderConcurrentCollect(t *testing.T) {
 		},
 	}
 
-	collector, _ := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	collector, _ := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 
 	var wg sync.WaitGroup
 	for range 10 {
@@ -301,8 +301,50 @@ func TestSignerBalanceCollector_BalanceOverflow_DropsSeriesAndIncrementsCounter(
 		},
 	}
 
-	_, reg := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	_, reg := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 	samples := gatherGaugeSeries(t, reg)
 	require.Empty(t, samples, "overflowing balance must not emit a gauge series")
 	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", pool.ProviderAddress(), "umfx")))
+}
+
+// TestSignerBalanceCollector_NonDefaultDenom_PropagatesThroughQueryAndLabel
+// guards the denom-passthrough contract added in commit 25d36e9. Without
+// this test, every other test in this file would still pass if
+// NewSignerBalanceCollector silently ignored its denom argument and
+// hard-coded "umfx" internally (since they all use "umfx").
+func TestSignerBalanceCollector_NonDefaultDenom_PropagatesThroughQueryAndLabel(t *testing.T) {
+	pool := newTestSignerPool(t, 1)
+	const testDenom = "uatom"
+
+	var (
+		observedDenomsMu sync.Mutex
+		observedDenoms   []string
+	)
+	bankQ := &mockBankQuerier{
+		balanceFn: func(ctx context.Context, in *banktypes.QueryBalanceRequest, opts ...grpc.CallOption) (*banktypes.QueryBalanceResponse, error) {
+			observedDenomsMu.Lock()
+			observedDenoms = append(observedDenoms, in.Denom)
+			observedDenomsMu.Unlock()
+			return &banktypes.QueryBalanceResponse{
+				Balance: &sdk.Coin{Denom: testDenom, Amount: math.NewInt(7)},
+			}, nil
+		},
+	}
+
+	_, reg := newCollectorForTest(t, bankQ, pool, testDenom, 5*time.Second)
+	samples := gatherGaugeSeries(t, reg)
+	require.Len(t, samples, 2, "should emit provider + 1 sub_signer with the non-default denom")
+
+	// Every Balance request received by the mock must use the configured denom.
+	observedDenomsMu.Lock()
+	defer observedDenomsMu.Unlock()
+	require.NotEmpty(t, observedDenoms)
+	for _, d := range observedDenoms {
+		assert.Equal(t, testDenom, d, "Balance query must use the configured denom (not a hard-coded umfx)")
+	}
+
+	// Every emitted gauge series must carry the configured denom label.
+	for _, s := range samples {
+		assert.Equal(t, testDenom, s.denom, "gauge series must carry the configured denom label (not a hard-coded umfx)")
+	}
 }
