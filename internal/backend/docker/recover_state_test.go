@@ -271,6 +271,7 @@ func (m *mockDockerClient) ContainerEvents(ctx context.Context) (<-chan Containe
 // methods unless they explicitly opt in.
 func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision) *Backend {
 	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.NetworkIsolation = ptrBool(false)
 
 	pool := shared.NewResourcePool(

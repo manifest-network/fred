@@ -1971,6 +1971,7 @@ func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
 // Fix 2: Negative CallbackMaxAge rejected by config validation.
 func TestConfigValidation_NegativeCallbackMaxAge(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.CallbackSecret = "this-is-a-32-character-secret!!x"
 	cfg.HostAddress = "192.168.1.100"
 	cfg.CallbackMaxAge = -1 * time.Hour

@@ -244,6 +244,13 @@ func (c *Config) HasStatefulSKUs() bool {
 }
 
 // DefaultConfig returns a Config with sensible defaults.
+//
+// SKUProfiles is intentionally left empty: tier sizing is operator policy,
+// not a code default. yaml.v3 merges map keys, so seeding defaults here
+// would silently leak into any partial sku_profiles: block in YAML and
+// trip the bidirectional sku_mapping/sku_profiles reachability check in
+// Validate (see ENG-238). Operators must declare sku_profiles in their
+// config; Validate enforces non-empty.
 func DefaultConfig() Config {
 	return Config{
 		Name:                    "docker",
@@ -270,28 +277,6 @@ func DefaultConfig() Config {
 		ReleasesMaxAge:          90 * 24 * time.Hour,
 		MigrationGracePeriod:    defaultMigrationGracePeriod,
 		MigrationReadyTimeout:   defaultMigrationReadyTimeout,
-		SKUProfiles: map[string]SKUProfile{
-			"docker-micro": {
-				CPUCores: 0.25,
-				MemoryMB: 256,
-				DiskMB:   512,
-			},
-			"docker-small": {
-				CPUCores: 0.5,
-				MemoryMB: 512,
-				DiskMB:   1024,
-			},
-			"docker-medium": {
-				CPUCores: 1.0,
-				MemoryMB: 1024,
-				DiskMB:   2048,
-			},
-			"docker-large": {
-				CPUCores: 2.0,
-				MemoryMB: 2048,
-				DiskMB:   4096,
-			},
-		},
 		AllowedRegistries: []string{
 			"docker.io",
 			"ghcr.io",

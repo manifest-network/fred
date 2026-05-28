@@ -44,6 +44,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	}
 
 	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
 	cfg.HostAddress = "127.0.0.1"
@@ -850,6 +851,7 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-cold-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
 	cfg.HostAddress = "127.0.0.1"
@@ -940,6 +942,7 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	callbackServer1, callbackCh1 := startCallbackServer(t)
 
 	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-cold-dead-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
 	cfg.HostAddress = "127.0.0.1"

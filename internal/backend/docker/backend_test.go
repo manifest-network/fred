@@ -181,6 +181,7 @@ func TestParseManifest_Env(t *testing.T) {
 func TestConfigValidation(t *testing.T) {
 	validConfig := func() Config {
 		cfg := DefaultConfig()
+		cfg.SKUProfiles = defaultTestSKUProfiles()
 		cfg.CallbackSecret = "this-is-a-32-character-secret!!x" // 33 chars
 		cfg.HostAddress = "192.168.1.100"
 		cfg.VolumeDataPath = "/var/lib/fred/volumes"
@@ -546,6 +547,7 @@ func TestConfigHardeningOverrides(t *testing.T) {
 func TestConfigHardeningValidation(t *testing.T) {
 	validConfig := func() Config {
 		cfg := DefaultConfig()
+		cfg.SKUProfiles = defaultTestSKUProfiles()
 		cfg.CallbackSecret = "this-is-a-32-character-secret!!x"
 		cfg.HostAddress = "192.168.1.100"
 		cfg.VolumeDataPath = "/var/lib/fred/volumes"
