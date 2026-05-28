@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -110,6 +111,10 @@ func (c *SignerBalanceCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 			if resp == nil || resp.Balance == nil {
 				results[i] = result{err: errors.New("nil balance response")}
+				return
+			}
+			if !resp.Balance.Amount.IsInt64() {
+				results[i] = result{err: fmt.Errorf("balance %s overflows int64", resp.Balance.Amount)}
 				return
 			}
 			results[i] = result{amount: resp.Balance.Amount.Int64()}

@@ -205,12 +205,15 @@ func run(cmd *cobra.Command, args []string) error {
 		setupCancel()
 	}
 
-	// Register the per-signer balance collector. Must run after any
-	// DemoteToSingleSigner above so the collector sees the live (possibly
-	// demoted) pool shape on every scrape. Denom comes from cfg.FeeDenom (the
-	// network-level fee/balance denom, always set — defaults to "umfx") and
-	// is emitted as the `denom` gauge label so the metric is accurate on any
-	// deployment, not just umfx-denominated networks.
+	// Register the per-signer balance collector. It samples each signer's
+	// balance on every /metrics scrape, reading the live pool snapshot at
+	// Collect time — so post-startup pool mutations (e.g.
+	// DemoteToSingleSigner) are reflected without any extra wiring,
+	// regardless of when this registration runs. Denom comes from
+	// cfg.FeeDenom (the network-level fee/balance denom, always set —
+	// defaults to "umfx") and is emitted as the `denom` gauge label so the
+	// metric is accurate on any deployment, not just umfx-denominated
+	// networks.
 	signerBalanceCollector := chain.NewSignerBalanceCollector(
 		banktypes.NewQueryClient(chainClient.Conn()),
 		signerPool,

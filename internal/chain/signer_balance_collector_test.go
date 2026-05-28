@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"errors"
+	stdmath "math"
 	"strconv"
 	"sync"
 	"testing"
@@ -218,7 +219,8 @@ func TestSignerBalanceCollector_ContextTimeout_DoesNotBlockScrape(t *testing.T) 
 	samples := gatherGaugeSeries(t, reg)
 	elapsed := time.Since(start)
 
-	assert.Less(t, elapsed, 6*time.Second, "Collect must not block past the per-scrape timeout")
+	assert.GreaterOrEqual(t, elapsed, 100*time.Millisecond, "Collect should have waited until the configured per-scrape timeout fired")
+	assert.Less(t, elapsed, 1*time.Second, "Collect must not block past the per-scrape timeout")
 	assert.Empty(t, samples, "no gauge series should be emitted on timeout")
 
 	// All 1+N addresses bumped the failures counter.
@@ -282,4 +284,25 @@ func TestSignerBalanceCollector_RaceFreeUnderConcurrentCollect(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestSignerBalanceCollector_BalanceOverflow_DropsSeriesAndIncrementsCounter(t *testing.T) {
+	pool := newTestSignerPool(t, 0)
+	// Construct an Int strictly larger than math.MaxInt64 so IsInt64() must
+	// return false. cosmossdk.io/math does not expose MaxUint64; we reach
+	// the constant via the stdmath alias.
+	overflow := math.NewIntFromUint64(stdmath.MaxUint64).Add(math.OneInt())
+
+	bankQ := &mockBankQuerier{
+		balanceFn: func(ctx context.Context, in *banktypes.QueryBalanceRequest, opts ...grpc.CallOption) (*banktypes.QueryBalanceResponse, error) {
+			return &banktypes.QueryBalanceResponse{
+				Balance: &sdk.Coin{Denom: "umfx", Amount: overflow},
+			}, nil
+		},
+	}
+
+	_, reg := newCollectorForTest(t, bankQ, pool, 5*time.Second)
+	samples := gatherGaugeSeries(t, reg)
+	require.Empty(t, samples, "overflowing balance must not emit a gauge series")
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", pool.ProviderAddress(), "umfx")))
 }
