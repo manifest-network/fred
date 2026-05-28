@@ -229,19 +229,6 @@ var (
 		Help:      "Container-death signals routeToLease could not deliver (stopCtx canceled or inbox full); reconciler re-detects on next cycle",
 	}, []string{"source"})
 
-	// leaseFailingRaceSkippedTotal counts onEnterFailing invocations that
-	// bailed because another caller (Restart/Update) flipped prov.Status
-	// off Ready between the SM guard and this entry action. Non-zero
-	// values indicate the Ready-vs-Restart race is being hit in practice;
-	// a sustained rate suggests the synchronous Status flip in
-	// Backend.Restart/Update should be moved into the actor.
-	leaseFailingRaceSkippedTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: metricsSubsystem,
-		Name:      "lease_failing_race_skipped_total",
-		Help:      "onEnterFailing bails due to concurrent Restart/Update flipping prov.Status off Ready",
-	})
-
 	// leaseWorkerPanicsTotal counts panics recovered in lease worker
 	// goroutines (provision, replace, diag), labeled by worker type.
 	// Workers are Docker-interaction code that is NOT expected to panic;

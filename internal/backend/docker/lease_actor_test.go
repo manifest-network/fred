@@ -12,7 +12,6 @@ import (
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -773,108 +772,6 @@ func TestHandleContainerDeath_ShutdownDoesNotHang(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("handleContainerDeath did not return within 500ms after shutdown")
 	}
-}
-
-// TestOnEnterFailing_RaceWithConcurrentStatusFlip pins the fix for the
-// Restart-races-ContainerDeath race. Backend.Restart flips prov.Status
-// synchronously outside the actor before routing its message, so a
-// Restart can sneak in between the SM guard's RLock-release (after the
-// slow InspectContainer) and onEnterFailing's Lock-acquire. Without
-// the recheck, onEnterFailing would overwrite Status=Restarting with
-// Failing, bump FailCount, and decrement activeProvisions — all
-// spurious. With the recheck, onEnterFailing bails on Status != Ready
-// and the metric records the skip.
-//
-// The test blocks InspectContainer to pin down the exact race window,
-// then simulates Restart's sync phase by flipping Status under the
-// lock while the guard is still waiting.
-func TestOnEnterFailing_RaceWithConcurrentStatusFlip(t *testing.T) {
-	inspectCalled := make(chan struct{})
-	releaseInspect := make(chan struct{})
-
-	mock := &mockDockerClient{
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			close(inspectCalled)
-			<-releaseInspect
-			return &ContainerInfo{
-				ContainerID: containerID,
-				Status:      "exited",
-				ExitCode:    1,
-			}, nil
-		},
-	}
-
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			Status:       backend.ProvisionStatusReady,
-			ContainerIDs: []string{"c1"},
-			FailCount:    0},
-		},
-	})
-	defer b.stopCancel()
-
-	activeBefore := testutil.ToFloat64(activeProvisions)
-	skippedBefore := testutil.ToFloat64(leaseFailingRaceSkippedTotal)
-
-	// Trigger the die event in a goroutine; it will block inside the
-	// guard's InspectContainer call until we release it.
-	deathDone := make(chan struct{})
-	go func() {
-		b.handleContainerDeath("c1")
-		close(deathDone)
-	}()
-
-	// Wait for the guard to reach InspectContainer — now the race window
-	// between the guard's RLock-release and onEnterFailing's Lock-acquire
-	// is open.
-	select {
-	case <-inspectCalled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("guard did not call InspectContainer")
-	}
-
-	// Simulate Backend.Restart's synchronous Status flip. The actor
-	// has not yet entered onEnterFailing (it's blocked on InspectContainer).
-	b.provisionsMu.Lock()
-	b.provisions["lease-1"].Status = backend.ProvisionStatusRestarting
-	b.provisionsMu.Unlock()
-
-	// Release InspectContainer. Guard returns true (the die event is
-	// real), SM commits Ready→Failing, onEnterFailing runs. It must see
-	// Status=Restarting and bail.
-	close(releaseInspect)
-
-	select {
-	case <-deathDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("handleContainerDeath did not complete")
-	}
-
-	// Invariants after the race: prov.Status stayed Restarting,
-	// FailCount unchanged, LastError empty, activeProvisions unchanged,
-	// and the skip counter bumped.
-	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	status := prov.Status
-	failCount := prov.FailCount
-	lastError := prov.LastError
-	b.provisionsMu.RUnlock()
-
-	assert.Equal(t, backend.ProvisionStatusRestarting, status,
-		"onEnterFailing must NOT overwrite Status=Restarting with Failing")
-	assert.Equal(t, 0, failCount,
-		"onEnterFailing must NOT bump FailCount after bailing on the race")
-	assert.Empty(t, lastError,
-		"onEnterFailing must NOT set LastError after bailing on the race")
-
-	activeAfter := testutil.ToFloat64(activeProvisions)
-	assert.Equal(t, activeBefore, activeAfter,
-		"activeProvisions must not be decremented when onEnterFailing bails")
-
-	skippedAfter := testutil.ToFloat64(leaseFailingRaceSkippedTotal)
-	assert.Equal(t, skippedBefore+1, skippedAfter,
-		"leaseFailingRaceSkippedTotal must increment by exactly 1")
 }
 
 // TestHandlerPanic_UnblocksReplyChannel pins the invariant that a panic

@@ -183,28 +183,49 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// evReplaceCompleted (full success), evReplaceRecovered (failure but
 	// lease ended up Ready via rollback / preflight-restored), or
 	// evReplaceFailed (ended up Failed).
+	//
+	// onEnterRestarting/onEnterUpdating are the SOLE writers of
+	// prov.Status (Restarting/Updating) + prov.CallbackURL for these
+	// paths post-ENG-230. They run inside Fire on the actor goroutine,
+	// before handleRestartRequested/handleUpdateRequested ack the
+	// request — preserving the "Restart()/Update() returns ⇒ Status is
+	// Restarting/Updating" contract the HTTP handler's event publish
+	// depends on.
+	//
+	// No Ignore(evRestartRequested/evUpdateRequested) guard is needed any
+	// more. Those guards existed only because the off-actor prelude
+	// pre-wrote prov.Status=Restarting/Updating, so newLeaseSM initialized
+	// a freshly-created actor's SM directly in Restarting/Updating and the
+	// incoming request event had to be Ignored as a self-event. With the
+	// prelude flip gone, readProvisionStatus reads the lease's TRUE status
+	// (Ready/Failed) and the event is a real Permit transition. recover.go
+	// can still leave a lease at rest in Restarting/Updating (it PRESERVES
+	// those statuses; only Failing is normalized to Failed) — but such a
+	// lease is unreachable by a restart/update event: the prelude fast-fail
+	// is a ROUTE-TIME precondition that refuses to route on a non-Ready/
+	// Failed lease. The one case where evRestartRequested meets an already-
+	// Restarting SM is a concurrent duplicate (handleRestartRequested
+	// TOCTOU), correctly rejected as an invalid transition → ErrInvalidState
+	// (409); keeping Ignore would instead no-op it and spawn a second
+	// worker. NOTE: this comment must NOT claim the prelude guarantees
+	// processing-time state — it is only a route-time precondition; the
+	// actor's serial inbox is what guarantees Status consistency.
 	sm.Configure(backend.ProvisionStatusRestarting).
+		OnEntryFrom(evRestartRequested, lsm.onEnterRestarting).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
-		Ignore(evContainerDied).
-		// Ignore evRestartRequested: Backend.Restart's synchronous section
-		// sets prov.Status to Restarting BEFORE the msg reaches the actor,
-		// so newLeaseSM initializes the SM in Restarting. The event
-		// arrives to a state already matching the target — treat as a
-		// no-op rather than an unhandled trigger error. Same pattern
-		// as Provisioning.Ignore(evProvisionRequested).
-		Ignore(evRestartRequested)
+		Ignore(evContainerDied)
 	sm.Configure(backend.ProvisionStatusUpdating).
+		OnEntryFrom(evUpdateRequested, lsm.onEnterUpdating).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
-		Ignore(evContainerDied).
-		Ignore(evUpdateRequested) // See Restarting.Ignore comment above.
+		Ignore(evContainerDied)
 
 	// Ready entry actions: emit Success from a Provision or Replace success,
 	// or emit Failed-with-rollback-suffix from a Replace recovery. Status
@@ -327,44 +348,26 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
 
-	// Re-check Status under the write lock. Backend.Restart and
-	// Backend.Update flip prov.Status synchronously outside the actor
-	// before routing their message (restart_update.go), so a Restart
-	// can slip in between the SM guard's RLock-release (after the
-	// 10s InspectContainer) and this entry action's Lock-acquire.
-	// If Status is no longer Ready, skip all side effects — the operator
-	// has taken over, the queued restart/update message will drive the
-	// actual transition, and bumping FailCount / decrementing
-	// activeProvisions here would double-count.
-	//
-	// NOTE: the SM has already committed to Failing by the time this
-	// runs, so bailing here creates transient drift (SM=Failing,
-	// prov.Status=Restarting). The drift resolves on the next message —
-	// Failing.Permit(evRestartRequested/Update/Provision) moves the SM
-	// to the state prov.Status already reflects. Failing.Ignore on
-	// ContainerDied/DiagGathered prevents stray events from doing
-	// anything during the drift window.
-	var raceSkipped, applied bool
+	// No Status recheck needed (ENG-230). Off-actor Status writes for
+	// restart/update are eliminated — onEnterRestarting/onEnterUpdating
+	// now own those writes on the actor goroutine — so every write to
+	// prov.Status is actor-serial. A Ready→Failing entry therefore always
+	// observes Status == Ready: nothing off-actor can flip it between the
+	// SM guard's read and this entry action. The previous recheck +
+	// lease_failing_race_skipped_total metric defended against the
+	// off-actor prelude flip that no longer exists. The `exists` guard is
+	// kept (cheap nil-guard: UpdateFn returns false if the lease was
+	// removed); ActiveProvisionsDec is now unconditional on the applied
+	// path.
 	exists := lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		if p.Status != backend.ProvisionStatusReady {
-			raceSkipped = true
-			return
-		}
 		p.Status = backend.ProvisionStatusFailing
 		p.FailCount++
 		p.LastError = errMsgContainerExited
-		applied = true
 	})
 	if !exists {
 		return nil
 	}
-	if raceSkipped {
-		lsm.actor.cfg.Metrics.FailingRaceSkipped()
-		return nil
-	}
-	if applied {
-		lsm.actor.cfg.Metrics.ActiveProvisionsDec()
-	}
+	lsm.actor.cfg.Metrics.ActiveProvisionsDec()
 
 	// Spawn the async diag gather. Its context is derived from
 	// context.Background() with a bounded timeout — NOT from stopCtx —
@@ -383,6 +386,50 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 		defer lsm.actor.workers.Done()
 		lsm.actor.gatherDiagAsync(diagCtx, containerID, info)
 	})
+	return nil
+}
+
+// onEnterRestarting / onEnterUpdating are the Ready|Failed|Failing →
+// Restarting|Updating entry actions. They are the SOLE writers of
+// prov.Status (Restarting/Updating) and prov.CallbackURL for the
+// restart/update paths (ENG-230). Fired synchronously inside
+// handleRestartRequested/handleUpdateRequested's fireAndVerify, BEFORE
+// the ack, so the "Restart()/Update() returns ⇒ Status is
+// Restarting/Updating" contract relied on by api/handlers.go holds.
+func (lsm *leaseSM) onEnterRestarting(ctx context.Context, args ...any) error {
+	return lsm.applyReplaceEntry(args, backend.ProvisionStatusRestarting)
+}
+
+func (lsm *leaseSM) onEnterUpdating(ctx context.Context, args ...any) error {
+	return lsm.applyReplaceEntry(args, backend.ProvisionStatusUpdating)
+}
+
+// applyReplaceEntry flips Status to the requested replace state and, when
+// the request carried a non-empty CallbackURL, applies it — all under one
+// UpdateFn critical section. No metric/log side effect inside the closure,
+// per the LeaseProvisionStore idempotence contract.
+func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus) error {
+	var callbackURL string
+	if len(args) > 0 {
+		if a, ok := args[0].(replaceEntryArgs); ok {
+			callbackURL = a.CallbackURL
+		}
+	}
+	// Capture whether the lease was active (Status==Ready) BEFORE overwriting
+	// it — this is the actor-authoritative gauge key the replace-outcome
+	// entry actions use (see LeaseActor.replaceWasActive). Read inside the
+	// closure (under the store lock) so it's consistent with the overwrite;
+	// the actor-field assignment happens after the closure (no side effect
+	// inside UpdateFn, per the idempotence contract).
+	var wasActive bool
+	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		wasActive = p.Status == backend.ProvisionStatusReady
+		p.Status = status
+		if callbackURL != "" {
+			p.CallbackURL = callbackURL
+		}
+	})
+	lsm.actor.replaceWasActive = wasActive
 	return nil
 }
 
@@ -474,7 +521,8 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 // onEnterReadyFromReplaceCompleted fires when doReplace* signals success.
 // Owns Status flip, ContainerIDs/ServiceContainers update, optional
 // OnSuccess hook (update flow sets Manifest/StackManifest), gauge
-// increment (if prevStatus was Failed), and Success callback emission.
+// increment (iff the lease was NOT active at replace-start), and Success
+// callback emission.
 func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args ...any) error {
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterReadyFromReplaceCompleted: missing result")
@@ -486,24 +534,32 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
+	// Inc iff the lease was NOT active (Status != Ready) when the replace
+	// began — actor-observed via replaceWasActive, NOT a stale prelude
+	// route-time snapshot (which under-counts the death-before-restart
+	// ordering). Computed outside the closure: it's an actor field, not
+	// ProvisionState.
+	incActive := !lsm.actor.replaceWasActive
 	var callbackURL string
-	var incActive bool
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.ContainerIDs = result.ContainerIDs
 		if result.ServiceContainers != nil {
 			p.ServiceContainers = result.ServiceContainers
 		}
 		p.Status = backend.ProvisionStatusReady
 		p.LastError = ""
-		if result.PrevStatus == backend.ProvisionStatusFailed {
-			incActive = true
-		}
 		if result.OnSuccess != nil {
 			result.OnSuccess(p)
 		}
 		callbackURL = p.CallbackURL
 	})
-	if incActive {
+	// Gate the gauge on applied (UpdateFn ran ⇒ lease still exists): never
+	// move the gauge for a lease the closure didn't touch. On every reachable
+	// path applied is true (entry action runs inside Fire after the SM
+	// transitioned, on the serial actor goroutine), so this is behavior-
+	// identical; it only closes the unreachable lease-removed drift, matching
+	// onEnterReadyFromProvision.
+	if applied && incActive {
 		cfg.Metrics.ActiveProvisionsInc()
 	}
 
@@ -516,7 +572,9 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 // without touching containers). Status ends up Ready; LastError is set
 // to the rich failure diagnostic. For the restart-with-oldStopped case,
 // LastError is cleared because we're back to the exact same state as
-// before the restart.
+// before the restart. Gauge: Inc iff the lease was NOT active at
+// replace-start (e.g. recovered-from-Failed/Failing) — previously this
+// path did no gauge op, under-counting that case.
 func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args ...any) error {
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterReadyFromReplaceRecovered: missing info")
@@ -528,9 +586,13 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
+	// Inc iff the lease was NOT active when the replace began (actor-observed
+	// via replaceWasActive); ending in Ready re-counts it. Computed outside
+	// the closure: it's an actor field, not ProvisionState.
+	incActive := !lsm.actor.replaceWasActive
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusReady
@@ -543,6 +605,11 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
+	// Gate the gauge on applied (lease still exists); behavior-identical on
+	// reachable paths — see onEnterReadyFromReplaceCompleted.
+	if applied && incActive {
+		cfg.Metrics.ActiveProvisionsInc()
+	}
 
 	if diagSnap.LeaseUUID != "" {
 		// Use logs captured by doReplace*'s defer BEFORE rollback tore
@@ -557,8 +624,8 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 
 // onEnterFailedFromReplace fires when doReplace* failed AND rollback
 // failed (or no rollback was possible). Status ends up Failed; gauge is
-// decremented if prevStatus was Ready (the operation took a Ready lease
-// and ended it in a Failed state).
+// decremented iff the lease WAS active at replace-start (the operation
+// took a counted lease and ended it Failed).
 func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) error {
 	if len(args) < 1 {
 		return fmt.Errorf("onEnterFailedFromReplace: missing info")
@@ -570,20 +637,22 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
+	// Dec iff the lease WAS active when the replace began (actor-observed via
+	// replaceWasActive, NOT a stale prelude route-time snapshot). Computed
+	// outside the closure: it's an actor field, not ProvisionState.
+	decActive := lsm.actor.replaceWasActive
 	var callbackURL string
 	var diagSnap shared.DiagnosticEntry
-	var decActive bool
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
-		if info.PrevStatus == backend.ProvisionStatusReady {
-			decActive = true
-		}
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
-	if decActive {
+	// Gate the gauge on applied (lease still exists); behavior-identical on
+	// reachable paths — see onEnterReadyFromReplaceCompleted.
+	if applied && decActive {
 		cfg.Metrics.ActiveProvisionsDec()
 	}
 
@@ -737,6 +806,12 @@ type provisionErrorInfo struct {
 	logs        map[string]string
 }
 
+// replaceEntryArgs carries the new CallbackURL from a Restart/Update
+// request message into the onEnterRestarting / onEnterUpdating entry
+// actions via Fire args, so the actor (not the HTTP prelude) is the
+// sole writer of prov.CallbackURL for these paths.
+type replaceEntryArgs struct{ CallbackURL string }
+
 // ReplaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
 // success output into onEnterReadyFromReplace. The goroutine returns these;
 // the entry action writes them to provision under a single lock acquisition.
@@ -744,7 +819,6 @@ type provisionErrorInfo struct {
 // Manifest/StackManifest there). Exported because the substrate's replace
 // worker closure builds the value and the SM entry action reads it.
 type ReplaceSuccessResult struct {
-	PrevStatus        backend.ProvisionStatus
 	ContainerIDs      []string
 	ServiceContainers map[string][]string // non-nil for stack
 	OnSuccess         func(*ProvisionState)
@@ -754,10 +828,9 @@ type ReplaceSuccessResult struct {
 // onEnterReadyFromReplaceRecovered (Status ends up Ready) and
 // onEnterFailedFromReplace (Status ends up Failed). The entry actions
 // set LastError, increment FailCount, persist diagnostics, and adjust
-// the activeProvisions gauge based on PrevStatus. Exported because
-// the substrate's replace worker closure builds the value.
+// the activeProvisions gauge via the actor-observed replaceWasActive.
+// Exported because the substrate's replace worker closure builds the value.
 type ReplaceFailureInfo struct {
-	PrevStatus  backend.ProvisionStatus
 	Operation   string // "restart" or "update"
 	OldStopped  bool   // only meaningful on the recovery path (restart-with-oldStopped clears LastError)
 	CallbackErr string
@@ -772,20 +845,31 @@ type ReplaceFailureInfo struct {
 
 // ReplaceResult is doReplace*'s return value bundling everything the
 // goroutine wrapper needs to fire the right SM event. The callback path
-// depends on (Err, Restored):
+// depends on (Err, recovered) where recovered = RecoveredIfSourceActive ?
+// LeaseActor.replaceWasActive : Restored (computed by spawnReplaceWorker):
 //
-//	Err == nil            → fire evReplaceCompleted with .Success
-//	Err != nil, Restored  → fire evReplaceRecovered with .Failure
-//	Err != nil, !Restored → fire evReplaceFailed    with .Failure
+//	Err == nil             → fire evReplaceCompleted with .Success
+//	Err != nil, recovered  → fire evReplaceRecovered with .Failure
+//	Err != nil, !recovered → fire evReplaceFailed    with .Failure
 //
 // Exported because the substrate's replace worker constructs the value
 // and the actor dispatches on its fields.
 type ReplaceResult struct {
 	CallbackErr string
 	Err         error
-	Restored    bool                 // only meaningful if Err != nil
+	Restored    bool                 // only meaningful if Err != nil && !RecoveredIfSourceActive
 	Success     ReplaceSuccessResult // populated when Err == nil
 	Failure     ReplaceFailureInfo   // populated when Err != nil
+	// RecoveredIfSourceActive, when true, tells the actor to derive the
+	// recovered-vs-failed outcome from LeaseActor.replaceWasActive (the
+	// actor-observed SM source) INSTEAD of Restored. Set ONLY by doRestart's
+	// preflight-failure branch: no container was touched, so "recovered to
+	// Ready" is correct iff the lease was Ready/running at replace-start —
+	// which the prelude's route-time status snapshot got wrong under the
+	// death-before-queued-restart ordering (ENG-230 PR#93 finding). Every
+	// other failure leaves this false: update-preflight stays Restored=false
+	// (intentional), post-replace keeps Restored=rollback result.
+	RecoveredIfSourceActive bool
 }
 
 // readProvisionStatus snapshots the lease's current provision status via
