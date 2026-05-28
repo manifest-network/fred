@@ -1247,4 +1247,4 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test result
 
 ## License
 
-[Add your license here]
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
