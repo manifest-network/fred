@@ -45,6 +45,7 @@ func TestMetricsRegistered(t *testing.T) {
 		MalformedMessagesTotal,
 		SignerPoolSize,
 		SignerPoolLaneCount,
+		SignerBalanceQueryFailures,
 	}
 
 	for _, c := range collectors {
@@ -142,6 +143,12 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")
+	})
+	assert.NotPanics(t, func() {
+		SignerBalanceQueryFailures.WithLabelValues("provider", "manifest1abc")
+	})
+	assert.NotPanics(t, func() {
+		SignerBalanceQueryFailures.WithLabelValues("sub_signer", "manifest1xyz")
 	})
 }
 

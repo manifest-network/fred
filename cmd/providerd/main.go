@@ -14,6 +14,7 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/x/authz"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
 
 	"github.com/manifest-network/fred/internal/api"
@@ -203,6 +204,19 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 		setupCancel()
 	}
+
+	// Register the per-signer balance collector. Must run after any
+	// DemoteToSingleSigner above so the collector sees the live (possibly
+	// demoted) pool shape on every scrape. Denom is hard-coded to "umfx" —
+	// the fee/balance denom for this network — to avoid coupling the gauge
+	// to cfg.SubSignerMinBalance (which is gated on HasSubSigners).
+	signerBalanceCollector := chain.NewSignerBalanceCollector(
+		banktypes.NewQueryClient(chainClient.Conn()),
+		signerPool,
+		"umfx",
+		5*time.Second,
+	)
+	prometheus.DefaultRegisterer.MustRegister(signerBalanceCollector)
 
 	// Initialize event subscriber
 	eventSub, err := chain.NewEventSubscriber(chain.EventSubscriberConfig{
