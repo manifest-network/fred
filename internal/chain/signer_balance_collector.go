@@ -27,10 +27,17 @@ const (
 // On Collect, the pool is snapshotted (live reads of ProviderAddress and
 // SubSignerAddresses), one balance query is fanned out per address against
 // the bank module, and each successful response yields one gauge series.
+// The balance (a math.Int) is emitted as a float64 via a big.Float
+// intermediate with no int64 round-trip, so balances above math.MaxInt64
+// (e.g. the ~1e29 umfx dev provider) produce a healthy series instead of
+// being misclassified as a failure; float64 is exact for integers <= 2^53,
+// with negligible relative rounding above that for threshold alerting.
 // The configured denom is both queried from bank and emitted as the `denom`
 // label so the gauge is accurate on any deployment (not just umfx-denominated
-// networks). Per-address failures drop only that address's series and bump
-// metrics.SignerBalanceQueryFailures (no per-index counter cardinality).
+// networks). Per-address query failures — a bank RPC error or a nil/empty
+// response, never a value-representation condition — drop only that address's
+// series and bump metrics.SignerBalanceQueryFailures (no per-index counter
+// cardinality).
 //
 // The collector is intentionally stateless across scrapes — it does not
 // cache balances, does not run a background sampler, and does not allocate
