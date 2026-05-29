@@ -3,8 +3,8 @@ package chain
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
+	"math/big"
 	"strconv"
 	"sync"
 	"time"
@@ -27,10 +27,17 @@ const (
 // On Collect, the pool is snapshotted (live reads of ProviderAddress and
 // SubSignerAddresses), one balance query is fanned out per address against
 // the bank module, and each successful response yields one gauge series.
+// The balance (a math.Int) is emitted as a float64 via a big.Float
+// intermediate with no int64 round-trip, so balances above math.MaxInt64
+// (e.g. the ~1e29 umfx dev provider) produce a healthy series instead of
+// being misclassified as a failure; float64 is exact for integers <= 2^53,
+// with negligible relative rounding above that for threshold alerting.
 // The configured denom is both queried from bank and emitted as the `denom`
 // label so the gauge is accurate on any deployment (not just umfx-denominated
-// networks). Per-address failures drop only that address's series and bump
-// metrics.SignerBalanceQueryFailures (no per-index counter cardinality).
+// networks). Per-address query failures — a bank RPC error or a nil/empty
+// response, never a value-representation condition — drop only that address's
+// series and bump metrics.SignerBalanceQueryFailures (no per-index counter
+// cardinality).
 //
 // The collector is intentionally stateless across scrapes — it does not
 // cache balances, does not run a background sampler, and does not allocate
@@ -91,7 +98,7 @@ func (c *SignerBalanceCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	type result struct {
-		amount int64
+		amount float64
 		err    error
 	}
 	results := make([]result, len(targets))
@@ -113,11 +120,16 @@ func (c *SignerBalanceCollector) Collect(ch chan<- prometheus.Metric) {
 				results[i] = result{err: errors.New("nil balance response")}
 				return
 			}
-			if !resp.Balance.Amount.IsInt64() {
-				results[i] = result{err: fmt.Errorf("balance %s overflows int64", resp.Balance.Amount)}
-				return
-			}
-			results[i] = result{amount: resp.Balance.Amount.Int64()}
+			// Convert math.Int → float64 directly via an arbitrary-precision
+			// big.Float intermediate. There is no int64 round-trip and no
+			// representation-based rejection: large balances (the dev provider
+			// holds ~1e29 umfx) emit a healthy gauge series instead of being
+			// misclassified as a query failure. float64 is exact for integers
+			// ≤ 2^53; above that the ~2^-52 relative rounding is irrelevant for
+			// threshold alerting. Float64() stays finite far below any realistic
+			// balance, so the discarded big.Accuracy is safe to ignore.
+			f, _ := new(big.Float).SetInt(resp.Balance.Amount.BigInt()).Float64()
+			results[i] = result{amount: f}
 		}(i)
 	}
 	wg.Wait()
@@ -137,7 +149,7 @@ func (c *SignerBalanceCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			c.desc,
 			prometheus.GaugeValue,
-			float64(r.amount),
+			r.amount,
 			t.role,
 			t.addr,
 			t.index,
