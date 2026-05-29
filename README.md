@@ -306,7 +306,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 # Or use environment variables
 ./build/providerd
 
-# Print version (all binaries support --version)
+# Print version (providerd, docker-backend, and k3s-backend support --version)
 ./build/providerd --version
 ./build/docker-backend --version
 ./build/k3s-backend --version
