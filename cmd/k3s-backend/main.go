@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -32,8 +33,18 @@ import (
 var version = "dev"
 
 func main() {
-	configPath := flag.String("config", "config.k3s.yaml", "Path to configuration file")
-	flag.Parse()
+	configPath, showVersion, err := parseFlags(os.Args[1:], os.Stdout)
+	if errors.Is(err, flag.ErrHelp) {
+		// -h/-help: usage already written to stderr; this is a clean exit.
+		os.Exit(0)
+	}
+	if err != nil {
+		// flag.ContinueOnError already wrote the error and usage to stderr.
+		os.Exit(2)
+	}
+	if showVersion {
+		os.Exit(0)
+	}
 
 	// Bootstrap logger for startup messages (before config is loaded).
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -42,7 +53,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	// Load configuration
-	cfg, err := loadConfig(*configPath)
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
@@ -159,6 +170,29 @@ func main() {
 	if startupErr != nil {
 		os.Exit(1)
 	}
+}
+
+// parseFlags parses k3s-backend's command-line arguments using a private
+// FlagSet (never the global flag.CommandLine). When -version is set it writes
+// the build-injected version to out and returns showVersion=true so main can
+// exit 0 before doing any startup work — config load, cluster probe, etc.
+// This mirrors providerd's `--version` and docker-backend's (ENG-254) so an
+// operator can query any backend's version without a valid config present.
+//
+// Usage and parse errors go to the FlagSet's default output (stderr); -h/-help
+// surfaces as flag.ErrHelp so the caller can exit 0.
+func parseFlags(args []string, out io.Writer) (configPath string, showVersion bool, err error) {
+	fs := flag.NewFlagSet("k3s-backend", flag.ContinueOnError)
+	cfgPath := fs.String("config", "config.k3s.yaml", "Path to configuration file")
+	showVer := fs.Bool("version", false, "print version information and exit")
+	if err := fs.Parse(args); err != nil {
+		return "", false, err
+	}
+	if *showVer {
+		fmt.Fprintf(out, "k3s-backend version %s\n", version)
+		return "", true, nil
+	}
+	return *cfgPath, false, nil
 }
 
 func loadConfig(path string) (k3s.Config, error) {
