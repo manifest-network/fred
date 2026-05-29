@@ -286,25 +286,43 @@ func TestSignerBalanceCollector_RaceFreeUnderConcurrentCollect(t *testing.T) {
 	wg.Wait()
 }
 
-func TestSignerBalanceCollector_BalanceOverflow_DropsSeriesAndIncrementsCounter(t *testing.T) {
+// TestSignerBalanceCollector_LargeBalance_EmitsGaugeNoFailure guards the
+// ENG-252 fix: a balance larger than math.MaxInt64 (the dev provider holds
+// ~1e29 umfx) must now emit a healthy gauge series carrying a finite, positive
+// value — NOT be misclassified as a query failure. Before the fix, the int64
+// round-trip rejected such balances via IsInt64() and dropped the series while
+// bumping fred_signer_balance_query_failures_total on every scrape.
+func TestSignerBalanceCollector_LargeBalance_EmitsGaugeNoFailure(t *testing.T) {
 	pool := newTestSignerPool(t, 0)
-	// Construct an Int strictly larger than math.MaxInt64 so IsInt64() must
-	// return false. cosmossdk.io/math does not expose MaxUint64; we reach
-	// the constant via the stdmath alias.
-	overflow := math.NewIntFromUint64(stdmath.MaxUint64).Add(math.OneInt())
+	// 1e29 is well above math.MaxInt64 (~9.2e18); this exercises the former
+	// overflow path and is in the real dev-provider range.
+	large, ok := math.NewIntFromString("100000000000000000000000000000") // 1e29
+	require.True(t, ok)
 
 	bankQ := &mockBankQuerier{
 		balanceFn: func(ctx context.Context, in *banktypes.QueryBalanceRequest, opts ...grpc.CallOption) (*banktypes.QueryBalanceResponse, error) {
 			return &banktypes.QueryBalanceResponse{
-				Balance: &sdk.Coin{Denom: "umfx", Amount: overflow},
+				Balance: &sdk.Coin{Denom: "umfx", Amount: large},
 			}, nil
 		},
 	}
 
 	_, reg := newCollectorForTest(t, bankQ, pool, "umfx", 5*time.Second)
 	samples := gatherGaugeSeries(t, reg)
-	require.Empty(t, samples, "overflowing balance must not emit a gauge series")
-	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", pool.ProviderAddress(), "umfx")))
+	require.Len(t, samples, 1, "large balance must emit exactly one provider gauge series")
+	assert.Equal(t, "provider", samples[0].role)
+	assert.Equal(t, pool.ProviderAddress(), samples[0].address)
+	assert.Equal(t, "", samples[0].index)
+	assert.Equal(t, "umfx", samples[0].denom)
+
+	v := samples[0].value
+	require.False(t, stdmath.IsInf(v, 0), "gauge value must be finite")
+	require.False(t, stdmath.IsNaN(v), "gauge value must not be NaN")
+	assert.Greater(t, v, 0.0, "gauge value must be positive")
+	assert.InEpsilon(t, 1e29, v, 1e-6, "gauge value must approximate the 1e29 balance within float64 rounding")
+
+	// A valid large balance is NOT a query failure: the counter stays at zero.
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", pool.ProviderAddress(), "umfx")))
 }
 
 // TestSignerBalanceCollector_NonDefaultDenom_PropagatesThroughQueryAndLabel
