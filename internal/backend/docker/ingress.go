@@ -49,7 +49,8 @@ type IngressConfig struct {
 
 	// CustomDomainDNSQuorum is how many of the resolvers must independently see
 	// the domain at this host before the gate opens (ENG-266). 0 (default) ==
-	// a majority of CustomDomainDNSResolvers. Clamped to [1, len(resolvers)].
+	// a majority of CustomDomainDNSResolvers. Clamped to [1, len(resolvers)],
+	// or 1 when no resolvers are configured.
 	CustomDomainDNSQuorum int `yaml:"custom_domain_dns_quorum"`
 
 	// CustomDomainDNSCheckDisabled turns OFF the readiness gate (ENG-266),

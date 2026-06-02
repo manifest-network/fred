@@ -95,6 +95,25 @@ func TestCustomDomainResolvesToHost_IPv6Match(t *testing.T) {
 	assert.True(t, ok)
 }
 
+func TestCustomDomainResolvesToHost_HostAddressWithPort(t *testing.T) {
+	// host_address may include a port (Config.Validate allows it); the readiness
+	// check must resolve the host part, not the literal "host:port".
+	res := &fakeResolver{hosts: map[string][]net.IPAddr{
+		"app.example.com":         ipAddrs("203.0.113.8"),
+		"s100-u028.manifest0.net": ipAddrs("203.0.113.8"),
+	}}
+	t.Run("literal IP with port", func(t *testing.T) {
+		ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "203.0.113.8:443")
+		require.NoError(t, err)
+		assert.True(t, ok)
+	})
+	t.Run("hostname with port", func(t *testing.T) {
+		ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "s100-u028.manifest0.net:8443")
+		require.NoError(t, err)
+		assert.True(t, ok)
+	})
+}
+
 func TestCustomDomainReadyByQuorum(t *testing.T) {
 	const host, hostIP = "s100-u028.manifest0.net", "203.0.113.8"
 	// mk builds a resolver whose view of app.example.com is domainIP

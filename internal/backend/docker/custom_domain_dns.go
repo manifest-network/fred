@@ -56,6 +56,12 @@ func customDomainResolvesToHost(ctx context.Context, res ipResolver, domain, hos
 // resolveToIPs returns the IPs for addr, treating a literal IP as a 1-element
 // set without a lookup.
 func resolveToIPs(ctx context.Context, res ipResolver, addr string) ([]net.IP, error) {
+	// host_address may carry a port (Config.Validate accepts e.g.
+	// "203.0.113.8:443" / "example.com:8443" and strips it the same way);
+	// resolve the host part, not the literal "host:port".
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		addr = h
+	}
 	if ip := net.ParseIP(addr); ip != nil {
 		return []net.IP{ip}, nil
 	}
