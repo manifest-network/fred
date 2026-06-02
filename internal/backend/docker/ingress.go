@@ -76,7 +76,7 @@ func (ic IngressConfig) dnsResolvers() []string {
 }
 
 // dnsQuorum returns the configured quorum, or a majority of n when unset (0),
-// clamped to [1, n].
+// clamped to [1, n]. With no resolvers (n == 0) it returns 1.
 func (ic IngressConfig) dnsQuorum(n int) int {
 	q := ic.CustomDomainDNSQuorum
 	if q <= 0 {

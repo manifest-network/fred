@@ -517,7 +517,14 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		b.customDomainDNSReady = func(ctx context.Context, domain string) bool {
 			cctx, cancel := context.WithTimeout(ctx, customDomainDNSCheckTimeout)
 			defer cancel()
-			return customDomainReadyByQuorum(cctx, resolvers, domain, hostAddr, quorum)
+			ready, hostErr := customDomainReadyByQuorum(cctx, resolvers, domain, hostAddr, quorum)
+			if !ready && hostErr != nil {
+				// host_address itself isn't resolving — a provider misconfig that
+				// would otherwise silently defer every custom domain forever.
+				b.logger.Warn("custom-domain DNS readiness: host_address not resolvable; deferring issuance (check ingress host_address and its DNS)",
+					"custom_domain", domain, "host_address", hostAddr, "error", hostErr)
+			}
+			return ready
 		}
 	}
 

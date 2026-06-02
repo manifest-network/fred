@@ -38,7 +38,7 @@ func customDomainResolvesToHost(ctx context.Context, res ipResolver, domain, hos
 	if derr != nil {
 		// NXDOMAIN / SERVFAIL / timeout on the tenant domain == not ready yet.
 		// This is the expected pre-propagation state, not an error.
-		return false, nil
+		return false, nil //nolint:nilerr // domain not resolving yet is "not ready", not an error to surface
 	}
 
 	hostSet := make(map[string]struct{}, len(hostIPs))
@@ -96,37 +96,50 @@ func newResolvers(servers []string) []ipResolver {
 func majorityQuorum(n int) int { return n/2 + 1 }
 
 // customDomainReadyByQuorum queries each resolver INDEPENDENTLY and returns
-// true iff at least `quorum` of them see `domain` resolving to a host IP.
+// whether at least `quorum` of them see `domain` resolving to a host IP, plus
+// the first host-resolution error encountered (if any). Callers should log a
+// non-nil error: it means host_address itself could not be resolved (a
+// config/infra problem) which otherwise silently defers ALL issuance with no
+// operator signal. A domain that simply doesn't resolve yet is NOT an error —
+// it's a "not ready" vote.
+//
 // Mirrors Let's Encrypt multi-perspective validation: one resolver's stale
 // NXDOMAIN cache can't block issuance (others still count) and one
-// early-propagated resolver can't force a premature order. A resolver whose
-// host lookup errors casts a "not ready" vote for that perspective.
+// early-propagated resolver can't force a premature order.
 //
 // The N lookups run concurrently and are all joined before return (no
 // goroutine outlives this call); the buffered channel guarantees no sender
 // blocks; ctx cancellation/timeout bounds every lookup. With 0 resolvers it
-// returns false (gate stays closed rather than silently opening).
-func customDomainReadyByQuorum(ctx context.Context, resolvers []ipResolver, domain, hostAddress string, quorum int) bool {
+// returns (false, nil) — the gate stays closed rather than silently opening.
+func customDomainReadyByQuorum(ctx context.Context, resolvers []ipResolver, domain, hostAddress string, quorum int) (bool, error) {
 	if len(resolvers) == 0 {
-		return false
+		return false, nil
 	}
-	votes := make(chan bool, len(resolvers))
+	type vote struct {
+		ready   bool
+		hostErr error
+	}
+	votes := make(chan vote, len(resolvers))
 	var wg sync.WaitGroup
 	for _, r := range resolvers {
 		wg.Add(1)
 		go func(rr ipResolver) {
 			defer wg.Done()
 			ok, err := customDomainResolvesToHost(ctx, rr, domain, hostAddress)
-			votes <- (err == nil && ok)
+			votes <- vote{ready: err == nil && ok, hostErr: err}
 		}(r)
 	}
 	wg.Wait()
 	close(votes)
 	ready := 0
+	var hostErr error
 	for v := range votes {
-		if v {
+		if v.ready {
 			ready++
 		}
+		if v.hostErr != nil && hostErr == nil {
+			hostErr = v.hostErr
+		}
 	}
-	return ready >= quorum
+	return ready >= quorum, hostErr
 }

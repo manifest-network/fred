@@ -41,9 +41,18 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		if d == "" {
 			continue
 		}
-		if _, seen := dnsReady[d]; !seen {
-			dnsReady[d] = b.dnsGateAllows(ctx, d)
+		if _, seen := dnsReady[d]; seen {
+			continue
 		}
+		// Validate before any DNS I/O: a malformed/forbidden value is rejected
+		// by the diff loop below anyway, so resolving it is wasted network work
+		// — and would needlessly send a bad value to the public resolvers.
+		// Record it as not-ready so a (rare) duplicate isn't re-validated.
+		if err := validateCustomDomain(d, b.cfg.Ingress.WildcardDomain); err != nil {
+			dnsReady[d] = false
+			continue
+		}
+		dnsReady[d] = b.dnsGateAllows(ctx, d)
 	}
 
 	b.provisionsMu.Lock()

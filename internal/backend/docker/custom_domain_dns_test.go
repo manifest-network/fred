@@ -125,7 +125,7 @@ func TestCustomDomainReadyByQuorum(t *testing.T) {
 			for i, ip := range tc.domainIPs {
 				resolvers[i] = mk(ip)
 			}
-			got := customDomainReadyByQuorum(context.Background(), resolvers, "app.example.com", host, tc.quorum)
+			got, _ := customDomainReadyByQuorum(context.Background(), resolvers, "app.example.com", host, tc.quorum)
 			assert.Equal(t, tc.want, got)
 		})
 	}
