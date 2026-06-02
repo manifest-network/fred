@@ -540,12 +540,53 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 	return nil
 }
 
+// deferUnreadyCustomDomains zeroes the CustomDomain of any item whose domain
+// does not yet resolve to this host (ENG-266), so the provision emits no
+// -custom Traefik router — and Traefik fires no HTTP-01 order — before DNS is
+// live. The periodic reconcile (ReconcileCustomDomain) re-applies the domain on
+// a later tick once it resolves. Mutates items in place: in the provision path
+// the items slice also backs the stored prov.Items, so the in-memory state and
+// the emitted container labels stay consistent.
+func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend.LeaseItem, leaseUUID string, logger *slog.Logger) {
+	// Phase 1: decide which items to defer — DNS I/O, no lock held.
+	var toDefer []int
+	for i := range items {
+		d := items[i].CustomDomain
+		if d == "" {
+			continue
+		}
+		// Validate before any DNS I/O: a malformed/forbidden value is rejected
+		// at label-emit time (applyIngressLabels), so resolving it is wasted
+		// network work and would leak the bad value to the public resolvers.
+		if err := validateCustomDomain(d, b.cfg.Ingress.WildcardDomain); err != nil {
+			continue
+		}
+		if !b.dnsGateAllows(ctx, d) {
+			logger.Info("custom_domain set but DNS not yet pointing at this host; deferring to reconcile",
+				"lease_uuid", leaseUUID, "custom_domain", d)
+			toDefer = append(toDefer, i)
+		}
+	}
+	if len(toDefer) == 0 {
+		return
+	}
+	// Phase 2: apply under provisionsMu. In the provision path `items` aliases
+	// the stored prov.Items (assigned under the lock in Provision), which other
+	// goroutines (recoverState, reconcile) read/write under provisionsMu — so
+	// the mutation must hold it too.
+	b.provisionsMu.Lock()
+	for _, i := range toDefer {
+		items[i].CustomDomain = ""
+	}
+	b.provisionsMu.Unlock()
+}
+
 // doProvision performs container creation for a stack (multi-service) lease
 // using Docker Compose. Compose handles container creation, start ordering, and
 // network attachment atomically via a single Up call.
 //
-// See doProvision for the (callbackErr, result, logs, err) return contract.
-// Stack-specific result fields are stackManifest + serviceContainers.
+// Returns the (callbackErr, result, logs, err) contract; stack-specific result
+// fields are stackManifest + serviceContainers.
 func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
@@ -688,6 +729,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		callbackErr = "volume creation failed"
 		return
 	}
+
+	// DNS-readiness gate (ENG-266): defer not-yet-resolving custom domains so
+	// provision doesn't fire a premature HTTP-01 order; the reconcile adds them
+	// once DNS is live.
+	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
 
 	// Build Compose project and bring it up.
 	project := buildComposeProject(composeProjectParams{

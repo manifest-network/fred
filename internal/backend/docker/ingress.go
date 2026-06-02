@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
 
@@ -39,6 +40,23 @@ type IngressConfig struct {
 	// applied to the secondary custom-domain router. Defaults to
 	// ["security-headers@file"] when empty.
 	CustomDomainMiddlewares []string `yaml:"custom_domain_middlewares"`
+
+	// CustomDomainDNSResolvers are the DNS servers (host:port) fred queries to
+	// check whether a tenant custom domain resolves to this host before
+	// emitting its HTTP-01 router (ENG-266). Public resolvers are used so the
+	// answer matches what the ACME CA sees. Defaults to Cloudflare 1.1.1.1:53 /
+	// Google 8.8.8.8:53 / Quad9 9.9.9.9:53.
+	CustomDomainDNSResolvers []string `yaml:"custom_domain_dns_resolvers"`
+
+	// CustomDomainDNSQuorum is how many of the resolvers must independently see
+	// the domain at this host before the gate opens (ENG-266). 0 (default) ==
+	// a majority of CustomDomainDNSResolvers. Clamped to [1, len(resolvers)],
+	// or 1 when no resolvers are configured.
+	CustomDomainDNSQuorum int `yaml:"custom_domain_dns_quorum"`
+
+	// CustomDomainDNSCheckDisabled turns OFF the readiness gate (ENG-266),
+	// reverting to emitting the custom-domain router immediately. Default false.
+	CustomDomainDNSCheckDisabled bool `yaml:"custom_domain_dns_check_disabled"`
 }
 
 // Defaults applied at label-emit time when IngressConfig fields are empty.
@@ -46,6 +64,34 @@ const (
 	defaultCustomDomainCertResolver = "http01"
 	defaultCustomDomainMiddleware   = "security-headers@file"
 )
+
+// defaultCustomDomainDNSResolvers are queried when IngressConfig leaves
+// CustomDomainDNSResolvers empty. Public resolvers ≈ the ACME CA's view.
+var defaultCustomDomainDNSResolvers = []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"}
+
+// dnsResolvers returns the configured resolvers or the public defaults.
+func (ic IngressConfig) dnsResolvers() []string {
+	if len(ic.CustomDomainDNSResolvers) > 0 {
+		return ic.CustomDomainDNSResolvers
+	}
+	return defaultCustomDomainDNSResolvers
+}
+
+// dnsQuorum returns the configured quorum, or a majority of n when unset (0),
+// clamped to [1, n]. With no resolvers (n == 0) it returns 1.
+func (ic IngressConfig) dnsQuorum(n int) int {
+	q := ic.CustomDomainDNSQuorum
+	if q <= 0 {
+		q = majorityQuorum(n)
+	}
+	if q > n {
+		q = n
+	}
+	if q < 1 {
+		q = 1
+	}
+	return q
+}
 
 // maxDNSLabel is the maximum length of a single DNS label (RFC 1035).
 const maxDNSLabel = 63
@@ -202,6 +248,18 @@ func (ic *IngressConfig) Validate() error {
 	}
 	if ic.Entrypoint == "" {
 		return fmt.Errorf("ingress.entrypoint is required when ingress is enabled")
+	}
+	// Configured DNS resolvers (ENG-266) must be host:port — a bad entry would
+	// dead-end in DialContext and silently defer all custom-domain issuance. An
+	// empty list is fine; defaultCustomDomainDNSResolvers is used instead.
+	for _, r := range ic.CustomDomainDNSResolvers {
+		host, port, err := net.SplitHostPort(r)
+		if err != nil || host == "" {
+			return fmt.Errorf("ingress.custom_domain_dns_resolvers entry %q must be host:port", r)
+		}
+		if p, perr := strconv.ParseUint(port, 10, 16); perr != nil || p == 0 {
+			return fmt.Errorf("ingress.custom_domain_dns_resolvers entry %q has an invalid port (must be 1-65535)", r)
+		}
 	}
 	return nil
 }

@@ -267,3 +267,10 @@ reconcile_interval: 5m
 #   enabled: true
 #   wildcard_domain: "example.com"    # *.example.com DNS must point to this host
 #   entrypoint: "websecure"           # Traefik entrypoint for HTTPS
+#   # ENG-266: gate tenant custom-domain HTTP-01 cert issuance on the domain
+#   # actually resolving to this host (avoids ACME NXDOMAIN negative-cache
+#   # stalls). The public resolvers are queried independently and a quorum must
+#   # agree, matching what Let's Encrypt's multi-perspective validation sees.
+#   custom_domain_dns_resolvers: ["1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"]
+#   custom_domain_dns_quorum: 0              # resolvers that must agree; 0 = majority
+#   custom_domain_dns_check_disabled: false  # true = emit -custom router immediately (no gate)

@@ -30,6 +30,31 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	if !b.cfg.Ingress.Enabled {
 		return nil
 	}
+
+	// Precompute DNS readiness for each non-empty incoming custom domain BEFORE
+	// taking provisionsMu — the lookups do network I/O (a quorum of public
+	// resolvers) and must not block the lock. Keyed by domain; a lease has 0-1
+	// custom domains in practice. (ENG-266)
+	dnsReady := make(map[string]bool)
+	for i := range items {
+		d := items[i].CustomDomain
+		if d == "" {
+			continue
+		}
+		if _, seen := dnsReady[d]; seen {
+			continue
+		}
+		// Validate before any DNS I/O: a malformed/forbidden value is rejected
+		// by the diff loop below anyway, so resolving it is wasted network work
+		// — and would needlessly send a bad value to the public resolvers.
+		// Record it as not-ready so a (rare) duplicate isn't re-validated.
+		if err := validateCustomDomain(d, b.cfg.Ingress.WildcardDomain); err != nil {
+			dnsReady[d] = false
+			continue
+		}
+		dnsReady[d] = b.dnsGateAllows(ctx, d)
+	}
+
 	b.provisionsMu.Lock()
 	prov, ok := b.provisions[leaseUUID]
 	if !ok {
@@ -93,22 +118,37 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 			// do here.
 			continue
 		}
-		if prov.Items[idx].CustomDomain == chainItem.CustomDomain {
-			continue
-		}
-		// Defense-in-depth: chain validates on MsgSetItemCustomDomain,
-		// but we re-run the same check here so a malformed value (e.g. set
-		// before this validation existed, or via a future chain bug) cannot
-		// leak into Traefik labels. Empty domain (clear) bypasses the FQDN
-		// check.
-		if chainItem.CustomDomain != "" {
-			if err := validateCustomDomain(chainItem.CustomDomain, b.cfg.Ingress.WildcardDomain); err != nil {
+		emitted := prov.Items[idx].CustomDomain
+		desired := chainItem.CustomDomain
+		// Defense-in-depth: chain validates on MsgSetItemCustomDomain, but we
+		// re-run the cheap checks here so a malformed value (e.g. set before
+		// this validation existed, or via a future chain bug) cannot leak into
+		// Traefik labels. Empty domain (clear) bypasses the FQDN check.
+		if desired != "" {
+			if err := validateCustomDomain(desired, b.cfg.Ingress.WildcardDomain); err != nil {
 				logger.Error("skipping custom-domain reconcile (validation failed)",
 					"service_name", prov.Items[idx].ServiceName,
-					"custom_domain", chainItem.CustomDomain,
+					"custom_domain", desired,
 					"error", err)
 				continue
 			}
+		}
+		// Asymmetric DNS-readiness gate (ENG-266): only gate emitting a domain
+		// that is not already the emitted one. Never tear down an
+		// already-emitted domain on a transient DNS mismatch; clearing ("") is
+		// never gated. dnsReady was precomputed before the lock.
+		if desired != "" && desired != emitted && !dnsReady[desired] {
+			// Debug, not Info: this fires every reconcile tick while a domain is
+			// still propagating (the expected steady state for a pending domain),
+			// so Info would spam at scale. Genuine host_address resolution
+			// failures are surfaced at Warn by the readiness checker (backend.go).
+			logger.Debug("custom_domain set but DNS not yet pointing at this host; deferring cert issuance",
+				"service_name", prov.Items[idx].ServiceName,
+				"custom_domain", desired)
+			desired = emitted
+		}
+		if emitted == desired {
+			continue
 		}
 		// Apply now while we still hold the lock. The rollback snapshot keys on
 		// the provision item's ACTUAL ServiceName (not the normalized key) so it
@@ -116,10 +156,10 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		// rollback runs.
 		pending = append(pending, pendingChange{
 			serviceName: prov.Items[idx].ServiceName,
-			oldValue:    prov.Items[idx].CustomDomain,
-			newValue:    chainItem.CustomDomain,
+			oldValue:    emitted,
+			newValue:    desired,
 		})
-		prov.Items[idx].CustomDomain = chainItem.CustomDomain
+		prov.Items[idx].CustomDomain = desired
 	}
 
 	if len(pending) == 0 {
