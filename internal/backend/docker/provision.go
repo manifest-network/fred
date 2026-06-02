@@ -546,6 +546,23 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 //
 // See doProvision for the (callbackErr, result, logs, err) return contract.
 // Stack-specific result fields are stackManifest + serviceContainers.
+// deferUnreadyCustomDomains zeroes the CustomDomain of any item whose domain
+// does not yet resolve to this host (ENG-266), so the provision emits no
+// -custom Traefik router — and Traefik fires no HTTP-01 order — before DNS is
+// live. The periodic reconcile (ReconcileCustomDomain) re-applies the domain on
+// a later tick once it resolves. Mutates items in place: in the provision path
+// the items slice also backs the stored prov.Items, so the in-memory state and
+// the emitted container labels stay consistent.
+func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend.LeaseItem, leaseUUID string, logger *slog.Logger) {
+	for i := range items {
+		if items[i].CustomDomain != "" && !b.dnsGateAllows(ctx, items[i].CustomDomain) {
+			logger.Info("custom_domain set but DNS not yet pointing at this host; deferring to reconcile",
+				"lease_uuid", leaseUUID, "custom_domain", items[i].CustomDomain)
+			items[i].CustomDomain = ""
+		}
+	}
+}
+
 func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
@@ -688,6 +705,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		callbackErr = "volume creation failed"
 		return
 	}
+
+	// DNS-readiness gate (ENG-266): defer not-yet-resolving custom domains so
+	// provision doesn't fire a premature HTTP-01 order; the reconcile adds them
+	// once DNS is live.
+	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
 
 	// Build Compose project and bring it up.
 	project := buildComposeProject(composeProjectParams{

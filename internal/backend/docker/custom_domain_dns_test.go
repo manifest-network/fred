@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 type fakeResolver struct {
@@ -138,4 +140,23 @@ func TestDNSGateAllows_DelegatesToFunc(t *testing.T) {
 	b := &Backend{customDomainDNSReady: func(_ context.Context, d string) bool { called = d; return false }}
 	assert.False(t, b.dnsGateAllows(context.Background(), "app.example.com"))
 	assert.Equal(t, "app.example.com", called)
+}
+
+func TestDeferUnreadyCustomDomains(t *testing.T) {
+	// ENG-266 provision-path gate: zero the CustomDomain of items whose DNS
+	// isn't pointing here yet (so provision emits no -custom router / no order),
+	// preserve ready ones, leave empties untouched. Mutates in place.
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.customDomainDNSReady = func(_ context.Context, d string) bool { return d == "ready.example.com" }
+
+	items := []backend.LeaseItem{
+		{ServiceName: "app", CustomDomain: "notready.example.com"},
+		{ServiceName: "api", CustomDomain: "ready.example.com"},
+		{ServiceName: "db", CustomDomain: ""},
+	}
+	b.deferUnreadyCustomDomains(context.Background(), items, "lease-1", b.logger)
+
+	assert.Equal(t, "", items[0].CustomDomain, "not-ready domain must be deferred (zeroed)")
+	assert.Equal(t, "ready.example.com", items[1].CustomDomain, "ready domain must be preserved")
+	assert.Equal(t, "", items[2].CustomDomain, "empty stays empty")
 }
