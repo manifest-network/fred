@@ -540,3 +540,73 @@ func TestReconcileCustomDomain_Clear_NotGated(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrInvalidState, "clear must still trigger a Restart (here failing on nil manifest)")
 }
+
+func TestReconcileCustomDomain_ChangedDomain_NewNotReady(t *testing.T) {
+	// ENG-266: domain changes old->new while new's DNS isn't pointing here yet.
+	// The gate must keep the OLD domain emitted (not switch, not tear down) and
+	// stage no change (no Restart) until new resolves.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Status: backend.ProvisionStatusReady,
+		Items:  []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: "old.example.com"}}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return false }
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "old.example.com", b.provisions["lease-1"].Items[0].CustomDomain,
+		"a not-ready new domain must not replace the working old one")
+}
+
+func TestReconcileCustomDomain_ChangedDomain_NewReady(t *testing.T) {
+	// Same change but new's DNS is ready → switch to new (Restart fails on nil
+	// manifest, proving the switch to "new.example.com" was staged, then rolls
+	// back to old for the next tick).
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Tenant: "t", ProviderUUID: "p", SKU: "docker-small",
+		Status: backend.ProvisionStatusReady, StackManifest: nil, ContainerIDs: []string{"c1"},
+		Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"}}, Quantity: 1},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInvalidState)
+	assert.Equal(t, "old.example.com", b.provisions["lease-1"].Items[0].CustomDomain,
+		"failed Restart rolls the staged new domain back to old")
+}
+
+func TestReconcileCustomDomain_MultiService_MixedReadiness(t *testing.T) {
+	// Per-service independence: an already-emitted service is untouched while a
+	// different service's not-ready new domain is deferred — same reconcile, no
+	// Restart.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Status: backend.ProvisionStatusReady,
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", ServiceName: "frontend", CustomDomain: "live.example.com"},
+			{SKU: "docker-small", ServiceName: "api", CustomDomain: ""},
+		}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, d string) bool { return d == "live.example.com" }
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "frontend", CustomDomain: "live.example.com"},
+		{SKU: "docker-small", ServiceName: "api", CustomDomain: "notready.example.com"},
+	})
+	require.NoError(t, err)
+	byService := map[string]string{}
+	for _, it := range b.provisions["lease-1"].Items {
+		byService[it.ServiceName] = it.CustomDomain
+	}
+	assert.Equal(t, "live.example.com", byService["frontend"], "already-emitted service untouched")
+	assert.Equal(t, "", byService["api"], "not-ready service deferred independently")
+}

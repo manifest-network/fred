@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 type fakeResolver struct {
@@ -116,6 +117,7 @@ func TestCustomDomainReadyByQuorum(t *testing.T) {
 		{"majority despite one proxied edge IP", []string{"104.16.0.1", hostIP, hostIP}, 2, true},
 		{"only one propagated", []string{hostIP, "", ""}, 2, false},
 		{"none resolve", []string{"", "", ""}, 2, false},
+		{"no resolvers configured (gate stays closed)", []string{}, 1, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -159,4 +161,69 @@ func TestDeferUnreadyCustomDomains(t *testing.T) {
 	assert.Equal(t, "", items[0].CustomDomain, "not-ready domain must be deferred (zeroed)")
 	assert.Equal(t, "ready.example.com", items[1].CustomDomain, "ready domain must be preserved")
 	assert.Equal(t, "", items[2].CustomDomain, "empty stays empty")
+}
+
+func TestNewResolvers(t *testing.T) {
+	servers := []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"}
+	rs := newResolvers(servers)
+	require.Len(t, rs, len(servers), "one independent resolver per server")
+	for i, r := range rs {
+		res, ok := r.(*net.Resolver)
+		require.Truef(t, ok, "resolver %d must be a *net.Resolver", i)
+		assert.True(t, res.PreferGo, "must use the Go resolver so the per-server Dial is honored")
+		assert.NotNil(t, res.Dial, "must pin queries to a single server via Dial")
+	}
+}
+
+func TestIngressConfig_DnsQuorum(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured int
+		n          int
+		want       int
+	}{
+		{"unset → majority of 3", 0, 3, 2},
+		{"unset → majority of 5", 0, 5, 3},
+		{"explicit 2 of 3", 2, 3, 2},
+		{"above n clamps to n", 9, 3, 3},
+		{"explicit 1", 1, 3, 1},
+		{"no resolvers → 1", 0, 0, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ic := IngressConfig{CustomDomainDNSQuorum: tc.configured}
+			assert.Equal(t, tc.want, ic.dnsQuorum(tc.n))
+		})
+	}
+}
+
+func TestDeferUnreadyCustomDomains_SuppressesCustomLabel(t *testing.T) {
+	// End-to-end for the provision gate: the helper's mutation must actually
+	// suppress the -custom Traefik router label in the built project (ENG-266),
+	// and leave it present when the domain is ready.
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.customDomainDNSReady = func(_ context.Context, d string) bool { return d == "ready.example.com" }
+
+	buildWebLabels := func(domain string) map[string]string {
+		params := baseProjectParams()
+		params.Stack.Services["web"] = &manifest.Manifest{
+			Image: "nginx:latest",
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
+		}
+		params.Items[0].CustomDomain = domain
+		params.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+		b.deferUnreadyCustomDomains(context.Background(), params.Items, params.LeaseUUID, b.logger)
+		return buildComposeProject(params).Services["web"].Labels
+	}
+
+	t.Run("not ready → no -custom router / no custom-domain label", func(t *testing.T) {
+		labels := buildWebLabels("notready.example.com")
+		assert.Empty(t, labels[LabelCustomDomain])
+		router := CustomDomainRouterName("lease-1", "web")
+		assert.NotContains(t, labels, "traefik.http.routers."+router+".rule")
+	})
+	t.Run("ready → -custom router emitted", func(t *testing.T) {
+		labels := buildWebLabels("ready.example.com")
+		assert.Equal(t, "ready.example.com", labels[LabelCustomDomain])
+	})
 }
