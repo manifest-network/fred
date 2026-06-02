@@ -412,3 +412,52 @@ func TestReconcileCustomDomain_LegacyEmptyServiceName(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "foo.example.com", b.provisions["lease-1"].Items[0].CustomDomain)
 }
+
+func TestReconcileCustomDomain_FreshSingleImage_ChainServiceNameEmpty(t *testing.T) {
+	// ENG-264 regression. A freshly-provisioned single-image lease has its
+	// lone item normalized to DefaultServiceName ("app") on the provision path
+	// (NormalizeProvisionRequest), so the container carries
+	// fred.service_name="app" and recoverState rebuilds
+	// prov.Items[].ServiceName="app". A custom_domain set AFTER deploy arrives
+	// here from chain via ExtractLeaseItems, which copies the RAW on-chain
+	// service_name — "" for a single-image deploy created without
+	// -service-name. Matching "app" against "" finds nothing, so drift is never
+	// detected and the domain is silently dropped (no -custom router, no cert).
+	//
+	// The reconcile must normalize BOTH sides (a lone unnamed item → "app")
+	// before matching. We assert drift IS detected by driving the synchronous
+	// Restart-error path (StackManifest nil → ErrInvalidState): that error only
+	// fires if a pending change was staged, i.e. chain "" matched container
+	// "app". Before the fix this returns nil (no drift); after, it errors.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Tenant:        "tenant-a",
+		ProviderUUID:  "prov-1",
+		SKU:           "docker-small",
+		Status:        backend.ProvisionStatusReady,
+		StackManifest: nil,
+		ContainerIDs:  []string{"old-c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: ""},
+		},
+		Quantity: 1},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "barney0.manifest0.net",
+		Entrypoint:     "websecure",
+	}
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.Error(t, err,
+		`drift must be detected: chain service_name="" must match container ServiceName="app" after normalization (ENG-264)`)
+	assert.ErrorIs(t, err, backend.ErrInvalidState)
+
+	// The failed Restart rolls the staged value back to the original "".
+	b.provisionsMu.RLock()
+	got := b.provisions["lease-1"].Items[0].CustomDomain
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "", got, "failed Restart must roll back the staged CustomDomain")
+}
