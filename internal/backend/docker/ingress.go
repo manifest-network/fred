@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
 
@@ -247,6 +248,15 @@ func (ic *IngressConfig) Validate() error {
 	}
 	if ic.Entrypoint == "" {
 		return fmt.Errorf("ingress.entrypoint is required when ingress is enabled")
+	}
+	// Configured DNS resolvers (ENG-266) must be host:port — a bad entry would
+	// dead-end in DialContext and silently defer all custom-domain issuance. An
+	// empty list is fine; defaultCustomDomainDNSResolvers is used instead.
+	for _, r := range ic.CustomDomainDNSResolvers {
+		host, port, err := net.SplitHostPort(r)
+		if err != nil || host == "" || port == "" {
+			return fmt.Errorf("ingress.custom_domain_dns_resolvers entry %q must be host:port", r)
+		}
 	}
 	return nil
 }

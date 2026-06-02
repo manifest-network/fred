@@ -286,3 +286,25 @@ func TestDeferUnreadyCustomDomains_MutatesUnderLock(t *testing.T) {
 
 	assert.Equal(t, "", items[0].CustomDomain, "not-ready domain deferred")
 }
+
+func TestIngressConfig_Validate_DNSResolvers(t *testing.T) {
+	base := IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	t.Run("empty list is valid (defaults apply)", func(t *testing.T) {
+		require.NoError(t, base.Validate())
+	})
+	t.Run("valid host:port entries (incl. IPv6)", func(t *testing.T) {
+		ic := base
+		ic.CustomDomainDNSResolvers = []string{"1.1.1.1:53", "[2001:4860:4860::8888]:53"}
+		require.NoError(t, ic.Validate())
+	})
+	t.Run("missing port is rejected", func(t *testing.T) {
+		ic := base
+		ic.CustomDomainDNSResolvers = []string{"1.1.1.1"}
+		require.Error(t, ic.Validate())
+	})
+	t.Run("empty entry is rejected", func(t *testing.T) {
+		ic := base
+		ic.CustomDomainDNSResolvers = []string{""}
+		require.Error(t, ic.Validate())
+	})
+}
