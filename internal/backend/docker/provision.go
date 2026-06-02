@@ -554,6 +554,8 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 // the items slice also backs the stored prov.Items, so the in-memory state and
 // the emitted container labels stay consistent.
 func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend.LeaseItem, leaseUUID string, logger *slog.Logger) {
+	// Phase 1: decide which items to defer — DNS I/O, no lock held.
+	var toDefer []int
 	for i := range items {
 		d := items[i].CustomDomain
 		if d == "" {
@@ -568,9 +570,21 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 		if !b.dnsGateAllows(ctx, d) {
 			logger.Info("custom_domain set but DNS not yet pointing at this host; deferring to reconcile",
 				"lease_uuid", leaseUUID, "custom_domain", d)
-			items[i].CustomDomain = ""
+			toDefer = append(toDefer, i)
 		}
 	}
+	if len(toDefer) == 0 {
+		return
+	}
+	// Phase 2: apply under provisionsMu. In the provision path `items` aliases
+	// the stored prov.Items (assigned under the lock in Provision), which other
+	// goroutines (recoverState, reconcile) read/write under provisionsMu — so
+	// the mutation must hold it too.
+	b.provisionsMu.Lock()
+	for _, i := range toDefer {
+		items[i].CustomDomain = ""
+	}
+	b.provisionsMu.Unlock()
 }
 
 func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
