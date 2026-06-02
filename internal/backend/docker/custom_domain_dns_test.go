@@ -152,6 +152,21 @@ func TestCustomDomainReadyByQuorum(t *testing.T) {
 	}
 }
 
+func TestCustomDomainReadyByQuorum_CapturesHostError(t *testing.T) {
+	// Even when readiness is decided early (here quorum is impossible), a genuine
+	// host-resolution error from any resolver must still be returned for the
+	// operator warning — not masked by reading only the votes seen before the
+	// decision. Reliable regardless of vote order because all votes are read.
+	const host = "s100-u028.manifest0.net"
+	r1 := &fakeResolver{errs: map[string]error{host: errors.New("SERVFAIL")}}         // host lookup errors
+	r2 := &fakeResolver{hosts: map[string][]net.IPAddr{host: ipAddrs("203.0.113.8")}} // host ok, domain NXDOMAIN
+	r3 := &fakeResolver{hosts: map[string][]net.IPAddr{host: ipAddrs("203.0.113.8")}}
+
+	ready, hostErr := customDomainReadyByQuorum(context.Background(), []ipResolver{r1, r2, r3}, "app.example.com", host, 2)
+	assert.False(t, ready, "domain resolves nowhere → not ready")
+	require.Error(t, hostErr, "a genuine host-resolution error must be surfaced even after an early decision")
+}
+
 func TestDNSGateAllows_NilFuncIsAlwaysReady(t *testing.T) {
 	b := &Backend{} // customDomainDNSReady nil
 	assert.True(t, b.dnsGateAllows(context.Background(), "anything.example.com"),

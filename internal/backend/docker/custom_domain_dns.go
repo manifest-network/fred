@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -144,22 +145,32 @@ func customDomainReadyByQuorum(ctx context.Context, resolvers []ipResolver, doma
 
 	ready, notReady := 0, 0
 	maxNotReady := len(resolvers) - quorum // once notReady exceeds this, quorum is impossible
+	decided := false
 	var hostErr error
+	// Read every vote so a genuine host-resolution error is reliably captured
+	// for diagnostics, but make the readiness decision as soon as it's final and
+	// cancel the outstanding lookups — the canceled lookups then return
+	// promptly, so a slow/hung resolver can't add its full timeout to latency.
 	for range resolvers {
 		v := <-votes
-		if v.ready {
-			ready++
-		} else {
-			notReady++
+		if !decided {
+			if v.ready {
+				ready++
+			} else {
+				notReady++
+			}
+			if ready >= quorum || notReady > maxNotReady {
+				decided = true
+				cancel()
+			}
 		}
-		if v.hostErr != nil && hostErr == nil {
+		// Capture the first genuine host-resolution error. Skip context.Canceled
+		// — that's our own cancellation of a not-yet-finished lookup, not a host
+		// problem, and surfacing it would mislead operators.
+		if hostErr == nil && v.hostErr != nil && !errors.Is(v.hostErr, context.Canceled) {
 			hostErr = v.hostErr
 		}
-		if ready >= quorum || notReady > maxNotReady {
-			cancel() // decided — stop the remaining lookups
-			break
-		}
 	}
-	wg.Wait() // reap every goroutine (canceled lookups return promptly); no leak
+	wg.Wait() // reap every goroutine; no leak
 	return ready >= quorum, hostErr
 }
