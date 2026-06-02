@@ -519,9 +519,10 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 			defer cancel()
 			ready, hostErr := customDomainReadyByQuorum(cctx, resolvers, domain, hostAddr, quorum)
 			if !ready && hostErr != nil {
-				// host_address itself isn't resolving — a provider misconfig that
-				// would otherwise silently defer every custom domain forever.
-				b.logger.Warn("custom-domain DNS readiness: host_address not resolvable; deferring issuance (check ingress host_address and its DNS)",
+				// host_address couldn't be resolved via the configured resolvers
+				// (misconfig, resolver outage, or network) — without this log we'd
+				// silently defer every custom domain with no operator signal.
+				b.logger.Warn("custom-domain DNS readiness: could not resolve host_address via the configured resolvers; deferring issuance (check host_address, the resolvers, and network reachability)",
 					"custom_domain", domain, "host_address", hostAddr, "error", hostErr)
 			}
 			return ready

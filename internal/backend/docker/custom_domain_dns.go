@@ -107,14 +107,20 @@ func majorityQuorum(n int) int { return n/2 + 1 }
 // NXDOMAIN cache can't block issuance (others still count) and one
 // early-propagated resolver can't force a premature order.
 //
-// The N lookups run concurrently and are all joined before return (no
-// goroutine outlives this call); the buffered channel guarantees no sender
-// blocks; ctx cancellation/timeout bounds every lookup. With 0 resolvers it
+// The N lookups run concurrently; once the outcome is decided (quorum reached,
+// or no longer reachable) the remaining lookups are canceled so a slow/hung
+// resolver can't add its full timeout to the readiness latency. All goroutines
+// are still joined (wg.Wait) before return — none outlives this call — and the
+// buffered channel guarantees no sender ever blocks. With 0 resolvers it
 // returns (false, nil) — the gate stays closed rather than silently opening.
 func customDomainReadyByQuorum(ctx context.Context, resolvers []ipResolver, domain, hostAddress string, quorum int) (bool, error) {
 	if len(resolvers) == 0 {
 		return false, nil
 	}
+	// Cancel outstanding lookups as soon as the result is decided.
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	type vote struct {
 		ready   bool
 		hostErr error
@@ -125,21 +131,29 @@ func customDomainReadyByQuorum(ctx context.Context, resolvers []ipResolver, doma
 		wg.Add(1)
 		go func(rr ipResolver) {
 			defer wg.Done()
-			ok, err := customDomainResolvesToHost(ctx, rr, domain, hostAddress)
+			ok, err := customDomainResolvesToHost(cctx, rr, domain, hostAddress)
 			votes <- vote{ready: err == nil && ok, hostErr: err}
 		}(r)
 	}
-	wg.Wait()
-	close(votes)
-	ready := 0
+
+	ready, notReady := 0, 0
+	maxNotReady := len(resolvers) - quorum // once notReady exceeds this, quorum is impossible
 	var hostErr error
-	for v := range votes {
+	for range resolvers {
+		v := <-votes
 		if v.ready {
 			ready++
+		} else {
+			notReady++
 		}
 		if v.hostErr != nil && hostErr == nil {
 			hostErr = v.hostErr
 		}
+		if ready >= quorum || notReady > maxNotReady {
+			cancel() // decided — stop the remaining lookups
+			break
+		}
 	}
+	wg.Wait() // reap every goroutine (canceled lookups return promptly); no leak
 	return ready >= quorum, hostErr
 }

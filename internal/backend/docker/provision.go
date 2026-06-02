@@ -555,9 +555,19 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 // the emitted container labels stay consistent.
 func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend.LeaseItem, leaseUUID string, logger *slog.Logger) {
 	for i := range items {
-		if items[i].CustomDomain != "" && !b.dnsGateAllows(ctx, items[i].CustomDomain) {
+		d := items[i].CustomDomain
+		if d == "" {
+			continue
+		}
+		// Validate before any DNS I/O: a malformed/forbidden value is rejected
+		// at label-emit time (applyIngressLabels), so resolving it is wasted
+		// network work and would leak the bad value to the public resolvers.
+		if err := validateCustomDomain(d, b.cfg.Ingress.WildcardDomain); err != nil {
+			continue
+		}
+		if !b.dnsGateAllows(ctx, d) {
 			logger.Info("custom_domain set but DNS not yet pointing at this host; deferring to reconcile",
-				"lease_uuid", leaseUUID, "custom_domain", items[i].CustomDomain)
+				"lease_uuid", leaseUUID, "custom_domain", d)
 			items[i].CustomDomain = ""
 		}
 	}
