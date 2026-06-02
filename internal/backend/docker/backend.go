@@ -62,6 +62,12 @@ type Backend struct {
 	volumes volumeManager
 	logger  *slog.Logger
 
+	// customDomainDNSReady gates HTTP-01 cert issuance on the custom domain
+	// resolving to this host (ENG-266). Set in New() to a public-resolver
+	// quorum check, unless the gate is disabled in config. nil == always
+	// ready (tests, and the disabled path); see dnsGateAllows.
+	customDomainDNSReady func(ctx context.Context, domain string) bool
+
 	// provisions tracks active provisions by lease UUID
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
@@ -369,6 +375,18 @@ func stackContainerLogKeys(serviceContainers map[string][]string) map[string]str
 }
 
 // New creates a new Docker backend.
+// customDomainDNSCheckTimeout bounds a single readiness check (all resolvers).
+const customDomainDNSCheckTimeout = 5 * time.Second
+
+// dnsGateAllows reports whether the custom domain may be emitted now. A nil
+// checker (tests, or gate disabled) allows everything.
+func (b *Backend) dnsGateAllows(ctx context.Context, domain string) bool {
+	if b.customDomainDNSReady == nil {
+		return true
+	}
+	return b.customDomainDNSReady(ctx, domain)
+}
+
 func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -488,6 +506,20 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	b.inspector = &dockerInstanceInspector{docker: b.docker}
 	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
 	b.provisionStore = &backendProvisionStore{backend: b}
+
+	// Gate custom-domain HTTP-01 issuance on the domain resolving to this host
+	// (ENG-266). A quorum of public resolvers mirrors what the ACME CA sees.
+	// Left nil when disabled, which dnsGateAllows treats as always-ready.
+	if b.cfg.Ingress.Enabled && !b.cfg.Ingress.CustomDomainDNSCheckDisabled {
+		resolvers := newResolvers(b.cfg.Ingress.dnsResolvers())
+		quorum := b.cfg.Ingress.dnsQuorum(len(resolvers))
+		hostAddr := b.cfg.HostAddress
+		b.customDomainDNSReady = func(ctx context.Context, domain string) bool {
+			cctx, cancel := context.WithTimeout(ctx, customDomainDNSCheckTimeout)
+			defer cancel()
+			return customDomainReadyByQuorum(cctx, resolvers, domain, hostAddr, quorum)
+		}
+	}
 
 	return b, nil
 }

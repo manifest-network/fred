@@ -126,3 +126,16 @@ func TestCustomDomainReadyByQuorum(t *testing.T) {
 		})
 	}
 }
+
+func TestDNSGateAllows_NilFuncIsAlwaysReady(t *testing.T) {
+	b := &Backend{} // customDomainDNSReady nil
+	assert.True(t, b.dnsGateAllows(context.Background(), "anything.example.com"),
+		"nil checker (tests / gate disabled) must allow emission unconditionally")
+}
+
+func TestDNSGateAllows_DelegatesToFunc(t *testing.T) {
+	called := ""
+	b := &Backend{customDomainDNSReady: func(_ context.Context, d string) bool { called = d; return false }}
+	assert.False(t, b.dnsGateAllows(context.Background(), "app.example.com"))
+	assert.Equal(t, "app.example.com", called)
+}
