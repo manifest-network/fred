@@ -610,3 +610,31 @@ func TestReconcileCustomDomain_MultiService_MixedReadiness(t *testing.T) {
 	assert.Equal(t, "live.example.com", byService["frontend"], "already-emitted service untouched")
 	assert.Equal(t, "", byService["api"], "not-ready service deferred independently")
 }
+
+func TestReconcileCustomDomain_DeferredThenReady(t *testing.T) {
+	// ENG-266 core behavior: a domain set while DNS isn't ready is deferred on
+	// one tick, then emitted on a later tick once DNS resolves — same domain, no
+	// chain change in between.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Tenant: "t", ProviderUUID: "p", SKU: "docker-small",
+		Status: backend.ProvisionStatusReady, StackManifest: nil, ContainerIDs: []string{"c1"},
+		Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: ""}}, Quantity: 1},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+
+	ready := false
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return ready }
+	chain := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "app.example.com"}}
+
+	// Tick 1: DNS not ready → deferred, no change staged, no error.
+	require.NoError(t, b.ReconcileCustomDomain(context.Background(), "lease-1", chain))
+	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain, "tick 1: deferred while DNS not ready")
+
+	// Tick 2: DNS now ready → drift staged → Restart attempted (nil manifest →
+	// ErrInvalidState proves the emission was staged this time).
+	ready = true
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", chain)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInvalidState, "tick 2: domain emitted once DNS becomes ready")
+}

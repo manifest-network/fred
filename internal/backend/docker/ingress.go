@@ -254,8 +254,11 @@ func (ic *IngressConfig) Validate() error {
 	// empty list is fine; defaultCustomDomainDNSResolvers is used instead.
 	for _, r := range ic.CustomDomainDNSResolvers {
 		host, port, err := net.SplitHostPort(r)
-		if err != nil || host == "" || port == "" {
+		if err != nil || host == "" {
 			return fmt.Errorf("ingress.custom_domain_dns_resolvers entry %q must be host:port", r)
+		}
+		if p, perr := strconv.ParseUint(port, 10, 16); perr != nil || p == 0 {
+			return fmt.Errorf("ingress.custom_domain_dns_resolvers entry %q has an invalid port (must be 1-65535)", r)
 		}
 	}
 	return nil

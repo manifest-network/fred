@@ -138,7 +138,11 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		// already-emitted domain on a transient DNS mismatch; clearing ("") is
 		// never gated. dnsReady was precomputed before the lock.
 		if desired != "" && desired != emitted && !dnsReady[desired] {
-			logger.Info("custom_domain set but DNS not yet pointing at this host; deferring cert issuance",
+			// Debug, not Info: this fires every reconcile tick while a domain is
+			// still propagating (the expected steady state for a pending domain),
+			// so Info would spam at scale. Genuine host_address resolution
+			// failures are surfaced at Warn by the readiness checker (backend.go).
+			logger.Debug("custom_domain set but DNS not yet pointing at this host; deferring cert issuance",
 				"service_name", prov.Items[idx].ServiceName,
 				"custom_domain", desired)
 			desired = emitted

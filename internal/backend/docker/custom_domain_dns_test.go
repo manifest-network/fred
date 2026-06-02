@@ -322,4 +322,19 @@ func TestIngressConfig_Validate_DNSResolvers(t *testing.T) {
 		ic.CustomDomainDNSResolvers = []string{""}
 		require.Error(t, ic.Validate())
 	})
+	t.Run("non-numeric port is rejected", func(t *testing.T) {
+		ic := base
+		ic.CustomDomainDNSResolvers = []string{"1.1.1.1:abc"}
+		require.Error(t, ic.Validate())
+	})
+	t.Run("out-of-range port is rejected", func(t *testing.T) {
+		ic := base
+		ic.CustomDomainDNSResolvers = []string{"1.1.1.1:65536"}
+		require.Error(t, ic.Validate())
+	})
+	t.Run("port zero is rejected", func(t *testing.T) {
+		ic := base
+		ic.CustomDomainDNSResolvers = []string{"1.1.1.1:0"}
+		require.Error(t, ic.Validate())
+	})
 }
