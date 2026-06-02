@@ -540,12 +540,6 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 	return nil
 }
 
-// doProvision performs container creation for a stack (multi-service) lease
-// using Docker Compose. Compose handles container creation, start ordering, and
-// network attachment atomically via a single Up call.
-//
-// See doProvision for the (callbackErr, result, logs, err) return contract.
-// Stack-specific result fields are stackManifest + serviceContainers.
 // deferUnreadyCustomDomains zeroes the CustomDomain of any item whose domain
 // does not yet resolve to this host (ENG-266), so the provision emits no
 // -custom Traefik router — and Traefik fires no HTTP-01 order — before DNS is
@@ -587,6 +581,12 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 	b.provisionsMu.Unlock()
 }
 
+// doProvision performs container creation for a stack (multi-service) lease
+// using Docker Compose. Compose handles container creation, start ordering, and
+// network attachment atomically via a single Up call.
+//
+// Returns the (callbackErr, result, logs, err) contract; stack-specific result
+// fields are stackManifest + serviceContainers.
 func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string

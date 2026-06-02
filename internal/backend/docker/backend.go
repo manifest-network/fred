@@ -374,7 +374,6 @@ func stackContainerLogKeys(serviceContainers map[string][]string) map[string]str
 	return keys
 }
 
-// New creates a new Docker backend.
 // customDomainDNSCheckTimeout bounds a single readiness check (all resolvers).
 const customDomainDNSCheckTimeout = 5 * time.Second
 
@@ -387,6 +386,7 @@ func (b *Backend) dnsGateAllows(ctx context.Context, domain string) bool {
 	return b.customDomainDNSReady(ctx, domain)
 }
 
+// New creates a new Docker backend.
 func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
