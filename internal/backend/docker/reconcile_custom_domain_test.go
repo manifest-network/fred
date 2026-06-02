@@ -461,3 +461,82 @@ func TestReconcileCustomDomain_FreshSingleImage_ChainServiceNameEmpty(t *testing
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, "", got, "failed Restart must roll back the staged CustomDomain")
 }
+
+func TestReconcileCustomDomain_NotDNSReady_DoesNotEmit(t *testing.T) {
+	// ENG-266: domain set on chain, container has none yet, DNS not pointing
+	// here → reconcile must NOT stage a change (no -custom router, no order, no
+	// Restart). With no change staged, the method returns nil and the in-memory
+	// value stays "".
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Status: backend.ProvisionStatusReady,
+		Items:  []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: ""}}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return false }
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain,
+		"not-ready domain must not be staged for emission")
+}
+
+func TestReconcileCustomDomain_DNSReady_Emits(t *testing.T) {
+	// Same shape as NotDNSReady but DNS ready → drift detected → Restart
+	// attempted. StackManifest nil makes Restart fail synchronously
+	// (ErrInvalidState), which only fires if a change was staged.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Tenant: "t", ProviderUUID: "p", SKU: "docker-small",
+		Status: backend.ProvisionStatusReady, StackManifest: nil, ContainerIDs: []string{"c1"},
+		Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: ""}}, Quantity: 1},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInvalidState)
+}
+
+func TestReconcileCustomDomain_AlreadyEmitted_NotTornDownOnDNSBlip(t *testing.T) {
+	// Domain already emitted; DNS now NOT matching (transient). Must NOT remove
+	// it — no change staged, no Restart, value preserved.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Status: backend.ProvisionStatusReady,
+		Items:  []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: "live.example.com"}}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return false }
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "", CustomDomain: "live.example.com"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "live.example.com", b.provisions["lease-1"].Items[0].CustomDomain,
+		"an already-emitted domain must not be removed on a transient DNS mismatch")
+}
+
+func TestReconcileCustomDomain_Clear_NotGated(t *testing.T) {
+	// Chain clears the domain; removal must proceed regardless of DNS readiness
+	// (here the Restart fails on nil manifest, proving a change was staged).
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Tenant: "t", ProviderUUID: "p", SKU: "docker-small",
+		Status: backend.ProvisionStatusReady, StackManifest: nil, ContainerIDs: []string{"c1"},
+		Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"}}, Quantity: 1},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return false } // irrelevant for clear
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: ""},
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInvalidState, "clear must still trigger a Restart (here failing on nil manifest)")
+}
