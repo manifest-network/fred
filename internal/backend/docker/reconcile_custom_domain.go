@@ -42,9 +42,9 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	}
 
 	// Compute per-position diff: for each incoming item, find the matching
-	// provision item by ServiceName (legacy uses "" on both sides), validate
-	// the new domain, and stage the change. Validation failures are skipped
-	// per item — bad inputs never block the rest of the reconcile.
+	// provision item by normalized service name (see normalizedServiceKeys),
+	// validate the new domain, and stage the change. Validation failures are
+	// skipped per item — bad inputs never block the rest of the reconcile.
 	//
 	// Rollback identifies items by ServiceName (NOT by index) plus a
 	// value-CAS check. Between this section's unlock and the rollback path's
@@ -63,10 +63,24 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 
 	logger := slog.With("lease_uuid", leaseUUID)
 
-	for _, chainItem := range items {
+	// Match chain items to provision items by their NORMALIZED service name.
+	// The provision path runs NormalizeProvisionRequest, which tags a lone
+	// unnamed item with DefaultServiceName ("app"); that normalized name is
+	// what lands in the container label and, via recoverState, in
+	// prov.Items[].ServiceName. The chain items handed to us carry the RAW
+	// on-chain service_name (ExtractLeaseItems does no normalization), which is
+	// "" for a single-image deploy created without -service-name. Normalizing
+	// both sides keeps them in lock-step; matching the raw strings would miss
+	// ("app" != "") and silently drop a custom_domain set after deploy
+	// (ENG-264).
+	chainKeys := normalizedServiceKeys(items)
+	provKeys := normalizedServiceKeys(prov.Items)
+
+	for ci := range items {
+		chainItem := items[ci]
 		idx := -1
 		for i := range prov.Items {
-			if prov.Items[i].ServiceName == chainItem.ServiceName {
+			if provKeys[i] == chainKeys[ci] {
 				idx = i
 				break
 			}
@@ -90,17 +104,18 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		if chainItem.CustomDomain != "" {
 			if err := validateCustomDomain(chainItem.CustomDomain, b.cfg.Ingress.WildcardDomain); err != nil {
 				logger.Error("skipping custom-domain reconcile (validation failed)",
-					"service_name", chainItem.ServiceName,
+					"service_name", prov.Items[idx].ServiceName,
 					"custom_domain", chainItem.CustomDomain,
 					"error", err)
 				continue
 			}
 		}
-		// Apply now while we still hold the lock; the snapshot for rollback
-		// keys on ServiceName so we can safely re-find the item if the
-		// provision struct is replaced before rollback runs.
+		// Apply now while we still hold the lock. The rollback snapshot keys on
+		// the provision item's ACTUAL ServiceName (not the normalized key) so it
+		// re-finds the item even if the provision struct is replaced before
+		// rollback runs.
 		pending = append(pending, pendingChange{
-			serviceName: chainItem.ServiceName,
+			serviceName: prov.Items[idx].ServiceName,
 			oldValue:    prov.Items[idx].CustomDomain,
 			newValue:    chainItem.CustomDomain,
 		})
@@ -156,4 +171,29 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		return err
 	}
 	return nil
+}
+
+// normalizedServiceKeys returns, for each item, the service name it resolves
+// to after the same boundary normalization the provision path applies — a lone
+// unnamed item (service_name == "") becomes DefaultServiceName ("app"). This
+// lets the reconcile match chain items (whose ServiceName is the RAW on-chain
+// value — "" for a single-image deploy created without -service-name) against
+// prov.Items, whose ServiceName came from the normalized container labels
+// (NormalizeProvisionRequest runs at provision, so the container is labeled
+// "app"). Matching the raw strings would miss ("app" != "") and silently drop
+// a custom_domain set after deploy (ENG-264).
+//
+// Best-effort: NormalizeProvisionRequest only rewrites the lone-unnamed case
+// and otherwise leaves names untouched, erroring (without mutating) only on
+// structurally-invalid sets — mixed or multiple-unnamed — which chain
+// validation prevents for a real lease. On error we fall back to the raw
+// names, which is no worse than the pre-fix exact-string match.
+func normalizedServiceKeys(items []backend.LeaseItem) []string {
+	cp := append([]backend.LeaseItem(nil), items...)
+	_ = backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: cp})
+	keys := make([]string, len(cp))
+	for i := range cp {
+		keys[i] = cp[i].ServiceName
+	}
+	return keys
 }
