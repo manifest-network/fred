@@ -414,13 +414,13 @@ Stack manifest service names must match on-chain lease items **exactly 1:1**:
 
 This ensures the operator provisions exactly the resources the tenant is paying for.
 
-> **Pick the format from your lease shape — a flat manifest does not adopt your item's name.**
-> If any lease item has a non-empty `service_name`, you **must** send a **stack** manifest whose
-> `services` keys match those names exactly. A flat (single-service) manifest is **always**
-> auto-wrapped under the synthetic name `app`, regardless of your lease item's name — so pairing a
-> flat manifest with a named item fails with `manifest service "app" has no matching lease item`.
-> The flat form is only valid for a lease with a **single, unnamed** item (`service_name: ""`),
-> which Fred normalizes to `app`.
+> **Pick the format from your lease shape — a flat manifest is always named `app`.**
+> If any lease item has a `service_name` **other than `app`**, you **must** send a **stack**
+> manifest whose `services` keys match those names exactly. A flat (single-service) manifest is
+> **always** auto-wrapped under the synthetic name `app`, so it only matches a lease whose single
+> item is named `app` or left unnamed (`service_name: ""`, which Fred normalizes to `app`).
+> Pairing a flat manifest with any **other** named item fails with
+> `manifest service "app" has no matching lease item`.
 
 ### depends_on
 
@@ -647,7 +647,7 @@ Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume 
 | Service name with uppercase | `must match [a-z0-9]...` | Use lowercase DNS labels |
 | Service name > 63 chars | `exceeds 63 characters` | Shorten the name |
 | Manifest services don't match lease items | `has no matching lease item` | Ensure 1:1 mapping between services and lease items |
-| Named lease item paired with a flat manifest | `manifest service "app" has no matching lease item` | Flat manifests are always named `app`; send a stack manifest whose service key matches the item's `service_name`, or leave the item unnamed (`service_name: ""`) |
+| Named lease item (other than `app`) paired with a flat manifest | `manifest service "app" has no matching lease item` | Flat manifests are always named `app`; send a stack manifest whose service key matches the item's `service_name`, or name the single item `app` / leave it unnamed (`service_name: ""`) |
 | Typo in field name | `unknown field "volumez"` | Check spelling; unknown fields are rejected |
 | `stop_grace_period` too short | `must be at least 1s` | Use a value ≥ 1s |
 | `stop_grace_period` too long | `must be at most 120s` | Use a value ≤ 120s |
