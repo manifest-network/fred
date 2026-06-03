@@ -629,3 +629,100 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 	b.stopCancel()
 	b.wg.Wait()
 }
+
+func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
+	// Lock-discipline guard (run under -race): ReconcileCustomDomain and
+	// recoverState hammering the same lease concurrently must not race and must
+	// converge to the new domain. Correctness of the interleaving is pinned by
+	// TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain.
+	stack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"app": {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+		},
+	}
+	manifestBytes, err := json.Marshal(stack)
+	require.NoError(t, err)
+	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "releases.db"),
+	})
+	require.NoError(t, err)
+	defer releaseStore.Close()
+	require.NoError(t, releaseStore.Append("lease-1", shared.Release{
+		Manifest: manifestBytes, Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}))
+
+	callbackReceived := make(chan struct{}, 1)
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackReceived <- struct{}{}:
+		default:
+		}
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{{
+				ContainerID: "old-app", LeaseUUID: "lease-1", SKU: "docker-small",
+				Tenant: "tenant-a", ProviderUUID: "prov-1", CallbackURL: callbackServer.URL,
+				ServiceName: "app", InstanceIndex: 0, Status: "running",
+				CustomDomain: "old.example.com", Name: "fred-lease-1-app-0",
+			}}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error { return nil },
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{ID: "new-app-c1", Service: "app", State: "running"}}, nil
+		},
+	}
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", ProviderUUID: "prov-1", SKU: "docker-small",
+			Status: backend.ProvisionStatusReady, StackManifest: stack,
+			ContainerIDs: []string{"old-app"}, ServiceContainers: map[string][]string{"app": {"old-app"}},
+			CallbackURL: callbackServer.URL,
+			Items:       []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"}},
+			Quantity:    1}},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	defer b.stopCancel()
+	b.compose = composeMock
+	b.releaseStore = releaseStore
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+
+	chain := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"}}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			_ = b.recoverState(context.Background())
+		}
+	}()
+	// Reconcile retries against the concurrent swap until the redeploy is
+	// accepted (ErrInvalidState/no-op ticks are expected while a swap is mid-flight).
+	require.Eventually(t, func() bool {
+		_ = b.ReconcileCustomDomain(context.Background(), "lease-1", chain)
+		select {
+		case <-callbackReceived:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 20*time.Millisecond)
+	wg.Wait()
+
+	b.stopCancel()
+	b.wg.Wait()
+}
