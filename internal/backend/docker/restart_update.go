@@ -14,9 +14,15 @@ import (
 )
 
 // applyCustomDomainOverrides applies per-ServiceName custom_domain values to the
-// given items slice (which must be a COPY of prov.Items, never prov.Items
-// itself). Keyed by ServiceName so it is robust to a recoverState rebuild that
-// reorders Items. No-op when overrides is empty. (ENG-231)
+// given items slice, keyed by ServiceName so it is robust to a recoverState
+// rebuild that reorders Items. No-op when overrides is empty.
+//
+// Two call sites (ENG-231), with opposite intent about WHICH slice to pass:
+//   - routeReplaceRestart passes the off-actor worker-snapshot COPY. It must NOT
+//     pass prov.Items here — that would be an off-actor mutation of live state.
+//   - customDomainOnSuccess passes prov.Items itself, to COMMIT the values. That
+//     is safe (and intended) because it runs on the serial actor goroutine inside
+//     onEnterReadyFromReplaceCompleted's UpdateFn, the sole writer of prov.Items.
 func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]string) {
 	if len(overrides) == 0 {
 		return
