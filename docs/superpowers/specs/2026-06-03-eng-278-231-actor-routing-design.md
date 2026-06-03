@@ -69,29 +69,43 @@ The in-flight Ready-gate (`reconcile_custom_domain.go:64`) already prevents re-e
 
 ## Concrete changes per file
 
-- **`internal/backend/docker/reconcile_custom_domain.go`** — the diff loop computes `overrides map[string]string` (serviceName→desiredDomain) instead of mutating `prov.Items[idx]` and recording `pendingChange`. Delete the `prov.Items[idx].CustomDomain = desired` write (`:162`), the post-`Restart` CAS rollback block (`:196-211`), and the `pendingChange` struct. If `len(overrides)==0`, return nil. Otherwise route the redeploy with `overrides`. `normalizedServiceKeys` stays.
-- **`internal/backend/docker/restart_update.go`** — factor the restart routing so it can carry custom-domain overrides:
-  - The shared routing applies `overrides` (by `ServiceName`) to the worker's `items` snapshot, and, when `overrides != nil`, sets an `OnSuccess` closure on the replace op that re-applies `overrides` to `prov.Items` by `ServiceName`.
-  - Public `Restart(ctx, RestartRequest)` calls the shared routing with `overrides == nil` (behavior-identical).
+- **`internal/backend/docker/reconcile_custom_domain.go`** — factor into two production-justified pieces (single responsibility; also what makes the deterministic test possible without any test-only prod surface):
+  - `computeCustomDomainOverrides(prov, items) (overrides map[string]string, ok bool)` — **read-only** under the caller's `provisionsMu`: runs the existing `normalizedServiceKeys` match + `validateCustomDomain` + asymmetric DNS gate and returns the `ServiceName`→desiredDomain map for changed items. No `prov.Items` mutation.
+  - `ReconcileCustomDomain` keeps the ingress guard + DNS precompute, takes the lock, calls `computeCustomDomainOverrides`, captures `callbackURL`, unlocks; if no overrides, returns nil; otherwise calls `routeReplaceRestart(...)`.
+  - Delete the `prov.Items[idx].CustomDomain = desired` write (`:162`), the post-`Restart` CAS rollback block (`:196-211`), and the `pendingChange` struct.
+- **`internal/backend/docker/restart_update.go`** — factor the restart routing into a shared internal `routeReplaceRestart(ctx, leaseUUID, callbackURL string, overrides map[string]string) error`:
+  - It snapshots `prov.Items` in the prelude and, when `overrides != nil`, applies them by `ServiceName` to the worker's item snapshot, and sets an `OnSuccess` closure on the replace op that re-applies `overrides` to `prov.Items` by `ServiceName`.
+  - Public `Restart(ctx, RestartRequest)` becomes a thin call to `routeReplaceRestart(..., nil)` (behavior-identical).
   - `doRestart` gains an `onSuccess func(*leasesm.ProvisionState)` parameter threaded onto `replaceContainersOp.OnSuccess` (currently unset for the restart op).
-  - *Factoring note for the plan:* prefer a single internal entry (e.g. `routeReplaceRestart(ctx, leaseUUID, callbackURL, overrides)`). Computing the diff in the reconciler under one lock and snapshotting in the restart prelude under a second lock are both correct because `overrides` is idempotent and `ServiceName`-keyed; whether to collapse to one lock acquisition is an implementation choice, not a correctness one.
+  - *Note:* the reconciler computing overrides under one lock and `routeReplaceRestart` snapshotting under a second lock is correct because `overrides` is idempotent and `ServiceName`-keyed (a `recoverState` swap between the two re-applies the same desired value). This two-phase shape is also the seam the deterministic test drives.
 - **`internal/backend/docker/recover.go`** — **no change** (the `Restarting`-preserve branch at `:301` + the map swap at `:341` already provide the property the fix relies on). Listed only to flag it as deliberately untouched.
 - **`internal/backend/shared/leasesm/`** — **no change.** `OnSuccess` already exists on `ReplaceSuccessResult` (`lease_sm.go:821-824`) and is invoked on the actor goroutine in `onEnterReadyFromReplaceCompleted` (`:551-552`). No new message type or handler.
-- **`internal/backend/docker/` (Backend struct)** — add an unexported test-only hook field (nil in prod), e.g. `reconcileApplyHook func()`, invoked in `ReconcileCustomDomain` immediately after the reconciler releases `provisionsMu` following the diff (i.e. in the bug window, before the redeploy is routed). Documented as test-only.
+- **No test-only production code.** The reconcile is split into `computeCustomDomainOverrides` (read-only) and `routeReplaceRestart` (shared with `Restart`) purely for single-responsibility; the test reaches the interleaving by calling these directly (white-box), so **no hook field, flag, or other test-only surface is added to `Backend` or any prod type.**
 
-## Test strategy (deterministic regression test)
+## Test strategy
 
-A green `go test -race` over the existing *synchronous* reconcile tests proves nothing about this race (the corpus notes "ReconcileCustomDomain runs synchronously"). The regression test forces the real interleaving deterministically:
+A green `go test -race` over the existing *synchronous* reconcile tests proves nothing about this race (the corpus notes "ReconcileCustomDomain runs synchronously"). Two complementary tests, **neither requiring any test-only production code**:
 
-1. Provision a lease to `Ready` with the **old** domain in both `prov.Items` and the fake container labels; wire a compose mock that captures the built project.
-2. Set `reconcileApplyHook` to run `recoverState` (which rebuilds from the old-labeled fake containers and swaps the map) — so the swap lands exactly in the bug window.
-3. Drive `ReconcileCustomDomain` with the chain wanting the **new** domain (`dnsReady[new]=true`).
-4. Assert: (a) the compose project the worker built carries the **new** `LabelCustomDomain`; (b) `b.provisions[uuid].Items[idx].CustomDomain == new` after the cycle; (c) `Status` went `Ready→Restarting→Ready`.
+### 1. Deterministic regression test (primary discriminator) — white-box, no hook
 
-- **Pre-fix (TDD red):** the hook's swap reverts `prov.Items` to old; `Restart`'s prelude re-snapshots old → worker renders old → assertion (a)/(b) fail.
-- **Post-fix (green):** the override is already captured/re-applied by `ServiceName` → worker renders new → passes.
+Drives the exact "`recoverState` swap lands in the `Ready` window" interleaving by calling the two factored pieces in order, with a real `recoverState` in between:
 
-The hook + a real `recoverState` call make the interleaving deterministic; the old/new domain is the discriminator, not the race detector. Existing tests that assert the CAS-rollback behavior are removed/rewritten (the CAS is deleted); the other synchronous reconcile tests stay.
+1. Provision a lease to `Ready` with the **old** domain in both `prov.Items` and the fake container labels; wire a compose fake that captures the built project.
+2. Under `provisionsMu`, call `computeCustomDomainOverrides(prov, chainItemsWithNewDomain)` → `overrides = {svc: new}`; unlock. (Chain wants the **new** domain; `dnsReady[new]=true`.)
+3. Call `b.recoverState(ctx)` — it rebuilds from the old-labeled fake containers and swaps the whole map (`prov.Items` reverts to **old**). This is the concurrent swap, made deterministic by sequencing it in the window.
+4. Call `routeReplaceRestart(ctx, uuid, callbackURL, overrides)`; drain the actor to completion.
+5. Assert: (a) the compose project the worker built carries the **new** `LabelCustomDomain`; (b) `b.provisions[uuid].Items[idx].CustomDomain == new` after the cycle; (c) `Status` went `Ready→Restarting→Ready`.
+
+- **Pre-fix (TDD red):** before the override mechanism exists, the redeploy re-snapshots the swapped `prov.Items` (old) → worker renders old → assertions (a)/(b) fail.
+- **Post-fix (green):** `routeReplaceRestart` re-applies `overrides` by `ServiceName` to the post-swap snapshot → worker renders new → passes.
+
+The discriminator is the old/new domain, not the race detector. No `Backend` hook/flag is added — the test simply calls the (production-justified) unexported `computeCustomDomainOverrides` and `routeReplaceRestart` from a `package docker` white-box test.
+
+### 2. Complementary concurrency test (lock-discipline guard) — `-race`
+
+Run `ReconcileCustomDomain` and `recoverState` in separate goroutines against the same lease (a handful of iterations) under `-race`, asserting no race report and that the final rendered/committed domain is the new one. This guards the lock discipline of the new write path (every `prov.Items` access stays lock-/actor-serialized); it is a guard, not the primary bug discriminator (test 1 is).
+
+Existing tests that assert the CAS-rollback behavior are removed/rewritten (the CAS is deleted); the other synchronous reconcile tests stay.
 
 ## Acceptance criteria
 
