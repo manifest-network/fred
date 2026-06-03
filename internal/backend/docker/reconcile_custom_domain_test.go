@@ -2,13 +2,22 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestReconcileCustomDomain_NoProvision(t *testing.T) {
@@ -451,4 +460,172 @@ func TestReconcileCustomDomain_DeferredThenReady(t *testing.T) {
 	err := b.ReconcileCustomDomain(context.Background(), "lease-1", chain)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrInvalidState, "tick 2: domain emitted once DNS becomes ready")
+}
+
+func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T) {
+	// ENG-278 regression. A recoverState struct-swap that reverts
+	// prov.Items[].CustomDomain to the OLD container-label value, landing in the
+	// Ready window, must NOT cause the redeploy to render the old domain. The
+	// override is captured read-only before the swap and re-applied by
+	// ServiceName, so the redeploy renders NEW and the actor commits NEW.
+
+	// Stack manifest with a routable port so the custom-domain Traefik label
+	// (LabelCustomDomain) is actually rendered (ingress gate requires a port).
+	stack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"app": {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+		},
+	}
+
+	// Seed a release store with an ACTIVE stack release so recoverState restores
+	// StackManifest after it rebuilds the (Ready) provision from labels.
+	manifestBytes, err := json.Marshal(stack)
+	require.NoError(t, err)
+	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "releases.db"),
+	})
+	require.NoError(t, err)
+	defer releaseStore.Close()
+	require.NoError(t, releaseStore.Append("lease-1", shared.Release{
+		Manifest: manifestBytes, Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}))
+
+	// mu guards both callbackPayload (written by the callback handler goroutine,
+	// read at the assertion) and capturedProject (written by the compose Up mock).
+	var mu sync.Mutex
+
+	// Callback server signals redeploy completion.
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		w.WriteHeader(http.StatusOK)
+		mu.Lock()
+		callbackPayload = p
+		mu.Unlock()
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	// Fake managed container carrying the OLD domain label — what recoverState
+	// rebuilds prov.Items from.
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{{
+				ContainerID:   "old-app",
+				LeaseUUID:     "lease-1",
+				SKU:           "docker-small",
+				Tenant:        "tenant-a",
+				ProviderUUID:  "prov-1",
+				CallbackURL:   callbackServer.URL,
+				ServiceName:   "app",
+				InstanceIndex: 0,
+				Status:        "running",
+				CustomDomain:  "old.example.com",
+				Name:          "fred-lease-1-app-0",
+			}}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	var capturedProject *composetypes.Project
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			mu.Lock()
+			capturedProject = project
+			mu.Unlock()
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{ID: "new-app-c1", Service: "app", State: "running"}}, nil
+		},
+	}
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant:            "tenant-a",
+			ProviderUUID:      "prov-1",
+			SKU:               "docker-small",
+			Status:            backend.ProvisionStatusReady,
+			StackManifest:     stack,
+			ContainerIDs:      []string{"old-app"},
+			ServiceContainers: map[string][]string{"app": {"old-app"}},
+			CallbackURL:       callbackServer.URL,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"},
+			},
+			Quantity: 1},
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	defer b.stopCancel()
+	b.compose = composeMock
+	b.releaseStore = releaseStore
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+
+	chain := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"}}
+
+	// 1. Compute the override read-only while Ready (mirrors ReconcileCustomDomain
+	//    under provisionsMu), with the new domain DNS-ready.
+	// DNS readiness is supplied directly to computeCustomDomainOverrides here, so
+	// b.customDomainDNSReady (the production probe) is intentionally not wired in this white-box test.
+	b.provisionsMu.Lock()
+	prov := b.provisions["lease-1"]
+	overrides := b.computeCustomDomainOverrides(prov, chain, map[string]bool{"new.example.com": true})
+	callbackURL := prov.CallbackURL
+	b.provisionsMu.Unlock()
+	require.Equal(t, map[string]string{"app": "new.example.com"}, overrides,
+		`chain service_name "" must normalize to "app" and stage the new domain`)
+
+	// 2. Concurrent recoverState lands in the Ready window: it rebuilds the
+	//    provision from the OLD-labeled container and swaps the map.
+	require.NoError(t, b.recoverState(context.Background()))
+	b.provisionsMu.RLock()
+	swapped := b.provisions["lease-1"].Items[0].CustomDomain
+	b.provisionsMu.RUnlock()
+	require.Equal(t, "old.example.com", swapped, "sanity: recoverState swapped prov.Items back to the old domain")
+
+	// 3. Route the redeploy with the pre-swap override.
+	require.NoError(t, b.routeReplaceRestart(context.Background(), "lease-1", callbackURL, overrides))
+
+	// 4. Wait for the async redeploy to complete.
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for redeploy callback")
+	}
+	mu.Lock()
+	gotStatus := callbackPayload.Status
+	mu.Unlock()
+	require.Equal(t, backend.CallbackStatusSuccess, gotStatus)
+
+	// 5. The redeploy rendered the NEW domain despite the swap.
+	mu.Lock()
+	proj := capturedProject
+	mu.Unlock()
+	require.NotNil(t, proj, "compose Up was not called")
+	assert.Equal(t, "new.example.com", proj.Services["app"].Labels[LabelCustomDomain],
+		"redeploy must render the new domain even though recoverState swapped prov.Items to the old one")
+
+	// 6. The actor committed the new domain to prov.Items on success.
+	b.provisionsMu.RLock()
+	committed := b.provisions["lease-1"].Items[0].CustomDomain
+	status := b.provisions["lease-1"].Status
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "new.example.com", committed, "actor must commit the new domain to prov.Items on success")
+	assert.Equal(t, backend.ProvisionStatusReady, status)
+
+	b.stopCancel()
+	b.wg.Wait()
 }
