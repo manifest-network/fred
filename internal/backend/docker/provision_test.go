@@ -905,7 +905,7 @@ func TestDeprovision_UnderLimitVolumeRetryKeepsProvisionFailed(t *testing.T) {
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
 			ContainerIDs: []string{"c1"},
-			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}}},
+			Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}}},
 	})
 	b.volumes = &mockVolumeManager{DestroyFn: func(ctx context.Context, id string) error {
 		return fmt.Errorf("device busy")
