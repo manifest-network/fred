@@ -823,7 +823,7 @@ func TestDoRestartPreflight_SetsRecoveredIfSourceActive(t *testing.T) {
 	defer b.stopCancel()
 
 	result := b.doRestart(context.Background(), "lease-1", &manifest.StackManifest{},
-		nil, nil, []backend.LeaseItem{{SKU: "nonexistent-sku"}}, b.logger)
+		nil, nil, []backend.LeaseItem{{SKU: "nonexistent-sku"}}, nil, b.logger)
 
 	require.Error(t, result.Err, "unknown SKU must fail doRestart preflight")
 	assert.True(t, result.RecoveredIfSourceActive,

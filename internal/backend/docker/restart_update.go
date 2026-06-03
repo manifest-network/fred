@@ -13,6 +13,44 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
+// applyCustomDomainOverrides applies per-ServiceName custom_domain values to the
+// given items slice, keyed by ServiceName so it is robust to a recoverState
+// rebuild that reorders Items. No-op when overrides is empty.
+//
+// Two call sites (ENG-231), with opposite intent about WHICH slice to pass:
+//   - routeReplaceRestart passes the off-actor worker-snapshot COPY. It must NOT
+//     pass prov.Items here — that would be an off-actor mutation of live state.
+//   - customDomainOnSuccess passes prov.Items itself, to COMMIT the values. That
+//     is safe (and intended) because it runs on the serial actor goroutine inside
+//     onEnterReadyFromReplaceCompleted's UpdateFn, the sole writer of prov.Items.
+func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]string) {
+	if len(overrides) == 0 {
+		return
+	}
+	for i := range items {
+		if d, ok := overrides[items[i].ServiceName]; ok {
+			items[i].CustomDomain = d
+		}
+	}
+}
+
+// customDomainOnSuccess returns an OnSuccess hook that commits the override
+// values into prov.Items. It runs inside onEnterReadyFromReplaceCompleted on the
+// serial actor goroutine, under the same UpdateFn critical section as the
+// Status->Ready flip, and ONLY on a successful redeploy — so the actor commits
+// nothing to prov.Items on a failed redeploy. Returns nil when there are no
+// overrides, preserving the plain-restart behavior. (ENG-231)
+func customDomainOnSuccess(overrides map[string]string) func(*leasesm.ProvisionState) {
+	if len(overrides) == 0 {
+		return nil
+	}
+	// Reuse the worker-snapshot match/assign so the committed prov.Items value
+	// and the rendered container label cannot diverge from a one-sided edit.
+	return func(p *leasesm.ProvisionState) {
+		applyCustomDomainOverrides(p.Items, overrides)
+	}
+}
+
 // Restart restarts containers for a lease without changing the manifest.
 // State machine: Ready|Failed → Restarting → Ready|Failed
 //
@@ -43,13 +81,26 @@ import (
 // "deploying" record left behind on routing/ack failure is cosmetic —
 // recover.go skips non-active releases and deprovision deletes them).
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
-	logger := b.logger.With("lease_uuid", req.LeaseUUID)
+	return b.routeReplaceRestart(ctx, req.LeaseUUID, req.CallbackURL, nil)
+}
 
-	// Synchronous phase: read-only validation + field snapshot. No
-	// prov.Status / prov.CallbackURL write (ENG-230) — see the function
-	// doc comment.
+// routeReplaceRestart is the shared restart routing used by the public Restart
+// (overrides == nil) and by ReconcileCustomDomain (overrides carries the
+// per-ServiceName custom_domain changes). The SEAM-CLOSED (ENG-230) prelude is
+// unchanged: read-only fast-fail under provisionsMu, field snapshot, no
+// prov.Status write — the actor's onEnterRestarting is the sole writer, firing
+// BEFORE the ack, so "returns => Status==Restarting" holds for HTTP-handler
+// publish (api/handlers.go:RestartLease). A concurrent caller that passes the
+// route-time check but loses the actor race gets ErrInvalidState (409 for HTTP;
+// silent retry-next-tick for the reconciler). The only addition over the plain
+// Restart prelude is that custom-domain overrides are applied to the worker's
+// item snapshot (a copy) and committed into prov.Items by the actor's success
+// entry action via OnSuccess (ENG-231).
+func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackURL string, overrides map[string]string) error {
+	logger := b.logger.With("lease_uuid", leaseUUID)
+
 	b.provisionsMu.Lock()
-	prov, exists := b.provisions[req.LeaseUUID]
+	prov, exists := b.provisions[leaseUUID]
 	if !exists {
 		b.provisionsMu.Unlock()
 		return backend.ErrNotProvisioned
@@ -60,19 +111,9 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, status)
 	}
 	if prov.StackManifest == nil {
-		// Post-Task-5 every restartable provision must carry a stack
-		// manifest. Legacy-shape provisions recovered before Tasks 8-9's
-		// startup migration runs would only have prov.Manifest populated
-		// and end up here; surfacing it as InvalidState lets the operator
-		// know a recover-time migration is owed. After Task 9 lands, no
-		// in-tree path can produce a manifest-less restartable provision.
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: no stored manifest for restart (pre-migration legacy lease?)", backend.ErrInvalidState)
 	}
-	// No pre-replace status snapshot is captured here: Status/CallbackURL
-	// writes and all gauge / recovered-vs-failed bookkeeping are the actor's,
-	// keyed on the actor-observed replaceWasActive (threaded to the worker as
-	// the wasActive arg below), not a stale route-time prelude snapshot.
 	stackManifest := prov.StackManifest
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
 	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
@@ -80,6 +121,11 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		serviceContainers[k] = append([]string(nil), v...)
 	}
 	items := append([]backend.LeaseItem(nil), prov.Items...)
+	// Apply custom-domain overrides to the worker's snapshot COPY (never
+	// prov.Items). Keyed by ServiceName, so even if recoverState swapped the
+	// struct between the reconciler's diff and here, the desired domain is
+	// re-applied onto the current items. (ENG-231/ENG-278)
+	applyCustomDomainOverrides(items, overrides)
 	b.provisionsMu.Unlock()
 
 	// Record restart release as deploying. Abort if this fails — without a
@@ -90,7 +136,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 		if marshalErr != nil {
 			return fmt.Errorf("failed to marshal manifest for release: %w", marshalErr)
 		}
-		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
+		if relErr := b.releaseStore.Append(leaseUUID, shared.Release{
 			Manifest:  manifestBytes,
 			Image:     "stack",
 			Status:    "deploying",
@@ -101,19 +147,19 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	}
 
 	// Hand off to the lease actor. The actor's onEnterRestarting writes
-	// Status=Restarting (+ CallbackURL) BEFORE acking, then spawns the
-	// replace worker (tracked by the workers barrier). See
-	// handleRestartRequested / spawnReplaceWorker.
+	// Status=Restarting (+ CallbackURL) BEFORE acking, then spawns the replace
+	// worker. On success, onEnterReadyFromReplaceCompleted runs onSuccess (the
+	// prov.Items custom_domain commit) under UpdateFn, atomic with Status->Ready.
 	opCtx, opCancel := b.shutdownAwareContext()
+	onSuccess := customDomainOnSuccess(overrides)
 	work := func() leasesm.ReplaceResult {
-		return b.doRestart(opCtx, req.LeaseUUID, stackManifest, containerIDs, serviceContainers, items, logger)
+		return b.doRestart(opCtx, leaseUUID, stackManifest, containerIDs, serviceContainers, items, onSuccess, logger)
 	}
 	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: req.CallbackURL}); routeErr != nil {
+	if routeErr := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: callbackURL}); routeErr != nil {
 		opCancel()
 		return routeErr
 	}
-	// See ackOrAbort's comment for the ctx-vs-ack race rationale.
 	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
 		opCancel()
 		return err
@@ -131,7 +177,7 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 // derives it from its serial, actor-observed replaceWasActive
 // (spawnReplaceWorker), which is correct even in the death-then-restart
 // ordering where the prelude's route-time snapshot was stale.
-func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, logger *slog.Logger) leasesm.ReplaceResult {
+func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, onSuccess func(*leasesm.ProvisionState), logger *slog.Logger) leasesm.ReplaceResult {
 	profiles := make(map[string]SKUProfile, len(items))
 	for _, item := range items {
 		if _, ok := profiles[item.SKU]; ok {
@@ -164,6 +210,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manife
 		ServiceContainers: serviceContainers,
 		Operation:         "restart",
 		Logger:            logger,
+		OnSuccess:         onSuccess,
 	})
 }
 

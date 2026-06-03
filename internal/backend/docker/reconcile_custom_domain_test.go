@@ -3,17 +3,22 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestReconcileCustomDomain_NoProvision(t *testing.T) {
@@ -106,9 +111,9 @@ func TestReconcileCustomDomain_InvalidDomainSkipsThatItem(t *testing.T) {
 	// "evil.barney0.manifest0.net" is a subdomain of the wildcard — chain
 	// would have rejected it; Fred's defense-in-depth check must too. The
 	// "admin" item is left unchanged ("" → "") so it's a no-op too. With
-	// both items short-circuited, pending stays empty and the method must
+	// both items short-circuited, no override is computed and the method must
 	// return nil — assert that contract here so a future regression that
-	// returns an error from the no-pending path gets caught.
+	// returns an error from the no-overrides path gets caught.
 	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
 		{SKU: "docker-small", ServiceName: "web", CustomDomain: "evil.barney0.manifest0.net"},
 		{SKU: "docker-small", ServiceName: "admin", CustomDomain: ""}, // unchanged: also no-op
@@ -173,103 +178,17 @@ func TestReconcileCustomDomain_UnknownServiceNameSkipped(t *testing.T) {
 	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain)
 }
 
-// reconcileHarness wires up a Backend with a mock Docker client and a
-// callback server so a redeploy triggered by ReconcileCustomDomain can be
-// observed end-to-end. Returns the callback received once the worker
-// finishes (success or failure), plus the captured CreateContainer params.
-type reconcileHarness struct {
-	b               *Backend
-	server          *httptest.Server
-	callbackPayload backend.CallbackPayload
-	callbackDone    chan struct{}
-	createParamsMu  sync.Mutex
-	createParams    []CreateContainerParams
-}
-
-func newReconcileHarness(t *testing.T, prov *provision) *reconcileHarness {
-	t.Helper()
-
-	h := &reconcileHarness{
-		callbackDone: make(chan struct{}),
-	}
-
-	mock := &mockDockerClient{
-		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			return nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			h.createParamsMu.Lock()
-			h.createParams = append(h.createParams, params)
-			h.createParamsMu.Unlock()
-			return "new-c1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-
-	h.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&h.callbackPayload)
-		w.WriteHeader(http.StatusOK)
-		// Tolerate multiple callbacks (success after restart is one;
-		// failure path may also fire). Close once.
-		select {
-		case <-h.callbackDone:
-		default:
-			close(h.callbackDone)
-		}
-	}))
-	t.Cleanup(h.server.Close)
-
-	prov.CallbackURL = h.server.URL
-	provisions := map[string]*provision{prov.LeaseUUID: prov}
-
-	b := newBackendForProvisionTest(t, mock, provisions)
-	b.httpClient = h.server.Client()
-	rebuildCallbackSender(b)
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	b.cfg.Ingress = IngressConfig{
-		Enabled:        true,
-		WildcardDomain: "barney0.manifest0.net",
-		Entrypoint:     "websecure",
-	}
-	h.b = b
-	return h
-}
-
-func (h *reconcileHarness) waitForCallback(t *testing.T) {
-	t.Helper()
-	select {
-	case <-h.callbackDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for restart callback")
-	}
-}
-
-func (h *reconcileHarness) lastCreateParams(t *testing.T) CreateContainerParams {
-	t.Helper()
-	h.createParamsMu.Lock()
-	defer h.createParamsMu.Unlock()
-	require.NotEmpty(t, h.createParams, "CreateContainer was not called")
-	return h.createParams[len(h.createParams)-1]
-}
-
-func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
-	// Restart() returns a synchronous error (here: no stored manifest →
-	// ErrInvalidState). ReconcileCustomDomain must roll back the in-memory
-	// CustomDomain so the next reconciler tick retries cleanly.
+func TestReconcileCustomDomain_RestartSyncError_LeavesItemsUnchanged(t *testing.T) {
+	// A synchronous redeploy error (here: no stored manifest -> ErrInvalidState)
+	// must surface to the caller, and prov.Items must be UNCHANGED — the
+	// reconciler no longer mutates prov.Items off-actor, so there is nothing to
+	// roll back; the staged value only ever lands via the actor on success.
 	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:        "tenant-a",
 		ProviderUUID:  "prov-1",
 		SKU:           "docker-small",
 		Status:        backend.ProvisionStatusReady,
-		StackManifest: nil,
+		StackManifest: nil, // forces ErrInvalidState in the routeReplaceRestart prelude
 		ContainerIDs:  []string{"old-c1"},
 		Items: []backend.LeaseItem{
 			{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "old.example.com"},
@@ -277,120 +196,25 @@ func TestReconcileCustomDomain_RestartSyncError_RollsBack(t *testing.T) {
 		Quantity: 1},
 	}
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	defer b.stopCancel()
 	b.cfg.Ingress = IngressConfig{
 		Enabled:        true,
 		WildcardDomain: "barney0.manifest0.net",
 		Entrypoint:     "websecure",
 	}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
 
 	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
 		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"},
 	})
-	require.Error(t, err, "ReconcileCustomDomain must surface synchronous Restart errors")
+	require.Error(t, err, "ReconcileCustomDomain must surface synchronous redeploy errors")
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 
 	b.provisionsMu.RLock()
 	got := b.provisions["lease-1"].Items[0].CustomDomain
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, "old.example.com", got,
-		"in-memory CustomDomain must roll back to the pre-call value when Restart fails synchronously")
-}
-
-func TestReconcileCustomDomain_RollbackUsesServiceNameNotIndex(t *testing.T) {
-	// Rollback after a synchronous Restart failure must identify items by
-	// ServiceName, not by stored index. recoverState (running on the
-	// docker-backend's own reconcileLoop) can replace b.provisions between
-	// our pre-Restart unlock and the rollback's re-lock, leaving prov.Items
-	// in a different order; an index-based rollback would then write to the
-	// wrong item.
-	//
-	// We can't easily race the swap inside a synchronous test, but we can
-	// exercise the rollback branch with a multi-item provision where the
-	// target service is NOT at index 0 — which is enough to fail any
-	// "rollback to stored index 0" implementation.
-	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		SKU:          "docker-small",
-		Status:       backend.ProvisionStatusReady,
-		ContainerIDs: []string{"old-c1"},
-		Items: []backend.LeaseItem{
-			{SKU: "docker-small", Quantity: 1, ServiceName: "db", CustomDomain: ""},
-			{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "old.example.com"},
-		},
-		Quantity: 1},
-	}
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
-	b.cfg.Ingress = IngressConfig{
-		Enabled:        true,
-		WildcardDomain: "barney0.manifest0.net",
-		Entrypoint:     "websecure",
-	}
-
-	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
-		{SKU: "docker-small", Quantity: 1, ServiceName: "db", CustomDomain: ""}, // unchanged
-		{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "new.example.com"},
-	})
-	require.Error(t, err)
-
-	b.provisionsMu.RLock()
-	got := b.provisions["lease-1"].Items
-	b.provisionsMu.RUnlock()
-	require.Len(t, got, 2)
-
-	byService := make(map[string]string, len(got))
-	for _, it := range got {
-		byService[it.ServiceName] = it.CustomDomain
-	}
-	assert.Equal(t, "old.example.com", byService["web"],
-		"web's CustomDomain must be rolled back via ServiceName lookup")
-	assert.Equal(t, "", byService["db"],
-		"db's CustomDomain must remain unchanged (no pending change for it)")
-}
-
-func TestReconcileCustomDomain_RollbackIsCASGated(t *testing.T) {
-	// The rollback's value-CAS gate ("only restore oldValue if current ==
-	// newValue") is what makes the operation safe in the presence of a
-	// concurrent recoverState that already restored prov.Items[].CustomDomain
-	// from the (unchanged) container labels. Without the gate, the rollback
-	// would clobber a value that some other goroutine already corrected.
-	//
-	// Construct a scenario that mimics the post-recoverState state directly:
-	// after the synchronous Restart error, but before rollback runs,
-	// "something else" has already reset web's CustomDomain to a different
-	// value. Verify the rollback respects it (no-op) instead of stomping.
-	//
-	// Implementation note: ReconcileCustomDomain runs synchronously, so we
-	// can't truly interpose. Instead we drive the inputs so the mutation
-	// path writes "stage" and immediately moves on to the failing Restart,
-	// then verify the post-state matches the CAS contract. The contract
-	// here is exercised by the rollback finding ServiceName "web" with
-	// CustomDomain == newValue (because nothing concurrent ran in this
-	// test) and writing back oldValue.
-	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		SKU:          "docker-small",
-		Status:       backend.ProvisionStatusReady,
-		ContainerIDs: []string{"old-c1"},
-		Items: []backend.LeaseItem{
-			{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "old.example.com"},
-		},
-		Quantity: 1},
-	}
-	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
-	b.cfg.Ingress = IngressConfig{
-		Enabled:        true,
-		WildcardDomain: "barney0.manifest0.net",
-		Entrypoint:     "websecure",
-	}
-
-	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
-		{SKU: "docker-small", Quantity: 1, ServiceName: "web", CustomDomain: "new.example.com"},
-	})
-	require.Error(t, err)
-	assert.Equal(t, "old.example.com", b.provisions["lease-1"].Items[0].CustomDomain,
-		"rollback must restore oldValue when current value still equals newValue")
+		"prov.Items must be unchanged on a failed redeploy (no off-actor mutation; commit is actor/success-only)")
 }
 
 func TestReconcileCustomDomain_LegacyEmptyServiceName(t *testing.T) {
@@ -427,7 +251,7 @@ func TestReconcileCustomDomain_FreshSingleImage_ChainServiceNameEmpty(t *testing
 	// The reconcile must normalize BOTH sides (a lone unnamed item → "app")
 	// before matching. We assert drift IS detected by driving the synchronous
 	// Restart-error path (StackManifest nil → ErrInvalidState): that error only
-	// fires if a pending change was staged, i.e. chain "" matched container
+	// fires if an override was computed, i.e. chain "" matched container
 	// "app". Before the fix this returns nil (no drift); after, it errors.
 	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant:        "tenant-a",
@@ -455,11 +279,11 @@ func TestReconcileCustomDomain_FreshSingleImage_ChainServiceNameEmpty(t *testing
 		`drift must be detected: chain service_name="" must match container ServiceName="app" after normalization (ENG-264)`)
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 
-	// The failed Restart rolls the staged value back to the original "".
+	// prov.Items is never mutated off-actor — value remains the original "".
 	b.provisionsMu.RLock()
 	got := b.provisions["lease-1"].Items[0].CustomDomain
 	b.provisionsMu.RUnlock()
-	assert.Equal(t, "", got, "failed Restart must roll back the staged CustomDomain")
+	assert.Equal(t, "", got, "prov.Items must be unchanged (no off-actor mutation; commit is actor/success-only)")
 }
 
 func TestReconcileCustomDomain_NotDNSReady_DoesNotEmit(t *testing.T) {
@@ -562,9 +386,9 @@ func TestReconcileCustomDomain_ChangedDomain_NewNotReady(t *testing.T) {
 }
 
 func TestReconcileCustomDomain_ChangedDomain_NewReady(t *testing.T) {
-	// Same change but new's DNS is ready → switch to new (Restart fails on nil
-	// manifest, proving the switch to "new.example.com" was staged, then rolls
-	// back to old for the next tick).
+	// Same change but new's DNS is ready → drift detected → Restart attempted
+	// (fails on nil manifest → ErrInvalidState). prov.Items is unchanged
+	// because there is no off-actor mutation; the commit lands on success only.
 	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 		Tenant: "t", ProviderUUID: "p", SKU: "docker-small",
 		Status: backend.ProvisionStatusReady, StackManifest: nil, ContainerIDs: []string{"c1"},
@@ -580,7 +404,7 @@ func TestReconcileCustomDomain_ChangedDomain_NewReady(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 	assert.Equal(t, "old.example.com", b.provisions["lease-1"].Items[0].CustomDomain,
-		"failed Restart rolls the staged new domain back to old")
+		"prov.Items unchanged on failed redeploy (no off-actor mutation; commit is actor/success-only)")
 }
 
 func TestReconcileCustomDomain_MultiService_MixedReadiness(t *testing.T) {
@@ -631,10 +455,380 @@ func TestReconcileCustomDomain_DeferredThenReady(t *testing.T) {
 	require.NoError(t, b.ReconcileCustomDomain(context.Background(), "lease-1", chain))
 	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain, "tick 1: deferred while DNS not ready")
 
-	// Tick 2: DNS now ready → drift staged → Restart attempted (nil manifest →
-	// ErrInvalidState proves the emission was staged this time).
+	// Tick 2: DNS now ready → drift detected → Restart attempted (nil manifest →
+	// ErrInvalidState proves the override was computed this time).
 	ready = true
 	err := b.ReconcileCustomDomain(context.Background(), "lease-1", chain)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrInvalidState, "tick 2: domain emitted once DNS becomes ready")
+}
+
+func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T) {
+	// ENG-278 regression. A recoverState struct-swap that reverts
+	// prov.Items[].CustomDomain to the OLD container-label value, landing in the
+	// Ready window, must NOT cause the redeploy to render the old domain. The
+	// override is captured read-only before the swap and re-applied by
+	// ServiceName, so the redeploy renders NEW and the actor commits NEW.
+
+	// Stack manifest with a routable port so the custom-domain Traefik label
+	// (LabelCustomDomain) is actually rendered (ingress gate requires a port).
+	stack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"app": {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+		},
+	}
+
+	// Seed a release store with an ACTIVE stack release so recoverState restores
+	// StackManifest after it rebuilds the (Ready) provision from labels.
+	manifestBytes, err := json.Marshal(stack)
+	require.NoError(t, err)
+	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "releases.db"),
+	})
+	require.NoError(t, err)
+	defer releaseStore.Close()
+	require.NoError(t, releaseStore.Append("lease-1", shared.Release{
+		Manifest: manifestBytes, Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}))
+
+	// mu guards both callbackPayload (written by the callback handler goroutine,
+	// read at the assertion) and capturedProject (written by the compose Up mock).
+	var mu sync.Mutex
+
+	// Callback server signals redeploy completion.
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{})
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		w.WriteHeader(http.StatusOK)
+		mu.Lock()
+		callbackPayload = p
+		mu.Unlock()
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer callbackServer.Close()
+
+	// Fake managed container carrying the OLD domain label — what recoverState
+	// rebuilds prov.Items from.
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{{
+				ContainerID:   "old-app",
+				LeaseUUID:     "lease-1",
+				SKU:           "docker-small",
+				Tenant:        "tenant-a",
+				ProviderUUID:  "prov-1",
+				CallbackURL:   callbackServer.URL,
+				ServiceName:   "app",
+				InstanceIndex: 0,
+				Status:        "running",
+				CustomDomain:  "old.example.com",
+				Name:          "fred-lease-1-app-0",
+			}}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+
+	var capturedProject *composetypes.Project
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			mu.Lock()
+			capturedProject = project
+			mu.Unlock()
+			return nil
+		},
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{ID: "new-app-c1", Service: "app", State: "running"}}, nil
+		},
+	}
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant:            "tenant-a",
+			ProviderUUID:      "prov-1",
+			SKU:               "docker-small",
+			Status:            backend.ProvisionStatusReady,
+			StackManifest:     stack,
+			ContainerIDs:      []string{"old-app"},
+			ServiceContainers: map[string][]string{"app": {"old-app"}},
+			CallbackURL:       callbackServer.URL,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"},
+			},
+			Quantity: 1},
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
+	b.releaseStore = releaseStore
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+
+	chain := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"}}
+
+	// 1. Compute the override read-only while Ready (mirrors ReconcileCustomDomain
+	//    under provisionsMu), with the new domain DNS-ready.
+	// DNS readiness is supplied directly to computeCustomDomainOverrides here, so
+	// b.customDomainDNSReady (the production probe) is intentionally not wired in this white-box test.
+	b.provisionsMu.Lock()
+	prov := b.provisions["lease-1"]
+	overrides := b.computeCustomDomainOverrides(prov, chain, map[string]bool{"new.example.com": true})
+	callbackURL := prov.CallbackURL
+	b.provisionsMu.Unlock()
+	require.Equal(t, map[string]string{"app": "new.example.com"}, overrides,
+		`chain service_name "" must normalize to "app" and stage the new domain`)
+
+	// 2. Concurrent recoverState lands in the Ready window: it rebuilds the
+	//    provision from the OLD-labeled container and swaps the map.
+	require.NoError(t, b.recoverState(context.Background()))
+	b.provisionsMu.RLock()
+	swapped := b.provisions["lease-1"].Items[0].CustomDomain
+	b.provisionsMu.RUnlock()
+	require.Equal(t, "old.example.com", swapped, "sanity: recoverState swapped prov.Items back to the old domain")
+
+	// 3. Route the redeploy with the pre-swap override.
+	require.NoError(t, b.routeReplaceRestart(context.Background(), "lease-1", callbackURL, overrides))
+
+	// 4. Wait for the async redeploy to complete.
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for redeploy callback")
+	}
+	mu.Lock()
+	gotStatus := callbackPayload.Status
+	mu.Unlock()
+	require.Equal(t, backend.CallbackStatusSuccess, gotStatus)
+
+	// 5. The redeploy rendered the NEW domain despite the swap.
+	mu.Lock()
+	proj := capturedProject
+	mu.Unlock()
+	require.NotNil(t, proj, "compose Up was not called")
+	assert.Equal(t, "new.example.com", proj.Services["app"].Labels[LabelCustomDomain],
+		"redeploy must render the new domain even though recoverState swapped prov.Items to the old one")
+
+	// 6. The actor committed the new domain to prov.Items on success.
+	b.provisionsMu.RLock()
+	committed := b.provisions["lease-1"].Items[0].CustomDomain
+	status := b.provisions["lease-1"].Status
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "new.example.com", committed, "actor must commit the new domain to prov.Items on success")
+	assert.Equal(t, backend.ProvisionStatusReady, status)
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
+	// Lock-discipline guard (run under -race): ReconcileCustomDomain and
+	// recoverState hammering the same lease concurrently must not race and must
+	// converge to the new domain. Correctness of the interleaving is pinned by
+	// TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain.
+	stack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"app": {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+		},
+	}
+	manifestBytes, err := json.Marshal(stack)
+	require.NoError(t, err)
+	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "releases.db"),
+	})
+	require.NoError(t, err)
+	defer releaseStore.Close()
+	require.NoError(t, releaseStore.Append("lease-1", shared.Release{
+		Manifest: manifestBytes, Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}))
+
+	callbackReceived := make(chan struct{}, 1)
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackReceived <- struct{}{}:
+		default:
+		}
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{{
+				ContainerID: "old-app", LeaseUUID: "lease-1", SKU: "docker-small",
+				Tenant: "tenant-a", ProviderUUID: "prov-1", CallbackURL: callbackServer.URL,
+				ServiceName: "app", InstanceIndex: 0, Status: "running",
+				CustomDomain: "old.example.com", Name: "fred-lease-1-app-0",
+			}}, nil
+		},
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error { return nil },
+		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{ID: "new-app-c1", Service: "app", State: "running"}}, nil
+		},
+	}
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", ProviderUUID: "prov-1", SKU: "docker-small",
+			Status: backend.ProvisionStatusReady, StackManifest: stack,
+			ContainerIDs: []string{"old-app"}, ServiceContainers: map[string][]string{"app": {"old-app"}},
+			CallbackURL: callbackServer.URL,
+			Items:       []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"}},
+			Quantity:    1}},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
+	b.releaseStore = releaseStore
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+
+	chain := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"}}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			_ = b.recoverState(context.Background())
+		}
+	}()
+	// Reconcile retries against the concurrent swap until the redeploy is
+	// accepted (ErrInvalidState/no-op ticks are expected while a swap is mid-flight).
+	require.Eventually(t, func() bool {
+		_ = b.ReconcileCustomDomain(context.Background(), "lease-1", chain)
+		select {
+		case <-callbackReceived:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 20*time.Millisecond)
+	wg.Wait()
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestReconcileCustomDomain_AsyncRedeployFailure_DoesNotCommit(t *testing.T) {
+	// "Commit only on success" on the ASYNC worker path: when the redeploy worker
+	// fails (compose Up errors), the actor's success entry action
+	// (onEnterReadyFromReplaceCompleted / OnSuccess) never runs, so the new domain
+	// is NOT committed to prov.Items — the actor commits nothing on failure. The
+	// existing TestReconcileCustomDomain_RestartSyncError_LeavesItemsUnchanged only
+	// covers the synchronous prelude error (ErrInvalidState), never the worker;
+	// this covers the worker-failure path the deleted CAS rollback used to.
+	stack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"app": {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+		},
+	}
+
+	var mu sync.Mutex
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{}, 1)
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		w.WriteHeader(http.StatusOK)
+		mu.Lock()
+		callbackPayload = p
+		mu.Unlock()
+		select {
+		case callbackReceived <- struct{}{}:
+		default:
+		}
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+	// Worker fails: compose Up always errors, so both the forward deploy and the
+	// rollback fail -> the lease lands Failed (recovered==false), and OnSuccess
+	// is never invoked.
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return fmt.Errorf("compose up failed (test)")
+		},
+	}
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant:            "tenant-a",
+			ProviderUUID:      "prov-1",
+			SKU:               "docker-small",
+			Status:            backend.ProvisionStatusReady,
+			StackManifest:     stack,
+			ContainerIDs:      []string{"old-app"},
+			ServiceContainers: map[string][]string{"app": {"old-app"}},
+			CallbackURL:       callbackServer.URL,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"},
+			},
+			Quantity: 1},
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+
+	// Drive the PUBLIC reconcile path. The route + ack succeed (Status flips to
+	// Restarting) and ReconcileCustomDomain returns nil; the redeploy then fails
+	// asynchronously in the worker.
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.NoError(t, err, "route + ack succeed; the redeploy fails asynchronously in the worker")
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for failure callback")
+	}
+
+	// The redeploy genuinely failed (so we are exercising the failure path, not a
+	// vacuous no-op).
+	mu.Lock()
+	gotStatus := callbackPayload.Status
+	mu.Unlock()
+	require.Equal(t, backend.CallbackStatusFailed, gotStatus,
+		"the failure callback must have been delivered (guards against a vacuous pass)")
+
+	// The actor committed nothing: prov.Items still carries the OLD domain, and
+	// the lease is not left Ready-with-the-new-domain.
+	b.provisionsMu.RLock()
+	got := b.provisions["lease-1"].Items[0].CustomDomain
+	status := b.provisions["lease-1"].Status
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "old.example.com", got,
+		"a failed worker redeploy must not commit the new domain to prov.Items (OnSuccess is success-only)")
+	assert.NotEqual(t, backend.ProvisionStatusReady, status,
+		"a failed redeploy must not land the lease back in Ready via the success entry action")
+
+	b.stopCancel()
+	b.wg.Wait()
 }
