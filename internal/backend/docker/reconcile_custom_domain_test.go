@@ -697,7 +697,11 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 	rebuildCallbackSender(b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
-	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+	// recordingDNS so we can assert the candidate filter holds under concurrency:
+	// only the changed domain is ever resolved (customDomainDNSReady is invoked
+	// solely from the reconcile goroutine below — recoverState never resolves —
+	// so *resolved is safe to read after the loop completes).
+	resolved := recordingDNS(b, func(string) bool { return true })
 
 	chain := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"}}
 
@@ -722,8 +726,114 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 	wg.Wait()
 
+	// ENG-277: even under concurrent recoverState swaps, only the changed
+	// candidate domain is ever resolved — never the already-emitted value
+	// ("old.example.com"), which is never a chain-desired value.
+	for _, d := range *resolved {
+		assert.Equal(t, "new.example.com", d, "only the candidate domain may be resolved, even under concurrency")
+	}
+
 	b.stopCancel()
 	b.wg.Wait()
+}
+
+// recordingDNS wraps customDomainDNSReady to record which domains are resolved
+// and return a per-domain readiness verdict. Uses the existing injectable seam
+// (no test-only production code).
+func recordingDNS(b *Backend, ready func(d string) bool) *[]string {
+	var mu sync.Mutex
+	var resolved []string
+	b.customDomainDNSReady = func(_ context.Context, d string) bool {
+		mu.Lock()
+		resolved = append(resolved, d)
+		mu.Unlock()
+		return ready(d)
+	}
+	return &resolved
+}
+
+func TestReconcileCustomDomain_SteadyState_NoDNS(t *testing.T) {
+	// A Ready lease whose custom domain already equals the chain value must
+	// perform ZERO DNS lookups (ENG-277 primary acceptance).
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Status: backend.ProvisionStatusReady,
+		Items:  []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: "live.example.com"}}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	resolved := recordingDNS(b, func(string) bool { return true })
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "", CustomDomain: "live.example.com"},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, *resolved, "an already-emitted unchanged domain must not be resolved")
+}
+
+func TestReconcileCustomDomain_CandidateOnly_ResolvesOnlyChanged(t *testing.T) {
+	// Two services: one already-emitted (unchanged), one changed. Only the
+	// changed domain is a candidate, so only it is resolved.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Tenant: "t", ProviderUUID: "p", SKU: "docker-small",
+		Status: backend.ProvisionStatusReady, StackManifest: nil, ContainerIDs: []string{"c1"},
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "frontend", CustomDomain: "live.example.com"},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "api", CustomDomain: ""},
+		}, Quantity: 1},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	resolved := recordingDNS(b, func(string) bool { return true })
+
+	// The changed (api) domain stages an override → routeReplaceRestart fails on
+	// the nil StackManifest (ErrInvalidState); that only happens if api was
+	// resolved+gated, confirming the candidate path ran end-to-end.
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "frontend", CustomDomain: "live.example.com"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "api", CustomDomain: "new.example.com"},
+	})
+	require.ErrorIs(t, err, backend.ErrInvalidState)
+	assert.Equal(t, []string{"new.example.com"}, *resolved,
+		"only the changed domain is a candidate; the already-emitted one must not be resolved")
+}
+
+func TestReconcileCustomDomain_NotReady_NoDNS(t *testing.T) {
+	// A not-Ready lease must perform ZERO DNS lookups (the pre-pass returns
+	// before resolving). Pre-ENG-277 the all-domains precompute ran before the
+	// Ready gate and would resolve here.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Status: backend.ProvisionStatusProvisioning,
+		Items:  []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: ""}}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	resolved := recordingDNS(b, func(string) bool { return true })
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, *resolved, "a not-Ready lease must not resolve any custom domain")
+}
+
+func TestReconcileCustomDomain_InvalidChangedDomain_NoDNS(t *testing.T) {
+	// A changed-but-invalid domain (subdomain of the wildcard) is rejected by
+	// validation, so it is NOT a candidate and is never resolved (validate
+	// before resolve). No override is staged.
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Status: backend.ProvisionStatusReady,
+		Items:  []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: ""}}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{"lease-1": prov})
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	resolved := recordingDNS(b, func(string) bool { return true })
+
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", ServiceName: "", CustomDomain: "evil.barney0.manifest0.net"},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, *resolved, "an invalid changed domain must not be resolved")
+	assert.Equal(t, "", b.provisions["lease-1"].Items[0].CustomDomain)
 }
 
 func TestReconcileCustomDomain_AsyncRedeployFailure_DoesNotCommit(t *testing.T) {
@@ -831,4 +941,50 @@ func TestReconcileCustomDomain_AsyncRedeployFailure_DoesNotCommit(t *testing.T) 
 
 	b.stopCancel()
 	b.wg.Wait()
+}
+
+func TestReconcileCustomDomain_WindowDeferralThenSelfHeal(t *testing.T) {
+	// White-box (ENG-277 window safety). The candidate pre-pass and the main
+	// diff read prov twice across the resolve window. If a recoverState swap
+	// changes the emitted value in that window, a domain that was NOT a candidate
+	// (so dnsReady lacks it) becomes a change the main pass sees → the asymmetric
+	// gate DEFERS it that tick (no tear-down), and the NEXT tick's pre-pass
+	// resolves it → emits. The swap is represented by two prov states.
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+
+	chain := []backend.LeaseItem{{SKU: "docker-small", ServiceName: "", CustomDomain: "new.example.com"}}
+	// Pre-pass state: domain already emitted == desired → NOT a candidate.
+	provPrepass := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Items: []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: "new.example.com"}}}}
+	// Window state after a recoverState swap: emitted reverted to old.
+	provSwapped := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Items: []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: "old.example.com"}}}}
+
+	// The helpers require the caller to hold provisionsMu; we wrap each call to
+	// match the production call shape (the prov values here are local, so the
+	// lock guards nothing real in the test — it just honors the precondition).
+	b.provisionsMu.RLock()
+	cands := b.customDomainDNSCandidates(provPrepass, chain)
+	b.provisionsMu.RUnlock()
+	require.Empty(t, cands, "an already-emitted domain is not a DNS candidate")
+
+	// Tick 1 main pass on the swapped state with the (empty) dnsReady: the now-
+	// changed domain is unresolved → DEFERRED (emitted preserved, no override).
+	b.provisionsMu.RLock()
+	deferred := b.computeCustomDomainOverrides(provSwapped, chain, map[string]bool{})
+	b.provisionsMu.RUnlock()
+	assert.Empty(t, deferred, "an unresolved changed domain must be deferred, not applied")
+
+	// Tick 2 pre-pass on the swapped state: now a candidate → resolved.
+	b.provisionsMu.RLock()
+	cands2 := b.customDomainDNSCandidates(provSwapped, chain)
+	b.provisionsMu.RUnlock()
+	require.Equal(t, []string{"new.example.com"}, cands2, "the changed domain is now a candidate")
+
+	// Tick 2 main pass with the resolved-ready domain: SELF-HEAL → emits.
+	b.provisionsMu.RLock()
+	healed := b.computeCustomDomainOverrides(provSwapped, chain, map[string]bool{"new.example.com": true})
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, map[string]string{"app": "new.example.com"}, healed, "next tick emits the new domain")
 }
