@@ -931,3 +931,49 @@ func TestReconcileCustomDomain_AsyncRedeployFailure_DoesNotCommit(t *testing.T) 
 	b.stopCancel()
 	b.wg.Wait()
 }
+
+func TestReconcileCustomDomain_WindowDeferralThenSelfHeal(t *testing.T) {
+	// White-box (ENG-277 window safety). The candidate pre-pass and the main
+	// diff read prov twice across the resolve window. If a recoverState swap
+	// changes the emitted value in that window, a domain that was NOT a candidate
+	// (so dnsReady lacks it) becomes a change the main pass sees → the asymmetric
+	// gate DEFERS it that tick (no tear-down), and the NEXT tick's pre-pass
+	// resolves it → emits. The swap is represented by two prov states.
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+
+	chain := []backend.LeaseItem{{SKU: "docker-small", ServiceName: "", CustomDomain: "new.example.com"}}
+	// Pre-pass state: domain already emitted == desired → NOT a candidate.
+	provPrepass := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Items: []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: "new.example.com"}}}}
+	// Window state after a recoverState swap: emitted reverted to old.
+	provSwapped := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		Items: []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", CustomDomain: "old.example.com"}}}}
+
+	// The helpers require the caller to hold provisionsMu; we wrap each call to
+	// match the production call shape (the prov values here are local, so the
+	// lock guards nothing real in the test — it just honors the precondition).
+	b.provisionsMu.RLock()
+	cands := b.customDomainDNSCandidates(provPrepass, chain)
+	b.provisionsMu.RUnlock()
+	require.Empty(t, cands, "an already-emitted domain is not a DNS candidate")
+
+	// Tick 1 main pass on the swapped state with the (empty) dnsReady: the now-
+	// changed domain is unresolved → DEFERRED (emitted preserved, no override).
+	b.provisionsMu.RLock()
+	deferred := b.computeCustomDomainOverrides(provSwapped, chain, map[string]bool{})
+	b.provisionsMu.RUnlock()
+	assert.Empty(t, deferred, "an unresolved changed domain must be deferred, not applied")
+
+	// Tick 2 pre-pass on the swapped state: now a candidate → resolved.
+	b.provisionsMu.RLock()
+	cands2 := b.customDomainDNSCandidates(provSwapped, chain)
+	b.provisionsMu.RUnlock()
+	require.Equal(t, []string{"new.example.com"}, cands2, "the changed domain is now a candidate")
+
+	// Tick 2 main pass with the resolved-ready domain: SELF-HEAL → emits.
+	b.provisionsMu.RLock()
+	healed := b.computeCustomDomainOverrides(provSwapped, chain, map[string]bool{"new.example.com": true})
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, map[string]string{"app": "new.example.com"}, healed, "next tick emits the new domain")
+}
