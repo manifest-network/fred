@@ -697,7 +697,11 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 	rebuildCallbackSender(b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
-	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+	// recordingDNS so we can assert the candidate filter holds under concurrency:
+	// only the changed domain is ever resolved (customDomainDNSReady is invoked
+	// solely from the reconcile goroutine below — recoverState never resolves —
+	// so *resolved is safe to read after the loop completes).
+	resolved := recordingDNS(b, func(string) bool { return true })
 
 	chain := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"}}
 
@@ -721,6 +725,13 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 		}
 	}, 5*time.Second, 20*time.Millisecond)
 	wg.Wait()
+
+	// ENG-277: even under concurrent recoverState swaps, only the changed
+	// candidate domain is ever resolved — never the already-emitted value
+	// ("old.example.com"), which is never a chain-desired value.
+	for _, d := range *resolved {
+		assert.Equal(t, "new.example.com", d, "only the candidate domain may be resolved, even under concurrency")
+	}
 
 	b.stopCancel()
 	b.wg.Wait()
