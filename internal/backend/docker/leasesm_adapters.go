@@ -133,3 +133,14 @@ func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.Prov
 	fn(&p.ProvisionState)
 	return true
 }
+
+// Delete implements leasesm.LeaseProvisionStore. Removes the lease's live
+// record under the same provisionsMu as Get/UpdateFn, so a concurrent Get
+// probe (e.g. handleDeprovision's terminated check) observes the removal.
+func (s *backendProvisionStore) Delete(leaseUUID string) bool {
+	s.backend.provisionsMu.Lock()
+	defer s.backend.provisionsMu.Unlock()
+	_, ok := s.backend.provisions[leaseUUID]
+	delete(s.backend.provisions, leaseUUID)
+	return ok
+}

@@ -79,6 +79,16 @@ func (m *mockProvisionStore) UpdateFn(uuid string, fn func(*ProvisionState)) boo
 	return true
 }
 
+// Delete implements LeaseProvisionStore. Removes the seeded state under the
+// same mutex as Get/UpdateFn. Returns true if present.
+func (m *mockProvisionStore) Delete(uuid string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.states[uuid]
+	delete(m.states, uuid)
+	return ok
+}
+
 // mockSMMetrics is a no-op SMMetrics implementation for tests that
 // don't assert on metric emission. Tests that need to assert on
 // specific metric calls can wrap their own counters via the function-

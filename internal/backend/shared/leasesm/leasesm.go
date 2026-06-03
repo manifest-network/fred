@@ -227,6 +227,12 @@ type LeaseProvisionStore interface {
 	// guards direct accesses for the duration of fn — the closure
 	// runs inside the lock.
 	UpdateFn(leaseUUID string, fn func(*ProvisionState)) bool
+
+	// Delete removes the lease's live record. Returns true if an entry was
+	// present. Takes the same mutex as Get/UpdateFn, so a concurrent Get
+	// observes the removal. Like UpdateFn, MUST NOT be called from inside an
+	// UpdateFn closure (re-entrant lock → deadlock).
+	Delete(leaseUUID string) bool
 }
 
 // SMMetrics is the observability seam for substrate-specific metric
