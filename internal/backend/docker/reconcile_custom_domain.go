@@ -81,6 +81,46 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	return b.routeReplaceRestart(ctx, leaseUUID, callbackURL, overrides)
 }
 
+// matchedDomain pairs a chain item's desired custom_domain with the matched
+// provision item's currently-emitted value and ServiceName. Produced by
+// matchCustomDomainItems for the matched chain items only.
+type matchedDomain struct {
+	desired     string
+	emitted     string
+	serviceName string
+}
+
+// matchCustomDomainItems matches each incoming chain item to a provision item by
+// normalized ServiceName (ENG-264) and returns one matchedDomain per MATCHED
+// chain item, in chain order, excluding chain items with no provision match. It
+// is pure and read-only: no validation, no DNS gate (those stay in the callers).
+// The caller must hold provisionsMu (read or write). Shared by the candidate
+// pre-pass and computeCustomDomainOverrides so the resolved set and the applied
+// diff cannot diverge.
+func matchCustomDomainItems(prov *provision, items []backend.LeaseItem) []matchedDomain {
+	chainKeys := normalizedServiceKeys(items)
+	provKeys := normalizedServiceKeys(prov.Items)
+	matched := make([]matchedDomain, 0, len(items))
+	for ci := range items {
+		idx := -1
+		for i := range prov.Items {
+			if provKeys[i] == chainKeys[ci] {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			continue
+		}
+		matched = append(matched, matchedDomain{
+			desired:     items[ci].CustomDomain,
+			emitted:     prov.Items[idx].CustomDomain,
+			serviceName: prov.Items[idx].ServiceName,
+		})
+	}
+	return matched
+}
+
 // computeCustomDomainOverrides returns the per-ServiceName custom_domain changes
 // to apply, computed READ-ONLY from the current provision and the incoming chain
 // items. The caller must hold provisionsMu. It performs the same
@@ -90,30 +130,15 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 // overrides to the worker snapshot and the actor commits them on success.
 func (b *Backend) computeCustomDomainOverrides(prov *provision, items []backend.LeaseItem, dnsReady map[string]bool) map[string]string {
 	logger := slog.With("lease_uuid", prov.LeaseUUID)
-	chainKeys := normalizedServiceKeys(items)
-	provKeys := normalizedServiceKeys(prov.Items)
-
 	overrides := make(map[string]string)
-	for ci := range items {
-		chainItem := items[ci]
-		idx := -1
-		for i := range prov.Items {
-			if provKeys[i] == chainKeys[ci] {
-				idx = i
-				break
-			}
-		}
-		if idx == -1 {
-			// Item present on chain but not in provision: skip silently.
-			continue
-		}
-		emitted := prov.Items[idx].CustomDomain
-		desired := chainItem.CustomDomain
+	for _, m := range matchCustomDomainItems(prov, items) {
+		emitted := m.emitted
+		desired := m.desired
 		// Defense-in-depth validation (empty clear bypasses the FQDN check).
 		if desired != "" {
 			if err := validateCustomDomain(desired, b.cfg.Ingress.WildcardDomain); err != nil {
 				logger.Error("skipping custom-domain reconcile (validation failed)",
-					"service_name", prov.Items[idx].ServiceName,
+					"service_name", m.serviceName,
 					"custom_domain", desired,
 					"error", err)
 				continue
@@ -124,14 +149,14 @@ func (b *Backend) computeCustomDomainOverrides(prov *provision, items []backend.
 		// domain on a transient DNS mismatch; clearing ("") is never gated.
 		if desired != "" && desired != emitted && !dnsReady[desired] {
 			logger.Debug("custom_domain set but DNS not yet pointing at this host; deferring cert issuance",
-				"service_name", prov.Items[idx].ServiceName,
+				"service_name", m.serviceName,
 				"custom_domain", desired)
 			desired = emitted
 		}
 		if emitted == desired {
 			continue
 		}
-		overrides[prov.Items[idx].ServiceName] = desired
+		overrides[m.serviceName] = desired
 	}
 	return overrides
 }
