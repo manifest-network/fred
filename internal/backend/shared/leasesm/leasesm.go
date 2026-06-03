@@ -212,6 +212,32 @@ type ProvisionState struct {
 // callback dispatch, log lines) factored out into post-UpdateFn code
 // behind captured flags. PR5 sets that pattern; future contributors
 // must preserve it.
+//
+// # Actor-sole-writer invariant (ENG-229)
+//
+// All live ProvisionState mutations occur on the lease actor goroutine via
+// UpdateFn/Delete, with exactly TWO documented exceptions:
+//
+//  1. The success-path pre-publish of ContainerIDs/ServiceContainers in
+//     spawnProvisionWorker/spawnReplaceWorker runs on the WORKER goroutine
+//     before sendTerminal. It is required so a Deprovision that preempts an
+//     in-flight worker observes the new container IDs under provisionsMu and
+//     tears them down instead of orphaning them. Correctness rests on the
+//     workers-barrier happens-before: the pre-publish UpdateFn completes before
+//     workers.Done() (the outermost defer); onExitProvisioning calls
+//     workCancel() then waitForWorkers() (blocked on workers.Zero()); only then
+//     does handleDeprovision invoke doDeprovision, which reads ContainerIDs.
+//     Routing this through an actor message is PROHIBITED: the actor is blocked
+//     in waitForWorkers() and cannot dequeue the publish the worker must send to
+//     release the barrier (actor self-deadlock). Bounded escape: a worker
+//     exceeding workExitWaitTimeout (75s; diagnosticsGatherTimeout 30s is the
+//     inner budget) degrades to a recoverState-reconciled zombie, never to state
+//     corruption.
+//  2. The deprovision volume-retry block (docker backend) stays a single direct
+//     provisionsMu span because it is coupled to the docker-private
+//     VolumeCleanupAttempts counter (not ProvisionState). It runs inline on the
+//     actor goroutine, so a hung volume.Destroy blocks the actor for that lease
+//     until ctx/timeout. Tracked for full seaming: ENG-285.
 type LeaseProvisionStore interface {
 	// Get returns a SHALLOW value-copy snapshot of the provision state
 	// and ok=true when the lease exists. Callers receive the copy by
