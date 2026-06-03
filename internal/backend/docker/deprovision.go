@@ -44,31 +44,34 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
 
-	b.provisionsMu.Lock()
-	prov, exists := b.provisions[leaseUUID]
+	// Mark Deprovisioning before removing containers (the in-memory marker lets
+	// Provision's status guard reject concurrent re-provision during the removal
+	// window). Capture the teardown inputs inside the closure; the metric Dec is
+	// a side effect kept OUTSIDE the closure (UpdateFn no-side-effect contract).
+	var (
+		wasReady     bool
+		containerIDs []string
+		items        []backend.LeaseItem
+		tenant       string
+		callbackURL  string
+	)
+	exists := b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+		wasReady = p.Status == backend.ProvisionStatusReady
+		p.Status = backend.ProvisionStatusDeprovisioning
+		containerIDs = append([]string(nil), p.ContainerIDs...)
+		items = append([]backend.LeaseItem(nil), p.Items...)
+		tenant = p.Tenant
+		callbackURL = p.CallbackURL
+	})
 	if !exists {
-		b.provisionsMu.Unlock()
-		// Already deprovisioned - idempotent success
+		// Already deprovisioned — idempotent success.
 		return nil
 	}
-	// Mark Deprovisioning before removing containers. The in-memory marker
-	// lets Provision's status guard reject concurrent re-provision attempts
-	// during the removal window (die events from RemoveContainer are dropped
-	// structurally by the SM's Deprovisioning.Ignore(evContainerDied)).
-	//
-	// Decrement activeProvisions on the Ready→Deprovisioning transition so
-	// the gauge stays accurate even if Deprovision fails partially and the
-	// provision ends up Failed on retry.
-	wasReady := prov.Status == backend.ProvisionStatusReady
-	prov.Status = backend.ProvisionStatusDeprovisioning
+	// Decrement activeProvisions on the Ready→Deprovisioning transition so the
+	// gauge stays accurate even if Deprovision later fails partially.
 	if wasReady {
 		activeProvisions.Dec()
 	}
-	containerIDs := append([]string(nil), prov.ContainerIDs...)
-	items := append([]backend.LeaseItem(nil), prov.Items...)
-	tenant := prov.Tenant
-	callbackURL := prov.CallbackURL
-	b.provisionsMu.Unlock()
 
 	// Remove all containers via Compose Down for atomic cleanup; fall back
 	// to individual RemoveContainer if Compose fails (e.g., compose project
@@ -109,17 +112,17 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	updateResourceMetrics(b.pool.Stats())
 
 	if len(errs) > 0 {
-		// Partial failure: keep provision visible with only the stuck containers
-		// so the reconciler (or a retry) can see and re-attempt them.
+		// Partial failure: keep provision visible with only the stuck containers.
 		var diagSnap shared.DiagnosticEntry
-		b.provisionsMu.Lock()
-		if p, ok := b.provisions[leaseUUID]; ok {
+		b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 			p.Status = backend.ProvisionStatusFailed
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
-			diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
-		}
-		b.provisionsMu.Unlock()
+			diagSnap = leasesm.DiagnosticSnapshot(p)
+		})
+		// Unlike the initial-mark migration, do NOT early-return on UpdateFn==false:
+		// still persist diagnostics and surface the error. If the entry is gone,
+		// diagSnap is zero-value and persistDiagnostics no-ops on its empty guard.
 		b.persistDiagnostics(diagSnap, failedIDs)
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
 	}
@@ -141,6 +144,13 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	if len(volumeErrs) > 0 {
+		// ENG-232: this block stays a single direct provisionsMu span (NOT routed
+		// through the store seam) because VolumeCleanupAttempts is a docker-private
+		// wrapper field (not on ProvisionState, unreachable through UpdateFn) and is
+		// incremented atomically with ContainerIDs/Status — seaming the
+		// ProvisionState writes would split one atomic read-modify-write into two.
+		// The give-up-branch delete stays inline for the same reason (calling
+		// store.Delete here would re-enter provisionsMu). Tracked: ENG-285.
 		var diagSnap shared.DiagnosticEntry
 		// attempts is captured INSIDE the b.provisionsMu Lock span (after
 		// the increment) so we can use the correct value at logger.Error
@@ -212,12 +222,10 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		}
 	}
 
-	// All containers and volumes removed — delete provision from map.
-	// Docker-private state (VolumeCleanupAttempts) is structural on the
-	// provision wrapper, so the single map delete drops it too.
-	b.provisionsMu.Lock()
-	delete(b.provisions, leaseUUID)
-	b.provisionsMu.Unlock()
+	// All containers and volumes removed — delete via the store seam. The map
+	// entry is the *provision wrapper, so GC drops the docker-private
+	// VolumeCleanupAttempts alongside ProvisionState when the entry goes.
+	b.provisionStore.Delete(leaseUUID)
 
 	// Clean up tenant network if isolation is enabled. releaseTenantNetwork
 	// scans b.provisions under a per-tenant mutex and skips removal if any

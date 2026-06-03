@@ -2162,9 +2162,55 @@ func TestCreateContainer_ExplicitPortConflict_NoRetry(t *testing.T) {
 
 // Fix 1: Deprovision on a provisioning lease still removes containers.
 
-// TestDeprovision_ActiveProvisionsGauge verifies that the activeProvisions gauge
-// is decremented exactly once on Ready→Failed transitions and never for non-Ready
-// provisions, even across partial-failure retry sequences.
+// TestDeprovision_ActiveProvisionsGauge verifies the wasReady-gated activeProvisions
+// Dec semantics the seam migration (ENG-232) preserves: a clean deprovision of a
+// Ready lease decrements the gauge exactly once, while a non-Ready (already Failed)
+// lease deprovisions without touching the gauge (wasReady=false → no Dec). The Dec
+// is read INSIDE the UpdateFn closure (wasReady) but applied OUTSIDE it, so this
+// guards the gauge-timing invariant flagged by the spec (cf. ENG-235).
+func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
+	t.Run("Ready lease decrements the gauge", func(t *testing.T) {
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusReady,
+				Quantity:     1,
+				ContainerIDs: []string{"c1"},
+				Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1,
+					ServiceName: manifest.DefaultServiceName}}},
+			},
+		})
+
+		before := testutil.ToFloat64(activeProvisions)
+		require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+		assert.Equal(t, -1.0, testutil.ToFloat64(activeProvisions)-before,
+			"Ready→Deprovisioning transition decrements activeProvisions exactly once")
+	})
+
+	t.Run("non-Ready lease does not decrement", func(t *testing.T) {
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusFailed,
+				Quantity:     1,
+				ContainerIDs: []string{"c1"},
+				Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1,
+					ServiceName: manifest.DefaultServiceName}}},
+			},
+		})
+
+		before := testutil.ToFloat64(activeProvisions)
+		require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+		assert.Equal(t, 0.0, testutil.ToFloat64(activeProvisions)-before,
+			"non-Ready (Failed) lease must not touch the gauge (wasReady=false → no Dec)")
+	})
+}
 
 // Fix 4: GetLogs on a failed lease still returns logs for remaining containers.
 
