@@ -9,10 +9,11 @@ import (
 
 // ReconcileCustomDomain reapplies the per-LeaseItem custom_domain values from
 // chain onto the running provision. When at least one item's CustomDomain
-// differs from the in-memory state, the backend snapshots the current values,
-// applies the new ones, and triggers a Restart() to re-emit Traefik labels.
-// On Restart failure the in-memory state is restored from the snapshot so the
-// next reconciler tick can retry cleanly.
+// differs from the in-memory state, the backend computes the diff read-only,
+// then routes the redeploy through the lease actor via routeReplaceRestart.
+// The actor commits prov.Items on success — no off-actor mutation, no CAS
+// rollback. A failed redeploy leaves prov.Items untouched so the next
+// reconciler tick retries (ENG-278).
 //
 // Reconciliation only runs when the provision is in ProvisionStatusReady.
 // Any other state (Provisioning, Restarting, Updating, Failing, Failed,
@@ -32,9 +33,8 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	}
 
 	// Precompute DNS readiness for each non-empty incoming custom domain BEFORE
-	// taking provisionsMu — the lookups do network I/O (a quorum of public
-	// resolvers) and must not block the lock. Keyed by domain; a lease has 0-1
-	// custom domains in practice. (ENG-266)
+	// taking provisionsMu — the lookups do network I/O and must not block the
+	// lock. Keyed by domain. (ENG-266)
 	dnsReady := make(map[string]bool)
 	for i := range items {
 		d := items[i].CustomDomain
@@ -44,10 +44,6 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		if _, seen := dnsReady[d]; seen {
 			continue
 		}
-		// Validate before any DNS I/O: a malformed/forbidden value is rejected
-		// by the diff loop below anyway, so resolving it is wasted network work
-		// — and would needlessly send a bad value to the public resolvers.
-		// Record it as not-ready so a (rare) duplicate isn't re-validated.
 		if err := validateCustomDomain(d, b.cfg.Ingress.WildcardDomain); err != nil {
 			dnsReady[d] = false
 			continue
@@ -55,6 +51,7 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		dnsReady[d] = b.dnsGateAllows(ctx, d)
 	}
 
+	// Compute the diff READ-ONLY under the lock; stage nothing in prov.Items.
 	b.provisionsMu.Lock()
 	prov, ok := b.provisions[leaseUUID]
 	if !ok {
@@ -65,42 +62,38 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		b.provisionsMu.Unlock()
 		return nil
 	}
+	overrides := b.computeCustomDomainOverrides(prov, items, dnsReady)
+	callbackURL := prov.CallbackURL
+	b.provisionsMu.Unlock()
 
-	// Compute per-position diff: for each incoming item, find the matching
-	// provision item by normalized service name (see normalizedServiceKeys),
-	// validate the new domain, and stage the change. Validation failures are
-	// skipped per item — bad inputs never block the rest of the reconcile.
-	//
-	// Rollback identifies items by ServiceName (NOT by index) plus a
-	// value-CAS check. Between this section's unlock and the rollback path's
-	// re-lock, recoverState (running on the docker-backend's own
-	// reconcileLoop) can swap b.provisions, replacing the provision struct
-	// with a freshly-rebuilt one whose Items may be in a different order.
-	// A stored index would silently target the wrong item; a stored
-	// ServiceName + value-CAS is robust against any reordering and against
-	// any concurrent mutation that already supplied the rolled-back value.
-	type pendingChange struct {
-		serviceName string
-		oldValue    string
-		newValue    string
+	if len(overrides) == 0 {
+		return nil
 	}
-	var pending []pendingChange
 
-	logger := slog.With("lease_uuid", leaseUUID)
+	slog.With("lease_uuid", leaseUUID).Info("custom_domain drift detected; redeploying",
+		"changes", len(overrides))
 
-	// Match chain items to provision items by their NORMALIZED service name.
-	// The provision path runs NormalizeProvisionRequest, which tags a lone
-	// unnamed item with DefaultServiceName ("app"); that normalized name is
-	// what lands in the container label and, via recoverState, in
-	// prov.Items[].ServiceName. The chain items handed to us carry the RAW
-	// on-chain service_name (ExtractLeaseItems does no normalization), which is
-	// "" for a single-image deploy created without -service-name. Normalizing
-	// both sides keeps them in lock-step; matching the raw strings would miss
-	// ("app" != "") and silently drop a custom_domain set after deploy
-	// (ENG-264).
+	// Route the redeploy through the lease actor. The worker renders the new
+	// domain from the override-applied item snapshot; the actor commits the
+	// values into prov.Items on success (ENG-231). No off-actor mutation, no
+	// CAS rollback — a failed redeploy leaves prov.Items untouched so the next
+	// tick retries (ENG-278).
+	return b.routeReplaceRestart(ctx, leaseUUID, callbackURL, overrides)
+}
+
+// computeCustomDomainOverrides returns the per-ServiceName custom_domain changes
+// to apply, computed READ-ONLY from the current provision and the incoming chain
+// items. The caller must hold provisionsMu. It performs the same
+// ServiceName-normalized match (ENG-264), defense-in-depth validation, and
+// asymmetric DNS-readiness gate (ENG-266) as the previous in-place mutation, but
+// stages nothing in prov.Items — routeReplaceRestart applies the returned
+// overrides to the worker snapshot and the actor commits them on success.
+func (b *Backend) computeCustomDomainOverrides(prov *provision, items []backend.LeaseItem, dnsReady map[string]bool) map[string]string {
+	logger := slog.With("lease_uuid", prov.LeaseUUID)
 	chainKeys := normalizedServiceKeys(items)
 	provKeys := normalizedServiceKeys(prov.Items)
 
+	overrides := make(map[string]string)
 	for ci := range items {
 		chainItem := items[ci]
 		idx := -1
@@ -112,18 +105,11 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		}
 		if idx == -1 {
 			// Item present on chain but not in provision: skip silently.
-			// Lease items are immutable post-creation on chain, so a
-			// missing-from-prov item can only mean the provision was
-			// recovered partially or pre-dates this code; nothing for us to
-			// do here.
 			continue
 		}
 		emitted := prov.Items[idx].CustomDomain
 		desired := chainItem.CustomDomain
-		// Defense-in-depth: chain validates on MsgSetItemCustomDomain, but we
-		// re-run the cheap checks here so a malformed value (e.g. set before
-		// this validation existed, or via a future chain bug) cannot leak into
-		// Traefik labels. Empty domain (clear) bypasses the FQDN check.
+		// Defense-in-depth validation (empty clear bypasses the FQDN check).
 		if desired != "" {
 			if err := validateCustomDomain(desired, b.cfg.Ingress.WildcardDomain); err != nil {
 				logger.Error("skipping custom-domain reconcile (validation failed)",
@@ -134,14 +120,9 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 			}
 		}
 		// Asymmetric DNS-readiness gate (ENG-266): only gate emitting a domain
-		// that is not already the emitted one. Never tear down an
-		// already-emitted domain on a transient DNS mismatch; clearing ("") is
-		// never gated. dnsReady was precomputed before the lock.
+		// that is not already the emitted one. Never tear down an already-emitted
+		// domain on a transient DNS mismatch; clearing ("") is never gated.
 		if desired != "" && desired != emitted && !dnsReady[desired] {
-			// Debug, not Info: this fires every reconcile tick while a domain is
-			// still propagating (the expected steady state for a pending domain),
-			// so Info would spam at scale. Genuine host_address resolution
-			// failures are surfaced at Warn by the readiness checker (backend.go).
 			logger.Debug("custom_domain set but DNS not yet pointing at this host; deferring cert issuance",
 				"service_name", prov.Items[idx].ServiceName,
 				"custom_domain", desired)
@@ -150,67 +131,9 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		if emitted == desired {
 			continue
 		}
-		// Apply now while we still hold the lock. The rollback snapshot keys on
-		// the provision item's ACTUAL ServiceName (not the normalized key) so it
-		// re-finds the item even if the provision struct is replaced before
-		// rollback runs.
-		pending = append(pending, pendingChange{
-			serviceName: prov.Items[idx].ServiceName,
-			oldValue:    emitted,
-			newValue:    desired,
-		})
-		prov.Items[idx].CustomDomain = desired
+		overrides[prov.Items[idx].ServiceName] = desired
 	}
-
-	if len(pending) == 0 {
-		b.provisionsMu.Unlock()
-		return nil
-	}
-
-	callbackURL := prov.CallbackURL
-	b.provisionsMu.Unlock()
-
-	logger.Info("custom_domain drift detected; redeploying",
-		"changes", len(pending))
-
-	// Re-emit labels via the existing Restart machinery. Restart uses the
-	// stored manifest unchanged and rebuilds containers from prov.Items —
-	// the new CustomDomain values get baked into the secondary-router
-	// labels naturally.
-	err := b.Restart(ctx, backend.RestartRequest{
-		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackURL,
-	})
-	if err != nil {
-		// Roll back the in-memory change so the next reconciler tick sees
-		// the same drift and tries again. The provision is still running
-		// the OLD containers (Restart's rollback restores them), so the
-		// in-memory state must match.
-		//
-		// Look up by ServiceName (not stored index) and gate the write on
-		// the current value still being newValue. If recoverState rebuilt
-		// b.provisions with a reordered Items slice, ServiceName lookup
-		// targets the correct item; the CAS makes the rollback a no-op
-		// when something else (e.g., recoverState reading from container
-		// labels) has already restored the previous value.
-		b.provisionsMu.Lock()
-		if prov, ok := b.provisions[leaseUUID]; ok {
-			for _, ch := range pending {
-				for i := range prov.Items {
-					if prov.Items[i].ServiceName != ch.serviceName {
-						continue
-					}
-					if prov.Items[i].CustomDomain == ch.newValue {
-						prov.Items[i].CustomDomain = ch.oldValue
-					}
-					break
-				}
-			}
-		}
-		b.provisionsMu.Unlock()
-		return err
-	}
-	return nil
+	return overrides
 }
 
 // normalizedServiceKeys returns, for each item, the service name it resolves
