@@ -57,7 +57,9 @@ Key properties:
 
 ### Failure semantics (CAS rollback deleted)
 
-On a failed redeploy, `onEnterReadyFromReplaceCompleted` does **not** run, so `OnSuccess` never commits — `prov.Items` is left untouched (old domain), consistent with the rolled-back old containers. The next reconcile tick re-detects the same drift and retries. This is the idiomatic level-triggered retry and **cleanly replaces** the ServiceName+value-CAS rollback (`reconcile_custom_domain.go:196-211`), which is deleted. No transient `prov.Items` inconsistency is externally observable (it is never written on failure).
+On a failed redeploy, `onEnterReadyFromReplaceCompleted` does **not** run, so `OnSuccess` never commits — **the actor writes nothing to `prov.Items`** and the lease lands Failed (or recovered-to-Ready), not Ready-with-the-new-domain-committed-by-the-actor. This **cleanly replaces** the ServiceName+value-CAS rollback (`reconcile_custom_domain.go:196-211`, deleted): no actor-side revert is needed, and the actor-as-sole-writer-of-`prov.Items` invariant (ENG-231) holds for the in-memory commit on the success path. This is verified by `TestReconcileCustomDomain_AsyncRedeployFailure_DoesNotCommit`.
+
+One subtlety worth stating precisely (pre-existing, **unchanged** by this PR): the redeploy's own rollback (`rollbackViaCompose`) rebuilds containers from the override-applied item snapshot (`op.Items`), so a *successfully rolled-back* failure leaves the restored containers carrying the **new** Traefik label — and `recoverState` then reconciles `prov.Items` to the new domain from those labels on a later tick. So the failure path does **not** simply "revert to the old domain and retry"; the system still converges to the chain-desired domain either way — via the actor's `OnSuccess` on success, or via `recoverState`'s existing label rebuild after a rolled-back failure. The behavior here is identical to before this PR (the old code's `Restart` prelude also snapshotted the already-mutated new domain into `op.Items`); only *who* performs the in-memory commit on the success path changed.
 
 The in-flight Ready-gate (`reconcile_custom_domain.go:64`) already prevents re-entry while a redeploy is running (`Status` is `Restarting`), so no redundant restart is triggered during the window; the `OnSuccess` commit prevents drift re-detection after success.
 
@@ -111,7 +113,7 @@ Existing tests that assert the CAS-rollback behavior are removed/rewritten (the 
 
 ENG-231:
 - [x] No write to `prov.Items` outside the actor goroutine — the only write is `OnSuccess` inside `onEnterReadyFromReplaceCompleted` (serial actor goroutine).
-- [x] Custom-domain reconcile still re-renders Traefik labels (worker renders from the override-applied snapshot) and still rolls back cleanly on failure — now via the actor's success/failure terminal path (no commit on failure → next-tick retry), replacing the CAS.
+- [x] Custom-domain reconcile still re-renders Traefik labels (worker renders from the override-applied snapshot) and still handles failure cleanly — now via the actor's success/failure terminal path (the actor commits nothing to `prov.Items` on failure; convergence rides `recoverState`'s label rebuild — see *Failure semantics*), replacing the CAS.
 
 ENG-278:
 - [x] A custom_domain change is not lost if `recoverState` runs concurrently (no redundant restart-with-old-domain).
