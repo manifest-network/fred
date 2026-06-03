@@ -31,19 +31,17 @@ func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]
 // customDomainOnSuccess returns an OnSuccess hook that commits the override
 // values into prov.Items. It runs inside onEnterReadyFromReplaceCompleted on the
 // serial actor goroutine, under the same UpdateFn critical section as the
-// Status->Ready flip, and ONLY on a successful redeploy — so a failed redeploy
-// leaves prov.Items untouched and the next reconcile tick retries. Returns nil
-// when there are no overrides, preserving the plain-restart behavior. (ENG-231)
+// Status->Ready flip, and ONLY on a successful redeploy — so the actor commits
+// nothing to prov.Items on a failed redeploy. Returns nil when there are no
+// overrides, preserving the plain-restart behavior. (ENG-231)
 func customDomainOnSuccess(overrides map[string]string) func(*leasesm.ProvisionState) {
 	if len(overrides) == 0 {
 		return nil
 	}
+	// Reuse the worker-snapshot match/assign so the committed prov.Items value
+	// and the rendered container label cannot diverge from a one-sided edit.
 	return func(p *leasesm.ProvisionState) {
-		for i := range p.Items {
-			if d, ok := overrides[p.Items[i].ServiceName]; ok {
-				p.Items[i].CustomDomain = d
-			}
-		}
+		applyCustomDomainOverrides(p.Items, overrides)
 	}
 }
 
