@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -720,6 +721,113 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 		}
 	}, 5*time.Second, 20*time.Millisecond)
 	wg.Wait()
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+func TestReconcileCustomDomain_AsyncRedeployFailure_DoesNotCommit(t *testing.T) {
+	// "Commit only on success" on the ASYNC worker path: when the redeploy worker
+	// fails (compose Up errors), the actor's success entry action
+	// (onEnterReadyFromReplaceCompleted / OnSuccess) never runs, so the new domain
+	// is NOT committed to prov.Items — the actor commits nothing on failure. The
+	// existing TestReconcileCustomDomain_RestartSyncError_LeavesItemsUnchanged only
+	// covers the synchronous prelude error (ErrInvalidState), never the worker;
+	// this covers the worker-failure path the deleted CAS rollback used to.
+	stack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"app": {Image: "nginx:latest", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+		},
+	}
+
+	var mu sync.Mutex
+	var callbackPayload backend.CallbackPayload
+	callbackReceived := make(chan struct{}, 1)
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		w.WriteHeader(http.StatusOK)
+		mu.Lock()
+		callbackPayload = p
+		mu.Unlock()
+		select {
+		case callbackReceived <- struct{}{}:
+		default:
+		}
+	}))
+	defer callbackServer.Close()
+
+	mock := &mockDockerClient{
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		},
+	}
+	// Worker fails: compose Up always errors, so both the forward deploy and the
+	// rollback fail -> the lease lands Failed (recovered==false), and OnSuccess
+	// is never invoked.
+	composeMock := &mockComposeExecutor{
+		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+			return fmt.Errorf("compose up failed (test)")
+		},
+	}
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant:            "tenant-a",
+			ProviderUUID:      "prov-1",
+			SKU:               "docker-small",
+			Status:            backend.ProvisionStatusReady,
+			StackManifest:     stack,
+			ContainerIDs:      []string{"old-app"},
+			ServiceContainers: map[string][]string{"app": {"old-app"}},
+			CallbackURL:       callbackServer.URL,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"},
+			},
+			Quantity: 1},
+		},
+	}
+
+	b := newBackendForProvisionTest(t, mock, provisions)
+	b.compose = composeMock
+	b.httpClient = callbackServer.Client()
+	rebuildCallbackSender(b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }
+
+	// Drive the PUBLIC reconcile path. The route + ack succeed (Status flips to
+	// Restarting) and ReconcileCustomDomain returns nil; the redeploy then fails
+	// asynchronously in the worker.
+	err := b.ReconcileCustomDomain(context.Background(), "lease-1", []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "", CustomDomain: "new.example.com"},
+	})
+	require.NoError(t, err, "route + ack succeed; the redeploy fails asynchronously in the worker")
+
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for failure callback")
+	}
+
+	// The redeploy genuinely failed (so we are exercising the failure path, not a
+	// vacuous no-op).
+	mu.Lock()
+	gotStatus := callbackPayload.Status
+	mu.Unlock()
+	require.Equal(t, backend.CallbackStatusFailed, gotStatus,
+		"the failure callback must have been delivered (guards against a vacuous pass)")
+
+	// The actor committed nothing: prov.Items still carries the OLD domain, and
+	// the lease is not left Ready-with-the-new-domain.
+	b.provisionsMu.RLock()
+	got := b.provisions["lease-1"].Items[0].CustomDomain
+	status := b.provisions["lease-1"].Status
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "old.example.com", got,
+		"a failed worker redeploy must not commit the new domain to prov.Items (OnSuccess is success-only)")
+	assert.NotEqual(t, backend.ProvisionStatusReady, status,
+		"a failed redeploy must not land the lease back in Ready via the success entry action")
 
 	b.stopCancel()
 	b.wg.Wait()
