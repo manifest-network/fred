@@ -566,7 +566,6 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 	}
 
 	b := newBackendForProvisionTest(t, mock, provisions)
-	defer b.stopCancel()
 	b.compose = composeMock
 	b.releaseStore = releaseStore
 	b.httpClient = callbackServer.Client()
@@ -691,7 +690,6 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, provisions)
-	defer b.stopCancel()
 	b.compose = composeMock
 	b.releaseStore = releaseStore
 	b.httpClient = callbackServer.Client()
