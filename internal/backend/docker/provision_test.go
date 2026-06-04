@@ -916,11 +916,19 @@ func TestDeprovision_UnderLimitVolumeRetryKeepsProvisionFailed(t *testing.T) {
 
 	b.provisionsMu.RLock()
 	p, ok := b.provisions["lease-1"]
+	var gotStatus backend.ProvisionStatus
+	var gotIDs []string
+	var gotAttempts int
+	if ok {
+		gotStatus = p.Status
+		gotIDs = append([]string(nil), p.ContainerIDs...)
+		gotAttempts = p.VolumeCleanupAttempts
+	}
 	b.provisionsMu.RUnlock()
 	require.True(t, ok, "provision stays visible for retry under the limit")
-	assert.Equal(t, backend.ProvisionStatusFailed, p.Status)
-	assert.Nil(t, p.ContainerIDs, "containers are gone")
-	assert.Equal(t, 1, p.VolumeCleanupAttempts)
+	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus)
+	assert.Nil(t, gotIDs, "containers are gone")
+	assert.Equal(t, 1, gotAttempts)
 }
 
 // TestDeprovision_RetryAfterPartialFailureFiresOneCallback verifies that the
@@ -967,8 +975,12 @@ func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
 	require.Error(t, b.Deprovision(context.Background(), "lease-1"))
 	b.provisionsMu.RLock()
 	p, ok := b.provisions["lease-1"]
-	gotStatus := p.Status
-	gotIDs := append([]string(nil), p.ContainerIDs...)
+	var gotStatus backend.ProvisionStatus
+	var gotIDs []string
+	if ok {
+		gotStatus = p.Status
+		gotIDs = append([]string(nil), p.ContainerIDs...)
+	}
 	b.provisionsMu.RUnlock()
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus)
