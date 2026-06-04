@@ -48,10 +48,12 @@ A new value type in the docker package, carrying **every** field needed to mater
 // every ProvisionState field plus every *provision wrapper field appears here
 // (enforced by test).
 type recoveredProvision struct {
-	state                 leasesm.ProvisionState // all 14 fields, by value
-	volumeCleanupAttempts int                    // the only wrapper field today
+	leasesm.ProvisionState // embedded, mirroring `provision` — all 14 fields by value
+	volumeCleanupAttempts int // the only wrapper field today
 }
 ```
+
+It **embeds** `leasesm.ProvisionState` exactly as `provision` does (no method-promotion downside — `ProvisionState` has no methods), so `materialize` is a trivial struct copy and the two stay structurally parallel.
 
 `ProvisionState` fields (14): `LeaseUUID, Tenant, ProviderUUID, SKU, Status, Quantity, CreatedAt, FailCount, LastError, CallbackURL, Items, ContainerIDs, StackManifest, ServiceContainers`. Wrapper field (1): `VolumeCleanupAttempts`.
 
@@ -68,6 +70,8 @@ The structural guarantee rests on one typed constructor:
 // writable handle to a published *provision.
 func (rec recoveredProvision) materialize() *provision
 ```
+
+> Naming: a value→pointer conversion method reads naturally here; if the plan prefers the package's `newX` house style, `newProvision(rec recoveredProvision) *provision` is equivalent. Either is fine — pick one and keep it the single gate.
 
 `recoveredProvision` is an off-map **value**; you cannot place it in `b.provisions` without `materialize()`. There are exactly **two** publish points — the only code that assigns into `b.provisions`:
 
@@ -119,9 +123,17 @@ Resolution:
 - **`ContainerIDs`, `ServiceContainers`** — defensive clone whenever a `recoveredProvision` is derived from a *live/kept* entry (workers re-point these headers off-actor: `restart_update.go:489-490`, `lease_actor.go:714/842-844`); recovery already clones at `recover.go:396/446` — preserve those inside the install span. The build loop allocates them fresh; nil at provision reservation.
 - **`StackManifest`** — pointer field, freshly produced on both paths (`provision.go:152`, `recover.go:151`); no copy needed, but note it is a pointer so future code does not assume value semantics.
 
+## Idiomatic grounding (industry practice)
+
+The design is a textbook application of well-established patterns, which the plan should name in code comments:
+- **Value object + factory gate** — `recoveredProvision` is an immutable-by-convention value; `materialize`/`newProvision` is the sole factory into the entity (`*provision`). Standard Go constructor practice (`NewX`/`newX` factory functions).
+- **Parse, don't validate / make illegal states unrepresentable** — construction is stratified into a build phase (off-map value) and a publish phase (one seam), so "off-actor write to a published provision" is structurally narrowed to a named set.
+- **Defensive copy at the boundary** — the `Items` deep-copy (`append([]LeaseItem(nil), req.Items...)`) is the idiomatic Go fix for retaining a caller-owned slice; confirmed best practice.
+- **Field-completeness enforced by tooling, not by hand** — see Testing.
+
 ## Testing
 
-- **`recoveredProvision` field-exhaustiveness guard** — a test (or small reflection-based check) that fails if any `ProvisionState` or `*provision` wrapper field is absent from `recoveredProvision` or from `installRecovered`'s assignment list. Any omission is a latent staleness bug.
+- **`recoveredProvision` field-completeness via the `exhaustruct` linter (not a hand-rolled reflection test)** — enable the `exhaustruct` golangci-lint linter and mark `provision` + `recoveredProvision` with `//exhaustruct:enforce` (or an `-enforce-rx` pattern). Then *any* `recoveredProvision{…}` / `&provision{…}` literal that omits a field fails CI, so a newly-added `ProvisionState`/wrapper field forces every construction site to set it (or explicitly zero it). The reservation-marker literal sets the deferred `SKU`/`Items`/`StackManifest` to explicit zero values (`""`/`nil`), which both satisfies the linter and self-documents the deferral. This is the maintained, idiomatic replacement for a custom reflection check.
 - **Behavior-preservation tests** — recovery of `Ready`-from-containers, in-flight (`Provisioning`/`Restarting`/`Updating`), `Failing`/`Failed`, and the new explicit `Deprovisioning` case all yield the same observable `b.provisions` state as before (same `Status`/`Items`/`ContainerIDs`/`FailCount`/`LastError`/`VolumeCleanupAttempts`), including the clear-on-rebuild of `LastError`/`VolumeCleanupAttempts`.
 - **Aliasing regression test** — provisioning a lease then observing that a later in-place mutation of the *caller's* `req.Items` does not change the published `Items`.
 - **Concurrent-reader tests** (a synchronous `-race` run proves nothing here — cf. ENG-278/ENG-266 lineage): (a) a reader/actor issuing `UpdateFn` writes racing recovery's install span; (b) a reader (`ListProvisions`/`GetInfo`/reconcile) racing a mid-validation provision in the `79→197` window.
@@ -133,7 +145,7 @@ Resolution:
 - The provision path sets the deferred metadata only through `enrichReserved`, which deep-copies `Items`.
 - Recovery behavior is byte-equivalent to the prior swap for every status, plus an explicit `Deprovisioning` preserve-case.
 - The surviving off-actor write exceptions (the enriched-`LastError` suffix; the worker pre-publish class) are explicitly named in code and documented as the *only* exceptions.
-- All existing docker + leasesm tests stay green under `-race`; the new exhaustiveness, behavior-preservation, aliasing, and concurrent-reader tests pass.
+- All existing docker + leasesm tests stay green under `-race`; the `exhaustruct` field-completeness check is enforced for `provision`/`recoveredProvision` (scoped via golangci `exhaustruct.include` or `//exhaustruct:enforce`, not repo-wide), and the new behavior-preservation, aliasing, and concurrent-reader tests pass.
 
 ## Non-goals / out of scope
 
