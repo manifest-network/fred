@@ -13,12 +13,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -845,11 +847,163 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 // max-attempts-exhausted volume cleanup path fires a failed callback with
 // a hardcoded message — without it, Fred would be unaware that the lease
 // had become terminal.
+func TestDeprovision_VolumeExhaustionSendsFailedCallback(t *testing.T) {
+	var received backend.CallbackPayload
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	mock := &mockDockerClient{RemoveContainerFn: func(ctx context.Context, id string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			ContainerIDs: []string{"c1"}, CallbackURL: server.URL,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}},
+			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1}, // one failure from give-up
+	})
+	// Container removal succeeds (compose Down nil default) so the volume path runs;
+	// volume Destroy always fails → attempts 2→3 → give-up.
+	b.volumes = &mockVolumeManager{DestroyFn: func(ctx context.Context, id string) error {
+		return fmt.Errorf("permission denied")
+	}}
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	before := testutil.ToFloat64(deprovisionsTotal)
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1")) // give-up returns nil, not error
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for failed callback")
+	}
+	assert.Equal(t, backend.CallbackStatusFailed, received.Status)
+	assert.Equal(t, "volume cleanup exhausted", received.Error)
+
+	b.provisionsMu.RLock()
+	_, ok := b.provisions["lease-1"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, ok, "provision must be deleted after give-up")
+	assert.Equal(t, 1.0, testutil.ToFloat64(deprovisionsTotal)-before, "give-up increments deprovisionsTotal")
+}
+
+// TestDeprovision_UnderLimitVolumeRetryKeepsProvisionFailed verifies that a
+// volume-destroy failure below maxVolumeCleanupAttempts increments the
+// counter, marks the provision Failed with ContainerIDs nil, keeps it visible
+// for retry, and returns an error (no callback).
+func TestDeprovision_UnderLimitVolumeRetryKeepsProvisionFailed(t *testing.T) {
+	mock := &mockDockerClient{RemoveContainerFn: func(ctx context.Context, id string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			ContainerIDs: []string{"c1"},
+			Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}}},
+	})
+	b.volumes = &mockVolumeManager{DestroyFn: func(ctx context.Context, id string) error {
+		return fmt.Errorf("device busy")
+	}}
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	require.Error(t, err, "under-limit volume failure returns an error")
+
+	b.provisionsMu.RLock()
+	p, ok := b.provisions["lease-1"]
+	var gotStatus backend.ProvisionStatus
+	var gotIDs []string
+	var gotAttempts int
+	if ok {
+		gotStatus = p.Status
+		gotIDs = append([]string(nil), p.ContainerIDs...)
+		gotAttempts = p.VolumeCleanupAttempts
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, ok, "provision stays visible for retry under the limit")
+	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus)
+	assert.Nil(t, gotIDs, "containers are gone")
+	assert.Equal(t, 1, gotAttempts)
+}
 
 // TestDeprovision_RetryAfterPartialFailureFiresOneCallback verifies that the
 // terminal callback only fires on clean completion. A first call that hits a
 // partial-container-failure path emits no callback; a successful retry emits
 // exactly one deprovisioned callback.
+func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
+	var statuses []backend.CallbackStatus
+	var mu sync.Mutex
+	callbackDone := make(chan struct{}, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		w.WriteHeader(http.StatusOK)
+		mu.Lock()
+		statuses = append(statuses, p.Status)
+		mu.Unlock()
+		callbackDone <- struct{}{}
+	}))
+	defer server.Close()
+
+	removeShouldFail := true
+	mock := &mockDockerClient{RemoveContainerFn: func(ctx context.Context, id string) error {
+		if removeShouldFail {
+			return fmt.Errorf("container removal failed")
+		}
+		return nil
+	}}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			ContainerIDs: []string{"c1"}, CallbackURL: server.URL,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}}},
+	})
+	// Force the RemoveContainer fallback on both calls (compose Down fails).
+	b.compose = &mockComposeExecutor{DownFn: func(ctx context.Context, project string, t time.Duration) error {
+		return fmt.Errorf("compose down failed")
+	}}
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	// Call 1: partial container failure → error, NO callback, provision stays Failed.
+	require.Error(t, b.Deprovision(context.Background(), "lease-1"))
+	b.provisionsMu.RLock()
+	p, ok := b.provisions["lease-1"]
+	var gotStatus backend.ProvisionStatus
+	var gotIDs []string
+	if ok {
+		gotStatus = p.Status
+		gotIDs = append([]string(nil), p.ContainerIDs...)
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus)
+	assert.Equal(t, []string{"c1"}, gotIDs, "ContainerIDs narrowed to the stuck containers")
+	select {
+	case <-callbackDone:
+		t.Fatal("partial failure must NOT fire a callback")
+	case <-time.After(1 * time.Second):
+	}
+
+	// Call 2: removal now succeeds → exactly one Deprovisioned callback.
+	removeShouldFail = false
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the deprovisioned callback")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, statuses, 1, "exactly one callback across both calls")
+	assert.Equal(t, backend.CallbackStatusDeprovisioned, statuses[0])
+}
 
 // --- GetInfo tests ---
 
@@ -2020,9 +2174,55 @@ func TestCreateContainer_ExplicitPortConflict_NoRetry(t *testing.T) {
 
 // Fix 1: Deprovision on a provisioning lease still removes containers.
 
-// TestDeprovision_ActiveProvisionsGauge verifies that the activeProvisions gauge
-// is decremented exactly once on Ready→Failed transitions and never for non-Ready
-// provisions, even across partial-failure retry sequences.
+// TestDeprovision_ActiveProvisionsGauge verifies the wasReady-gated activeProvisions
+// Dec semantics the seam migration (ENG-232) preserves: a clean deprovision of a
+// Ready lease decrements the gauge exactly once, while a non-Ready (already Failed)
+// lease deprovisions without touching the gauge (wasReady=false → no Dec). The Dec
+// is read INSIDE the UpdateFn closure (wasReady) but applied OUTSIDE it, so this
+// guards the gauge-timing invariant flagged by the spec (cf. ENG-235).
+func TestDeprovision_ActiveProvisionsGauge(t *testing.T) {
+	t.Run("Ready lease decrements the gauge", func(t *testing.T) {
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusReady,
+				Quantity:     1,
+				ContainerIDs: []string{"c1"},
+				Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1,
+					ServiceName: manifest.DefaultServiceName}}},
+			},
+		})
+
+		before := testutil.ToFloat64(activeProvisions)
+		require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+		assert.Equal(t, -1.0, testutil.ToFloat64(activeProvisions)-before,
+			"Ready→Deprovisioning transition decrements activeProvisions exactly once")
+	})
+
+	t.Run("non-Ready lease does not decrement", func(t *testing.T) {
+		mock := &mockDockerClient{
+			RemoveContainerFn: func(ctx context.Context, containerID string) error { return nil },
+		}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+				Tenant:       "tenant-a",
+				Status:       backend.ProvisionStatusFailed,
+				Quantity:     1,
+				ContainerIDs: []string{"c1"},
+				Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1,
+					ServiceName: manifest.DefaultServiceName}}},
+			},
+		})
+
+		before := testutil.ToFloat64(activeProvisions)
+		require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+		assert.Equal(t, 0.0, testutil.ToFloat64(activeProvisions)-before,
+			"non-Ready (Failed) lease must not touch the gauge (wasReady=false → no Dec)")
+	})
+}
 
 // Fix 4: GetLogs on a failed lease still returns logs for remaining containers.
 

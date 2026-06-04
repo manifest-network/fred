@@ -159,6 +159,23 @@ func TestBackendProvisionStore_Get(t *testing.T) {
 	})
 }
 
+// TestBackendProvisionStore_Delete verifies that Delete removes the entry
+// and returns the presence bool correctly.
+func TestBackendProvisionStore_Delete(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
+	})
+
+	t.Run("present returns true and entry is removed", func(t *testing.T) {
+		assert.True(t, b.provisionStore.Delete("lease-1"))
+		_, ok := b.provisionStore.Get("lease-1")
+		assert.False(t, ok, "entry must be gone after Delete")
+	})
+	t.Run("absent returns false (idempotent)", func(t *testing.T) {
+		assert.False(t, b.provisionStore.Delete("lease-1"))
+	})
+}
+
 // TestBackendProvisionStore_UpdateFn applies the closure under one
 // critical section (verified by inspecting the mutated provision
 // struct after the call).
