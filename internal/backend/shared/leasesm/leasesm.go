@@ -228,8 +228,8 @@ type ProvisionState struct {
 //     workCancel() then waitForWorkers() (blocked on workers.Zero()); only then
 //     does handleDeprovision invoke doDeprovision, which reads ContainerIDs.
 //     Routing this through an actor message is PROHIBITED: the actor is blocked
-//     in waitForWorkers() and cannot dequeue the publish the worker must send to
-//     release the barrier (actor self-deadlock). Bounded escape: a worker
+//     in waitForWorkers() and cannot dequeue the publish message the worker must
+//     send to release the barrier (actor self-deadlock). Bounded escape: a worker
 //     exceeding workExitWaitTimeout (75s; diagnosticsGatherTimeout 30s is the
 //     inner budget) degrades to a recoverState-reconciled zombie, never to state
 //     corruption.
