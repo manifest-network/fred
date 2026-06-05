@@ -3,6 +3,7 @@ package docker
 import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // recoveredProvision is a fully-built, NOT-YET-PUBLISHED provision snapshot.
@@ -53,4 +54,16 @@ func recoveredFromProvision(p *provision) recoveredProvision {
 		rec.ServiceContainers = sc
 	}
 	return rec
+}
+
+// enrichReserved sets the post-validation workload metadata on a reserved
+// provision (the slot is a Provisioning marker). It is the ONLY place SKU /
+// Items / StackManifest are written outside the actor; the caller holds
+// b.provisionsMu. Items is deep-copied so the published provision does not
+// alias the caller's request slice (NormalizeProvisionRequest mutates it in
+// place).
+func (p *provision) enrichReserved(sku string, items []backend.LeaseItem, sm *manifest.StackManifest) {
+	p.SKU = sku
+	p.Items = append([]backend.LeaseItem(nil), items...)
+	p.StackManifest = sm
 }
