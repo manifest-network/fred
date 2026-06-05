@@ -17,9 +17,17 @@ linters:
     - unparam
     - nilerr
     - errorlint
+    - exhaustruct
   settings:
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
+    exhaustruct:
+      # Directive-only mode: exclude every type globally so the linter checks
+      # ONLY literals explicitly marked //exhaustruct:enforce (the recovered-
+      # Provision / ProvisionState construction sites). Keeps the guard off the
+      # rest of the repo and all test literals. (ENG-193)
+      exclude:
+        - '.*'
     gocritic:
       enabled-tags:
         - diagnostic
