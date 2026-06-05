@@ -3608,3 +3608,37 @@ func TestProvision_EnrichReserved_DeepCopiesItems(t *testing.T) {
 	require.Len(t, p.Items, 1)
 	assert.Equal(t, "app", p.Items[0].ServiceName, "stored Items must be a copy, not the caller's slice")
 }
+
+func TestProvision_ConcurrentReaderDuringValidationWindow(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusProvisioning, CallbackURL: "http://cb"}},
+	})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if s, ok := b.provisionStore.Get("L1"); ok {
+					// A reader in the validation window sees the Provisioning marker
+					// with its CallbackURL resolved — never an empty/torn entry.
+					_ = s.CallbackURL
+				}
+			}
+		}
+	}()
+	// Exercise enrichReserved concurrently with the reader (the create-path write).
+	for range 50 {
+		b.provisionsMu.Lock()
+		if p, ok := b.provisions["L1"]; ok {
+			p.enrichReserved("docker-small", []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}, nil)
+		}
+		b.provisionsMu.Unlock()
+	}
+	close(stop)
+	wg.Wait()
+}

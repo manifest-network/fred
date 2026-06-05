@@ -494,3 +494,42 @@ func TestRecoverState_DeprovisioningPreserved_SurvivingContainers(t *testing.T) 
 	assert.Equal(t, backend.ProvisionStatusDeprovisioning, p.Status, "must NOT be resurrected to a container-derived status")
 	assert.Same(t, existing["L1"], p)
 }
+
+// TestRecoverState_ConcurrentReaderDuringMerge runs recoverState while another
+// goroutine continuously reads provision state through the store seam. The race
+// detector must stay clean: the merge holds provisionsMu across the swap and the
+// reader takes it via Get.
+func TestRecoverState_ConcurrentReaderDuringMerge(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusReady, ContainerIDs: []string{"c1"}}},
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running"},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, existing)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = b.provisionStore.Get("L1")
+			}
+		}
+	}()
+
+	for range 20 {
+		require.NoError(t, b.recoverState(context.Background()))
+	}
+	close(stop)
+	wg.Wait()
+}
