@@ -445,6 +445,37 @@ func TestRecoverState_FailingNormalizedToFailed(t *testing.T) {
 	assert.Equal(t, "x", p.LastError)
 }
 
+func TestRecoverState_FailingNormalized_DeepClonesReferenceFields(t *testing.T) {
+	// recover.go's Failing->Failed normalization builds a fresh entry via
+	// recoveredFromProvision+materialize. Lock the deep-clone at its real call
+	// site with NON-empty reference fields: the recovered entry must be a fresh
+	// struct whose Items/ContainerIDs/ServiceContainers do not alias the
+	// original existing entry's backing arrays.
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:         "L1",
+			Status:            backend.ProvisionStatusFailing,
+			FailCount:         2,
+			LastError:         "boom",
+			Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "x.example"}},
+			ContainerIDs:      []string{"c1"},
+			ServiceContainers: map[string][]string{"app": {"c1"}},
+		}},
+	}
+	got := runRecover(t, existing, nil) // no containers -> Failing-normalize path
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status, "Failing normalizes to Failed")
+	assert.NotSame(t, existing["L1"], p, "must be a fresh materialized entry, not the mutated published struct")
+	// Mutating the recovered entry's reference fields must NOT touch the original.
+	p.Items[0].ServiceName = "mutated"
+	p.ContainerIDs[0] = "mutated"
+	p.ServiceContainers["app"][0] = "mutated"
+	assert.Equal(t, "app", existing["L1"].Items[0].ServiceName, "Items must be deep-cloned")
+	assert.Equal(t, "c1", existing["L1"].ContainerIDs[0], "ContainerIDs must be deep-cloned")
+	assert.Equal(t, "c1", existing["L1"].ServiceContainers["app"][0], "ServiceContainers must be deep-cloned")
+}
+
 func TestRecoverState_FailedPreservedNoContainers(t *testing.T) {
 	existing := map[string]*provision{
 		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusFailed, FailCount: 7}},
