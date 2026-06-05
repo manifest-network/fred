@@ -470,3 +470,27 @@ func TestRecoverState_FailCountAntiRegression(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, p.Status,
 		"container-derived Ready status must not be suppressed by FailCount anti-regression")
 }
+
+func TestRecoverState_DeprovisioningPreserved_NoContainers(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusDeprovisioning}},
+	}
+	got := runRecover(t, existing, nil) // containers already gone
+	p, ok := got["L1"]
+	require.True(t, ok, "a Deprovisioning lease must be preserved, not dropped")
+	assert.Equal(t, backend.ProvisionStatusDeprovisioning, p.Status)
+	assert.Same(t, existing["L1"], p, "preserved by pointer — the deprovision goroutine owns it")
+}
+
+func TestRecoverState_DeprovisioningPreserved_SurvivingContainers(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusDeprovisioning}},
+	}
+	got := runRecover(t, existing, []ContainerInfo{
+		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running"},
+	})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusDeprovisioning, p.Status, "must NOT be resurrected to a container-derived status")
+	assert.Same(t, existing["L1"], p)
+}

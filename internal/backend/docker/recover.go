@@ -78,7 +78,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 
 	allocsByLease := make(map[string][]shared.ResourceAllocation)
-	recovered := make(map[string]*provision)
+	building := make(map[string]*recoveredProvision)
 	// firstExitedByLease[uuid] is the container ID of the first container we
 	// observed in an exited state for that lease. Used to fire containerDiedMsg
 	// into the actor for Ready→Failed transitions so the SM handles the
@@ -120,20 +120,26 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 
 		// Check if we already have a provision record for this lease
-		prov, exists := recovered[c.LeaseUUID]
+		prov, exists := building[c.LeaseUUID]
 		if !exists {
-			prov = &provision{
-				ProvisionState: leasesm.ProvisionState{
-					LeaseUUID:    c.LeaseUUID,
-					Tenant:       c.Tenant,
-					ProviderUUID: c.ProviderUUID,
-					SKU:          c.SKU,
-					Status:       containerStatusToProvisionStatus(c.Status),
-					CreatedAt:    c.CreatedAt,
-					FailCount:    c.FailCount,
-					CallbackURL:  c.CallbackURL,
-					ContainerIDs: make([]string, 0),
+			prov = &recoveredProvision{ //exhaustruct:enforce
+				ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
+					LeaseUUID:         c.LeaseUUID,
+					Tenant:            c.Tenant,
+					ProviderUUID:      c.ProviderUUID,
+					SKU:               c.SKU,
+					Status:            containerStatusToProvisionStatus(c.Status),
+					Quantity:          0, // set from ContainerIDs below
+					CreatedAt:         c.CreatedAt,
+					FailCount:         c.FailCount,
+					LastError:         "", // populated by cold-start/transition logic below
+					CallbackURL:       c.CallbackURL,
+					Items:             nil, // rebuilt from labels below
+					ContainerIDs:      make([]string, 0),
+					StackManifest:     nil, // restored below
+					ServiceContainers: nil, // rebuilt from labels below
 				},
+				volumeCleanupAttempts: 0,
 			}
 
 			// Restore manifest from the last successful (active) release so
@@ -158,7 +164,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				}
 			}
 
-			recovered[c.LeaseUUID] = prov
+			building[c.LeaseUUID] = prov
 		}
 
 		// Add container ID to the provision
@@ -250,19 +256,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// Merge with existing state and detect status transitions.
 	b.provisionsMu.Lock()
 
-	// Detect ready→failed transitions: containers that were running but have since crashed.
-	// For each transition, we hand off to the SM by firing containerDiedMsg
-	// on the actor *after* the merge (see below). The SM's Ready→Failing→Failed
-	// flow gathers diagnostics via the async goroutine and emits the
-	// terminal Failed callback through Failed.OnEntryFrom(evDiagGathered).
-	//
-	// Status stays Ready in the recovered map so the actor's guard sees the
-	// pre-transition state and permits evContainerDied; FailCount and
-	// LastError are populated by the SM's Failing entry action.
+	// Detect ready→failed transitions: containers that were running but have
+	// since crashed. We hand off to the SM by firing containerDiedMsg on the
+	// actor *after* the merge. Status stays Ready in the building value so the
+	// actor's guard sees the pre-transition state and permits evContainerDied;
+	// FailCount and LastError are populated by the SM's Failing entry action.
 	var failedLeases []string
 	for uuid, existing := range b.provisions {
 		if existing.Status == backend.ProvisionStatusReady {
-			if rec, ok := recovered[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
+			if rec, ok := building[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
 				rec.Status = backend.ProvisionStatusReady
 				rec.FailCount = existing.FailCount
 				rec.LastError = existing.LastError
@@ -276,11 +278,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 
 	// Cold-start correction: provisions recovered as failed with no prior
-	// in-memory state have a FailCount from the container label that was
-	// written at creation time (before this failure occurred). Increment
-	// it to account for the failure evidenced by the container being dead.
+	// in-memory state carry a creation-time FailCount label. Increment it to
+	// account for the failure evidenced by the dead container. The baseline
+	// LastError rides the materialized value.
 	var coldStartFailed []string
-	for uuid, rec := range recovered {
+	for uuid, rec := range building {
 		if rec.Status == backend.ProvisionStatusFailed {
 			if _, hasExisting := b.provisions[uuid]; !hasExisting {
 				rec.FailCount++
@@ -294,51 +296,75 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 
-	// Preserve provisions without containers that need to remain visible
-	// to fred's reconciler.
-	for uuid, existing := range b.provisions {
-		if rec, hasContainers := recovered[uuid]; hasContainers {
-			if existing.Status == backend.ProvisionStatusProvisioning || existing.Status == backend.ProvisionStatusRestarting || existing.Status == backend.ProvisionStatusUpdating {
-				// In-flight re-provision: the containers in recovered belong to the
-				// previous (failed) provision and carry stale FailCount labels. The
-				// old containers are being removed by Provision() concurrently.
-				// Preserve the in-flight entry with its correct FailCount so the
-				// next container creation picks up the right value.
-				recovered[uuid] = existing
-			} else if existing.FailCount > rec.FailCount {
-				// Container labels carry the FailCount from creation time. When
-				// recoverState increments FailCount in-memory (e.g., ready→failed
-				// transition), subsequent recoverState calls re-read the stale label
-				// value. Preserve the higher in-memory count to prevent regression.
-				rec.FailCount = existing.FailCount
-			}
-			continue // Already recovered from containers
+	// FailCount anti-regression on rebuilt entries: a re-list after an in-memory
+	// increment would otherwise regress FailCount to the stale label. Preserve
+	// the higher in-memory value. Skipped for in-flight statuses (preserved
+	// wholesale below).
+	for uuid, rec := range building {
+		existing, ok := b.provisions[uuid]
+		if !ok {
+			continue
 		}
 		switch existing.Status {
 		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
-			// In-flight operation that hasn't produced containers yet — preserve it.
-			recovered[uuid] = existing
-		case backend.ProvisionStatusFailing:
-			// Failing is a transient state between container-death detection
-			// and the diag goroutine firing DiagGathered. A crash (or external
-			// container removal while Failing) can preserve Failing in memory
-			// without the transition to Failed completing. Normalize to
-			// Failed so Provision/Restart/Update retry paths (which require
-			// Status == Failed) can proceed — the container is dead,
-			// FailCount has been incremented, LastError was set by
-			// onEnterFailing. Any diag that was in-flight is lost; the
-			// normalized Failed callback is not re-emitted (the lease is
-			// recoverable via retry from the caller).
-			existing.Status = backend.ProvisionStatusFailed
-			recovered[uuid] = existing
-		case backend.ProvisionStatusFailed:
-			// Failed provision whose containers have been cleaned up.
-			// Preserve so fred's reconciler can see the failure and its
-			// FailCount.
-			recovered[uuid] = existing
+			// preserved wholesale below
+		default:
+			if existing.FailCount > rec.FailCount {
+				rec.FailCount = existing.FailCount
+			}
 		}
 	}
-	b.provisions = recovered
+
+	// Publish: materialize every rebuilt entry into a fresh *provision (the only
+	// path a recoveredProvision reaches b.provisions). A fresh struct clears
+	// stale fields (LastError, VolumeCleanupAttempts) exactly as the prior
+	// fresh-&provision{}+swap did.
+	final := make(map[string]*provision, len(building))
+	for uuid, rec := range building {
+		final[uuid] = rec.materialize()
+	}
+
+	// Overlay existing entries that must be preserved: the actor / deprovision
+	// goroutine owns their live state, so reuse the live *provision pointer
+	// (no off-actor field mutation).
+	for uuid, existing := range b.provisions {
+		if _, hasContainers := building[uuid]; hasContainers {
+			switch existing.Status {
+			case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+				// In-flight re-provision: the rebuilt containers belong to the
+				// previous (failed) provision; keep the in-flight entry so the
+				// next container creation picks up the right FailCount.
+				final[uuid] = existing
+			case backend.ProvisionStatusDeprovisioning:
+				// The deprovision goroutine owns this lease; do not resurrect it
+				// to a container-derived status (ENG-193 explicit case).
+				final[uuid] = existing
+			}
+			continue
+		}
+		switch existing.Status {
+		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+			// In-flight operation that hasn't produced containers yet.
+			final[uuid] = existing
+		case backend.ProvisionStatusFailing:
+			// Failing is transient (container-death detected, diag goroutine not
+			// yet fired DiagGathered). Normalize to Failed so retry paths (which
+			// require Status == Failed) can proceed. Build the kept entry as a
+			// value — no in-place mutation of the published struct.
+			rec := recoveredFromProvision(existing)
+			rec.Status = backend.ProvisionStatusFailed
+			final[uuid] = rec.materialize()
+		case backend.ProvisionStatusFailed:
+			// Failed provision whose containers are gone — preserve so the
+			// reconciler sees the failure and its FailCount.
+			final[uuid] = existing
+		case backend.ProvisionStatusDeprovisioning:
+			// Owned by the in-flight deprovision goroutine; preserve untouched
+			// (ENG-193 explicit case — previously dropped on recovery).
+			final[uuid] = existing
+		}
+	}
+	b.provisions = final
 
 	// Build the final allocations list, excluding leases with in-flight
 	// operations (provisioning/restarting/updating). Their old containers
@@ -346,7 +372,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// race with TryAllocate in Provision/Restart/Update.
 	var allocations []shared.ResourceAllocation
 	for uuid, allocs := range allocsByLease {
-		if prov, ok := recovered[uuid]; ok {
+		if prov, ok := final[uuid]; ok {
 			switch prov.Status {
 			case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
 				continue
@@ -357,13 +383,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	b.pool.Reset(allocations)
 
 	// Snapshot aggregate stats from the recovered map before releasing the lock.
-	// After unlock, `recovered` aliases `b.provisions` and concurrent goroutines
+	// After unlock, `final` aliases `b.provisions` and concurrent goroutines
 	// may modify both the map and the pointed-to provision structs.
 	var readyCount float64
 	totalContainers := 0
-	leaseCount := len(recovered)
-	activeTenants := make(map[string]bool, len(recovered))
-	for _, p := range recovered {
+	leaseCount := len(final)
+	activeTenants := make(map[string]bool, len(final))
+	for _, p := range final {
 		if p.Status == backend.ProvisionStatusReady {
 			readyCount++
 		}
