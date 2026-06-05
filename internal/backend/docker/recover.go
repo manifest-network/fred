@@ -439,19 +439,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 
-	// Update LastError with enriched diagnostics. Writes are gated on
-	// Status==Failed so a concurrent Deprovision/Provision-re-attempt/Restart
-	// that took ownership during the diag window doesn't get its fresh
-	// LastError clobbered with this failure's data. Same principle as the
-	// suppress-callback-on-status-change loop below.
-	if len(failedDiagnostics) > 0 {
-		b.provisionsMu.Lock()
-		for uuid, diag := range failedDiagnostics {
-			if prov, ok := b.provisions[uuid]; ok && prov.Status == backend.ProvisionStatusFailed {
-				prov.LastError = leasesm.ErrMsgContainerExited + ": " + diag
+	// Route the enriched LastError through the store seam (UpdateFn) so recover
+	// holds no raw b.provisions field access. The Status==Failed re-check stays
+	// INSIDE the closure: a concurrent Deprovision/Provision-retry/Restart that
+	// took ownership during the diag window must not get its fresh LastError
+	// clobbered with this failure's data (ENG-193).
+	for uuid, diag := range failedDiagnostics {
+		enriched := leasesm.ErrMsgContainerExited + ": " + diag
+		b.provisionStore.UpdateFn(uuid, func(p *leasesm.ProvisionState) {
+			if p.Status == backend.ProvisionStatusFailed {
+				p.LastError = enriched
 			}
-		}
-		b.provisionsMu.Unlock()
+		})
 	}
 
 	// Snapshot diagnostics under lock, then persist outside (I/O). Same
