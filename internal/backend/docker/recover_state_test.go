@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -563,4 +564,84 @@ func TestRecoverState_ConcurrentReaderDuringMerge(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestRecoverState_ColdStartFailed_EnrichesLastError covers the cold-start
+// diagnostics-enrichment path (ENG-193 review #4 — previously dark): the
+// runRecover helper hardcodes an erroring InspectContainerFn so the gather
+// branch never runs. Here InspectInstance SUCCEEDS (Status "exited" maps to
+// PhaseExited), so failedDiagnostics is populated and the UpdateFn enrichment
+// loop fires, rewriting LastError to ErrMsgContainerExited + ": " + diag.
+func TestRecoverState_ColdStartFailed_EnrichesLastError(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "exited"},
+			}, nil
+		},
+		// Succeeding inspector: InspectInstance -> PhaseExited reaches the gather
+		// branch. ContainerLogs uses the mock's safe default ("no such container"
+		// error), so the gatherer returns a benign non-empty "exit_code=0" diag.
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{Status: "exited", ExitCode: 1}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	require.NoError(t, b.recoverState(context.Background()))
+
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	p, ok := b.provisions["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status)
+	assert.True(t, strings.HasPrefix(p.LastError, leasesm.ErrMsgContainerExited+": "),
+		"enrichment loop must rewrite LastError with the gathered diag prefix; got %q", p.LastError)
+}
+
+// TestRecoverState_ColdStartFailed_EnrichmentSkippedWhenInstanceReplaced is the
+// ENG-193 review #1 guard: diagnostics are gathered during an I/O window AFTER
+// provisionsMu is released. If a concurrent Provision-retry replaces the lease
+// with a DIFFERENT Failed instance during that window, the stale diag must NOT
+// clobber the new owner's LastError. The InspectContainerFn side effect
+// simulates that re-provision mid-window; the CreatedAt guard must skip the
+// stale write because the replacement carries a fresh CreatedAt.
+func TestRecoverState_ColdStartFailed_EnrichmentSkippedWhenInstanceReplaced(t *testing.T) {
+	// The recovered cold-start entry's CreatedAt comes from the container label
+	// (ContainerInfo.CreatedAt). Use distinct explicit times so the guard sees a
+	// mismatch between the snapshot identity and the replacement's identity.
+	originalCreatedAt := time.Unix(1000, 0)
+	replacementCreatedAt := time.Unix(2000, 0)
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "exited", CreatedAt: originalCreatedAt},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	// Set the inspector AFTER building b so the closure can capture it. The side
+	// effect simulates a Provision-retry taking ownership during the diag I/O
+	// window: replace L1 with a fresh Failed instance (different CreatedAt) under
+	// the same provisionsMu, then return a terminal state to drive the gather.
+	mock.InspectContainerFn = func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+		b.provisionsMu.Lock()
+		b.provisions["L1"] = &provision{ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "L1",
+			Status:    backend.ProvisionStatusFailed,
+			LastError: "fresh-owner-error",
+			CreatedAt: replacementCreatedAt,
+		}}
+		b.provisionsMu.Unlock()
+		return &ContainerInfo{Status: "exited"}, nil
+	}
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	p, ok := b.provisions["L1"]
+	require.True(t, ok)
+	assert.Equal(t, "fresh-owner-error", p.LastError,
+		"CreatedAt guard must skip the stale enriched write onto a replacement instance; got %q", p.LastError)
 }

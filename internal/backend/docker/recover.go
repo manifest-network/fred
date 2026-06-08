@@ -411,7 +411,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// whose OnEntry action spawns the async diag goroutine — same code
 	// path as a live container-death event.
 	allFailed := coldStartFailed
-	failedDiagnostics := make(map[string]string, len(allFailed))
+	// failedDiag carries the gathered diagnostic together with the instance
+	// identity (CreatedAt) captured at snapshot time, so the write loop below
+	// can verify it is still enriching the SAME failed instance the diag was
+	// gathered from (ENG-193 code-review #1).
+	type failedDiag struct {
+		diag      string
+		createdAt time.Time
+	}
+	failedDiagnostics := make(map[string]failedDiag, len(allFailed))
 	for _, uuid := range allFailed {
 		b.provisionsMu.RLock()
 		prov, ok := b.provisions[uuid]
@@ -420,6 +428,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			continue
 		}
 		containerIDs := append([]string(nil), prov.ContainerIDs...)
+		// Capture the instance identity under the SAME RLock that snapshots
+		// containerIDs, so the (CreatedAt, containerIDs) pair is consistent.
+		createdAt := prov.CreatedAt
 		b.provisionsMu.RUnlock()
 
 		for _, cid := range containerIDs {
@@ -433,7 +444,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// previously mapped to ProvisionStatusFailed in
 			// containerStatusToProvisionStatus.
 			if state != nil && (state.Phase == leasesm.PhaseExited || state.Phase == leasesm.PhaseFailed) {
-				failedDiagnostics[uuid] = b.gatherer.GatherDiagnostics(ctx, cid, state)
+				failedDiagnostics[uuid] = failedDiag{
+					diag:      b.gatherer.GatherDiagnostics(ctx, cid, state),
+					createdAt: createdAt,
+				}
 				break
 			}
 		}
@@ -444,10 +458,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// INSIDE the closure: a concurrent Deprovision/Provision-retry/Restart that
 	// took ownership during the diag window must not get its fresh LastError
 	// clobbered with this failure's data (ENG-193).
-	for uuid, diag := range failedDiagnostics {
-		enriched := leasesm.ErrMsgContainerExited + ": " + diag
+	for uuid, fd := range failedDiagnostics {
+		enriched := leasesm.ErrMsgContainerExited + ": " + fd.diag
+		createdAt := fd.createdAt
 		b.provisionStore.UpdateFn(uuid, func(p *leasesm.ProvisionState) {
-			if p.Status == backend.ProvisionStatusFailed {
+			// Only enrich the SAME failed instance the diag was gathered from: a
+			// Provision-retry that replaced the lease during the diag I/O window
+			// gets a fresh CreatedAt, so its LastError is not clobbered with this
+			// failure's data (ENG-193 code-review #1).
+			if p.Status == backend.ProvisionStatusFailed && p.CreatedAt.Equal(createdAt) {
 				p.LastError = enriched
 			}
 		})
