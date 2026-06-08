@@ -583,6 +583,50 @@ func TestConfig_DefaultConfig_MigrationDefaults(t *testing.T) {
 	assert.Equal(t, defaultMigrationGracePeriod, cfg.MigrationGracePeriod)
 }
 
+func TestConfig_Validate_TLS(t *testing.T) {
+	t.Run("cert without key is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TLSCertFile = "/etc/fred/docker-backend/tls/cert.pem"
+		require.ErrorContains(t, cfg.Validate(), "tls_cert_file and tls_key_file")
+	})
+
+	t.Run("key without cert is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TLSKeyFile = "/etc/fred/docker-backend/tls/key.pem"
+		require.ErrorContains(t, cfg.Validate(), "tls_cert_file and tls_key_file")
+	})
+
+	t.Run("client CA without server cert is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TLSClientCAFile = "/etc/fred/docker-backend/tls/client-ca.pem"
+		require.ErrorContains(t, cfg.Validate(), "tls_client_ca_file requires")
+	})
+
+	t.Run("allowed names without client CA is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TLSCertFile = "/etc/fred/docker-backend/tls/cert.pem"
+		cfg.TLSKeyFile = "/etc/fred/docker-backend/tls/key.pem"
+		cfg.TLSClientAllowedNames = []string{"providerd"}
+		require.ErrorContains(t, cfg.Validate(), "tls_client_allowed_names requires")
+	})
+
+	t.Run("cert and key together is accepted", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TLSCertFile = "/etc/fred/docker-backend/tls/cert.pem"
+		cfg.TLSKeyFile = "/etc/fred/docker-backend/tls/key.pem"
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("full mTLS config with allowlist is accepted", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TLSCertFile = "/etc/fred/docker-backend/tls/cert.pem"
+		cfg.TLSKeyFile = "/etc/fred/docker-backend/tls/key.pem"
+		cfg.TLSClientCAFile = "/etc/fred/docker-backend/tls/client-ca.pem"
+		cfg.TLSClientAllowedNames = []string{"providerd"}
+		require.NoError(t, cfg.Validate())
+	})
+}
+
 func TestConfig_GetSKUProfile(t *testing.T) {
 	cfg := validConfig()
 

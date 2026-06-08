@@ -41,6 +41,24 @@ type Config struct {
 	// ListenAddr is the address the HTTP server listens on.
 	ListenAddr string `yaml:"listen_addr"`
 
+	// TLSCertFile and TLSKeyFile enable HTTPS on the listener when both are
+	// set; otherwise it serves plaintext HTTP (the default). Loaded once at
+	// startup — rotation requires a restart (see ENG-294).
+	TLSCertFile string `yaml:"tls_cert_file"`
+	TLSKeyFile  string `yaml:"tls_key_file"`
+
+	// TLSClientCAFile turns on mutual TLS when set: the listener requires and
+	// verifies a client certificate signed by this CA. Requires TLSCertFile and
+	// TLSKeyFile (the listener must be on TLS first).
+	TLSClientCAFile string `yaml:"tls_client_ca_file"`
+
+	// TLSClientAllowedNames optionally pins the mTLS client's identity: the
+	// presented certificate's CommonName or a DNS SAN must be in this list.
+	// Empty accepts any certificate signed by TLSClientCAFile. Requires
+	// TLSClientCAFile. Use this whenever the client CA is not dedicated solely
+	// to providerd.
+	TLSClientAllowedNames []string `yaml:"tls_client_allowed_names"`
+
 	// DockerHost is the Docker daemon socket path or URL.
 	DockerHost string `yaml:"docker_host"`
 
@@ -292,6 +310,18 @@ func (c *Config) Validate() error {
 
 	if c.ListenAddr == "" {
 		return fmt.Errorf("listen_addr is required")
+	}
+
+	// TLS: cert and key are set together; client-CA (mTLS) needs the listener
+	// on TLS first; client-name pinning needs mTLS.
+	if (c.TLSCertFile != "") != (c.TLSKeyFile != "") {
+		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
+	}
+	if c.TLSClientCAFile != "" && c.TLSCertFile == "" {
+		return fmt.Errorf("tls_client_ca_file requires tls_cert_file and tls_key_file (mTLS needs the listener on TLS)")
+	}
+	if len(c.TLSClientAllowedNames) > 0 && c.TLSClientCAFile == "" {
+		return fmt.Errorf("tls_client_allowed_names requires tls_client_ca_file (mTLS must be enabled to pin client identity)")
 	}
 
 	if c.DockerHost == "" {
