@@ -2,16 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let the providerd → docker-backend HTTP hop run over TLS (optionally mutually-authenticated), configurable on both sides, with plaintext HTTP remaining the default so existing deployments keep working.
+**Goal:** Let the providerd → docker-backend HTTP hop run over TLS (optionally mutually-authenticated, with client-identity pinning), configurable on both sides, with plaintext HTTP remaining the default so existing deployments keep working.
 
-**Architecture:** A new `internal/tlsconfig` package builds `*tls.Config` for the server side (cert/key + optional `ClientCAs`/`RequireAndVerifyClientCert`) and the client side (optional `RootCAs` + client cert + skip-verify), both pinned to `MinVersion: tls.VersionTLS13`. docker-backend's listener branches to `ListenAndServeTLS` when a cert is configured. providerd builds a per-backend `*tls.Config` at startup (composition root, where file-I/O errors are handled) and hands it to `NewHTTPClient`, which applies it to the backend transport. The existing gRPC TLS helper (`chain.buildTLSConfig`) is intentionally left untouched (decision: isolated, gRPC path has sensitive race history).
+**Architecture:** A new `internal/tlsconfig` package builds `*tls.Config` for the server side (cert/key + optional `ClientCAs`/`RequireAndVerifyClientCert` + optional client-name pinning via `VerifyPeerCertificate`) and the client side (optional `RootCAs` + client cert + skip-verify), both pinned to `MinVersion: tls.VersionTLS13`. docker-backend's listener branches to `ListenAndServeTLS` when a cert is configured. providerd builds a per-backend `*tls.Config` at startup (composition root, where file-I/O errors are handled) and hands it to `NewHTTPClient`, which applies it to the backend transport. The hop stays **HTTP/1.1 over TLS** (it is plaintext HTTP/1.1 today) — we deliberately do not force HTTP/2. The existing gRPC TLS helper (`chain.buildTLSConfig`) is intentionally left untouched.
 
 **Tech Stack:** Go stdlib `crypto/tls`, `crypto/x509`, `net/http`; `github.com/stretchr/testify` for assertions; `net/http/httptest` for end-to-end TLS tests.
 
-**Decisions locked (from design discussion):**
+**Decisions locked (from design + best-practice review):**
 - New `internal/tlsconfig` package for the new hop **only**; `chain.buildTLSConfig` stays as-is.
-- `MinVersion: tls.VersionTLS13` on the new hop (we control both ends).
-- Certs are **pre-provisioned files loaded once at startup**; hot-reload is out of scope (tracked in ENG-294). Cert provisioning is out of scope (manifest-deploy / ENG-104).
+- `MinVersion: tls.VersionTLS13` on the new hop (Mozilla "Modern" profile; we control both ends).
+- **Client-identity pinning:** `RequireAndVerifyClientCert` only proves the client cert chains to our CA — *not* who the client is. docker-backend gets an optional `tls_client_allowed_names` allowlist enforced by a server-side `VerifyPeerCertificate` (matches the client cert's CN or a DNS SAN). Empty list = accept any cert from the CA (back-compat).
+- **No HTTP/2 forcing:** keep HTTP/1.1 over TLS (behavior-preserving; avoids the custom-TLS-config + `ForceAttemptHTTP2` footgun, golang/go#20645).
+- Certs are **pre-provisioned files loaded once at startup**; hot-reload is out of scope (ENG-294). Cert provisioning is out of scope (manifest-deploy / ENG-104).
 - Config-error handling for client TLS lives in `cmd/providerd/main.go`; `NewHTTPClient` keeps its no-error signature by accepting a pre-built `*tls.Config`.
 
 **Conventions:** All commands run from the worktree root `/home/fmorency/dev/fred/.claude/worktrees/eng-103-tls-transport`. Branch: `worktree-eng-103-tls-transport`.
@@ -21,22 +23,22 @@
 ## File Structure
 
 **Create:**
-- `internal/tlsconfig/tlsconfig.go` — `ServerConfig` + `ClientConfig` builders. Single responsibility: turn file paths into a validated `*tls.Config`.
+- `internal/tlsconfig/tlsconfig.go` — `ServerConfig` + `ClientConfig` builders, plus a `VerifyPeerCertificate` name-pinner. Single responsibility: turn file paths + an allowlist into a validated `*tls.Config`.
 - `internal/tlsconfig/tlsconfig_test.go` — unit + end-to-end handshake tests, with an in-package cert-generation helper (keeps cert-gen out of production code and avoids a shared test-support package).
 
 **Modify:**
-- `internal/backend/docker/config.go` — add `TLSCertFile`/`TLSKeyFile`/`TLSClientCAFile` fields + validation in `Validate()`.
+- `internal/backend/docker/config.go` — add `TLSCertFile`/`TLSKeyFile`/`TLSClientCAFile`/`TLSClientAllowedNames` fields + validation in `Validate()`.
 - `internal/backend/docker/config_test.go` — validation tests (uses existing `validConfig()` helper at line 16).
 - `cmd/docker-backend/main.go` — branch the listener to `ListenAndServeTLS` when TLS is configured.
 - `internal/config/config.go` — extend `BackendConfig` with TLS fields; add pairing validation + production-mode skip-verify rejection.
 - `internal/config/config_test.go` — add a `validConfig()` helper (factored from `TestConfig_Validate_Valid`) and validation tests.
-- `internal/backend/client.go` — add `TLSClientConfig *tls.Config` to `HTTPClientConfig`; apply it (and `ForceAttemptHTTP2`) in `NewHTTPClient`.
+- `internal/backend/client.go` — add `TLSClientConfig *tls.Config` to `HTTPClientConfig`; apply it in `NewHTTPClient`.
 - `internal/backend/client_test.go` — white-box wiring test (package `backend`, asserts the unexported transport).
 - `cmd/providerd/main.go` — build the per-backend `*tls.Config` and pass it into `HTTPClientConfig`.
 - `config.example.yaml` — document the new per-backend TLS fields.
 - `docker-backend.example.yaml` — document the new server-side TLS fields.
 
-**Test coverage rationale:** the *real* TLS behavior (mTLS success, missing-client-cert rejection, private-CA trust, skip-verify, MinVersion) is proven end-to-end in `internal/tlsconfig` against an `httptest` TLS server. `NewHTTPClient`'s job is only to copy a `*tls.Config` onto the transport — proven by a focused white-box test. The composition (providerd dialing a TLS docker-backend) follows by transitivity; a manual smoke is included in the final verification.
+**Test coverage rationale:** the *real* TLS behavior (mTLS success, missing-client-cert rejection, name-allowlist accept/reject, private-CA trust, skip-verify, MinVersion) is proven end-to-end in `internal/tlsconfig` against an `httptest` TLS server. `NewHTTPClient`'s job is only to copy a `*tls.Config` onto the transport — proven by a focused white-box test. The composition (providerd dialing a TLS docker-backend) follows by transitivity; a manual smoke is included in the final verification.
 
 ---
 
@@ -79,7 +81,7 @@ type testCertPaths struct {
 	caFile         string
 	serverCertFile string
 	serverKeyFile  string
-	clientCertFile string
+	clientCertFile string // CN=client, DNS SAN=providerd.internal
 	clientKeyFile  string
 	// untrusted* is a self-signed server leaf NOT signed by caFile.
 	untrustedCertFile string
@@ -147,8 +149,9 @@ func writeTestCerts(t *testing.T) testCertPaths {
 	loopback := []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback}
 	p.serverCertFile, p.serverKeyFile = writeLeaf("server",
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []string{"localhost"}, loopback)
+	// Client leaf: CN=client, plus a DNS SAN so we can test SAN-based pinning.
 	p.clientCertFile, p.clientKeyFile = writeLeaf("client",
-		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil, nil)
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, []string{"providerd.internal"}, nil)
 
 	// Untrusted self-signed server leaf for skip-verify tests.
 	uKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -175,29 +178,37 @@ func writeTestCerts(t *testing.T) testCertPaths {
 
 func TestServerConfig_MinVersionAndDefaults(t *testing.T) {
 	certs := writeTestCerts(t)
-	cfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, "")
+	cfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, "", nil)
 	require.NoError(t, err)
 	require.Equal(t, uint16(tls.VersionTLS13), cfg.MinVersion)
 	require.Equal(t, tls.NoClientCert, cfg.ClientAuth)
+	require.Nil(t, cfg.VerifyPeerCertificate)
 	require.Len(t, cfg.Certificates, 1)
 }
 
 func TestServerConfig_MTLSEnablesClientAuth(t *testing.T) {
 	certs := writeTestCerts(t)
-	cfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile)
+	cfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile, nil)
 	require.NoError(t, err)
 	require.Equal(t, tls.RequireAndVerifyClientCert, cfg.ClientAuth)
 	require.NotNil(t, cfg.ClientCAs)
+	require.Nil(t, cfg.VerifyPeerCertificate) // no allowlist => no pinning
+}
+
+func TestServerConfig_AllowedNamesWithoutClientCAErrors(t *testing.T) {
+	certs := writeTestCerts(t)
+	_, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, "", []string{"providerd"})
+	require.Error(t, err)
 }
 
 func TestServerConfig_BadCert(t *testing.T) {
-	_, err := tlsconfig.ServerConfig("/nope/cert.pem", "/nope/key.pem", "")
+	_, err := tlsconfig.ServerConfig("/nope/cert.pem", "/nope/key.pem", "", nil)
 	require.Error(t, err)
 }
 
 func TestServerConfig_BadClientCA(t *testing.T) {
 	certs := writeTestCerts(t)
-	_, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, "/nope/ca.pem")
+	_, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, "/nope/ca.pem", nil)
 	require.Error(t, err)
 }
 
@@ -221,21 +232,28 @@ func TestClientConfig_BadClientCert(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestEndToEnd_MTLS_RoundTrip(t *testing.T) {
-	certs := writeTestCerts(t)
-	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile)
-	require.NoError(t, err)
-
+// startMTLSServer starts an httptest TLS server using the given server config
+// and returns its URL. The handler always replies 200.
+func startMTLSServer(t *testing.T, srvCfg *tls.Config) string {
+	t.Helper()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	srv.TLS = srvCfg
 	srv.StartTLS()
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func TestEndToEnd_MTLS_RoundTrip(t *testing.T) {
+	certs := writeTestCerts(t)
+	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile, nil)
+	require.NoError(t, err)
+	url := startMTLSServer(t, srvCfg)
 
 	cliCfg, err := tlsconfig.ClientConfig(certs.caFile, false, certs.clientCertFile, certs.clientKeyFile)
 	require.NoError(t, err)
-	resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: cliCfg}}).Get(srv.URL)
+	resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: cliCfg}}).Get(url)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -243,40 +261,72 @@ func TestEndToEnd_MTLS_RoundTrip(t *testing.T) {
 
 func TestEndToEnd_MTLS_RejectsMissingClientCert(t *testing.T) {
 	certs := writeTestCerts(t)
-	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile)
+	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile, nil)
 	require.NoError(t, err)
-
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	srv.TLS = srvCfg
-	srv.StartTLS()
-	defer srv.Close()
+	url := startMTLSServer(t, srvCfg)
 
 	cliCfg, err := tlsconfig.ClientConfig(certs.caFile, false, "", "") // trusts CA, presents no client cert
 	require.NoError(t, err)
-	_, err = (&http.Client{Transport: &http.Transport{TLSClientConfig: cliCfg}}).Get(srv.URL)
+	_, err = (&http.Client{Transport: &http.Transport{TLSClientConfig: cliCfg}}).Get(url)
+	require.Error(t, err)
+}
+
+func TestEndToEnd_MTLS_AllowlistAcceptsCN(t *testing.T) {
+	certs := writeTestCerts(t)
+	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile, []string{"client"})
+	require.NoError(t, err)
+	require.NotNil(t, srvCfg.VerifyPeerCertificate)
+	url := startMTLSServer(t, srvCfg)
+
+	cliCfg, err := tlsconfig.ClientConfig(certs.caFile, false, certs.clientCertFile, certs.clientKeyFile)
+	require.NoError(t, err)
+	resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: cliCfg}}).Get(url)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestEndToEnd_MTLS_AllowlistAcceptsSAN(t *testing.T) {
+	certs := writeTestCerts(t)
+	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile, []string{"providerd.internal"})
+	require.NoError(t, err)
+	url := startMTLSServer(t, srvCfg)
+
+	cliCfg, err := tlsconfig.ClientConfig(certs.caFile, false, certs.clientCertFile, certs.clientKeyFile)
+	require.NoError(t, err)
+	resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: cliCfg}}).Get(url)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestEndToEnd_MTLS_AllowlistRejectsUnknownName(t *testing.T) {
+	certs := writeTestCerts(t)
+	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile, []string{"someone-else"})
+	require.NoError(t, err)
+	url := startMTLSServer(t, srvCfg)
+
+	// Cert is signed by the trusted CA but its CN/SAN are not in the allowlist.
+	cliCfg, err := tlsconfig.ClientConfig(certs.caFile, false, certs.clientCertFile, certs.clientKeyFile)
+	require.NoError(t, err)
+	_, err = (&http.Client{Transport: &http.Transport{TLSClientConfig: cliCfg}}).Get(url)
 	require.Error(t, err)
 }
 
 func TestEndToEnd_SkipVerify(t *testing.T) {
 	certs := writeTestCerts(t)
-	srvCfg, err := tlsconfig.ServerConfig(certs.untrustedCertFile, certs.untrustedKeyFile, "")
+	srvCfg, err := tlsconfig.ServerConfig(certs.untrustedCertFile, certs.untrustedKeyFile, "", nil)
 	require.NoError(t, err)
-
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	srv.TLS = srvCfg
-	srv.StartTLS()
-	defer srv.Close()
+	url := startMTLSServer(t, srvCfg)
 
 	strict, err := tlsconfig.ClientConfig("", false, "", "") // no matching CA -> fail
 	require.NoError(t, err)
-	_, err = (&http.Client{Transport: &http.Transport{TLSClientConfig: strict}}).Get(srv.URL)
+	_, err = (&http.Client{Transport: &http.Transport{TLSClientConfig: strict}}).Get(url)
 	require.Error(t, err)
 
 	loose, err := tlsconfig.ClientConfig("", true, "", "") // skip-verify -> success
 	require.NoError(t, err)
-	resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: loose}}).Get(srv.URL)
+	resp, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: loose}}).Get(url)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -295,7 +345,8 @@ Create `internal/tlsconfig/tlsconfig.go`:
 ```go
 // Package tlsconfig builds *tls.Config values for Fred's internal
 // providerd <-> backend HTTP hop (ENG-103). Server configs optionally
-// require a client certificate (mTLS); client configs optionally trust a
+// require a client certificate (mTLS) and optionally pin the client's
+// identity (CN / DNS SAN) to an allowlist; client configs optionally trust a
 // private CA and present a client certificate. Both pin MinVersion to TLS 1.3.
 //
 // Certificates are read from files once, at call time; rotation requires a
@@ -310,9 +361,19 @@ import (
 )
 
 // ServerConfig builds a server-side *tls.Config from a certificate/key pair.
+//
 // When clientCAFile is non-empty, mutual TLS is enabled: the server requires
 // and verifies a client certificate signed by that CA.
-func ServerConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
+//
+// When allowedClientNames is non-empty (which requires clientCAFile), the
+// server additionally pins the client's identity: the presented certificate's
+// CommonName or one of its DNS SANs must appear in the list. This closes the
+// gap that RequireAndVerifyClientCert only checks the chain, not *who* the
+// client is — without it, any certificate signed by the CA would be accepted.
+func ServerConfig(certFile, keyFile, clientCAFile string, allowedClientNames []string) (*tls.Config, error) {
+	if len(allowedClientNames) > 0 && clientCAFile == "" {
+		return nil, fmt.Errorf("allowed client names require a client CA (mutual TLS)")
+	}
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load server cert/key: %w", err)
@@ -328,6 +389,9 @@ func ServerConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
 		}
 		cfg.ClientCAs = pool
 		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		if len(allowedClientNames) > 0 {
+			cfg.VerifyPeerCertificate = clientNamePinner(allowedClientNames)
+		}
 	}
 	return cfg, nil
 }
@@ -358,6 +422,33 @@ func ClientConfig(caFile string, skipVerify bool, clientCertFile, clientKeyFile 
 	return cfg, nil
 }
 
+// clientNamePinner returns a VerifyPeerCertificate callback that passes only
+// when the verified client leaf's CommonName or a DNS SAN is in allowed.
+// It runs after RequireAndVerifyClientCert has already verified the chain, so
+// verifiedChains is non-empty.
+func clientNamePinner(allowed []string) func([][]byte, [][]*x509.Certificate) error {
+	set := make(map[string]struct{}, len(allowed))
+	for _, n := range allowed {
+		set[n] = struct{}{}
+	}
+	return func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
+		for _, chain := range verifiedChains {
+			leaf := chain[0]
+			if _, ok := set[leaf.Subject.CommonName]; ok {
+				return nil
+			}
+			for _, dns := range leaf.DNSNames {
+				if _, ok := set[dns]; ok {
+					return nil
+				}
+			}
+		}
+		leaf := verifiedChains[0][0]
+		return fmt.Errorf("client certificate identity not allowed (CN=%q SANs=%v)",
+			leaf.Subject.CommonName, leaf.DNSNames)
+	}
+}
+
 // loadCertPool reads a PEM bundle and returns a pool containing its certs.
 func loadCertPool(file string) (*x509.CertPool, error) {
 	pem, err := os.ReadFile(file)
@@ -381,7 +472,7 @@ Expected: PASS (all tests in Step 1).
 
 ```bash
 git add internal/tlsconfig/
-git commit -m "feat(tlsconfig): add server/client TLS config builders for the backend hop (ENG-103)"
+git commit -m "feat(tlsconfig): add server/client TLS builders with client-name pinning (ENG-103)"
 ```
 
 ---
@@ -416,6 +507,14 @@ func TestConfig_Validate_TLS(t *testing.T) {
 		require.ErrorContains(t, cfg.Validate(), "tls_client_ca_file requires")
 	})
 
+	t.Run("allowed names without client CA is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.TLSCertFile = "/etc/fred/docker-backend/tls/cert.pem"
+		cfg.TLSKeyFile = "/etc/fred/docker-backend/tls/key.pem"
+		cfg.TLSClientAllowedNames = []string{"providerd"}
+		require.ErrorContains(t, cfg.Validate(), "tls_client_allowed_names requires")
+	})
+
 	t.Run("cert and key together is accepted", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.TLSCertFile = "/etc/fred/docker-backend/tls/cert.pem"
@@ -423,11 +522,12 @@ func TestConfig_Validate_TLS(t *testing.T) {
 		require.NoError(t, cfg.Validate())
 	})
 
-	t.Run("full mTLS config is accepted", func(t *testing.T) {
+	t.Run("full mTLS config with allowlist is accepted", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.TLSCertFile = "/etc/fred/docker-backend/tls/cert.pem"
 		cfg.TLSKeyFile = "/etc/fred/docker-backend/tls/key.pem"
 		cfg.TLSClientCAFile = "/etc/fred/docker-backend/tls/client-ca.pem"
+		cfg.TLSClientAllowedNames = []string{"providerd"}
 		require.NoError(t, cfg.Validate())
 	})
 }
@@ -436,7 +536,7 @@ func TestConfig_Validate_TLS(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `go test ./internal/backend/docker/ -run TestConfig_Validate_TLS`
-Expected: FAIL — `cfg.TLSCertFile undefined` (field not yet added).
+Expected: FAIL — `cfg.TLSCertFile undefined` (fields not yet added).
 
 - [ ] **Step 3: Add the fields**
 
@@ -456,6 +556,13 @@ In `internal/backend/docker/config.go`, immediately after the `ListenAddr` field
 	// verifies a client certificate signed by this CA. Requires TLSCertFile and
 	// TLSKeyFile (the listener must be on TLS first).
 	TLSClientCAFile string `yaml:"tls_client_ca_file"`
+
+	// TLSClientAllowedNames optionally pins the mTLS client's identity: the
+	// presented certificate's CommonName or a DNS SAN must be in this list.
+	// Empty accepts any certificate signed by TLSClientCAFile. Requires
+	// TLSClientCAFile. Use this whenever the client CA is not dedicated solely
+	// to providerd.
+	TLSClientAllowedNames []string `yaml:"tls_client_allowed_names"`
 ```
 
 - [ ] **Step 4: Add the validation**
@@ -468,12 +575,15 @@ In `internal/backend/docker/config.go` `Validate()`, immediately after the `list
 	}
 
 	// TLS: cert and key are set together; client-CA (mTLS) needs the listener
-	// on TLS first.
+	// on TLS first; client-name pinning needs mTLS.
 	if (c.TLSCertFile != "") != (c.TLSKeyFile != "") {
 		return fmt.Errorf("both tls_cert_file and tls_key_file must be set together")
 	}
 	if c.TLSClientCAFile != "" && c.TLSCertFile == "" {
 		return fmt.Errorf("tls_client_ca_file requires tls_cert_file and tls_key_file (mTLS needs the listener on TLS)")
+	}
+	if len(c.TLSClientAllowedNames) > 0 && c.TLSClientCAFile == "" {
+		return fmt.Errorf("tls_client_allowed_names requires tls_client_ca_file (mTLS must be enabled to pin client identity)")
 	}
 ```
 
@@ -486,7 +596,7 @@ Expected: PASS (new TLS subtests + existing validation tests).
 
 ```bash
 git add internal/backend/docker/config.go internal/backend/docker/config_test.go
-git commit -m "feat(docker-backend): add tls_cert_file/tls_key_file/tls_client_ca_file config + validation (ENG-103)"
+git commit -m "feat(docker-backend): add TLS/mTLS config fields + validation (ENG-103)"
 ```
 
 ---
@@ -498,17 +608,7 @@ git commit -m "feat(docker-backend): add tls_cert_file/tls_key_file/tls_client_c
 
 - [ ] **Step 1: Add imports**
 
-In `cmd/docker-backend/main.go`, add to the stdlib import group:
-
-```go
-	"crypto/tls"
-```
-
-and to the project import group:
-
-```go
-	"github.com/manifest-network/fred/internal/tlsconfig"
-```
+In `cmd/docker-backend/main.go`, add `"crypto/tls"` to the stdlib import group and `"github.com/manifest-network/fred/internal/tlsconfig"` to the project import group.
 
 - [ ] **Step 2: Build the server TLS config (fail-fast) before the server**
 
@@ -530,10 +630,10 @@ with:
 ```go
 	// Build the listener TLS config up front so a bad cert fails fast before we
 	// announce readiness. Config.Validate (run in docker.New) already enforces
-	// the cert/key pairing; ServerConfig loads and parses the actual files.
+	// field pairing; ServerConfig loads and parses the actual files.
 	var tlsServerConfig *tls.Config
 	if cfg.TLSCertFile != "" {
-		tlsServerConfig, err = tlsconfig.ServerConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSClientCAFile)
+		tlsServerConfig, err = tlsconfig.ServerConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSClientCAFile, cfg.TLSClientAllowedNames)
 		if err != nil {
 			logger.Error("failed to build TLS config", "error", err)
 			os.Exit(1)
@@ -574,7 +674,8 @@ with:
 	go func() {
 		var serveErr error
 		if tlsServerConfig != nil {
-			logger.Info("starting HTTPS server", "addr", cfg.ListenAddr, "mtls", cfg.TLSClientCAFile != "")
+			logger.Info("starting HTTPS server", "addr", cfg.ListenAddr,
+				"mtls", cfg.TLSClientCAFile != "", "pinned_names", len(cfg.TLSClientAllowedNames))
 			// The cert/key live in tlsServerConfig.Certificates (loaded by
 			// tlsconfig.ServerConfig), so the file arguments are empty.
 			serveErr = httpServer.ListenAndServeTLS("", "")
@@ -596,7 +697,7 @@ Expected: no output, exit 0.
 - [ ] **Step 5: Run existing docker-backend tests (no regression)**
 
 Run: `go test ./cmd/docker-backend/...`
-Expected: PASS (existing tests unaffected). TLS serve behavior is covered end-to-end by Task 1's `tlsconfig` tests and the manual smoke in the final verification.
+Expected: PASS. TLS serve behavior is covered end-to-end by Task 1's `tlsconfig` tests and the manual smoke in the final verification.
 
 - [ ] **Step 6: Commit**
 
@@ -744,7 +845,7 @@ In `internal/config/config.go`, inside the basic backends loop, after the URL va
 
 - [ ] **Step 5: Add production-mode skip-verify rejection**
 
-In `internal/config/config.go`, in the production-mode block, immediately after the gRPC skip-verify check (currently lines 474-476), add the per-backend rejection so it groups with the existing skip-verify guard and fires before the later checks:
+In `internal/config/config.go`, in the production-mode block, immediately after the gRPC skip-verify check (currently lines 474-476):
 
 ```go
 		if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
@@ -792,7 +893,6 @@ func TestNewHTTPClient_AppliesTLSClientConfig(t *testing.T) {
 	tr, ok := c.httpClient.Transport.(*http.Transport)
 	require.True(t, ok)
 	require.Same(t, sentinel, tr.TLSClientConfig)
-	require.True(t, tr.ForceAttemptHTTP2)
 }
 
 func TestNewHTTPClient_NoTLSConfig_LeavesTransportDefault(t *testing.T) {
@@ -810,11 +910,7 @@ Expected: FAIL — `unknown field TLSClientConfig in struct literal`.
 
 - [ ] **Step 3: Add the import**
 
-In `internal/backend/client.go`, add to the stdlib import group:
-
-```go
-	"crypto/tls"
-```
+In `internal/backend/client.go`, add `"crypto/tls"` to the stdlib import group.
 
 - [ ] **Step 4: Add the `HTTPClientConfig` field**
 
@@ -826,7 +922,6 @@ In `internal/backend/client.go`, in the `HTTPClientConfig` struct, after the `Se
 	// TLSClientConfig, when non-nil, is applied to the backend HTTP transport
 	// (private-CA trust and/or a client certificate for mTLS). Built by the
 	// caller from per-backend config so this package performs no file I/O.
-	// Setting it also forces HTTP/2, which a custom Transport otherwise disables.
 	TLSClientConfig *tls.Config
 ```
 
@@ -852,10 +947,11 @@ with:
 	}
 	if cfg.TLSClientConfig != nil {
 		transport.TLSClientConfig = cfg.TLSClientConfig
-		// Setting TLSClientConfig on a custom Transport disables automatic
-		// HTTP/2; re-enable it so the encrypted hop can negotiate h2 with the
-		// backend's ServeTLS listener.
-		transport.ForceAttemptHTTP2 = true
+		// The hop stays HTTP/1.1 over TLS (it is plaintext HTTP/1.1 today).
+		// A custom TLSClientConfig disables Go's automatic HTTP/2; we
+		// deliberately do NOT set ForceAttemptHTTP2 — these are low-volume
+		// JSON request/response calls and h2 with a custom TLS config carries
+		// a known footgun (golang/go#20645).
 	}
 ```
 
@@ -932,7 +1028,7 @@ Note: `err` is already in scope in this function (declared earlier, e.g. the `ev
 - [ ] **Step 3: Build and vet**
 
 Run: `go build ./cmd/providerd/... && go vet ./cmd/providerd/...`
-Expected: no output, exit 0. (If vet reports `err` declared-but-not-used or shadowing, confirm the assignment uses `=` not `:=`.)
+Expected: no output, exit 0. (If vet reports shadowing, confirm the assignment uses `=` not `:=`.)
 
 - [ ] **Step 4: Run the broader test set (no regression)**
 
@@ -951,7 +1047,7 @@ git commit -m "feat(providerd): build per-backend TLS client config from config 
 ## Task 7: Document the new fields in example configs
 
 **Files:**
-- Modify: `config.example.yaml` (backends section, after the examples ending ~line 296)
+- Modify: `config.example.yaml` (backends section, before the CALLBACK banner ~line 298)
 - Modify: `docker-backend.example.yaml` (after `listen_addr`, ~line 16)
 
 - [ ] **Step 1: Document providerd per-backend TLS**
@@ -988,8 +1084,10 @@ In `docker-backend.example.yaml`, insert immediately after the `listen_addr: ":9
 # TLS / mTLS (ENG-103)
 # ---------------------------------------------------------------------------
 # When tls_cert_file and tls_key_file are both set, the listener serves HTTPS
-# instead of plaintext HTTP. Point providerd's per-backend url at https:// and
-# its tls_ca_file at the CA that signed this certificate.
+# instead of plaintext HTTP. The server certificate MUST carry a SAN matching
+# the address providerd dials (Go ignores the legacy CN). Point providerd's
+# per-backend url at https:// and its tls_ca_file at the CA that signed this
+# certificate.
 # tls_cert_file: "/etc/fred/docker-backend/tls/cert.pem"
 # tls_key_file:  "/etc/fred/docker-backend/tls/key.pem"
 #
@@ -999,14 +1097,21 @@ In `docker-backend.example.yaml`, insert immediately after the `listen_addr: ":9
 # tls_cert_file / tls_key_file above.
 # tls_client_ca_file: "/etc/fred/docker-backend/tls/client-ca.pem"
 #
+# Client-identity pinning (recommended unless the client CA is dedicated solely
+# to providerd): mTLS only proves the client cert was signed by the CA, not who
+# the client is. List the allowed client certificate CommonNames / DNS SANs to
+# reject any other cert the CA may have signed. Empty = accept any such cert.
+# tls_client_allowed_names:
+#   - providerd
+#
 # NOTE: certificates are loaded once at startup; rotation requires a restart
 # (hot-reload is tracked in ENG-294).
 ```
 
 - [ ] **Step 3: Sanity-check YAML validity**
 
-Run: `go test ./cmd/docker-backend/... -run TestLoadConfig` (the loadconfig tests parse the example shape) and, if present, any config-example test under `internal/config`.
-Expected: PASS. If no such test exercises the example file, instead run `python3 -c "import yaml,sys; yaml.safe_load(open('config.example.yaml')); yaml.safe_load(open('docker-backend.example.yaml')); print('ok')"`.
+Run: `go test ./cmd/docker-backend/... -run TestLoadConfig` (the loadconfig tests parse the example shape).
+Expected: PASS. If no test exercises the example file, instead run `python3 -c "import yaml; yaml.safe_load(open('config.example.yaml')); yaml.safe_load(open('docker-backend.example.yaml')); print('ok')"`.
 Expected: `ok`.
 
 - [ ] **Step 4: Commit**
@@ -1053,6 +1158,7 @@ Expected: `{"status":"healthy"}` over TLS. (Skip if no Docker host is available;
 Tick each against the work:
 - [ ] docker-backend listens on HTTPS when configured — Task 3 + Task 1 e2e.
 - [ ] docker-backend requires client certs (mTLS) when configured — Task 3 (`tls_client_ca_file`) + `TestEndToEnd_MTLS_RejectsMissingClientCert`.
+- [ ] docker-backend pins client identity when configured — Task 2/3 (`tls_client_allowed_names`) + `TestEndToEnd_MTLS_Allowlist*`.
 - [ ] providerd dials backends over HTTPS with a private CA — Task 5/6 + `TestEndToEnd_MTLS_RoundTrip`.
 - [ ] providerd presents a client cert (mTLS) when configured — Task 4/5/6 + `TestEndToEnd_MTLS_RoundTrip`.
 - [ ] Plaintext HTTP remains the default; existing configs keep working — nil-config paths in Tasks 3/5/6 + unchanged existing tests.
@@ -1070,10 +1176,12 @@ git commit -m "chore(eng-103): verification fixups"
 
 ## Self-Review
 
-**Spec coverage:** every ENG-103 acceptance criterion maps to a task (see Task 8 Step 4). Server-side HTTPS+mTLS → Tasks 2/3; client-side CA+mTLS → Tasks 4/5/6; plaintext default → nil-paths throughout; production_mode skip-verify → Task 4; docs → Task 7. The shared builder is Task 1.
+**Spec coverage:** every ENG-103 acceptance criterion maps to a task (see Task 8 Step 4). Server-side HTTPS+mTLS → Tasks 2/3; client-identity pinning → Tasks 2/3; client-side CA+mTLS → Tasks 4/5/6; plaintext default → nil-paths throughout; production_mode skip-verify → Task 4; docs → Task 7. The shared builder is Task 1.
 
-**Placeholder scan:** no TBD/“add error handling”/“similar to” — every code step is complete, including the cert-generation helper.
+**Placeholder scan:** no TBD/“add error handling”/“similar to” — every code step is complete, including the cert-generation helper and the name-pinner.
 
-**Type consistency:** `tlsconfig.ServerConfig(certFile, keyFile, clientCAFile)` and `tlsconfig.ClientConfig(caFile, skipVerify, clientCertFile, clientKeyFile)` are used with identical signatures in Tasks 1, 3, and 6. `HTTPClientConfig.TLSClientConfig *tls.Config` is defined in Task 5 and consumed in Task 6. Config field names (`TLSCertFile`/`TLSKeyFile`/`TLSClientCAFile` on docker.Config; `TLSCAFile`/`TLSSkipVerify`/`TLSClientCertFile`/`TLSClientKeyFile` on BackendConfig) are consistent across struct, validation, wiring, and docs.
+**Type consistency:** `tlsconfig.ServerConfig(certFile, keyFile, clientCAFile string, allowedClientNames []string)` and `tlsconfig.ClientConfig(caFile string, skipVerify bool, clientCertFile, clientKeyFile string)` are used with identical signatures in Tasks 1, 3, and 6. `HTTPClientConfig.TLSClientConfig *tls.Config` is defined in Task 5 and consumed in Task 6. Config field names (`TLSCertFile`/`TLSKeyFile`/`TLSClientCAFile`/`TLSClientAllowedNames` on docker.Config; `TLSCAFile`/`TLSSkipVerify`/`TLSClientCertFile`/`TLSClientKeyFile` on BackendConfig) are consistent across struct, validation, wiring, and docs.
+
+**Best-practice review (web-verified):** TLS 1.3-only matches Mozilla's "Modern" profile for known/internal clients. Client-identity pinning via `VerifyPeerCertificate` addresses the documented `RequireAndVerifyClientCert` gap (chain-only, no identity). HTTP/2 deliberately not forced (behavior-preserving; avoids golang/go#20645). Server cert SAN requirement documented (Go ≥1.15).
 
 **Out of scope (intentional):** `chain.buildTLSConfig` untouched; hot-reload (ENG-294); cert provisioning / manifest-deploy (ENG-104).
