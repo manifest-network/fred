@@ -441,6 +441,15 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("backends[%d]: both tls_client_cert_file and tls_client_key_file must be set together", i)
 		}
 
+		// TLS settings are meaningless on a plaintext backend; reject the
+		// dead config rather than silently ignoring it. (https:// without any
+		// TLS fields stays valid — it uses the system root CAs.)
+		if b.TLSCAFile != "" || b.TLSClientCertFile != "" || b.TLSClientKeyFile != "" || b.TLSSkipVerify {
+			if u, perr := url.Parse(b.URL); perr != nil || u.Scheme != "https" {
+				return fmt.Errorf("backends[%d]: TLS settings (tls_ca_file/tls_skip_verify/tls_client_cert_file/tls_client_key_file) require an https:// url", i)
+			}
+		}
+
 		if b.IsDefault {
 			if hasDefault {
 				return fmt.Errorf("multiple default backends specified")

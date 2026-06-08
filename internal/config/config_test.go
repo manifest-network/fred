@@ -1509,4 +1509,13 @@ func TestConfig_Validate_BackendTLS(t *testing.T) {
 		}}
 		require.ErrorContains(t, cfg.Validate(), "tls_skip_verify")
 	})
+
+	t.Run("TLS fields with http url is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Backends = []BackendConfig{{
+			Name: "b1", URL: "http://10.0.0.1:9001", IsDefault: true,
+			TLSCAFile: "/etc/fred/providerd/tls/backend-ca.pem",
+		}}
+		require.ErrorContains(t, cfg.Validate(), "require an https:// url")
+	})
 }
