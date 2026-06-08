@@ -76,21 +76,28 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		oldItems = existing.Items
 		delete(b.provisions, req.LeaseUUID)
 	}
-	b.provisions[req.LeaseUUID] = &provision{
-		ProvisionState: leasesm.ProvisionState{
+	b.provisions[req.LeaseUUID] = recoveredProvision{ //exhaustruct:enforce
+		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
 			LeaseUUID:    req.LeaseUUID,
 			Tenant:       req.Tenant,
 			ProviderUUID: req.ProviderUUID,
+			SKU:          "", // set by enrichReserved after validation
 			Status:       backend.ProvisionStatusProvisioning,
 			Quantity:     totalQuantity,
-			ContainerIDs: make([]string, 0, totalQuantity),
 			CreatedAt:    time.Now(),
 			FailCount:    prevFailCount,
-			CallbackURL:  req.CallbackURL,
+			LastError:    "",
+			CallbackURL:  req.CallbackURL, // MUST be set at reservation: a failure/Deprovision
+			// racing this provision in the validation window resolves CallbackURL from the map.
+			Items:             nil, // set by enrichReserved
+			ContainerIDs:      make([]string, 0, totalQuantity),
+			StackManifest:     nil, // set by enrichReserved
+			ServiceContainers: nil,
 		},
-		// VolumeCleanupAttempts: 0 by struct-zero — structural reset
-		// of the per-lease counter is the whole point of the wrapper.
-	}
+		// VolumeCleanupAttempts: 0 by struct-zero — structural reset of the
+		// per-lease counter is the whole point of the wrapper.
+		volumeCleanupAttempts: 0,
+	}.materialize()
 	b.provisionsMu.Unlock()
 
 	// Clean up old failed provision resources outside the lock.
@@ -195,9 +202,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// Update the reservation with full details now that validation passed.
 	b.provisionsMu.Lock()
 	if prov, ok := b.provisions[req.LeaseUUID]; ok {
-		prov.SKU = req.RoutingSKU()
-		prov.Items = req.Items
-		prov.StackManifest = stackManifest
+		prov.enrichReserved(req.RoutingSKU(), req.Items, stackManifest)
 	}
 	b.provisionsMu.Unlock()
 
@@ -544,9 +549,12 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 // does not yet resolve to this host (ENG-266), so the provision emits no
 // -custom Traefik router — and Traefik fires no HTTP-01 order — before DNS is
 // live. The periodic reconcile (ReconcileCustomDomain) re-applies the domain on
-// a later tick once it resolves. Mutates items in place: in the provision path
-// the items slice also backs the stored prov.Items, so the in-memory state and
-// the emitted container labels stay consistent.
+// a later tick once it resolves. It zeroes the deferred domain on BOTH the
+// caller's `items` slice (the label-emit path reads it via buildComposeProject)
+// AND the stored prov.Items: enrichReserved deep-copies Items (ENG-193), so
+// prov.Items no longer aliases the caller's slice and the in-memory state that
+// recoverState / ReconcileCustomDomain read must be updated explicitly to stay
+// consistent with the emitted container labels.
 func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend.LeaseItem, leaseUUID string, logger *slog.Logger) {
 	// Phase 1: decide which items to defer — DNS I/O, no lock held.
 	var toDefer []int
@@ -570,13 +578,19 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 	if len(toDefer) == 0 {
 		return
 	}
-	// Phase 2: apply under provisionsMu. In the provision path `items` aliases
-	// the stored prov.Items (assigned under the lock in Provision), which other
-	// goroutines (recoverState, reconcile) read/write under provisionsMu — so
-	// the mutation must hold it too.
+	// Phase 2: apply under provisionsMu. enrichReserved deep-copies Items, so
+	// prov.Items no longer aliases the caller's slice — update both explicitly:
+	// `items` for the label-emit path, prov.Items for the in-memory state that
+	// recoverState / ReconcileCustomDomain read under provisionsMu (ENG-193).
+	// Both slices are copies of the same normalized req.Items, so they
+	// correspond index-for-index.
 	b.provisionsMu.Lock()
+	prov, ok := b.provisions[leaseUUID]
 	for _, i := range toDefer {
 		items[i].CustomDomain = ""
+		if ok && i < len(prov.Items) {
+			prov.Items[i].CustomDomain = ""
+		}
 	}
 	b.provisionsMu.Unlock()
 }

@@ -3595,3 +3595,50 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 // (actor.workers, actor.workCancel) and is cleaner expressed via the
 // leasesm test fixtures (newTestActor + mock DoDeprovisionFn) than
 // via Backend integration.
+
+func TestProvision_EnrichReserved_DeepCopiesItems(t *testing.T) {
+	// enrichReserved must not retain the caller's Items slice: NormalizeProvisionRequest
+	// mutates req.Items[0] in place (client.go), so a stored alias would change
+	// the published provision after the fact.
+	p := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusProvisioning}}
+	callerItems := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+	p.enrichReserved("docker-small", callerItems, nil)
+	// Mutate the caller's slice after enrichment.
+	callerItems[0].ServiceName = "mutated"
+	require.Len(t, p.Items, 1)
+	assert.Equal(t, "app", p.Items[0].ServiceName, "stored Items must be a copy, not the caller's slice")
+}
+
+func TestProvision_ConcurrentReaderDuringValidationWindow(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusProvisioning, CallbackURL: "http://cb"}},
+	})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if s, ok := b.provisionStore.Get("L1"); ok {
+					// A reader in the validation window sees the Provisioning marker
+					// with its CallbackURL resolved — never an empty/torn entry.
+					_ = s.CallbackURL
+				}
+			}
+		}
+	}()
+	// Exercise enrichReserved concurrently with the reader (the create-path write).
+	for range 50 {
+		b.provisionsMu.Lock()
+		if p, ok := b.provisions["L1"]; ok {
+			p.enrichReserved("docker-small", []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}, nil)
+		}
+		b.provisionsMu.Unlock()
+	}
+	close(stop)
+	wg.Wait()
+}

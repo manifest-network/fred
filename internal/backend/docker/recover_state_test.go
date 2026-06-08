@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,7 +14,9 @@ import (
 
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
@@ -360,3 +363,285 @@ func TestRecoverState_Serialized(t *testing.T) {
 // preemption. The real-Deprovision test
 // TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback
 // (lease_actor_test.go) covers the invariant end-to-end.
+
+// runRecover drives recoverState with a fixed set of managed containers and a
+// pre-existing provisions map, returning the resulting b.provisions.
+func runRecover(t *testing.T, existing map[string]*provision, containers []ContainerInfo) map[string]*provision {
+	t.Helper()
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return containers, nil
+		},
+		// Cold-start recovery (a Failed-derived entry with no prior in-memory
+		// state) runs a post-merge diagnostics-gathering pass that inspects each
+		// recovered container. By the time recovery sees a Failed provision the
+		// container is gone, so mirror Docker's real behavior on a removed
+		// container: InspectInstance returns an error, the diag loop logs+skips,
+		// and LastError stays the un-enriched ErrMsgContainerExited baseline the
+		// merge set. This stubs the harness only — it does NOT alter the merge
+		// result these tests assert on.
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return nil, fmt.Errorf("no such container: %s", leasesm.ShortID(containerID))
+		},
+	}
+	b := newBackendForTest(mock, existing)
+	require.NoError(t, b.recoverState(context.Background()))
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	out := make(map[string]*provision, len(b.provisions))
+	for k, v := range b.provisions {
+		out[k] = v
+	}
+	return out
+}
+
+func TestRecoverState_ReadyFromRunningContainers(t *testing.T) {
+	got := runRecover(t, nil, []ContainerInfo{
+		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running", CallbackURL: "http://cb"},
+	})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusReady, p.Status)
+	assert.Equal(t, []string{"c1"}, p.ContainerIDs)
+	assert.Equal(t, 1, p.Quantity)
+	assert.Equal(t, "http://cb", p.CallbackURL)
+	assert.Equal(t, map[string][]string{"app": {"c1"}}, p.ServiceContainers,
+		"ServiceContainers must be rebuilt from container labels")
+	assert.Equal(t, []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}, p.Items,
+		"Items must be rebuilt from container labels")
+}
+
+func TestRecoverState_ColdStartFailed_BumpsFailCountAndLastError(t *testing.T) {
+	got := runRecover(t, nil, []ContainerInfo{
+		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "exited", FailCount: 2},
+	})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status)
+	assert.Equal(t, 3, p.FailCount, "cold-start increments the label FailCount")
+	assert.Equal(t, leasesm.ErrMsgContainerExited, p.LastError)
+}
+
+func TestRecoverState_InFlightProvisioning_PreservedNoContainers(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusProvisioning, FailCount: 4}},
+	}
+	got := runRecover(t, existing, nil) // no containers
+	p, ok := got["L1"]
+	require.True(t, ok, "in-flight provisioning entry must survive recovery")
+	assert.Equal(t, backend.ProvisionStatusProvisioning, p.Status)
+	assert.Equal(t, 4, p.FailCount)
+	assert.Same(t, existing["L1"], p, "in-flight entry is preserved by pointer")
+}
+
+func TestRecoverState_FailingNormalizedToFailed(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusFailing, FailCount: 1, LastError: "x"}},
+	}
+	got := runRecover(t, existing, nil)
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status, "Failing normalizes to Failed")
+	assert.Equal(t, 1, p.FailCount)
+	assert.Equal(t, "x", p.LastError)
+}
+
+func TestRecoverState_FailingNormalized_DeepClonesReferenceFields(t *testing.T) {
+	// recover.go's Failing->Failed normalization builds a fresh entry via
+	// recoveredFromProvision+materialize. Lock the deep-clone at its real call
+	// site with NON-empty reference fields: the recovered entry must be a fresh
+	// struct whose Items/ContainerIDs/ServiceContainers do not alias the
+	// original existing entry's backing arrays.
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:         "L1",
+			Status:            backend.ProvisionStatusFailing,
+			FailCount:         2,
+			LastError:         "boom",
+			Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "x.example"}},
+			ContainerIDs:      []string{"c1"},
+			ServiceContainers: map[string][]string{"app": {"c1"}},
+		}},
+	}
+	got := runRecover(t, existing, nil) // no containers -> Failing-normalize path
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status, "Failing normalizes to Failed")
+	assert.NotSame(t, existing["L1"], p, "must be a fresh materialized entry, not the mutated published struct")
+	// Mutating the recovered entry's reference fields must NOT touch the original.
+	p.Items[0].ServiceName = "mutated"
+	p.ContainerIDs[0] = "mutated"
+	p.ServiceContainers["app"][0] = "mutated"
+	assert.Equal(t, "app", existing["L1"].Items[0].ServiceName, "Items must be deep-cloned")
+	assert.Equal(t, "c1", existing["L1"].ContainerIDs[0], "ContainerIDs must be deep-cloned")
+	assert.Equal(t, "c1", existing["L1"].ServiceContainers["app"][0], "ServiceContainers must be deep-cloned")
+}
+
+func TestRecoverState_FailedPreservedNoContainers(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusFailed, FailCount: 7}},
+	}
+	got := runRecover(t, existing, nil)
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status)
+	assert.Equal(t, 7, p.FailCount)
+}
+
+func TestRecoverState_FailCountAntiRegression(t *testing.T) {
+	// Existing in-memory FailCount (5) must win over the stale container label (2).
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusFailed, FailCount: 5}},
+	}
+	got := runRecover(t, existing, []ContainerInfo{
+		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running", FailCount: 2},
+	})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, 5, p.FailCount, "higher in-memory FailCount must not regress to the label value")
+	assert.Equal(t, backend.ProvisionStatusReady, p.Status,
+		"container-derived Ready status must not be suppressed by FailCount anti-regression")
+}
+
+func TestRecoverState_DeprovisioningPreserved_NoContainers(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusDeprovisioning}},
+	}
+	got := runRecover(t, existing, nil) // containers already gone
+	p, ok := got["L1"]
+	require.True(t, ok, "a Deprovisioning lease must be preserved, not dropped")
+	assert.Equal(t, backend.ProvisionStatusDeprovisioning, p.Status)
+	assert.Same(t, existing["L1"], p, "preserved by pointer — the deprovision goroutine owns it")
+}
+
+func TestRecoverState_DeprovisioningPreserved_SurvivingContainers(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusDeprovisioning}},
+	}
+	got := runRecover(t, existing, []ContainerInfo{
+		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running"},
+	})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusDeprovisioning, p.Status, "must NOT be resurrected to a container-derived status")
+	assert.Same(t, existing["L1"], p)
+}
+
+// TestRecoverState_ConcurrentReaderDuringMerge runs recoverState while another
+// goroutine continuously reads provision state through the store seam. The race
+// detector must stay clean: the merge holds provisionsMu across the swap and the
+// reader takes it via Get.
+func TestRecoverState_ConcurrentReaderDuringMerge(t *testing.T) {
+	existing := map[string]*provision{
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusReady, ContainerIDs: []string{"c1"}}},
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running"},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, existing)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = b.provisionStore.Get("L1")
+			}
+		}
+	}()
+
+	for range 20 {
+		require.NoError(t, b.recoverState(context.Background()))
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// TestRecoverState_ColdStartFailed_EnrichesLastError covers the cold-start
+// diagnostics-enrichment path (ENG-193 review #4 — previously dark): the
+// runRecover helper hardcodes an erroring InspectContainerFn so the gather
+// branch never runs. Here InspectInstance SUCCEEDS (Status "exited" maps to
+// PhaseExited), so failedDiagnostics is populated and the UpdateFn enrichment
+// loop fires, rewriting LastError to ErrMsgContainerExited + ": " + diag.
+func TestRecoverState_ColdStartFailed_EnrichesLastError(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "exited"},
+			}, nil
+		},
+		// Succeeding inspector: InspectInstance -> PhaseExited reaches the gather
+		// branch. ContainerLogs uses the mock's safe default ("no such container"
+		// error), so the gatherer returns a benign non-empty "exit_code=0" diag.
+		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{Status: "exited", ExitCode: 1}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	require.NoError(t, b.recoverState(context.Background()))
+
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	p, ok := b.provisions["L1"]
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status)
+	assert.True(t, strings.HasPrefix(p.LastError, leasesm.ErrMsgContainerExited+": "),
+		"enrichment loop must rewrite LastError with the gathered diag prefix; got %q", p.LastError)
+}
+
+// TestRecoverState_ColdStartFailed_EnrichmentSkippedWhenInstanceReplaced is the
+// ENG-193 review #1 guard: diagnostics are gathered during an I/O window AFTER
+// provisionsMu is released. If a concurrent Provision-retry replaces the lease
+// with a DIFFERENT Failed instance during that window, the stale diag must NOT
+// clobber the new owner's LastError. The InspectContainerFn side effect
+// simulates that re-provision mid-window; the CreatedAt guard must skip the
+// stale write because the replacement carries a fresh CreatedAt.
+func TestRecoverState_ColdStartFailed_EnrichmentSkippedWhenInstanceReplaced(t *testing.T) {
+	// The recovered cold-start entry's CreatedAt comes from the container label
+	// (ContainerInfo.CreatedAt). Use distinct explicit times so the guard sees a
+	// mismatch between the snapshot identity and the replacement's identity.
+	originalCreatedAt := time.Unix(1000, 0)
+	replacementCreatedAt := time.Unix(2000, 0)
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "exited", CreatedAt: originalCreatedAt},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	// Set the inspector AFTER building b so the closure can capture it. The side
+	// effect simulates a Provision-retry taking ownership during the diag I/O
+	// window: replace L1 with a fresh Failed instance (different CreatedAt) under
+	// the same provisionsMu, then return a terminal state to drive the gather.
+	mock.InspectContainerFn = func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+		b.provisionsMu.Lock()
+		b.provisions["L1"] = &provision{ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "L1",
+			Status:    backend.ProvisionStatusFailed,
+			LastError: "fresh-owner-error",
+			CreatedAt: replacementCreatedAt,
+		}}
+		b.provisionsMu.Unlock()
+		return &ContainerInfo{Status: "exited"}, nil
+	}
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	p, ok := b.provisions["L1"]
+	require.True(t, ok)
+	assert.Equal(t, "fresh-owner-error", p.LastError,
+		"CreatedAt guard must skip the stale enriched write onto a replacement instance; got %q", p.LastError)
+}

@@ -199,6 +199,33 @@ func TestDeferUnreadyCustomDomains(t *testing.T) {
 	assert.Equal(t, "", items[2].CustomDomain, "empty stays empty")
 }
 
+func TestDeferUnreadyCustomDomains_ZeroesStoredProvItems(t *testing.T) {
+	// ENG-193 regression: enrichReserved deep-copies Items, so prov.Items is a
+	// DISTINCT array from the caller's req.Items. Deferring an unready domain
+	// must zero BOTH — otherwise the in-memory prov.Items keeps the domain while
+	// the emitted container labels (built from req.Items) have it zeroed, so
+	// ReconcileCustomDomain reads a stale "already-emitted" value and never
+	// re-applies the domain once DNS goes live.
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return false } // defer all
+
+	// prov.Items is a separate slice from reqItems (mirrors the deep-copy), with
+	// equal values index-for-index.
+	storedItems := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "x.example.com"}}
+	b.provisionsMu.Lock()
+	b.provisions["L1"] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Items: storedItems}}
+	b.provisionsMu.Unlock()
+	reqItems := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "x.example.com"}}
+
+	b.deferUnreadyCustomDomains(context.Background(), reqItems, "L1", b.logger)
+
+	assert.Equal(t, "", reqItems[0].CustomDomain, "caller's slice (label-emit path) must be zeroed")
+	b.provisionsMu.RLock()
+	got := b.provisions["L1"].Items[0].CustomDomain
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "", got, "stored prov.Items must be zeroed too (distinct array post-deep-copy)")
+}
+
 func TestNewResolvers(t *testing.T) {
 	servers := []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"}
 	rs := newResolvers(servers)
