@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +27,7 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/scheduler"
+	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/watcher"
 )
 
@@ -240,11 +242,24 @@ func run(cmd *cobra.Command, args []string) error {
 
 	var backendEntries []backend.BackendEntry
 	for _, bcfg := range cfg.Backends {
+		// Build the per-backend TLS config at the composition root so file-I/O
+		// errors fail startup here (config.Validate has already checked field
+		// pairing and the production_mode skip-verify rule). Left nil when no
+		// TLS fields are set, so plaintext http:// backends are unaffected.
+		var tlsClientConfig *tls.Config
+		if bcfg.TLSCAFile != "" || bcfg.TLSClientCertFile != "" || bcfg.TLSClientKeyFile != "" || bcfg.TLSSkipVerify {
+			tlsClientConfig, err = tlsconfig.ClientConfig(bcfg.TLSCAFile, bcfg.TLSSkipVerify, bcfg.TLSClientCertFile, bcfg.TLSClientKeyFile)
+			if err != nil {
+				return fmt.Errorf("backend %q: build TLS client config: %w", bcfg.Name, err)
+			}
+		}
+
 		client := backend.NewHTTPClient(backend.HTTPClientConfig{
 			Name:                bcfg.Name,
 			BaseURL:             bcfg.URL,
 			Timeout:             bcfg.Timeout,
 			Secret:              string(cfg.CallbackSecret),
+			TLSClientConfig:     tlsClientConfig,
 			RequestDuration:     metrics.BackendRequestDuration,
 			RequestsTotal:       metrics.BackendRequestsTotal,
 			CircuitBreakerState: metrics.BackendCircuitBreakerState,
