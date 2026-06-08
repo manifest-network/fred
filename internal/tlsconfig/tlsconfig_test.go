@@ -127,7 +127,7 @@ func TestServerConfig_MinVersionAndDefaults(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint16(tls.VersionTLS13), cfg.MinVersion)
 	require.Equal(t, tls.NoClientCert, cfg.ClientAuth)
-	require.Nil(t, cfg.VerifyPeerCertificate)
+	require.Nil(t, cfg.VerifyConnection)
 	require.Len(t, cfg.Certificates, 1)
 }
 
@@ -137,7 +137,7 @@ func TestServerConfig_MTLSEnablesClientAuth(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, tls.RequireAndVerifyClientCert, cfg.ClientAuth)
 	require.NotNil(t, cfg.ClientCAs)
-	require.Nil(t, cfg.VerifyPeerCertificate) // no allowlist => no pinning
+	require.Nil(t, cfg.VerifyConnection) // no allowlist => no pinning
 }
 
 func TestServerConfig_AllowedNamesWithoutClientCAErrors(t *testing.T) {
@@ -220,7 +220,7 @@ func TestEndToEnd_MTLS_AllowlistAcceptsCN(t *testing.T) {
 	certs := writeTestCerts(t)
 	srvCfg, err := tlsconfig.ServerConfig(certs.serverCertFile, certs.serverKeyFile, certs.caFile, []string{"client"})
 	require.NoError(t, err)
-	require.NotNil(t, srvCfg.VerifyPeerCertificate)
+	require.NotNil(t, srvCfg.VerifyConnection)
 	url := startMTLSServer(t, srvCfg)
 
 	cliCfg, err := tlsconfig.ClientConfig(certs.caFile, false, certs.clientCertFile, certs.clientKeyFile)

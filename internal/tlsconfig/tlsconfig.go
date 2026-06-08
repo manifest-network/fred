@@ -45,7 +45,7 @@ func ServerConfig(certFile, keyFile, clientCAFile string, allowedClientNames []s
 		cfg.ClientCAs = pool
 		cfg.ClientAuth = tls.RequireAndVerifyClientCert
 		if len(allowedClientNames) > 0 {
-			cfg.VerifyPeerCertificate = clientNamePinner(allowedClientNames)
+			cfg.VerifyConnection = clientNamePinner(allowedClientNames)
 		}
 	}
 	return cfg, nil
@@ -77,17 +77,18 @@ func ClientConfig(caFile string, skipVerify bool, clientCertFile, clientKeyFile 
 	return cfg, nil
 }
 
-// clientNamePinner returns a VerifyPeerCertificate callback that passes only
-// when the verified client leaf's CommonName or a DNS SAN is in allowed.
-// It runs after RequireAndVerifyClientCert has already verified the chain, so
-// verifiedChains is non-empty.
-func clientNamePinner(allowed []string) func([][]byte, [][]*x509.Certificate) error {
+// clientNamePinner returns a VerifyConnection callback that passes only when
+// the verified client leaf's CommonName or a DNS SAN is in allowed. It uses
+// VerifyConnection (not VerifyPeerCertificate) so the check also runs on
+// resumed TLS connections; RequireAndVerifyClientCert has already verified
+// the chain, so VerifiedChains is normally populated.
+func clientNamePinner(allowed []string) func(tls.ConnectionState) error {
 	set := make(map[string]struct{}, len(allowed))
 	for _, n := range allowed {
 		set[n] = struct{}{}
 	}
-	return func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
-		for _, chain := range verifiedChains {
+	return func(cs tls.ConnectionState) error {
+		for _, chain := range cs.VerifiedChains {
 			leaf := chain[0]
 			if _, ok := set[leaf.Subject.CommonName]; ok {
 				return nil
@@ -98,7 +99,10 @@ func clientNamePinner(allowed []string) func([][]byte, [][]*x509.Certificate) er
 				}
 			}
 		}
-		leaf := verifiedChains[0][0]
+		if len(cs.VerifiedChains) == 0 {
+			return fmt.Errorf("client certificate identity not allowed: no verified chains")
+		}
+		leaf := cs.VerifiedChains[0][0]
 		return fmt.Errorf("client certificate identity not allowed (CN=%q SANs=%v)",
 			leaf.Subject.CommonName, leaf.DNSNames)
 	}
