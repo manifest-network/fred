@@ -15,6 +15,33 @@ name: docker
 # HTTP server listen address
 listen_addr: ":9001"
 
+# ---------------------------------------------------------------------------
+# TLS / mTLS (ENG-103)
+# ---------------------------------------------------------------------------
+# When tls_cert_file and tls_key_file are both set, the listener serves HTTPS
+# instead of plaintext HTTP. The server certificate MUST carry a SAN matching
+# the address providerd dials (Go ignores the legacy CN). Point providerd's
+# per-backend url at https:// and its tls_ca_file at the CA that signed this
+# certificate.
+# tls_cert_file: "/etc/fred/docker-backend/tls/cert.pem"
+# tls_key_file:  "/etc/fred/docker-backend/tls/key.pem"
+#
+# For mutual TLS, also set tls_client_ca_file: the listener then requires and
+# verifies a client certificate signed by this CA (providerd presents one via
+# its per-backend tls_client_cert_file / tls_client_key_file). Requires
+# tls_cert_file / tls_key_file above.
+# tls_client_ca_file: "/etc/fred/docker-backend/tls/client-ca.pem"
+#
+# Client-identity pinning (recommended unless the client CA is dedicated solely
+# to providerd): mTLS only proves the client cert was signed by the CA, not who
+# the client is. List the allowed client certificate CommonNames / DNS SANs to
+# reject any other cert the CA may have signed. Empty = accept any such cert.
+# tls_client_allowed_names:
+#   - providerd
+#
+# NOTE: certificates are loaded once at startup; rotation requires a restart
+# (hot-reload is tracked in ENG-294).
+
 # Docker daemon socket or URL
 docker_host: "unix:///var/run/docker.sock"
 
