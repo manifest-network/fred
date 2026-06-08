@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -438,6 +439,11 @@ type HTTPClientConfig struct {
 	MaxIdleConnsPerHost int // Max idle connections per host (default: 10)
 	Secret              string
 
+	// TLSClientConfig, when non-nil, is applied to the backend HTTP transport
+	// (private-CA trust and/or a client certificate for mTLS). Built by the
+	// caller from per-backend config so this package performs no file I/O.
+	TLSClientConfig *tls.Config
+
 	// Circuit breaker settings
 	CBMaxRequests   uint32        // Max requests in half-open state (default: 1)
 	CBInterval      time.Duration // Interval to clear counts in closed state (default: 0, never clear)
@@ -487,6 +493,14 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		MaxIdleConns:        maxIdleConns,
 		MaxIdleConnsPerHost: maxIdleConnsPerHost,
 		IdleConnTimeout:     90 * time.Second,
+	}
+	if cfg.TLSClientConfig != nil {
+		transport.TLSClientConfig = cfg.TLSClientConfig
+		// The hop stays HTTP/1.1 over TLS (it is plaintext HTTP/1.1 today).
+		// A custom TLSClientConfig disables Go's automatic HTTP/2; we
+		// deliberately do NOT set ForceAttemptHTTP2 — these are low-volume
+		// JSON request/response calls and h2 with a custom TLS config carries
+		// a known footgun (golang/go#20645).
 	}
 
 	// Create circuit breaker

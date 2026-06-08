@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -1749,4 +1750,23 @@ func TestNormalizeProvisionRequest_AcceptsSingleNamedItem(t *testing.T) {
 	require.NoError(t, NormalizeProvisionRequest(&req))
 	require.Equal(t, "custom", req.Items[0].ServiceName,
 		"single explicitly-named item must pass through unchanged")
+}
+
+func TestNewHTTPClient_AppliesTLSClientConfig(t *testing.T) {
+	sentinel := &tls.Config{MinVersion: tls.VersionTLS13}
+	c := NewHTTPClient(HTTPClientConfig{
+		Name:            "tls-backend",
+		BaseURL:         "https://backend.example:9001",
+		TLSClientConfig: sentinel,
+	})
+	tr, ok := c.httpClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Same(t, sentinel, tr.TLSClientConfig)
+}
+
+func TestNewHTTPClient_NoTLSConfig_LeavesTransportDefault(t *testing.T) {
+	c := NewHTTPClient(HTTPClientConfig{Name: "plain", BaseURL: "http://backend:9001"})
+	tr, ok := c.httpClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Nil(t, tr.TLSClientConfig)
 }
