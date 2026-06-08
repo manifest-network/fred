@@ -1431,3 +1431,82 @@ backends:
 	assert.Equal(t, "abcdef01-2345-6789-abcd-ef0123456789", cfg.ProviderUUID)
 	assert.Equal(t, 100.0, cfg.RateLimitRPS)
 }
+
+// validConfig returns a Config that passes Validate(), for mutation in tests.
+func validConfig() Config {
+	return Config{
+		ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+		ProviderAddress:           "manifest1abc",
+		KeyName:                   "provider",
+		KeyringDir:                "/home/provider/.manifest",
+		Bech32Prefix:              "manifest",
+		WithdrawInterval:          time.Hour,
+		RateLimitRPS:              10,
+		RateLimitBurst:            20,
+		GRPCEndpoint:              "localhost:9090",
+		WebSocketURL:              "ws://localhost:26657/websocket",
+		GasLimit:                  500000,
+		GasPrice:                  25,
+		GasAdjustment:             1.2,
+		FeeDenom:                  "umfx",
+		HTTPReadTimeout:           15 * time.Second,
+		HTTPWriteTimeout:          15 * time.Second,
+		HTTPIdleTimeout:           60 * time.Second,
+		WebSocketPingInterval:     30 * time.Second,
+		TxPollInterval:            500 * time.Millisecond,
+		TxTimeout:                 30 * time.Second,
+		QueryPageLimit:            100,
+		MaxWithdrawIterations:     100,
+		WebSocketReconnectInitial: time.Second,
+		WebSocketReconnectMax:     60 * time.Second,
+		MaxRequestBodySize:        1 << 20,
+		CreditCheckErrorThreshold: 3,
+		CreditCheckRetryInterval:  30 * time.Second,
+		ReconciliationInterval:    5 * time.Minute,
+		ShutdownTimeout:           30 * time.Second,
+		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+		CallbackBaseURL:           "http://localhost:8080",
+		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+	}
+}
+
+func TestConfig_Validate_BackendTLS(t *testing.T) {
+	t.Run("client cert without key is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Backends = []BackendConfig{{
+			Name: "b1", URL: "https://10.0.0.1:9001", IsDefault: true,
+			TLSClientCertFile: "/etc/fred/providerd/tls/client.pem",
+		}}
+		require.ErrorContains(t, cfg.Validate(), "tls_client_cert_file and tls_client_key_file")
+	})
+
+	t.Run("client key without cert is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Backends = []BackendConfig{{
+			Name: "b1", URL: "https://10.0.0.1:9001", IsDefault: true,
+			TLSClientKeyFile: "/etc/fred/providerd/tls/client-key.pem",
+		}}
+		require.ErrorContains(t, cfg.Validate(), "tls_client_cert_file and tls_client_key_file")
+	})
+
+	t.Run("full mTLS backend is accepted", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Backends = []BackendConfig{{
+			Name: "b1", URL: "https://10.0.0.1:9001", IsDefault: true,
+			TLSCAFile:         "/etc/fred/providerd/tls/backend-ca.pem",
+			TLSClientCertFile: "/etc/fred/providerd/tls/client.pem",
+			TLSClientKeyFile:  "/etc/fred/providerd/tls/client-key.pem",
+		}}
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("production_mode rejects backend tls_skip_verify", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.ProductionMode = true
+		cfg.Backends = []BackendConfig{{
+			Name: "b1", URL: "https://10.0.0.1:9001", IsDefault: true,
+			TLSSkipVerify: true,
+		}}
+		require.ErrorContains(t, cfg.Validate(), "tls_skip_verify")
+	})
+}
