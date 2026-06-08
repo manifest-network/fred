@@ -65,3 +65,27 @@ func TestRecoveredFromProvision_ClonesReferenceFields(t *testing.T) {
 	assert.Equal(t, "c1", src.ServiceContainers["app"][0], "ServiceContainers must be deep-cloned")
 	assert.Equal(t, 2, rec.volumeCleanupAttempts, "wrapper field carried")
 }
+
+func TestRecoveredFromProvision_PreservesNilVsEmpty(t *testing.T) {
+	// slices.Clone preserves nil-vs-empty, so a kept entry's reference fields
+	// keep the same nil-ness they had before normalization (byte-equivalent to
+	// the prior preserve-by-pointer path; the old append([]T(nil), ...) idiom
+	// collapsed a non-nil empty slice to nil).
+	t.Run("nil stays nil", func(t *testing.T) {
+		rec := recoveredFromProvision(&provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1"}})
+		assert.Nil(t, rec.Items)
+		assert.Nil(t, rec.ContainerIDs)
+		assert.Nil(t, rec.ServiceContainers)
+	})
+	t.Run("non-nil empty stays non-nil empty", func(t *testing.T) {
+		rec := recoveredFromProvision(&provision{ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    "L1",
+			Items:        []backend.LeaseItem{},
+			ContainerIDs: []string{},
+		}})
+		assert.NotNil(t, rec.Items, "non-nil empty Items must stay non-nil")
+		assert.Empty(t, rec.Items)
+		assert.NotNil(t, rec.ContainerIDs, "non-nil empty ContainerIDs must stay non-nil")
+		assert.Empty(t, rec.ContainerIDs)
+	})
+}
