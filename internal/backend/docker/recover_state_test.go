@@ -505,13 +505,22 @@ func TestRecoverState_FailCountAntiRegression(t *testing.T) {
 
 func TestRecoverState_DeprovisioningPreserved_NoContainers(t *testing.T) {
 	existing := map[string]*provision{
-		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusDeprovisioning}},
+		// Seed a non-zero VolumeCleanupAttempts. ENG-285's volume-retry split
+		// increments this docker-private counter in a span separate from the
+		// ProvisionState writes and relies on this preserve-case keeping the live
+		// *provision (and thus the counter) across recoverState's map swap.
+		// Asserting it survives here is the DETERMINISTIC guard for that invariant
+		// — the concurrent race test only hits the inter-span window
+		// probabilistically; a rebuild-fresh regression would reset the counter
+		// and is caught here every run.
+		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusDeprovisioning}, VolumeCleanupAttempts: 2},
 	}
 	got := runRecover(t, existing, nil) // containers already gone
 	p, ok := got["L1"]
 	require.True(t, ok, "a Deprovisioning lease must be preserved, not dropped")
 	assert.Equal(t, backend.ProvisionStatusDeprovisioning, p.Status)
 	assert.Same(t, existing["L1"], p, "preserved by pointer — the deprovision goroutine owns it")
+	assert.Equal(t, 2, p.VolumeCleanupAttempts, "docker-private VolumeCleanupAttempts must survive the preserve-case (not reset by a rebuild-fresh)")
 }
 
 func TestRecoverState_DeprovisioningPreserved_SurvivingContainers(t *testing.T) {
