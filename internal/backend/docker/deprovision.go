@@ -164,7 +164,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		}
 		b.provisionsMu.Unlock()
 		if !entryExists {
-			// Entry already gone (idempotent re-entry) — nothing to update.
+			// Defensive: the entry existed at the initial Deprovisioning mark
+			// (else doDeprovision returned early at the !exists guard) and the
+			// lease actor owns it through teardown, so it should still be here.
+			// If a concurrent path removed it mid-flight, there's nothing left
+			// to update.
 			return fmt.Errorf("volume cleanup failed: %w", errors.Join(volumeErrs...))
 		}
 
