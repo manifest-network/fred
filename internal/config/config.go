@@ -450,6 +450,13 @@ func (c *Config) Validate() error {
 			}
 		}
 
+		// Security warning for per-backend TLS skip verify (mirrors the
+		// grpc_tls_skip_verify advisory above). production_mode rejects this
+		// outright; in non-production we still surface the risk.
+		if b.TLSSkipVerify {
+			slog.Warn("SECURITY WARNING: backend tls_skip_verify is enabled - TLS certificate verification is disabled, vulnerable to MITM attacks", "backend", b.Name)
+		}
+
 		if b.IsDefault {
 			if hasDefault {
 				return fmt.Errorf("multiple default backends specified")
