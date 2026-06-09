@@ -177,6 +177,20 @@ func TestClientConfig_BadClientCert(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestClientConfig_HalfSetClientCertKeyIsRejected(t *testing.T) {
+	certs := writeTestCerts(t)
+
+	t.Run("cert without key", func(t *testing.T) {
+		_, err := tlsconfig.ClientConfig("", false, certs.clientCertFile, "")
+		require.ErrorContains(t, err, "both be set")
+	})
+
+	t.Run("key without cert", func(t *testing.T) {
+		_, err := tlsconfig.ClientConfig("", false, "", certs.clientKeyFile)
+		require.ErrorContains(t, err, "both be set")
+	})
+}
+
 // startMTLSServer starts an httptest TLS server using the given server config
 // and returns its URL. The handler always replies 200.
 func startMTLSServer(t *testing.T, srvCfg *tls.Config) string {

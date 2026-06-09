@@ -54,7 +54,8 @@ func ServerConfig(certFile, keyFile, clientCAFile string, allowedClientNames []s
 // ClientConfig builds a client-side *tls.Config. When caFile is non-empty it
 // is used as the root CA set (otherwise the system roots apply). When both
 // clientCertFile and clientKeyFile are non-empty, the pair is presented for
-// mutual TLS. skipVerify disables server certificate verification (dev only).
+// mutual TLS; supplying only one of the two is an error. skipVerify disables
+// server certificate verification (dev only).
 func ClientConfig(caFile string, skipVerify bool, clientCertFile, clientKeyFile string) (*tls.Config, error) {
 	cfg := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
@@ -67,7 +68,10 @@ func ClientConfig(caFile string, skipVerify bool, clientCertFile, clientKeyFile 
 		}
 		cfg.RootCAs = pool
 	}
-	if clientCertFile != "" || clientKeyFile != "" {
+	if (clientCertFile != "") != (clientKeyFile != "") {
+		return nil, fmt.Errorf("client cert and key must both be set or both empty")
+	}
+	if clientCertFile != "" {
 		cert, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("load client cert/key: %w", err)
