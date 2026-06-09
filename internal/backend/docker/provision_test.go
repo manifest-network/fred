@@ -931,6 +931,92 @@ func TestDeprovision_UnderLimitVolumeRetryKeepsProvisionFailed(t *testing.T) {
 	assert.Equal(t, 1, gotAttempts)
 }
 
+// TestDeprovision_VolumeRetry_ConcurrentRecoverState is the ENG-285 acceptance
+// guard for the seam split. The volume-retry block writes ProvisionState
+// (ContainerIDs/Status/LastError) through UpdateFn in a critical section
+// SEPARATE from the docker-private VolumeCleanupAttempts increment. A periodic
+// recoverState wholesale-swaps b.provisions between those two sections; its
+// Deprovisioning preserve-case (recover.go, ENG-193) must keep the in-flight
+// entry by pointer so both sections operate on the same *provision and the
+// increment is never lost to a rebuilt-fresh struct. -race validates the
+// synchronization across the split.
+func TestDeprovision_VolumeRetry_ConcurrentRecoverState(t *testing.T) {
+	// containersGone flips once compose Down removes the lease's containers, so
+	// recoverState lists c1 while the lease is still Ready (preventing a
+	// Ready-with-no-containers drop in setup) and lists nothing afterward (so the
+	// in-flight entry hits the Deprovisioning preserve-case, not a label rebuild).
+	var containersGone atomic.Bool
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			if containersGone.Load() {
+				return nil, nil
+			}
+			return []ContainerInfo{{
+				ContainerID: "c1", LeaseUUID: "lease-1", Tenant: "tenant-a",
+				SKU: "docker-small", ServiceName: manifest.DefaultServiceName, Status: "running",
+			}}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			ContainerIDs: []string{"c1"},
+			Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}}},
+	})
+	b.compose = &mockComposeExecutor{DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+		containersGone.Store(true) // containers removed — recoverState now lists none
+		return nil
+	}}
+	// Volume Destroy always fails → one under-limit attempt → entry kept Failed.
+	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error {
+		return fmt.Errorf("device busy")
+	}}
+
+	// Hammer recoverState concurrently with the deprovision so its map swap
+	// interleaves with the volume-retry block's two critical sections.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if err := b.recoverState(context.Background()); err != nil {
+					t.Errorf("recoverState: %v", err)
+					return
+				}
+			}
+		}
+	}()
+
+	err := b.Deprovision(context.Background(), "lease-1")
+	close(stop)
+	wg.Wait()
+
+	require.Error(t, err, "under-limit volume failure returns an error")
+
+	b.provisionsMu.RLock()
+	p, ok := b.provisions["lease-1"]
+	var gotStatus backend.ProvisionStatus
+	var gotIDs []string
+	var gotAttempts int
+	if ok {
+		gotStatus = p.Status
+		gotIDs = append([]string(nil), p.ContainerIDs...)
+		gotAttempts = p.VolumeCleanupAttempts
+	}
+	b.provisionsMu.RUnlock()
+
+	require.True(t, ok, "entry must survive concurrent recoverState (Deprovisioning preserve-case)")
+	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus, "under-limit retry keeps the lease Failed")
+	assert.Nil(t, gotIDs, "containers are gone")
+	assert.Equal(t, 1, gotAttempts, "VolumeCleanupAttempts increment must not be lost to a concurrent recoverState swap")
+}
+
 // TestDeprovision_RetryAfterPartialFailureFiresOneCallback verifies that the
 // terminal callback only fires on clean completion. A first call that hits a
 // partial-container-failure path emits no callback; a successful retry emits

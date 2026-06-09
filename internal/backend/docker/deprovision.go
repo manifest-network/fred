@@ -144,71 +144,76 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	if len(volumeErrs) > 0 {
-		// ENG-232: this block stays a single direct provisionsMu span (NOT routed
-		// through the store seam) because VolumeCleanupAttempts is a docker-private
-		// wrapper field (not on ProvisionState, unreachable through UpdateFn) and is
-		// incremented atomically with ContainerIDs/Status — seaming the
-		// ProvisionState writes would split one atomic read-modify-write into two.
-		// The give-up-branch delete stays inline for the same reason (calling
-		// store.Delete here would re-enter provisionsMu). Tracked: ENG-285.
-		var diagSnap shared.DiagnosticEntry
-		// attempts is captured INSIDE the b.provisionsMu Lock span (after
-		// the increment) so we can use the correct value at logger.Error
-		// below — which runs AFTER the Unlock and AFTER the provision
-		// entry has been deleted in the give-up branch. The other reads
-		// in this block (the if-guard and the LastError fmt.Sprintf) also
-		// use the captured value to make the lock-held-state dependency
-		// explicit and prevent future regressions where someone moves a
-		// read outside the Lock.
+		// ENG-285: VolumeCleanupAttempts is a docker-private wrapper field (not
+		// on ProvisionState, unreachable through the substrate-agnostic UpdateFn
+		// seam), so its increment stays a short direct provisionsMu span. The
+		// ProvisionState writes that follow (ContainerIDs/Status/LastError) route
+		// through the actor's single-writer store seam. Splitting the former
+		// atomic read-modify-write into these two critical sections is safe
+		// because recoverState's Deprovisioning preserve-case (recover.go,
+		// ENG-193) keeps the in-flight entry by pointer across its wholesale map
+		// swap — both sections operate on the same *provision, so the increment
+		// is never lost to a rebuilt-fresh struct.
 		var attempts int
+		var entryExists bool
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions[leaseUUID]; ok {
 			p.VolumeCleanupAttempts++
 			attempts = p.VolumeCleanupAttempts
-			p.ContainerIDs = nil // containers are gone
-
-			if attempts >= maxVolumeCleanupAttempts {
-				// Too many failed attempts — give up and remove the provision.
-				// The leaked volumes require manual cleanup by the operator.
-				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
-					attempts, errors.Join(volumeErrs...))
-				diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
-				delete(b.provisions, leaseUUID)
-				b.provisionsMu.Unlock()
-
-				// Persist diagnostics before losing the provision so operators
-				// can see the final error via the diagnostics API.
-				b.persistDiagnostics(diagSnap, nil)
-
-				// Perform the same cleanup as the normal success path.
-				if b.releaseStore != nil {
-					if err := b.releaseStore.Delete(leaseUUID); err != nil {
-						logger.Warn("failed to delete release history", "error", err)
-					}
-				}
-				if b.cfg.IsNetworkIsolation() {
-					if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
-						logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
-					}
-				}
-				deprovisionsTotal.Inc()
-
-				logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
-					"attempts", attempts,
-					"errors", errors.Join(volumeErrs...),
-				)
-
-				// Volume leak: operator must clean up manually.
-				b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted")
-				return nil
-			}
-
-			// Under the limit — keep provision visible for retry.
-			p.Status = backend.ProvisionStatusFailed
-			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
-			diagSnap = leasesm.DiagnosticSnapshot(&p.ProvisionState)
+			entryExists = true
 		}
 		b.provisionsMu.Unlock()
+		if !entryExists {
+			// Entry already gone (idempotent re-entry) — nothing to update.
+			return fmt.Errorf("volume cleanup failed: %w", errors.Join(volumeErrs...))
+		}
+
+		var diagSnap shared.DiagnosticEntry
+		if attempts >= maxVolumeCleanupAttempts {
+			// Too many failed attempts — give up and remove the provision.
+			// The leaked volumes require manual cleanup by the operator.
+			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+				p.ContainerIDs = nil // containers are gone
+				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
+					attempts, errors.Join(volumeErrs...))
+				diagSnap = leasesm.DiagnosticSnapshot(p)
+			})
+			b.provisionStore.Delete(leaseUUID)
+
+			// Persist diagnostics before losing the provision so operators
+			// can see the final error via the diagnostics API.
+			b.persistDiagnostics(diagSnap, nil)
+
+			// Perform the same cleanup as the normal success path.
+			if b.releaseStore != nil {
+				if err := b.releaseStore.Delete(leaseUUID); err != nil {
+					logger.Warn("failed to delete release history", "error", err)
+				}
+			}
+			if b.cfg.IsNetworkIsolation() {
+				if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
+					logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
+				}
+			}
+			deprovisionsTotal.Inc()
+
+			logger.Error("MANUAL CLEANUP REQUIRED: volume cleanup failed after max attempts, giving up",
+				"attempts", attempts,
+				"errors", errors.Join(volumeErrs...),
+			)
+
+			// Volume leak: operator must clean up manually.
+			b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted")
+			return nil
+		}
+
+		// Under the limit — keep provision visible for retry.
+		b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+			p.ContainerIDs = nil // containers are gone
+			p.Status = backend.ProvisionStatusFailed
+			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
+			diagSnap = leasesm.DiagnosticSnapshot(p)
+		})
 		// Persist diagnostics outside the lock so failure state survives
 		// a process restart (no containers remain to recover from).
 		b.persistDiagnostics(diagSnap, nil)
