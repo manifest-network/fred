@@ -102,14 +102,21 @@ sku_profiles:
   # zfs datasets). Image VOLUME paths (e.g., /data for redis) are automatically
   # discovered and bind-mounted. Data persists across container restarts and
   # re-provisions but is destroyed on deprovision.
-  docker-redis:
-    cpu_cores: 0.5
-    memory_mb: 512
-    disk_mb: 2048
-  docker-postgres:
-    cpu_cores: 1.0
-    memory_mb: 1024
-    disk_mb: 4096
+  #
+  # IMPORTANT: sku_profiles is authoritative (ENG-238) — every profile MUST have
+  # a matching sku_mapping UUID entry, or config validation fails with
+  # "sku_profiles[<name>] has no sku_mapping entry and is unreachable from
+  # on-chain SKUs". To enable the profiles below, uncomment them AND add a
+  # corresponding on-chain SKU UUID -> profile-name line in sku_mapping above
+  # (use the real UUIDs from `manifestd query sku skus-by-provider <uuid>`).
+  # docker-redis:
+  #   cpu_cores: 0.5
+  #   memory_mb: 512
+  #   disk_mb: 2048
+  # docker-postgres:
+  #   cpu_cores: 1.0
+  #   memory_mb: 1024
+  #   disk_mb: 4096
 
 # =============================================================================
 # TENANT QUOTAS (optional)
@@ -275,6 +282,21 @@ startup_verify_duration: 5s
 # containers and sends failure callbacks. Default: 5m.
 reconcile_interval: 5m
 
+# --- Advanced: recover-time migration knobs ----------------------------------
+# On restart, fred may migrate legacy single-container leases to the current
+# stack form. These tune that one-time, per-lease migration window. The
+# defaults are sane; only set these if you know you need to.
+#
+# Cap on how long the migration waits for the new stack-form container to
+# become healthy (or running, if it declares no health check) before declaring
+# the migration failed for that lease. Default: 90s.
+# migration_ready_timeout: 90s
+#
+# How long the renamed "-prev" legacy container lingers after a successful
+# migration before forced removal (preserves rollback if you interrupt fred to
+# inspect during the window). Default: 1m.
+# migration_grace_period: 1m
+
 # =============================================================================
 # INGRESS (optional)
 # =============================================================================
@@ -301,3 +323,9 @@ reconcile_interval: 5m
 #   custom_domain_dns_resolvers: ["1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"]
 #   custom_domain_dns_quorum: 0              # resolvers that must agree; 0 = majority
 #   custom_domain_dns_check_disabled: false  # true = emit -custom router immediately (no gate)
+#   # Traefik certresolver name used for per-tenant custom domains.
+#   # Default: "http01".
+#   custom_domain_cert_resolver: "http01"
+#   # Traefik middleware references applied to the custom-domain router.
+#   # Default: ["security-headers@file"].
+#   custom_domain_middlewares: ["security-headers@file"]

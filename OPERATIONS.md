@@ -188,7 +188,7 @@ For zero-downtime upgrades, run two providerd instances against different sets o
 Per the benchmarks in [PERFORMANCE.md](PERFORMANCE.md), Fred itself sustains 56,000+ events/sec, far above realistic chain event rates. The bottleneck is always the backend (Docker pull, container start, health check) and the chain (block time).
 
 **Practical sizing:**
-- Chain ack throughput is the typical limit. With `sub_signer_count = N`, you get up to `N × 50` acks per block (5s blocks ≈ 600 leases/min).
+- Chain ack throughput is the typical limit. With `sub_signer_count = N`, you get up to `N × 50` acks per block (~5s blocks, chain-dependent ≈ 600 leases/min).
 - Per docker-backend host, image pull and container start dominate provision latency (10s–60s for typical images).
 - Budget memory: ~50MB baseline + ~1KB per active lease (in-memory tracker entries). bbolt stores grow with payload sizes and history retention.
 

@@ -200,7 +200,7 @@ Authoritative on-chain field. The chain emits events when this changes; Fred rea
 
 ### Provision Status
 
-Fred-internal runtime status of the provisioned resource. Surfaced via `GET /v1/leases/{uuid}/provision`, the docker-backend's `GET /provisions/{uuid}`, and the lease state machine in `internal/backend/docker/lease_sm.go`.
+Fred-internal runtime status of the provisioned resource. Surfaced via `GET /v1/leases/{uuid}/provision`, the docker-backend's `GET /provisions/{uuid}`, and the lease state machine in `internal/backend/shared/leasesm/lease_sm.go`.
 
 | Status | Description | Terminal? |
 |---|---|---|
@@ -389,32 +389,39 @@ This ensures that expected business conditions don't trip the circuit breaker an
 
 ### Lease Actor Model (Docker backend)
 
-The Docker backend replaces lock-heavy mutation of shared provision state with a **single-writer actor per lease**. Each active lease owns a dedicated goroutine — a `leaseActor` — that serializes all state-mutating operations for that lease. This is the central concurrency primitive of the Docker backend.
+The Docker backend replaces lock-heavy mutation of shared provision state with a **single-writer actor per lease**. Each active lease owns a dedicated goroutine — a `leasesm.LeaseActor` — that serializes all state-mutating operations for that lease. This is the central concurrency primitive of the Docker backend. The SM/actor machinery lives in the shared, substrate-agnostic package `internal/backend/shared/leasesm` (see [SM is shared across backends](#k3s-backend-experimental)).
 
 **Structure:**
 
+The actor holds **no substrate/backend pointer** — all reach-back into substrate state goes through closures supplied in `cfg` (`lease_actor.go:261`):
+
 ```go
-type leaseActor struct {
-    leaseUUID string
-    sm        *leaseSM                 // stateless.StateMachine wrapper
-    inbox     chan leaseMessage        // buffered — caller enqueues, actor dequeues
+type LeaseActor struct {
+    leaseUUID        string
+    cfg              LeaseActorConfig  // substrate-agnostic closures (incl. ProvisionStore)
+    inbox            chan LeaseMessage // buffered — caller enqueues, actor dequeues
+    sm               *leaseSM          // stateless.StateMachine wrapper
+    pendingDeathInfo *InstanceState
+    diagCancel       context.CancelFunc // canceled on exit from Failing
+    workCancel       context.CancelFunc // canceled on exit from Provisioning/Restarting/Updating
+    replaceWasActive bool
     ...
 }
 
-type leaseMessage interface {
+type LeaseMessage interface {
     isLeaseMessage()
     doneChan() chan struct{}          // closed after message is processed
     onPanic(err error)                 // unblocks caller if a handler panics
 }
 ```
 
-Messages are value types. The full set: `containerDiedMsg`, `deprovisionMsg`, `diagGatheredMsg`, `provisionRequestedMsg`, `provisionCompletedMsg`, `provisionErroredMsg`, `restartRequestedMsg`, `updateRequestedMsg`, `replaceCompletedMsg`, `replaceRecoveredMsg`, `replaceFailedMsg`. Each implements `leaseMessage`.
+Messages are value types. Caller-facing messages are exported: `ContainerDiedMsg`, `DeprovisionMsg`, `ProvisionRequestedMsg`, `RestartRequestedMsg`, `UpdateRequestedMsg` (so substrate packages can construct and route them). The internal terminal/handoff messages remain unexported: `diagGatheredMsg`, `provisionCompletedMsg`, `provisionErroredMsg`, `replaceCompletedMsg`, `replaceRecoveredMsg`, `replaceFailedMsg`. Each implements `LeaseMessage`.
 
-Synchronous callers signal back through one of two channels:
-- **`reply chan error`** (deprovisionMsg only) — receives the operation outcome.
-- **`ack chan error`** (provisionRequested / restartRequested / updateRequested) — one-shot accept/reject. The actor sends `Fire`'s result so the caller knows whether the SM accepted the transition before returning; the actual work then runs asynchronously and reports back via the corresponding completed/errored/replace-outcome message.
+Synchronous callers signal back through one of two exported channels:
+- **`Reply chan error`** (`DeprovisionMsg` only) — receives the operation outcome.
+- **`Ack chan error`** (`ProvisionRequestedMsg` / `RestartRequestedMsg` / `UpdateRequestedMsg`) — one-shot accept/reject. The actor sends `Fire`'s result so the caller knows whether the SM accepted the transition before returning; the actual work then runs asynchronously and reports back via the corresponding completed/errored/replace-outcome message.
 
-Fire-and-forget messages (containerDied, diagGathered, the three terminal "completed/errored/replace-outcome" messages) use neither channel.
+Fire-and-forget messages (`ContainerDiedMsg`, `diagGatheredMsg`, the three terminal "completed/errored/replace-outcome" messages) use neither channel.
 
 **State machine:**
 
@@ -455,9 +462,15 @@ All states are configured up front with explicit `Permit`/`Ignore`/`OnEntry`/`On
 - **Blast-radius-contained panics** — each message is wrapped in `recover()`. The actor survives, other leases are unaffected, and the panicking caller is unblocked via `onPanic`.
 - **Observable transitions** — every SM transition is counted in `lease_sm_transitions_total{source,destination,trigger}`.
 
+**The `LeaseProvisionStore` seam (single-writer substrate):**
+
+The live provision records are owned by the Docker backend, not the actor: `Backend.provisions` is a `map[string]*provision` guarded by `provisionsMu` (`backend.go:72`). The actor never touches that map directly. Instead it mutates provision state **only** through `leasesm.LeaseProvisionStore` — a `backendProvisionStore` adapter (`leasesm_adapters.go:90-119`) wired as `b.provisionStore` (`backend.go:149`, `508`) and reached via the actor's `cfg`. Every SM entry/exit action reads and writes through `cfg.ProvisionStore.Get(...)` and `cfg.ProvisionStore.UpdateFn(...)` (`lease_sm.go:303`, `362`, `425`, `500`); the closure-style `UpdateFn` runs a compound multi-field update inside one `provisionsMu.Lock`, so atomicity is preserved without one method per transition.
+
+This mutex-guarded shared map plus the per-lease serialization goroutine is a **deliberate idiomatic Go hybrid** — the single-writer substrate the actor model is built on. It is **not tech debt and not an unfinished migration**: the map stays shared because recovery and enumeration are inherently cross-lease, while the per-lease ordering guarantee comes from the inbox, and the store adapter takes the same mutex as the direct accessors (`recover.go`, `deprovision.go`, startup mutators) so cross-path atomicity holds.
+
 **Registry & lifecycle:**
 
-- `Backend.actors` is a `map[leaseUUID]*leaseActor`; `actorForLocked` resolves-or-creates under a short mutex.
+- `Backend.actors` is a `map[string]*leasesm.LeaseActor`; `actorForLocked` resolves-or-creates under a short mutex.
 - An actor self-removes from the registry after `Deprovisioning` completes (via a deferred `removeFromRegistry`).
 - `errActorTerminated` is returned when a new message arrives at an actor whose `Deprovisioning` has just completed but whose registry cleanup hasn't yet fired — the caller rolls back and retries, getting a fresh actor.
 
@@ -470,6 +483,12 @@ The inbox is buffered. Three distinct delivery paths cover the cases that actual
 - **`sendTerminal`** — used by in-flight worker goroutines to deliver terminal SM events whose physical work has already happened on the host (containers swapped, removed, etc.). Bounded by `terminalSendTimeout` (10s) and refuses on `hasExited`, `isExiting`, or send timeout. Refusals are counted in `lease_terminal_event_dropped_total`; recovery falls to the next reconcile cycle.
 
 A bare `send()` method exists for tests only — production code never holds an actor pointer directly.
+
+### K3s backend (experimental)
+
+`internal/backend/k3s` is an **experimental, non-functional scaffold (ENG-133)**. It boots, serves the full backend contract over HTTP, and wires up config/metrics/health, but its provisioner is a stub: every accepted provision flips to `failed` and posts a `status=failed, error="not implemented"` callback (`internal/backend/k3s/provision_stub.go:15`). Real Pod/Deployment provisioning lands in ENG-134+.
+
+The SM/actor machinery (`internal/backend/shared/leasesm`) is **shared across backends** and substrate-agnostic — the actor holds no backend pointer and reaches all substrate state through `cfg` closures (`LeaseProvisionStore`, `InstanceInspector`, `DiagnosticsGatherer`), so the same single-writer model applies to any backend that supplies those seams.
 
 ## Data Flow
 

@@ -80,7 +80,7 @@ Go backends in this repository can import `internal/hmacauth` and call `hmacauth
 
 ### Backend Authentication (HMAC-SHA256)
 
-Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all operational endpoints: `POST /provision`, `POST /deprovision`, `POST /restart`, `POST /update`, `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /releases/{lease_uuid}`. Health and metrics endpoints are unauthenticated.
+Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all operational endpoints: `POST /provision`, `POST /deprovision`, `POST /restart`, `POST /update`, `POST /reconcile_custom_domain`, `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated.
 
 **Implementation:** `cmd/docker-backend/main.go` (auth middleware), `internal/hmacauth/`
 
@@ -211,6 +211,32 @@ Optional HTTPS for the tenant-facing API. Configured via `tls_cert_file` and `tl
 
 Optional TLS for the gRPC connection to the chain. Supports custom CA file. `grpc_tls_skip_verify` is available for testing but blocked in production mode.
 
+### TLS (providerd → backend, ENG-103)
+
+Optional TLS, including mutual TLS, on the providerd → backend HTTP transport. TLS is opt-in: when no TLS fields are configured the hop serves plaintext HTTP (the default). When enabled, both sides pin TLS 1.3 as the minimum version (`internal/tlsconfig/tlsconfig.go:37,61`). Certificates are loaded once at startup; rotation requires a restart (tracked in ENG-294).
+
+**Server side (docker-backend YAML, `internal/backend/docker/config.go:44-60`):**
+
+| Field | Effect |
+|-------|--------|
+| `tls_cert_file`, `tls_key_file` | Enable HTTPS on the listener (both required) |
+| `tls_client_ca_file` | Require and verify a client certificate signed by this CA (mutual TLS); requires the cert/key pair above |
+| `tls_client_allowed_names` | Pin the client's identity (see below); requires `tls_client_ca_file` |
+
+Wired via `tlsconfig.ServerConfig` (`cmd/docker-backend/main.go:108-115`).
+
+**Client side (providerd `backends[]`, `internal/config/config.go:138-141`):**
+
+| Field | Effect |
+|-------|--------|
+| `tls_ca_file` | Private CA that signed the backend's server cert (otherwise system roots) |
+| `tls_client_cert_file`, `tls_client_key_file` | Client cert/key presented for mutual TLS (both or neither) |
+| `tls_skip_verify` | Disable server cert verification (dev only; blocked in production mode) |
+
+Wired via `tlsconfig.ClientConfig` (`cmd/providerd/main.go:249-255`).
+
+**Client-identity pinning.** `tls.Config.RequireAndVerifyClientCert` only proves the client's certificate chains to the configured CA — it does not check *who* the client is. Without `tls_client_allowed_names`, any certificate signed by the configured client CA is accepted. When `tls_client_allowed_names` is set, the verified client leaf's CommonName or one of its DNS SANs must appear in the list. The check is implemented as a `tls.Config.VerifyConnection` callback, **not** `VerifyPeerCertificate` — a `VerifyPeerCertificate` callback is skipped on resumed TLS sessions, so using it would let a previously-authenticated client resume a session and bypass the name pin. `VerifyConnection` runs on every handshake, including resumptions, closing that bypass (`internal/tlsconfig/tlsconfig.go:24-27,47-49,84-113`).
+
 ### Security Headers
 
 All responses include:
@@ -273,6 +299,7 @@ When `production_mode: true`, Fred enforces security requirements at startup:
 |-------|-----------|
 | `token_tracker_db_path` required | Replay protection must be enabled |
 | `grpc_tls_skip_verify` blocked (when TLS enabled) | Prevent MITM on chain connection |
+| `backends[].tls_skip_verify` blocked | Prevent MITM on the providerd → backend connection |
 | SSRF checks on all URLs | Block loopback, link-local, unspecified addresses |
 
 The daemon refuses to start if any check fails.

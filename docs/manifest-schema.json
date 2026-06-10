@@ -109,6 +109,7 @@
         "depends_on": {
           "type": "object",
           "description": "Startup dependencies on other services. Only allowed inside a StackManifest; rejected for single-service manifests when non-empty.",
+          "$comment": "The schema validates only the condition enum. Referenced-service existence, dependency cycles, and the service_healthy → active-health-check rule are enforced server-side at runtime.",
           "additionalProperties": {
             "$ref": "#/$defs/DependsOnCondition"
           }

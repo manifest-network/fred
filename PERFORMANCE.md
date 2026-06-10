@@ -113,7 +113,7 @@ Watermill claims "hundreds of thousands of messages per second" for in-memory Go
 
 In production, the limiting factors will be:
 
-1. **Chain block times** (~6 seconds on Cosmos) - limits event arrival rate
+1. **Chain block times** (~5s, chain-dependent) - limits event arrival rate
 2. **Backend provisioning time** (seconds to minutes) - real work takes time
 3. **Network latency** - round-trip to backends and chain
 

@@ -77,11 +77,29 @@ Your backend receives the full SKU and decides what to do with it. This is entir
 |-----|----------------------|
 | `docker-nginx` | Create nginx:latest container |
 | `docker-redis` | Create redis:7-alpine container |
-| `k8s-small` | Create deployment with 1 CPU, 512MB |
-| `k8s-large` | Create deployment with 4 CPU, 4GB |
+| `k8s-small` | Create deployment with 1 CPU, 512MB (illustrative — see k3s note below) |
+| `k8s-large` | Create deployment with 4 CPU, 4GB (illustrative — see k3s note below) |
 | `gpu-a100` | Allocate A100 GPU node |
 
 **Note:** The `mock-backend` included with Fred ignores the SKU entirely - it provisions the same fake resource regardless of SKU. This is intentional for testing purposes.
+
+**Note on `k8s-*` / k3s:** The `k8s-small`/`k8s-large` rows above are illustrative only. The bundled `k3s-backend` is an **experimental, non-functional scaffold (ENG-133)**: it serves the full HTTP contract, but its provisioner returns `status=failed, error="not implemented"` and returns `ErrNotProvisioned` for info/logs/restart/update. It is **not for production use**; real Kubernetes provisioning lands in ENG-134+.
+
+## Inbound Authentication
+
+**Your backend MUST verify Fred's signature on every inbound contract request.** Fred signs every request it sends to a backend with the same `X-Fred-Signature` HMAC scheme used for callbacks (see Callback Protocol → HMAC Signature). A backend that does not verify inbound signatures accepts unauthenticated provision/deprovision/update commands from anyone who can reach it.
+
+Both reference backends (`internal/backend/docker`, `cmd/k3s-backend`) wrap **all** contract routes in HMAC verification middleware and respond `401 Unauthorized` to any request with a missing or invalid `X-Fred-Signature`.
+
+The verifier uses the **same canonical string** documented for callbacks, computed over the request's method, request-URI, and body:
+
+```
+<timestamp>\n<METHOD>\n<request-URI>\n<hex(sha256(body))>
+```
+
+Read the body, then verify before dispatching to the handler. Backends inside this repository can call `hmacauth.VerifyRequest(secret, r, body, sig, 5*time.Minute)`; external backends should re-derive the canonical string using the standalone sample in the Callback Protocol section (the computation is symmetric — sender and verifier hash identical bytes).
+
+**Unauthenticated endpoints:** only the operational endpoints `GET /health`, `GET /stats`, and `GET /metrics` are exempt. Every other (contract) endpoint below must be authenticated.
 
 ## HTTP API Specification
 
@@ -98,14 +116,20 @@ Start provisioning a resource asynchronously.
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [
-    {"sku": "docker-nginx", "quantity": 1},
-    {"sku": "docker-redis", "quantity": 2}
+    {"sku": "docker-nginx", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
+    {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
   ],
   "callback_url": "http://fred:8080/callbacks/provision",
   "payload": "base64-encoded-bytes",
   "payload_hash": "sha256-hex-string"
 }
 ```
+
+**Item fields:**
+- `sku` - The full SKU (your backend interprets it; see Two Levels of SKU Handling)
+- `quantity` - Number of instances to provision for this item
+- `service_name` (omitempty) - Service name in a stack lease. A legacy single-item request without `service_name` is auto-tagged `"app"` by Fred before it reaches your backend
+- `custom_domain` (omitempty) - Optional FQDN the tenant assigned to this item. When non-empty (and the service has a routable HTTP port), the backend should route `Host(<custom_domain>)` to this item's instances (see `POST /reconcile_custom_domain`)
 
 **Response:** `202 Accepted`
 ```json
@@ -134,6 +158,7 @@ Get connection details for a provisioned resource.
 ```json
 {
   "host": "192.168.1.100",
+  "protocol": "tcp",
   "ports": {
     "80/tcp": {
       "host_ip": "0.0.0.0",
@@ -144,17 +169,25 @@ Get connection details for a provisioned resource.
       "host_port": "32769"
     }
   },
-  "protocol": "tcp",
-  "container_id": "abc123def456",
-  "image": "nginx:latest",
-  "status": "running"
+  "instances": [
+    {
+      "instance_index": 0,
+      "container_id": "abc123def456",
+      "image": "nginx:latest",
+      "status": "running",
+      "ports": {
+        "80/tcp": {"host_ip": "0.0.0.0", "host_port": "32768"}
+      }
+    }
+  ]
 }
 ```
 
-The response format is flexible - return whatever fields are relevant to your resource type. Fred passes this directly to tenants. The `ports` field maps container ports (e.g., `80/tcp`) to host bindings.
+The response format is flexible - return whatever fields are relevant to your resource type. Fred passes this directly to tenants. The `ports` field maps container ports (e.g., `80/tcp`) to host bindings. Per-instance details (`container_id`, `image`, `status`, `fqdn`, `ports`) are nested under `instances[]`, not at the top level.
 
 **Known fields** that Fred extracts into the structured `ConnectionResponse`:
-- `host`, `fqdn`, `ports`, `instances`, `services`, `protocol`, `metadata`
+- Top level: `host`, `fqdn`, `protocol`, `ports`, `instances`, `services`, `metadata`
+- Per `instances[]` entry: `instance_index`, `container_id`, `image`, `status`, `fqdn`, `ports`
 
 When ingress is enabled, instances may include an `fqdn` field. If no top-level `fqdn` is present in the response, Fred propagates the first instance's `fqdn` to `connection.fqdn` automatically. The same propagation applies per-service in stack leases.
 
@@ -173,6 +206,11 @@ Release resources for a lease. **Must be idempotent** - calling multiple times s
 ```
 
 **Response:** `200 OK`
+```json
+{
+  "status": "ok"
+}
+```
 
 **Behavior:**
 - Stop/delete the resource
@@ -191,11 +229,28 @@ List all currently provisioned resources. Used by Fred for reconciliation.
       "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
       "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
       "status": "ready",
-      "created_at": "2024-01-15T10:30:00Z"
+      "created_at": "2024-01-15T10:30:00Z",
+      "fail_count": 0,
+      "last_error": "",
+      "image": "nginx:latest",
+      "sku": "docker-nginx",
+      "quantity": 1,
+      "items": [
+        {"sku": "docker-nginx", "quantity": 1, "service_name": "web"}
+      ],
+      "service_images": {"web": "nginx:latest"}
     }
   ]
 }
 ```
+
+**Fields:**
+- `fail_count` - Number of provision failures for this lease
+- `last_error` (omitempty) - Last diagnostic error message
+- `image` / `sku` (omitempty) - Image and SKU for non-stack (single-service) leases
+- `quantity` - Total expected container count across all items
+- `items` (omitempty) - Per-service items for stack leases
+- `service_images` (omitempty) - Map of service name → image for stack leases
 
 **Status Values:**
 - `provisioning` - Resource is being created
@@ -319,6 +374,32 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for update (e.g., currently restarting or provisioning)
 
+### POST /reconcile_custom_domain
+
+Reconcile the custom-domain routing for a lease's items. Fred calls this on **every active lease on every reconcile tick**, so it must be cheap and idempotent: when nothing has changed, do no work and return success. The request carries the current desired item set; the backend ensures each item's `custom_domain` routing (e.g. a secondary Traefik router for `Host(<custom_domain>)`) matches.
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "items": [
+    {"sku": "docker-nginx", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
+    {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
+  ]
+}
+```
+
+**Response:** `204 No Content`
+
+**Behavior:**
+- Compare each item's desired `custom_domain` to the current routing and apply any difference
+- Make no changes (and still return `204`) when the desired state already matches — this is the common case every tick
+- A backend that does not support custom domains (or has ingress disabled) should return `204` as a no-op, **not** `404`. Returning `404` on every tick pollutes Fred's reconciler error metrics and logs
+
+**Error Responses:**
+- `404 Not Found` - Lease not provisioned
+- `409 Conflict` - Invalid state for reconcile (e.g., currently restarting, updating, or provisioning)
+
 ### GET /releases/{lease_uuid}
 
 Get the release (deployment) history for a lease. Each provision, update, or restart creates a release entry. Restarts reuse the existing manifest and image but still record a new release entry for operational tracking.
@@ -355,9 +436,14 @@ Get the release (deployment) history for a lease. Each provision, update, or res
 
 ### GET /health
 
-Simple health check endpoint.
+Simple health check endpoint. This endpoint is **not** authenticated (see Inbound Authentication below).
 
 **Response:** `200 OK`
+```json
+{
+  "status": "healthy"
+}
+```
 
 Return 200 if your backend can accept requests. Fred uses this for health monitoring.
 
@@ -405,7 +491,8 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "status": "success",
-  "error": ""
+  "error": "",
+  "backend": "my-backend"
 }
 ```
 
@@ -414,6 +501,7 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 **Fields:**
 - `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Use `"deprovisioned"` when the backend has autonomously torn down a lease (e.g. after a failed provision rollback) so Fred records the lease as deprovisioned without firing failure-callback side effects.
 - `error`: Error message if status is `"failed"`, empty otherwise
+- `backend` (omitempty): The backend's configured name. Lets Fred label metrics per-backend without a placement lookup. Empty from pre-upgrade senders.
 
 ### HMAC Signature with Replay Protection
 
@@ -478,7 +566,7 @@ The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration. Backend
 
 ### In-Memory Pattern (Recommended for Starting)
 
-Follow the pattern from `cmd/mock-backend/main.go` (the HTTP reference implementation):
+Follow the in-memory state pattern from `cmd/mock-backend/main.go` (a minimal, callback-only example — see Reference Implementation):
 
 ```go
 type MyBackend struct {
@@ -562,15 +650,21 @@ func main() {
     }
 
     mux := http.NewServeMux()
-    mux.HandleFunc("POST /provision", b.handleProvision)
-    mux.HandleFunc("GET /info/{lease_uuid}", b.handleGetInfo)
-    mux.HandleFunc("GET /provisions/{lease_uuid}", b.handleGetProvision)
-    mux.HandleFunc("GET /logs/{lease_uuid}", b.handleGetLogs)
-    mux.HandleFunc("POST /deprovision", b.handleDeprovision)
-    mux.HandleFunc("GET /provisions", b.handleListProvisions)
-    mux.HandleFunc("POST /restart", b.handleRestart)
-    mux.HandleFunc("POST /update", b.handleUpdate)
-    mux.HandleFunc("GET /releases/{lease_uuid}", b.handleGetReleases)
+
+    // Contract routes — all wrapped in inbound HMAC verification.
+    auth := hmacAuthMiddleware(callbackSecret) // 401s missing/invalid X-Fred-Signature
+    mux.Handle("POST /provision", auth(http.HandlerFunc(b.handleProvision)))
+    mux.Handle("POST /deprovision", auth(http.HandlerFunc(b.handleDeprovision)))
+    mux.Handle("GET /info/{lease_uuid}", auth(http.HandlerFunc(b.handleGetInfo)))
+    mux.Handle("GET /logs/{lease_uuid}", auth(http.HandlerFunc(b.handleGetLogs)))
+    mux.Handle("GET /provisions/{lease_uuid}", auth(http.HandlerFunc(b.handleGetProvision)))
+    mux.Handle("GET /provisions", auth(http.HandlerFunc(b.handleListProvisions)))
+    mux.Handle("POST /restart", auth(http.HandlerFunc(b.handleRestart)))
+    mux.Handle("POST /update", auth(http.HandlerFunc(b.handleUpdate)))
+    mux.Handle("POST /reconcile_custom_domain", auth(http.HandlerFunc(b.handleReconcileCustomDomain)))
+    mux.Handle("GET /releases/{lease_uuid}", auth(http.HandlerFunc(b.handleGetReleases)))
+
+    // Operational routes — no auth (monitoring, health checks).
     mux.HandleFunc("GET /health", b.handleHealth)
 
     http.ListenAndServe(":9001", mux)
@@ -600,7 +694,9 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 ## Reference Implementation
 
-See `cmd/mock-backend/main.go` for a complete working example. Key sections:
+**For a full-contract reference, read the Docker backend at `internal/backend/docker` (with `cmd/docker-backend`).** It implements all 10 contract routes plus `/health`, verifies inbound HMAC signatures, supports TLS/mTLS, and exercises the complete lifecycle (provision, info, logs, restart, update, releases, custom-domain reconciliation, deprovision, reconciliation).
+
+`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 7 of the 10 contract routes (provision, info, deprovision, provisions, provisions/{uuid}, logs, health), **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
 
 | Function | Description |
 |----------|-------------|
@@ -613,23 +709,50 @@ See `cmd/mock-backend/main.go` for a complete working example. Key sections:
 
 ## Configuration
 
-Your backend should accept configuration via environment variables:
+The bundled backends are configured via a YAML file (the Docker backend reads `docker-backend.yaml`; see `internal/backend/docker/config.go`). A backend needs at minimum a listen address, an HMAC `callback_secret` that matches Fred's `callback_secret`, and a name/host for logging and connection info:
 
-```bash
-# Required
-MY_BACKEND_ADDR=":9001"                      # Listen address
-MY_BACKEND_CALLBACK_SECRET="32-char-min"     # HMAC secret (must match Fred's config)
-
-# Recommended
-MY_BACKEND_NAME="my-backend"                 # For logging/metrics
-MY_BACKEND_HOST_ADDRESS="192.168.1.100"      # For connection info
-
-# Optional
-MY_BACKEND_TLS_CERT="/path/to/cert.pem"      # Enable HTTPS
-MY_BACKEND_TLS_KEY="/path/to/key.pem"
+```yaml
+listen_addr: ":9001"             # Listen address
+callback_secret: "32-char-min"   # HMAC secret (must match Fred's config)
+name: "my-backend"               # For logging/metrics
+host_address: "192.168.1.100"    # For connection info
 ```
 
+The Docker backend takes a `--config` flag (path to the YAML file, default `docker-backend.yaml`) and a `--version` flag that prints the build-injected version and exits 0 without loading config or connecting to Docker.
+
+### TLS / mTLS on the providerd → backend transport (ENG-103)
+
+TLS on the providerd → backend HTTP transport is **optional**; the transport defaults to **plaintext** when unconfigured. When enabled, TLS 1.3 is pinned. TLS is configured on both sides:
+
+**Server side** (the backend's YAML, e.g. `docker-backend.yaml`):
+
+```yaml
+tls_cert_file: "/path/to/server-cert.pem"   # enable server TLS (with tls_key_file)
+tls_key_file:  "/path/to/server-key.pem"
+tls_client_ca_file: "/path/to/client-ca.pem" # require + verify client certs => mTLS
+tls_client_allowed_names:                     # pin allowed client identities
+  - "providerd"
+```
+
+Setting `tls_cert_file` + `tls_key_file` turns on server TLS. Adding `tls_client_ca_file` turns on mutual TLS: the listener requires and verifies a client certificate signed by that CA. `tls_client_allowed_names` optionally pins the client's identity — the presented certificate's CommonName or a DNS SAN must be in this list. **Without it, any certificate signed by the client CA is accepted**, so set it whenever the client CA is not dedicated solely to providerd. The server config is built via `tlsconfig.ServerConfig`.
+
+**Client side** (providerd, per-backend under `backends[]` in Fred's `config.yaml`):
+
+```yaml
+backends:
+  - name: my-backend
+    url: "https://my-backend:9001"
+    tls_ca_file: "/path/to/server-ca.pem"          # CA that signed the backend's server cert
+    tls_client_cert_file: "/path/to/client-cert.pem" # client cert for mTLS (set with key)
+    tls_client_key_file: "/path/to/client-key.pem"   # client key for mTLS (set with cert)
+    tls_skip_verify: false                           # DEV ONLY; rejected in production_mode
+```
+
+The client config is built via `tlsconfig.ClientConfig`. Client-identity pinning is enforced with `tls.Config.VerifyConnection` (so it applies even on resumed TLS sessions), matching the client certificate's CommonName / DNS-SAN against `tls_client_allowed_names`.
+
 ## Testing Your Backend
+
+**Note:** `/health` is unauthenticated, so the health check below works as-is. The contract endpoints (`/provision`, `/provisions`, `/info`, `/deprovision`, ...) require a valid `X-Fred-Signature` header (see Inbound Authentication) and will return `401` to the plain `curl` commands below. To exercise them against an auth-enforcing backend, sign the request with the canonical string (or temporarily run the backend with auth disabled in a dev-only build).
 
 ### 1. Health Check
 ```bash
@@ -670,24 +793,25 @@ curl -X POST http://localhost:9001/deprovision \
 
 Before deploying your backend:
 
-- [ ] All 7 required HTTP endpoints implemented (`/provision`, `/info/{uuid}`, `/provisions/{uuid}`, `/logs/{uuid}`, `/deprovision`, `/provisions`, `/health`)
+- [ ] All 10 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{uuid}`, `/logs/{uuid}`, `/provisions/{uuid}`, `/provisions`, `/restart`, `/update`, `/reconcile_custom_domain`, `/releases/{uuid}`) plus `/health`
+- [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
 - [ ] Callbacks signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent
 - [ ] ListProvisions returns all managed resources
+- [ ] `/reconcile_custom_domain` is idempotent and returns 204 on no-change (never 404 just because custom domains are unsupported — that pollutes Fred's reconciler every tick)
 - [ ] State protected with mutex for concurrent access
 - [ ] Callback URLs stored per-lease (not globally)
 - [ ] Health endpoint returns 200 when operational
 - [ ] Graceful shutdown (finish in-flight provisions)
-- [ ] (Optional) `/restart` endpoint for container restart without manifest change
-- [ ] (Optional) `/update` endpoint for deploying new manifests
-- [ ] (Optional) `/releases/{uuid}` endpoint for release history tracking
 - [ ] (Optional) `/stats` endpoint for resource monitoring
+
+**Note:** Fred unconditionally calls `/restart`, `/update`, `/reconcile_custom_domain`, and `/releases/{uuid}` during normal operation — they are part of the contract, not optional add-ons. A backend that has no work for one of these should still serve it gracefully (e.g. the k3s scaffold returns `nil` from `ReconcileCustomDomain` rather than 404), not return 404.
 
 ## Further reading
 
 - [SECURITY.md](SECURITY.md) — full security model including HMAC details and replay protection
 - [OPERATIONS.md](OPERATIONS.md) — operator-side runbook (alert interpretation, callback debugging)
 - [docs/manifest-guide.md](docs/manifest-guide.md) — tenant manifest schema (if your backend interprets manifests)
-- [internal/backend/docker/README.md](internal/backend/docker/README.md) — the bundled Docker backend, useful as a worked example
+- [internal/backend/docker/README.md](internal/backend/docker/README.md) — the bundled Docker backend, the full-contract reference implementation
 - [CONTRIBUTING.md § Adding a backend operation](CONTRIBUTING.md#adding-a-backend-operation) — if you're contributing a backend operation upstream rather than building a separate backend

@@ -269,6 +269,8 @@ curl -X POST -H "Authorization: Bearer $(fresh_token)" \
 
 The body shape is different from `/data` — the manifest is base64-encoded inside a JSON wrapper. Volumes are preserved across updates. On failure the operation rolls back to the previous containers.
 
+`/update` re-runs the same service-name↔lease-item match as provision, so the manifest format must fit your lease shape — submitting a flat manifest for a named-item lease fails with `manifest service "app" has no matching lease item`. See [manifest-guide.md § Service Name ↔ Lease Item Matching](manifest-guide.md#service-name--lease-item-matching).
+
 Both endpoints enforce **replay protection** since they're mutating. Each retry needs a fresh token (hence `$(fresh_token)` rather than a stored `$TOKEN` variable).
 
 To see what's been deployed:
