@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -30,6 +31,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/tlsconfig"
 )
 
 var version = "dev"
@@ -100,6 +102,18 @@ func main() {
 	// Create server
 	server := NewServer(b, string(cfg.CallbackSecret), logger)
 
+	// Build the listener TLS config up front so a bad cert fails fast before we
+	// announce readiness. Config.Validate (run in docker.New) already enforces
+	// field pairing; ServerConfig loads and parses the actual files.
+	var tlsServerConfig *tls.Config
+	if cfg.TLSCertFile != "" {
+		tlsServerConfig, err = tlsconfig.ServerConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSClientCAFile, cfg.TLSClientAllowedNames)
+		if err != nil {
+			logger.Error("failed to build TLS config", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// Setup HTTP server
 	httpServer := &http.Server{
 		Addr:         cfg.ListenAddr,
@@ -107,14 +121,25 @@ func main() {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
+		TLSConfig:    tlsServerConfig, // nil => plaintext HTTP
 	}
 
 	// Start HTTP server
 	serverErr := make(chan error, 1)
 	go func() {
-		logger.Info("starting HTTP server", "addr", cfg.ListenAddr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
+		var serveErr error
+		if tlsServerConfig != nil {
+			logger.Info("starting HTTPS server", "addr", cfg.ListenAddr,
+				"mtls", cfg.TLSClientCAFile != "", "pinned_names", len(cfg.TLSClientAllowedNames))
+			// The cert/key live in tlsServerConfig.Certificates (loaded by
+			// tlsconfig.ServerConfig), so the file arguments are empty.
+			serveErr = httpServer.ListenAndServeTLS("", "")
+		} else {
+			logger.Info("starting HTTP server", "addr", cfg.ListenAddr)
+			serveErr = httpServer.ListenAndServe()
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			serverErr <- serveErr
 		}
 	}()
 

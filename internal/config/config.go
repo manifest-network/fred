@@ -132,6 +132,13 @@ type BackendConfig struct {
 	Timeout   time.Duration `mapstructure:"timeout"`
 	SKUs      []string      `mapstructure:"skus"`
 	IsDefault bool          `mapstructure:"default"`
+
+	// TLS for the providerd -> backend hop (ENG-103). Empty fields fall back to
+	// Go defaults (system root CAs, no client certificate).
+	TLSCAFile         string `mapstructure:"tls_ca_file"`          // private CA that signed the backend's server cert
+	TLSSkipVerify     bool   `mapstructure:"tls_skip_verify"`      // DEV ONLY; rejected when production_mode is true
+	TLSClientCertFile string `mapstructure:"tls_client_cert_file"` // client cert for mTLS (set with key)
+	TLSClientKeyFile  string `mapstructure:"tls_client_key_file"`  // client key for mTLS (set with cert)
 }
 
 // TLSEnabled returns true if TLS is configured.
@@ -429,6 +436,27 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("backends[%d].url: %w", i, err)
 		}
 
+		// mTLS client cert and key are set together.
+		if (b.TLSClientCertFile != "") != (b.TLSClientKeyFile != "") {
+			return fmt.Errorf("backends[%d]: both tls_client_cert_file and tls_client_key_file must be set together", i)
+		}
+
+		// TLS settings are meaningless on a plaintext backend; reject the
+		// dead config rather than silently ignoring it. (https:// without any
+		// TLS fields stays valid — it uses the system root CAs.)
+		if b.TLSCAFile != "" || b.TLSClientCertFile != "" || b.TLSClientKeyFile != "" || b.TLSSkipVerify {
+			if u, perr := url.Parse(b.URL); perr != nil || u.Scheme != "https" {
+				return fmt.Errorf("backends[%d]: TLS settings (tls_ca_file/tls_skip_verify/tls_client_cert_file/tls_client_key_file) require an https:// url", i)
+			}
+		}
+
+		// Security warning for per-backend TLS skip verify (mirrors the
+		// grpc_tls_skip_verify advisory above). production_mode rejects this
+		// outright; in non-production we still surface the risk.
+		if b.TLSSkipVerify {
+			slog.Warn("SECURITY WARNING: backend tls_skip_verify is enabled - TLS certificate verification is disabled, vulnerable to MITM attacks", "backend", b.Name)
+		}
+
 		if b.IsDefault {
 			if hasDefault {
 				return fmt.Errorf("multiple default backends specified")
@@ -473,6 +501,11 @@ func (c *Config) Validate() error {
 		// disabled the flag is meaningless and not a security concern.
 		if c.GRPCTLSEnabled && c.GRPCTLSSkipVerify {
 			return fmt.Errorf("production_mode: grpc_tls_skip_verify cannot be enabled with grpc_tls_enabled")
+		}
+		for i, b := range c.Backends {
+			if b.TLSSkipVerify {
+				return fmt.Errorf("production_mode: backends[%d].tls_skip_verify cannot be enabled", i)
+			}
 		}
 		if c.TokenTrackerDBPath == "" {
 			return fmt.Errorf("production_mode: token_tracker_db_path is required for replay protection")

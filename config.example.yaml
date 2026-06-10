@@ -295,6 +295,24 @@ backends:
   #   skus:
   #     - "c3d4e5f6-a7b8-9012-cdef-3456789012cd"
 
+  # ---------------------------------------------------------------------------
+  # TLS / mTLS to a backend (ENG-103)
+  # ---------------------------------------------------------------------------
+  # When a backend listens on HTTPS, use https:// in url and point tls_ca_file
+  # at the private CA that signed the backend's server certificate (omit it to
+  # use the system root CAs). For mutual TLS, also supply a client certificate
+  # and key that the backend's tls_client_ca_file trusts.
+  #
+  # - name: docker-1
+  #   url: "https://10.0.0.1:9001"
+  #   tls_ca_file: "/etc/fred/providerd/tls/backend-ca.pem"
+  #   # mTLS (optional): present a client certificate to the backend
+  #   tls_client_cert_file: "/etc/fred/providerd/tls/client.pem"
+  #   tls_client_key_file:  "/etc/fred/providerd/tls/client-key.pem"
+  #   # tls_skip_verify: true   # DEV ONLY — rejected when production_mode: true
+  #   skus:
+  #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+
 # =============================================================================
 # CALLBACK CONFIGURATION (required)
 # =============================================================================
