@@ -233,11 +233,17 @@ type ProvisionState struct {
 //     exceeding workExitWaitTimeout (75s; diagnosticsGatherTimeout 30s is the
 //     inner budget) degrades to a recoverState-reconciled zombie, never to state
 //     corruption.
-//  2. The deprovision volume-retry block (docker backend) stays a single direct
-//     provisionsMu span because it is coupled to the docker-private
-//     VolumeCleanupAttempts counter (not ProvisionState). It runs inline on the
-//     actor goroutine, so a hung volume.Destroy blocks the actor for that lease
-//     until ctx/timeout. Tracked for full seaming: ENG-285.
+//  2. The deprovision volume-retry block (docker backend) keeps ONLY the
+//     docker-private VolumeCleanupAttempts increment in a short direct
+//     provisionsMu span — that counter is not a ProvisionState field, so it
+//     cannot route through UpdateFn. The ProvisionState writes that follow
+//     (ContainerIDs/Status/LastError) DO route through UpdateFn, and the
+//     give-up branch deletes via Delete (ENG-285). The split across two
+//     critical sections is safe because recoverState's Deprovisioning
+//     preserve-case keeps the in-flight entry by pointer across its map swap,
+//     so the same *provision (and its counter) is seen by both sections. A
+//     hung volume.Destroy still blocks the actor for that lease until
+//     ctx/timeout.
 type LeaseProvisionStore interface {
 	// Get returns a SHALLOW value-copy snapshot of the provision state
 	// and ok=true when the lease exists. Callers receive the copy by
