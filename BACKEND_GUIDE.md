@@ -436,7 +436,7 @@ Get the release (deployment) history for a lease. Each provision, update, or res
 
 ### GET /health
 
-Simple health check endpoint. This endpoint is **not** authenticated (see Inbound Authentication below).
+Simple health check endpoint. This endpoint is **not** authenticated (see Inbound Authentication above).
 
 **Response:** `200 OK`
 ```json
@@ -696,7 +696,7 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 **For a full-contract reference, read the Docker backend at `internal/backend/docker` (with `cmd/docker-backend`).** It implements all 10 contract routes plus `/health`, verifies inbound HMAC signatures, supports TLS/mTLS, and exercises the complete lifecycle (provision, info, logs, restart, update, releases, custom-domain reconciliation, deprovision, reconciliation).
 
-`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 7 of the 10 contract routes (provision, info, deprovision, provisions, provisions/{uuid}, logs, health), **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
+`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 6 of the 10 contract routes (provision, info, deprovision, provisions, provisions/{uuid}, logs) plus `/health` — it lacks restart, update, reconcile_custom_domain, and releases — **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
 
 | Function | Description |
 |----------|-------------|
