@@ -806,7 +806,7 @@ Before deploying your backend:
 - [ ] Graceful shutdown (finish in-flight provisions)
 - [ ] (Optional) `/stats` endpoint for resource monitoring
 
-**Note:** Fred unconditionally calls `/restart`, `/update`, `/reconcile_custom_domain`, and `/releases/{lease_uuid}` during normal operation — they are part of the contract, not optional add-ons. A backend that has no work for one of these should still serve it gracefully (e.g. the k3s scaffold returns `nil` from `ReconcileCustomDomain` rather than 404), not return 404.
+**Note:** `/restart`, `/update`, `/reconcile_custom_domain`, and `/releases/{lease_uuid}` are all part of the contract, not optional add-ons. `/reconcile_custom_domain` is called on **every reconcile tick** for each active lease (`internal/provisioner/reconciler.go`), so it must be cheap and idempotent — a backend with no work should return success, not 404 (e.g. the k3s scaffold returns `nil` from `ReconcileCustomDomain`). `/restart`, `/update`, and `/releases/{lease_uuid}` are invoked **on demand** when a tenant calls the corresponding API operation (`RestartLease`/`UpdateLease`/`GetLeaseReleases` in `internal/api/handlers.go`); they must still be implemented, but returning 404 when a lease isn't provisioned is correct for these.
 
 ## Further reading
 
