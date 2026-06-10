@@ -23,7 +23,8 @@ builds:
 
 # NOTE: k3s-backend is intentionally NOT released as an artifact. It is an
 # experimental, non-functional scaffold (ENG-133) whose provisioner returns
-# "not implemented"; shipping it under :latest would imply it is usable. Build
+# "not implemented"; shipping it as a release binary/archive would imply it is
+# usable. Build
 # it from source (`go build ./cmd/k3s-backend`) until real provisioning lands
 # (ENG-134+), then add it back here.
 archives:

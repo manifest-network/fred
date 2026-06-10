@@ -722,7 +722,7 @@ The Docker backend takes a `--config` flag (path to the YAML file, default `dock
 
 ### TLS / mTLS on the providerd → backend transport (ENG-103)
 
-TLS on the providerd → backend HTTP transport is **optional**; the transport defaults to **plaintext** when unconfigured. When enabled, TLS 1.3 is pinned. TLS is configured on both sides:
+TLS on the providerd → backend HTTP transport is **optional**; the transport defaults to **plaintext** when unconfigured. When enabled, TLS 1.3 is pinned as the minimum version. TLS is configured on both sides:
 
 **Server side** (the backend's YAML, e.g. `docker-backend.yaml`):
 

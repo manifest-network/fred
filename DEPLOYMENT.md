@@ -267,7 +267,7 @@ Configure `trusted_proxies` in `config.yaml` to include the proxy's IP CIDR so p
 
 The HMAC signature on this hop always provides authentication and integrity, so on a trusted private network plain HTTP is acceptable. For confidentiality (and across untrusted networks), enable transport TLS — both directions are independently configurable.
 
-**Recommended: native TLS/mTLS (ENG-103).** The docker-backend can serve TLS directly, and providerd can verify it (and optionally present a client certificate for mutual TLS). TLS is plaintext-by-default — the transport stays HTTP until you configure it — and the negotiated version is pinned to TLS 1.3.
+**Recommended: native TLS/mTLS (ENG-103).** The docker-backend can serve TLS directly, and providerd can verify it (and optionally present a client certificate for mutual TLS). TLS is plaintext-by-default — the transport stays HTTP until you configure it — and when enabled, TLS 1.3 is pinned as the minimum version (`MinVersion`; no maximum is set).
 
 On the **docker-backend** (server), in `docker-backend.yaml`:
 
