@@ -128,7 +128,7 @@ Start provisioning a resource asynchronously.
 **Item fields:**
 - `sku` - The full SKU (your backend interprets it; see Two Levels of SKU Handling)
 - `quantity` - Number of instances to provision for this item
-- `service_name` (omitempty) - Service name in a stack lease. A legacy single-item request without `service_name` is auto-tagged `"app"` by Fred before it reaches your backend
+- `service_name` (omitempty) - Service name in a stack lease. **Fred forwards this verbatim from the chain**, so a legacy single-item lease arrives with an **empty** `service_name`. Your backend must treat an empty `service_name` as the synthetic default `"app"` itself — the in-repo backends do this at handler entry via `backend.NormalizeProvisionRequest` (which also rejects mixed-presence and multi-unnamed item sets). The same applies to items in `/update` and `/reconcile_custom_domain`.
 - `custom_domain` (omitempty) - Optional FQDN the tenant assigned to this item. When non-empty (and the service has a routable HTTP port), the backend should route `Host(<custom_domain>)` to this item's instances (see `POST /reconcile_custom_domain`)
 
 **Response:** `202 Accepted`
