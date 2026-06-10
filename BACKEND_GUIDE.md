@@ -264,7 +264,7 @@ List all currently provisioned resources. Used by Fred for reconciliation.
 
 ### GET /provisions/{lease_uuid}
 
-Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/leases/{uuid}/provision` to tenants. Falls back to persisted diagnostics (bbolt) when the provision is no longer in memory.
+Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/leases/{lease_uuid}/provision` to tenants. Falls back to persisted diagnostics (bbolt) when the provision is no longer in memory.
 
 **Response:** `200 OK`
 ```json
@@ -288,7 +288,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 
 ### GET /logs/{lease_uuid}
 
-Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{uuid}/logs` to tenants. Falls back to persisted logs when containers no longer exist.
+Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{lease_uuid}/logs` to tenants. Falls back to persisted logs when containers no longer exist.
 
 **Query Parameters:**
 - `tail` - Number of log lines per container (default: 100)
@@ -696,7 +696,7 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 **For a full-contract reference, read the Docker backend at `internal/backend/docker` (with `cmd/docker-backend`).** It implements all 10 contract routes plus `/health`, verifies inbound HMAC signatures, supports TLS/mTLS, and exercises the complete lifecycle (provision, info, logs, restart, update, releases, custom-domain reconciliation, deprovision, reconciliation).
 
-`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 6 of the 10 contract routes (provision, info, deprovision, provisions, provisions/{uuid}, logs) plus `/health` — it lacks restart, update, reconcile_custom_domain, and releases — **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
+`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 6 of the 10 contract routes (provision, info, deprovision, provisions, provisions/{lease_uuid}, logs) plus `/health` — it lacks restart, update, reconcile_custom_domain, and releases — **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
 
 | Function | Description |
 |----------|-------------|
@@ -793,7 +793,7 @@ curl -X POST http://localhost:9001/deprovision \
 
 Before deploying your backend:
 
-- [ ] All 10 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{uuid}`, `/logs/{uuid}`, `/provisions/{uuid}`, `/provisions`, `/restart`, `/update`, `/reconcile_custom_domain`, `/releases/{uuid}`) plus `/health`
+- [ ] All 10 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{lease_uuid}`, `/logs/{lease_uuid}`, `/provisions/{lease_uuid}`, `/provisions`, `/restart`, `/update`, `/reconcile_custom_domain`, `/releases/{lease_uuid}`) plus `/health`
 - [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
 - [ ] Callbacks signed with HMAC-SHA256 with timestamp
@@ -806,7 +806,7 @@ Before deploying your backend:
 - [ ] Graceful shutdown (finish in-flight provisions)
 - [ ] (Optional) `/stats` endpoint for resource monitoring
 
-**Note:** Fred unconditionally calls `/restart`, `/update`, `/reconcile_custom_domain`, and `/releases/{uuid}` during normal operation — they are part of the contract, not optional add-ons. A backend that has no work for one of these should still serve it gracefully (e.g. the k3s scaffold returns `nil` from `ReconcileCustomDomain` rather than 404), not return 404.
+**Note:** Fred unconditionally calls `/restart`, `/update`, `/reconcile_custom_domain`, and `/releases/{lease_uuid}` during normal operation — they are part of the contract, not optional add-ons. A backend that has no work for one of these should still serve it gracefully (e.g. the k3s scaffold returns `nil` from `ReconcileCustomDomain` rather than 404), not return 404.
 
 ## Further reading
 
