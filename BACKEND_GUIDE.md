@@ -709,7 +709,7 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 ## Configuration
 
-The bundled backends are configured via a YAML file (the Docker backend reads `docker-backend.yaml`; see `internal/backend/docker/config.go`). A backend needs at minimum a listen address, an HMAC `callback_secret` that matches Fred's `callback_secret`, and a name/host for logging and connection info:
+The production backends (docker-backend, k3s-backend) are configured via a YAML file (the Docker backend reads `docker-backend.yaml`; see `internal/backend/docker/config.go`); the mock backend is the exception — it is configured via `MOCK_BACKEND_*` environment variables, not YAML. A backend needs at minimum a listen address, an HMAC `callback_secret` that matches Fred's `callback_secret`, and a name/host for logging and connection info:
 
 ```yaml
 listen_addr: ":9001"             # Listen address
