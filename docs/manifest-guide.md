@@ -93,7 +93,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 }
 ```
 
-**Format auto-detection:** Fred inspects the payload for a top-level `"services"` key. If present, it is parsed as a stack manifest; otherwise as a single-service manifest.
+**Format auto-detection:** Fred inspects the payload for a top-level `"services"` key. If present, it is parsed as a stack manifest; otherwise as a single-service manifest. Either way the parse result is always a stack — a single-service (flat) manifest is auto-wrapped into a 1-service stack under the synthetic service name `app`.
 
 ## Field Reference
 

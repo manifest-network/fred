@@ -331,7 +331,7 @@ stateDiagram-v2
     Deprovisioning --> [*]
 ```
 
-The edges above are the complete set of allowed transitions; any event not listed against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative source is `lease_sm.go`.
+The edges above are the complete set of allowed transitions; any event not listed against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative source is `internal/backend/shared/leasesm/lease_sm.go`.
 
 ### Key behaviors
 

@@ -14,6 +14,7 @@ A production deployment has three independently runnable processes:
 |---|---|---|
 | `providerd` | Provider control host (1) | Subscribes to chain events, owns ADR-036 / HMAC auth, calls backends, batches lease acknowledgments |
 | `docker-backend` | Each Docker host (1..N) | Provisions containers, manages volumes, sends signed callbacks |
+| `k3s-backend` | Experimental — not for production | Kubernetes backend scaffold (ENG-133): boots and serves the backend contract but provisions nothing (every provision is reported as failed). Full K8s provisioning lands in ENG-134+. |
 | `manifestd` | Chain node (external) | Cosmos SDK chain that emits lease events |
 
 Common topology:
@@ -264,7 +265,41 @@ Configure `trusted_proxies` in `config.yaml` to include the proxy's IP CIDR so p
 
 ### 2. providerd → backend (HMAC-authenticated)
 
-If your backends are on private networks, plain HTTP between providerd and docker-backend is acceptable; the HMAC signature provides authentication and integrity. For backends across untrusted networks, run docker-backend behind TLS-terminating proxies and use `https://` in the `backends[].url`.
+The HMAC signature on this hop always provides authentication and integrity, so on a trusted private network plain HTTP is acceptable. For confidentiality (and across untrusted networks), enable transport TLS — both directions are independently configurable.
+
+**Recommended: native TLS/mTLS (ENG-103).** The docker-backend can serve TLS directly, and providerd can verify it (and optionally present a client certificate for mutual TLS). TLS is plaintext-by-default — the transport stays HTTP until you configure it — and when enabled, TLS 1.3 is pinned as the minimum version (`MinVersion`; no maximum is set).
+
+On the **docker-backend** (server), in `docker-backend.yaml`:
+
+```yaml
+# Server TLS (both must be set, or neither): serves HTTPS on listen_addr.
+tls_cert_file: "/etc/fred/backend.crt"
+tls_key_file:  "/etc/fred/backend.key"
+# Mutual TLS (optional): require and verify a client certificate signed by
+# this CA. Requires the server tls_cert_file/tls_key_file above.
+tls_client_ca_file: "/etc/fred/client-ca.crt"
+# Pin the client identity (optional): the client cert's CommonName or a DNS
+# SAN must appear here. Use whenever tls_client_ca_file is not dedicated
+# solely to providerd. Requires tls_client_ca_file.
+tls_client_allowed_names:
+  - "providerd.fred.example.com"
+```
+
+On **providerd** (client), per `backends[]` entry in `config.yaml`:
+
+```yaml
+backends:
+  - name: docker-1
+    url: "https://10.0.0.1:9001"     # https:// to use TLS
+    tls_ca_file: "/etc/fred/backend-ca.crt"        # CA that signed the backend's server cert
+    tls_client_cert_file: "/etc/fred/providerd.crt" # client cert for mTLS (set with key)
+    tls_client_key_file:  "/etc/fred/providerd.key" # client key for mTLS (set with cert)
+    # tls_skip_verify: true   # insecure; rejected when production_mode is true
+```
+
+Empty client TLS fields fall back to Go defaults (system root CAs, no client certificate). `tls_skip_verify` disables server-certificate verification and is for testing only — it is rejected when `production_mode: true`.
+
+**Alternative: TLS-terminating proxy.** Instead of native TLS, you can run docker-backend behind a TLS-terminating reverse proxy and use `https://` in `backends[].url`. This predates native TLS support and remains a valid option, e.g. where you already operate a proxy fleet.
 
 ### 3. providerd → chain (gRPC)
 
@@ -346,7 +381,7 @@ Schema migrations: bbolt schemas are versioned implicitly; Fred handles forward 
 
 ## Docker images
 
-The repo ships a multi-stage `Dockerfile` with two named targets:
+The repo ships a multi-stage `Dockerfile` with three named targets:
 
 ```bash
 # providerd
@@ -354,9 +389,14 @@ docker build --target providerd -t fred-providerd .
 
 # docker-backend
 docker build --target docker-backend -t fred-docker-backend .
+
+# k3s-backend (experimental scaffold — see below; not for production)
+docker build --target k3s-backend -t fred-k3s-backend .
 ```
 
-Both run as the `nonroot` user (UID 65532) on a `gcr.io/distroless/static-debian12` base.
+The `docker-backend` stage is intentionally last in the `Dockerfile`, so a target-less `docker build .` defaults to producing the `docker-backend` image. `k3s-backend` is an experimental, non-functional scaffold (ENG-133) — it boots and serves the backend contract but provisions nothing (every provision is reported as failed); it is not for production. Full Kubernetes provisioning lands in ENG-134+.
+
+All three run as the `nonroot` user (UID 65532) on a `gcr.io/distroless/static-debian12` base.
 
 **`docker-backend`** — needs the Docker socket and a writable `/data` volume (which holds `callbacks.db`, `diagnostics.db`, `releases.db`; the image declares `WORKDIR /data` and `VOLUME /data`). Use a named Docker volume so permissions are handled automatically; for a host bind mount, the directory must be owned by UID 65532. Use `--group-add` with the host Docker group ID so the nonroot user can talk to the socket:
 

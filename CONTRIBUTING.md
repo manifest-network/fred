@@ -8,7 +8,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 
 ## Prerequisites
 
-- **Go 1.25+** — Fred uses `sync.WaitGroup.Go()` and `testing.B.Loop()` which require 1.25+.
+- **Go 1.25.9** (per `go.mod`) — Fred uses `sync.WaitGroup.Go()` and `testing.B.Loop()` which require 1.25+.
 - **Docker 24+** with iptables enabled — required for `make test-integration` and the docker-backend.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **(Optional) `golangci-lint`** — `make lint` runs `go vet` unconditionally and adds golangci checks if it's on `PATH`.
@@ -37,6 +37,8 @@ bash scripts/dev-init.sh    # registers a provider + SKUs, generates configs, wr
 
 To exercise just the provisioner without Docker, run `make run-mock` in one shell and `make run` in another — the mock backend ignores SKUs and simulates provisioning.
 
+The experimental K3s backend can be built with `make build-k3s` and run with `make run-k3s` (override its config via `K3S_BACKEND_CONFIG=...`). It is a non-functional scaffold (see *Project layout*) — the provisioner is a stub.
+
 ---
 
 ## Project layout
@@ -45,6 +47,7 @@ To exercise just the provisioner without Docker, run `make run-mock` in one shel
 cmd/
 ├── providerd/          Main daemon (chain ↔ backends, tenant API)
 ├── docker-backend/     Production Docker backend
+├── k3s-backend/        Experimental K3s backend (scaffold, non-functional)
 ├── mock-backend/       Test/dev backend
 └── loadtest/           Load tester (exercises the API)
 
@@ -105,6 +108,7 @@ Integration tests require a running Docker daemon and use the `integration` buil
 make test-integration              # full Docker integration suite (~10 min)
 make test-integration-stack        # stack/compose-based provisions
 make test-integration-restart-update   # restart, update, release-history flows
+make test-integration-k3s          # k3s-backend integration tests (self-builds the binary)
 sudo make test-integration-volume  # filesystem quota tests (root + btrfs-progs)
 ```
 
@@ -157,12 +161,12 @@ make fmt    # runs `go fmt ./...`
 make lint
 ```
 
-This runs `go vet` plus `golangci-lint` if installed. The `.golangci.yml` enables: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `misspell`, `unconvert`, `unparam`, `nilerr`, `errorlint`. Test files and `cmd/` are excluded from some strict checks (see `.golangci.yml` for the rules).
+This runs `go vet` plus `golangci-lint` if installed. The `.golangci.yml` enables: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `misspell`, `unconvert`, `unparam`, `nilerr`, `errorlint`, `exhaustruct`. Test files and `cmd/` are excluded from some strict checks (see `.golangci.yml` for the rules). `exhaustruct` runs in directive-only mode — it checks only struct literals explicitly marked `//exhaustruct:enforce`.
 
-Install golangci-lint:
+Install golangci-lint. CI pins **v2.8.0** (`.github/workflows/ci.yml`), and the config uses the v2 schema, so match that version locally to avoid local-vs-CI drift:
 
 ```bash
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.8.0
 ```
 
 ### Conventions used in this codebase
@@ -248,7 +252,9 @@ PRs go through code review. Expect comments on test coverage, error handling, an
 
 ## Releases
 
-Releases are tagged on GitHub. CI builds binaries via `goreleaser` and pushes Docker images. Release notes are tracked in GitHub Releases (no in-tree CHANGELOG).
+Releases are tagged on GitHub. CI builds binaries via `goreleaser` and pushes Docker images.
+
+User-visible changes are tracked in the in-tree [CHANGELOG.md](CHANGELOG.md), which follows [Keep a Changelog](https://keepachangelog.com/). Add your change to the `## [Unreleased]` section under the appropriate heading (Added, Changed, Deprecated, Removed, Fixed, Security) as part of the PR that introduces it. On release, the maintainers stamp `## [Unreleased]` to the new version with the release date and open a fresh empty `## [Unreleased]` above it.
 
 If you're contributing to a release, the maintainers will tag and publish. If you maintain a fork, follow the existing tag convention (`vMAJOR.MINOR.PATCH`) so `goreleaser` recognizes it.
 

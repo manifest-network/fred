@@ -19,6 +19,8 @@ The signer's view of the URI and the verifier's view of the URI agree on the out
 
 In this deployment topology, the fred ↔ backend channel is **plain HTTP (no TLS)** by design — the lines cited are in the `manifest-deploy` repo's `CLAUDE.md`, not this repo's. HMAC is therefore the *only* authenticity mechanism on the wire between fred and backends. An in-zone observer can read every byte. That elevates the impact of any signature-binding weakness from theoretical to materially exploitable, which is the load-bearing reason ENG-191 had to bind method + URI into the canonical string in the first place. Do not reason about this system as if it were TLS-protected.
 
+> **Note (ENG-103).** TLS/mTLS is now *optionally* available on this hop (see [SECURITY.md § TLS (providerd → backend, ENG-103)](../SECURITY.md#tls-providerd--backend-eng-103)); it is a per-deployment choice, not a system constraint, and the production deploy above still runs plaintext. The HMAC scheme must remain robust independent of TLS — see the rejected alternative on switching to TLS in §5.
+
 ## 3. ENG-191's role on the call leg
 
 ENG-191 binds HTTP method and request URI into the canonical string to prevent **cross-endpoint replay**: a captured `POST /provision` signature must not verify when replayed against `POST /deprovision`, `POST /restart`, `POST /update`, or any other endpoint. Nine endpoints share one HMAC secret (`callback_secret`). Without method/URI binding, an in-zone observer can flip lease state by replaying a captured legitimate signature against a different endpoint — exploitable, given the plain-HTTP posture in (2).

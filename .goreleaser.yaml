@@ -21,16 +21,11 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
-  - id: k3s-backend
-    main: ./cmd/k3s-backend
-    binary: k3s-backend
-    env: [CGO_ENABLED=0]
-    goos: [linux]
-    goarch: [amd64]
-    flags: [-trimpath]
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-
+# NOTE: k3s-backend is intentionally NOT released as an artifact. It is an
+# experimental, non-functional scaffold (ENG-133) whose provisioner returns
+# "not implemented"; shipping it as a release binary/archive would imply it is
+# usable. Build it from source (`go build ./cmd/k3s-backend`) until real
+# provisioning lands (ENG-134+), then add it back here.
 archives:
   - id: providerd
     ids: [providerd]
@@ -38,9 +33,6 @@ archives:
   - id: docker-backend
     ids: [docker-backend]
     name_template: "docker-backend_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-  - id: k3s-backend
-    ids: [k3s-backend]
-    name_template: "k3s-backend_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 dockers:
   - ids: [providerd]

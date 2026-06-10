@@ -121,7 +121,7 @@ sequenceDiagram
 ## Building
 
 ```bash
-# Build all binaries (providerd, mock-backend, docker-backend)
+# Build all binaries (providerd, mock-backend, docker-backend, k3s-backend)
 make all
 
 # Build only providerd
@@ -132,7 +132,12 @@ go build -o build/mock-backend ./cmd/mock-backend
 
 # Build only docker-backend
 go build -o build/docker-backend ./cmd/docker-backend
+
+# Build only k3s-backend
+go build -o build/k3s-backend ./cmd/k3s-backend
 ```
+
+> **k3s-backend is currently an experimental, non-functional scaffold (ENG-133):** the binary boots, serves the backend HTTP contract, and signs/verifies callbacks, but its provisioner returns `status=failed, error="not implemented"` for every provision. It is **not usable in production**; real Kubernetes provisioning lands in ENG-134+.
 
 ## Local Development Setup
 
@@ -311,6 +316,8 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 ./build/docker-backend --version
 ./build/k3s-backend --version
 ```
+
+> **k3s-backend is currently an experimental, non-functional scaffold (ENG-133):** the binary boots, serves the backend HTTP contract, and signs/verifies callbacks, but its provisioner returns `status=failed, error="not implemented"` for every provision. It is **not usable in production**; real Kubernetes provisioning lands in ENG-134+.
 
 ## API Endpoints
 
@@ -1135,6 +1142,8 @@ internal/
 │   ├── inflight.go     # Manager delegation methods to the tracker
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
+│   ├── leaseutil.go    # Lease helper utilities
+│   ├── topics.go       # Watermill topic name constants
 │   ├── payload/        # Temporary payload storage (bbolt)
 │   ├── placement/      # Lease→backend placement store (bbolt)
 │   ├── bridge.go       # Chain events -> Watermill
