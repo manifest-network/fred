@@ -1770,3 +1770,38 @@ func TestNewHTTPClient_NoTLSConfig_LeavesTransportDefault(t *testing.T) {
 	require.True(t, ok)
 	require.Nil(t, tr.TLSClientConfig)
 }
+
+func TestHTTPClient_GetLoadStats(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/stats", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"total_cpu_cores":8,"allocated_cpu_cores":2,"active_containers":3,"total_memory_mb":1024}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+
+	stats, err := client.GetLoadStats(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, stats)
+	assert.Equal(t, 8.0, stats.TotalCPUCores)
+	assert.Equal(t, 2.0, stats.AllocatedCPUCores)
+	assert.Equal(t, 3, stats.ActiveContainers)
+
+	ratio, ok := stats.CPUAllocatedRatio()
+	assert.True(t, ok)
+	assert.InDelta(t, 0.25, ratio, 1e-9)
+}
+
+func TestLoadStats_CPUAllocatedRatio(t *testing.T) {
+	var nilStats *LoadStats
+	_, ok := nilStats.CPUAllocatedRatio()
+	assert.False(t, ok, "nil stats has no usable ratio")
+
+	_, ok = (&LoadStats{TotalCPUCores: 0, AllocatedCPUCores: 5}).CPUAllocatedRatio()
+	assert.False(t, ok, "zero total capacity has no usable ratio")
+
+	ratio, ok := (&LoadStats{TotalCPUCores: 4, AllocatedCPUCores: 1}).CPUAllocatedRatio()
+	assert.True(t, ok)
+	assert.InDelta(t, 0.25, ratio, 1e-9)
+}
