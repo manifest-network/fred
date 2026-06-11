@@ -440,9 +440,16 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	require.NotNil(t, inspect.HostConfig.PidsLimit, "PidsLimit should be set")
 	assert.Equal(t, pidsLimit, *inspect.HostConfig.PidsLimit)
 
-	// Verify tmpfs mounts for /tmp and /run
-	assert.Contains(t, inspect.HostConfig.Tmpfs, "/tmp", "tmpfs mount for /tmp expected")
-	assert.Contains(t, inspect.HostConfig.Tmpfs, "/run", "tmpfs mount for /run expected")
+	// Verify tmpfs mounts for /tmp and /run. The compose path realizes these as
+	// container Mounts of type "tmpfs", not the legacy HostConfig.Tmpfs map.
+	tmpfsDests := map[string]bool{}
+	for _, m := range inspect.Mounts {
+		if string(m.Type) == "tmpfs" {
+			tmpfsDests[m.Destination] = true
+		}
+	}
+	assert.True(t, tmpfsDests["/tmp"], "tmpfs mount for /tmp expected")
+	assert.True(t, tmpfsDests["/run"], "tmpfs mount for /run expected")
 
 	// Cleanup
 	err = b.Deprovision(ctx, leaseUUID)
@@ -1031,8 +1038,13 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 func TestIntegration_Docker_PortConflict(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
+	// NetworkIsolation=true so the container lands on a real bridge and actually
+	// publishes the host port — the only mode where a host-port conflict occurs in
+	// the compose era. With isolation OFF the container is attached to Docker's
+	// "none" network and host-port publishing is silently dropped; that
+	// isolation-off port-publishing gap is a separate product bug tracked elsewhere.
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
-		cfg.NetworkIsolation = ptrBool(false)
+		cfg.NetworkIsolation = ptrBool(true)
 	})
 
 	// Start a TCP listener to occupy port 19876
@@ -1656,6 +1668,19 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// releaseServiceImage recovers the recorded image for a service from a release's
+// persisted manifest. Post-compose-unification, ReleaseInfo.Image is the "stack"
+// sentinel for every (now-always-stack-shaped) lease, so the real per-service
+// image lives in the manifest the release captured.
+func releaseServiceImage(t *testing.T, r backend.ReleaseInfo, service string) string {
+	t.Helper()
+	sm, err := manifest.ParsePayload(r.Manifest)
+	require.NoError(t, err)
+	svc, ok := sm.Services[service]
+	require.True(t, ok, "service %q not found in release manifest", service)
+	return svc.Image
+}
+
 func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
@@ -1720,12 +1745,12 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 
 	// Release 1: version=1, busybox, superseded (ActivateLatest marks previous as superseded)
 	assert.Equal(t, 1, releases[0].Version)
-	assert.Equal(t, "busybox:latest", releases[0].Image)
+	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], "app"))
 	assert.Equal(t, "superseded", releases[0].Status)
 
 	// Release 2: version=2, alpine, active
 	assert.Equal(t, 2, releases[1].Version)
-	assert.Equal(t, "alpine:latest", releases[1].Image)
+	assert.Equal(t, "alpine:latest", releaseServiceImage(t, releases[1], "app"))
 	assert.Equal(t, "active", releases[1].Status)
 
 	// Cleanup
@@ -2218,7 +2243,7 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	assert.Equal(t, "active", releases[0].Status, "initial release should still be active")
 	assert.Equal(t, "failed", releases[1].Status, "bad update release should be marked failed")
 	assert.NotEmpty(t, releases[1].Error, "failed release should have error message")
-	assert.Equal(t, "busybox:this-tag-does-not-exist-xyz-99999", releases[1].Image)
+	assert.Equal(t, "busybox:this-tag-does-not-exist-xyz-99999", releaseServiceImage(t, releases[1], "app"))
 
 	// No leftover containers from the failed update — only the old ones remain (exited/removed)
 	// The original containers were removed during the update attempt
@@ -2304,13 +2329,13 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	require.Len(t, releases, 3, "expected 3 releases: provision + 2 updates")
 
 	assert.Equal(t, 1, releases[0].Version)
-	assert.Equal(t, "busybox:latest", releases[0].Image)
+	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], "app"))
 
 	assert.Equal(t, 2, releases[1].Version)
-	assert.Equal(t, "alpine:latest", releases[1].Image)
+	assert.Equal(t, "alpine:latest", releaseServiceImage(t, releases[1], "app"))
 
 	assert.Equal(t, 3, releases[2].Version)
-	assert.Equal(t, "busybox:latest", releases[2].Image)
+	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[2], "app"))
 	assert.Equal(t, "active", releases[2].Status, "latest release should be active")
 
 	// Final state: container running busybox
