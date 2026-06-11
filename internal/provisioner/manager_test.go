@@ -110,6 +110,10 @@ func (m *mockManagerBackend) GetReleases(ctx context.Context, leaseUUID string) 
 	return nil, backend.ErrNotProvisioned
 }
 
+func (m *mockManagerBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
 func TestNewManager_Validation(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{

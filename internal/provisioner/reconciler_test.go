@@ -138,6 +138,10 @@ func (m *mockReconcilerBackend) GetReleases(ctx context.Context, leaseUUID strin
 	return nil, backend.ErrNotProvisioned
 }
 
+func (m *mockReconcilerBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
 func TestNewReconciler_Validation(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
@@ -1505,6 +1509,10 @@ func (m *mockCancellingBackend) GetReleases(ctx context.Context, leaseUUID strin
 	return nil, backend.ErrNotProvisioned
 }
 
+func (m *mockCancellingBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
 	mockChain := &chaintest.MockClient{
@@ -1928,6 +1936,10 @@ func (m *mockConcurrencyBackend) GetReleases(ctx context.Context, leaseUUID stri
 	return nil, backend.ErrNotProvisioned
 }
 
+func (m *mockConcurrencyBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
 // mockInFlightTracker implements ReconcilerTracker for testing orphaned payload cleanup.
 type mockInFlightTracker struct {
 	payloadStore   *payload.Store
@@ -2004,6 +2016,16 @@ func (m *mockInFlightTracker) InFlightCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.inFlight)
+}
+
+func (m *mockInFlightTracker) InFlightCountsByBackend() map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	counts := make(map[string]int, len(m.inFlight))
+	for _, p := range m.inFlight {
+		counts[p.Backend]++
+	}
+	return counts
 }
 
 func (m *mockInFlightTracker) GetInFlightLeases() []string {

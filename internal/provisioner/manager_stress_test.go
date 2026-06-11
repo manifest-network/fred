@@ -496,6 +496,10 @@ func (m *mockLatencyBackend) GetReleases(ctx context.Context, leaseUUID string) 
 	return nil, backend.ErrNotProvisioned
 }
 
+func (m *mockLatencyBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
 // TestManager_HighConcurrencySustained tests sustained high concurrency.
 func TestManager_HighConcurrencySustained(t *testing.T) {
 	if testing.Short() {
