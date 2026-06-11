@@ -96,6 +96,11 @@ type Backend interface {
 	// Returns ErrNotProvisioned if lease not found.
 	GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error)
 
+	// GetLoadStats returns the backend's current resource-load snapshot,
+	// used for least-loaded provision routing. Implementations that do not
+	// track load may return a snapshot whose CPUAllocatedRatio is not ok.
+	GetLoadStats(ctx context.Context) (*LoadStats, error)
+
 	// Name returns the backend's configured name.
 	Name() string
 }
