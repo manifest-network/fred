@@ -221,11 +221,11 @@ func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("lifecycle-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision
@@ -290,11 +290,11 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	leaseUUID1 := fmt.Sprintf("net-iso-1-%d", time.Now().UnixNano())
 	leaseUUID2 := fmt.Sprintf("net-iso-2-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision for tenant 1
@@ -387,11 +387,11 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("hardening-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -459,11 +459,11 @@ func TestIntegration_Docker_DeprovisionIdempotent(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("idempotent-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -597,11 +597,11 @@ func TestIntegration_Docker_MultiContainerProvision(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("multi-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision with Quantity: 2
@@ -657,11 +657,11 @@ func TestIntegration_Docker_ContainerKilled_Detected(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("killed-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -713,11 +713,11 @@ func TestIntegration_Docker_MultiContainer_PartialKill(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("partial-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision with Quantity: 2
@@ -770,11 +770,11 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	leaseUUID := fmt.Sprintf("exit-%d", time.Now().UnixNano())
 
 	// Command ["false"] exits immediately with code 1
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"false"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -810,7 +810,7 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	leaseUUID := fmt.Sprintf("health-%d", time.Now().UnixNano())
 
 	// Health check ["CMD", "false"] always fails
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 		HealthCheck: &manifest.HealthCheckConfig{
@@ -820,7 +820,7 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 			Retries:  1,
 		},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -886,11 +886,11 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 
 	leaseUUID := fmt.Sprintf("cold-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -976,11 +976,11 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 
 	leaseUUID := fmt.Sprintf("cold-dead-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -1043,14 +1043,14 @@ func TestIntegration_Docker_PortConflict(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("port-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 		Ports: map[string]manifest.PortConfig{
 			"80/tcp": {HostPort: 19876},
 		},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -1140,11 +1140,11 @@ func TestIntegration_Docker_UnknownSKU_Rejected(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("bad-sku-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -1186,11 +1186,11 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		leaseUUID := fmt.Sprintf("bad-manifest-%d", time.Now().UnixNano())
 
 		// Manifest with empty image
-		manifest := manifest.Manifest{
+		appManifest := manifest.Manifest{
 			Image:   "",
 			Command: []string{"sleep", "3600"},
 		}
-		payload, err := json.Marshal(manifest)
+		payload, err := json.Marshal(appManifest)
 		require.NoError(t, err)
 
 		err = b.Provision(ctx, backend.ProvisionRequest{
@@ -1213,11 +1213,11 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		leaseUUID := fmt.Sprintf("bad-registry-%d", time.Now().UnixNano())
 
 		// Use an image from a registry not in AllowedRegistries
-		manifest := manifest.Manifest{
+		appManifest := manifest.Manifest{
 			Image:   "registry.evil.com/malware:latest",
 			Command: []string{"sleep", "3600"},
 		}
-		payload, err := json.Marshal(manifest)
+		payload, err := json.Marshal(appManifest)
 		require.NoError(t, err)
 
 		err = b.Provision(ctx, backend.ProvisionRequest{
@@ -1266,11 +1266,11 @@ func TestIntegration_Docker_DuplicateProvision_Rejected(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("dup-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	req := backend.ProvisionRequest{
@@ -1324,11 +1324,11 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 
 	ctx := context.Background()
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// First provision should succeed (uses all resources)
@@ -1409,11 +1409,11 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 	leaseUUID2 := fmt.Sprintf("same-net-2-%d", time.Now().UnixNano())
 	leaseUUID3 := fmt.Sprintf("other-net-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision two leases for the same tenant
@@ -1499,11 +1499,11 @@ func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("restart-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision
@@ -1582,11 +1582,11 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	leaseUUID := fmt.Sprintf("update-%d", time.Now().UnixNano())
 
 	// Provision with busybox
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -1667,11 +1667,11 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	leaseUUID := fmt.Sprintf("releases-%d", time.Now().UnixNano())
 
 	// Provision with busybox
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -1744,11 +1744,11 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("update-failed-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision
@@ -1836,11 +1836,11 @@ func TestIntegration_Docker_RestartFromFailed(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("restart-invalid-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision
@@ -1913,11 +1913,11 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	leaseUUID := fmt.Sprintf("full-%d", time.Now().UnixNano())
 
 	// 1. Provision with busybox
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -2005,11 +2005,11 @@ func TestIntegration_Docker_MultiContainerRestart(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("multi-restart-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision with Quantity=2
@@ -2077,11 +2077,11 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("multi-update-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision with Quantity=2
@@ -2158,11 +2158,11 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("bad-update-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision
@@ -2237,11 +2237,11 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	leaseUUID := fmt.Sprintf("seq-update-%d", time.Now().UnixNano())
 
 	// 1. Provision with busybox
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -2340,11 +2340,11 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	leaseUUID := fmt.Sprintf("restart-vol-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision with stateful SKU (docker-small has DiskMB > 0)
@@ -2412,11 +2412,11 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	leaseUUID := fmt.Sprintf("update-vol-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision with stateful SKU (docker-small has DiskMB > 0)
