@@ -444,7 +444,7 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	// container Mounts of type "tmpfs", not the legacy HostConfig.Tmpfs map.
 	tmpfsDests := map[string]bool{}
 	for _, m := range inspect.Mounts {
-		if string(m.Type) == "tmpfs" {
+		if m.Type == "tmpfs" {
 			tmpfsDests[m.Destination] = true
 		}
 	}
@@ -1745,12 +1745,12 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 
 	// Release 1: version=1, busybox, superseded (ActivateLatest marks previous as superseded)
 	assert.Equal(t, 1, releases[0].Version)
-	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], "app"))
+	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], manifest.DefaultServiceName))
 	assert.Equal(t, "superseded", releases[0].Status)
 
 	// Release 2: version=2, alpine, active
 	assert.Equal(t, 2, releases[1].Version)
-	assert.Equal(t, "alpine:latest", releaseServiceImage(t, releases[1], "app"))
+	assert.Equal(t, "alpine:latest", releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
 	assert.Equal(t, "active", releases[1].Status)
 
 	// Cleanup
@@ -2243,7 +2243,7 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	assert.Equal(t, "active", releases[0].Status, "initial release should still be active")
 	assert.Equal(t, "failed", releases[1].Status, "bad update release should be marked failed")
 	assert.NotEmpty(t, releases[1].Error, "failed release should have error message")
-	assert.Equal(t, "busybox:this-tag-does-not-exist-xyz-99999", releaseServiceImage(t, releases[1], "app"))
+	assert.Equal(t, "busybox:this-tag-does-not-exist-xyz-99999", releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
 
 	// No leftover containers from the failed update — only the old ones remain (exited/removed)
 	// The original containers were removed during the update attempt
@@ -2329,13 +2329,13 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	require.Len(t, releases, 3, "expected 3 releases: provision + 2 updates")
 
 	assert.Equal(t, 1, releases[0].Version)
-	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], "app"))
+	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], manifest.DefaultServiceName))
 
 	assert.Equal(t, 2, releases[1].Version)
-	assert.Equal(t, "alpine:latest", releaseServiceImage(t, releases[1], "app"))
+	assert.Equal(t, "alpine:latest", releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
 
 	assert.Equal(t, 3, releases[2].Version)
-	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[2], "app"))
+	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[2], manifest.DefaultServiceName))
 	assert.Equal(t, "active", releases[2].Status, "latest release should be active")
 
 	// Final state: container running busybox

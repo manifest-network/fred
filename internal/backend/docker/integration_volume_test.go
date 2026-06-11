@@ -65,7 +65,7 @@ func setupBtrfsLoopback(t *testing.T) string {
 	// genuine (non-loop) mount error should fail the test.
 	out, err = exec.Command("mount", "-o", "loop", imgFile, mountDir).CombinedOutput()
 	if err != nil {
-		if strings.Contains(string(out), "loop") {
+		if strings.Contains(string(out), "set up loop device") {
 			t.Skipf("btrfs loopback unavailable (loop device setup failed): %s", out)
 		}
 		require.NoError(t, err, "mount: %s", out)
