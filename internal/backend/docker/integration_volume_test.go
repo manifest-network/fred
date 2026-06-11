@@ -57,9 +57,19 @@ func setupBtrfsLoopback(t *testing.T) string {
 	out, err = exec.Command("mkfs.btrfs", "-f", imgFile).CombinedOutput()
 	require.NoError(t, err, "mkfs.btrfs: %s", out)
 
-	// Mount with loop
+	// Mount with loop. Loop-device support is a prerequisite just like root and
+	// btrfs-progs above, but it can't be probed reliably ahead of time. Some
+	// environments (containers, restricted/hardened hosts, many CI runners) have
+	// no usable loop devices even as root, where `mount -o loop` fails with a
+	// "failed to set up loop device" error. Skip there rather than fail — only a
+	// genuine (non-loop) mount error should fail the test.
 	out, err = exec.Command("mount", "-o", "loop", imgFile, mountDir).CombinedOutput()
-	require.NoError(t, err, "mount: %s", out)
+	if err != nil {
+		if strings.Contains(string(out), "set up loop device") {
+			t.Skipf("btrfs loopback unavailable (loop device setup failed): %s", out)
+		}
+		require.NoError(t, err, "mount: %s", out)
+	}
 
 	// Enable quotas
 	out, err = exec.Command("btrfs", "quota", "enable", mountDir).CombinedOutput()

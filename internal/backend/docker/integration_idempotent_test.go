@@ -44,6 +44,7 @@ func baseCreateParams(d *DockerClient, leaseUUID, image string) CreateContainerP
 		Tenant:        "test-tenant",
 		ProviderUUID:  "test-provider",
 		SKU:           "docker-micro",
+		ServiceName:   manifest.DefaultServiceName,
 		Manifest:      &manifest.Manifest{Image: image, Command: []string{"sleep", "3600"}},
 		Profile:       SKUProfile{CPUCores: 0.1, MemoryMB: 32, DiskMB: 0},
 		InstanceIndex: 0,
