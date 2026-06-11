@@ -23,10 +23,25 @@ NODE="${NODE:-http://localhost:26657}"
 GAS_PRICES="${GAS_PRICES:-0.025umfx}"
 PWR_DENOM="${PWR_DENOM:-factory/manifest1afk9zr2hn2jsac63h4hm60vl9z3e5u69gndzf7c99cqge3vzwjzsfmy9qj/upwr}"
 API_URL="${API_URL:-https://localhost:8080}"
-CALLBACK_SECRET="${CALLBACK_SECRET:-$(openssl rand -hex 32)}"
+CALLBACK_SECRET="${CALLBACK_SECRET:-}"  # random default resolved after helpers (needs openssl)
 
 # Repo root (script lives in scripts/)
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Volume data path. Fred writes managed volume subdirs under this path.
+# Must be on a filesystem supported by fred's quota backends (btrfs, xfs
+# with project quotas, or zfs). The default lives under $HOME so dev
+# setups don't need sudo; for production-shaped layouts override with
+# e.g. VOLUME_DATA_PATH=/var/lib/fred/volumes.
+VOLUME_DATA_PATH="${VOLUME_DATA_PATH:-$HOME/fred-volumes}"
+
+# TLS cert/key paths used by providerd. The script generates a self-signed
+# cert only when neither exists (and errors if exactly one is present).
+CERT_FILE="${CERT_FILE:-$REPO_ROOT/cert.pem}"
+KEY_FILE="${KEY_FILE:-$REPO_ROOT/key.pem}"
+# Subject Alternative Names baked into the dev cert. Override for
+# remote test setups (e.g. CERT_SAN="DNS:my.host,IP:10.0.0.5").
+CERT_SAN="${CERT_SAN:-DNS:localhost,IP:127.0.0.1}"
 
 # SKU definitions: name and price (price in PWR per hour, divisible by 3600)
 SKU_NAMES=("docker-micro" "docker-small" "docker-medium" "docker-large")
@@ -56,6 +71,14 @@ info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m OK\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33mWARN\033[0m %s\n' "$*"; }
 die()   { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Default CALLBACK_SECRET to a random value. openssl is also required later to
+# generate the dev TLS cert; resolve it here (after die is defined) so a missing
+# openssl gives a clear message instead of an opaque set -e abort at the top.
+if [[ -z "$CALLBACK_SECRET" ]]; then
+  command -v openssl >/dev/null || die "openssl not found — install it, or set CALLBACK_SECRET (and pre-create CERT_FILE/KEY_FILE to skip cert generation)"
+  CALLBACK_SECRET="$(openssl rand -hex 32)"
+fi
 
 # Run a manifestd tx command and validate the response code is 0.
 run_tx() {
@@ -212,7 +235,48 @@ for name in "${SKU_NAMES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 8. Generate docker-backend.yaml
+# 8. Ensure volume data path exists
+# ---------------------------------------------------------------------------
+# docker-backend rejects a volume_data_path containing whitespace; fail fast
+# here rather than at backend startup (e.g. a $HOME that contains spaces).
+if [[ "$VOLUME_DATA_PATH" == *[[:space:]]* ]]; then
+  die "VOLUME_DATA_PATH must not contain whitespace (got: '$VOLUME_DATA_PATH') — docker-backend rejects whitespace volume paths"
+fi
+info "Ensuring volume data path exists: $VOLUME_DATA_PATH"
+if [[ ! -d "$VOLUME_DATA_PATH" ]]; then
+  mkdir -p -- "$VOLUME_DATA_PATH" \
+    || die "Failed to create $VOLUME_DATA_PATH (set VOLUME_DATA_PATH= to a writable location)"
+  ok "Created $VOLUME_DATA_PATH"
+else
+  ok "Already present"
+fi
+# docker-backend (same user in dev) creates per-volume subdirs here, which needs
+# write + execute (search) permission — fail fast if the path isn't usable.
+[[ -w "$VOLUME_DATA_PATH" && -x "$VOLUME_DATA_PATH" ]] \
+  || die "$VOLUME_DATA_PATH is not writable/searchable by $(id -un) — fix its permissions or set VOLUME_DATA_PATH= to a writable location"
+
+# ---------------------------------------------------------------------------
+# 9. Ensure TLS cert + key exist
+# ---------------------------------------------------------------------------
+info "Ensuring TLS cert exists: $CERT_FILE"
+if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+  ok "Cert and key already present"
+elif [[ -f "$CERT_FILE" || -f "$KEY_FILE" ]]; then
+  die "One of $CERT_FILE / $KEY_FILE exists but the other is missing — remove the stray file and re-run, or set CERT_FILE/KEY_FILE to a fresh pair"
+else
+  command -v openssl >/dev/null || die "openssl not found; install it or pre-create $CERT_FILE and $KEY_FILE"
+  if ! ssl_err=$(openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+    -keyout "$KEY_FILE" -out "$CERT_FILE" \
+    -subj /CN=localhost \
+    -addext "subjectAltName=$CERT_SAN" 2>&1); then
+    die "openssl cert generation failed: $ssl_err"
+  fi
+  chmod 600 -- "$KEY_FILE"
+  ok "Generated $CERT_FILE (SAN: $CERT_SAN)"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. Generate docker-backend.yaml
 # ---------------------------------------------------------------------------
 DOCKER_BACKEND_FILE="$REPO_ROOT/docker-backend.yaml"
 info "Writing $DOCKER_BACKEND_FILE"
@@ -279,7 +343,7 @@ releases_max_age: 2160h  # 90 days
 host_address: "127.0.0.1"
 
 # Volume management
-volume_data_path: "/mnt/docker-btrfs/volumes"
+volume_data_path: "$VOLUME_DATA_PATH"
 
 # Timeouts
 provision_timeout: 10m
@@ -294,7 +358,7 @@ YAML
 ok "Wrote $DOCKER_BACKEND_FILE"
 
 # ---------------------------------------------------------------------------
-# 9. Generate config.mock.yaml
+# 11. Generate config.docker.yaml
 # ---------------------------------------------------------------------------
 CONFIG_DOCKER_FILE="$REPO_ROOT/config.docker.yaml"
 info "Writing $CONFIG_DOCKER_FILE"
@@ -336,8 +400,8 @@ api_listen_addr: ":8080"
 #   - "http://localhost:5173"
 
 # TLS (self-signed for dev)
-tls_cert_file: "$REPO_ROOT/cert.pem"
-tls_key_file: "$REPO_ROOT/key.pem"
+tls_cert_file: "$CERT_FILE"
+tls_key_file: "$KEY_FILE"
 
 # Backend
 backends:
@@ -371,13 +435,16 @@ YAML
 ok "Wrote $CONFIG_DOCKER_FILE"
 
 # ---------------------------------------------------------------------------
-# 10. Summary
+# 12. Summary
 # ---------------------------------------------------------------------------
 echo ""
 info "Dev environment initialized!"
 echo ""
 echo "  Provider address : $PROVIDER_ADDRESS"
 echo "  Provider UUID    : $PROVIDER_UUID"
+echo "  Volume data path : $VOLUME_DATA_PATH"
+echo "  TLS cert         : $CERT_FILE"
+echo "  TLS key          : $KEY_FILE"
 echo "  SKU mapping:"
 for name in "${SKU_NAMES[@]}"; do
   printf '    %-16s => %s\n' "$name" "${SKU_UUID_BY_NAME[$name]}"
