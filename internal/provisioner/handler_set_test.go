@@ -360,6 +360,78 @@ func TestHandlerSet_HandleLeaseExpired_DelegatesToClosed(t *testing.T) {
 	mb.mu.Unlock()
 }
 
+// TestHandlerSet_HandleLeaseClosed_PublishesRetainedEvent verifies that
+// processLeaseClose publishes a LeaseStatusEvent with ProvisionStatusRetained
+// so a connected tenant learns their data may be recoverable if the backend
+// has retention enabled.
+func TestHandlerSet_HandleLeaseClosed_PublishesRetainedEvent(t *testing.T) {
+	pub := newMockPublisher()
+	mb := &mockManagerBackend{name: "test-backend"}
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:  leaseUUID,
+				State: billingtypes.LEASE_STATE_ACTIVE,
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+			}, nil
+		},
+	}
+
+	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
+	hs.deps.Publisher = pub
+
+	msg := newLeaseEventMsg(t, chain.LeaseEvent{
+		Type:      chain.LeaseClosed,
+		LeaseUUID: "lease-retained",
+		Tenant:    "tenant-a",
+	})
+
+	err := hs.HandleLeaseClosed(msg)
+	require.NoError(t, err)
+
+	pub.mu.Lock()
+	msgs := pub.published[TopicLeaseEvent]
+	pub.mu.Unlock()
+
+	require.Len(t, msgs, 1, "should publish exactly one retained event on lease close")
+
+	var event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	assert.Equal(t, "lease-retained", event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
+	assert.NotEmpty(t, event.Error, "retained event should carry informational message")
+}
+
+// TestHandlerSet_HandleLeaseExpired_PublishesRetainedEvent verifies that the
+// expiry path also emits the retained event (it delegates to processLeaseClose).
+func TestHandlerSet_HandleLeaseExpired_PublishesRetainedEvent(t *testing.T) {
+	pub := newMockPublisher()
+	mb := &mockManagerBackend{name: "test-backend"}
+	mockChain := &chaintest.MockClient{}
+
+	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
+	hs.deps.Publisher = pub
+
+	msg := newLeaseEventMsg(t, chain.LeaseEvent{
+		Type:      chain.LeaseExpired,
+		LeaseUUID: "lease-expired-retained",
+	})
+
+	err := hs.HandleLeaseExpired(msg)
+	require.NoError(t, err)
+
+	pub.mu.Lock()
+	msgs := pub.published[TopicLeaseEvent]
+	pub.mu.Unlock()
+
+	require.Len(t, msgs, 1, "should publish exactly one retained event on lease expire")
+
+	var event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	assert.Equal(t, "lease-expired-retained", event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
+}
+
 // --- HandleBackendCallback tests ---
 
 func TestHandlerSet_HandleBackendCallback_Success(t *testing.T) {

@@ -197,6 +197,40 @@ releases_db_path: "releases.db"
 releases_max_age: 2160h
 
 # =============================================================================
+# SOFT-DELETE & RETENTION (optional)
+# =============================================================================
+# When retain_on_close is enabled, managed volumes are renamed into a
+# fred-retained- namespace at lease close/expire time instead of being
+# destroyed. Tenants can restore their data into a new lease via:
+#   POST /v1/leases/{new_lease_uuid}/restore
+# with body: {"from_lease_uuid": "<original_closed_lease_uuid>"}
+#
+# Limitations:
+#   - Retention is best-effort and capacity-bounded (see max_retained_leases_per_tenant).
+#   - Restore works only on the backend node that holds the retained volumes
+#     (single-backend deployments; multi-node affinity is a future enhancement).
+#   - Retained data is a single copy on local disk — retention is not a backup.
+
+# Enable soft-delete on lease close/expire. Default: false.
+# retain_on_close: false
+
+# Path to bbolt database tracking retained lease records. Default: "retention.db".
+# retention_db_path: "retention.db"
+
+# How long retained volumes are kept before the grace reaper destroys them.
+# Default: 2160h (90 days). Set to 0 to disable automatic reaping.
+# retention_max_age: 2160h
+
+# How often the grace reaper runs to destroy expired retained volumes.
+# Default: 1h.
+# retention_reap_interval: 1h
+
+# Maximum number of retained leases kept per tenant. When the cap is reached,
+# the tenant's oldest retained lease is eagerly reaped to make room.
+# Default: 0 (unlimited).
+# max_retained_leases_per_tenant: 0
+
+# =============================================================================
 # HOST CONFIGURATION
 # =============================================================================
 
