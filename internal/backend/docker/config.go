@@ -41,6 +41,13 @@ type Config struct {
 	// ListenAddr is the address the HTTP server listens on.
 	ListenAddr string `yaml:"listen_addr"`
 
+	// ProductionMode tightens startup checks beyond basic validation. When true,
+	// Validate rejects dev-only insecure toggles — currently
+	// callback_insecure_skip_verify, which disables TLS verification on the
+	// backend → Fred callback hop. Mirrors providerd's production_mode (which
+	// gates the reverse providerd → backend tls_skip_verify). Defaults to false.
+	ProductionMode bool `yaml:"production_mode"`
+
 	// TLSCertFile and TLSKeyFile enable HTTPS on the listener when both are
 	// set; otherwise it serves plaintext HTTP (the default). Loaded once at
 	// startup — rotation requires a restart (see ENG-294).
@@ -486,6 +493,14 @@ func (c *Config) Validate() error {
 		if tq.MaxDiskMB > c.TotalDiskMB {
 			return fmt.Errorf("tenant_quota.max_disk_mb (%d) exceeds total_disk_mb (%d)", tq.MaxDiskMB, c.TotalDiskMB)
 		}
+	}
+
+	// Production mode security enforcement (runs after all basic validation).
+	// callback_insecure_skip_verify disables TLS verification on the backend →
+	// Fred callback hop; it is a dev-only escape hatch and must never reach a
+	// production deployment.
+	if c.ProductionMode && c.CallbackInsecureSkipVerify {
+		return fmt.Errorf("production_mode: callback_insecure_skip_verify cannot be enabled")
 	}
 
 	return nil
