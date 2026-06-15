@@ -5,7 +5,7 @@
 // # Why this exists
 //
 // When multiple backends share the same `skus` list, the provisioner uses
-// RouteRoundRobin to distribute new provisions across them. But subsequent
+// RouteForProvision to distribute new provisions across them. But subsequent
 // read operations (GET /connection, /logs, /provision diagnostics) need to
 // reach the specific backend that holds the lease's state. Round-robin'ing
 // reads would produce 404s on N-1 of N backends.

@@ -52,8 +52,8 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	sku := ExtractRoutingSKU(lease)
 	totalQuantity := TotalLeaseQuantity(lease)
 
-	// Route to appropriate backend using round-robin for load distribution
-	backendClient := o.router.RouteRoundRobin(sku)
+	// Route to appropriate backend using least-loaded selection
+	backendClient := o.router.RouteForProvision(ctx, sku, o.tracker.InFlightCountsByBackend())
 	if backendClient == nil {
 		slog.Error("no backend available for provisioning",
 			"lease_uuid", lease.Uuid,
