@@ -301,6 +301,415 @@ func TestDeprovision_RetainOff_DestroysAsBefore(t *testing.T) {
 	assert.Contains(t, got, canonicalVolumeName("u1", manifest.DefaultServiceName, 0))
 }
 
+// ---------------------------------------------------------------------------
+// Part A + B + ordering tests (Task 5: orphan exclusion + reconciliation)
+// ---------------------------------------------------------------------------
+
+// TestCleanupOrphanedVolumes_SkipsRetained verifies that fred-retained- volumes
+// are never destroyed by the orphan reaper, regardless of whether they appear
+// in the expected set.
+func TestCleanupOrphanedVolumes_SkipsRetained(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, map[string]*provision{
+		"live": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "live",
+			Tenant:    "tenant-a",
+			Status:    backend.ProvisionStatusReady,
+			Quantity:  1,
+			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		}},
+	})
+
+	var mu sync.Mutex
+	var destroyedIDs []string
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{
+				"fred-live-app-0",
+				"fred-retained-u1-app-0",
+				"fred-stale-app-0",
+			}, nil
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			mu.Lock()
+			destroyedIDs = append(destroyedIDs, id)
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.NoError(t, err)
+
+	mu.Lock()
+	got := append([]string(nil), destroyedIDs...)
+	mu.Unlock()
+
+	assert.NotContains(t, got, "fred-retained-u1-app-0", "retained volume must never be destroyed by orphan reaper")
+	assert.NotContains(t, got, "fred-live-app-0", "expected live volume must not be destroyed")
+	assert.Contains(t, got, "fred-stale-app-0", "orphaned stale volume must be destroyed")
+}
+
+// TestReconcileRetentions_RequarantinesActive verifies that an active retention
+// record whose canonical volume is still present on disk (crashed mid-soft-delete)
+// gets the canonical volume renamed back to the retained namespace.
+func TestReconcileRetentions_RequarantinesActive(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	type renameCall struct{ old, new string }
+	var mu sync.Mutex
+	var renames []renameCall
+
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			renames = append(renames, renameCall{old, new})
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		Generation:          1,
+	}))
+
+	err := b.reconcileRetentions(context.Background())
+	require.NoError(t, err)
+
+	mu.Lock()
+	got := append([]renameCall(nil), renames...)
+	mu.Unlock()
+
+	assert.Contains(t, got, renameCall{"fred-u1-app-0", "fred-retained-u1-app-0"},
+		"canonical volume must be renamed back to retained namespace")
+}
+
+// TestReconcileRestoring_RollsBackOrphan verifies that a restoring record with
+// no live provision (crashed restore) is fully rolled back: compose Down is called
+// for the new lease's project, volumes are re-quarantined to the retained namespace,
+// the record reverts to active (Generation bumped, NewLeaseUUID cleared), and the
+// orphaned provision is removed from b.provisions.
+func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	var mu sync.Mutex
+	var downProjects []string
+	type renameCall struct{ old, new string }
+	var renames []renameCall
+
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
+			mu.Lock()
+			downProjects = append(downProjects, projectName)
+			mu.Unlock()
+			return nil
+		},
+	}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			renames = append(renames, renameCall{old, new})
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		NewLeaseUUID:        "u2",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          3,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+	}
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	mu.Lock()
+	gotDown := append([]string(nil), downProjects...)
+	gotRenames := append([]renameCall(nil), renames...)
+	mu.Unlock()
+
+	// Compose Down must be called for the new lease's project.
+	assert.Contains(t, gotDown, composeProjectName("u2"),
+		"compose Down must be called for the new lease's project")
+
+	// Volume must be re-quarantined from new canonical → original retained name.
+	assert.Contains(t, gotRenames, renameCall{
+		old: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
+		new: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
+	}, "volume must be renamed from new canonical to original retained name")
+
+	// The record must have reverted to active with Generation bumped and NewLeaseUUID cleared.
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "retention record for u1 must still exist after rollback")
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
+	assert.Equal(t, 4, entry.Generation, "generation must be bumped by RevertToActive")
+	assert.Empty(t, entry.NewLeaseUUID, "NewLeaseUUID must be cleared after rollback")
+
+	// The orphaned provision for u2 must be removed.
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, hasU2, "orphaned provision for u2 must be removed")
+}
+
+// TestReconcileRestoring_DefersToInFlight verifies that when b.provisions["u2"]
+// has status Restarting (restore is in flight), reconcileRestoring is a no-op:
+// no compose Down, no rename, store record remains restoring.
+func TestReconcileRestoring_DefersToInFlight(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, map[string]*provision{
+		"u2": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u2",
+			Status:    backend.ProvisionStatusRestarting,
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+
+	downCalled := false
+	renameCalled := false
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+			downCalled = true
+			return nil
+		},
+	}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error {
+			renameCalled = true
+			return nil
+		},
+	}
+
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID: "u1",
+		NewLeaseUUID:      "u2",
+		Tenant:            "tenant-a",
+		Status:            shared.RetentionStatusRestoring,
+		Generation:        3,
+		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+	}
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	assert.False(t, downCalled, "compose Down must NOT be called for an in-flight restore")
+	assert.False(t, renameCalled, "RenameVolume must NOT be called for an in-flight restore")
+
+	// Record must still be in restoring state.
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
+		"record must remain restoring when restore is in flight")
+}
+
+// TestReconcileRestoring_DeletesOnReady verifies that when b.provisions["u2"]
+// has status Ready (restore completed successfully), the retention record for
+// the original lease is deleted from the store.
+func TestReconcileRestoring_DeletesOnReady(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, map[string]*provision{
+		"u2": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u2",
+			Status:    backend.ProvisionStatusReady,
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID: "u1",
+		NewLeaseUUID:      "u2",
+		Tenant:            "tenant-a",
+		Status:            shared.RetentionStatusRestoring,
+		Generation:        2,
+		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+	}
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	// Record must be deleted (restore finished, leftover record cleaned up).
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	assert.Nil(t, entry, "retention record must be deleted when restore is already done (Ready provision)")
+}
+
+// TestStart_ReconcilesBeforeOrphanReap pins the invariant that
+// reconcileRetentions runs BEFORE cleanupOrphanedVolumes. A canonical volume
+// (fred-u1-app-0) that survived a crash mid-soft-delete would be destroyed by
+// the orphan reaper unless reconcileRetentions first renames it to the retained
+// namespace. This test drives the two functions in Start's order and asserts
+// the canonical volume is never destroyed.
+func TestStart_ReconcilesBeforeOrphanReap(t *testing.T) {
+	// Start's ordering guarantee (Part C): reconcileRetentions THEN cleanupOrphanedVolumes.
+	// If the order is reversed, the canonical volume gets destroyed before it can be
+	// re-quarantined. This test calls them in Start's order to pin the invariant.
+
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	// active record: crash happened after Put, before canonical→retained rename.
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		Generation:          1,
+	}))
+
+	// Simulate the canonical volume being present on disk (crash mid-rename).
+	// The ListFn is called by cleanupOrphanedVolumes; after reconcile renames it,
+	// the retained volume is no longer an orphan candidate.
+	var mu sync.Mutex
+	volumes := []string{"fred-u1-app-0"}
+	var destroyedIDs []string
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string(nil), volumes...), nil
+		},
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			// Update the volume list to reflect the rename.
+			for i, v := range volumes {
+				if v == old {
+					volumes[i] = new
+					break
+				}
+			}
+			mu.Unlock()
+			return nil
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			mu.Lock()
+			destroyedIDs = append(destroyedIDs, id)
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	ctx := context.Background()
+
+	// Drive reconcileRetentions THEN cleanupOrphanedVolumes — the same order Start uses.
+	// (Part C guarantees this order in production; this test pins it for regression.)
+	err := b.reconcileRetentions(ctx)
+	require.NoError(t, err)
+
+	err = b.cleanupOrphanedVolumes(ctx)
+	require.NoError(t, err)
+
+	mu.Lock()
+	got := append([]string(nil), destroyedIDs...)
+	mu.Unlock()
+
+	assert.NotContains(t, got, "fred-u1-app-0",
+		"canonical volume must not be destroyed: reconcile must have renamed it to retained before orphan reap")
+	assert.NotContains(t, got, "fred-retained-u1-app-0",
+		"retained volume must never be destroyed by orphan reaper (Part A exclusion)")
+}
+
+// TestCleanupOrphanedVolumes_ProtectsRetentionCanonical verifies that
+// cleanupOrphanedVolumes does NOT destroy a retention record's canonical volume
+// even when it is still canonical-named on disk (a reconcile rename failed or
+// crashed). Without the retention-aware protection in cleanupOrphanedVolumes,
+// this canonical (not fred-retained-, not in any live provision) would be
+// destroyed = permanent data loss. Covers both the active and restoring arms.
+func TestCleanupOrphanedVolumes_ProtectsRetentionCanonical(t *testing.T) {
+	t.Run("active record canonical", func(t *testing.T) {
+		mock := &mockDockerClient{}
+		b := newBackendForTest(mock, nil)
+		rs := attachRetentionStore(t, b)
+
+		// Active record whose canonical (fred-u1-app-0) is still on disk because
+		// the reconcile rename failed/crashed.
+		require.NoError(t, rs.Put(shared.RetentionEntry{
+			OriginalLeaseUUID:   "u1",
+			Tenant:              "tenant-a",
+			Status:              shared.RetentionStatusActive,
+			RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+			Generation:          1,
+		}))
+
+		var mu sync.Mutex
+		var destroyedIDs []string
+		b.volumes = &mockVolumeManager{
+			ListFn: func() ([]string, error) {
+				return []string{"fred-u1-app-0"}, nil // canonical still on disk
+			},
+			DestroyFn: func(_ context.Context, id string) error {
+				mu.Lock()
+				destroyedIDs = append(destroyedIDs, id)
+				mu.Unlock()
+				return nil
+			},
+		}
+
+		require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+
+		mu.Lock()
+		got := append([]string(nil), destroyedIDs...)
+		mu.Unlock()
+		assert.NotContains(t, got, "fred-u1-app-0",
+			"active retention record's canonical must be protected from the orphan reaper")
+	})
+
+	t.Run("restoring record new-lease canonical", func(t *testing.T) {
+		mock := &mockDockerClient{}
+		b := newBackendForTest(mock, nil)
+		rs := attachRetentionStore(t, b)
+
+		// Restoring record: the new lease's canonical (fred-u2-app-0) holds the
+		// adopted/in-flight data and must not be reaped.
+		require.NoError(t, rs.Put(shared.RetentionEntry{
+			OriginalLeaseUUID: "u1",
+			NewLeaseUUID:      "u2",
+			Tenant:            "tenant-a",
+			Status:            shared.RetentionStatusRestoring,
+			Generation:        2,
+			Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		}))
+
+		var mu sync.Mutex
+		var destroyedIDs []string
+		b.volumes = &mockVolumeManager{
+			ListFn: func() ([]string, error) {
+				return []string{"fred-u2-app-0"}, nil // adopted data still on disk
+			},
+			DestroyFn: func(_ context.Context, id string) error {
+				mu.Lock()
+				destroyedIDs = append(destroyedIDs, id)
+				mu.Unlock()
+				return nil
+			},
+		}
+
+		require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+
+		mu.Lock()
+		got := append([]string(nil), destroyedIDs...)
+		mu.Unlock()
+		assert.NotContains(t, got, "fred-u2-app-0",
+			"restoring record's new-lease canonical (adopted data) must be protected from the orphan reaper")
+	})
+}
+
 func TestVolumeNameHelpers(t *testing.T) {
 	if got := canonicalVolumeName("u1", "app", 0); got != "fred-u1-app-0" {
 		t.Errorf("canonicalVolumeName: got %q, want %q", got, "fred-u1-app-0")

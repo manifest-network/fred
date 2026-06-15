@@ -569,8 +569,41 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	}
 	b.provisionsMu.RUnlock()
 
+	// Protect retention-record canonicals from the reaper. reconcileRetentions
+	// runs immediately before this in Start and re-quarantines crash-stranded
+	// canonical volumes back to the fred-retained- namespace — but if any of
+	// those renames FAILED (real Docker error, not a benign no-op), the volume
+	// is still canonical-named, not fred-retained-, and not in any live
+	// provision's expected set, so the loop below would destroy it = permanent
+	// data loss. Add those canonicals (active arm: the not-yet-renamed canonical;
+	// restoring arm: the adopted/in-flight new-lease canonical) to the expected
+	// set so an incomplete rename can never be reaped.
+	if b.retentionStore != nil {
+		if recs, rerr := b.retentionStore.List(); rerr != nil {
+			b.logger.Warn("cleanupOrphanedVolumes: retention read failed; canonical protection skipped", "error", rerr)
+		} else {
+			for _, e := range recs {
+				switch e.Status {
+				case shared.RetentionStatusActive:
+					for _, retained := range e.RetainedVolumeNames {
+						expected[canonicalFromRetained(retained)] = true // protect a not-yet-renamed canonical
+					}
+				case shared.RetentionStatusRestoring:
+					for _, item := range e.Items {
+						for i := range item.Quantity {
+							expected[canonicalVolumeName(e.NewLeaseUUID, item.ServiceName, i)] = true // protect adopted/in-flight data
+						}
+					}
+				}
+			}
+		}
+	}
+
 	var orphanCount, failCount int
 	for _, id := range volumeIDs {
+		if isRetainedVolume(id) {
+			continue
+		}
 		if expected[id] {
 			continue
 		}

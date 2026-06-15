@@ -571,6 +571,14 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
 
+	// Reconcile crash-interrupted soft-deletes and restores. MUST run AFTER
+	// recoverState (so b.provisions reflects live containers) and BEFORE
+	// cleanupOrphanedVolumes (so any mid-rename canonical volume is moved back
+	// into the fred-retained- namespace before the orphan reaper sees it).
+	if err := b.reconcileRetentions(b.stopCtx); err != nil {
+		b.logger.Warn("retention reconciliation failed", "error", err)
+	}
+
 	// Clean up orphaned volumes (created but no matching provision).
 	// Must run after recoverState so the provision map is populated.
 	if err := b.cleanupOrphanedVolumes(ctx); err != nil {
