@@ -185,6 +185,32 @@ type Config struct {
 	// Defaults to 90 days.
 	ReleasesMaxAge time.Duration `yaml:"releases_max_age"`
 
+	// RetainOnClose controls whether a lease's container is soft-deleted
+	// (moved to the retention store) instead of immediately destroyed when
+	// the lease is closed. When false (default), the container is destroyed
+	// immediately on close.
+	RetainOnClose bool `yaml:"retain_on_close"`
+
+	// RetentionDBPath is the path to the bbolt database for persisting
+	// soft-deleted leases awaiting restore or reaping.
+	// Defaults to "retention.db".
+	RetentionDBPath string `yaml:"retention_db_path"`
+
+	// RetentionMaxAge is the grace window after which a soft-deleted lease
+	// becomes eligible for reaping. 0 disables reaping entirely.
+	// Defaults to 90 days.
+	RetentionMaxAge time.Duration `yaml:"retention_max_age"`
+
+	// RetentionReapInterval is how often the background reaper sweeps for
+	// expired soft-deleted leases. Decoupled from RetentionMaxAge so the
+	// sweep cadence can be tuned independently of the grace window.
+	// Defaults to 1h.
+	RetentionReapInterval time.Duration `yaml:"retention_reap_interval"`
+
+	// MaxRetainedLeasesPerTenant caps how many soft-deleted leases a single
+	// tenant may have in the retention store at once. 0 means unlimited.
+	MaxRetainedLeasesPerTenant int `yaml:"max_retained_leases_per_tenant"`
+
 	// MigrationGracePeriod is how long the renamed `-prev` legacy container
 	// lingers after a successful recover-time migration before forced
 	// removal. Preserves rollback potential if the operator interrupts fred
@@ -293,6 +319,9 @@ func DefaultConfig() Config {
 		DiagnosticsMaxAge:       7 * 24 * time.Hour,
 		ReleasesDBPath:          "releases.db",
 		ReleasesMaxAge:          90 * 24 * time.Hour,
+		RetentionDBPath:         "retention.db",
+		RetentionMaxAge:         90 * 24 * time.Hour,
+		RetentionReapInterval:   time.Hour,
 		MigrationGracePeriod:    defaultMigrationGracePeriod,
 		MigrationReadyTimeout:   defaultMigrationReadyTimeout,
 		AllowedRegistries: []string{
@@ -446,6 +475,18 @@ func (c *Config) Validate() error {
 
 	if c.ReleasesMaxAge < 0 {
 		return fmt.Errorf("releases_max_age must be non-negative")
+	}
+
+	if c.RetentionMaxAge < 0 {
+		return fmt.Errorf("retention_max_age must be non-negative")
+	}
+
+	if c.RetentionReapInterval < 0 {
+		return fmt.Errorf("retention_reap_interval must be non-negative")
+	}
+
+	if c.MaxRetainedLeasesPerTenant < 0 {
+		return fmt.Errorf("max_retained_leases_per_tenant must be non-negative")
 	}
 
 	// Volume management validation
