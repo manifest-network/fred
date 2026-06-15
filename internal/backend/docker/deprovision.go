@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // Deprovision is the public shim: it routes the request through the lease's
@@ -49,11 +51,13 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// window). Capture the teardown inputs inside the closure; the metric Dec is
 	// a side effect kept OUTSIDE the closure (UpdateFn no-side-effect contract).
 	var (
-		wasReady     bool
-		containerIDs []string
-		items        []backend.LeaseItem
-		tenant       string
-		callbackURL  string
+		wasReady      bool
+		containerIDs  []string
+		items         []backend.LeaseItem
+		tenant        string
+		callbackURL   string
+		providerUUID  string
+		stackManifest *manifest.StackManifest
 	)
 	exists := b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 		wasReady = p.Status == backend.ProvisionStatusReady
@@ -62,6 +66,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		items = append([]backend.LeaseItem(nil), p.Items...)
 		tenant = p.Tenant
 		callbackURL = p.CallbackURL
+		providerUUID = p.ProviderUUID
+		stackManifest = p.StackManifest
 	})
 	if !exists {
 		// Already deprovisioned — idempotent success.
@@ -127,18 +133,59 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
 	}
 
-	// Destroy managed volumes for all instances. Volume IDs are always
-	// service-aware now (fred-{lease}-{service}-{idx}); the legacy
-	// fred-{lease}-{idx} scheme is gone from the live path. Task 9's
-	// recover-time migration renames pre-existing legacy volumes onto
-	// the new naming convention before this code sees them.
+	// Destroy managed volumes for all instances — or soft-delete them into the
+	// retained namespace when RetainOnClose is true.
 	var volumeErrs []error
-	for _, item := range items {
-		for i := range item.Quantity {
-			volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)
-			if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
-				logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
-				volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
+	if b.cfg.RetainOnClose && b.retentionStore != nil {
+		// Enumerate the lease's ACTUAL managed volumes (ground truth — no SKU guess).
+		all, listErr := b.volumes.List()
+		if listErr != nil {
+			volumeErrs = append(volumeErrs, fmt.Errorf("list volumes for retention: %w", listErr))
+		}
+		var canonical []string
+		prefix := leaseVolumePrefix(leaseUUID)
+		for _, id := range all {
+			if strings.HasPrefix(id, prefix) { // excludes fred-retained-* and other leases
+				canonical = append(canonical, id)
+			}
+		}
+		if len(canonical) > 0 {
+			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant); err != nil {
+				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
+			}
+			retained := make([]string, 0, len(canonical))
+			for _, c := range canonical {
+				retained = append(retained, retainedName(c))
+			}
+			// RECORD-FIRST: persist the active record before any rename, so a crash
+			// between rename and record can never leak a record-less volume.
+			if err := b.retentionStore.Put(shared.RetentionEntry{
+				OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
+				Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
+				RetainedVolumeNames: retained, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
+			}); err != nil {
+				logger.Error("failed to write retention record", "lease_uuid", leaseUUID, "error", err)
+				volumeErrs = append(volumeErrs, fmt.Errorf("write retention record: %w", err))
+			} else {
+				for _, c := range canonical {
+					if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
+						logger.Error("failed to retain volume", "volume", c, "error", err)
+						volumeErrs = append(volumeErrs, fmt.Errorf("retain volume %s: %w", c, err))
+					}
+				}
+				if len(volumeErrs) == 0 {
+					logger.Info("soft-deleted lease volumes", "lease_uuid", leaseUUID, "retained", len(retained))
+				}
+			}
+		}
+	} else {
+		for _, item := range items {
+			for i := range item.Quantity {
+				volumeID := canonicalVolumeName(leaseUUID, item.ServiceName, i)
+				if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
+					logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
+					volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
+				}
 			}
 		}
 	}
