@@ -28,6 +28,7 @@ import (
 type recoveredProvision struct {
 	leasesm.ProvisionState
 	volumeCleanupAttempts int
+	restoringFrom         string
 }
 
 // materialize is the ONLY function that turns recovery/creation data into a
@@ -37,6 +38,7 @@ func (rec recoveredProvision) materialize() *provision {
 	return &provision{ //exhaustruct:enforce
 		ProvisionState:        rec.ProvisionState,
 		VolumeCleanupAttempts: rec.volumeCleanupAttempts,
+		RestoringFrom:         rec.restoringFrom,
 	}
 }
 
@@ -52,6 +54,7 @@ func recoveredFromProvision(p *provision) recoveredProvision {
 	rec := recoveredProvision{ //exhaustruct:enforce
 		ProvisionState:        p.ProvisionState,
 		volumeCleanupAttempts: p.VolumeCleanupAttempts,
+		restoringFrom:         p.RestoringFrom,
 	}
 	rec.Items = slices.Clone(p.Items)
 	rec.ContainerIDs = slices.Clone(p.ContainerIDs)
