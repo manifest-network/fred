@@ -124,6 +124,12 @@ type Config struct {
 	// HostAddress is the external address for connection info returned to tenants.
 	HostAddress string `yaml:"host_address"`
 
+	// ProductionMode tightens startup checks beyond basic validation. When true,
+	// Validate rejects dev-only insecure toggles — currently
+	// callback_insecure_skip_verify. Mirrors the docker-backend and providerd
+	// production_mode gates. Defaults to false.
+	ProductionMode bool `yaml:"production_mode"`
+
 	// CallbackInsecureSkipVerify skips TLS certificate verification for callbacks.
 	// WARNING: This disables TLS certificate validation, enabling MITM attacks.
 	// NEVER enable in production. Only use for local development with self-signed certificates.
@@ -349,6 +355,14 @@ func (c *Config) Validate() error {
 		if tq.MaxDiskMB > c.TotalDiskMB {
 			return fmt.Errorf("tenant_quota.max_disk_mb (%d) exceeds total_disk_mb (%d)", tq.MaxDiskMB, c.TotalDiskMB)
 		}
+	}
+
+	// Production mode security enforcement (runs after all basic validation).
+	// callback_insecure_skip_verify disables TLS verification on the backend →
+	// Fred callback hop; it is a dev-only escape hatch and must never reach a
+	// production deployment.
+	if c.ProductionMode && c.CallbackInsecureSkipVerify {
+		return fmt.Errorf("production_mode: callback_insecure_skip_verify cannot be enabled")
 	}
 
 	return nil
