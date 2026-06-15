@@ -557,6 +557,79 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "restarting"}, http.StatusAccepted)
 }
 
+// RestoreLease handles POST /v1/leases/{lease_uuid}/restore
+// (lease_uuid is the NEW, fresh lease; the body names the original retained lease).
+func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
+	// requireActive=FALSE: a fresh restore lease is PENDING (not yet active), so
+	// GetActiveLease would 404. Authenticate against GetLease.
+	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, false)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		FromLeaseUUID string `json:"from_lease_uuid"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.FromLeaseUUID == "" {
+		writeError(w, "from_lease_uuid is required", http.StatusBadRequest)
+		return
+	}
+	if !config.IsValidUUID(body.FromLeaseUUID) {
+		writeError(w, "from_lease_uuid is not a valid UUID", http.StatusBadRequest)
+		return
+	}
+
+	items := provisioner.ExtractLeaseItems(auth.Lease)
+
+	err := backendClient.Restore(r.Context(), backend.RestoreRequest{
+		LeaseUUID:     leaseUUID,
+		FromLeaseUUID: body.FromLeaseUUID,
+		Tenant:        auth.Token.Tenant,
+		ProviderUUID:  h.providerUUID,
+		Items:         items,
+		CallbackURL:   provisioner.BuildCallbackURL(h.callbackBaseURL),
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, backend.ErrNotRetained):
+			writeError(w, "no retained data found for that lease", http.StatusNotFound)
+		case errors.Is(err, backend.ErrInvalidState):
+			writeError(w, "lease not in a restorable state", http.StatusConflict)
+		case errors.Is(err, backend.ErrAlreadyProvisioned):
+			writeError(w, "lease already provisioned", http.StatusConflict)
+		case errors.Is(err, backend.ErrInsufficientResources):
+			writeError(w, "insufficient resources to restore", http.StatusConflict)
+		case errors.Is(err, backend.ErrValidation):
+			writeError(w, err.Error(), http.StatusBadRequest)
+		default:
+			slog.Error("failed to restore lease", "error", err, "lease_uuid", leaseUUID, "from_lease", body.FromLeaseUUID)
+			writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		}
+		return
+	}
+
+	if h.eventBroker != nil {
+		h.eventBroker.Publish(backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusProvisioning,
+			Timestamp: time.Now(),
+		})
+	}
+
+	slog.Info("lease restore initiated",
+		"lease_uuid", leaseUUID,
+		"from_lease", body.FromLeaseUUID,
+		"tenant", auth.Token.Tenant,
+		"backend", backendClient.Name(),
+	)
+
+	writeJSON(w, map[string]string{"status": "provisioning"}, http.StatusAccepted)
+}
+
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update
 func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, true)
