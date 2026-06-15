@@ -26,6 +26,16 @@ const (
 	evDeprovisionRequested
 	evRestartRequested
 	evUpdateRequested
+	// evRestoreRequested rides the EXISTING replace machinery (same as
+	// evRestartRequested/evUpdateRequested) but is permitted ONLY from
+	// Provisioning → Restarting: a restore's NEW lease is reserved at
+	// Status=Provisioning (it was never running), whereas a restart/update
+	// fire from Ready/Failed. Entering Restarting via evRestoreRequested
+	// reuses onEnterRestarting, whose applyReplaceEntry reads the prior
+	// Status (Provisioning, not Ready) and therefore yields
+	// replaceWasActive=false — so the replace-completed entry action Inc's
+	// activeProvisions, correctly bringing the lease from absent to active.
+	evRestoreRequested
 	evProvisionRequested
 	evProvisionCompleted
 	evProvisionErrored
@@ -59,6 +69,8 @@ func (e leaseEvent) String() string {
 		return "RestartRequested"
 	case evUpdateRequested:
 		return "UpdateRequested"
+	case evRestoreRequested:
+		return "RestoreRequested"
 	case evProvisionRequested:
 		return "ProvisionRequested"
 	case evProvisionCompleted:
@@ -174,6 +186,14 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		Permit(evProvisionCompleted, backend.ProvisionStatusReady).
 		Permit(evProvisionErrored, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
+		// Restore (ENG-325): the new lease is reserved at Provisioning, so a
+		// restore drives Provisioning→Restarting onto the existing replace
+		// machinery — the SOLE state from which evRestoreRequested is permitted
+		// (restart/update fire from Ready/Failed instead). Entering Restarting
+		// reuses onEnterRestarting; its prior-Status read (Provisioning, not
+		// Ready) yields replaceWasActive=false so the lease is counted active
+		// on success.
+		Permit(evRestoreRequested, backend.ProvisionStatusRestarting).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied).
 		Ignore(evProvisionRequested)
@@ -212,6 +232,12 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// actor's serial inbox is what guarantees Status consistency.
 	sm.Configure(backend.ProvisionStatusRestarting).
 		OnEntryFrom(evRestartRequested, lsm.onEnterRestarting).
+		// Restore (ENG-325) enters Restarting from Provisioning and reuses the
+		// SAME entry action: applyReplaceEntry writes Status=Restarting +
+		// CallbackURL and captures replaceWasActive from the prior Status. For
+		// the restore source (Provisioning) that read is false, which is exactly
+		// what the replace-completed entry action needs to Inc activeProvisions.
+		OnEntryFrom(evRestoreRequested, lsm.onEnterRestarting).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).

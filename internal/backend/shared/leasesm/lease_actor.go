@@ -185,6 +185,34 @@ func (m UpdateRequestedMsg) onPanic(err error) {
 	}
 }
 
+// RestoreRequestedMsg drives a restore (ENG-325) through the EXISTING
+// replace machinery — same Cancel/Work/Ack/CallbackURL shape as
+// RestartRequestedMsg. The difference is purely the SM event it fires:
+// evRestoreRequested, which is permitted only from Provisioning (a
+// restore's new lease is reserved there), versus evRestartRequested
+// from Ready/Failed. The Work closure returns a ReplaceResult consumed
+// by spawnReplaceWorker exactly as for restart/update. Exported so the
+// substrate's Restore shim can construct values and route them through
+// the actor's inbox.
+type RestoreRequestedMsg struct {
+	Cancel context.CancelFunc
+	Work   func() ReplaceResult
+	Ack    chan error
+	// CallbackURL is applied to prov.CallbackURL by onEnterRestarting
+	// (reused for the restore path) before the actor acks — the actor,
+	// not the HTTP prelude, is the sole writer of that field (ENG-230).
+	CallbackURL string
+}
+
+func (RestoreRequestedMsg) isLeaseMessage()         {}
+func (RestoreRequestedMsg) doneChan() chan struct{} { return nil }
+func (m RestoreRequestedMsg) onPanic(err error) {
+	select {
+	case m.Ack <- err:
+	default:
+	}
+}
+
 // replaceCompletedMsg / replaceRecoveredMsg / replaceFailedMsg fire the
 // Restarting|Updating exit transition after the goroutine finishes. The
 // goroutine picks which to send based on (err == nil, final Status):
@@ -530,6 +558,8 @@ func (a *LeaseActor) handle(msg LeaseMessage) {
 		a.handleRestartRequested(m)
 	case UpdateRequestedMsg:
 		a.handleUpdateRequested(m)
+	case RestoreRequestedMsg:
+		a.handleRestoreRequested(m)
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
@@ -757,6 +787,40 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 	// func, which onExitProvisioning uses on Deprovision-preempt. workCancel
 	// is consumed only by onExitProvisioning, which can run only after the
 	// state was entered (i.e. after a successful fire).
+	a.workCancel = msg.Cancel
+	msg.Ack <- nil
+	a.spawnReplaceWorker(msg.Work)
+}
+
+// handleRestoreRequested drives a restore (ENG-325) onto the existing
+// replace machinery. It is a clone of handleRestartRequested with one
+// difference: it fires evRestoreRequested (permitted only from
+// Provisioning, the state a restore's new lease is reserved in) instead
+// of evRestartRequested. The destination state is still Restarting, so
+// onEnterRestarting (reused via OnEntryFrom(evRestoreRequested)) writes
+// Status=Restarting + CallbackURL before the ack, and spawnReplaceWorker
+// + the evReplace{Completed,Recovered,Failed} terminal events behave
+// identically. Because the prior Status was Provisioning (not Ready),
+// applyReplaceEntry sets replaceWasActive=false, so a successful restore
+// Inc's activeProvisions — bringing the lease from absent to active.
+func (a *LeaseActor) handleRestoreRequested(msg RestoreRequestedMsg) {
+	if a.terminated {
+		msg.Ack <- errActorTerminated
+		return
+	}
+	// onEnterRestarting writes Status=Restarting (+ CallbackURL) inside this
+	// Fire, before the ack — preserving the handler-publish contract.
+	if err := a.fireAndVerify(evRestoreRequested, backend.ProvisionStatusRestarting,
+		replaceEntryArgs{CallbackURL: msg.CallbackURL}); err != nil {
+		// Restore is permitted only from Provisioning; from any other state
+		// (e.g. a duplicate after the SM already left Provisioning, or a
+		// concurrent Deprovision) classifyReplaceReject yields ErrInvalidState
+		// (→409).
+		msg.Ack <- a.classifyReplaceReject(err)
+		return
+	}
+	// Set workCancel only AFTER a successful fire (ENG-230 §4); see
+	// handleRestartRequested for the rationale.
 	a.workCancel = msg.Cancel
 	msg.Ack <- nil
 	a.spawnReplaceWorker(msg.Work)

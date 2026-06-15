@@ -1179,6 +1179,211 @@ func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 func TestRestartFromFailed_Succeeds(t *testing.T) { runReplaceFromFailedSucceedsTest(t, "restart") }
 func TestUpdateFromFailed_Succeeds(t *testing.T)  { runReplaceFromFailedSucceedsTest(t, "update") }
 
+// TestRestoreRequestedMsg_FiresEventAndSpawnsWorker pins the restore
+// plumbing (ENG-325 Task 7a): a RestoreRequestedMsg rides the existing
+// replace machinery from the Provisioning state. The new restore lease
+// was reserved at Status=Provisioning (it was never running), so:
+//
+//   - evRestoreRequested is permitted Provisioning→Restarting (whereas
+//     evRestartRequested fires from Ready/Failed).
+//   - The entry action (onEnterRestarting, reused) writes Status=Restarting
+//     and applies the CallbackURL before the ack (handler-publish contract).
+//   - replaceWasActive ends up false (prior Status was Provisioning, not
+//     Ready), so onEnterReadyFromReplaceCompleted Inc's activeProvisions —
+//     a restore brings a lease from absent to active.
+//
+// On a successful ReplaceResult the SM reaches Ready via evReplaceCompleted
+// and the gauge increments exactly once.
+func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID:   "lease-1",
+		Tenant:      "tenant-a",
+		Status:      backend.ProvisionStatusProvisioning,
+		CallbackURL: "old-cb",
+	})
+
+	metrics := &countingMetrics{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actor := newTestActor(t, "lease-1", testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+		Metrics:        metrics,
+	})
+	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State(),
+		"test precondition: SM must start in Provisioning (restore reserves the new lease there)")
+
+	// Block the worker so we can observe Restarting + CallbackURL before it
+	// flips the lease to Ready.
+	workerRelease := make(chan struct{})
+	ack := make(chan error, 1)
+	require.True(t, actor.TryEnqueue(RestoreRequestedMsg{
+		Cancel:      func() {},
+		CallbackURL: "new-cb",
+		Work: func() ReplaceResult {
+			<-workerRelease
+			return ReplaceResult{Success: ReplaceSuccessResult{ContainerIDs: []string{"c1"}}}
+		},
+		Ack: ack,
+	}))
+
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "restore from Provisioning must be accepted by the SM")
+	case <-time.After(2 * time.Second):
+		t.Fatal("no ack received from handleRestoreRequested")
+	}
+
+	prov, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
+		"actor must write Status=Restarting BEFORE acking (handler-publish contract)")
+	assert.Equal(t, "new-cb", prov.CallbackURL,
+		"actor must apply the message CallbackURL before acking")
+	assert.False(t, actor.replaceWasActive,
+		"replaceWasActive must be false for a Provisioning→Restarting restore (lease was absent, not active)")
+
+	// Release the worker → evReplaceCompleted → Ready, gauge Inc once.
+	close(workerRelease)
+	require.Eventually(t, func() bool {
+		return actor.State() == backend.ProvisionStatusReady
+	}, 2*time.Second, 10*time.Millisecond,
+		"SM must reach Ready via replaceCompleted after the restore worker succeeds")
+
+	final, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, []string{"c1"}, final.ContainerIDs,
+		"ContainerIDs must reflect the restore worker's success result")
+	assert.Equal(t, int64(1), metrics.activeProvisionsInc.Load(),
+		"a restore that brings a lease from absent to active must Inc activeProvisions exactly once")
+	assert.Equal(t, int64(0), metrics.activeProvisionsDec.Load(),
+		"a successful restore must not Dec activeProvisions")
+}
+
+// TestRestoreRequested_RejectedFromBadState mirrors the restart
+// loses-to-deprovision case: evRestoreRequested is NOT permitted from
+// Deprovisioning, so a restore against a deprovisioning lease must be
+// rejected via classifyReplaceReject (ErrInvalidState → 409) and spawn
+// no worker. (Restore is only permitted from Provisioning.)
+func TestRestoreRequested_RejectedFromBadState(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady})
+
+	// No-spawn: drive the handlers synchronously. The default DoDeprovisionFn
+	// is a no-op that leaves the provision in place, so the SM stays in
+	// Deprovisioning with terminated=false (the partial-deprovision actor).
+	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	require.NoError(t, actor.handleDeprovision(context.Background()))
+	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
+		"test precondition: SM must be Deprovisioning")
+
+	var workerCount atomic.Int64
+	ack := make(chan error, 1)
+	actor.handleRestoreRequested(RestoreRequestedMsg{
+		Cancel: func() {},
+		Work:   func() ReplaceResult { workerCount.Add(1); return ReplaceResult{} },
+		Ack:    ack,
+	})
+
+	select {
+	case err := <-ack:
+		require.ErrorIs(t, err, backend.ErrInvalidState,
+			"restore against a deprovisioning lease must be rejected with ErrInvalidState (→409)")
+	default:
+		t.Fatal("handler did not ack the rejected restore")
+	}
+	assert.Equal(t, int64(0), workerCount.Load(),
+		"no restore worker may be spawned when the lease is deprovisioning")
+}
+
+// TestRestoreRequestedMsg_RejectsWhenTerminated mirrors the Restart arm
+// of TestTerminatedActor_RejectsCallerFacingRequests: a restore routed
+// to a terminated actor (post-handleDeprovision, pre-registry-removal)
+// must reject with errActorTerminated and spawn no worker.
+func TestRestoreRequestedMsg_RejectsWhenTerminated(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusDeprovisioning,
+	})
+	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	actor.terminated = true
+
+	var workerSpawned atomic.Bool
+	msg := RestoreRequestedMsg{
+		Cancel: func() {},
+		Work: func() ReplaceResult {
+			workerSpawned.Store(true)
+			return ReplaceResult{}
+		},
+		Ack: make(chan error, 1),
+	}
+	actor.handleRestoreRequested(msg)
+
+	select {
+	case err := <-msg.Ack:
+		assert.ErrorIs(t, err, errActorTerminated,
+			"terminated actor must reject Restore with errActorTerminated")
+	case <-time.After(time.Second):
+		t.Fatal("ack channel never received a value")
+	}
+	time.Sleep(20 * time.Millisecond)
+	assert.False(t, workerSpawned.Load(),
+		"terminated actor must NOT spawn a replace worker for Restore")
+}
+
+// TestSpawnReplaceWorker_RestorePanicRecovery exercises a panic in the
+// restore Work closure end-to-end through handleRestoreRequested: the
+// replace worker's recover must drive the SM to Failed (via
+// evReplaceFailed) and ack the restore without crashing fred. The
+// restore reuses spawnReplaceWorker, so this is the restore-shaped
+// mirror of TestSpawnReplaceWorker_PanicRecovery.
+func TestSpawnReplaceWorker_RestorePanicRecovery(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Tenant:    "tenant-a",
+		Status:    backend.ProvisionStatusProvisioning,
+	})
+
+	metrics := &countingMetrics{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actor := newTestActor(t, "lease-1", testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+		Metrics:        metrics,
+	})
+
+	panicsBefore := metrics.workerPanic.Load()
+
+	ack := make(chan error, 1)
+	require.True(t, actor.TryEnqueue(RestoreRequestedMsg{
+		Cancel: func() {},
+		Work: func() ReplaceResult {
+			panic("synthetic restore panic")
+		},
+		Ack: ack,
+	}))
+
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "restore from Provisioning must be accepted before the worker runs")
+	case <-time.After(2 * time.Second):
+		t.Fatal("no ack received from handleRestoreRequested")
+	}
+
+	require.Eventually(t, func() bool {
+		return actor.State() == backend.ProvisionStatusFailed
+	}, 2*time.Second, 10*time.Millisecond,
+		"SM must transition to Failed after restore worker panic recovery")
+
+	assert.Equal(t, panicsBefore+1, metrics.workerPanic.Load(),
+		"WorkerPanic metric must increment by 1 after restore worker panic")
+}
+
 // countingMetrics implements SMMetrics with atomic counters so tests
 // can assert on metric calls without needing the docker prometheus
 // adapter. Useful for tests that verify panic-recovery hooks or other
