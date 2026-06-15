@@ -241,6 +241,26 @@ var (
 		Name:      "circuit_breaker_state",
 		Help:      "Circuit breaker state (0=closed, 1=half-open, 2=open)",
 	}, []string{"backend"})
+
+	// BackendAllocatedCPURatio tracks the allocated-CPU ratio fred observed for
+	// each backend at provision-routing time (allocated/total). Distinct from the
+	// backend's own resource_cpu_allocated_ratio: this is fred's view, including
+	// staleness, recorded only on multi-candidate provision-routing decisions.
+	BackendAllocatedCPURatio = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "allocated_cpu_ratio",
+		Help:      "Allocated-CPU ratio observed by the router at provision time (allocated/total). Per-backend router-decision signal, event-sampled on multi-candidate routing; not intended for cross-backend aggregation (avg of ratios is not statistically valid) — use the backends' own /stats component gauges for fleet views.",
+	}, []string{"backend"})
+
+	// RoutingFallbackTotal counts provision-routing decisions that fell back to
+	// round-robin because no SKU-matching backend exposed usable load stats.
+	RoutingFallbackTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "routing_fallback_total",
+		Help:      "Provision-routing decisions that fell back to round-robin (no usable backend load stats)",
+	})
 )
 
 // Rate limit metrics
