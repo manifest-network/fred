@@ -585,6 +585,14 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("orphaned volume cleanup failed: %w", err)
 	}
 
+	// Boot-eager reap: destroy volumes that expired while fred was offline.
+	// The periodic sweep handles ongoing reaping; this catches the gap between
+	// the last reap and the restart.
+	if _, err := b.reapExpiredRetentions(b.stopCtx); err != nil {
+		b.logger.Warn("retention boot reap failed", "error", err)
+	}
+	b.startRetentionReaper()
+
 	// Replay any pending callbacks from a previous run
 	b.callbackSender.ReplayPendingCallbacks()
 

@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -725,5 +726,274 @@ func TestVolumeNameHelpers(t *testing.T) {
 	}
 	if got := leaseVolumePrefix("u1"); got != "fred-u1-" {
 		t.Errorf("leaseVolumePrefix: got %q, want %q", got, "fred-u1-")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: grace reaper + periodic restore reconcile
+// ---------------------------------------------------------------------------
+
+// TestReapExpiredRetentions verifies the grace reaper:
+//   - Destroys volumes and removes the store record for an expired ACTIVE entry.
+//   - Leaves a fresh ACTIVE entry alone (not yet expired).
+//   - Leaves a RESTORING entry alone even when old (not eligible for reaping).
+//   - Returns count == 1 (only the expired active entry was reaped).
+func TestReapExpiredRetentions(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour // 90 days
+
+	// (a) expired ACTIVE entry — should be reaped.
+	expiredActive := shared.RetentionEntry{
+		OriginalLeaseUUID:   "old-active",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-old-app-0"},
+		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
+	}
+	require.NoError(t, rs.Put(expiredActive))
+
+	// (b) fresh ACTIVE entry — should NOT be reaped.
+	freshActive := shared.RetentionEntry{
+		OriginalLeaseUUID:   "fresh-active",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-fresh-app-0"},
+		CreatedAt:           time.Now(),
+	}
+	require.NoError(t, rs.Put(freshActive))
+
+	// (c) expired RESTORING entry — should NOT be reaped (only active entries are eligible).
+	expiredRestoring := shared.RetentionEntry{
+		OriginalLeaseUUID:   "old-restoring",
+		Tenant:              "tenant-a",
+		NewLeaseUUID:        "u2",
+		Status:              shared.RetentionStatusRestoring,
+		RetainedVolumeNames: []string{"fred-retained-old-restoring-app-0"},
+		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
+	}
+	require.NoError(t, rs.Put(expiredRestoring))
+
+	var mu sync.Mutex
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error {
+			mu.Lock()
+			destroyed = append(destroyed, id)
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	n, err := b.reapExpiredRetentions(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "exactly one expired active entry must be reaped")
+
+	mu.Lock()
+	gotDestroyed := append([]string(nil), destroyed...)
+	mu.Unlock()
+
+	// Only the expired active volume is destroyed.
+	assert.Contains(t, gotDestroyed, "fred-retained-old-app-0", "expired active volume must be destroyed")
+	assert.NotContains(t, gotDestroyed, "fred-retained-fresh-app-0", "fresh active volume must NOT be destroyed")
+	assert.NotContains(t, gotDestroyed, "fred-retained-old-restoring-app-0", "restoring volume must NOT be destroyed")
+
+	// The expired active record must be gone from the store.
+	entry, err := rs.Get("old-active")
+	require.NoError(t, err)
+	assert.Nil(t, entry, "expired active record must be removed from store")
+
+	// The fresh active record must remain.
+	fresh, err := rs.Get("fresh-active")
+	require.NoError(t, err)
+	assert.NotNil(t, fresh, "fresh active record must remain in store")
+
+	// The restoring record must remain.
+	restoring, err := rs.Get("old-restoring")
+	require.NoError(t, err)
+	assert.NotNil(t, restoring, "restoring record must remain in store")
+}
+
+// TestReapExpiredRetentions_DisabledWhenMaxAgeZero verifies that the reaper
+// is a no-op when RetentionMaxAge==0, even with an old record present.
+func TestReapExpiredRetentions_DisabledWhenMaxAgeZero(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.RetentionMaxAge = 0 // disabled
+
+	// Seed an old record that would normally be reaped.
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "old-lease",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-old-lease-app-0"},
+		CreatedAt:           time.Now().Add(-365 * 24 * time.Hour),
+	}))
+
+	destroyCalled := false
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, _ string) error {
+			destroyCalled = true
+			return nil
+		},
+	}
+
+	n, err := b.reapExpiredRetentions(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "no entries must be reaped when RetentionMaxAge==0")
+	assert.False(t, destroyCalled, "Destroy must NOT be called when RetentionMaxAge==0")
+}
+
+// TestReapExpiredRetentions_DestroyFailureReRecordsForRetry verifies the
+// self-heal path: when a Destroy fails after ReapIfExpired atomically removed
+// the record, the (still-expired) entry is re-recorded so the next sweep retries
+// the destroy — avoiding a permanent orphaned-volume disk leak. A subsequent
+// sweep with a succeeding Destroy then fully reaps it.
+func TestReapExpiredRetentions_DestroyFailureReRecordsForRetry(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour
+
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "old-active",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-old-app-0"},
+		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
+	}))
+
+	var mu sync.Mutex
+	failDestroy := true
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, _ string) error {
+			mu.Lock()
+			fail := failDestroy
+			mu.Unlock()
+			if fail {
+				return errors.New("docker destroy failed")
+			}
+			return nil
+		},
+	}
+
+	// First sweep: Destroy fails -> record must be re-recorded for retry.
+	n, err := b.reapExpiredRetentions(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "a Destroy failure must NOT count as reaped")
+
+	entry, err := rs.Get("old-active")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "record must be re-recorded after Destroy failure so the next sweep retries")
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "re-recorded entry must stay active+expired")
+	assert.Equal(t, []string{"fred-retained-old-app-0"}, entry.RetainedVolumeNames)
+
+	// Second sweep: Destroy succeeds -> record fully reaped.
+	mu.Lock()
+	failDestroy = false
+	mu.Unlock()
+
+	n, err = b.reapExpiredRetentions(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "retry with a succeeding Destroy must reap the record")
+
+	entry, err = rs.Get("old-active")
+	require.NoError(t, err)
+	assert.Nil(t, entry, "record must be removed after a successful retry")
+}
+
+// TestRunRetentionSweep_ReconcilesRestoring verifies that the periodic sweep
+// rolls back an orphaned restoring record (no live provision for the new lease).
+// This mirrors TestReconcileRestoring_RollsBackOrphan but exercises runRetentionSweep
+// to confirm it invokes reconcileRestoring for each restoring record.
+func TestRunRetentionSweep_ReconcilesRestoring(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour
+
+	var mu sync.Mutex
+	var downProjects []string
+	type renameCall struct{ old, new string }
+	var renames []renameCall
+
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
+			mu.Lock()
+			downProjects = append(downProjects, projectName)
+			mu.Unlock()
+			return nil
+		},
+	}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			renames = append(renames, renameCall{old, new})
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	// Seed a restoring record with no live provision for u2 (orphaned).
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		NewLeaseUUID:        "u2",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          3,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+	}
+	require.NoError(t, rs.Put(e))
+
+	err := b.runRetentionSweep(context.Background())
+	require.NoError(t, err)
+
+	mu.Lock()
+	gotDown := append([]string(nil), downProjects...)
+	gotRenames := append([]renameCall(nil), renames...)
+	mu.Unlock()
+
+	// reconcileRestoring must have been invoked: compose Down for u2's project.
+	assert.Contains(t, gotDown, composeProjectName("u2"),
+		"compose Down must be called for the orphaned restore's new lease")
+
+	// Volume must be re-quarantined.
+	assert.Contains(t, gotRenames, renameCall{
+		old: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
+		new: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
+	}, "volume must be renamed from new canonical to original retained name")
+
+	// Record must have reverted to active.
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
+	assert.Equal(t, 4, entry.Generation, "generation must be bumped")
+	assert.Empty(t, entry.NewLeaseUUID)
+}
+
+// TestStartRetentionReaper_NoopWhenDisabled verifies that startRetentionReaper
+// returns immediately when RetentionMaxAge==0.
+func TestStartRetentionReaper_NoopWhenDisabled(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	attachRetentionStore(t, b)
+	b.cfg.RetentionMaxAge = 0 // disabled
+
+	// Must not block, must not panic.
+	done := make(chan struct{})
+	go func() {
+		b.startRetentionReaper()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// good: returned without blocking
+	case <-time.After(time.Second):
+		t.Fatal("startRetentionReaper blocked when RetentionMaxAge==0 — expected immediate return")
 	}
 }

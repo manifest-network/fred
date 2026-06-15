@@ -10,6 +10,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // retainedVolumePrefix is the namespace soft-deleted volumes are renamed into.
@@ -191,4 +193,87 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 		}
 	}
 	return nil
+}
+
+// reapExpiredRetentions hard-deletes retained volumes past RetentionMaxAge.
+// Returns the count of records FULLY reaped (all volumes destroyed AND the
+// record removed). If a Destroy fails after ReapIfExpired atomically removed the
+// record, the (still-expired) entry is re-recorded so the next sweep retries the
+// destroy; that record is NOT counted as reaped.
+func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
+	if b.retentionStore == nil || b.cfg.RetentionMaxAge <= 0 {
+		return 0, nil
+	}
+	candidates, err := b.retentionStore.ListExpired(b.cfg.RetentionMaxAge)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	for _, e := range candidates {
+		names, err := b.retentionStore.ReapIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
+		if err != nil {
+			b.logger.Error("reap: store error", "lease_uuid", e.OriginalLeaseUUID, "error", err)
+			continue
+		}
+		if names == nil {
+			continue // concurrently claimed/changed since the snapshot — skip
+		}
+		destroyFailed := false
+		for _, name := range names {
+			if derr := b.volumes.Destroy(ctx, name); derr != nil {
+				b.logger.Error("reap: destroy volume", "volume", name, "error", derr)
+				destroyFailed = true
+			}
+		}
+		if destroyFailed {
+			// A Destroy failed AFTER ReapIfExpired atomically removed the record.
+			// Re-record the (still-expired) entry so the next sweep retries the
+			// destroy; ClaimForRestore rejects expired records, so it cannot be
+			// adopted in the meantime. (Idempotent: already-destroyed names no-op.)
+			if perr := b.retentionStore.Put(e); perr != nil {
+				b.logger.Error("reap: re-record for retry failed; volume(s) leaked until manual cleanup", "lease_uuid", e.OriginalLeaseUUID, "error", perr)
+			}
+			continue // not counted as reaped
+		}
+		n++
+	}
+	return n, nil
+}
+
+// runRetentionSweep is the PERIODIC reaper body: reap expired + reconcile any
+// restoring records (a running-process backstop for restores that failed since
+// the last tick). The BOOT path does NOT call this: at startup reconcileRetentions
+// (before cleanup) handles restoring records and an eager reapExpiredRetentions
+// (after cleanup) handles expired ones, so restoring records aren't double-reconciled.
+func (b *Backend) runRetentionSweep(ctx context.Context) error {
+	if _, err := b.reapExpiredRetentions(ctx); err != nil {
+		return err
+	}
+	if b.retentionStore == nil {
+		return nil
+	}
+	recs, err := b.retentionStore.ListRestoring()
+	if err != nil {
+		return err
+	}
+	for _, e := range recs {
+		b.reconcileRestoring(ctx, e)
+	}
+	return nil
+}
+
+// startRetentionReaper runs the periodic sweep on the backend's lifecycle goroutine.
+func (b *Backend) startRetentionReaper() {
+	if b.retentionStore == nil || b.cfg.RetentionMaxAge <= 0 {
+		return
+	}
+	interval := b.cfg.RetentionReapInterval
+	if interval <= 0 {
+		interval = b.cfg.RetentionMaxAge
+	}
+	b.wg.Go(func() {
+		util.StartCleanupLoop(b.stopCtx, interval, func() error {
+			return b.runRetentionSweep(b.stopCtx)
+		}, "retention", func(any) { metrics.CleanupPanicsTotal.WithLabelValues("retention").Inc() })
+	})
 }
