@@ -76,6 +76,12 @@ type Backend interface {
 	// Returns ErrNotProvisioned if lease not found, ErrInvalidState if not updatable.
 	Update(ctx context.Context, req UpdateRequest) error
 
+	// Restore re-provisions a new lease from the retained volumes of a prior
+	// soft-deleted lease (ENG-325). Returns ErrNotRetained if no retained data
+	// exists for FromLeaseUUID, ErrInvalidState if the target lease is not in
+	// a valid state for restore, ErrValidation for bad inputs.
+	Restore(ctx context.Context, req RestoreRequest) error
+
 	// ReconcileCustomDomain reapplies the per-LeaseItem custom_domain values
 	// from chain onto the running provision. When any item's CustomDomain
 	// differs from the in-memory provision state, the backend snapshots the
@@ -540,12 +546,14 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrInsufficientResources: 503 from Provision (backend at capacity, not unhealthy)
 			//   - ErrAlreadyProvisioned: 409 from Provision (idempotent duplicate)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
+			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			return err == nil ||
 				errors.Is(err, ErrNotProvisioned) ||
 				errors.Is(err, ErrValidation) ||
 				errors.Is(err, ErrInsufficientResources) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
-				errors.Is(err, ErrInvalidState)
+				errors.Is(err, ErrInvalidState) ||
+				errors.Is(err, ErrNotRetained)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -985,6 +993,55 @@ func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) 
 			return nil, ErrInvalidState
 		default:
 			return nil, fmt.Errorf("update failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return ErrCircuitOpen
+	}
+	return cbErr
+}
+
+// Restore sends a restore request to the backend.
+func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("restore", start, err) }()
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal restore request: %w", err)
+	}
+
+	_, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restore", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("restore request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		switch resp.StatusCode {
+		case http.StatusAccepted:
+			return nil, nil
+		case http.StatusUnprocessableEntity:
+			return nil, ErrNotRetained
+		case http.StatusConflict:
+			return nil, ErrInvalidState
+		case http.StatusBadRequest:
+			// Reconstruct the validation sub-category sentinel from the
+			// validation_code body field (matching Provision/Update). Restore's
+			// prelude returns ErrUnknownSKU/ErrInvalidManifest/ErrImageNotAllowed
+			// via GetSKUProfile/ValidateImage; the returned error still wraps
+			// ErrValidation so the breaker allowlist and 400 mapping hold.
+			return nil, parseValidationError(readErrorBodyBytes(resp))
+		default:
+			return nil, fmt.Errorf("restore failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 	})
 

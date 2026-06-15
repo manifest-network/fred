@@ -125,6 +125,9 @@ func (m *mockReconcilerBackend) Restart(ctx context.Context, req backend.Restart
 func (m *mockReconcilerBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return nil
 }
+func (m *mockReconcilerBackend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+	return backend.ErrNotRetained
+}
 func (m *mockReconcilerBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1498,6 +1501,9 @@ func (m *mockCancellingBackend) Restart(ctx context.Context, req backend.Restart
 func (m *mockCancellingBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return nil
 }
+func (m *mockCancellingBackend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+	return backend.ErrNotRetained
+}
 func (m *mockCancellingBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
 	return nil
 }
@@ -1920,6 +1926,9 @@ func (m *mockConcurrencyBackend) Restart(ctx context.Context, req backend.Restar
 }
 func (m *mockConcurrencyBackend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return nil
+}
+func (m *mockConcurrencyBackend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+	return backend.ErrNotRetained
 }
 func (m *mockConcurrencyBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
 	return nil
