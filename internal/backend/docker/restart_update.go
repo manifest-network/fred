@@ -222,8 +222,18 @@ type replaceContainersOp struct {
 	Profiles          map[string]SKUProfile
 	OldContainerIDs   []string
 	ServiceContainers map[string][]string // old service → container IDs mapping
-	Operation         string              // "restart" or "update"
+	Operation         string              // "restart", "update", or "restore"
 	Logger            *slog.Logger
+
+	// NoComposeRollback disables the failure-path rollbackViaCompose. The
+	// restore op sets it: there are NO prior containers to "recover" to (the
+	// new lease was reserved at Provisioning, never Ready), and the restore
+	// caller (doRestore) owns its own compensating teardown — compose.Down +
+	// re-quarantining the adopted volumes back to the retained namespace. With
+	// this true, Restored stays false on failure, so spawnReplaceWorker
+	// dispatches replaceFailedMsg (terminal Failed) rather than
+	// replaceRecoveredMsg. Defaults false: restart/update are unaffected.
+	NoComposeRollback bool
 
 	// OnSuccess is called under provisionsMu lock after successful replacement.
 	OnSuccess func(prov *leasesm.ProvisionState)
@@ -262,8 +272,15 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			failureLogs := b.captureContainerLogs(newContainerIDs, stackContainerLogKeys(newServiceContainers))
 
 			// Rollback: rebuild the Project from the previous StackManifest and
-			// Compose Up to restore the old containers.
-			restored := b.rollbackViaCompose(op)
+			// Compose Up to restore the old containers. Skipped for the restore
+			// op (NoComposeRollback): a failed restore has no prior containers to
+			// recover to — doRestore's terminal defer does the compensating
+			// teardown — and leaving Restored=false makes spawnReplaceWorker fire
+			// replaceFailedMsg (terminal Failed) instead of replaceRecoveredMsg.
+			restored := false
+			if !op.NoComposeRollback {
+				restored = b.rollbackViaCompose(op)
+			}
 			if restored {
 				op.Logger.Info("rolled back to previous containers via compose (stack)")
 				callbackErr += "; rolled back to previous version"

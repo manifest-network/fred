@@ -3,13 +3,17 @@ package docker
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/util"
 )
@@ -276,4 +280,316 @@ func (b *Backend) startRetentionReaper() {
 			return b.runRetentionSweep(b.stopCtx)
 		}, "retention", func(any) { metrics.CleanupPanicsTotal.WithLabelValues("retention").Inc() })
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Restore as a first-class backend operation (ENG-325, Task 7b)
+// ---------------------------------------------------------------------------
+
+// totalQuantity sums the per-item quantities of a lease item set.
+func totalQuantity(items []backend.LeaseItem) int {
+	total := 0
+	for _, item := range items {
+		total += item.Quantity
+	}
+	return total
+}
+
+// itemsShapeMatch reports nil iff a and b carry identical service-name →
+// summed-quantity maps. A restore's new-lease items must match the retained
+// set's shape exactly (the volumes are addressed by serviceName×instanceIndex),
+// so a divergence is a validation error.
+func itemsShapeMatch(a, b []backend.LeaseItem) error {
+	shape := func(items []backend.LeaseItem) map[string]int {
+		m := make(map[string]int, len(items))
+		for _, it := range items {
+			m[it.ServiceName] += it.Quantity
+		}
+		return m
+	}
+	sa, sb := shape(a), shape(b)
+	if len(sa) != len(sb) {
+		return fmt.Errorf("restore items shape mismatch: retained has %d services, request has %d", len(sa), len(sb))
+	}
+	for svc, q := range sa {
+		if sb[svc] != q {
+			return fmt.Errorf("restore items shape mismatch for service %q: retained quantity %d, request %d", svc, q, sb[svc])
+		}
+	}
+	return nil
+}
+
+// releaseAll releases every pool allocation id (best-effort, idempotent).
+func releaseAll(pool *shared.ResourcePool, ids []string) {
+	for _, id := range ids {
+		pool.Release(id)
+	}
+}
+
+// adoptRetainedVolumes renames each retained volume (fred-retained-<orig>-…)
+// to its new-lease canonical name (fred-<newLease>-…). Returns the first error;
+// the caller fully rolls back on failure. RenameVolume is synchronous, so no
+// context is threaded.
+func (b *Backend) adoptRetainedVolumes(newLease string, rec *shared.RetentionEntry) error {
+	for _, item := range rec.Items {
+		for i := range item.Quantity {
+			retained := retainedName(canonicalVolumeName(rec.OriginalLeaseUUID, item.ServiceName, i))
+			canonical := canonicalVolumeName(newLease, item.ServiceName, i)
+			if err := b.volumes.RenameVolume(retained, canonical); err != nil {
+				return fmt.Errorf("adopt volume %s -> %s: %w", retained, canonical, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Restore adopts a soft-deleted lease's retained volumes into a NEW lease and
+// brings up its stack from the retained manifest (ENG-325). The new lease is
+// reserved at Provisioning and driven through the existing replace machinery via
+// evRestoreRequested (Provisioning→Restarting→Ready|Failed).
+//
+// The flow is the reviewed Rev 5 design; ordering is load-bearing:
+//
+//	(a) validate against the retained record (read-only),
+//	(b) reserve the new-lease provision at Provisioning (reject if live),
+//	(c) allocate pool slots,
+//	(d) ATOMICALLY claim active→restoring (closes the prelude-vs-reaper race),
+//	(e) adopt: rename retained→canonical (full rollback on failure),
+//	(f) hand off to the actor; doRestore's terminal defer owns success/failure/panic.
+//
+// Synchronous errors (validation, already-provisioned, insufficient resources,
+// not-retained, not-restorable) are returned to the caller; asynchronous outcomes
+// flow via the lease callback.
+func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+	logger := b.logger.With("lease_uuid", req.LeaseUUID, "from_lease", req.FromLeaseUUID, "tenant", req.Tenant)
+
+	if b.retentionStore == nil {
+		return backend.ErrNotRetained
+	}
+
+	// (a) Validate against the retained record (read-only; the authoritative
+	// claim is atomic, step d).
+	rec, err := b.retentionStore.Get(req.FromLeaseUUID)
+	if err != nil {
+		return fmt.Errorf("read retention store: %w", err)
+	}
+	if rec == nil || rec.Tenant != req.Tenant { // collapse not-found + cross-tenant into one
+		if rec != nil {
+			logger.Warn("restore tenant mismatch", "entry_tenant", rec.Tenant)
+		}
+		return backend.ErrNotRetained
+	}
+	if err := itemsShapeMatch(rec.Items, req.Items); err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
+	// Defensive provider cross-check: the reservation uses rec.ProviderUUID, but a
+	// retained record for a different provider should never be restorable here.
+	// Skip when the request omits it (req.ProviderUUID == "").
+	if req.ProviderUUID != "" && req.ProviderUUID != rec.ProviderUUID {
+		logger.Warn("restore provider mismatch", "entry_provider", rec.ProviderUUID, "request_provider", req.ProviderUUID)
+		return fmt.Errorf("%w: provider mismatch", backend.ErrValidation)
+	}
+	// A retained record always carries a StackManifest (written at soft-delete);
+	// a nil one is a corrupt record — reject rather than nil-deref below.
+	if rec.StackManifest == nil || len(rec.Items) == 0 {
+		logger.Error("restore: corrupt retained record (nil manifest or no items)")
+		return fmt.Errorf("%w: corrupt retained record", backend.ErrValidation)
+	}
+	profiles := map[string]SKUProfile{}
+	for _, item := range rec.Items {
+		if _, ok := profiles[item.SKU]; ok {
+			continue
+		}
+		p, perr := b.cfg.GetSKUProfile(item.SKU)
+		if perr != nil {
+			return fmt.Errorf("%w: %w", backend.ErrValidation, perr)
+		}
+		profiles[item.SKU] = p
+	}
+	for svc, m := range rec.StackManifest.Services {
+		if ierr := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); ierr != nil {
+			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svc, ierr)
+		}
+	}
+
+	// (b) Reserve the new-lease entry at Status=Provisioning, tagged
+	// restoringFrom. (7a permits evRestoreRequested from Provisioning.) Reject
+	// if already provisioned.
+	b.provisionsMu.Lock()
+	if _, exists := b.provisions[req.LeaseUUID]; exists {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID)
+	}
+	b.provisions[req.LeaseUUID] = recoveredProvision{ //exhaustruct:enforce
+		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
+			LeaseUUID:         req.LeaseUUID,
+			Tenant:            rec.Tenant,
+			ProviderUUID:      rec.ProviderUUID,
+			SKU:               rec.Items[0].SKU,
+			Status:            backend.ProvisionStatusProvisioning,
+			Quantity:          totalQuantity(rec.Items),
+			CreatedAt:         time.Now(),
+			FailCount:         0,
+			LastError:         "",
+			CallbackURL:       req.CallbackURL,
+			Items:             slices.Clone(rec.Items),
+			ContainerIDs:      make([]string, 0),
+			StackManifest:     rec.StackManifest,
+			ServiceContainers: nil,
+		},
+		volumeCleanupAttempts: 0,
+		restoringFrom:         req.FromLeaseUUID,
+	}.materialize()
+	b.provisionsMu.Unlock()
+
+	// (c) Allocate pool slots.
+	var allocatedIDs []string
+	for _, item := range rec.Items {
+		for i := range item.Quantity {
+			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
+			if aerr := b.pool.TryAllocate(id, item.SKU, rec.Tenant); aerr != nil {
+				releaseAll(b.pool, allocatedIDs)
+				updateResourceMetrics(b.pool.Stats())
+				b.removeProvision(req.LeaseUUID)
+				return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr)
+			}
+			allocatedIDs = append(allocatedIDs, id)
+		}
+	}
+
+	// (d) ATOMIC claim active->restoring (closes the prelude-vs-reaper race).
+	// Nothing renamed yet.
+	claimed, err := b.retentionStore.ClaimForRestore(req.FromLeaseUUID, req.LeaseUUID, b.cfg.RetentionMaxAge)
+	if err != nil {
+		releaseAll(b.pool, allocatedIDs)
+		updateResourceMetrics(b.pool.Stats())
+		b.removeProvision(req.LeaseUUID)
+		switch {
+		case errors.Is(err, shared.ErrNoRetention):
+			return backend.ErrNotRetained
+		case errors.Is(err, shared.ErrNotRestorable):
+			return fmt.Errorf("%w: %w", backend.ErrInvalidState, err)
+		default:
+			return fmt.Errorf("claim retention: %w", err)
+		}
+	}
+
+	// (e) Adopt: rename retained->canonical. On failure, full rollback. The
+	// worker never ran, so no actor terminal transition is coming — drop the
+	// reservation (dropProvision=true).
+	if err := b.adoptRetainedVolumes(req.LeaseUUID, claimed); err != nil {
+		b.rollbackRestoreAdoption(ctx, req.LeaseUUID, allocatedIDs, claimed, true, logger)
+		return fmt.Errorf("adopt retained volumes: %w", err)
+	}
+
+	// (f) Hand off to the actor; doRestore's terminal defer owns
+	// success/failure/panic.
+	opCtx, opCancel := b.shutdownAwareContext()
+	work := func() leasesm.ReplaceResult {
+		return b.doRestore(opCtx, req.LeaseUUID, claimed, profiles, allocatedIDs, logger)
+	}
+	ack := make(chan error, 1)
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestoreRequestedMsg{
+		Cancel: opCancel, Work: work, Ack: ack, CallbackURL: req.CallbackURL,
+	}); routeErr != nil {
+		opCancel()
+		// Worker never ran; no actor transition will flip Status — drop the
+		// reservation (dropProvision=true).
+		b.rollbackRestoreAdoption(ctx, req.LeaseUUID, allocatedIDs, claimed, true, logger)
+		return routeErr
+	}
+	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
+		opCancel()
+		// ackOrAbort returned !accepted: the actor rejected the message (it never
+		// fired evRestoreRequested) OR we abandoned on cancellation without the
+		// actor committing — either way no terminal transition owns this
+		// provision, so drop the reservation (dropProvision=true).
+		b.rollbackRestoreAdoption(ctx, req.LeaseUUID, allocatedIDs, claimed, true, logger)
+		return err
+	}
+	return nil
+}
+
+// doRestore is the restore worker (runs on the lease actor's replace-worker
+// goroutine). It brings up the new lease's stack from the retained manifest via
+// doReplaceContainers with NoComposeRollback (no prior containers to recover to).
+//
+// Its terminal defer is the SOLE owner of the success/failure/panic outcome for
+// the retention record:
+//   - success (resultRet.Err==nil): delete the retained record (data adopted).
+//   - failure (resultRet.Err!=nil): roll back the adoption (re-quarantine the
+//     volumes, revert the record to active).
+//   - panic: a panic leaves resultRet.Err==nil; force the failure path so we
+//     never delete the record while the lease is not Ready. Convert panic→Failed.
+//
+// In BOTH the failure and panic cases the rollback does NOT drop the provision
+// (dropProvision=false): doRestore returns an errored ReplaceResult, so the actor
+// will fire evReplaceFailed and onEnterFailedFromReplace flips Status=Failed and
+// emits the failure callback — which reads CallbackURL from the still-present
+// provision. The lease then settles as a Failed entry, exactly like a failed
+// restart/update. (Dropping it here would race that transition and silently lose
+// the callback; the periodic reaper / a subsequent op reconciles the entry.)
+func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.RetentionEntry,
+	profiles map[string]SKUProfile, allocatedIDs []string, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
+	defer func() {
+		// N2: a panic leaves resultRet.Err==nil; force the failure path so we never
+		// delete the record while the lease is not Ready. Convert panic -> Failed.
+		if r := recover(); r != nil {
+			logger.Error("restore worker panicked", "recover", r)
+			b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
+			resultRet = leasesm.ReplaceResult{Err: fmt.Errorf("restore panic: %v", r), Restored: false}
+			return
+		}
+		if resultRet.Err == nil {
+			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
+				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
+			}
+			return
+		}
+		b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
+	}()
+	return b.doReplaceContainers(ctx, replaceContainersOp{
+		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: rec.Items, Profiles: profiles,
+		OldContainerIDs: nil, ServiceContainers: nil, Operation: "restore", NoComposeRollback: true, Logger: logger,
+		OnSuccess: func(p *leasesm.ProvisionState) { p.StackManifest = rec.StackManifest },
+	})
+}
+
+// rollbackRestoreAdoption is the idempotent compensating teardown for an adopted
+// restore. N1: compose.Down the new project FIRST (stop containers on the
+// bind-mounted volumes) BEFORE renaming volumes back — otherwise a still-running
+// container holds the volume's bind mount open. It then re-quarantines each
+// adopted volume to the retained namespace, releases the pool allocations, and
+// CAS-reverts the record to active.
+//
+// dropProvision controls the new-lease reservation:
+//   - true  (synchronous paths: adopt failure, route failure, ack abort): no
+//     actor terminal transition is coming, so the reservation would leak — remove it.
+//   - false (worker failure/panic from doRestore's defer): the actor WILL fire
+//     evReplaceFailed; onEnterFailedFromReplace must read CallbackURL from the
+//     still-present provision to emit the failure callback, then flips it to
+//     Failed. Removing it here would race that transition and drop the callback.
+func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
+	allocatedIDs []string, rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger) {
+	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
+	if derr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); derr != nil {
+		logger.Warn("restore rollback: compose down failed (continuing)", "error", derr)
+	}
+	for _, item := range rec.Items {
+		for i := range item.Quantity {
+			newCanonical := canonicalVolumeName(leaseUUID, item.ServiceName, i)
+			origRetained := retainedName(canonicalVolumeName(rec.OriginalLeaseUUID, item.ServiceName, i))
+			_ = b.renameIfPresent(newCanonical, origRetained)
+		}
+	}
+	releaseAll(b.pool, allocatedIDs)
+	updateResourceMetrics(b.pool.Stats())
+	if ok, err := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation); err != nil {
+		logger.Error("restore rollback: revert record failed", "error", err)
+	} else if !ok {
+		logger.Warn("restore rollback: record generation changed; reaper will reconcile", "lease_uuid", rec.OriginalLeaseUUID)
+	}
+	if dropProvision {
+		b.removeProvision(leaseUUID)
+	}
 }

@@ -282,6 +282,25 @@ type UpdateRequest struct {
 	PayloadHash string `json:"payload_hash,omitempty"`
 }
 
+// RestoreRequest contains the data needed to restore a soft-deleted lease's
+// retained volumes into a NEW lease (ENG-325). FromLeaseUUID identifies the
+// original (retained) lease whose data is adopted; LeaseUUID is the new lease
+// the data is restored into. Items must match the retained set's shape
+// (service-name → summed-quantity).
+type RestoreRequest struct {
+	LeaseUUID     string      `json:"lease_uuid"`      // NEW lease
+	FromLeaseUUID string      `json:"from_lease_uuid"` // original (retained) lease
+	Tenant        string      `json:"tenant"`
+	ProviderUUID  string      `json:"provider_uuid"` // when non-empty, cross-checked against the retained record
+	Items         []LeaseItem `json:"items"`         // must match the retained set
+	CallbackURL   string      `json:"callback_url"`
+}
+
+// ErrNotRetained is returned when no retained data exists for the original
+// lease (absent, expired, or owned by a different tenant). Distinct from
+// ErrNotProvisioned (which concerns live provisions).
+var ErrNotRetained = errors.New("no retained data for lease")
+
 // ReleaseInfo describes a single release in the history.
 type ReleaseInfo struct {
 	Version   int       `json:"version"`
