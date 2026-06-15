@@ -97,7 +97,6 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		// VolumeCleanupAttempts: 0 by struct-zero — structural reset of the
 		// per-lease counter is the whole point of the wrapper.
 		volumeCleanupAttempts: 0,
-		restoringFrom:         "", // normal provision; only set by the Restore reservation
 	}.materialize()
 	b.provisionsMu.Unlock()
 

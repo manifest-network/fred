@@ -140,7 +140,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					ServiceContainers: nil, // rebuilt from labels below
 				},
 				volumeCleanupAttempts: 0,
-				restoringFrom:         "", // cold-start recovery; not a restore
 			}
 
 			// Restore manifest from the last successful (active) release so

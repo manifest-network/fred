@@ -103,7 +103,7 @@ type backendProvisionStore struct {
 // value-copy snapshot of the embedded ProvisionState — slices/maps
 // alias the underlying record (no deep copy). Caller does NOT hold
 // any lock after Get returns. Docker-private wrapper fields
-// (VolumeCleanupAttempts, RestoringFrom) are NOT exposed through this seam — the SM
+// (VolumeCleanupAttempts) are NOT exposed through this seam — the SM
 // has no business reading them.
 func (s *backendProvisionStore) Get(leaseUUID string) (*leasesm.ProvisionState, bool) {
 	s.backend.provisionsMu.RLock()
@@ -120,7 +120,7 @@ func (s *backendProvisionStore) Get(leaseUUID string) (*leasesm.ProvisionState, 
 // Lock acquisition on b.provisionsMu, passing a pointer to the embedded
 // ProvisionState. Mutations made by fn persist on the underlying
 // record. Returns true when the lease existed and fn was applied.
-// Docker-private wrapper fields (VolumeCleanupAttempts, RestoringFrom) are NOT
+// Docker-private wrapper fields (VolumeCleanupAttempts) are NOT
 // reachable through fn — only the substrate-agnostic ProvisionState
 // fields the SM consumes.
 func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.ProvisionState)) bool {

@@ -1576,3 +1576,253 @@ func TestRestore_RaceWithProvision(t *testing.T) {
 	b.stopCancel()
 	b.wg.Wait()
 }
+
+// ---------------------------------------------------------------------------
+// ENG-325 fix: drive restore volume ops off RetainedVolumeNames (not Items×Qty)
+// ---------------------------------------------------------------------------
+
+// mixedStackManifest is a TWO-service stack: "db" (stateful) and "web"
+// (stateless). Both images pass the default registry allowlist and carry no
+// active health check so verifyStartup falls through to the inspect path.
+func mixedStackManifest() *manifest.StackManifest {
+	return &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"db":  {Image: "nginx:latest"},
+			"web": {Image: "nginx:latest"},
+		},
+	}
+}
+
+// mixedItems is the lease item set for the mixed stack: db (stateful) + web
+// (stateless), each Quantity 1.
+func mixedItems() []backend.LeaseItem {
+	return []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+	}
+}
+
+// seedMixedRetained writes an ACTIVE retained record for a MIXED lease: two
+// services (db stateful, web stateless) but only ONE retained volume
+// (fred-retained-<orig>-db-0) — the stateless "web" service has no managed
+// volume on disk. This is the exact shape that breaks an Items×Quantity volume
+// derivation (it would invent a non-existent fred-retained-<orig>-web-0).
+func seedMixedRetained(t *testing.T, rs *shared.RetentionStore, orig string) shared.RetentionEntry {
+	t.Helper()
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID:   orig,
+		Tenant:              "tenant-a",
+		ProviderUUID:        "prov-1",
+		Items:               mixedItems(),
+		StackManifest:       mixedStackManifest(),
+		CallbackURL:         "http://localhost/callback",
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(orig, "db", 0))}, // only db has a volume
+		Status:              shared.RetentionStatusActive,
+		Generation:          1,
+		CreatedAt:           time.Now(),
+	}
+	require.NoError(t, rs.Put(e))
+	return e
+}
+
+// mixedRestoreRequest builds a RestoreRequest matching seedMixedRetained's shape.
+func mixedRestoreRequest(newLease, fromLease, callbackURL string) backend.RestoreRequest {
+	return backend.RestoreRequest{
+		LeaseUUID:     newLease,
+		FromLeaseUUID: fromLease,
+		Tenant:        "tenant-a",
+		ProviderUUID:  "prov-1",
+		Items:         mixedItems(),
+		CallbackURL:   callbackURL,
+	}
+}
+
+// happyMixedComposeMock is happyComposeMock for a 2-service stack: PS reports a
+// running container for BOTH "db" and "web" so verifyStartup passes per-service.
+func happyMixedComposeMock(mu *sync.Mutex, downProjects *[]string, upErr error) *mockComposeExecutor {
+	return &mockComposeExecutor{
+		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
+			return upErr
+		},
+		PSFn: func(_ context.Context, _ string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{
+				{ID: "container-db", Service: "db", State: "running"},
+				{ID: "container-web", Service: "web", State: "running"},
+			}, nil
+		},
+		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
+			mu.Lock()
+			*downProjects = append(*downProjects, projectName)
+			mu.Unlock()
+			return nil
+		},
+	}
+}
+
+// TestRestore_MixedStatefulStatelessLease is the regression test for the HIGH bug:
+// a lease with a stateful service ("db") AND a stateless service ("web", no
+// volume) must restore SUCCESSFULLY. The fix drives the adopt rename off the
+// record's RetainedVolumeNames, so exactly the db volume is renamed and NO
+// phantom rename of a non-existent web volume is ever attempted. The
+// RenameVolumeFn ERRORS for any name not in RetainedVolumeNames to prove the
+// phantom is never requested (an Items×Quantity derivation would request
+// fred-retained-u1-web-0 → hard error → whole restore fails).
+func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedMixedRetained(t, rs, "u1")
+
+	retainedSet := map[string]bool{retainedName(canonicalVolumeName("u1", "db", 0)): true}
+
+	var mu sync.Mutex
+	var downProjects []string
+	var renames []restoreRenameCall
+	b.compose = happyMixedComposeMock(&mu, &downProjects, nil)
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			renames = append(renames, restoreRenameCall{old, new})
+			mu.Unlock()
+			// Prove no phantom is ever attempted: error for any source name that is
+			// not an actually-retained volume.
+			if !retainedSet[old] {
+				return errors.New("phantom volume rename attempted for non-retained source: " + old)
+			}
+			return nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer server.Close()
+
+	err := b.Restore(context.Background(), mixedRestoreRequest("u2", "u1", server.URL))
+	require.NoError(t, err)
+
+	<-callbackReceived
+
+	// u2 must reach Ready (the restore SUCCEEDED despite the stateless service).
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p, ok := b.provisions["u2"]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "mixed-lease restore must reach Ready")
+
+	// The retained record for u1 must be deleted on success.
+	require.Eventually(t, func() bool {
+		e, gerr := rs.Get("u1")
+		return gerr == nil && e == nil
+	}, 5*time.Second, 20*time.Millisecond, "retained record for u1 must be deleted on successful mixed restore")
+
+	mu.Lock()
+	gotRenames := append([]restoreRenameCall(nil), renames...)
+	mu.Unlock()
+
+	// Exactly ONE rename happened: the db volume retained(u1) → canonical(u2).
+	require.Len(t, gotRenames, 1, "exactly one rename (db) must happen; the stateless web service has no volume")
+	assert.Equal(t, restoreRenameCall{
+		old: retainedName(canonicalVolumeName("u1", "db", 0)),
+		new: canonicalVolumeName("u2", "db", 0),
+	}, gotRenames[0], "the sole rename must adopt the db volume retained(u1) → canonical(u2)")
+
+	// No rename for the web service was ever attempted (no phantom source/target).
+	for _, r := range gotRenames {
+		assert.NotContains(t, r.old, "-web-", "no rename of a web-service source must be attempted")
+		assert.NotContains(t, r.new, "-web-", "no rename targeting a web-service canonical must be attempted")
+	}
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+// TestReconcileRestoring_MixedLease_RollsBackWithoutWedging proves the
+// reconcile-rollback arm no longer wedges a mixed lease: a restoring record with
+// the mixed shape (db stateful + web stateless) and no live provision for the
+// new lease must re-quarantine ONLY the db volume (driven off RetainedVolumeNames)
+// and successfully revert to active — NOT get stuck in restoring forever. Before
+// the fix, the Items×Quantity derivation tried to rename a non-existent
+// fred-u2-web-0, RenameVolume erred, failed=true, and the record stayed restoring.
+func TestReconcileRestoring_MixedLease_RollsBackWithoutWedging(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	retainedSet := map[string]bool{retainedName(canonicalVolumeName("u1", "db", 0)): true}
+
+	var mu sync.Mutex
+	var downProjects []string
+	var renames []restoreRenameCall
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
+			mu.Lock()
+			downProjects = append(downProjects, projectName)
+			mu.Unlock()
+			return nil
+		},
+	}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			renames = append(renames, restoreRenameCall{old, new})
+			mu.Unlock()
+			// Error for any non-retained target so a phantom web rename would set
+			// failed=true and wedge the record — exactly the bug we are guarding.
+			if !retainedSet[new] { // re-quarantine target is the retained name
+				return errors.New("phantom re-quarantine attempted, target not retained: " + new)
+			}
+			return nil
+		},
+	}
+
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		NewLeaseUUID:        "u2",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          3,
+		Items:               mixedItems(),
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", "db", 0))}, // only db
+	}
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	mu.Lock()
+	gotDown := append([]string(nil), downProjects...)
+	gotRenames := append([]restoreRenameCall(nil), renames...)
+	mu.Unlock()
+
+	// Compose Down ran for the new lease's project.
+	assert.Contains(t, gotDown, composeProjectName("u2"), "compose Down must run for the orphaned restore")
+
+	// Exactly ONE re-quarantine: db canonical(u2) → retained(u1). No web phantom.
+	require.Len(t, gotRenames, 1, "exactly one re-quarantine (db) must happen; web has no volume")
+	assert.Equal(t, restoreRenameCall{
+		old: canonicalVolumeName("u2", "db", 0),
+		new: retainedName(canonicalVolumeName("u1", "db", 0)),
+	}, gotRenames[0], "the sole re-quarantine must move db canonical(u2) → retained(u1)")
+
+	// The record must have reverted to active (NOT wedged in restoring), with
+	// Generation bumped and NewLeaseUUID cleared.
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "retention record for u1 must still exist after rollback")
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "record must revert to active, NOT stay wedged in restoring")
+	assert.Equal(t, 4, entry.Generation, "generation must be bumped by RevertToActive")
+	assert.Empty(t, entry.NewLeaseUUID, "NewLeaseUUID must be cleared after rollback")
+}

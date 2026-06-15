@@ -39,6 +39,13 @@ func canonicalFromRetained(retained string) string {
 	return "fred-" + strings.TrimPrefix(retained, "fred-retained-")
 }
 
+// retainedToNewCanonical maps a retained volume name fred-retained-{orig}-{svc}-{idx}
+// to the new lease's canonical name fred-{newLease}-{svc}-{idx} during restore adopt.
+func retainedToNewCanonical(retained, originalLease, newLease string) string {
+	suffix := strings.TrimPrefix(retained, "fred-retained-"+originalLease+"-") // {svc}-{idx}
+	return "fred-" + newLease + "-" + suffix
+}
+
 // isRetainedVolume reports whether a volume id is a soft-delete tombstone.
 func isRetainedVolume(id string) bool {
 	return strings.HasPrefix(id, retainedVolumePrefix)
@@ -147,13 +154,10 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	// the next startup retries; the provision stays so its expected-set entry
 	// keeps protecting the data in the interim.
 	failed := false
-	for _, item := range e.Items {
-		for i := range item.Quantity {
-			newCanonical := canonicalVolumeName(e.NewLeaseUUID, item.ServiceName, i)
-			origRetained := retainedName(canonicalVolumeName(e.OriginalLeaseUUID, item.ServiceName, i))
-			if rerr := b.renameIfPresent(newCanonical, origRetained); rerr != nil {
-				failed = true
-			}
+	for _, retained := range e.RetainedVolumeNames {
+		newCanonical := retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)
+		if rerr := b.renameIfPresent(newCanonical, retained); rerr != nil {
+			failed = true
 		}
 	}
 	if failed {
@@ -327,17 +331,18 @@ func releaseAll(pool *shared.ResourcePool, ids []string) {
 }
 
 // adoptRetainedVolumes renames each retained volume (fred-retained-<orig>-…)
-// to its new-lease canonical name (fred-<newLease>-…). Returns the first error;
-// the caller fully rolls back on failure. RenameVolume is synchronous, so no
-// context is threaded.
+// to its new-lease canonical name (fred-<newLease>-…). It is driven off the
+// record's RetainedVolumeNames (the ACTUAL on-disk volumes enumerated at
+// soft-delete), NOT a Items×Quantity re-derivation: a stateless service (no
+// managed volume) has no retained name, so deriving from Items would attempt a
+// rename of a volume that never existed and fail the whole restore. Returns the
+// first error; the caller fully rolls back on failure. RenameVolume is
+// synchronous, so no context is threaded.
 func (b *Backend) adoptRetainedVolumes(newLease string, rec *shared.RetentionEntry) error {
-	for _, item := range rec.Items {
-		for i := range item.Quantity {
-			retained := retainedName(canonicalVolumeName(rec.OriginalLeaseUUID, item.ServiceName, i))
-			canonical := canonicalVolumeName(newLease, item.ServiceName, i)
-			if err := b.volumes.RenameVolume(retained, canonical); err != nil {
-				return fmt.Errorf("adopt volume %s -> %s: %w", retained, canonical, err)
-			}
+	for _, retained := range rec.RetainedVolumeNames {
+		newCanonical := retainedToNewCanonical(retained, rec.OriginalLeaseUUID, newLease)
+		if err := b.volumes.RenameVolume(retained, newCanonical); err != nil {
+			return fmt.Errorf("adopt volume %s -> %s: %w", retained, newCanonical, err)
 		}
 	}
 	return nil
@@ -412,9 +417,8 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		}
 	}
 
-	// (b) Reserve the new-lease entry at Status=Provisioning, tagged
-	// restoringFrom. (7a permits evRestoreRequested from Provisioning.) Reject
-	// if already provisioned.
+	// (b) Reserve the new-lease entry at Status=Provisioning. (7a permits
+	// evRestoreRequested from Provisioning.) Reject if already provisioned.
 	b.provisionsMu.Lock()
 	if _, exists := b.provisions[req.LeaseUUID]; exists {
 		b.provisionsMu.Unlock()
@@ -438,7 +442,6 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			ServiceContainers: nil,
 		},
 		volumeCleanupAttempts: 0,
-		restoringFrom:         req.FromLeaseUUID,
 	}.materialize()
 	b.provisionsMu.Unlock()
 
@@ -575,12 +578,9 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 	if derr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); derr != nil {
 		logger.Warn("restore rollback: compose down failed (continuing)", "error", derr)
 	}
-	for _, item := range rec.Items {
-		for i := range item.Quantity {
-			newCanonical := canonicalVolumeName(leaseUUID, item.ServiceName, i)
-			origRetained := retainedName(canonicalVolumeName(rec.OriginalLeaseUUID, item.ServiceName, i))
-			_ = b.renameIfPresent(newCanonical, origRetained)
-		}
+	for _, retained := range rec.RetainedVolumeNames {
+		newCanonical := retainedToNewCanonical(retained, rec.OriginalLeaseUUID, leaseUUID)
+		_ = b.renameIfPresent(newCanonical, retained)
 	}
 	releaseAll(b.pool, allocatedIDs)
 	updateResourceMetrics(b.pool.Stats())

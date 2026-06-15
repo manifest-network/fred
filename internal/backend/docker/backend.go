@@ -184,11 +184,6 @@ type provision struct {
 	// because volume cleanup is Docker-specific — K3s would implement
 	// deprovision retry differently.
 	VolumeCleanupAttempts int
-
-	// RestoringFrom is docker-private; set only by the Restore reservation;
-	// empty for normal provisions; NOT on ProvisionState / not reachable via
-	// the store seam.
-	RestoringFrom string
 }
 
 // shortID, diagnosticSnapshot, and containerLogKeys moved to
