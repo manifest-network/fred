@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
@@ -18,6 +19,18 @@ func newTestRetentionStore(t *testing.T) *RetentionStore {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// getRaw returns the raw stored bytes for a key (test-only, white-box) so a test
+// can assert a record is byte-identical/untouched after a refused write.
+func (s *RetentionStore) getRaw(orig string) ([]byte, error) {
+	var out []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(retentionBucketName).Get([]byte(orig))
+		out = append([]byte(nil), raw...)
+		return nil
+	})
+	return out, err
 }
 
 func sampleEntry(orig string) RetentionEntry {
@@ -394,4 +407,120 @@ func TestDeleteIfActive_AbsentNoOp(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, deleted)
 	assert.Nil(t, names)
+}
+
+// TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
+// absent key writes the base entry verbatim and returns ok=true.
+func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	createdAt := time.Now().Round(time.Millisecond)
+	base := RetentionEntry{
+		OriginalLeaseUUID:   "lease-1",
+		Tenant:              "tenant-a",
+		ProviderUUID:        "prov-1",
+		Items:               []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}},
+		StackManifest:       &manifest.StackManifest{},
+		CallbackURL:         "https://example.com/cb",
+		RetainedVolumeNames: []string{"fred-retained-lease-1-app-0"},
+		Status:              RetentionStatusActive,
+		Generation:          0,
+		CreatedAt:           createdAt,
+	}
+
+	ok, err := s.PutActiveMerged(base)
+	require.NoError(t, err)
+	assert.True(t, ok, "absent key must be written fresh (ok=true)")
+
+	got, err := s.Get("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, RetentionStatusActive, got.Status)
+	assert.Equal(t, 0, got.Generation)
+	assert.True(t, got.CreatedAt.Equal(createdAt))
+	assert.Equal(t, []string{"fred-retained-lease-1-app-0"}, got.RetainedVolumeNames)
+	assert.Equal(t, "tenant-a", got.Tenant)
+}
+
+// TestPutActiveMerged_ActiveMergesAndPreservesCreatedAtGen verifies that against
+// an existing ACTIVE record PutActiveMerged preserves the stored CreatedAt and
+// Generation and writes the dedup-union of the stored and base RetainedVolumeNames.
+func TestPutActiveMerged_ActiveMergesAndPreservesCreatedAtGen(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	past := time.Now().Add(-30 * 24 * time.Hour).Round(time.Millisecond)
+	require.NoError(t, s.Put(RetentionEntry{
+		OriginalLeaseUUID:   "lease-1",
+		Tenant:              "tenant-a",
+		Status:              RetentionStatusActive,
+		RetainedVolumeNames: []string{"a"},
+		Generation:          3,
+		CreatedAt:           past,
+	}))
+
+	// Base carries fresh CreatedAt/Gen=0 and an overlapping+new name set; the
+	// stored CreatedAt/Generation must win and the names must be unioned.
+	base := RetentionEntry{
+		OriginalLeaseUUID:   "lease-1",
+		Tenant:              "tenant-a",
+		Status:              RetentionStatusActive,
+		RetainedVolumeNames: []string{"a", "b"},
+		Generation:          0,
+		CreatedAt:           time.Now(),
+	}
+	ok, err := s.PutActiveMerged(base)
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	got, err := s.Get("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, got.CreatedAt.Equal(past), "stored CreatedAt must be preserved; got %v want %v", got.CreatedAt, past)
+	assert.Equal(t, 3, got.Generation, "stored Generation must be preserved")
+	assert.ElementsMatch(t, []string{"a", "b"}, got.RetainedVolumeNames, "names must be the dedup union")
+}
+
+// TestPutActiveMerged_RestoringRefuses verifies that against an existing
+// NON-active (restoring) record PutActiveMerged writes NOTHING, returns
+// ok=false + nil err, and leaves the stored record byte-identical.
+func TestPutActiveMerged_RestoringRefuses(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	stored := RetentionEntry{
+		OriginalLeaseUUID:   "lease-1",
+		Tenant:              "tenant-a",
+		Status:              RetentionStatusRestoring,
+		NewLeaseUUID:        "new-lease",
+		RetainedVolumeNames: []string{"a"},
+		Generation:          5,
+		RestoringSince:      time.Now().Round(time.Millisecond),
+		CreatedAt:           time.Now().Add(-time.Hour).Round(time.Millisecond),
+	}
+	require.NoError(t, s.Put(stored))
+
+	before, err := s.getRaw("lease-1")
+	require.NoError(t, err)
+
+	base := RetentionEntry{
+		OriginalLeaseUUID:   "lease-1",
+		Tenant:              "tenant-a",
+		Status:              RetentionStatusActive,
+		RetainedVolumeNames: []string{"b"},
+		Generation:          0,
+		CreatedAt:           time.Now(),
+	}
+	ok, err := s.PutActiveMerged(base)
+	require.NoError(t, err, "refusing a restoring record is not an error")
+	assert.False(t, ok, "a restoring record must not be overwritten (ok=false)")
+
+	after, err := s.getRaw("lease-1")
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "the restoring record's bytes must be untouched")
+
+	got, err := s.Get("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, RetentionStatusRestoring, got.Status)
+	assert.Equal(t, 5, got.Generation)
+	assert.Equal(t, "new-lease", got.NewLeaseUUID)
 }

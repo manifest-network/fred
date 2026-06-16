@@ -499,6 +499,57 @@ func TestEvictRetentionsToCap_ExcludesClosingLease(t *testing.T) {
 	require.NotNil(t, got, "closing lease's own retention record must NOT be evicted")
 }
 
+// TestEvictRetentionsToCap_ReRecordsOnDestroyFailure verifies HOLE 3: after
+// DeleteIfActive removes the record in-txn, a FAILED Destroy must re-record the
+// snapshot entry so the volume stays tracked/retryable instead of being leaked
+// permanently (mirrors reapExpiredRetentions' self-heal). The evicted record
+// must STILL be present in the store afterward.
+func TestEvictRetentionsToCap_ReRecordsOnDestroyFailure(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	// Tenant has two active records; cap=1 forces eviction of the oldest.
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "old-lease",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-old-lease-app-0"},
+		CreatedAt:           time.Now().Add(-2 * time.Hour),
+	}))
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "newer-lease",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-newer-lease-app-0"},
+		CreatedAt:           time.Now().Add(-time.Hour),
+	}))
+
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, _ string) error {
+			return errors.New("docker destroy failed")
+		},
+	}
+
+	// excludeLease is the (third) closing lease; cap=1 means evict down to 0 of
+	// the remaining → both old-lease and newer-lease are eviction candidates, but
+	// oldest-first to maxPerTenant-1=0 evicts both. The Destroy failure must
+	// re-record each so nothing is lost.
+	err := b.evictRetentionsToCap(context.Background(), "tenant-a", 1, "closing")
+	require.NoError(t, err)
+
+	// The evicted records must STILL be present (re-recorded), not lost.
+	got, err := rs.Get("old-lease")
+	require.NoError(t, err)
+	require.NotNil(t, got, "evicted record must be re-recorded after Destroy failure, not leaked")
+	assert.Equal(t, shared.RetentionStatusActive, got.Status)
+	assert.Equal(t, []string{"fred-retained-old-lease-app-0"}, got.RetainedVolumeNames)
+
+	got2, err := rs.Get("newer-lease")
+	require.NoError(t, err)
+	require.NotNil(t, got2, "second evicted record must also be re-recorded after Destroy failure")
+}
+
 // TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError verifies the
 // fail-safe: when the retention store cannot be read (so the protected-canonical
 // set cannot be built), orphan destruction is skipped entirely — nothing is
@@ -1046,6 +1097,52 @@ func TestCleanupOrphanedVolumes_ProtectsRestoringFromRetainedNames(t *testing.T)
 		"restoring arm must protect the adopted canonical via RetainedVolumeNames")
 }
 
+// TestCleanupOrphanedVolumes_RestoringProtectsOriginalCanonical verifies HOLE 2:
+// while a record is restoring, an ORIGINAL-lease canonical volume that still
+// exists on disk (e.g. a partial soft-delete left it un-retained before the
+// record was claimed for restore) must be protected. Previously the restoring
+// arm only protected the new-lease adopted canonical, so the original canonical
+// — neither fred-retained- nor in any live provision — would be destroyed = data
+// loss. The restoring arm must protect BOTH placements.
+func TestCleanupOrphanedVolumes_RestoringProtectsOriginalCanonical(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	// Restoring record; the ORIGINAL canonical (fred-orig-app-0) is still on disk,
+	// NOT yet adopted to the new lease (a partial soft-delete left it un-retained).
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "orig",
+		NewLeaseUUID:        "new",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          2,
+		RetainedVolumeNames: []string{"fred-retained-orig-app-0"},
+	}))
+
+	var mu sync.Mutex
+	var destroyedIDs []string
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{"fred-orig-app-0"}, nil // original canonical, NOT yet adopted
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			mu.Lock()
+			destroyedIDs = append(destroyedIDs, id)
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+
+	mu.Lock()
+	got := append([]string(nil), destroyedIDs...)
+	mu.Unlock()
+	assert.NotContains(t, got, "fred-orig-app-0",
+		"restoring arm must also protect the un-adopted ORIGINAL-lease canonical from the orphan reaper")
+}
+
 // TestRollbackRestoreAdoption_RenameFailureLeavesRecordRestoring verifies FIX F:
 // when a re-quarantine rename FAILS, rollbackRestoreAdoption must NOT revert the
 // record to active and must NOT remove the provision — leaving the record
@@ -1411,12 +1508,14 @@ func TestRunRetentionSweep_ReconcilesRestoring(t *testing.T) {
 }
 
 // TestStartRetentionReaper_NoopWhenDisabled verifies that startRetentionReaper
-// returns immediately when RetentionMaxAge==0.
+// returns immediately when RetentionMaxAge==0 AND RetainOnClose is off (nothing
+// to reap and nothing to reconcile).
 func TestStartRetentionReaper_NoopWhenDisabled(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, nil)
 	attachRetentionStore(t, b)
-	b.cfg.RetentionMaxAge = 0 // disabled
+	b.cfg.RetentionMaxAge = 0   // reaping disabled
+	b.cfg.RetainOnClose = false // and retention not in use
 
 	// Must not block, must not panic.
 	done := make(chan struct{})
@@ -1429,7 +1528,56 @@ func TestStartRetentionReaper_NoopWhenDisabled(t *testing.T) {
 	case <-done:
 		// good: returned without blocking
 	case <-time.After(time.Second):
-		t.Fatal("startRetentionReaper blocked when RetentionMaxAge==0 — expected immediate return")
+		t.Fatal("startRetentionReaper blocked when reaping disabled and RetainOnClose off — expected immediate return")
+	}
+}
+
+// TestRetentionSweepGating verifies HOLE 4's gating predicate:
+//   - reaping enabled (RetentionMaxAge>0): sweep runs (regardless of RetainOnClose).
+//   - reaping disabled (RetentionMaxAge==0) but RetainOnClose=true: sweep STILL runs
+//     so restoring-record reconcile happens at runtime (a failed restore rollback's
+//     "next sweep retries" promise is honored without a process restart).
+//   - reaping disabled AND RetainOnClose=false: sweep does NOT run (nothing to do).
+//   - no retention store: never runs.
+//
+// retentionSweepInterval also encodes the interval default: hourly when
+// RetentionMaxAge==0 and RetentionReapInterval unset.
+func TestRetentionSweepGating(t *testing.T) {
+	cases := []struct {
+		name          string
+		hasStore      bool
+		maxAge        time.Duration
+		retainOnClose bool
+		reapInterval  time.Duration
+		wantEnabled   bool
+		wantInterval  time.Duration
+	}{
+		{"reaping enabled, retain off", true, 90 * 24 * time.Hour, false, time.Hour, true, time.Hour},
+		{"reaping enabled, reap-interval unset → falls back to maxAge", true, 48 * time.Hour, false, 0, true, 48 * time.Hour},
+		{"reaping disabled but retain on → reconcile hourly", true, 0, true, 0, true, time.Hour},
+		{"reaping disabled but retain on, explicit reap-interval honored", true, 0, true, 15 * time.Minute, true, 15 * time.Minute},
+		{"reaping disabled and retain off → no sweep", true, 0, false, 0, false, 0},
+		{"no store → no sweep", false, 90 * 24 * time.Hour, true, time.Hour, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockDockerClient{}
+			b := newBackendForTest(mock, nil)
+			if tc.hasStore {
+				attachRetentionStore(t, b)
+			} else {
+				b.retentionStore = nil
+			}
+			b.cfg.RetentionMaxAge = tc.maxAge
+			b.cfg.RetainOnClose = tc.retainOnClose
+			b.cfg.RetentionReapInterval = tc.reapInterval
+
+			interval, enabled := b.retentionSweepInterval()
+			assert.Equal(t, tc.wantEnabled, enabled, "sweep enabled gating")
+			if tc.wantEnabled {
+				assert.Equal(t, tc.wantInterval, interval, "sweep interval")
+			}
+		})
 	}
 }
 

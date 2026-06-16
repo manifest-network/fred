@@ -207,9 +207,23 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 		if !deleted {
 			continue // concurrently claimed for restore (or already gone) — skip
 		}
+		destroyFailed := false
 		for _, name := range names {
 			if derr := b.volumes.Destroy(ctx, name); derr != nil {
-				b.logger.Error("evict: destroy retained volume failed (leaked until manual cleanup)", "volume", name, "error", derr)
+				b.logger.Error("evict: destroy retained volume failed", "volume", name, "error", derr)
+				destroyFailed = true
+			}
+		}
+		if destroyFailed {
+			// A Destroy failed AFTER DeleteIfActive atomically removed the record,
+			// which would otherwise leave the volume with NO record (never reaped/
+			// enumerable = permanent leak). Re-record the snapshot entry so the volume
+			// stays tracked and the next sweep/eviction retries (mirrors
+			// reapExpiredRetentions). Bounded, accepted re-claim possibility: the
+			// re-recorded active entry becomes restore-claimable again until reaped —
+			// same trade-off the reaper makes. (Idempotent: already-destroyed names no-op.)
+			if perr := b.retentionStore.Put(active[i]); perr != nil {
+				b.logger.Error("evict: re-record for retry failed; volume(s) leaked until manual cleanup", "lease_uuid", active[i].OriginalLeaseUUID, "error", perr)
 			}
 		}
 	}
@@ -283,14 +297,34 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 	return nil
 }
 
-// startRetentionReaper runs the periodic sweep on the backend's lifecycle goroutine.
-func (b *Backend) startRetentionReaper() {
-	if b.retentionStore == nil || b.cfg.RetentionMaxAge <= 0 {
-		return
+// retentionSweepInterval is the pure gating decision for the periodic sweep.
+// Returns (interval, enabled). The sweep runs when reaping is enabled OR
+// retention is in use (RetainOnClose), so a failed restore rollback's
+// restoring-record reconcile happens at runtime — not only at process restart.
+// reapExpiredRetentions itself no-ops when RetentionMaxAge<=0, so in the
+// retain-only mode the sweep just performs the restoring-reconcile.
+func (b *Backend) retentionSweepInterval() (time.Duration, bool) {
+	if b.retentionStore == nil {
+		return 0, false
+	}
+	if b.cfg.RetentionMaxAge <= 0 && !b.cfg.RetainOnClose {
+		return 0, false // nothing to reap, nothing to reconcile
 	}
 	interval := b.cfg.RetentionReapInterval
 	if interval <= 0 {
 		interval = b.cfg.RetentionMaxAge
+	}
+	if interval <= 0 {
+		interval = time.Hour // RetentionMaxAge==0 + reap-interval unset: still reconcile restores hourly
+	}
+	return interval, true
+}
+
+// startRetentionReaper runs the periodic sweep on the backend's lifecycle goroutine.
+func (b *Backend) startRetentionReaper() {
+	interval, enabled := b.retentionSweepInterval()
+	if !enabled {
+		return
 	}
 	b.wg.Go(func() {
 		util.StartCleanupLoop(b.stopCtx, interval, func() error {

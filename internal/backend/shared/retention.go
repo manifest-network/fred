@@ -81,6 +81,64 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 	})
 }
 
+// PutActiveMerged atomically upserts the soft-delete record for a closing lease,
+// merging mergeVolumes into any existing record's RetainedVolumeNames. Single txn,
+// so it is safe against a concurrent ClaimForRestore (no Get→Put TOCTOU):
+//   - absent: writes `base` fresh (caller sets CreatedAt=now, Generation=0, Status=active).
+//   - existing ACTIVE: PRESERVES the stored CreatedAt and Generation, and writes the
+//     UNION of stored RetainedVolumeNames and base.RetainedVolumeNames (dedup); other
+//     fields come from `base`.
+//   - existing NON-active (restoring): writes NOTHING, returns ok=false — a restore owns
+//     the record; a blind write would corrupt the CAS. Caller defers (keeps lease Failed).
+//
+// Returns (ok bool, err error): ok=false + nil err means "deferred, record is restoring".
+func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
+	var ok bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
+			var stored RetentionEntry
+			if err := json.Unmarshal(raw, &stored); err != nil {
+				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			}
+			if stored.Status != RetentionStatusActive {
+				return nil // restoring (or otherwise non-active): refuse, ok stays false
+			}
+			// Existing ACTIVE: preserve the grace clock + CAS generation, union the names.
+			base.CreatedAt = stored.CreatedAt
+			base.Generation = stored.Generation
+			base.RetainedVolumeNames = dedupUnion(stored.RetainedVolumeNames, base.RetainedVolumeNames)
+		}
+		data, err := json.Marshal(base)
+		if err != nil {
+			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		ok = true
+		return bkt.Put([]byte(base.OriginalLeaseUUID), data)
+	})
+	return ok, err
+}
+
+// dedupUnion returns the order-preserving deduplicated union of a and b
+// (a's entries first, then b's not already present).
+func dedupUnion(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, s := range a {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, s := range b {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // Get retrieves a RetentionEntry by original lease UUID.
 // Returns nil, nil when absent.
 func (s *RetentionStore) Get(orig string) (*RetentionEntry, error) {

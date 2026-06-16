@@ -594,7 +594,8 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 					}
 				case shared.RetentionStatusRestoring:
 					for _, retained := range e.RetainedVolumeNames {
-						expected[retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)] = true // protect adopted/in-flight data (authoritative names; matches adoptRetainedVolumes)
+						expected[retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)] = true // adopted/in-flight new-lease canonical
+						expected[canonicalFromRetained(retained)] = true                                       // original-lease canonical (un-retained volume from a partial soft-delete)
 					}
 				}
 			}
