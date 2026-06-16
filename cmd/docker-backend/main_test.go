@@ -1627,7 +1627,7 @@ func TestHandleRestore(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "invalid state for restore")
 	})
 
-	t.Run("ErrAlreadyProvisioned returns 409", func(t *testing.T) {
+	t.Run("ErrAlreadyProvisioned returns 409 with already_provisioned code", func(t *testing.T) {
 		mb := &mockBackend{
 			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
 				return fmt.Errorf("dup: %w", backend.ErrAlreadyProvisioned)
@@ -1638,6 +1638,13 @@ func TestHandleRestore(t *testing.T) {
 
 		assert.Equal(t, http.StatusConflict, w.Code)
 		assert.Contains(t, w.Body.String(), "already provisioned")
+
+		// FIX B: the body must carry the code discriminator so the client can
+		// reconstruct ErrAlreadyProvisioned (not the bare-409 ErrInvalidState).
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "already_provisioned", resp.Code,
+			"already-provisioned 409 must set code=already_provisioned")
 	})
 
 	t.Run("ErrValidation returns 400", func(t *testing.T) {

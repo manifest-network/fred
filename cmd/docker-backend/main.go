@@ -493,11 +493,14 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrInvalidState) {
+			// 409 with no code → client maps to ErrInvalidState.
 			s.errorResponse(w, http.StatusConflict, "invalid state for restore")
 			return
 		}
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
-			s.errorResponse(w, http.StatusConflict, "lease already provisioned")
+			// 409 with code="already_provisioned" → client reconstructs
+			// ErrAlreadyProvisioned (Restore overloads 409 for two sentinels).
+			s.errorResponseWithCode(w, http.StatusConflict, "lease already provisioned", "already_provisioned")
 			return
 		}
 		if errors.Is(err, backend.ErrValidation) {
@@ -733,6 +736,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 type ErrorResponse struct {
 	Error          string                 `json:"error"`
 	ValidationCode backend.ValidationCode `json:"validation_code,omitempty"`
+	// Code is an omitempty discriminator for overloaded status codes. Restore
+	// returns 409 for BOTH ErrInvalidState and ErrAlreadyProvisioned; the
+	// client maps a bare 409 to ErrInvalidState, so the already-provisioned
+	// case sets Code="already_provisioned" to let the client reconstruct the
+	// correct sentinel. (Mirrors the validation_code body-discriminator pattern.)
+	Code string `json:"code,omitempty"`
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
@@ -753,6 +762,13 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 
 func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, ErrorResponse{Error: message})
+}
+
+// errorResponseWithCode writes an error response carrying a machine-readable
+// discriminator code so the client can disambiguate an overloaded status code
+// (e.g. Restore's 409, which is shared by ErrInvalidState and ErrAlreadyProvisioned).
+func (s *Server) errorResponseWithCode(w http.ResponseWriter, status int, message, code string) {
+	s.writeJSON(w, status, ErrorResponse{Error: message, Code: code})
 }
 
 // validationErrorResponse writes a 400 response with a validation_code field

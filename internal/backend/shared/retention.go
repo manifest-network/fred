@@ -221,6 +221,35 @@ func (s *RetentionStore) ReapIfExpired(orig string, maxAge time.Duration) ([]str
 	return names, err
 }
 
+// DeleteIfActive atomically removes a record ONLY if it is still ACTIVE,
+// returning its retained volume names for the caller to destroy AFTER the
+// txn commits. deleted=false (nil names) when absent or not active (e.g.
+// concurrently claimed for restore), so cap-eviction never races a restore.
+func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
+	var (
+		names   []string
+		deleted bool
+	)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		raw := bkt.Get([]byte(orig))
+		if raw == nil {
+			return nil
+		}
+		var e RetentionEntry
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+		}
+		if e.Status != RetentionStatusActive {
+			return nil
+		}
+		names = e.RetainedVolumeNames
+		deleted = true
+		return bkt.Delete([]byte(orig))
+	})
+	return names, deleted, err
+}
+
 // RevertToActive transitions a restoring record back to active, using a
 // compare-and-swap on Generation. Returns (true, nil) on success, (false, nil)
 // when the record is absent, not in restoring state, or the generation does not

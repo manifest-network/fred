@@ -1777,6 +1777,7 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
+		body       string // optional response body (for code-discriminated cases)
 		wantErr    error
 		wantNil    bool
 	}{
@@ -1791,9 +1792,15 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 			wantErr:    ErrNotRetained,
 		},
 		{
-			name:       "409 Conflict returns ErrInvalidState",
+			name:       "409 Conflict (no code) returns ErrInvalidState",
 			statusCode: http.StatusConflict,
 			wantErr:    ErrInvalidState,
+		},
+		{
+			name:       "409 Conflict with already_provisioned code returns ErrAlreadyProvisioned",
+			statusCode: http.StatusConflict,
+			body:       `{"error":"lease already provisioned","code":"already_provisioned"}`,
+			wantErr:    ErrAlreadyProvisioned,
 		},
 		{
 			name:       "503 Service Unavailable returns ErrInsufficientResources",
@@ -1815,6 +1822,9 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 					return
 				}
 				w.WriteHeader(tt.statusCode)
+				if tt.body != "" {
+					_, _ = w.Write([]byte(tt.body))
+				}
 			}))
 			defer server.Close()
 

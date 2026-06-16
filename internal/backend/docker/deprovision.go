@@ -166,34 +166,60 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			retainedSet[retainedName(c)] = true
 		}
 		if len(retainedSet) > 0 {
-			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
-				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
-			}
-			retained := make([]string, 0, len(retainedSet))
-			for name := range retainedSet {
-				retained = append(retained, name)
-			}
-			// RECORD-FIRST: persist the active record (with the MERGED retained set)
-			// before any rename, so a crash between rename and record can never leak
-			// a record-less volume, and a retry never shrinks the prior record.
-			if err := b.retentionStore.Put(shared.RetentionEntry{
-				OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
-				Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
-				RetainedVolumeNames: retained, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
-			}); err != nil {
-				logger.Error("failed to write retention record", "lease_uuid", leaseUUID, "error", err)
-				volumeErrs = append(volumeErrs, fmt.Errorf("write retention record: %w", err))
+			// A concurrent restore may have claimed this lease's record (active→
+			// restoring) between attempts. A blind Put would revert it to active,
+			// reset Generation, drop NewLeaseUUID, and break the restore rollback's
+			// generation-CAS. So: do NOT Put and do NOT rename here — surface a
+			// volumeErr instead so the lease stays Failed and the volume-cleanup
+			// retry re-attempts after the restore resolves (the record is back to
+			// active, or gone if the restore succeeded).
+			if existing != nil && existing.Status != shared.RetentionStatusActive {
+				logger.Warn("soft-delete deferred: retention record is being restored (not active); will retry",
+					"lease_uuid", leaseUUID, "status", existing.Status, "new_lease_uuid", existing.NewLeaseUUID)
+				volumeErrs = append(volumeErrs, fmt.Errorf("retention record for %s is restoring, not active", leaseUUID))
 			} else {
-				// Only the STILL-canonical volumes need renaming; the already-retained
-				// ones (from a prior attempt) are done.
-				for _, c := range canonical {
-					if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
-						logger.Error("failed to retain volume", "volume", c, "error", err)
-						volumeErrs = append(volumeErrs, fmt.Errorf("retain volume %s: %w", c, err))
-					}
+				if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
+					logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 				}
-				if len(volumeErrs) == 0 {
-					logger.Info("soft-deleted lease volumes", "lease_uuid", leaseUUID, "retained", len(retained))
+				retained := make([]string, 0, len(retainedSet))
+				for name := range retainedSet {
+					retained = append(retained, name)
+				}
+				// Preserve the grace clock and CAS generation across retries: reuse the
+				// prior record's CreatedAt (so a retry never slides the 90d clock forward)
+				// and Generation (zero-value would clobber a CAS bump). existing==nil on
+				// the first attempt; existing.Status==active here (guarded above).
+				createdAt := time.Now()
+				generation := 0
+				if existing != nil {
+					createdAt = existing.CreatedAt
+					generation = existing.Generation
+				}
+				// RECORD-FIRST: persist the active record (with the MERGED retained set)
+				// before any rename, so a crash between rename and record can never leak
+				// a record-less volume, and a retry never shrinks the prior record.
+				// CreatedAt+Generation are preserved across retries, and a record being
+				// restored (Status!=active) is never overwritten (guarded above).
+				if err := b.retentionStore.Put(shared.RetentionEntry{
+					OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
+					Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
+					RetainedVolumeNames: retained, Status: shared.RetentionStatusActive,
+					CreatedAt: createdAt, Generation: generation,
+				}); err != nil {
+					logger.Error("failed to write retention record", "lease_uuid", leaseUUID, "error", err)
+					volumeErrs = append(volumeErrs, fmt.Errorf("write retention record: %w", err))
+				} else {
+					// Only the STILL-canonical volumes need renaming; the already-retained
+					// ones (from a prior attempt) are done.
+					for _, c := range canonical {
+						if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
+							logger.Error("failed to retain volume", "volume", c, "error", err)
+							volumeErrs = append(volumeErrs, fmt.Errorf("retain volume %s: %w", c, err))
+						}
+					}
+					if len(volumeErrs) == 0 {
+						logger.Info("soft-deleted lease volumes", "lease_uuid", leaseUUID, "retained", len(retained))
+					}
 				}
 			}
 		}

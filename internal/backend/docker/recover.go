@@ -593,10 +593,8 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 						expected[canonicalFromRetained(retained)] = true // protect a not-yet-renamed canonical
 					}
 				case shared.RetentionStatusRestoring:
-					for _, item := range e.Items {
-						for i := range item.Quantity {
-							expected[canonicalVolumeName(e.NewLeaseUUID, item.ServiceName, i)] = true // protect adopted/in-flight data
-						}
+					for _, retained := range e.RetainedVolumeNames {
+						expected[retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)] = true // protect adopted/in-flight data (authoritative names; matches adoptRetainedVolumes)
 					}
 				}
 			}

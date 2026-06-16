@@ -678,6 +678,24 @@ func parseValidationError(body []byte) error {
 	return fmt.Errorf("%w: %s", ErrValidation, msg)
 }
 
+// parseErrorCode extracts the omitempty "code" discriminator from an error
+// response body (best-effort; returns "" when absent or unparseable). Used to
+// disambiguate overloaded status codes — e.g. Restore's 409, shared by
+// ErrInvalidState (no code) and ErrAlreadyProvisioned (code="already_provisioned").
+func parseErrorCode(body []byte) (code, msg string) {
+	var resp struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", string(body)
+	}
+	if resp.Error == "" {
+		resp.Error = string(body)
+	}
+	return resp.Code, resp.Error
+}
+
 // signRequest adds an HMAC-SHA256 signature header to the request.
 // If no secret is configured, this is a no-op (backwards compatible).
 func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
@@ -1037,6 +1055,15 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 		case http.StatusUnprocessableEntity:
 			return nil, ErrNotRetained
 		case http.StatusConflict:
+			// Restore overloads 409 for two sentinels: the backend tags the
+			// already-provisioned case with code="already_provisioned" so we can
+			// reconstruct ErrAlreadyProvisioned (otherwise a duplicate restore would
+			// surface the wrong ErrInvalidState message). A bare 409 (no code) is
+			// ErrInvalidState (wrong lease state for restore).
+			code, msg := parseErrorCode(readErrorBodyBytes(resp))
+			if code == "already_provisioned" {
+				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, msg)
+			}
 			return nil, ErrInvalidState
 		case http.StatusServiceUnavailable:
 			// 503: backend at capacity — not a health failure (matches Provision).

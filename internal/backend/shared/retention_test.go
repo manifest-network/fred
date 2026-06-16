@@ -340,3 +340,58 @@ func TestRetentionStore_ListRestoring(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, all, 3)
 }
+
+// TestDeleteIfActive_DeletesActive verifies the atomic cap-eviction primitive:
+// an ACTIVE record is removed in-txn and its retained volume names are returned
+// for the caller to destroy after commit.
+func TestDeleteIfActive_DeletesActive(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	e := sampleEntry("lease-active")
+	require.NoError(t, s.Put(e))
+
+	names, deleted, err := s.DeleteIfActive("lease-active")
+	require.NoError(t, err)
+	assert.True(t, deleted, "active record must be deleted")
+	assert.Equal(t, []string{"vol-a", "vol-b"}, names, "retained names returned for post-commit destroy")
+
+	got, err := s.Get("lease-active")
+	require.NoError(t, err)
+	assert.Nil(t, got, "record must be gone after DeleteIfActive")
+}
+
+// TestDeleteIfActive_SkipsRestoring verifies the TOCTOU guard: a record that was
+// concurrently claimed for restore (Status=restoring) is NOT deleted, so cap
+// eviction can never race a restore that already owns the record.
+func TestDeleteIfActive_SkipsRestoring(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	e := sampleEntry("lease-restoring")
+	e.Status = RetentionStatusRestoring
+	e.NewLeaseUUID = "new-lease"
+	e.Generation = 5
+	require.NoError(t, s.Put(e))
+
+	names, deleted, err := s.DeleteIfActive("lease-restoring")
+	require.NoError(t, err)
+	assert.False(t, deleted, "restoring record must NOT be deleted")
+	assert.Nil(t, names, "no names returned when not deleted")
+
+	got, err := s.Get("lease-restoring")
+	require.NoError(t, err)
+	require.NotNil(t, got, "restoring record must remain untouched")
+	assert.Equal(t, RetentionStatusRestoring, got.Status)
+	assert.Equal(t, "new-lease", got.NewLeaseUUID)
+	assert.Equal(t, 5, got.Generation)
+}
+
+// TestDeleteIfActive_AbsentNoOp verifies DeleteIfActive on a missing key is a
+// no-op: deleted=false, nil names, no error.
+func TestDeleteIfActive_AbsentNoOp(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	names, deleted, err := s.DeleteIfActive("nonexistent")
+	require.NoError(t, err)
+	assert.False(t, deleted)
+	assert.Nil(t, names)
+}

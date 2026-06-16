@@ -58,17 +58,6 @@ func leaseVolumePrefix(leaseUUID string) string {
 	return "fred-" + leaseUUID + "-"
 }
 
-// destroyRetained hard-deletes one record's volumes then the record itself.
-// Used by the per-tenant cap eviction and the grace reaper.
-func (b *Backend) destroyRetained(ctx context.Context, e shared.RetentionEntry) error {
-	for _, name := range e.RetainedVolumeNames {
-		if err := b.volumes.Destroy(ctx, name); err != nil {
-			return fmt.Errorf("destroy retained volume %s: %w", name, err)
-		}
-	}
-	return b.retentionStore.Delete(e.OriginalLeaseUUID)
-}
-
 // renameIfPresent is a best-effort reconcile rename. Per the RenameVolume
 // contract (volume.go), RenameVolume errors for the conflict case (BOTH names
 // present) and the missing case (NEITHER present), as well as for a real
@@ -205,10 +194,23 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 	}
 	sort.Slice(active, func(i, j int) bool { return active[i].CreatedAt.Before(active[j].CreatedAt) })
 	// Evict oldest-first until maxPerTenant-1 remain (making room for one new entry).
+	// DeleteIfActive removes the record IN-TXN before we destroy its volumes, so a
+	// ClaimForRestore racing between the ListByTenant snapshot above and this loop
+	// can never have its record evicted out from under it (TOCTOU-safe): a now-
+	// restoring record returns deleted=false and is skipped.
 	for i := 0; i <= len(active)-maxPerTenant; i++ {
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap", "tenant", tenant, "lease_uuid", active[i].OriginalLeaseUUID)
-		if err := b.destroyRetained(ctx, active[i]); err != nil {
+		names, deleted, err := b.retentionStore.DeleteIfActive(active[i].OriginalLeaseUUID)
+		if err != nil {
 			return err
+		}
+		if !deleted {
+			continue // concurrently claimed for restore (or already gone) — skip
+		}
+		for _, name := range names {
+			if derr := b.volumes.Destroy(ctx, name); derr != nil {
+				b.logger.Error("evict: destroy retained volume failed (leaked until manual cleanup)", "volume", name, "error", derr)
+			}
 		}
 	}
 	return nil
@@ -551,7 +553,22 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 		if r := recover(); r != nil {
 			logger.Error("restore worker panicked", "recover", r)
 			b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
-			resultRet = leasesm.ReplaceResult{Err: fmt.Errorf("restore panic: %v", r), Restored: false}
+			// Mirror spawnReplaceWorker's own panic recovery (lease_actor.go) and the
+			// normal doReplace* failure shape: populate top-level CallbackErr AND
+			// Failure.{Operation,CallbackErr,LastError} so the actor's evReplaceFailed
+			// carries a non-empty ReplaceFailureInfo (otherwise the tenant callback is
+			// empty/unhelpful).
+			msg := fmt.Sprintf("restore panic: %v", r)
+			resultRet = leasesm.ReplaceResult{
+				Err:         errors.New(msg),
+				Restored:    false,
+				CallbackErr: leasesm.ErrMsgInternal,
+				Failure: leasesm.ReplaceFailureInfo{
+					Operation:   "restore",
+					CallbackErr: leasesm.ErrMsgInternal,
+					LastError:   msg,
+				},
+			}
 			return
 		}
 		if resultRet.Err == nil {
@@ -583,18 +600,35 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 //     evReplaceFailed; onEnterFailedFromReplace must read CallbackURL from the
 //     still-present provision to emit the failure callback, then flips it to
 //     Failed. Removing it here would race that transition and drop the callback.
+//
+// A REAL re-quarantine rename failure (not a benign no-op) means an adopted
+// volume may still be canonical-named under the new lease, so the on-disk state
+// no longer matches the record. Mirroring reconcileRestoring, we then LEAVE the
+// record restoring (do NOT RevertToActive, do NOT removeProvision) and return:
+// the next reconcile sweep retries the re-quarantine safely, and meanwhile the
+// provision's expected-set entry (cleanupOrphanedVolumes' restoring arm) protects
+// the canonical volume from the orphan reaper. Reverting here would make that
+// still-live data eligible for cleanup/reaping.
 func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 	allocatedIDs []string, rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger) {
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 	if derr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); derr != nil {
 		logger.Warn("restore rollback: compose down failed (continuing)", "error", derr)
 	}
+	failed := false
 	for _, retained := range rec.RetainedVolumeNames {
 		newCanonical := retainedToNewCanonical(retained, rec.OriginalLeaseUUID, leaseUUID)
-		_ = b.renameIfPresent(newCanonical, retained)
+		if rerr := b.renameIfPresent(newCanonical, retained); rerr != nil {
+			failed = true
+		}
 	}
 	releaseAll(b.pool, allocatedIDs)
 	updateResourceMetrics(b.pool.Stats())
+	if failed {
+		logger.Warn("restore rollback: re-quarantine rename failed; leaving record restoring for reconcile sweep",
+			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID)
+		return // do NOT RevertToActive, do NOT removeProvision; next reconcile sweep retries safely
+	}
 	if ok, err := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation); err != nil {
 		logger.Error("restore rollback: revert record failed", "error", err)
 	} else if !ok {
