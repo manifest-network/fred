@@ -431,6 +431,16 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		}
 		return backend.ErrNotRetained
 	}
+	// Boundary normalization (same contract as Provision/Update): a legacy
+	// single-service lease arrives with ServiceName="" from the chain, but the
+	// retained record's Items were normalized to defaultServiceName ("app") at
+	// Provision time. Without normalizing here the shape check below would
+	// deterministically mismatch ("app" vs ""), making restore impossible for
+	// every single-service lease. Mutates req.Items in place (shared backing
+	// array), exactly like restart_update.go's preflight.
+	if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: req.Items}); err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
 	if err := itemsShapeMatch(rec.Items, req.Items); err != nil {
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}

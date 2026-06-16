@@ -1839,6 +1839,82 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	b.wg.Wait()
 }
 
+// TestRestore_NormalizesLegacyUnnamedItem_Succeeds: a legacy single-service lease
+// arrives from the chain with ServiceName="" while the retained record was
+// normalized to "app" at Provision time. Restore must normalize the request
+// before the shape check (same boundary contract as Provision/Update), so the
+// restore SUCCEEDS instead of deterministically failing ErrValidation. Without the
+// fix this single-service restore (the common case) is impossible.
+func TestRestore_NormalizesLegacyUnnamedItem_Succeeds(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "u1") // retained record has ServiceName="app"
+
+	var mu sync.Mutex
+	var downProjects []string
+	var renames []restoreRenameCall
+	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			renames = append(renames, restoreRenameCall{old, new})
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	callbackReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer server.Close()
+
+	// Legacy chain shape: a single item with an EMPTY ServiceName.
+	req := restoreRequest("u2", "u1", server.URL)
+	req.Items = []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: ""}}
+
+	err := b.Restore(context.Background(), req)
+	require.NoError(t, err, "legacy unnamed-item restore must normalize to \"app\" and pass the shape check")
+
+	<-callbackReceived
+
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p, ok := b.provisions["u2"]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+
+	require.Eventually(t, func() bool {
+		e, gerr := rs.Get("u1")
+		return gerr == nil && e == nil
+	}, 5*time.Second, 20*time.Millisecond, "retained record for u1 must be deleted on successful restore")
+
+	// The normalized "app" service name must flow into the adopt rename.
+	mu.Lock()
+	gotRenames := append([]restoreRenameCall(nil), renames...)
+	mu.Unlock()
+	assert.Contains(t, gotRenames, restoreRenameCall{
+		old: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
+		new: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
+	}, "adopt must rename retained(u1) → canonical(u2) using the normalized service name")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
 // TestRestore_Failure_RollsBackInline makes the downstream compose Up FAIL and
 // asserts the C2+N1 behavior: the lease ends Failed (NOT recovered) — proven by
 // the FAILED callback firing — compose.Down(fred-u2) was called, the volume was
