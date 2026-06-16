@@ -253,6 +253,138 @@ func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
 	assert.NotNil(t, other, "other-tenant-lease retention record must remain")
 }
 
+// TestDeprovision_Retain_MergesPriorRecordOnRetry verifies that a retry of the
+// soft-delete path (after a partial rename on attempt 1) MERGES the existing
+// record's RetainedVolumeNames with the still-canonical volumes instead of
+// overwriting them. Without the merge, b.volumes.List on the retry no longer
+// returns the already-renamed fred-retained-u1-app-0, so Put would shrink the
+// record to only the still-canonical one (leaking the already-retained volume).
+func TestDeprovision_Retain_MergesPriorRecordOnRetry(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"u1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u1",
+			Tenant:    "tenant-a",
+			Status:    backend.ProvisionStatusReady,
+			Quantity:  2,
+			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+		}},
+	})
+
+	b.cfg.RetainOnClose = true
+	rs := attachRetentionStore(t, b)
+
+	// Simulate attempt 1: instance 0 was already renamed into the retained
+	// namespace and recorded; instance 1's rename failed and was retried.
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		CreatedAt:           time.Now().Add(-time.Minute),
+	}))
+
+	b.volumes = &mockVolumeManager{
+		// On the RETRY, List no longer returns fred-u1-app-0 (already retained);
+		// only the still-canonical fred-u1-app-1 remains.
+		ListFn: func() ([]string, error) {
+			return []string{"fred-u1-app-1"}, nil
+		},
+		RenameVolumeFn: func(old, new string) error { return nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
+			return nil
+		},
+	}
+
+	err := b.Deprovision(context.Background(), "u1")
+	require.NoError(t, err)
+
+	// Wait for the merged record: both names must be present.
+	var entry *shared.RetentionEntry
+	require.Eventually(t, func() bool {
+		e, err := rs.Get("u1")
+		if err != nil || e == nil {
+			return false
+		}
+		entry = e
+		return len(e.RetainedVolumeNames) == 2
+	}, 5*time.Second, 20*time.Millisecond, "merged retention record for u1 must contain both volumes")
+
+	assert.ElementsMatch(t,
+		[]string{"fred-retained-u1-app-0", "fred-retained-u1-app-1"},
+		entry.RetainedVolumeNames,
+		"retry must MERGE the prior record's retained names with the still-canonical one, not overwrite")
+}
+
+// TestEvictRetentionsToCap_ExcludesClosingLease verifies that the cap eviction
+// never destroys the CLOSING lease's own retention record (which can exist from
+// a prior soft-delete attempt). With cap=1 and the closing lease's own record as
+// the only active record, evict with excludeLease set must be a no-op.
+func TestEvictRetentionsToCap_ExcludesClosingLease(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	// The closing lease's OWN active record from a prior attempt.
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "closing",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{"fred-retained-closing-app-0"},
+		CreatedAt:           time.Now().Add(-time.Hour),
+	}))
+
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("evict must NOT destroy the closing lease's own record; got Destroy(%q)", id)
+			return nil
+		},
+	}
+
+	// cap=1: without the exclusion this lone record would be (wrongly) evicted.
+	err := b.evictRetentionsToCap(context.Background(), "tenant-a", 1, "closing")
+	require.NoError(t, err)
+
+	// The closing lease's record must still be present.
+	got, err := rs.Get("closing")
+	require.NoError(t, err)
+	require.NotNil(t, got, "closing lease's own retention record must NOT be evicted")
+}
+
+// TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError verifies the
+// fail-safe: when the retention store cannot be read (so the protected-canonical
+// set cannot be built), orphan destruction is skipped entirely — nothing is
+// destroyed — rather than failing open and risking a retained canonical.
+func TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, nil)
+	attachRetentionStore(t, b)
+	// Close the store so List() returns an error (bolt.ErrDatabaseNotOpen).
+	// attachRetentionStore's Cleanup also closes it; Close is idempotent.
+	require.Error(t, func() error {
+		_ = b.retentionStore.Close()
+		_, err := b.retentionStore.List()
+		return err
+	}(), "closed store List must error (precondition for the fail-safe)")
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			// A volume that would otherwise be an orphan (no live provision).
+			return []string{"fred-stale-app-0"}, nil
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("Destroy must NOT be called when the retention store is unreadable; got %q", id)
+			return nil
+		},
+	}
+
+	// Must NOT error (so Start doesn't crash) and must NOT destroy anything.
+	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+}
+
 // TestDeprovision_RetainOff_DestroysAsBefore verifies that when
 // RetainOnClose=false the existing volume-destroy behaviour is unchanged:
 // Destroy is called for the lease's volumes and RenameVolume is never called.

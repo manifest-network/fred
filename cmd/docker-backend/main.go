@@ -505,7 +505,9 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
-			s.errorResponse(w, http.StatusConflict, "insufficient resources for restore")
+			// 503 Service Unavailable, matching handleProvision: the backend is at
+			// capacity, not a permanent client error.
+			s.errorResponse(w, http.StatusServiceUnavailable, "insufficient resources for restore")
 			return
 		}
 		s.logger.Error("restore failed", "lease_uuid", req.LeaseUUID, "from_lease_uuid", req.FromLeaseUUID, "error", err)

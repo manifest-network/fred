@@ -422,6 +422,13 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 // handleRestartRequested/handleUpdateRequested's fireAndVerify, BEFORE
 // the ack, so the "Restart()/Update() returns ⇒ Status is
 // Restarting/Updating" contract relied on by api/handlers.go holds.
+//
+// onEnterRestarting is ALSO the entry action for the RESTORE path:
+// evRestoreRequested (Provisioning → Restarting, fired by
+// handleRestoreRequested) reuses it (ENG-325). For that source the prior
+// Status is Provisioning (not Ready), so applyReplaceEntry captures
+// replaceWasActive=false (absent→active) and the lease is counted active
+// on completion.
 func (lsm *leaseSM) onEnterRestarting(ctx context.Context, args ...any) error {
 	return lsm.applyReplaceEntry(args, backend.ProvisionStatusRestarting)
 }

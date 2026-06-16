@@ -1038,6 +1038,9 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			return nil, ErrNotRetained
 		case http.StatusConflict:
 			return nil, ErrInvalidState
+		case http.StatusServiceUnavailable:
+			// 503: backend at capacity — not a health failure (matches Provision).
+			return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
 		case http.StatusBadRequest:
 			// Reconstruct the validation sub-category sentinel from the
 			// validation_code body field (matching Provision/Update). Restore's

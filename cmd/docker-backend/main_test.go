@@ -1652,7 +1652,7 @@ func TestHandleRestore(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 	})
 
-	t.Run("ErrInsufficientResources returns 409", func(t *testing.T) {
+	t.Run("ErrInsufficientResources returns 503", func(t *testing.T) {
 		mb := &mockBackend{
 			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
 				return fmt.Errorf("no cap: %w", backend.ErrInsufficientResources)
@@ -1661,7 +1661,7 @@ func TestHandleRestore(t *testing.T) {
 		w := httptest.NewRecorder()
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
 
-		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 		assert.Contains(t, w.Body.String(), "insufficient resources")
 	})
 

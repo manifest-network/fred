@@ -149,16 +149,33 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				canonical = append(canonical, id)
 			}
 		}
-		if len(canonical) > 0 {
-			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant); err != nil {
+		// RETRY-SAFE MERGE: on a retry after a partial rename, b.volumes.List no
+		// longer returns the volumes already renamed to fred-retained-{lease}-… on
+		// the prior attempt, so `canonical` only covers the STILL-canonical ones.
+		// Merge any existing record's RetainedVolumeNames with the retained names of
+		// the still-canonical set so a retry never drops already-retained volumes
+		// (which would leak them) or overwrites the prior record with a shorter list.
+		existing, _ := b.retentionStore.Get(leaseUUID)
+		retainedSet := make(map[string]bool)
+		if existing != nil {
+			for _, name := range existing.RetainedVolumeNames {
+				retainedSet[name] = true
+			}
+		}
+		for _, c := range canonical {
+			retainedSet[retainedName(c)] = true
+		}
+		if len(retainedSet) > 0 {
+			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
-			retained := make([]string, 0, len(canonical))
-			for _, c := range canonical {
-				retained = append(retained, retainedName(c))
+			retained := make([]string, 0, len(retainedSet))
+			for name := range retainedSet {
+				retained = append(retained, name)
 			}
-			// RECORD-FIRST: persist the active record before any rename, so a crash
-			// between rename and record can never leak a record-less volume.
+			// RECORD-FIRST: persist the active record (with the MERGED retained set)
+			// before any rename, so a crash between rename and record can never leak
+			// a record-less volume, and a retry never shrinks the prior record.
 			if err := b.retentionStore.Put(shared.RetentionEntry{
 				OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
 				Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
@@ -167,6 +184,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				logger.Error("failed to write retention record", "lease_uuid", leaseUUID, "error", err)
 				volumeErrs = append(volumeErrs, fmt.Errorf("write retention record: %w", err))
 			} else {
+				// Only the STILL-canonical volumes need renaming; the already-retained
+				// ones (from a prior attempt) are done.
 				for _, c := range canonical {
 					if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
 						logger.Error("failed to retain volume", "volume", c, "error", err)

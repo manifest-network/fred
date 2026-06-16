@@ -69,10 +69,12 @@ func (b *Backend) destroyRetained(ctx context.Context, e shared.RetentionEntry) 
 	return b.retentionStore.Delete(e.OriginalLeaseUUID)
 }
 
-// renameIfPresent is a best-effort reconcile rename: RenameVolume errors both
-// for the benign no-op/conflict cases (both or neither name present) AND for a
-// real Docker-daemon failure. It logs and RETURNS the error so callers can
-// decide whether the failure is fatal to their step (e.g. the restoring-arm
+// renameIfPresent is a best-effort reconcile rename. Per the RenameVolume
+// contract (volume.go), RenameVolume errors for the conflict case (BOTH names
+// present) and the missing case (NEITHER present), as well as for a real
+// Docker-daemon failure; the only-new-exists case is a benign no-op that
+// returns nil (idempotent success). It logs and RETURNS the error so callers
+// can decide whether the failure is fatal to their step (e.g. the restoring-arm
 // rollback must NOT advance the record if a re-quarantine rename actually
 // failed, or the still-canonical volume would be reaped). reconcileRetentions'
 // active arm tolerates the error because cleanupOrphanedVolumes independently
@@ -175,7 +177,13 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 // evictRetentionsToCap hard-deletes the CLOSING TENANT's oldest ACTIVE records
 // until at most (maxPerTenant-1) of that tenant's remain (making room for one more).
 // Never touches another tenant's records. No-op when maxPerTenant<=0.
-func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPerTenant int) error {
+//
+// excludeLease is the closing lease's OriginalLeaseUUID: it is skipped entirely
+// (never counted, sorted, or evicted). On a soft-delete retry the closing lease
+// may already have its own ACTIVE record from a prior attempt; without this
+// exclusion the cap eviction could destroy the lease's own in-progress record =
+// data loss.
+func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPerTenant int, excludeLease string) error {
 	if b.retentionStore == nil || maxPerTenant <= 0 || tenant == "" {
 		return nil
 	}
@@ -185,6 +193,9 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 	}
 	var active []shared.RetentionEntry
 	for _, e := range mine {
+		if e.OriginalLeaseUUID == excludeLease {
+			continue // never evict the closing lease's own record
+		}
 		if e.Status == shared.RetentionStatusActive {
 			active = append(active, e)
 		}

@@ -185,9 +185,11 @@ type Config struct {
 	// Defaults to 90 days.
 	ReleasesMaxAge time.Duration `yaml:"releases_max_age"`
 
-	// RetainOnClose controls whether a lease's container is soft-deleted
-	// (moved to the retention store) instead of immediately destroyed when
-	// the lease is closed. When false (default), the container is destroyed
+	// RetainOnClose controls whether a lease's managed VOLUMES are soft-deleted
+	// (renamed into the fred-retained- namespace and recorded in the retention
+	// store) instead of immediately destroyed when the lease is closed. The
+	// lease's containers are still stopped and removed either way; only the
+	// volumes are retained. When false (default), the volumes are destroyed
 	// immediately on close.
 	RetainOnClose bool `yaml:"retain_on_close"`
 

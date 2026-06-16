@@ -1796,6 +1796,11 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 			wantErr:    ErrInvalidState,
 		},
 		{
+			name:       "503 Service Unavailable returns ErrInsufficientResources",
+			statusCode: http.StatusServiceUnavailable,
+			wantErr:    ErrInsufficientResources,
+		},
+		{
 			name:       "400 Bad Request returns ErrValidation",
 			statusCode: http.StatusBadRequest,
 			wantErr:    ErrValidation,

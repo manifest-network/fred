@@ -579,7 +579,12 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	// set so an incomplete rename can never be reaped.
 	if b.retentionStore != nil {
 		if recs, rerr := b.retentionStore.List(); rerr != nil {
-			b.logger.Warn("cleanupOrphanedVolumes: retention read failed; canonical protection skipped", "error", rerr)
+			// FAIL SAFE: we cannot read the retention store, so we cannot build the
+			// protected-canonical set. Proceeding to the destroy loop could reap a
+			// retained canonical we couldn't protect = permanent data loss. Skip
+			// orphan destruction entirely this run; the next boot retries.
+			b.logger.Error("cleanupOrphanedVolumes: retention read failed; skipping orphan destruction this run (fail-safe)", "error", rerr)
+			return nil
 		} else {
 			for _, e := range recs {
 				switch e.Status {

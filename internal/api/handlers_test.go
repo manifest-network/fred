@@ -4824,6 +4824,72 @@ func TestRestoreLease_NoRetention404(t *testing.T) {
 	assert.Equal(t, "no retained data found for that lease", errResp.Error)
 }
 
+// TestRestoreLease_InsufficientResources503 verifies that a 503 from the backend
+// (ErrInsufficientResources via the HTTP client's 503→sentinel mapping) is
+// surfaced as a 503 to the tenant, matching how Provision surfaces capacity —
+// NOT a 409.
+func TestRestoreLease_InsufficientResources503(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/restore" && r.Method == "POST" {
+			// 503 → ErrInsufficientResources in the HTTP client.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		client:        chainClient,
+		backendRouter: router,
+		providerUUID:  providerUUID,
+		bech32Prefix:  "manifest",
+	}
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.RestoreLease(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "body: %s", rec.Body.String())
+
+	var errResp ErrorResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+	assert.Equal(t, "insufficient resources to restore", errResp.Error)
+}
+
 // TestRestoreLease_PendingLeaseAuthenticates verifies that requireActive=false
 // allows a PENDING lease to authenticate successfully (i.e. the handler reaches
 // the backend call rather than 404-ing on auth).

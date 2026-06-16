@@ -602,7 +602,9 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, backend.ErrAlreadyProvisioned):
 			writeError(w, "lease already provisioned", http.StatusConflict)
 		case errors.Is(err, backend.ErrInsufficientResources):
-			writeError(w, "insufficient resources to restore", http.StatusConflict)
+			// 503, matching how Provision/StartProvisioning surface capacity to
+			// tenants: the provider is full, not a permanent client error.
+			writeError(w, "insufficient resources to restore", http.StatusServiceUnavailable)
 		case errors.Is(err, backend.ErrValidation):
 			writeError(w, err.Error(), http.StatusBadRequest)
 		default:
@@ -613,9 +615,13 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.eventBroker != nil {
+		// Restore rides the EXISTING restart machinery: the lease actor fires
+		// evRestoreRequested → onEnterRestarting and writes prov.Status=Restarting
+		// BEFORE acking (like RestartLease), so after Restore() returns the true
+		// internal status is Restarting, not Provisioning. Publish that.
 		h.eventBroker.Publish(backend.LeaseStatusEvent{
 			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusProvisioning,
+			Status:    backend.ProvisionStatusRestarting,
 			Timestamp: time.Now(),
 		})
 	}
@@ -627,6 +633,9 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		"backend", backendClient.Name(),
 	)
 
+	// The 202 body label stays "provisioning" — the tenant-facing operation is a
+	// restore — even though internally the lease rides the restart machinery and
+	// its published status (above) is Restarting.
 	writeJSON(w, map[string]string{"status": "provisioning"}, http.StatusAccepted)
 }
 
