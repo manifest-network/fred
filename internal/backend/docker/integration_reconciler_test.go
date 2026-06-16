@@ -20,6 +20,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
@@ -913,4 +914,99 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 
 	env.backend.cfg.RetainOnClose = false
 	require.NoError(t, env.backend.Deprovision(ctx, newLease))
+}
+
+// testManagerSetup wires a real provisioner.Manager to the real docker backend +
+// mock chain, for exercising the event-driven close/expiry deprovision path.
+//
+// NOTE: this deliberately collapses the production transport seam — prod wires the
+// Manager to backends via backend.NewHTTPClient against the docker-backend process
+// (cmd/providerd/main.go), whereas this injects the in-process *docker.Backend
+// directly. It exercises the provisioner→backend LIFECYCLE logic, not the HTTP wire
+// or HMAC auth (those are unit-tested separately).
+func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ...func(*Config)) (*provisioner.Manager, *Backend, <-chan backend.CallbackPayload, string) {
+	t.Helper()
+	callbackServer, callbackCh := startCallbackServer(t)
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		for _, fn := range extraCfg {
+			fn(cfg)
+		}
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
+		ProviderUUID:    "test-provider",
+		CallbackBaseURL: callbackServer.URL,
+	}, router, mockChain)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); _ = mgr.Close() })
+	go func() { _ = mgr.Start(ctx) }()
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for manager to start")
+	}
+	return mgr, b, callbackCh, callbackServer.URL
+}
+
+func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	leaseUUID := fmt.Sprintf("mgr-close-%d", time.Now().UnixNano())
+	tenant := "test-tenant"
+	const sku = "docker-small"
+	const providerUUID = "test-provider"
+
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			return chaintest.NewMockLeaseWithSKU(uuid, tenant, providerUUID, billingtypes.LEASE_STATE_ACTIVE, sku), nil
+		},
+	}
+	mgr, b, callbackCh, callbackURL := testManagerSetup(t, mockChain, func(cfg *Config) {
+		cfg.VolumeDataPath = mountPath // REQUIRED: empty would zero docker-small's DiskMB → stateless → nothing to retain
+		cfg.VolumeFilesystem = "btrfs"
+		cfg.RetainOnClose = true
+		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
+		cfg.RetentionMaxAge = 0
+		cfg.RetentionReapInterval = 0
+	})
+	ctx := context.Background()
+
+	// Provision directly on the backend. This exercises the SKU-hint / default-route
+	// close path (orchestrator Case 2): the lease is NOT Manager-tracked and has no
+	// placement, mirroring a post-restart close of an already-active lease.
+	payload, err := json.Marshal(manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}})
+	require.NoError(t, err)
+	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
+		Items: []backend.LeaseItem{{SKU: sku, Quantity: 1}}, CallbackURL: callbackURL, Payload: payload,
+	}))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute).Status)
+
+	execInContainer(t, getContainerID(t, leaseUUID), []string{"sh", "-c", "echo mgr-event-sentinel > /data/sentinel.txt"})
+
+	// Drive the on-chain close as an event through the real Manager. LeaseExpired is
+	// intentionally not a second btrfs run — HandleLeaseExpired calls processLeaseClose
+	// verbatim (handler_set.go:126-136), so this also covers the expiry route.
+	require.NoError(t, mgr.PublishLeaseEvent(chain.LeaseEvent{
+		Type: chain.LeaseClosed, LeaseUUID: leaseUUID, ProviderUUID: providerUUID, Tenant: tenant,
+	}))
+
+	// The KEY assertion: the event route reached a REAL soft-delete (mock backends can't).
+	retainedPath := filepath.Join(mountPath, retainedName(canonicalVolumeName(leaseUUID, manifest.DefaultServiceName, 0)))
+	require.Eventually(t, func() bool {
+		rec, _ := b.retentionStore.Get(leaseUUID)
+		if rec == nil {
+			return false
+		}
+		_, statErr := os.Stat(retainedPath)
+		return statErr == nil
+	}, 60*time.Second, 500*time.Millisecond, "LeaseClosed event must reach a real soft-delete (retained volume + record)")
+	data, err := os.ReadFile(filepath.Join(retainedPath, "data", "sentinel.txt"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "mgr-event-sentinel")
+	// Retained volume + bbolt DB live under the loopback mount / t.TempDir → torn down automatically.
 }
