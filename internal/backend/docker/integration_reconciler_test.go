@@ -68,7 +68,7 @@ type reconcilerTestEnv struct {
 
 // testReconcilerSetup creates a full-stack test environment:
 // real docker backend + reconciler + mock chain + tracker + payload store.
-func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient) *reconcilerTestEnv {
+func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraCfg ...func(*Config)) *reconcilerTestEnv {
 	t.Helper()
 
 	callbackServer, callbackCh := startCallbackServer(t)
@@ -77,6 +77,9 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient) *recon
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ReconcileInterval = 2 * time.Second
+		for _, fn := range extraCfg {
+			fn(cfg)
+		}
 	})
 
 	// Create the router wrapping our real docker backend
