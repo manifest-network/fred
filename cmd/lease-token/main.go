@@ -4,9 +4,14 @@
 //
 // Usage:
 //
-//	lease-token -mnemonic "word1 word2 ... word24" \
-//	            -tenant manifest1... \
-//	            -lease-uuid <NEW lease uuid in the request path>
+//	FRED_MNEMONIC="word1 word2 ... word24" \
+//	  lease-token -tenant manifest1... \
+//	              -lease-uuid <NEW lease uuid in the request path>
+//
+// The mnemonic is the tenant's full secret key material, so it is NEVER accepted
+// as a command-line flag (argv is world-readable via /proc and lands in shell
+// history). Provide it via the $FRED_MNEMONIC environment variable, or pipe it on
+// stdin:  echo "$MNEMONIC" | lease-token -tenant ... -lease-uuid ...
 //
 // The token is bound to the lease UUID in the request path (the restore handler
 // enforces token.lease_uuid == path lease_uuid), so -lease-uuid must be the NEW
@@ -16,7 +21,7 @@
 // It prints the base64 bearer token to stdout (followed by a newline for
 // readability). To use it:
 //
-//	TOKEN=$(lease-token -mnemonic "$MNEMONIC" -tenant "$TENANT" -lease-uuid "$UUID")
+//	TOKEN=$(FRED_MNEMONIC="$MNEMONIC" lease-token -tenant "$TENANT" -lease-uuid "$UUID")
 //	curl -H "Authorization: Bearer $TOKEN" ...
 package main
 
@@ -25,7 +30,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/cosmos/cosmos-sdk/crypto/hd"
@@ -54,9 +61,9 @@ const (
 type authToken struct {
 	Tenant    string `json:"tenant"`
 	LeaseUUID string `json:"lease_uuid"`
-	Timestamp int64  `json:"timestamp"`  // unix seconds
-	PubKey    string `json:"pub_key"`    // base64 of 33-byte compressed secp256k1 pubkey
-	Signature string `json:"signature"`  // base64 of 64-byte ADR-036 signature
+	Timestamp int64  `json:"timestamp"` // unix seconds
+	PubKey    string `json:"pub_key"`   // base64 of 33-byte compressed secp256k1 pubkey
+	Signature string `json:"signature"` // base64 of 64-byte ADR-036 signature
 }
 
 func main() {
@@ -67,22 +74,28 @@ func main() {
 }
 
 func run() error {
-	mnemonic := flag.String("mnemonic", "", "BIP39 mnemonic for the tenant account (required)")
 	tenant := flag.String("tenant", "", "expected bech32 tenant address (manifest1...) (required)")
 	leaseUUID := flag.String("lease-uuid", "", "lease UUID to bind the token to (the request-path UUID) (required)")
 	timestamp := flag.Int64("timestamp", 0, "unix timestamp to sign (default: now); the server allows ~30s past / ~10s future")
 	flag.Parse()
 
-	if *mnemonic == "" || *tenant == "" || *leaseUUID == "" {
+	if *tenant == "" || *leaseUUID == "" {
 		flag.Usage()
-		return fmt.Errorf("-mnemonic, -tenant and -lease-uuid are all required")
+		return fmt.Errorf("-tenant and -lease-uuid are required")
+	}
+
+	// The mnemonic is secret key material — never read it from a flag (argv leaks
+	// via /proc and shell history). Take it from $FRED_MNEMONIC or stdin.
+	mnemonic, err := readMnemonic()
+	if err != nil {
+		return err
 	}
 
 	// Derive the secp256k1 private key from the mnemonic at m/44'/118'/0'/0/0.
 	// hd.Secp256k1.Derive() returns a DeriveFn; go-bip39 validates the mnemonic
 	// inside it, so an invalid mnemonic surfaces as an error here.
 	hdPath := hd.CreateHDPath(cosmosCoinType, 0, 0).String()
-	derived, err := hd.Secp256k1.Derive()(*mnemonic, "", hdPath)
+	derived, err := hd.Secp256k1.Derive()(mnemonic, "", hdPath)
 	if err != nil {
 		return fmt.Errorf("derive key from mnemonic: %w", err)
 	}
@@ -131,4 +144,21 @@ func run() error {
 
 	fmt.Println(base64.StdEncoding.EncodeToString(jsonBytes))
 	return nil
+}
+
+// readMnemonic returns the BIP39 mnemonic from $FRED_MNEMONIC, falling back to
+// reading all of stdin (so callers can pipe it without exposing it on argv).
+func readMnemonic() (string, error) {
+	if m := strings.TrimSpace(os.Getenv("FRED_MNEMONIC")); m != "" {
+		return m, nil
+	}
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", fmt.Errorf("read mnemonic from stdin: %w", err)
+	}
+	m := strings.TrimSpace(string(data))
+	if m == "" {
+		return "", fmt.Errorf("no mnemonic provided: set $FRED_MNEMONIC or pipe it on stdin")
+	}
+	return m, nil
 }
