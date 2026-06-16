@@ -567,6 +567,17 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The target lease must be a fresh PENDING lease. Restore deploys a stack into
+	// it exactly like provisioning, and provisioning only runs for PENDING leases
+	// (handler_set.go gates on LEASE_STATE_PENDING). Without this guard an
+	// authenticated tenant could restore onto an ACTIVE or CLOSED lease and trigger
+	// backend work for a non-restorable state (e.g. compute on an unbilled closed
+	// lease), leaving inconsistent chain/backend state.
+	if auth.Lease.State != billingtypes.LEASE_STATE_PENDING {
+		writeError(w, "lease is not pending; only a fresh lease can be restored into", http.StatusConflict)
+		return
+	}
+
 	var body struct {
 		FromLeaseUUID string `json:"from_lease_uuid"`
 	}

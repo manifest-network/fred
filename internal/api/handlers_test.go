@@ -4760,6 +4760,73 @@ func TestRestoreLease_ForwardsAnd202(t *testing.T) {
 	assert.Equal(t, fromLeaseUUID, backendReq["from_lease_uuid"])
 }
 
+// TestRestoreLease_RejectsNonPendingLease verifies that restore refuses a target
+// lease that is not PENDING (e.g. ACTIVE or CLOSED) with 409 and never reaches the
+// backend — so a tenant cannot deploy onto an already-active or unbilled-closed
+// lease, mirroring the provisioning path's LEASE_STATE_PENDING gate.
+func TestRestoreLease_RejectsNonPendingLease(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state billingtypes.LeaseState
+	}{
+		{"active", billingtypes.LEASE_STATE_ACTIVE},
+		{"closed", billingtypes.LEASE_STATE_CLOSED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kp := testutil.NewTestKeyPair("test-tenant")
+			leaseUUID := testutil.ValidUUID1
+			providerUUID := testutil.ValidUUID2
+
+			chainClient := &mockChainClient{
+				getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+					if uuid == leaseUUID {
+						return &billingtypes.Lease{
+							Uuid:         leaseUUID,
+							Tenant:       kp.Address,
+							ProviderUuid: providerUUID,
+							State:        tc.state, // NOT pending
+						}, nil
+					}
+					return nil, nil
+				},
+			}
+
+			backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("backend must NOT be called for a non-pending lease: %s %s", r.Method, r.URL.Path)
+			}))
+			defer backendServer.Close()
+
+			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name:    "test-backend",
+				BaseURL: backendServer.URL,
+				Timeout: 5 * time.Second,
+			})
+			router, err := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+			})
+			require.NoError(t, err)
+
+			h := &Handlers{
+				client:        chainClient,
+				backendRouter: router,
+				providerUUID:  providerUUID,
+				bech32Prefix:  "manifest",
+			}
+
+			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+			reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+			req.Header.Set("Authorization", "Bearer "+validToken)
+			req.SetPathValue("lease_uuid", leaseUUID)
+
+			rec := httptest.NewRecorder()
+			h.RestoreLease(rec, req)
+
+			assert.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
+		})
+	}
+}
+
 // TestRestoreLease_NoRetention404 verifies that a 422 from the backend
 // (ErrNotRetained) is surfaced as a 404 to the caller.
 func TestRestoreLease_NoRetention404(t *testing.T) {
