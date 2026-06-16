@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -824,4 +825,92 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 
 	info := getProvisionInfo(t, b, leaseUUID)
 	assert.Equal(t, backend.ProvisionStatusReady, info.Status)
+}
+
+func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	leaseUUID := fmt.Sprintf("recon-retain-%d", time.Now().UnixNano())
+	tenant := "test-tenant"
+	const sku = "docker-small" // stateful: DiskMB=1024
+
+	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
+	payload, err := json.Marshal(appManifest)
+	require.NoError(t, err)
+	hash := sha256.Sum256(payload)
+
+	var mu sync.Mutex
+	leaseVisible := true // flip false to simulate the on-chain close/auto-close
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(_ context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if leaseVisible {
+				l := makeLease(leaseUUID, tenant, providerUUID, sku, 1, hash[:])
+				l.State = billingtypes.LEASE_STATE_PENDING
+				return []billingtypes.Lease{l}, nil
+			}
+			return nil, nil
+		},
+		GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) { return nil, nil },
+		AcknowledgeLeasesFunc:         func(_ context.Context, _ []string) (uint64, []string, error) { return 1, []string{"tx"}, nil },
+	}
+
+	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {
+		cfg.VolumeDataPath = mountPath
+		cfg.VolumeFilesystem = "btrfs"
+		cfg.RetainOnClose = true
+		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
+		cfg.RetentionMaxAge = 0 // reaper OFF: assert soft-delete persists
+		cfg.RetentionReapInterval = 0
+	})
+	require.True(t, env.tracker.store.Store(leaseUUID, payload))
+	ctx := context.Background()
+
+	// 1. Chain-driven provision.
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, leaseUUID, 3*time.Minute).Status)
+	env.tracker.UntrackInFlight(leaseUUID)
+
+	// 2. Sentinel into the managed volume.
+	cid := getContainerID(t, leaseUUID)
+	require.True(t, containerHasBindMount(t, cid, "/data"))
+	execInContainer(t, cid, []string{"sh", "-c", "echo recon-restore-sentinel > /data/sentinel.txt"})
+
+	// 3. Lease vanishes from chain (auto-close / credit exhaustion) → orphan cleanup soft-deletes.
+	mu.Lock()
+	leaseVisible = false
+	mu.Unlock()
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+
+	retainedPath := filepath.Join(mountPath, retainedName(canonicalVolumeName(leaseUUID, manifest.DefaultServiceName, 0)))
+	require.Eventually(t, func() bool {
+		rec, _ := env.backend.retentionStore.Get(leaseUUID)
+		if rec == nil {
+			return false
+		}
+		_, statErr := os.Stat(retainedPath)
+		return statErr == nil
+	}, 60*time.Second, 500*time.Millisecond, "reconciler orphan cleanup must soft-delete (retained volume + record)")
+	data, err := os.ReadFile(filepath.Join(retainedPath, "data", "sentinel.txt"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "recon-restore-sentinel")
+
+	// 4. Restore into a NEW lease.
+	newLease := fmt.Sprintf("recon-restore-new-%d", time.Now().UnixNano())
+	require.NoError(t, env.backend.Restore(ctx, backend.RestoreRequest{
+		LeaseUUID: newLease, FromLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: env.providerUUID,
+		Items:       []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL: env.callbackURL,
+	}))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, newLease, 3*time.Minute).Status)
+
+	// 5. Sentinel survived; record gone.
+	out := execInContainer(t, getContainerID(t, newLease), []string{"cat", "/data/sentinel.txt"})
+	assert.Contains(t, out, "recon-restore-sentinel")
+	rec, err := env.backend.retentionStore.Get(leaseUUID)
+	require.NoError(t, err)
+	assert.Nil(t, rec)
+
+	env.backend.cfg.RetainOnClose = false
+	require.NoError(t, env.backend.Deprovision(ctx, newLease))
 }
