@@ -404,6 +404,15 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	return backend.ErrNotProvisioned
 }
 
+// Restore is a stub for ENG-133. Returns ErrNotRetained (mapped to 422 by
+// the HTTP handler) because the stub provisioner never retains volume data.
+// ENG-134+ wires real volume restoration flows.
+func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+	_ = ctx
+	_ = req
+	return backend.ErrNotRetained
+}
+
 // ReconcileCustomDomain is a no-op in the ENG-133 scaffold and returns
 // nil. The backendService contract documents this method as idempotent /
 // no-op for leases the backend doesn't manage (or when ingress is

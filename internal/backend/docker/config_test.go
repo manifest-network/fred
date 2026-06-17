@@ -3,6 +3,7 @@ package docker
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -605,6 +606,60 @@ func TestConfig_DefaultConfig_MigrationDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 	assert.Equal(t, defaultMigrationReadyTimeout, cfg.MigrationReadyTimeout)
 	assert.Equal(t, defaultMigrationGracePeriod, cfg.MigrationGracePeriod)
+}
+
+func TestConfig_RetentionDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.False(t, cfg.RetainOnClose)
+	assert.Equal(t, "retention.db", cfg.RetentionDBPath)
+	assert.Equal(t, 90*24*time.Hour, cfg.RetentionMaxAge)
+	assert.Equal(t, time.Hour, cfg.RetentionReapInterval)
+	assert.Equal(t, 0, cfg.MaxRetainedLeasesPerTenant)
+}
+
+func TestConfig_RetentionValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name:    "negative retention_max_age",
+			mutate:  func(c *Config) { c.RetentionMaxAge = -1 },
+			wantErr: "retention_max_age must be non-negative",
+		},
+		{
+			name:    "negative retention_reap_interval",
+			mutate:  func(c *Config) { c.RetentionReapInterval = -1 },
+			wantErr: "retention_reap_interval must be non-negative",
+		},
+		{
+			name:    "negative max_retained_leases_per_tenant",
+			mutate:  func(c *Config) { c.MaxRetainedLeasesPerTenant = -1 },
+			wantErr: "max_retained_leases_per_tenant must be non-negative",
+		},
+		{
+			name: "zero retention values are valid",
+			mutate: func(c *Config) {
+				c.RetentionMaxAge = 0
+				c.RetentionReapInterval = 0
+				c.MaxRetainedLeasesPerTenant = 0
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
 }
 
 func TestConfig_Validate_TLS(t *testing.T) {

@@ -275,6 +275,18 @@ func (m *MockBackend) Update(ctx context.Context, req UpdateRequest) error {
 	return nil
 }
 
+// Restore is a no-op for mock backend — returns ErrNotRetained unless the
+// source lease exists in the provisions map (simulating "has retained data").
+func (m *MockBackend) Restore(ctx context.Context, req RestoreRequest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.provisions[req.FromLeaseUUID]; !exists {
+		return ErrNotRetained
+	}
+	return nil
+}
+
 // ReconcileCustomDomain is a no-op for mock backend.
 func (m *MockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []LeaseItem) error {
 	return nil

@@ -183,6 +183,12 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 		skuHint = ExtractRoutingSKU(lease)
 	}
 
+	// Best-effort: notify the tenant that their data may be retained.
+	// Fired regardless of whether the backend has retain_on_close enabled —
+	// providerd does not know the backend's retain config at close time.
+	h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusRetained,
+		"data may be retained if provider retention is enabled; restore is best-effort and capacity-bounded — restore within the grace window")
+
 	// Delegate to orchestrator for deprovisioning
 	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID, skuHint)
 }

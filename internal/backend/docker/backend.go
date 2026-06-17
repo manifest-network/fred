@@ -107,6 +107,9 @@ type Backend struct {
 	// releaseStore persists release history in bbolt
 	releaseStore *shared.ReleaseStore
 
+	// retentionStore persists soft-deleted leases awaiting restore or reaping
+	retentionStore *shared.RetentionStore
+
 	// callbackSender handles callback delivery with retry and HMAC
 	callbackSender *shared.CallbackSender
 
@@ -450,11 +453,20 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to open release store: %w", err)
 	}
 
+	retentionStore, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: cfg.RetentionDBPath})
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("failed to open retention store: %w", err)
+	}
+
 	volumes, err := newVolumeManager(cfg.VolumeDataPath, cfg.VolumeFilesystem, logger)
 	if err != nil {
 		_ = cbStore.Close()
 		_ = diagStore.Close()
 		_ = releaseStore.Close()
+		_ = retentionStore.Close()
 		return nil, fmt.Errorf("failed to create volume manager: %w", err)
 	}
 
@@ -463,6 +475,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		_ = cbStore.Close()
 		_ = diagStore.Close()
 		_ = releaseStore.Close()
+		_ = retentionStore.Close()
 		return nil, fmt.Errorf("init compose service: %w", err)
 	}
 
@@ -478,6 +491,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,
+		retentionStore:   retentionStore,
 		httpClient:       httpClient,
 		// tenantNetworkStripes is a fixed-size array embedded in Backend;
 		// the zero value is ready to use (N unlocked sync.Mutexes).
@@ -552,11 +566,27 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
 
+	// Reconcile crash-interrupted soft-deletes and restores. MUST run AFTER
+	// recoverState (so b.provisions reflects live containers) and BEFORE
+	// cleanupOrphanedVolumes (so any mid-rename canonical volume is moved back
+	// into the fred-retained- namespace before the orphan reaper sees it).
+	if err := b.reconcileRetentions(b.stopCtx); err != nil {
+		b.logger.Warn("retention reconciliation failed", "error", err)
+	}
+
 	// Clean up orphaned volumes (created but no matching provision).
 	// Must run after recoverState so the provision map is populated.
 	if err := b.cleanupOrphanedVolumes(ctx); err != nil {
 		return fmt.Errorf("orphaned volume cleanup failed: %w", err)
 	}
+
+	// Boot-eager reap: destroy volumes that expired while fred was offline.
+	// The periodic sweep handles ongoing reaping; this catches the gap between
+	// the last reap and the restart.
+	if _, err := b.reapExpiredRetentions(b.stopCtx); err != nil {
+		b.logger.Warn("retention boot reap failed", "error", err)
+	}
+	b.startRetentionReaper()
 
 	// Replay any pending callbacks from a previous run
 	b.callbackSender.ReplayPendingCallbacks()
@@ -635,6 +665,11 @@ func (b *Backend) Stop() error {
 	if b.releaseStore != nil {
 		if err := b.releaseStore.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing release store: %w", err))
+		}
+	}
+	if b.retentionStore != nil {
+		if err := b.retentionStore.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing retention store: %w", err))
 		}
 	}
 	if err := b.docker.Close(); err != nil {

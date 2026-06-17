@@ -250,6 +250,7 @@ type backendService interface {
 	LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	Restart(ctx context.Context, req backend.RestartRequest) error
 	Update(ctx context.Context, req backend.UpdateRequest) error
+	Restore(ctx context.Context, req backend.RestoreRequest) error
 	ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	Health(ctx context.Context) error
@@ -285,6 +286,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
 	mux.Handle("POST /restart", authMw(http.HandlerFunc(s.handleRestart)))
 	mux.Handle("POST /update", authMw(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("POST /restore", authMw(http.HandlerFunc(s.handleRestore)))
 	mux.Handle("POST /reconcile_custom_domain", authMw(http.HandlerFunc(s.handleReconcileCustomDomain)))
 	mux.Handle("GET /releases/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetReleases)))
 
@@ -458,6 +460,65 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "restarting"})
+}
+
+func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
+	var req backend.RestoreRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.LeaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+		return
+	}
+	if req.FromLeaseUUID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "from_lease_uuid is required")
+		return
+	}
+	if req.CallbackURL == "" {
+		s.errorResponse(w, http.StatusBadRequest, "callback_url is required")
+		return
+	}
+	if err := validateCallbackURL(req.CallbackURL); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
+		return
+	}
+
+	err := s.backend.Restore(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotRetained) {
+			s.errorResponse(w, http.StatusUnprocessableEntity, "no retained data for lease")
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			// 409 with no code → client maps to ErrInvalidState.
+			s.errorResponse(w, http.StatusConflict, "invalid state for restore")
+			return
+		}
+		if errors.Is(err, backend.ErrAlreadyProvisioned) {
+			// 409 with code="already_provisioned" → client reconstructs
+			// ErrAlreadyProvisioned (Restore overloads 409 for two sentinels).
+			s.errorResponseWithCode(w, http.StatusConflict, "lease already provisioned", "already_provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrValidation) {
+			s.validationErrorResponse(w, err)
+			return
+		}
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			// 503 Service Unavailable, matching handleProvision: the backend is at
+			// capacity, not a permanent client error.
+			s.errorResponse(w, http.StatusServiceUnavailable, "insufficient resources for restore")
+			return
+		}
+		s.logger.Error("restore failed", "lease_uuid", req.LeaseUUID, "from_lease_uuid", req.FromLeaseUUID, "error", err)
+		s.errorResponse(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "restoring"})
 }
 
 func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Request) {
@@ -675,6 +736,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 type ErrorResponse struct {
 	Error          string                 `json:"error"`
 	ValidationCode backend.ValidationCode `json:"validation_code,omitempty"`
+	// Code is an omitempty discriminator for overloaded status codes. Restore
+	// returns 409 for BOTH ErrInvalidState and ErrAlreadyProvisioned; the
+	// client maps a bare 409 to ErrInvalidState, so the already-provisioned
+	// case sets Code="already_provisioned" to let the client reconstruct the
+	// correct sentinel. (Mirrors the validation_code body-discriminator pattern.)
+	Code string `json:"code,omitempty"`
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
@@ -695,6 +762,13 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 
 func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, ErrorResponse{Error: message})
+}
+
+// errorResponseWithCode writes an error response carrying a machine-readable
+// discriminator code so the client can disambiguate an overloaded status code
+// (e.g. Restore's 409, which is shared by ErrInvalidState and ErrAlreadyProvisioned).
+func (s *Server) errorResponseWithCode(w http.ResponseWriter, status int, message, code string) {
+	s.writeJSON(w, status, ErrorResponse{Error: message, Code: code})
 }
 
 // validationErrorResponse writes a 400 response with a validation_code field
