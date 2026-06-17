@@ -105,14 +105,20 @@ go test -race -short ./...
 Integration tests require a running Docker daemon and use the `integration` build tag.
 
 ```bash
-make test-integration              # full Docker integration suite (~10 min)
+make test-integration              # full Docker integration suite (now also sweeps the slower retain/restore tests; ~15-25 min — override the ceiling with `INTEGRATION_TIMEOUT=30m`)
 make test-integration-stack        # stack/compose-based provisions
 make test-integration-restart-update   # restart, update, release-history flows
 make test-integration-k3s          # k3s-backend integration tests (self-builds the binary)
 sudo make test-integration-volume  # filesystem quota tests (root + btrfs-progs)
 ```
 
-Volume tests need root because they create btrfs subvolumes and set xfs project quotas. **None of the integration suites run in CI** — `.github/workflows/ci.yml` only does `build`, `test` (without `-race`, no `integration` tag), `lint`, and `vulncheck`. Anything that touches Docker or the filesystem-quota machinery has to be run locally.
+Volume tests need root because they create btrfs subvolumes and enable btrfs quotas (the integration suite runs against a btrfs loopback; the xfs project-quota path is a separate, non-integration code path).
+
+**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on a privileged `ubuntu-latest` runner (root + a btrfs loopback + Docker): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore) plus `make test-integration-k3s`. It triggers on PRs/pushes touching the docker backend (`internal/backend/docker/**`, `internal/backend/shared/**`, `cmd/k3s-backend/**`, `Makefile`, `go.mod`/`go.sum`) and runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` still only does `build`, `test` (without `-race`, no `integration` tag), `lint`, and `vulncheck`.
+
+Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
+
+> **Convention:** an integration test that needs a missing prerequisite (root, btrfs, a loop device, Docker) must gate via `t.Skip`/`t.Skipf` — never a bare early `return`. The CI guard detects a misprovisioned runner by looking for `--- SKIP:` in the test output; a test that silently returns instead of skipping would slip past it and reopen the ENG-330 gap.
 
 ### Stress tests
 
@@ -229,7 +235,7 @@ Update [BACKEND_GUIDE.md](BACKEND_GUIDE.md) to document the new endpoint for thi
 
 - [ ] `make fmt && make lint && make test` pass cleanly
 - [ ] `go test -race -short ./...` passes
-- [ ] If touching the docker-backend, `make test-integration` passes (requires Docker)
+- [ ] If touching the docker-backend, `sudo -E env "PATH=$PATH" make test-integration` passes locally (the `-E env "PATH=$PATH"` keeps `sudo`'s `secure_path` from hiding the Go toolchain — a plain `sudo make` can fail with `go: command not found`; requires root + Docker + btrfs-progs). CI runs the same invocation via `integration.yml`, but local is the fast loop and the only signal for changes outside that workflow's path filter
 - [ ] New code has tests
 - [ ] Public APIs / config / metrics that are user-visible are documented in the relevant `.md`
 - [ ] Commit messages are descriptive (we follow [Conventional Commits](https://www.conventionalcommits.org/) loosely: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`)

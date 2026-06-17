@@ -568,8 +568,45 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	}
 	b.provisionsMu.RUnlock()
 
+	// Protect retention-record canonicals from the reaper. reconcileRetentions
+	// runs immediately before this in Start and re-quarantines crash-stranded
+	// canonical volumes back to the fred-retained- namespace — but if any of
+	// those renames FAILED (real Docker error, not a benign no-op), the volume
+	// is still canonical-named, not fred-retained-, and not in any live
+	// provision's expected set, so the loop below would destroy it = permanent
+	// data loss. Add those canonicals (active arm: the not-yet-renamed canonical;
+	// restoring arm: the adopted/in-flight new-lease canonical) to the expected
+	// set so an incomplete rename can never be reaped.
+	if b.retentionStore != nil {
+		if recs, rerr := b.retentionStore.List(); rerr != nil {
+			// FAIL SAFE: we cannot read the retention store, so we cannot build the
+			// protected-canonical set. Proceeding to the destroy loop could reap a
+			// retained canonical we couldn't protect = permanent data loss. Skip
+			// orphan destruction entirely this run; the next boot retries.
+			b.logger.Error("cleanupOrphanedVolumes: retention read failed; skipping orphan destruction this run (fail-safe)", "error", rerr)
+			return nil
+		} else {
+			for _, e := range recs {
+				switch e.Status {
+				case shared.RetentionStatusActive:
+					for _, retained := range e.RetainedVolumeNames {
+						expected[canonicalFromRetained(retained)] = true // protect a not-yet-renamed canonical
+					}
+				case shared.RetentionStatusRestoring:
+					for _, retained := range e.RetainedVolumeNames {
+						expected[retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)] = true // adopted/in-flight new-lease canonical
+						expected[canonicalFromRetained(retained)] = true                                       // original-lease canonical (un-retained volume from a partial soft-delete)
+					}
+				}
+			}
+		}
+	}
+
 	var orphanCount, failCount int
 	for _, id := range volumeIDs {
+		if isRetainedVolume(id) {
+			continue
+		}
 		if expected[id] {
 			continue
 		}

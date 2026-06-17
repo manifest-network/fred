@@ -76,6 +76,12 @@ type Backend interface {
 	// Returns ErrNotProvisioned if lease not found, ErrInvalidState if not updatable.
 	Update(ctx context.Context, req UpdateRequest) error
 
+	// Restore re-provisions a new lease from the retained volumes of a prior
+	// soft-deleted lease (ENG-325). Returns ErrNotRetained if no retained data
+	// exists for FromLeaseUUID, ErrInvalidState if the target lease is not in
+	// a valid state for restore, ErrValidation for bad inputs.
+	Restore(ctx context.Context, req RestoreRequest) error
+
 	// ReconcileCustomDomain reapplies the per-LeaseItem custom_domain values
 	// from chain onto the running provision. When any item's CustomDomain
 	// differs from the in-memory provision state, the backend snapshots the
@@ -287,6 +293,25 @@ type UpdateRequest struct {
 	PayloadHash string `json:"payload_hash,omitempty"`
 }
 
+// RestoreRequest contains the data needed to restore a soft-deleted lease's
+// retained volumes into a NEW lease (ENG-325). FromLeaseUUID identifies the
+// original (retained) lease whose data is adopted; LeaseUUID is the new lease
+// the data is restored into. Items must match the retained set's shape
+// (service-name → summed-quantity).
+type RestoreRequest struct {
+	LeaseUUID     string      `json:"lease_uuid"`      // NEW lease
+	FromLeaseUUID string      `json:"from_lease_uuid"` // original (retained) lease
+	Tenant        string      `json:"tenant"`
+	ProviderUUID  string      `json:"provider_uuid"` // when non-empty, cross-checked against the retained record
+	Items         []LeaseItem `json:"items"`         // must match the retained set
+	CallbackURL   string      `json:"callback_url"`
+}
+
+// ErrNotRetained is returned when no retained data exists for the original
+// lease (absent, expired, or owned by a different tenant). Distinct from
+// ErrNotProvisioned (which concerns live provisions).
+var ErrNotRetained = errors.New("no retained data for lease")
+
 // ReleaseInfo describes a single release in the history.
 type ReleaseInfo struct {
 	Version   int       `json:"version"`
@@ -345,6 +370,11 @@ const (
 	ProvisionStatusRestarting     ProvisionStatus = "restarting"
 	ProvisionStatusUpdating       ProvisionStatus = "updating"
 	ProvisionStatusDeprovisioning ProvisionStatus = "deprovisioning"
+	// ProvisionStatusRetained is published to the tenant at lease close/expire
+	// time to signal that managed volumes may have been kept under a
+	// fred-retained- namespace if the backend has retain_on_close enabled.
+	// This is a best-effort hint; the backend may not have retention configured.
+	ProvisionStatusRetained ProvisionStatus = "retained"
 )
 
 // CallbackStatus represents the status sent in a callback payload.
@@ -552,12 +582,14 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrInsufficientResources: 503 from Provision (backend at capacity, not unhealthy)
 			//   - ErrAlreadyProvisioned: 409 from Provision (idempotent duplicate)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
+			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			return err == nil ||
 				errors.Is(err, ErrNotProvisioned) ||
 				errors.Is(err, ErrValidation) ||
 				errors.Is(err, ErrInsufficientResources) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
-				errors.Is(err, ErrInvalidState)
+				errors.Is(err, ErrInvalidState) ||
+				errors.Is(err, ErrNotRetained)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -676,6 +708,24 @@ func parseValidationError(body []byte) error {
 		return fmt.Errorf("%w: %s", sentinel, msg)
 	}
 	return fmt.Errorf("%w: %s", ErrValidation, msg)
+}
+
+// parseErrorCode extracts the omitempty "code" discriminator from an error
+// response body (best-effort; returns "" when absent or unparseable). Used to
+// disambiguate overloaded status codes — e.g. Restore's 409, shared by
+// ErrInvalidState (no code) and ErrAlreadyProvisioned (code="already_provisioned").
+func parseErrorCode(body []byte) (code, msg string) {
+	var resp struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", string(body)
+	}
+	if resp.Error == "" {
+		resp.Error = string(body)
+	}
+	return resp.Code, resp.Error
 }
 
 // signRequest adds an HMAC-SHA256 signature header to the request.
@@ -998,6 +1048,67 @@ func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) 
 			return nil, ErrInvalidState
 		default:
 			return nil, fmt.Errorf("update failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return ErrCircuitOpen
+	}
+	return cbErr
+}
+
+// Restore sends a restore request to the backend.
+func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("restore", start, err) }()
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal restore request: %w", err)
+	}
+
+	_, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restore", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		c.signRequest(httpReq, body)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("restore request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		switch resp.StatusCode {
+		case http.StatusAccepted:
+			return nil, nil
+		case http.StatusUnprocessableEntity:
+			return nil, ErrNotRetained
+		case http.StatusConflict:
+			// Restore overloads 409 for two sentinels: the backend tags the
+			// already-provisioned case with code="already_provisioned" so we can
+			// reconstruct ErrAlreadyProvisioned (otherwise a duplicate restore would
+			// surface the wrong ErrInvalidState message). A bare 409 (no code) is
+			// ErrInvalidState (wrong lease state for restore).
+			code, msg := parseErrorCode(readErrorBodyBytes(resp))
+			if code == "already_provisioned" {
+				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, msg)
+			}
+			return nil, ErrInvalidState
+		case http.StatusServiceUnavailable:
+			// 503: backend at capacity — not a health failure (matches Provision).
+			return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
+		case http.StatusBadRequest:
+			// Reconstruct the validation sub-category sentinel from the
+			// validation_code body field (matching Provision/Update). Restore's
+			// prelude returns ErrUnknownSKU/ErrInvalidManifest/ErrImageNotAllowed
+			// via GetSKUProfile/ValidateImage; the returned error still wraps
+			// ErrValidation so the breaker allowlist and 400 mapping hold.
+			return nil, parseValidationError(readErrorBodyBytes(resp))
+		default:
+			return nil, fmt.Errorf("restore failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 	})
 

@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker build-k3s install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-k3s test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker run-k3s fmt generate verify help
+.PHONY: all build build-mock build-docker build-k3s install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-restore test-integration-k3s test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker run-k3s fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -18,6 +18,11 @@ GOVET=$(GOCMD) vet
 
 # Version
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+
+# Timeout for the full `-run Integration` docker suite. Overridable so CI can
+# grant the grown suite (volume + the slower retain/restore tests) extra headroom
+# without changing the local default. e.g. `make test-integration INTEGRATION_TIMEOUT=30m`.
+INTEGRATION_TIMEOUT ?= 15m
 
 # Build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
@@ -85,7 +90,7 @@ test-volume:
 # Run Docker integration tests (requires Docker daemon)
 test-integration:
 	@echo "Running Docker integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout 15m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout $(INTEGRATION_TIMEOUT)
 
 # Run stack integration tests (requires Docker daemon)
 test-integration-stack:
@@ -102,6 +107,12 @@ test-integration-restart-update:
 test-integration-volume:
 	@echo "Running volume integration tests (requires root + Docker + btrfs-progs)..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota|RestartPreservesVolumes|UpdatePreservesVolumes)" -timeout 10m
+
+# Run retain/restore integration tests (requires root + Docker + btrfs-progs)
+# Usage: sudo make test-integration-restore
+test-integration-restore:
+	@echo "Running retain/restore integration tests (requires root + Docker + btrfs-progs)..."
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
 
 # Run k3s-backend integration tests (requires `go` toolchain; cmd/k3s-backend/integration_test.go
 # self-builds the binary into t.TempDir and exercises the full HTTP + callback path against a fake Fred).
@@ -193,6 +204,7 @@ help:
 	@echo "  test-integration-stack         - Run stack integration tests (requires Docker)"
 	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
 	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, btrfs-progs)"
+	@echo "  test-integration-restore       - Run retain/restore integration tests (sudo, Docker, btrfs-progs)"
 	@echo "  test-integration-k3s           - Run k3s-backend integration tests (self-builds binary)"
 	@echo "  test-coverage           - Run tests with coverage report"
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"

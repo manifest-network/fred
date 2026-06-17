@@ -544,6 +544,7 @@ type mockBackend struct {
 	LookupProvisionsFunc      func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	RestartFunc               func(ctx context.Context, req backend.RestartRequest) error
 	UpdateFunc                func(ctx context.Context, req backend.UpdateRequest) error
+	RestoreFunc               func(ctx context.Context, req backend.RestoreRequest) error
 	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleasesFunc           func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	HealthFunc                func(ctx context.Context) error
@@ -611,6 +612,13 @@ func (m *mockBackend) Update(ctx context.Context, req backend.UpdateRequest) err
 		panic("mockBackend.Update called but not configured")
 	}
 	return m.UpdateFunc(ctx, req)
+}
+
+func (m *mockBackend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+	if m.RestoreFunc == nil {
+		panic("mockBackend.Restore called but not configured")
+	}
+	return m.RestoreFunc(ctx, req)
 }
 
 func (m *mockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
@@ -1501,4 +1509,178 @@ func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code,
 		"middleware must reject method-swapped signature; body=%q", w.Body.String())
 	assert.Contains(t, w.Body.String(), "invalid signature")
+}
+
+// --- Restore handler tests ---
+
+func TestRestore_RequiresAuth(t *testing.T) {
+	handler := newTestHandler()
+
+	req := httptest.NewRequest("POST", "/restore",
+		strings.NewReader(`{"lease_uuid":"new-1","from_lease_uuid":"old-1","callback_url":"http://localhost/cb"}`))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "missing signature")
+}
+
+func TestRestore_MissingLeaseUUID(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"from_lease_uuid":"old-1","callback_url":"http://localhost/cb"}`)
+	req := httptest.NewRequest("POST", "/restore", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "lease_uuid is required")
+}
+
+func TestRestore_MissingFromLeaseUUID(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"new-1","callback_url":"http://localhost/cb"}`)
+	req := httptest.NewRequest("POST", "/restore", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "from_lease_uuid is required")
+}
+
+func TestRestore_MissingCallbackURL(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"new-1","from_lease_uuid":"old-1"}`)
+	req := httptest.NewRequest("POST", "/restore", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "callback_url is required")
+}
+
+func TestRestore_InvalidCallbackURL(t *testing.T) {
+	handler := newTestHandler()
+
+	body := []byte(`{"lease_uuid":"new-1","from_lease_uuid":"old-1","callback_url":"ftp://invalid/cb"}`)
+	req := httptest.NewRequest("POST", "/restore", bytes.NewReader(body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid callback_url")
+}
+
+func TestHandleRestore(t *testing.T) {
+	validBody := `{"lease_uuid":"new-1","from_lease_uuid":"old-1","callback_url":"http://localhost/cb"}`
+
+	t.Run("success returns 202", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(_ context.Context, req backend.RestoreRequest) error {
+				assert.Equal(t, "new-1", req.LeaseUUID)
+				assert.Equal(t, "old-1", req.FromLeaseUUID)
+				return nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusAccepted, w.Code)
+		var resp StatusResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "restoring", resp.Status)
+	})
+
+	t.Run("ErrNotRetained returns 422", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
+				return backend.ErrNotRetained
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+		assert.Contains(t, w.Body.String(), "no retained data")
+	})
+
+	t.Run("ErrInvalidState returns 409", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
+				return backend.ErrInvalidState
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "invalid state for restore")
+	})
+
+	t.Run("ErrAlreadyProvisioned returns 409 with already_provisioned code", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
+				return fmt.Errorf("dup: %w", backend.ErrAlreadyProvisioned)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "already provisioned")
+
+		// FIX B: the body must carry the code discriminator so the client can
+		// reconstruct ErrAlreadyProvisioned (not the bare-409 ErrInvalidState).
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "already_provisioned", resp.Code,
+			"already-provisioned 409 must set code=already_provisioned")
+	})
+
+	t.Run("ErrValidation returns 400", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
+				return fmt.Errorf("bad items: %w", backend.ErrValidation)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	t.Run("ErrInsufficientResources returns 503", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
+				return fmt.Errorf("no cap: %w", backend.ErrInsufficientResources)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		assert.Contains(t, w.Body.String(), "insufficient resources")
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
+				return fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
 }

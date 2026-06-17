@@ -25,10 +25,11 @@ import (
 // methods default to sensible no-ops (not panics) since most tests don't care
 // about volumes. Tests that need to observe volume calls set the Fn fields.
 type mockVolumeManager struct {
-	CreateFn   func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
-	DestroyFn  func(ctx context.Context, id string) error
-	ListFn     func() ([]string, error)
-	ValidateFn func() error
+	CreateFn       func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
+	DestroyFn      func(ctx context.Context, id string) error
+	ListFn         func() ([]string, error)
+	ValidateFn     func() error
+	RenameVolumeFn func(oldName, newName string) error
 
 	// defaultDir is returned by Create when CreateFn is nil.
 	// Set this to t.TempDir() in tests that need real paths.
@@ -63,10 +64,13 @@ func (m *mockVolumeManager) Validate() error {
 	return nil
 }
 
-// RenameVolume is a no-op for tests that don't exercise migration; Task 9
-// tests use fakeVolumeBackend (in testsupport_test.go) which captures
-// rename calls.
+// RenameVolume delegates to RenameVolumeFn when set. Tests that don't exercise
+// volume renaming get a no-op default; Task 9 tests and restore tests that need
+// to observe rename calls set RenameVolumeFn.
 func (m *mockVolumeManager) RenameVolume(oldName, newName string) error {
+	if m.RenameVolumeFn != nil {
+		return m.RenameVolumeFn(oldName, newName)
+	}
 	return nil
 }
 

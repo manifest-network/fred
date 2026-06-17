@@ -41,6 +41,13 @@ type Config struct {
 	// ListenAddr is the address the HTTP server listens on.
 	ListenAddr string `yaml:"listen_addr"`
 
+	// ProductionMode tightens startup checks beyond basic validation. When true,
+	// Validate rejects dev-only insecure toggles — currently
+	// callback_insecure_skip_verify, which disables TLS verification on the
+	// backend → Fred callback hop. Mirrors providerd's production_mode (which
+	// gates the reverse providerd → backend tls_skip_verify). Defaults to false.
+	ProductionMode bool `yaml:"production_mode"`
+
 	// TLSCertFile and TLSKeyFile enable HTTPS on the listener when both are
 	// set; otherwise it serves plaintext HTTP (the default). Loaded once at
 	// startup — rotation requires a restart (see ENG-294).
@@ -185,6 +192,34 @@ type Config struct {
 	// Defaults to 90 days.
 	ReleasesMaxAge time.Duration `yaml:"releases_max_age"`
 
+	// RetainOnClose controls whether a lease's managed VOLUMES are soft-deleted
+	// (renamed into the fred-retained- namespace and recorded in the retention
+	// store) instead of immediately destroyed when the lease is closed. The
+	// lease's containers are still stopped and removed either way; only the
+	// volumes are retained. When false (default), the volumes are destroyed
+	// immediately on close.
+	RetainOnClose bool `yaml:"retain_on_close"`
+
+	// RetentionDBPath is the path to the bbolt database for persisting
+	// soft-deleted leases awaiting restore or reaping.
+	// Defaults to "retention.db".
+	RetentionDBPath string `yaml:"retention_db_path"`
+
+	// RetentionMaxAge is the grace window after which a soft-deleted lease
+	// becomes eligible for reaping. 0 disables reaping entirely.
+	// Defaults to 90 days.
+	RetentionMaxAge time.Duration `yaml:"retention_max_age"`
+
+	// RetentionReapInterval is how often the background reaper sweeps for
+	// expired soft-deleted leases. Decoupled from RetentionMaxAge so the
+	// sweep cadence can be tuned independently of the grace window.
+	// Defaults to 1h.
+	RetentionReapInterval time.Duration `yaml:"retention_reap_interval"`
+
+	// MaxRetainedLeasesPerTenant caps how many soft-deleted leases a single
+	// tenant may have in the retention store at once. 0 means unlimited.
+	MaxRetainedLeasesPerTenant int `yaml:"max_retained_leases_per_tenant"`
+
 	// MigrationGracePeriod is how long the renamed `-prev` legacy container
 	// lingers after a successful recover-time migration before forced
 	// removal. Preserves rollback potential if the operator interrupts fred
@@ -293,6 +328,9 @@ func DefaultConfig() Config {
 		DiagnosticsMaxAge:       7 * 24 * time.Hour,
 		ReleasesDBPath:          "releases.db",
 		ReleasesMaxAge:          90 * 24 * time.Hour,
+		RetentionDBPath:         "retention.db",
+		RetentionMaxAge:         90 * 24 * time.Hour,
+		RetentionReapInterval:   time.Hour,
 		MigrationGracePeriod:    defaultMigrationGracePeriod,
 		MigrationReadyTimeout:   defaultMigrationReadyTimeout,
 		AllowedRegistries: []string{
@@ -448,6 +486,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("releases_max_age must be non-negative")
 	}
 
+	if c.RetentionMaxAge < 0 {
+		return fmt.Errorf("retention_max_age must be non-negative")
+	}
+
+	if c.RetentionReapInterval < 0 {
+		return fmt.Errorf("retention_reap_interval must be non-negative")
+	}
+
+	if c.MaxRetainedLeasesPerTenant < 0 {
+		return fmt.Errorf("max_retained_leases_per_tenant must be non-negative")
+	}
+
 	// Volume management validation
 	if c.HasStatefulSKUs() && c.VolumeDataPath == "" {
 		return fmt.Errorf("volume_data_path is required when any SKU profile has disk_mb > 0")
@@ -486,6 +536,14 @@ func (c *Config) Validate() error {
 		if tq.MaxDiskMB > c.TotalDiskMB {
 			return fmt.Errorf("tenant_quota.max_disk_mb (%d) exceeds total_disk_mb (%d)", tq.MaxDiskMB, c.TotalDiskMB)
 		}
+	}
+
+	// Production mode security enforcement (runs after all basic validation).
+	// callback_insecure_skip_verify disables TLS verification on the backend →
+	// Fred callback hop; it is a dev-only escape hatch and must never reach a
+	// production deployment.
+	if c.ProductionMode && c.CallbackInsecureSkipVerify {
+		return fmt.Errorf("production_mode: callback_insecure_skip_verify cannot be enabled")
 	}
 
 	return nil

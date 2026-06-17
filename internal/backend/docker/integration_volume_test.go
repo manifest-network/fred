@@ -186,11 +186,11 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	leaseUUID := fmt.Sprintf("vol-lifecycle-%d", time.Now().UnixNano())
 
 	// Redis declares VOLUME /data
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// 1. Provision redis with stateful SKU
@@ -213,7 +213,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	}
 
 	// 3. Verify btrfs subvolume exists
-	volumeID := fmt.Sprintf("fred-%s-0", leaseUUID)
+	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
 	subvolPath := filepath.Join(mountPath, volumeID)
 	out, err := exec.Command("btrfs", "subvolume", "show", subvolPath).CombinedOutput()
 	require.NoError(t, err, "btrfs subvolume should exist: %s", out)
@@ -266,11 +266,11 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := fmt.Sprintf("vol-persist-%d", time.Now().UnixNano())
 
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server", "--save", "1", "1"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// 1. Provision redis
@@ -297,7 +297,7 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
 
 	// Record subvolume path for later comparison
-	volumeID := fmt.Sprintf("fred-%s-0", leaseUUID)
+	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
 	subvolPath := filepath.Join(mountPath, volumeID)
 	_, err = os.Stat(subvolPath)
 	require.NoError(t, err, "subvolume should exist before kill")
@@ -376,11 +376,11 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 	leaseUUID := fmt.Sprintf("ephemeral-%d", time.Now().UnixNano())
 
 	// Redis declares VOLUME /data
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"redis-server"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
@@ -429,11 +429,11 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	leaseUUID := fmt.Sprintf("vol-multi-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	// Provision with Quantity=2 → two containers, two volumes
@@ -455,8 +455,8 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	}
 
 	// Verify two separate btrfs subvolumes exist
-	subvol0 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-0", leaseUUID))
-	subvol1 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-1", leaseUUID))
+	subvol0 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName))
+	subvol1 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-1", leaseUUID, manifest.DefaultServiceName))
 
 	out, err := exec.Command("btrfs", "subvolume", "show", subvol0).CombinedOutput()
 	require.NoError(t, err, "subvolume 0 should be a btrfs subvolume: %s", out)
@@ -544,11 +544,11 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	leaseUUID := fmt.Sprintf("orphan-vol-%d", time.Now().UnixNano())
 
 	// redis:7 declares VOLUME /data → triggers btrfs subvolume creation
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b1.Provision(ctx, backend.ProvisionRequest{
@@ -569,7 +569,7 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	}
 
 	// Verify subvolume exists
-	volumeID := fmt.Sprintf("fred-%s-0", leaseUUID)
+	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
 	subvolPath := filepath.Join(mountPath, volumeID)
 	_, err = os.Stat(subvolPath)
 	require.NoError(t, err, "subvolume should exist after provision")
@@ -700,11 +700,11 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 
 	// redis:7 declares VOLUME /data → bind-mounted to 5MB btrfs subvolume.
 	// Using "sleep" as command so redis-server doesn't start and consume space.
-	manifest := manifest.Manifest{
+	appManifest := manifest.Manifest{
 		Image:   "redis:7",
 		Command: []string{"sleep", "3600"},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{

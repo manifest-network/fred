@@ -78,6 +78,16 @@ When a provision fails (during provisioning, state recovery, or partial deprovis
 | ReleasesDBPath | `releases_db_path` | string | `"releases.db"` | Path to bbolt database for persisting release history |
 | ReleasesMaxAge | `releases_max_age` | duration | `2160h` | Maximum age of persisted release entries before cleanup (90 days) |
 
+### Soft-delete & Retention
+
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| RetainOnClose | `retain_on_close` | bool | `false` | When true, managed volumes are renamed into a `fred-retained-` namespace on lease close/expire instead of being destroyed. Tenants can restore data into a new lease via `POST /v1/leases/{new_lease_uuid}/restore`. |
+| RetentionDBPath | `retention_db_path` | string | `"retention.db"` | Path to bbolt database tracking retained lease records |
+| RetentionMaxAge | `retention_max_age` | duration | `2160h` (90 days) | How long retained volumes are kept before the grace reaper destroys them. Set to `0` to disable automatic reaping (volumes are kept until the per-tenant cap evicts them). |
+| RetentionReapInterval | `retention_reap_interval` | duration | `1h` | How often the grace reaper runs to destroy expired retained volumes |
+| MaxRetainedLeasesPerTenant | `max_retained_leases_per_tenant` | int | `0` (unlimited) | Maximum number of retained leases kept per tenant. When the cap is reached, the tenant's oldest retained lease is eagerly reaped to make room. `0` means no cap. |
+
 ### Tenant Quotas
 
 | Field | YAML Key | Type | Default | Description |
@@ -187,6 +197,29 @@ When provisioning `redis:latest` on this SKU:
 ## Tenant Manifest Reference
 
 See [Manifest Guide](../../../docs/manifest-guide.md) for the full tenant-facing manifest specification (image, ports, env, health check, tmpfs). A formal [JSON Schema](../../../docs/manifest-schema.json) is also available.
+
+## Soft-delete & Restore
+
+When `retain_on_close: true` is set, the backend performs a **soft-delete** instead of a hard destroy at lease close or auto-expire time:
+
+1. All managed volumes for the lease are **renamed** from `fred-<lease_uuid>-…` into a `fred-retained-<lease_uuid>-…` namespace and kept on disk.
+2. The original containers and resource-pool allocations are still released (the running workload is stopped; resources are freed for new leases).
+3. Fred publishes a `retained` status event to any connected tenant WebSocket so the tenant knows their data may be recoverable.
+4. Retained volumes are held for up to `retention_max_age` (default 90 days). The grace reaper runs every `retention_reap_interval` (default 1h) and destroys expired retained volumes.
+
+### Restore flow
+
+To restore data from a closed lease into a new lease:
+
+1. Open a **fresh lease on the same provider** by requesting the **same service names and quantities** as the original closed lease. The new lease UUID (`new_lease_uuid`) will be in `PENDING` state.
+2. Call `POST /v1/leases/{new_lease_uuid}/restore` with body `{"from_lease_uuid": "<original_closed_lease_uuid>"}`. Fred validates the request and delegates to the backend.
+3. The backend re-deploys the **retained manifest** (the exact deployment that was running at close time) onto the adopted volumes. The new lease becomes active with the same data. To change the image or configuration after restore, use the normal update path once the lease is active.
+
+### Limitations
+
+- **Best-effort and capacity-bounded**: retention is not a guarantee. The per-tenant cap (`max_retained_leases_per_tenant`) may evict a tenant's oldest retained lease before `retention_max_age` expires to make room for a newer one. Always restore within the grace window.
+- **Same-backend-node only**: restore works only on the backend node that holds the retained volumes. In single-backend deployments this is always satisfied. Multi-node routing affinity (routing a new lease to the node holding its retained data) is a future enhancement.
+- **Not a backup**: retained data is a single copy on the node's local disk (RAID-backed by the operator). It provides a grace window against accidental lease closure, not protection against node-level data loss. Operators should run separate backup procedures for production data.
 
 ## Provisioning Lifecycle
 

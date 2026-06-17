@@ -1805,3 +1805,262 @@ func TestLoadStats_CPUAllocatedRatio(t *testing.T) {
 	assert.True(t, ok)
 	assert.InDelta(t, 0.25, ratio, 1e-9)
 }
+
+// --- HTTPClient.Restore tests ---
+
+func TestHTTPClientRestore_StatusMapping(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string // optional response body (for code-discriminated cases)
+		wantErr    error
+		wantNil    bool
+	}{
+		{
+			name:       "202 Accepted returns nil",
+			statusCode: http.StatusAccepted,
+			wantNil:    true,
+		},
+		{
+			name:       "422 Unprocessable Entity returns ErrNotRetained",
+			statusCode: http.StatusUnprocessableEntity,
+			wantErr:    ErrNotRetained,
+		},
+		{
+			name:       "409 Conflict (no code) returns ErrInvalidState",
+			statusCode: http.StatusConflict,
+			wantErr:    ErrInvalidState,
+		},
+		{
+			name:       "409 Conflict with already_provisioned code returns ErrAlreadyProvisioned",
+			statusCode: http.StatusConflict,
+			body:       `{"error":"lease already provisioned","code":"already_provisioned"}`,
+			wantErr:    ErrAlreadyProvisioned,
+		},
+		{
+			name:       "503 Service Unavailable returns ErrInsufficientResources",
+			statusCode: http.StatusServiceUnavailable,
+			wantErr:    ErrInsufficientResources,
+		},
+		{
+			name:       "400 Bad Request returns ErrValidation",
+			statusCode: http.StatusBadRequest,
+			wantErr:    ErrValidation,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/restore" {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(tt.statusCode)
+				if tt.body != "" {
+					_, _ = w.Write([]byte(tt.body))
+				}
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name:    "test-restore-status",
+				BaseURL: server.URL,
+				Timeout: 5 * time.Second,
+			})
+
+			err := client.Restore(context.Background(), RestoreRequest{
+				LeaseUUID:     "new-lease-1",
+				FromLeaseUUID: "old-lease-1",
+				Tenant:        "tenant-1",
+				CallbackURL:   "http://fred/callback",
+			})
+
+			if tt.wantNil {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorIs(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestHTTPClientRestore_ValidationCodeRoundTrips verifies that a 400 response
+// carrying a validation_code reconstructs the SPECIFIC sub-category sentinel
+// (not just the generic ErrValidation), matching Provision/Update. Restore's
+// prelude returns ErrUnknownSKU/ErrInvalidManifest/ErrImageNotAllowed and the
+// docker-backend handler encodes validation_code, so dropping it client-side
+// would lose the sub-category across the wire.
+func TestHTTPClientRestore_ValidationCodeRoundTrips(t *testing.T) {
+	tests := []struct {
+		name         string
+		responseBody string
+		wantSentinel error
+		wantMessage  string
+	}{
+		{
+			"unknown SKU code",
+			`{"error":"validation error: unknown SKU: bad-sku","validation_code":"unknown_sku"}`,
+			ErrUnknownSKU,
+			"unknown SKU: bad-sku",
+		},
+		{
+			"invalid manifest code",
+			`{"error":"validation error: invalid manifest: bad shape","validation_code":"invalid_manifest"}`,
+			ErrInvalidManifest,
+			"invalid manifest: bad shape",
+		},
+		{
+			"image not allowed code",
+			`{"error":"validation error: image not allowed: evil.io","validation_code":"image_not_allowed"}`,
+			ErrImageNotAllowed,
+			"image not allowed: evil.io",
+		},
+		{
+			"missing code falls back to generic ErrValidation",
+			`{"error":"some validation error"}`,
+			ErrValidation,
+			"some validation error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/restore" {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(tt.responseBody))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name:    "test-restore-validation-code",
+				BaseURL: server.URL,
+				Timeout: 5 * time.Second,
+			})
+
+			err := client.Restore(context.Background(), RestoreRequest{
+				LeaseUUID:     "new-lease-1",
+				FromLeaseUUID: "old-lease-1",
+				Tenant:        "tenant-1",
+				CallbackURL:   "http://fred/callback",
+			})
+
+			assert.ErrorIs(t, err, tt.wantSentinel)
+			assert.ErrorIs(t, err, ErrValidation, "all validation errors should match ErrValidation")
+			assert.Contains(t, err.Error(), tt.wantMessage)
+		})
+	}
+}
+
+func TestHTTPClientRestore_500TripsBreaker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-restore-500-cb",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: 3,
+		CBTimeout:       100 * time.Millisecond,
+	})
+
+	req := RestoreRequest{
+		LeaseUUID:     "new-lease-1",
+		FromLeaseUUID: "old-lease-1",
+		Tenant:        "t",
+		CallbackURL:   "http://fred/callback",
+	}
+
+	// First 3 calls should reach the server
+	for i := range 3 {
+		err := client.Restore(context.Background(), req)
+		assert.Error(t, err)
+		assert.NotErrorIs(t, err, ErrCircuitOpen, "circuit should not be open at call %d", i+1)
+	}
+
+	// 4th call should get ErrCircuitOpen (breaker tripped)
+	err := client.Restore(context.Background(), req)
+	assert.ErrorIs(t, err, ErrCircuitOpen)
+}
+
+// TestHTTPClientRestore_422DoesNotTripBreaker is the primary circuit-breaker
+// allowlist test: 422 (ErrNotRetained) is a benign client condition and must
+// NOT count toward the failure threshold, no matter how many times it occurs.
+func TestHTTPClientRestore_422DoesNotTripBreaker(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	defer server.Close()
+
+	// Set a low threshold to make any tripping obvious.
+	const threshold = 3
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-restore-422-cb",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: threshold,
+	})
+
+	req := RestoreRequest{
+		LeaseUUID:     "new-lease-1",
+		FromLeaseUUID: "old-lease-1",
+		Tenant:        "t",
+		CallbackURL:   "http://fred/callback",
+	}
+
+	// Make more requests than the threshold — circuit must stay closed.
+	const n = threshold * 4
+	for i := range n {
+		err := client.Restore(context.Background(), req)
+		assert.ErrorIs(t, err, ErrNotRetained, "call %d should return ErrNotRetained", i+1)
+		assert.NotErrorIs(t, err, ErrCircuitOpen, "circuit must not open on ErrNotRetained (call %d)", i+1)
+	}
+
+	// All requests should have reached the server (none short-circuited).
+	assert.Equal(t, n, requestCount, "all %d requests should have reached the server", n)
+}
+
+func TestHTTPClientRestore_WithHMAC(t *testing.T) {
+	const secret = "test-secret-for-hmac-restore-abcde"
+
+	var capturedSig, capturedMethod, capturedURI string
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSig = r.Header.Get(hmacauth.SignatureHeader)
+		capturedMethod = r.Method
+		capturedURI = r.URL.RequestURI()
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:    "test-hmac-restore",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+		Secret:  secret,
+	})
+
+	err := client.Restore(context.Background(), RestoreRequest{
+		LeaseUUID:     "new-lease-hmac",
+		FromLeaseUUID: "old-lease-hmac",
+		Tenant:        "tenant-1",
+		CallbackURL:   "http://fred/callback",
+	})
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
+	err = hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute)
+	assert.NoError(t, err, "HMAC signature should verify successfully")
+}

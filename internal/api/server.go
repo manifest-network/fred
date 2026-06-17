@@ -242,6 +242,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTimeout(withAuthRL(handlers.GetLeaseLogs)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTimeout(withPayloadRL(s.handlePayloadUpload)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withAuthRL(handlers.RestartLease)))
+	mux.Handle("POST /v1/leases/{lease_uuid}/restore", withTimeout(withAuthRL(handlers.RestoreLease)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/update", withTimeout(withAuthRL(handlers.UpdateLease)))
 	mux.Handle("GET /v1/leases/{lease_uuid}/releases", withTimeout(withAuthRL(handlers.GetLeaseReleases)))
 

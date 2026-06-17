@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
@@ -68,7 +70,7 @@ type reconcilerTestEnv struct {
 
 // testReconcilerSetup creates a full-stack test environment:
 // real docker backend + reconciler + mock chain + tracker + payload store.
-func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient) *reconcilerTestEnv {
+func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraCfg ...func(*Config)) *reconcilerTestEnv {
 	t.Helper()
 
 	callbackServer, callbackCh := startCallbackServer(t)
@@ -77,6 +79,9 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient) *recon
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ReconcileInterval = 2 * time.Second
+		for _, fn := range extraCfg {
+			fn(cfg)
+		}
 	})
 
 	// Create the router wrapping our real docker backend
@@ -656,8 +661,16 @@ func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
 //
 // Without RefreshState, the reconciler reads stale in-memory state from
 // ListProvisions and misses container failures that happened between
-// recoverState cycles. With RefreshState called before ListProvisions,
-// the reconciler always sees fresh Docker state.
+// recoverState cycles. With RefreshState called before ListProvisions, every
+// reconciler tick re-lists live Docker state and hands a crashed container to
+// the lease SM — so the failure is detected and re-provisioned even with the
+// background recoverState loop disabled. Detection and re-provision span more
+// than one tick: recoverState keeps the provision Ready and fires
+// containerDiedMsg, but the SM's Ready→Failing→Failed transition is async
+// (diagnostics are gathered off-actor), so the ListProvisions in that same tick
+// can still observe Ready and skip re-provision. The assertion below therefore
+// drives RunOnce on an interval — mirroring the production reconciler, which
+// self-heals on its next tick — instead of betting on a single tick.
 func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) {
 	leaseUUID := fmt.Sprintf("recon-refresh-%d", time.Now().UnixNano())
 	tenant := "test-tenant"
@@ -775,10 +788,10 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	killContainer(t, containers[0].ID)
 	waitForContainerExited(t, containers[0].ID)
 
-	// 4. Do NOT wait for recoverState — with ReconcileInterval=1h it won't run.
-	//    Immediately call RunOnce. The reconciler's fetchAllProvisions calls
-	//    RefreshState (which delegates to recoverState) before ListProvisions,
-	//    so it should see the container is dead.
+	// 4. Do NOT wait for the background recoverState loop (ReconcileInterval=1h,
+	//    so it never fires). Drive the reconciler manually instead. Each RunOnce
+	//    calls RefreshState (→ recoverState) before ListProvisions, so it re-lists
+	//    live Docker state and hands the dead container to the lease SM.
 
 	// Drain any failure callback that RefreshState might send
 	drainCallbacks := func() {
@@ -794,11 +807,18 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	err = reconciler.RunOnce(ctx)
 	require.NoError(t, err)
 
-	// 5. The reconciler should have detected the failure (via RefreshState)
-	//    and re-provisioned. Wait for the success callback.
-	//    RefreshState may fire a "failed" callback first when it detects the
-	//    crashed container, so skip any failed callbacks until we get success.
+	// 5. The reconciler re-provisions the crashed container; wait for the success
+	//    callback. Detection and re-provision are NOT atomic within one RunOnce:
+	//    RefreshState fires containerDiedMsg, but the SM's Ready→Failing→Failed
+	//    transition is asynchronous, so the ListProvisions in that same tick can
+	//    still observe a Ready provision and skip re-provision. In production the
+	//    reconciler runs on an interval and self-heals on the next tick, so model
+	//    that here by ticking RunOnce until the provision is re-provisioned —
+	//    rather than betting on a single tick winning the race (which flaked on
+	//    CI). Failed callbacks emitted while the SM settles are skipped.
 	successTimeout := time.After(2 * time.Minute)
+	retick := time.NewTicker(2 * time.Second)
+	defer retick.Stop()
 	gotSuccess := false
 	for !gotSuccess {
 		select {
@@ -807,9 +827,10 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 				assert.Equal(t, leaseUUID, cb.LeaseUUID)
 				gotSuccess = true
 			}
+		case <-retick.C:
+			require.NoError(t, reconciler.RunOnce(ctx))
 		case <-successTimeout:
-			t.Fatal("timeout waiting for re-provision success callback — " +
-				"RefreshState may not be called before ListProvisions")
+			t.Fatal("timeout waiting for re-provision success callback after repeated reconciler ticks")
 		}
 	}
 
@@ -821,4 +842,187 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 
 	info := getProvisionInfo(t, b, leaseUUID)
 	assert.Equal(t, backend.ProvisionStatusReady, info.Status)
+}
+
+func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	leaseUUID := fmt.Sprintf("recon-retain-%d", time.Now().UnixNano())
+	tenant := "test-tenant"
+	const sku = "docker-small" // stateful: DiskMB=1024
+
+	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
+	payload, err := json.Marshal(appManifest)
+	require.NoError(t, err)
+	hash := sha256.Sum256(payload)
+
+	var mu sync.Mutex
+	leaseVisible := true // flip false to simulate the on-chain close/auto-close
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(_ context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if leaseVisible {
+				l := makeLease(leaseUUID, tenant, providerUUID, sku, 1, hash[:])
+				l.State = billingtypes.LEASE_STATE_PENDING
+				return []billingtypes.Lease{l}, nil
+			}
+			return nil, nil
+		},
+		GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) { return nil, nil },
+		AcknowledgeLeasesFunc:         func(_ context.Context, _ []string) (uint64, []string, error) { return 1, []string{"tx"}, nil },
+	}
+
+	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {
+		cfg.VolumeDataPath = mountPath
+		cfg.VolumeFilesystem = "btrfs"
+		cfg.RetainOnClose = true
+		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
+		cfg.RetentionMaxAge = 0 // reaper OFF: assert soft-delete persists
+		cfg.RetentionReapInterval = 0
+	})
+	require.True(t, env.tracker.store.Store(leaseUUID, payload))
+	ctx := context.Background()
+
+	// 1. Chain-driven provision.
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, leaseUUID, 3*time.Minute).Status)
+	env.tracker.UntrackInFlight(leaseUUID)
+
+	// 2. Sentinel into the managed volume.
+	cid := getContainerID(t, leaseUUID)
+	require.True(t, containerHasBindMount(t, cid, "/data"))
+	execInContainer(t, cid, []string{"sh", "-c", "echo recon-restore-sentinel > /data/sentinel.txt"})
+
+	// 3. Lease vanishes from chain (auto-close / credit exhaustion) → orphan cleanup soft-deletes.
+	mu.Lock()
+	leaseVisible = false
+	mu.Unlock()
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+
+	retainedPath := filepath.Join(mountPath, retainedName(canonicalVolumeName(leaseUUID, manifest.DefaultServiceName, 0)))
+	require.Eventually(t, func() bool {
+		rec, _ := env.backend.retentionStore.Get(leaseUUID)
+		if rec == nil {
+			return false
+		}
+		_, statErr := os.Stat(retainedPath)
+		return statErr == nil
+	}, 60*time.Second, 500*time.Millisecond, "reconciler orphan cleanup must soft-delete (retained volume + record)")
+	data, err := os.ReadFile(filepath.Join(retainedPath, "data", "sentinel.txt"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "recon-restore-sentinel")
+
+	// 4. Restore into a NEW lease.
+	newLease := fmt.Sprintf("recon-restore-new-%d", time.Now().UnixNano())
+	require.NoError(t, env.backend.Restore(ctx, backend.RestoreRequest{
+		LeaseUUID: newLease, FromLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: env.providerUUID,
+		Items:       []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL: env.callbackURL,
+	}))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, newLease, 3*time.Minute).Status)
+
+	// 5. Sentinel survived; record gone.
+	out := execInContainer(t, getContainerID(t, newLease), []string{"cat", "/data/sentinel.txt"})
+	assert.Contains(t, out, "recon-restore-sentinel")
+	rec, err := env.backend.retentionStore.Get(leaseUUID)
+	require.NoError(t, err)
+	assert.Nil(t, rec)
+
+	env.backend.cfg.RetainOnClose = false
+	require.NoError(t, env.backend.Deprovision(ctx, newLease))
+}
+
+// testManagerSetup wires a real provisioner.Manager to the real docker backend +
+// mock chain, for exercising the event-driven close/expiry deprovision path.
+//
+// NOTE: this deliberately collapses the production transport seam — prod wires the
+// Manager to backends via backend.NewHTTPClient against the docker-backend process
+// (cmd/providerd/main.go), whereas this injects the in-process *docker.Backend
+// directly. It exercises the provisioner→backend LIFECYCLE logic, not the HTTP wire
+// or HMAC auth (those are unit-tested separately).
+func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ...func(*Config)) (*provisioner.Manager, *Backend, <-chan backend.CallbackPayload, string) {
+	t.Helper()
+	callbackServer, callbackCh := startCallbackServer(t)
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		for _, fn := range extraCfg {
+			fn(cfg)
+		}
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
+		ProviderUUID:    "test-provider",
+		CallbackBaseURL: callbackServer.URL,
+	}, router, mockChain)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); _ = mgr.Close() })
+	go func() { _ = mgr.Start(ctx) }()
+	select {
+	case <-mgr.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for manager to start")
+	}
+	return mgr, b, callbackCh, callbackServer.URL
+}
+
+func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	leaseUUID := fmt.Sprintf("mgr-close-%d", time.Now().UnixNano())
+	tenant := "test-tenant"
+	const sku = "docker-small"
+	const providerUUID = "test-provider"
+
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			return chaintest.NewMockLeaseWithSKU(uuid, tenant, providerUUID, billingtypes.LEASE_STATE_ACTIVE, sku), nil
+		},
+	}
+	mgr, b, callbackCh, callbackURL := testManagerSetup(t, mockChain, func(cfg *Config) {
+		cfg.VolumeDataPath = mountPath // REQUIRED: empty would zero docker-small's DiskMB → stateless → nothing to retain
+		cfg.VolumeFilesystem = "btrfs"
+		cfg.RetainOnClose = true
+		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
+		cfg.RetentionMaxAge = 0
+		cfg.RetentionReapInterval = 0
+	})
+	ctx := context.Background()
+
+	// Provision directly on the backend. This exercises the SKU-hint / default-route
+	// close path (orchestrator Case 2): the lease is NOT Manager-tracked and has no
+	// placement, mirroring a post-restart close of an already-active lease.
+	payload, err := json.Marshal(manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}})
+	require.NoError(t, err)
+	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
+		Items: []backend.LeaseItem{{SKU: sku, Quantity: 1}}, CallbackURL: callbackURL, Payload: payload,
+	}))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute).Status)
+
+	execInContainer(t, getContainerID(t, leaseUUID), []string{"sh", "-c", "echo mgr-event-sentinel > /data/sentinel.txt"})
+
+	// Drive the on-chain close as an event through the real Manager. LeaseExpired is
+	// intentionally not a second btrfs run — HandleLeaseExpired calls processLeaseClose
+	// verbatim (handler_set.go:126-136), so this also covers the expiry route.
+	require.NoError(t, mgr.PublishLeaseEvent(chain.LeaseEvent{
+		Type: chain.LeaseClosed, LeaseUUID: leaseUUID, ProviderUUID: providerUUID, Tenant: tenant,
+	}))
+
+	// The KEY assertion: the event route reached a REAL soft-delete (mock backends can't).
+	retainedPath := filepath.Join(mountPath, retainedName(canonicalVolumeName(leaseUUID, manifest.DefaultServiceName, 0)))
+	require.Eventually(t, func() bool {
+		rec, _ := b.retentionStore.Get(leaseUUID)
+		if rec == nil {
+			return false
+		}
+		_, statErr := os.Stat(retainedPath)
+		return statErr == nil
+	}, 60*time.Second, 500*time.Millisecond, "LeaseClosed event must reach a real soft-delete (retained volume + record)")
+	data, err := os.ReadFile(filepath.Join(retainedPath, "data", "sentinel.txt"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "mgr-event-sentinel")
+	// Retained volume + bbolt DB live under the loopback mount / t.TempDir → torn down automatically.
 }
