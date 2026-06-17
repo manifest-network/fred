@@ -661,8 +661,16 @@ func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
 //
 // Without RefreshState, the reconciler reads stale in-memory state from
 // ListProvisions and misses container failures that happened between
-// recoverState cycles. With RefreshState called before ListProvisions,
-// the reconciler always sees fresh Docker state.
+// recoverState cycles. With RefreshState called before ListProvisions, every
+// reconciler tick re-lists live Docker state and hands a crashed container to
+// the lease SM — so the failure is detected and re-provisioned even with the
+// background recoverState loop disabled. Detection and re-provision span more
+// than one tick: recoverState keeps the provision Ready and fires
+// containerDiedMsg, but the SM's Ready→Failing→Failed transition is async
+// (diagnostics are gathered off-actor), so the ListProvisions in that same tick
+// can still observe Ready and skip re-provision. The assertion below therefore
+// drives RunOnce on an interval — mirroring the production reconciler, which
+// self-heals on its next tick — instead of betting on a single tick.
 func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) {
 	leaseUUID := fmt.Sprintf("recon-refresh-%d", time.Now().UnixNano())
 	tenant := "test-tenant"
@@ -780,10 +788,10 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	killContainer(t, containers[0].ID)
 	waitForContainerExited(t, containers[0].ID)
 
-	// 4. Do NOT wait for recoverState — with ReconcileInterval=1h it won't run.
-	//    Immediately call RunOnce. The reconciler's fetchAllProvisions calls
-	//    RefreshState (which delegates to recoverState) before ListProvisions,
-	//    so it should see the container is dead.
+	// 4. Do NOT wait for the background recoverState loop (ReconcileInterval=1h,
+	//    so it never fires). Drive the reconciler manually instead. Each RunOnce
+	//    calls RefreshState (→ recoverState) before ListProvisions, so it re-lists
+	//    live Docker state and hands the dead container to the lease SM.
 
 	// Drain any failure callback that RefreshState might send
 	drainCallbacks := func() {
@@ -799,11 +807,18 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	err = reconciler.RunOnce(ctx)
 	require.NoError(t, err)
 
-	// 5. The reconciler should have detected the failure (via RefreshState)
-	//    and re-provisioned. Wait for the success callback.
-	//    RefreshState may fire a "failed" callback first when it detects the
-	//    crashed container, so skip any failed callbacks until we get success.
+	// 5. The reconciler re-provisions the crashed container; wait for the success
+	//    callback. Detection and re-provision are NOT atomic within one RunOnce:
+	//    RefreshState fires containerDiedMsg, but the SM's Ready→Failing→Failed
+	//    transition is asynchronous, so the ListProvisions in that same tick can
+	//    still observe a Ready provision and skip re-provision. In production the
+	//    reconciler runs on an interval and self-heals on the next tick, so model
+	//    that here by ticking RunOnce until the provision is re-provisioned —
+	//    rather than betting on a single tick winning the race (which flaked on
+	//    CI). Failed callbacks emitted while the SM settles are skipped.
 	successTimeout := time.After(2 * time.Minute)
+	retick := time.NewTicker(2 * time.Second)
+	defer retick.Stop()
 	gotSuccess := false
 	for !gotSuccess {
 		select {
@@ -812,9 +827,10 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 				assert.Equal(t, leaseUUID, cb.LeaseUUID)
 				gotSuccess = true
 			}
+		case <-retick.C:
+			require.NoError(t, reconciler.RunOnce(ctx))
 		case <-successTimeout:
-			t.Fatal("timeout waiting for re-provision success callback — " +
-				"RefreshState may not be called before ListProvisions")
+			t.Fatal("timeout waiting for re-provision success callback after repeated reconciler ticks")
 		}
 	}
 
