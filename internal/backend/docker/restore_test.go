@@ -800,6 +800,66 @@ func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
 	assert.False(t, hasU2, "orphaned provision for u2 must be removed")
 }
 
+// TestReconcileRestoring_RenameFailureLeavesRestoring is the data-safety arm: an
+// orphaned restoring record whose re-quarantine rename FAILS must NOT advance.
+// Because a real rename failure means the volume may still carry the new canonical
+// name, advancing the record (RevertToActive) or dropping the provision would let
+// cleanupOrphanedVolumes destroy still-live data. The reconcile must leave the
+// record restoring (Generation unchanged = RevertToActive's CAS bump did NOT fire)
+// and keep the provision (removeProvision skipped) so the next startup retries.
+func TestReconcileRestoring_RenameFailureLeavesRestoring(t *testing.T) {
+	mock := &mockDockerClient{}
+	// Seed an ORPHANED-looking provision for u2 in a non-Ready/non-Restarting
+	// state (Provisioning) so the orphaned arm is taken AND the "provision must
+	// NOT be removed" assertion is meaningful.
+	b := newBackendForTest(mock, map[string]*provision{
+		"u2": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u2",
+			Status:    backend.ProvisionStatusProvisioning,
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+	}
+	// Force the re-quarantine rename to fail with a real (non-benign) error.
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return assert.AnError },
+	}
+
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		NewLeaseUUID:        "u2",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          3,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+	}
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	// The record must STILL be restoring with Generation UNCHANGED: a successful
+	// RevertToActive would have flipped it to active and bumped Generation to 4.
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "record must still exist")
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
+		"a failed re-quarantine must leave the record restoring")
+	assert.Equal(t, 3, entry.Generation,
+		"generation must be unchanged (RevertToActive's CAS bump must NOT have fired)")
+	assert.Equal(t, "u2", entry.NewLeaseUUID, "NewLeaseUUID must be retained for the retry")
+
+	// The provision must STILL be present (removeProvision was skipped) so its
+	// expected-set entry keeps protecting the data until the next attempt.
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.True(t, hasU2, "provision for u2 must NOT be removed when re-quarantine failed")
+}
+
 // TestReconcileRestoring_DefersToInFlight verifies that when b.provisions["u2"]
 // has status Restarting (restore is in flight), reconcileRestoring is a no-op:
 // no compose Down, no rename, store record remains restoring.
@@ -1766,6 +1826,45 @@ func TestRestore_ProviderMismatch_Validation(t *testing.T) {
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
 	assert.Equal(t, 1, entry.Generation)
+}
+
+// TestRestore_TenantMismatch_CollapsesToNotRetained: a request whose Tenant does
+// not match the retained record's is DELIBERATELY collapsed into ErrNotRetained
+// (NOT ErrValidation) so a cross-tenant caller cannot distinguish "exists but not
+// yours" from "does not exist" — a no-info-leak guard. The record stays untouched:
+// no rename, no provision entry, status/generation unchanged.
+func TestRestore_TenantMismatch_CollapsesToNotRetained(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	seedActiveRetained(t, rs, "u1") // Tenant: "tenant-a"
+
+	renameCalled := false
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
+	}
+
+	req := restoreRequest("u2", "u1", "http://localhost/cb")
+	req.Tenant = "tenant-b" // differs from the retained record's "tenant-a"
+
+	err := b.Restore(context.Background(), req)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrNotRetained, "cross-tenant must collapse to ErrNotRetained")
+	assert.False(t, errors.Is(err, backend.ErrValidation),
+		"must NOT be ErrValidation: that would leak that the record exists")
+
+	assert.False(t, renameCalled, "no volume rename must occur on a tenant-mismatch rejection")
+
+	b.provisionsMu.RLock()
+	_, has := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, has, "no provision entry must be created on a tenant-mismatch rejection")
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
+	assert.Equal(t, 1, entry.Generation, "generation must be unchanged (no claim happened)")
 }
 
 // TestRestore_Success_DeletesRecord drives a restore all the way to Ready and

@@ -91,13 +91,29 @@ func run() error {
 		return err
 	}
 
+	token, err := mintToken(mnemonic, *tenant, *leaseUUID, *timestamp)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(token)
+	return nil
+}
+
+// mintToken derives the tenant's secp256k1 key from the BIP39 mnemonic, verifies
+// it matches the supplied tenant address, ADR-036-signs the {tenant}:{lease_uuid}:
+// {timestamp} sign data, and returns the base64-encoded JSON bearer token. When
+// ts is 0 the current unix time is used (matching the -timestamp flag default).
+// This is the pure signing core extracted from run() so it can be exercised
+// directly against the real verifier without a process/flag harness.
+func mintToken(mnemonic, tenant, leaseUUID string, ts int64) (string, error) {
 	// Derive the secp256k1 private key from the mnemonic at m/44'/118'/0'/0/0.
 	// hd.Secp256k1.Derive() returns a DeriveFn; go-bip39 validates the mnemonic
 	// inside it, so an invalid mnemonic surfaces as an error here.
 	hdPath := hd.CreateHDPath(cosmosCoinType, 0, 0).String()
 	derived, err := hd.Secp256k1.Derive()(mnemonic, "", hdPath)
 	if err != nil {
-		return fmt.Errorf("derive key from mnemonic: %w", err)
+		return "", fmt.Errorf("derive key from mnemonic: %w", err)
 	}
 	privKey := hd.Secp256k1.Generate()(derived).(*secp256k1.PrivKey)
 	pubKey := privKey.PubKey().(*secp256k1.PubKey)
@@ -107,43 +123,41 @@ func run() error {
 	// catches a wrong mnemonic / HD path before we bother signing.
 	derivedAddr, err := sdktypes.Bech32ifyAddressBytes(bech32Prefix, pubKey.Address().Bytes())
 	if err != nil {
-		return fmt.Errorf("encode bech32 address: %w", err)
+		return "", fmt.Errorf("encode bech32 address: %w", err)
 	}
-	if derivedAddr != *tenant {
-		return fmt.Errorf("derived address %s does not match -tenant %s (wrong mnemonic or HD path)", derivedAddr, *tenant)
+	if derivedAddr != tenant {
+		return "", fmt.Errorf("derived address %s does not match -tenant %s (wrong mnemonic or HD path)", derivedAddr, tenant)
 	}
 
-	ts := *timestamp
 	if ts == 0 {
 		ts = time.Now().Unix()
 	}
 
 	// Build the sign data ("{tenant}:{lease_uuid}:{timestamp}") using the same
 	// helper the server uses to recompute it, so the formats cannot drift.
-	signData := auth.FormatSignData(*tenant, *leaseUUID, ts)
+	signData := auth.FormatSignData(tenant, leaseUUID, ts)
 
 	// ADR-036 sign: sign the canonical StdSignDoc bytes with the tenant address
 	// as the signer. The server normalizes to low-S on verify, so we don't.
-	signBytes := adr036.CreateSignBytes(signData, *tenant)
+	signBytes := adr036.CreateSignBytes(signData, tenant)
 	sig, err := privKey.Sign(signBytes)
 	if err != nil {
-		return fmt.Errorf("sign: %w", err)
+		return "", fmt.Errorf("sign: %w", err)
 	}
 
 	tok := authToken{
-		Tenant:    *tenant,
-		LeaseUUID: *leaseUUID,
+		Tenant:    tenant,
+		LeaseUUID: leaseUUID,
 		Timestamp: ts,
 		PubKey:    base64.StdEncoding.EncodeToString(pubKey.Bytes()),
 		Signature: base64.StdEncoding.EncodeToString(sig),
 	}
 	jsonBytes, err := json.Marshal(tok)
 	if err != nil {
-		return fmt.Errorf("marshal token: %w", err)
+		return "", fmt.Errorf("marshal token: %w", err)
 	}
 
-	fmt.Println(base64.StdEncoding.EncodeToString(jsonBytes))
-	return nil
+	return base64.StdEncoding.EncodeToString(jsonBytes), nil
 }
 
 // readMnemonic returns the BIP39 mnemonic from $FRED_MNEMONIC, falling back to
