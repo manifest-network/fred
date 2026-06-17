@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/httpserver"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -69,14 +70,14 @@ func TestVerifySignature(t *testing.T) {
 // that don't need it. If a handler change causes unexpected panics, it means
 // the change touched the backend in a path that previously didn't.
 func newTestHandler() http.Handler {
-	s := NewServer(nil, testSecret, slog.Default())
+	s := httpserver.NewServer(nil, testSecret, slog.Default())
 	return s.Handler()
 }
 
 func TestGetLogs_TailExceedsMax(t *testing.T) {
 	handler := newTestHandler()
 
-	req := httptest.NewRequest("GET", fmt.Sprintf("/logs/lease-1?tail=%d", maxTailLines+1), nil)
+	req := httptest.NewRequest("GET", fmt.Sprintf("/logs/lease-1?tail=%d", httpserver.MaxTailLines+1), nil)
 	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 
 	w := httptest.NewRecorder()
@@ -91,7 +92,7 @@ func TestGetLogs_TailAtMax(t *testing.T) {
 	// call s.backend.GetLogs which panics with a nil backend, so we recover.
 	handler := newTestHandler()
 
-	req := httptest.NewRequest("GET", fmt.Sprintf("/logs/lease-1?tail=%d", maxTailLines), nil)
+	req := httptest.NewRequest("GET", fmt.Sprintf("/logs/lease-1?tail=%d", httpserver.MaxTailLines), nil)
 	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 
 	w := httptest.NewRecorder()
@@ -653,7 +654,7 @@ func (m *mockBackend) Stats() shared.ResourceStats {
 
 // newMockHandler creates a Handler backed by the given mockBackend.
 func newMockHandler(mb *mockBackend) http.Handler {
-	s := NewServer(mb, testSecret, slog.Default())
+	s := httpserver.NewServer(mb, testSecret, slog.Default())
 	return s.Handler()
 }
 
@@ -716,7 +717,7 @@ func TestHandleProvision(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
-		var errResp ErrorResponse
+		var errResp httpserver.ErrorResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 		assert.Equal(t, backend.ValidationCodeUnknownSKU, errResp.ValidationCode)
 	})
@@ -731,7 +732,7 @@ func TestHandleProvision(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
-		var errResp ErrorResponse
+		var errResp httpserver.ErrorResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 		assert.Equal(t, backend.ValidationCodeInvalidManifest, errResp.ValidationCode)
 	})
@@ -746,7 +747,7 @@ func TestHandleProvision(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
-		var errResp ErrorResponse
+		var errResp httpserver.ErrorResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 		assert.Equal(t, backend.ValidationCodeImageNotAllowed, errResp.ValidationCode)
 	})
@@ -790,7 +791,7 @@ func TestHandleDeprovision(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/deprovision", validBody))
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var resp StatusResponse
+		var resp httpserver.StatusResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "ok", resp.Status)
 	})
@@ -1110,7 +1111,7 @@ func TestHandleRestart(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
 
 		assert.Equal(t, http.StatusAccepted, w.Code)
-		var resp StatusResponse
+		var resp httpserver.StatusResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "restarting", resp.Status)
 	})
@@ -1167,7 +1168,7 @@ func TestHandleUpdate(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
 
 		assert.Equal(t, http.StatusAccepted, w.Code)
-		var resp StatusResponse
+		var resp httpserver.StatusResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "updating", resp.Status)
 	})
@@ -1207,7 +1208,7 @@ func TestHandleUpdate(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
-		var errResp ErrorResponse
+		var errResp httpserver.ErrorResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 		assert.Equal(t, backend.ValidationCodeUnknownSKU, errResp.ValidationCode)
 	})
@@ -1222,7 +1223,7 @@ func TestHandleUpdate(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
-		var errResp ErrorResponse
+		var errResp httpserver.ErrorResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 		assert.Equal(t, backend.ValidationCodeInvalidManifest, errResp.ValidationCode)
 	})
@@ -1315,7 +1316,7 @@ func TestHandleHealth(t *testing.T) {
 		handler.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var resp StatusResponse
+		var resp httpserver.StatusResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "healthy", resp.Status)
 	})
@@ -1358,7 +1359,7 @@ func TestHandleStats(t *testing.T) {
 		handler.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var got StatsResponse
+		var got httpserver.StatsResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 
 		assert.InDelta(t, 8.0, got.TotalCPUCores, 0.001)
@@ -1415,7 +1416,7 @@ func TestValidateCallbackURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateCallbackURL(tt.url)
+			err := httpserver.ValidateCallbackURL(tt.url)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
@@ -1489,7 +1490,7 @@ func TestHMACMiddleware_RejectsCrossPathReplay(t *testing.T) {
 // check. Wrapping the middleware around a permissive next-handler
 // proves the property the test cares about.
 func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
-	mw := hmacAuthMiddleware(testSecret, slog.Default())
+	mw := httpserver.HmacAuthMiddleware(testSecret, slog.Default())
 	authed := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -1596,7 +1597,7 @@ func TestHandleRestore(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
 
 		assert.Equal(t, http.StatusAccepted, w.Code)
-		var resp StatusResponse
+		var resp httpserver.StatusResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "restoring", resp.Status)
 	})
@@ -1641,7 +1642,7 @@ func TestHandleRestore(t *testing.T) {
 
 		// FIX B: the body must carry the code discriminator so the client can
 		// reconstruct ErrAlreadyProvisioned (not the bare-409 ErrInvalidState).
-		var resp ErrorResponse
+		var resp httpserver.ErrorResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "already_provisioned", resp.Code,
 			"already-provisioned 409 must set code=already_provisioned")

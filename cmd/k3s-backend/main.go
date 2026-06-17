@@ -27,6 +27,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/manifest-network/fred/internal/backend/k3s"
+	"github.com/manifest-network/fred/internal/backend/shared/httpserver"
 	"github.com/manifest-network/fred/internal/config"
 )
 
@@ -106,7 +107,7 @@ func main() {
 	cancel()
 
 	// Create server
-	server := NewServer(b, string(cfg.CallbackSecret), logger)
+	server := httpserver.NewServer(b, string(cfg.CallbackSecret), logger)
 
 	// Setup HTTP server. ReadHeaderTimeout closes the slow-loris attack
 	// surface (a client that trickles request headers to hold a goroutine
