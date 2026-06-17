@@ -104,7 +104,10 @@ jobs:
           exit "$fail"
 
       - name: Docker Hub login (optional)
-        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        # Gate on BOTH values: a half-configured secret (username set, token empty)
+        # would otherwise run this step and fail the job instead of falling back
+        # to anonymous pulls.
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}

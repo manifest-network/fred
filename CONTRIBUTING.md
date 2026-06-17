@@ -235,7 +235,7 @@ Update [BACKEND_GUIDE.md](BACKEND_GUIDE.md) to document the new endpoint for thi
 
 - [ ] `make fmt && make lint && make test` pass cleanly
 - [ ] `go test -race -short ./...` passes
-- [ ] If touching the docker-backend, `sudo make test-integration` passes locally (requires root + Docker + btrfs-progs). CI also runs it via `integration.yml`, but local is the fast loop and the only signal for changes outside that workflow's path filter
+- [ ] If touching the docker-backend, `sudo -E env "PATH=$PATH" make test-integration` passes locally (the `-E env "PATH=$PATH"` keeps `sudo`'s `secure_path` from hiding the Go toolchain — a plain `sudo make` can fail with `go: command not found`; requires root + Docker + btrfs-progs). CI runs the same invocation via `integration.yml`, but local is the fast loop and the only signal for changes outside that workflow's path filter
 - [ ] New code has tests
 - [ ] Public APIs / config / metrics that are user-visible are documented in the relevant `.md`
 - [ ] Commit messages are descriptive (we follow [Conventional Commits](https://www.conventionalcommits.org/) loosely: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`)
