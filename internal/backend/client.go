@@ -336,7 +336,7 @@ type LoadStats struct {
 // CPUAllocatedRatio returns the fraction of CPU allocated (allocated/total) and
 // ok=true when that ratio is meaningful. ok is false when total capacity is
 // unknown or non-positive (e.g., a backend that does not report CPU capacity, or
-// a nil snapshot), signalling the caller to treat this backend as having no
+// a nil snapshot), signaling the caller to treat this backend as having no
 // usable load signal.
 func (s *LoadStats) CPUAllocatedRatio() (ratio float64, ok bool) {
 	if s == nil || s.TotalCPUCores <= 0 {
