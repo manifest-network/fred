@@ -19,10 +19,10 @@ import (
 
 // mockBackendRouter implements BackendRouter for testing.
 type mockBackendRouter struct {
-	routeFn            func(sku string) backend.Backend
-	routeRoundRobinFn  func(sku string) backend.Backend
-	getBackendByNameFn func(name string) backend.Backend
-	backendsFn         func() []backend.Backend
+	routeFn             func(sku string) backend.Backend
+	routeForProvisionFn func(ctx context.Context, sku string, inFlight map[string]int) backend.Backend
+	getBackendByNameFn  func(name string) backend.Backend
+	backendsFn          func() []backend.Backend
 }
 
 func (m *mockBackendRouter) Route(sku string) backend.Backend {
@@ -39,9 +39,9 @@ func (m *mockBackendRouter) GetBackendByName(name string) backend.Backend {
 	return nil
 }
 
-func (m *mockBackendRouter) RouteRoundRobin(sku string) backend.Backend {
-	if m.routeRoundRobinFn != nil {
-		return m.routeRoundRobinFn(sku)
+func (m *mockBackendRouter) RouteForProvision(ctx context.Context, sku string, inFlight map[string]int) backend.Backend {
+	if m.routeForProvisionFn != nil {
+		return m.routeForProvisionFn(ctx, sku, inFlight)
 	}
 	// Default: fall back to Route for backward-compatible tests
 	return m.Route(sku)
@@ -564,7 +564,7 @@ func TestOrchestrator_TypedNilPlacementStore_Panics(t *testing.T) {
 
 	mb := &mockManagerBackend{name: "test-backend"}
 	router := &mockBackendRouter{
-		routeRoundRobinFn: func(string) backend.Backend { return mb },
+		routeForProvisionFn: func(_ context.Context, sku string, _ map[string]int) backend.Backend { return mb },
 	}
 	tracker := NewInFlightTracker()
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, iface)

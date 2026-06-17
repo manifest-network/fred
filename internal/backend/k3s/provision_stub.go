@@ -445,6 +445,13 @@ func (b *Backend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.
 	return nil, backend.ErrNotProvisioned
 }
 
+// GetLoadStats returns nil (no usable load signal) for the k3s backend stub.
+// The k3s backend does not expose a /stats endpoint; the router will fall back
+// to round-robin when this backend is a candidate.
+func (b *Backend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
 // Stats returns the resource pool's current snapshot. The k3s scaffold
 // never allocates against the pool (the stub provisioner doesn't call
 // pool.TryAllocate), so AllocationCount is always 0 and Available* ==

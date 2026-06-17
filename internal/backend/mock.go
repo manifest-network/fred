@@ -23,6 +23,10 @@ type MockBackend struct {
 
 	// Callbacks to simulate async provisioning
 	callbackFunc func(CallbackPayload)
+
+	// loadStats is returned by GetLoadStats. nil = simulate a backend that
+	// exposes no usable load signal (exercises the router's round-robin fallback).
+	loadStats *LoadStats
 }
 
 type mockProvision struct {
@@ -63,6 +67,26 @@ func (m *MockBackend) SetCallbackFunc(fn func(CallbackPayload)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.callbackFunc = fn
+}
+
+// SetLoadStats configures the snapshot returned by GetLoadStats. Pass nil to
+// simulate a backend with no usable load signal.
+func (m *MockBackend) SetLoadStats(stats *LoadStats) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.loadStats = stats
+}
+
+// GetLoadStats returns the configured load snapshot (a copy, so callers cannot
+// mutate mock state), or (nil, nil) when unset.
+func (m *MockBackend) GetLoadStats(_ context.Context) (*LoadStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.loadStats == nil {
+		return nil, nil
+	}
+	cp := *m.loadStats
+	return &cp, nil
 }
 
 // Name returns the backend's name.

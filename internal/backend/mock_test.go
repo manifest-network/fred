@@ -215,3 +215,19 @@ func TestMockBackend_Name(t *testing.T) {
 	mock2 := NewMockBackend(MockBackendConfig{})
 	assert.Equal(t, "mock", mock2.Name())
 }
+
+func TestMockBackend_GetLoadStats(t *testing.T) {
+	m := NewMockBackend(MockBackendConfig{Name: "m"})
+
+	// Unset → nil snapshot (no usable signal → router fallback).
+	stats, err := m.GetLoadStats(context.Background())
+	require.NoError(t, err)
+	assert.Nil(t, stats)
+
+	m.SetLoadStats(&LoadStats{TotalCPUCores: 4, AllocatedCPUCores: 1, ActiveContainers: 2})
+	stats, err = m.GetLoadStats(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, stats)
+	assert.Equal(t, 4.0, stats.TotalCPUCores)
+	assert.Equal(t, 1.0, stats.AllocatedCPUCores)
+}

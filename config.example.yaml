@@ -221,7 +221,10 @@ tenant_rate_limit_burst: 10
 #   Leases are routed to backends using the skus field — an exact list of
 #   on-chain SKU UUIDs. Empty criteria matches nothing.
 #   If no backend matches, the backend with default: true is used.
-#   When multiple backends match, round-robin distributes provisions evenly.
+#   When multiple backends match, provisions go to the backend with the lowest
+#   allocated-CPU ratio (queried live from each backend's /stats endpoint).
+#   Backends without usable load stats are excluded; if no matching backend
+#   has usable stats, routing falls back to round-robin.
 #
 # BACKEND API:
 #   Backends must implement the Provider Backend API.
@@ -237,6 +240,7 @@ tenant_rate_limit_burst: 10
 #   - POST /restart            - Restart a provisioned resource
 #   - POST /update             - Update a provisioned resource with a new manifest
 #   - GET  /releases/{uuid}    - Get release history for a provisioned resource
+#   - GET  /stats              - Resource-load snapshot (CPU) for least-loaded routing
 
 backends:
   # Default backend - receives all leases that don't match other backends
@@ -250,7 +254,7 @@ backends:
   # ---------------------------------------------------------------------------
   # On-chain SKUs are always UUIDs (e.g., "a1b2c3d4-..."). Use the skus field
   # to match them exactly. Give every backend the same list so they all match,
-  # then round-robin distributes provisions evenly.
+  # then provisions are placed on the least-loaded (lowest allocated-CPU) backend.
   #
   # With Ansible, the skus list is populated from sku_mapping at deploy time:
   #   skus:
@@ -443,15 +447,16 @@ token_tracker_db_path: "/var/lib/fred/tokens.db"
 payload_store_db_path: "/var/lib/fred/payloads.db"
 
 # =============================================================================
-# PLACEMENT STORE (optional — enables round-robin load balancing)
+# PLACEMENT STORE (optional — enables correct read routing across multiple backends)
 # =============================================================================
 # Records which backend is serving each lease so that read operations
 # (connection details, logs, provision diagnostics) are routed correctly.
 #
 # Required when multiple backends share the same match criteria (skus list)
-# and you want round-robin distribution across them. Without this, new
-# provisions are still distributed round-robin, but reads fall back to
-# match-based routing (first match) and may hit the wrong backend.
+# because provisions are spread across them. Without this, new provisions are
+# still distributed across matching backends (least-loaded, with round-robin
+# fallback), but reads fall back to match-based routing (first match) and may
+# hit the wrong backend.
 #
 # If not set, the placement store is disabled and all routing uses match-based
 # logic. This is fine for single-backend-per-SKU setups.

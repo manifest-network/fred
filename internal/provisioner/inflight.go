@@ -42,6 +42,11 @@ func (m *Manager) InFlightCount() int {
 	return m.tracker.InFlightCount()
 }
 
+// InFlightCountsByBackend delegates to the tracker.
+func (m *Manager) InFlightCountsByBackend() map[string]int {
+	return m.tracker.InFlightCountsByBackend()
+}
+
 // GetInFlightLeases delegates to the tracker.
 func (m *Manager) GetInFlightLeases() []string {
 	return m.tracker.GetInFlightLeases()

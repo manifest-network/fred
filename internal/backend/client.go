@@ -102,6 +102,11 @@ type Backend interface {
 	// Returns ErrNotProvisioned if lease not found.
 	GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error)
 
+	// GetLoadStats returns the backend's current resource-load snapshot,
+	// used for least-loaded provision routing. Implementations that do not
+	// track load may return a snapshot whose CPUAllocatedRatio is not ok.
+	GetLoadStats(ctx context.Context) (*LoadStats, error)
+
 	// Name returns the backend's configured name.
 	Name() string
 }
@@ -317,6 +322,29 @@ type ReleaseInfo struct {
 	Manifest  []byte    `json:"manifest"`
 }
 
+// LoadStats is the backend load snapshot fred consumes for least-loaded
+// provision routing. It is decoded from the backend's GET /stats response.
+// Only the CPU-related fields are needed for routing — CPU is the binding
+// resource on current configurations, so memory/disk are intentionally ignored.
+// Unknown JSON fields in the response are discarded by the decoder.
+type LoadStats struct {
+	TotalCPUCores     float64 `json:"total_cpu_cores"`
+	AllocatedCPUCores float64 `json:"allocated_cpu_cores"`
+	ActiveContainers  int     `json:"active_containers"`
+}
+
+// CPUAllocatedRatio returns the fraction of CPU allocated (allocated/total) and
+// ok=true when that ratio is meaningful. ok is false when total capacity is
+// unknown or non-positive (e.g., a backend that does not report CPU capacity, or
+// a nil snapshot), signaling the caller to treat this backend as having no
+// usable load signal.
+func (s *LoadStats) CPUAllocatedRatio() (ratio float64, ok bool) {
+	if s == nil || s.TotalCPUCores <= 0 {
+		return 0, false
+	}
+	return s.AllocatedCPUCores / s.TotalCPUCores, true
+}
+
 // ErrNotProvisioned is returned when a lease is not yet provisioned.
 var ErrNotProvisioned = errors.New("lease not provisioned")
 
@@ -437,6 +465,7 @@ type HTTPClient struct {
 	maxLookupProvisionsBytes int64
 	maxLogsBytes             int64
 	maxReleasesBytes         int64
+	maxStatsBytes            int64
 
 	// Optional Prometheus metrics (nil = skip recording)
 	requestDuration *prometheus.HistogramVec
@@ -458,6 +487,7 @@ const (
 	DefaultMaxLookupProvisionsBytes int64 = 8 << 20  // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because each ProvisionInfo carries an unbounded LastError and stack leases carry unbounded ServiceImages
 	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
 	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
+	DefaultMaxStatsBytes            int64 = 1 << 20  // 1 MiB — load stats snapshot (small JSON)
 )
 
 // HTTPClientConfig configures an HTTP backend client.
@@ -488,6 +518,7 @@ type HTTPClientConfig struct {
 	MaxLookupProvisionsBytes int64 // LookupProvisions response limit (default: 8 MiB)
 	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
 	MaxReleasesBytes         int64 // GetReleases response limit (default: 8 MiB)
+	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
 
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
@@ -587,6 +618,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		maxLookupProvisionsBytes: positiveOr(cfg.MaxLookupProvisionsBytes, DefaultMaxLookupProvisionsBytes),
 		maxLogsBytes:             positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
 		maxReleasesBytes:         positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
+		maxStatsBytes:            positiveOr(cfg.MaxStatsBytes, DefaultMaxStatsBytes),
 		requestDuration:          cfg.RequestDuration,
 		requestsTotal:            cfg.RequestsTotal,
 	}
@@ -1148,6 +1180,12 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 		return ErrCircuitOpen
 	}
 	return cbErr
+}
+
+// GetLoadStats retrieves the backend's current resource-load snapshot from
+// GET /stats. Used by the router for least-loaded provision placement.
+func (c *HTTPClient) GetLoadStats(ctx context.Context) (*LoadStats, error) {
+	return doGet[LoadStats](c, ctx, "get_load_stats", c.baseURL+"/stats", c.maxStatsBytes)
 }
 
 // Health checks if the backend is reachable and healthy.

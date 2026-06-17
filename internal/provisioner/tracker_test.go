@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -349,4 +350,43 @@ func TestTracker_RoutingSKU(t *testing.T) {
 		p := InFlightProvision{}
 		assert.Equal(t, "", p.RoutingSKU())
 	})
+}
+
+func TestDefaultInFlightTracker_InFlightCountsByBackend(t *testing.T) {
+	tr := NewInFlightTracker()
+	assert.Empty(t, tr.InFlightCountsByBackend())
+
+	tr.TrackInFlight("l1", "ten", nil, "docker-1")
+	tr.TrackInFlight("l2", "ten", nil, "docker-1")
+	tr.TrackInFlight("l3", "ten", nil, "docker-2")
+
+	counts := tr.InFlightCountsByBackend()
+	assert.Equal(t, 2, counts["docker-1"])
+	assert.Equal(t, 1, counts["docker-2"])
+
+	tr.UntrackInFlight("l1")
+	counts = tr.InFlightCountsByBackend()
+	assert.Equal(t, 1, counts["docker-1"])
+	assert.Equal(t, 1, counts["docker-2"])
+}
+
+func TestDefaultInFlightTracker_InFlightCountsByBackend_Concurrent(t *testing.T) {
+	tr := NewInFlightTracker()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tr.TrackInFlight(fmt.Sprintf("l%d", i), "ten", nil, "docker-1")
+		}(i)
+	}
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = tr.InFlightCountsByBackend()
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, 100, tr.InFlightCountsByBackend()["docker-1"])
 }

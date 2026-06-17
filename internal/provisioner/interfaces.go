@@ -13,9 +13,11 @@ type BackendRouter interface {
 	// Route returns the appropriate backend for the given SKU.
 	Route(sku string) backend.Backend
 
-	// RouteRoundRobin distributes requests across all backends matching
-	// the SKU using round-robin selection. Falls back to the default backend.
-	RouteRoundRobin(sku string) backend.Backend
+	// RouteForProvision selects the least-loaded backend matching the SKU for a
+	// new provision, falling back to round-robin when no candidate exposes usable
+	// load stats. inFlightByBackend is a per-backend in-flight provision count
+	// used to spread concurrent provisions; it may be nil.
+	RouteForProvision(ctx context.Context, sku string, inFlightByBackend map[string]int) backend.Backend
 
 	// GetBackendByName returns a backend by its name. Returns nil if not found.
 	GetBackendByName(name string) backend.Backend
@@ -28,7 +30,7 @@ type BackendRouter interface {
 var _ BackendRouter = (*backend.Router)(nil)
 
 // PlacementStore records which backend is serving each lease so that
-// read operations reach the correct backend after round-robin provisioning.
+// read operations reach the correct backend after provision routing.
 type PlacementStore interface {
 	Get(leaseUUID string) string
 	Set(leaseUUID, backendName string) error
