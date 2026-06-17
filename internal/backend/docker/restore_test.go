@@ -810,13 +810,15 @@ func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
 // and keep the provision (removeProvision skipped) so the next startup retries.
 func TestReconcileRestoring_RenameFailureLeavesRestoring(t *testing.T) {
 	mock := &mockDockerClient{}
-	// Seed an ORPHANED-looking provision for u2 in a non-Ready/non-Restarting
-	// state (Provisioning) so the orphaned arm is taken AND the "provision must
-	// NOT be removed" assertion is meaningful.
+	// Seed an ORPHANED provision for u2 in a genuinely-orphaned live state (Failed
+	// — the status a crashed restore's recovered-from-containers provision lands at)
+	// so the orphaned arm is taken AND the "provision must NOT be removed" assertion
+	// is meaningful. (Provisioning/Restarting now defer as in-flight, so they would
+	// NOT reach the orphaned arm.)
 	b := newBackendForTest(mock, map[string]*provision{
 		"u2": {ProvisionState: leasesm.ProvisionState{
 			LeaseUUID: "u2",
-			Status:    backend.ProvisionStatusProvisioning,
+			Status:    backend.ProvisionStatusFailed,
 		}},
 	})
 	rs := attachRetentionStore(t, b)
@@ -910,6 +912,69 @@ func TestReconcileRestoring_DefersToInFlight(t *testing.T) {
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
 		"record must remain restoring when restore is in flight")
+}
+
+// TestReconcileRestoring_DefersToInFlightProvisioning verifies the Provisioning
+// window is treated as in-flight (NOT orphaned). During a live Restore() the new-
+// lease provision sits at Provisioning (reserved at step b) from ClaimForRestore
+// (record -> restoring, step d) until the actor fires evRestoreRequested (-> Restarting).
+// A PERIODIC sweep landing in that window must DEFER — re-quarantining the just-
+// adopted volumes and reverting the record would spuriously fail the in-flight restore.
+func TestReconcileRestoring_DefersToInFlightProvisioning(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForTest(mock, map[string]*provision{
+		"u2": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u2",
+			Status:    backend.ProvisionStatusProvisioning,
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+
+	downCalled := false
+	renameCalled := false
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+			downCalled = true
+			return nil
+		},
+	}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error {
+			renameCalled = true
+			return nil
+		},
+	}
+
+	e := shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		NewLeaseUUID:        "u2",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          3,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+	}
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	assert.False(t, downCalled, "compose Down must NOT be called for an in-flight (Provisioning) restore")
+	assert.False(t, renameCalled, "RenameVolume must NOT be called for an in-flight (Provisioning) restore")
+
+	// Record must remain restoring with Generation unchanged (orphaned arm / RevertToActive must NOT fire).
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
+		"record must remain restoring during the Provisioning window")
+	assert.Equal(t, 3, entry.Generation, "Generation must be unchanged (orphaned arm must NOT fire)")
+	assert.Equal(t, "u2", entry.NewLeaseUUID, "NewLeaseUUID must be retained")
+
+	// The in-flight provision must NOT be removed.
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.True(t, hasU2, "in-flight provision for u2 must NOT be removed")
 }
 
 // TestReconcileRestoring_DeletesOnReady verifies that when b.provisions["u2"]

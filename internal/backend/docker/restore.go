@@ -123,13 +123,23 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 		_ = b.retentionStore.Delete(e.OriginalLeaseUUID) // restore finished; drop leftover record
 		return
 	}
-	if live && status == backend.ProvisionStatusRestarting {
-		// Restarting only arises during the PERIODIC reaper sweep (Task 6) while
-		// fred is running and a restore is genuinely in flight — doRestore's
-		// terminal defer owns the record, so defer to it. At STARTUP this branch
-		// cannot fire: recoverState rebuilds provisions from live containers and
-		// never yields Restarting, so a restore that crashed mid-flight is
-		// (correctly) rolled back by the orphaned-arm below.
+	if live && (status == backend.ProvisionStatusProvisioning || status == backend.ProvisionStatusRestarting) {
+		// A live provision at Provisioning OR Restarting is a restore that is
+		// genuinely in flight — doRestore's terminal defer owns the record, so
+		// defer to it rather than racing it. Restore() reserves the new-lease
+		// provision at Provisioning (step b) and only reaches Restarting once the
+		// actor processes evRestoreRequested; the record is already `restoring`
+		// (ClaimForRestore, step d) throughout that window. A PERIODIC sweep that
+		// lands in the Provisioning sub-window must NOT treat the in-flight restore
+		// as orphaned — doing so would re-quarantine the just-adopted volumes and
+		// spuriously fail the restore.
+		//
+		// Neither status can arise at STARTUP: recoverState rebuilds provisions from
+		// live containers and only yields container-derived statuses (Ready/Failed);
+		// Provisioning/Restarting are in-memory operation states preserved solely
+		// from a pre-existing overlay entry, which a cold start does not have. So a
+		// restore that crashed mid-flight is (correctly) rolled back by the orphaned
+		// arm below.
 		return
 	}
 	// Orphaned (crash/failed): tear down any orphaned project, re-quarantine the
