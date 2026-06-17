@@ -14,6 +14,7 @@ import (
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -2649,4 +2650,196 @@ func TestReconcileRestoring_MixedLease_RollsBackWithoutWedging(t *testing.T) {
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "record must revert to active, NOT stay wedged in restoring")
 	assert.Equal(t, 4, entry.Generation, "generation must be bumped by RevertToActive")
 	assert.Empty(t, entry.NewLeaseUUID, "NewLeaseUUID must be cleared after rollback")
+}
+
+// attachReleaseStore wires a real ReleaseStore (backed by a temp bbolt DB) into
+// the Backend and registers a cleanup to close it.
+func attachReleaseStore(t *testing.T, b *Backend) *shared.ReleaseStore {
+	t.Helper()
+	s, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: filepath.Join(t.TempDir(), "releases.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	b.releaseStore = s
+	return s
+}
+
+// TestRestore_Success_RefreshesResourceMetrics drives a restore to Ready (mirroring
+// TestRestore_Success_DeletesRecord) and asserts the resource-allocation gauge is
+// refreshed on the SUCCESS path — not only on the failure/rollback paths. The CPU
+// gauge is package-global, so it is reset to a sentinel that the docker-small
+// allocation (0.5 CPU / 8.0 total = 0.0625) cannot coincidentally equal, then
+// asserted to reflect that allocation after the synchronous Restore prelude returns.
+func TestRestore_Success_RefreshesResourceMetrics(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "u1")
+
+	var mu sync.Mutex
+	var downProjects []string
+	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	// Reset the CPU gauge to a sentinel the real allocation cannot equal. With
+	// DefaultConfig's 8.0 total cores, one docker-small (0.5) yields 0.0625.
+	const sentinel = 0.99
+	resourceCPUAllocatedRatio.Set(sentinel)
+	require.InDelta(t, sentinel, testutil.ToFloat64(resourceCPUAllocatedRatio), 0.0001,
+		"sanity: gauge reset to sentinel before restore")
+
+	callbackReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer server.Close()
+
+	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
+	require.NoError(t, err)
+
+	// The success-path refresh runs synchronously inside Restore (right after the
+	// allocation loop), so the gauge already reflects the docker-small allocation.
+	expectedCPURatio := 0.5 / b.cfg.TotalCPUCores // 0.5 / 8.0 = 0.0625; distinct from the 0.99 sentinel
+	assert.InDelta(t, expectedCPURatio, testutil.ToFloat64(resourceCPUAllocatedRatio), 0.0001,
+		"resource gauge must be refreshed on the restore success path (moved off the %v sentinel)", sentinel)
+
+	<-callbackReceived
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p, ok := b.provisions["u2"]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+// TestDeprovision_Retain_HydratesNilManifestFromReleaseStore verifies that when a
+// recovered provision carries a nil StackManifest (cold-start recover left it nil),
+// the soft-delete path hydrates it from the release store's latest ACTIVE release
+// before writing the retention record — so the retained data stays API-restorable
+// (Restore rejects nil-manifest records as corrupt).
+func TestDeprovision_Retain_HydratesNilManifestFromReleaseStore(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"u1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "u1",
+			Tenant:        "tenant-a",
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      1,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: nil, // recovered provision: manifest not restored from labels
+		}},
+	})
+
+	b.cfg.RetainOnClose = true
+	rs := attachRetentionStore(t, b)
+	relStore := attachReleaseStore(t, b)
+
+	// Seed the latest ACTIVE release whose Manifest parses to a stack. ParsePayload
+	// wraps a legacy flat payload under DefaultServiceName, matching recover.go.
+	require.NoError(t, relStore.Append("u1", shared.Release{
+		Manifest:  []byte(`{"image":"nginx:1.27"}`),
+		Image:     "nginx:1.27",
+		Status:    "active",
+		CreatedAt: time.Now(),
+	}))
+
+	b.volumes = &mockVolumeManager{
+		ListFn:         func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
+		RenameVolumeFn: func(_, _ string) error { return nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
+			return nil
+		},
+	}
+
+	err := b.Deprovision(context.Background(), "u1")
+	require.NoError(t, err)
+
+	var entry *shared.RetentionEntry
+	require.Eventually(t, func() bool {
+		e, gerr := rs.Get("u1")
+		if gerr != nil || e == nil {
+			return false
+		}
+		entry = e
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "retention record for u1 must appear")
+
+	// The record's manifest must be HYDRATED (non-nil) from the release store.
+	require.NotNil(t, entry.StackManifest, "StackManifest must be hydrated from the release store")
+	require.Contains(t, entry.StackManifest.Services, manifest.DefaultServiceName,
+		"hydrated manifest must carry the default service")
+	assert.Equal(t, "nginx:1.27", entry.StackManifest.Services[manifest.DefaultServiceName].Image,
+		"hydrated manifest must reflect the latest active release image")
+}
+
+// TestDeprovision_Retain_NilManifestNoRelease_StillRetains verifies that when the
+// recovered provision's StackManifest is nil AND there is no release to hydrate
+// from, the soft-delete path STILL writes the retention record (preserving the
+// data for manual recovery) with a nil manifest and without panicking — the warn
+// path. The data must never be destroyed just because it is un-restorable.
+func TestDeprovision_Retain_NilManifestNoRelease_StillRetains(t *testing.T) {
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"u1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "u1",
+			Tenant:        "tenant-a",
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      1,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: nil,
+		}},
+	})
+
+	b.cfg.RetainOnClose = true
+	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // empty: no release to hydrate from
+
+	b.volumes = &mockVolumeManager{
+		ListFn:         func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
+		RenameVolumeFn: func(_, _ string) error { return nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
+			return nil
+		},
+	}
+
+	err := b.Deprovision(context.Background(), "u1")
+	require.NoError(t, err)
+
+	var entry *shared.RetentionEntry
+	require.Eventually(t, func() bool {
+		e, gerr := rs.Get("u1")
+		if gerr != nil || e == nil {
+			return false
+		}
+		entry = e
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "retention record for u1 must STILL be written (data preserved)")
+
+	// Data preserved: the record exists with the retained volume tracked.
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
+	assert.ElementsMatch(t, []string{"fred-retained-u1-app-0"}, entry.RetainedVolumeNames,
+		"the volume must be retained even though the manifest is nil")
+	// Manifest stays nil (no release to hydrate from) — the warn path, no panic.
+	assert.Nil(t, entry.StackManifest, "manifest stays nil when no release exists to hydrate from")
 }

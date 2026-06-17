@@ -169,6 +169,28 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
+			// Hydrate a nil StackManifest from the release store so the retained data
+			// stays API-restorable. A cold-start recover restores the manifest
+			// best-effort (recover.go) and leaves it nil if the active release is
+			// missing/unparseable/store-nil; Restore rejects a nil-manifest record as
+			// corrupt, so without this the volumes are retained but un-restorable.
+			// Mirror recover.go's LatestActive + ParsePayload guard exactly.
+			if stackManifest == nil && b.releaseStore != nil {
+				if rel, relErr := b.releaseStore.LatestActive(leaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
+					if stackM, payloadErr := manifest.ParsePayload(rel.Manifest); payloadErr != nil {
+						logger.Warn("soft-delete: failed to parse release manifest for retention hydration", "error", payloadErr)
+					} else {
+						stackManifest = stackM
+					}
+				}
+			}
+			if stackManifest == nil {
+				// Still nil after hydration: preserve the data (write the record) but
+				// warn loudly that it cannot be restored through the API.
+				logger.Warn("soft-delete: retained data will NOT be API-restorable (no manifest for lease); volumes preserved for manual recovery",
+					"lease_uuid", leaseUUID)
+			}
+
 			// RECORD-FIRST + ATOMIC: PutActiveMerged persists the active record (with
 			// the MERGED retained set) before any rename in ONE bbolt txn. CreatedAt
 			// (grace clock) and Generation (CAS) are preserved across retries by the

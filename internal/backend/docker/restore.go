@@ -516,6 +516,10 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			allocatedIDs = append(allocatedIDs, id)
 		}
 	}
+	// Refresh the resource gauges now that the allocation succeeded, mirroring
+	// Provision/Deprovision's on-success refresh. The rollback paths re-refresh
+	// after releaseAll, so this only stands as the live value on the success arm.
+	updateResourceMetrics(b.pool.Stats())
 
 	// (d) ATOMIC claim active->restoring (closes the prelude-vs-reaper race).
 	// Nothing renamed yet.
