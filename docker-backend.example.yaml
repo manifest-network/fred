@@ -152,8 +152,15 @@ allowed_registries:
 # Must match callback_secret configured on the Fred side.
 callback_secret: ""
 
+# Production mode: tighten startup checks. When true, the backend refuses to
+# start if any dev-only insecure toggle is set (currently
+# callback_insecure_skip_verify below). Mirrors providerd's production_mode.
+# Default: false
+# production_mode: true
+
 # Skip TLS certificate verification for callbacks (development only!)
-# WARNING: Never enable in production - vulnerable to MITM attacks
+# WARNING: Never enable in production - vulnerable to MITM attacks.
+# Rejected at startup when production_mode is true.
 # callback_insecure_skip_verify: false
 
 # Path to bbolt database for persisting pending callbacks.

@@ -327,6 +327,10 @@ allowed_registries:
 
 # Callback configuration
 callback_secret: "$CALLBACK_SECRET"
+# Local dev only: production_mode stays false, which permits the insecure
+# skip-verify below. Setting production_mode: true makes the backend reject it
+# at startup (ENG-321). Never ship a production config with skip-verify enabled.
+production_mode: false
 callback_insecure_skip_verify: true
 callback_db_path: "callbacks.db"
 callback_max_age: 24h

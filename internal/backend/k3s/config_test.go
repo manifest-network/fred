@@ -57,6 +57,30 @@ func TestConfig_Validate(t *testing.T) {
 	})
 }
 
+func TestConfig_Validate_ProductionMode(t *testing.T) {
+	t.Run("rejects callback_insecure_skip_verify", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.ProductionMode = true
+		cfg.CallbackInsecureSkipVerify = true
+		err := cfg.Validate()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "callback_insecure_skip_verify")
+	})
+
+	t.Run("allows callback_insecure_skip_verify when production_mode is off", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.ProductionMode = false
+		cfg.CallbackInsecureSkipVerify = true
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("production_mode without insecure flags passes", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.ProductionMode = true
+		require.NoError(t, cfg.Validate())
+	})
+}
+
 func TestConfig_Validate_RequiredFields(t *testing.T) {
 	tests := []struct {
 		name    string
