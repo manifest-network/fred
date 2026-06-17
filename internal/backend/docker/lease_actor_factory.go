@@ -60,7 +60,9 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 				b.persistDiagnosticsWithLogs(entry, logs)
 			},
 			SendCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
-				b.sendCallbackWithURL(uuid, url, status, errMsg)
+				// The actor SM only drives provision/restart/update callbacks —
+				// never the deprovision retain-success path — so retained=false.
+				b.sendCallbackWithURL(uuid, url, status, errMsg, false)
 			},
 			DoDeprovisionFn: func(ctx context.Context, leaseUUID string) error {
 				return b.doDeprovision(ctx, leaseUUID)

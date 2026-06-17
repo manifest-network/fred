@@ -58,6 +58,12 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		callbackURL   string
 		providerUUID  string
 		stackManifest *manifest.StackManifest
+		// volumesRetained is best-effort ground truth: set true only when the
+		// soft-delete path renamed all volumes into the retained namespace
+		// without error. Carried to the terminal deprovisioned callback so a
+		// connected tenant gets a low-latency retained hint. (Named distinctly
+		// from the inner `retained []string` volume-name slice below.)
+		volumesRetained bool
 	)
 	exists := b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 		wasReady = p.Status == backend.ProvisionStatusReady
@@ -224,6 +230,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 					}
 				}
 				if len(volumeErrs) == 0 {
+					volumesRetained = true
 					logger.Info("soft-deleted lease volumes", "lease_uuid", leaseUUID, "retained", len(retained))
 				}
 			}
@@ -303,8 +310,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				"errors", errors.Join(volumeErrs...),
 			)
 
-			// Volume leak: operator must clean up manually.
-			b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted")
+			// Volume leak: operator must clean up manually. Not a retain-success.
+			b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted", false)
 			return nil
 		}
 
@@ -347,6 +354,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	deprovisionsTotal.Inc()
 	logger.Info("deprovisioned", "containers_removed", len(containerIDs))
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusDeprovisioned, "")
+	// Terminal success: carry the best-effort retained flag (true only when all
+	// volumes were soft-deleted into the retained namespace without error).
+	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
 	return nil
 }

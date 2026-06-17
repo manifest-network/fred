@@ -87,7 +87,10 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 // The caller must provide the callbackURL (resolved from its own state) and
 // the backendName (so Fred can label metrics per-backend without a placement
 // lookup, which is often already deleted for intentional deprovisions).
-func (s *CallbackSender) SendCallback(leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string) {
+// retained is the best-effort ground-truth deprovision retain-success flag
+// (false for all non-deprovision callbacks); it is threaded into the payload
+// and persisted so a restart-replayed callback keeps it.
+func (s *CallbackSender) SendCallback(leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string, retained bool) {
 	if callbackURL == "" {
 		s.logger.Warn("no callback URL for lease", "lease_uuid", leaseUUID)
 		return
@@ -98,6 +101,7 @@ func (s *CallbackSender) SendCallback(leaseUUID, callbackURL, backendName string
 		Status:    status,
 		Error:     errMsg,
 		Backend:   backendName,
+		Retained:  retained,
 	}
 
 	body, err := json.Marshal(payload)
@@ -119,6 +123,7 @@ func (s *CallbackSender) SendCallback(leaseUUID, callbackURL, backendName string
 			Status:      status,
 			Backend:     backendName,
 			Error:       errMsg,
+			Retained:    retained,
 			CreatedAt:   time.Now(),
 		}); storeErr != nil {
 			s.logger.Error("failed to persist callback", "error", storeErr, "lease_uuid", leaseUUID)
@@ -242,6 +247,7 @@ func (s *CallbackSender) ReplayPendingCallbacks() {
 			Status:    status,
 			Error:     entry.Error,
 			Backend:   entry.Backend,
+			Retained:  entry.Retained,
 		}
 		body, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {

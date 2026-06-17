@@ -841,6 +841,145 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 	assert.Equal(t, backend.CallbackStatusDeprovisioned, received.Status)
 	assert.Empty(t, received.Error)
 	assert.NotEmpty(t, received.Backend, "backend name should be populated for per-backend metrics")
+	assert.False(t, received.Retained, "destroy path (RetainOnClose off) must report retained=false")
+}
+
+// TestDeprovision_RetainSuccessSendsRetainedCallback verifies the ENG-329 #6
+// ground-truth flag: when RetainOnClose is enabled and all volumes are renamed
+// into the retained namespace without error, the terminal deprovisioned callback
+// carries retained=true.
+func TestDeprovision_RetainSuccessSendsRetainedCallback(t *testing.T) {
+	var received backend.CallbackPayload
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	mock := &mockDockerClient{RemoveContainerFn: func(ctx context.Context, id string) error { return nil }}
+	canonical := canonicalVolumeName("lease-1", "web", 0)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, Quantity: 1,
+			ContainerIDs: []string{"c1"}, CallbackURL: server.URL,
+			Items:         []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}}},
+		},
+	})
+	var renamed [][2]string
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{canonical}, nil },
+		RenameVolumeFn: func(oldName, newName string) error {
+			renamed = append(renamed, [2]string{oldName, newName})
+			return nil
+		},
+	}
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	assert.Equal(t, backend.CallbackStatusDeprovisioned, received.Status)
+	assert.True(t, received.Retained, "retain-success path must report retained=true")
+	require.Len(t, renamed, 1, "the one canonical volume should be renamed into the retained namespace")
+	assert.Equal(t, canonical, renamed[0][0])
+	assert.Equal(t, retainedName(canonical), renamed[0][1])
+
+	// And the record is queryable as retained.
+	rec, err := rs.Get("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.Equal(t, shared.RetentionStatusActive, rec.Status)
+}
+
+// TestDeprovision_RetainPartialFailureEmitsNoCallbackKeepsFailed verifies the
+// true invariant for the partial-rename-failure path (under the retry limit):
+// doDeprovision returns an error WITHOUT emitting any Deprovisioned callback,
+// and leaves the lease in ProvisionStatusFailed (containers gone) so the
+// volume-cleanup retry re-attempts. This pins that the retained=true callback
+// can ONLY fire on the all-renames-succeeded path.
+func TestDeprovision_RetainPartialFailureEmitsNoCallbackKeepsFailed(t *testing.T) {
+	var statuses []backend.CallbackStatus
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p backend.CallbackPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		mu.Lock()
+		statuses = append(statuses, p.Status)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	mock := &mockDockerClient{RemoveContainerFn: func(ctx context.Context, id string) error { return nil }}
+	canonical := canonicalVolumeName("lease-1", "web", 0)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Tenant: "tenant-a", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, Quantity: 1,
+			ContainerIDs: []string{"c1"}, CallbackURL: server.URL,
+			Items:         []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}}},
+		},
+	})
+	b.volumes = &mockVolumeManager{
+		ListFn:         func() ([]string, error) { return []string{canonical}, nil },
+		RenameVolumeFn: func(oldName, newName string) error { return fmt.Errorf("rename failed") },
+	}
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	// Rename failure surfaces as a volume-cleanup error (under the limit → lease
+	// kept Failed for retry, no terminal callback emitted on this attempt).
+	err = b.Deprovision(context.Background(), "lease-1")
+	require.Error(t, err)
+
+	// No Deprovisioned callback may be emitted on a partial-failure attempt — the
+	// retained=true notice fires ONLY on the all-renames-succeeded path.
+	mu.Lock()
+	got := append([]backend.CallbackStatus(nil), statuses...)
+	mu.Unlock()
+	assert.NotContains(t, got, backend.CallbackStatusDeprovisioned,
+		"a partial rename failure must not emit a Deprovisioned callback")
+
+	// Lease is kept visible in Failed for the volume-cleanup retry.
+	b.provisionsMu.RLock()
+	prov, ok := b.provisions["lease-1"]
+	var gotStatus backend.ProvisionStatus
+	if ok {
+		gotStatus = prov.Status
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, ok, "provision must stay visible for retry after a partial rename failure")
+	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus, "lease must be left Failed for retry")
 }
 
 // TestDeprovision_VolumeExhaustionSendsFailedCallback verifies that the

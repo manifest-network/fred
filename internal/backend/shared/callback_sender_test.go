@@ -85,7 +85,7 @@ func TestNewCallbackSender_CustomBackoff(t *testing.T) {
 func TestSendCallback_EmptyURL(t *testing.T) {
 	s := newTestSender(t, nil, http.DefaultClient, "secret")
 	// Should not panic, just log a warning
-	s.SendCallback("lease-1", "", "test-backend", backend.CallbackStatusSuccess, "")
+	s.SendCallback("lease-1", "", "test-backend", backend.CallbackStatusSuccess, "", false)
 }
 
 func TestSendCallback_SuccessDelivery(t *testing.T) {
@@ -105,7 +105,7 @@ func TestSendCallback_SuccessDelivery(t *testing.T) {
 	defer server.Close()
 
 	s := newTestSender(t, nil, server.Client(), secret)
-	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusSuccess, "")
+	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusSuccess, "", false)
 
 	assert.Equal(t, "lease-1", received.LeaseUUID)
 	assert.Equal(t, backend.CallbackStatusSuccess, received.Status)
@@ -125,7 +125,7 @@ func TestSendCallback_FailurePayload(t *testing.T) {
 	defer server.Close()
 
 	s := newTestSender(t, nil, server.Client(), "secret")
-	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusFailed, "image pull failed")
+	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusFailed, "image pull failed", false)
 
 	assert.Equal(t, backend.CallbackStatusFailed, received.Status)
 	assert.Equal(t, "image pull failed", received.Error)
@@ -143,7 +143,7 @@ func TestSendCallback_PersistsAndRemoves(t *testing.T) {
 	defer store.Close()
 
 	s := newTestSender(t, store, server.Client(), "secret")
-	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusSuccess, "")
+	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusSuccess, "", false)
 
 	// After successful delivery, store should be empty
 	pending, err := store.ListPending()
@@ -163,7 +163,7 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 	defer store.Close()
 
 	s := newTestSender(t, store, server.Client(), "secret")
-	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusFailed, "error")
+	s.SendCallback("lease-1", server.URL, "test-backend", backend.CallbackStatusFailed, "error", false)
 
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -388,6 +388,69 @@ func TestReplayPendingCallbacks_PreservesStatusAndBackend(t *testing.T) {
 	assert.Empty(t, byID["lease-legacy"].Backend)
 }
 
+// TestSendCallback_ThreadsRetainedFlag verifies (ENG-329 #7) that SendCallback's
+// retained argument is threaded into the wire payload AND persisted on the
+// CallbackEntry, so a restart-replay keeps the flag.
+func TestSendCallback_ThreadsRetainedFlag(t *testing.T) {
+	var received backend.CallbackPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&received)
+		// Fail delivery so the entry stays in the store for the assertions below.
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb.db")
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	s := newTestSender(t, store, server.Client(), "secret")
+	s.SendCallback("lease-r", server.URL, "docker", backend.CallbackStatusDeprovisioned, "", true)
+
+	// Wire payload carried the flag.
+	assert.True(t, received.Retained, "retained flag must be threaded into the wire payload")
+
+	// Persisted entry retained the flag (delivery failed → entry remains).
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.True(t, pending[0].Retained, "retained flag must be persisted on the CallbackEntry")
+}
+
+// TestReplayPendingCallbacks_PreservesRetained verifies the replay path re-sends
+// the persisted Retained flag (so a callback delivered only after restart still
+// tells providerd the data was retained).
+func TestReplayPendingCallbacks_PreservesRetained(t *testing.T) {
+	var received backend.CallbackPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb.db")
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-r",
+		CallbackURL: server.URL,
+		Success:     true,
+		Status:      backend.CallbackStatusDeprovisioned,
+		Backend:     "docker",
+		Retained:    true,
+		CreatedAt:   time.Now(),
+	}))
+
+	s := newTestSender(t, store, server.Client(), "secret")
+	s.ReplayPendingCallbacks()
+
+	assert.Equal(t, "lease-r", received.LeaseUUID)
+	assert.True(t, received.Retained, "replayed callback must preserve the retained flag")
+}
+
 // TestSendCallback_LegacySuccessFieldEncodesNotFailed verifies that when a
 // new binary writes a deprovisioned (or success) callback, the legacy Success
 // field is true so a rollback to a pre-Status binary replays as 'success' on
@@ -416,7 +479,7 @@ func TestSendCallback_LegacySuccessFieldEncodesNotFailed(t *testing.T) {
 			defer store.Close()
 
 			s := newTestSender(t, store, server.Client(), "secret")
-			s.SendCallback("lease-1", server.URL, "docker", tc.status, "")
+			s.SendCallback("lease-1", server.URL, "docker", tc.status, "", false)
 
 			pending, err := store.ListPending()
 			require.NoError(t, err)

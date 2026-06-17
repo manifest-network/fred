@@ -689,7 +689,10 @@ func (b *Backend) Health(ctx context.Context) error {
 }
 
 // sendCallback resolves the callback URL from the provisions map and delegates
-// to sendCallbackWithURL. Use this when the provision is still in the map.
+// to sendCallbackWithURL. Use this when the provision is still in the map. It
+// always passes retained=false: only the deprovision retain-success path (which
+// uses sendCallbackWithURL directly, since the map entry is being deleted)
+// carries retained=true.
 func (b *Backend) sendCallback(leaseUUID string, status backend.CallbackStatus, errMsg string) {
 	b.provisionsMu.RLock()
 	var callbackURL string
@@ -698,20 +701,21 @@ func (b *Backend) sendCallback(leaseUUID string, status backend.CallbackStatus, 
 	}
 	b.provisionsMu.RUnlock()
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, status, errMsg)
+	b.sendCallbackWithURL(leaseUUID, callbackURL, status, errMsg, false)
 }
 
 // sendCallbackWithURL dispatches a callback using a caller-provided URL,
 // bypassing the provisions map. Use when the map entry is about to be deleted
 // (or is being deleted under the write lock) and the URL has been captured
-// earlier.
-func (b *Backend) sendCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string) {
+// earlier. retained is best-effort ground truth threaded into the payload; it
+// is true only on the deprovision retain-success path.
+func (b *Backend) sendCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string, retained bool) {
 	// Truncate error to fit the on-chain rejection reason limit.
 	if len(errMsg) > callbackMaxErrorLen {
 		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
 	}
 
-	b.callbackSender.SendCallback(leaseUUID, callbackURL, b.Name(), status, errMsg)
+	b.callbackSender.SendCallback(leaseUUID, callbackURL, b.Name(), status, errMsg, retained)
 }
 
 // removeProvision removes a provision reservation. Used when pre-flight

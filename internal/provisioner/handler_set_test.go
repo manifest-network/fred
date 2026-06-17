@@ -360,11 +360,13 @@ func TestHandlerSet_HandleLeaseExpired_DelegatesToClosed(t *testing.T) {
 	mb.mu.Unlock()
 }
 
-// TestHandlerSet_HandleLeaseClosed_PublishesRetainedEvent verifies that
-// processLeaseClose publishes a LeaseStatusEvent with ProvisionStatusRetained
-// so a connected tenant learns their data may be recoverable if the backend
-// has retention enabled.
-func TestHandlerSet_HandleLeaseClosed_PublishesRetainedEvent(t *testing.T) {
+// TestHandlerSet_HandleLeaseClosed_DoesNotEmitRetainedOnIntent verifies the
+// ENG-329 change: processLeaseClose NO LONGER emits a retained event on close
+// intent (the former optimistic :189 emit fired regardless of whether the
+// backend actually retained). The notice now fires on observed ground truth
+// from the deprovision callback (HandleBackendCallback), and the durable
+// backstop is the queryable retention status. Close must publish no lease event.
+func TestHandlerSet_HandleLeaseClosed_DoesNotEmitRetainedOnIntent(t *testing.T) {
 	pub := newMockPublisher()
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{
@@ -393,18 +395,12 @@ func TestHandlerSet_HandleLeaseClosed_PublishesRetainedEvent(t *testing.T) {
 	msgs := pub.published[TopicLeaseEvent]
 	pub.mu.Unlock()
 
-	require.Len(t, msgs, 1, "should publish exactly one retained event on lease close")
-
-	var event backend.LeaseStatusEvent
-	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
-	assert.Equal(t, "lease-retained", event.LeaseUUID)
-	assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
-	assert.NotEmpty(t, event.Error, "retained event should carry informational message")
+	assert.Empty(t, msgs, "close must not emit a retained (or any) lease event on intent")
 }
 
-// TestHandlerSet_HandleLeaseExpired_PublishesRetainedEvent verifies that the
-// expiry path also emits the retained event (it delegates to processLeaseClose).
-func TestHandlerSet_HandleLeaseExpired_PublishesRetainedEvent(t *testing.T) {
+// TestHandlerSet_HandleLeaseExpired_DoesNotEmitRetainedOnIntent mirrors the
+// close case for the expiry path (it delegates to processLeaseClose).
+func TestHandlerSet_HandleLeaseExpired_DoesNotEmitRetainedOnIntent(t *testing.T) {
 	pub := newMockPublisher()
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
@@ -424,12 +420,7 @@ func TestHandlerSet_HandleLeaseExpired_PublishesRetainedEvent(t *testing.T) {
 	msgs := pub.published[TopicLeaseEvent]
 	pub.mu.Unlock()
 
-	require.Len(t, msgs, 1, "should publish exactly one retained event on lease expire")
-
-	var event backend.LeaseStatusEvent
-	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
-	assert.Equal(t, "lease-expired-retained", event.LeaseUUID)
-	assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
+	assert.Empty(t, msgs, "expire must not emit a retained (or any) lease event on intent")
 }
 
 // --- HandleBackendCallback tests ---
@@ -738,6 +729,54 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		assert.Equal(t, "lease-update", event.LeaseUUID)
 		assert.Equal(t, backend.ProvisionStatusFailed, event.Status)
 		assert.Equal(t, "container crashed", event.Error)
+	})
+
+	// ENG-329: a deprovisioned callback emits the retained notice on observed
+	// ground truth — only when payload.Retained is true.
+	t.Run("deprovisioned_retained_publishes_retained", func(t *testing.T) {
+		pub.mu.Lock()
+		pub.published = make(map[string][]*message.Message)
+		pub.mu.Unlock()
+
+		msg := newCallbackMsg(t, backend.CallbackPayload{
+			LeaseUUID: "lease-closed-retained",
+			Status:    backend.CallbackStatusDeprovisioned,
+			Retained:  true,
+		})
+
+		err := hs.HandleBackendCallback(msg)
+		require.NoError(t, err)
+
+		pub.mu.Lock()
+		msgs := pub.published[TopicLeaseEvent]
+		pub.mu.Unlock()
+		require.Len(t, msgs, 1, "retained deprovision must emit exactly one retained event")
+
+		var event backend.LeaseStatusEvent
+		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+		assert.Equal(t, "lease-closed-retained", event.LeaseUUID)
+		assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
+		assert.NotEmpty(t, event.Error, "retained event should carry an informational message")
+	})
+
+	t.Run("deprovisioned_not_retained_publishes_nothing", func(t *testing.T) {
+		pub.mu.Lock()
+		pub.published = make(map[string][]*message.Message)
+		pub.mu.Unlock()
+
+		msg := newCallbackMsg(t, backend.CallbackPayload{
+			LeaseUUID: "lease-closed-destroyed",
+			Status:    backend.CallbackStatusDeprovisioned,
+			Retained:  false,
+		})
+
+		err := hs.HandleBackendCallback(msg)
+		require.NoError(t, err)
+
+		pub.mu.Lock()
+		msgs := pub.published[TopicLeaseEvent]
+		pub.mu.Unlock()
+		assert.Empty(t, msgs, "non-retain deprovision must not emit any lease event")
 	})
 }
 
