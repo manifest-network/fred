@@ -451,10 +451,11 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		logger.Warn("restore provider mismatch", "entry_provider", rec.ProviderUUID, "request_provider", req.ProviderUUID)
 		return fmt.Errorf("%w: provider mismatch", backend.ErrValidation)
 	}
-	// A retained record always carries a StackManifest (written at soft-delete);
-	// a nil one is a corrupt record — reject rather than nil-deref below.
-	if rec.StackManifest == nil || len(rec.Items) == 0 {
-		logger.Error("restore: corrupt retained record (nil manifest or no items)")
+	// A retained record always carries a StackManifest with at least one service
+	// (written at soft-delete); a nil/empty one is a corrupt record — reject rather
+	// than nil-deref below.
+	if rec.StackManifest == nil || len(rec.StackManifest.Services) == 0 || len(rec.Items) == 0 {
+		logger.Error("restore: corrupt retained record (nil/empty manifest or no items)")
 		return fmt.Errorf("%w: corrupt retained record", backend.ErrValidation)
 	}
 	profiles := map[string]SKUProfile{}
@@ -469,6 +470,12 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		profiles[item.SKU] = p
 	}
 	for svc, m := range rec.StackManifest.Services {
+		// A nil service entry is corruption (provision/recovery validate manifests);
+		// guard it so a tampered record fails cleanly instead of nil-derefing m.Image.
+		if m == nil {
+			logger.Error("restore: corrupt retained record (nil service entry)", "service", svc)
+			return fmt.Errorf("%w: service %s: nil manifest in retained record", backend.ErrValidation, svc)
+		}
 		if ierr := shared.ValidateImage(m.Image, b.cfg.AllowedRegistries); ierr != nil {
 			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svc, ierr)
 		}

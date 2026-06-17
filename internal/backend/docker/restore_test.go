@@ -1829,6 +1829,57 @@ func TestRestore_ProviderMismatch_Validation(t *testing.T) {
 	assert.Equal(t, 1, entry.Generation)
 }
 
+// TestRestore_NilServiceEntry_RejectedNotPanic: a corrupt retained record whose
+// StackManifest.Services carries a nil service entry (the shape a tampered/legacy
+// `{"services":{"app":null}}` payload deserializes to) must be rejected with
+// ErrValidation, NOT crash the backend. Restore() runs synchronously with no panic
+// recovery before the service loop, so an unguarded nil-deref on m.Image would take
+// down the backend goroutine. Only reachable via store corruption — provision and
+// recovery both run ParsePayload->Validate — so this is defense-in-depth that
+// completes the existing "reject rather than nil-deref" corruption guard.
+func TestRestore_NilServiceEntry_RejectedNotPanic(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID: "u1",
+		Tenant:            "tenant-a",
+		ProviderUUID:      "prov-1",
+		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		StackManifest: &manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{manifest.DefaultServiceName: nil}, // corrupt: nil entry
+		},
+		CallbackURL:         "http://localhost/callback",
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
+		Status:              shared.RetentionStatusActive,
+		Generation:          1,
+		CreatedAt:           time.Now(),
+	}))
+
+	renameCalled := false
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
+	}
+
+	// Must reject cleanly, not panic.
+	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://localhost/cb"))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrValidation)
+
+	assert.False(t, renameCalled, "no volume rename must occur on a corrupt-record rejection")
+
+	b.provisionsMu.RLock()
+	_, has := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, has, "no provision entry must be created on a corrupt-record rejection")
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "retained record must remain active")
+}
+
 // TestRestore_TenantMismatch_CollapsesToNotRetained: a request whose Tenant does
 // not match the retained record's is DELIBERATELY collapsed into ErrNotRetained
 // (NOT ErrValidation) so a cross-tenant caller cannot distinguish "exists but not
