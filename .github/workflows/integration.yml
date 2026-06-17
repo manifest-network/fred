@@ -1,0 +1,191 @@
+name: Integration Tests
+
+# Runs the `-tags integration` suites that need a privileged environment
+# (root + btrfs loopback + a real Docker daemon) and therefore never ran in
+# `ci.yml`. Without this, the volume/quota and retain/restore tests rot
+# silently — a volume-naming change went undetected for ~3 months (PR #115,
+# ENG-330). The whole point is *signal*: this workflow FAILS (it does not pass
+# green) if the privileged environment is missing and the tests would `t.Skip`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "internal/backend/docker/**"
+      - "internal/backend/shared/**"
+      - "cmd/k3s-backend/**"
+      - "Makefile"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/integration.yml"
+  push:
+    branches: [main]
+    paths:
+      - "internal/backend/docker/**"
+      - "internal/backend/shared/**"
+      - "cmd/k3s-backend/**"
+      - "Makefile"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/integration.yml"
+  # Nightly safety net: catches rot from changes outside the path filter
+  # (dependency bumps, shared code) and from GitHub runner-image drift.
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Include event_name so a nightly `schedule` run and a `push` to main (both ref
+  # refs/heads/main) don't cancel each other; PR pushes to the same ref still
+  # supersede stale in-progress runs.
+  group: integration-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-btrfs:
+    name: docker + btrfs integration (root)
+    # MUST be the full ubuntu image (not ubuntu-slim): we need passwordless
+    # sudo→root, loop devices, and low-level mount — ubuntu-slim's job container
+    # is unprivileged and cannot do any of that.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Optional Docker Hub auth to dodge anonymous pull rate limits (ubuntu-24.04
+      # ships zero preloaded images, so every workload image is pulled fresh).
+      # Absent secrets evaluate to "" and the login step is skipped — anonymous
+      # pulls still work, just rate-limited. On fork PRs secrets are never exposed,
+      # so those pulls are always anonymous; the nightly/post-merge run is the backstop.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install btrfs-progs
+        # mkfs.btrfs / btrfs are NOT preinstalled on ubuntu-latest; util-linux
+        # (losetup, mount) already is. The tests build their own btrfs loopback.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          sudo modprobe btrfs || true
+
+      - name: Preflight — fail loudly if the privileged env is missing
+        # setupBtrfsLoopback (and the Docker-ping helpers) call t.Skip when root,
+        # btrfs-progs, loop devices, or Docker are absent — which would make this
+        # whole job pass green while testing NOTHING (the ENG-330 trap). Reproduce
+        # the exact loopback path here so a broken runner fails fast and clearly.
+        run: |
+          set -uo pipefail
+          fail=0
+          docker info >/dev/null 2>&1 || { echo "::error::Docker daemon not reachable"; fail=1; }
+          command -v mkfs.btrfs >/dev/null 2>&1 || { echo "::error::mkfs.btrfs not installed"; fail=1; }
+          command -v btrfs >/dev/null 2>&1 || { echo "::error::btrfs CLI not installed"; fail=1; }
+          work="$(mktemp -d)"
+          truncate -s 256M "$work/btrfs.img" || { echo "::error::truncate failed"; fail=1; }
+          sudo mkfs.btrfs -f "$work/btrfs.img" >/dev/null || { echo "::error::mkfs.btrfs failed"; fail=1; }
+          sync
+          mkdir -p "$work/mnt"
+          if sudo mount -o loop "$work/btrfs.img" "$work/mnt"; then
+            sudo btrfs quota enable "$work/mnt" || { echo "::error::btrfs quota enable failed"; fail=1; }
+            sudo umount -l "$work/mnt" || true
+          else
+            echo "::error::loopback btrfs mount failed — the volume/restore tests would t.Skip (ENG-330 silent-rot gap). Failing."
+            fail=1
+          fi
+          rm -rf "$work" || true
+          [ "$fail" -eq 0 ] && echo "Preflight OK: docker + root + btrfs-progs + loopback + quota all available."
+          exit "$fail"
+
+      - name: Docker Hub login (optional)
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Pre-pull workload images
+        # Warm the shared daemon cache and surface any pull/rate-limit failure
+        # clearly here rather than mid-suite. (The negative-path test image — a
+        # deliberately non-existent tag — is intentionally NOT pre-pulled.)
+        run: |
+          set -uo pipefail
+          for img in busybox:latest alpine:latest redis:7 redis:7-alpine; do
+            ok=0
+            for attempt in 1 2 3; do
+              if docker pull "$img"; then ok=1; break; fi
+              echo "pull $img failed (attempt $attempt/3), retrying in 10s..."
+              sleep 10
+            done
+            if [ "$ok" -ne 1 ]; then echo "::error::failed to pull $img after 3 attempts"; exit 1; fi
+          done
+
+      - name: Run docker + btrfs integration suite (as root)
+        # `-run Integration` covers the ENTIRE docker package: core lifecycle,
+        # stack, restart/update, reconciler, idempotency, volume/quota, and the
+        # ENG-325 retain/restore tests. 30m timeout: the restore tests are slow
+        # (multi-minute provision waits) and the default 15m predates them.
+        # `sudo -E env PATH=$PATH` preserves the actions/setup-go toolchain that
+        # sudo's secure_path would otherwise hide (the containerd idiom).
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m 2>&1 | tee integration.log
+
+      - name: Guard — fail if any integration test was SKIPPED
+        # A green-but-skipped run is the exact failure mode ENG-330 exists to kill.
+        # In a correctly provisioned runner, zero integration tests should skip.
+        run: |
+          set -uo pipefail
+          if grep -Eq '^[[:space:]]*--- SKIP:' integration.log; then
+            echo "::group::Skipped tests"
+            grep -E '^[[:space:]]*--- SKIP:' integration.log || true
+            echo "::endgroup::"
+            echo "::error::Integration tests were SKIPPED — the runner is missing root/btrfs/loop/docker. A green-but-skipped run is the ENG-330 silent-rot gap. Failing."
+            exit 1
+          fi
+          passed="$(grep -cE '^[[:space:]]*--- PASS:' integration.log || true)"
+          echo "Integration tests passed: ${passed:-0}"
+          if [ "${passed:-0}" -lt 1 ]; then
+            echo "::error::No integration tests executed (0 PASS lines) — check the build tag / -run pattern."
+            exit 1
+          fi
+
+  k3s:
+    name: k3s-backend integration
+    # No root/btrfs/Docker needed: the test self-builds the binary into a TempDir
+    # and exercises the HTTP + callback path against a fake Fred. Just needs Go.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run k3s-backend integration suite
+        run: |
+          set -o pipefail
+          make test-integration-k3s 2>&1 | tee k3s-integration.log
+
+      - name: Guard — fail if any k3s integration test was SKIPPED
+        run: |
+          set -uo pipefail
+          if grep -Eq '^[[:space:]]*--- SKIP:' k3s-integration.log; then
+            grep -E '^[[:space:]]*--- SKIP:' k3s-integration.log || true
+            echo "::error::k3s integration tests were SKIPPED (go toolchain missing?). Failing."
+            exit 1
+          fi
+          passed="$(grep -cE '^[[:space:]]*--- PASS:' k3s-integration.log || true)"
+          echo "k3s integration tests passed: ${passed:-0}"
+          if [ "${passed:-0}" -lt 1 ]; then
+            echo "::error::No k3s integration tests executed."
+            exit 1
+          fi
