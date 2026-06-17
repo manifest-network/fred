@@ -19,6 +19,11 @@ GOVET=$(GOCMD) vet
 # Version
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
+# Timeout for the full `-run Integration` docker suite. Overridable so CI can
+# grant the grown suite (volume + the slower retain/restore tests) extra headroom
+# without changing the local default. e.g. `make test-integration INTEGRATION_TIMEOUT=30m`.
+INTEGRATION_TIMEOUT ?= 15m
+
 # Build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
@@ -85,7 +90,7 @@ test-volume:
 # Run Docker integration tests (requires Docker daemon)
 test-integration:
 	@echo "Running Docker integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout 15m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout $(INTEGRATION_TIMEOUT)
 
 # Run stack integration tests (requires Docker daemon)
 test-integration-stack:
