@@ -85,9 +85,10 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 // merging mergeVolumes into any existing record's RetainedVolumeNames. Single txn,
 // so it is safe against a concurrent ClaimForRestore (no Get→Put TOCTOU):
 //   - absent: writes `base` fresh (caller sets CreatedAt=now, Generation=0, Status=active).
-//   - existing ACTIVE: PRESERVES the stored CreatedAt and Generation, and writes the
-//     UNION of stored RetainedVolumeNames and base.RetainedVolumeNames (dedup); other
-//     fields come from `base`.
+//   - existing ACTIVE: PRESERVES the stored CreatedAt and Generation, writes the
+//     UNION of stored RetainedVolumeNames and base.RetainedVolumeNames (dedup), and
+//     KEEPS the stored StackManifest when base's is nil (a close retry must never
+//     clobber a restorable manifest with a nil one); other fields come from `base`.
 //   - existing NON-active (restoring): writes NOTHING, returns ok=false — a restore owns
 //     the record; a blind write would corrupt the CAS. Caller defers (keeps lease Failed).
 //
@@ -108,6 +109,16 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 			base.CreatedAt = stored.CreatedAt
 			base.Generation = stored.Generation
 			base.RetainedVolumeNames = dedupUnion(stored.RetainedVolumeNames, base.RetainedVolumeNames)
+			// Never let a nil base manifest clobber a previously-persisted one. A
+			// close retry can recompute base.StackManifest == nil (e.g. a transient
+			// release-store hydration failure, or the release reaped between
+			// attempts), and Restore rejects nil manifests — clobbering would make
+			// an otherwise-restorable lease permanently un-restorable. The manifest
+			// is the only hydrated (retry-variable) field, so it is the only one
+			// needing this guard.
+			if base.StackManifest == nil {
+				base.StackManifest = stored.StackManifest
+			}
 		}
 		data, err := json.Marshal(base)
 		if err != nil {

@@ -480,6 +480,57 @@ func TestPutActiveMerged_ActiveMergesAndPreservesCreatedAtGen(t *testing.T) {
 	assert.ElementsMatch(t, []string{"a", "b"}, got.RetainedVolumeNames, "names must be the dedup union")
 }
 
+// TestPutActiveMerged_ActivePreservesStoredManifestWhenBaseNil guards the
+// soft-delete retry path: a first close attempt may persist a non-nil
+// StackManifest (from the provision or hydrated from the release store), then a
+// later retry can recompute base.StackManifest == nil (e.g. a transient release-
+// store read/parse failure, or the release reaped between attempts). The merge
+// must NOT let that nil clobber the stored manifest — Restore rejects nil
+// manifests, so a clobber would make an otherwise-restorable lease permanently
+// un-restorable. CreatedAt/Generation are still preserved and names still union.
+func TestPutActiveMerged_ActivePreservesStoredManifestWhenBaseNil(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	past := time.Now().Add(-10 * 24 * time.Hour).Round(time.Millisecond)
+	require.NoError(t, s.Put(RetentionEntry{
+		OriginalLeaseUUID: "lease-1",
+		Tenant:            "tenant-a",
+		Status:            RetentionStatusActive,
+		StackManifest: &manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{
+				manifest.DefaultServiceName: {Image: "nginx:latest"},
+			},
+		},
+		RetainedVolumeNames: []string{"vol-a"},
+		Generation:          2,
+		CreatedAt:           past,
+	}))
+
+	// Retry whose hydration regressed to nil; everything else as before.
+	base := RetentionEntry{
+		OriginalLeaseUUID:   "lease-1",
+		Tenant:              "tenant-a",
+		Status:              RetentionStatusActive,
+		StackManifest:       nil,
+		RetainedVolumeNames: []string{"vol-a", "vol-b"},
+		Generation:          0,
+		CreatedAt:           time.Now(),
+	}
+	ok, err := s.PutActiveMerged(base)
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	got, err := s.Get("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NotNil(t, got.StackManifest, "stored manifest must NOT be clobbered by a nil base manifest")
+	require.NotNil(t, got.StackManifest.Services[manifest.DefaultServiceName], "the specific stored service must survive")
+	assert.Equal(t, "nginx:latest", got.StackManifest.Services[manifest.DefaultServiceName].Image)
+	assert.True(t, got.CreatedAt.Equal(past), "stored CreatedAt must still be preserved")
+	assert.Equal(t, 2, got.Generation, "stored Generation must still be preserved")
+	assert.ElementsMatch(t, []string{"vol-a", "vol-b"}, got.RetainedVolumeNames, "names must still union")
+}
+
 // TestPutActiveMerged_RestoringRefuses verifies that against an existing
 // NON-active (restoring) record PutActiveMerged writes NOTHING, returns
 // ok=false + nil err, and leaves the stored record byte-identical.
