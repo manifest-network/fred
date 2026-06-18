@@ -5373,6 +5373,71 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 	assert.Equal(t, "no retained data found for that lease", errResp.Error)
 }
 
+// TestRestoreLease_PlacementDisabled_Returns503 verifies that when placement
+// routing is disabled (placementLookup is nil), restore returns 503 "service
+// not configured" — a service-misconfiguration condition — rather than a
+// misleading 404 "no retained data" (Copilot review on PR #120). This matches
+// how authenticateLease treats a nil backendRouter.
+func TestRestoreLease_PlacementDisabled_Returns503(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no backend should be called when placement routing is disabled: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// placementLookup is nil => placement routing disabled (service misconfig).
+	// backendRouter is non-nil so authenticateLease passes; the nil placement
+	// lookup must then surface as 503, not 404.
+	h := &Handlers{
+		client:        chainClient,
+		backendRouter: router,
+		providerUUID:  providerUUID,
+		bech32Prefix:  "manifest",
+	}
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.RestoreLease(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "body: %s", rec.Body.String())
+
+	var errResp ErrorResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+	assert.Equal(t, errMsgServiceNotConfigured, errResp.Error)
+}
+
 // fakeRestoreRecorder captures the arguments passed to RecordRestorePlacement.
 type fakeRestoreRecorder struct {
 	newLease, backend string

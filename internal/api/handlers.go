@@ -644,9 +644,21 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Placement routing disabled (no placement lookup wired) is a service
+	// misconfiguration, not a "data not found" condition — surface it as 503,
+	// matching how authenticateLease treats a nil backendRouter. Restore cannot
+	// determine the source backend without placement. (backendRouter is already
+	// guaranteed non-nil here by authenticateLease.)
+	if h.placementLookup == nil {
+		slog.Error("placement lookup not configured; restore requires placement routing")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
 	// Resolve the backend that holds the SOURCE lease's retained data. Restore
 	// is same-backend: the retained volumes live only where the source lease was
-	// provisioned (ENG-333). No placement / backend gone => no retained data here.
+	// provisioned (ENG-333). No placement for the source lease (or its backend is
+	// gone) => no retained data here => 404.
 	backendClient := h.resolveBackendByPlacement(body.FromLeaseUUID)
 	if backendClient == nil {
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
