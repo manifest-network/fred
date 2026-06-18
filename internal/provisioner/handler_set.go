@@ -235,7 +235,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			// reaper here). A non-retain deprovision emits nothing.
 			if callback.Retained {
 				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusRetained,
-					"your lease data was retained and can be restored within the grace window; restore via POST .../restore with a fresh PENDING lease of matching shape")
+					"your lease data was retained and can be restored within the grace window: create a fresh PENDING lease of matching shape, then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID")
 			}
 		default:
 			slog.Warn("unexpected callback status for non-in-flight lease",

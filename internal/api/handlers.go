@@ -237,7 +237,7 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 
 // restoreHint is the short, human-readable next-step surfaced alongside a
 // retained provision so a returning tenant knows how to recover their data.
-const restoreHint = "restore via POST .../restore with a fresh PENDING lease of matching shape, before retained_until"
+const restoreHint = "to restore before retained_until: create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
 
 // findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4) used to
 // locate a lease's holding backend. The lease→backend placement is deleted on
@@ -284,6 +284,33 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 		}
 	}
 	return nil, firstErr
+}
+
+// findProvision locates a lease's provision, preferring an O(1) placement hit
+// before the bounded fan-out. For an ACTIVE lease the placement record resolves
+// the holding backend directly — a single GetProvision call — which is the
+// read-heavy common case. Only on an ACTUAL placement hit that yields a
+// provision is the fast path taken; a missing/stale placement, or
+// ErrNotProvisioned on the placed backend (the closed/retained case, where
+// placement was deleted on close), falls through to findProvisionAcrossBackends.
+//
+// Deliberately does NOT use resolveBackend: its Route(sku) fallback would query
+// a single, likely-wrong backend rather than fanning out across all candidates.
+func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
+	if h.placementLookup != nil && h.backendRouter != nil {
+		if name := h.placementLookup.Get(leaseUUID); name != "" {
+			if b := h.backendRouter.GetBackendByName(name); b != nil {
+				info, err := b.GetProvision(ctx, leaseUUID)
+				if err == nil && info != nil {
+					return info, nil
+				}
+				// Miss on the placed backend (stale placement or ErrNotProvisioned,
+				// e.g. a closed/retained lease whose placement was deleted) — fall
+				// through to the bounded fan-out below.
+			}
+		}
+	}
+	return h.findProvisionAcrossBackends(ctx, leaseUUID, sku)
 }
 
 // ConnectionResponse represents the response for connection details.
@@ -473,13 +500,14 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Include provision status from the backend for ANY lease state (ENG-329
 	// lifts the former ACTIVE-only gate so a non-ACTIVE lease whose data was
-	// retained surfaces provision_status=retained). Use the bounded fan-out
-	// rather than placement: placement is deleted on close. Errors are
-	// intentionally ignored — provision status on /status is best-effort and
-	// ErrNotProvisioned during initial setup is expected.
+	// retained surfaces provision_status=retained). findProvision takes the O(1)
+	// placement fast-path for the ACTIVE common case and falls back to the
+	// bounded fan-out for closed/retained leases (placement is deleted on close).
+	// Errors are intentionally ignored — provision status on /status is
+	// best-effort and ErrNotProvisioned during initial setup is expected.
 	if h.backendRouter != nil {
 		sku := provisioner.ExtractRoutingSKU(lease)
-		info, fanErr := h.findProvisionAcrossBackends(r.Context(), leaseUUID, sku)
+		info, fanErr := h.findProvision(r.Context(), leaseUUID, sku)
 		if fanErr != nil {
 			slog.Warn("provision status lookup failed (best-effort)", "lease_uuid", leaseUUID, "error", fanErr)
 		}
@@ -620,7 +648,8 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 	if lease != nil {
 		sku = provisioner.ExtractRoutingSKU(lease)
 	}
-	info, fanErr := h.findProvisionAcrossBackends(r.Context(), leaseUUID, sku)
+	// Placement fast-path for the ACTIVE common case; bounded fan-out otherwise.
+	info, fanErr := h.findProvision(r.Context(), leaseUUID, sku)
 
 	switch {
 	case lease == nil:

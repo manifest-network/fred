@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -460,4 +461,173 @@ func TestGetLeaseStatus_Retained_ExpiredLease(t *testing.T) {
 	assert.Equal(t, "retained", resp.ProvisionStatus, "an EXPIRED lease with retained data must surface retained")
 	assert.Equal(t, retainedUntil.Format(time.RFC3339), resp.RetainedUntil)
 	require.NotEmpty(t, resp.Items)
+}
+
+// readyProvisionServer serves a ready (live, ACTIVE) ProvisionInfo for matchLease.
+func readyProvisionServer(t *testing.T, matchLease string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/provisions/"+matchLease {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.ProvisionInfo{
+			LeaseUUID:    matchLease,
+			ProviderUUID: testutil.ValidUUID2,
+			Status:       backend.ProvisionStatusReady,
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// countingNotProvisionedServer 404s every request and increments hits so a test
+// can assert the backend was (or was NOT) queried.
+func countingNotProvisionedServer(t *testing.T, hits *atomic.Int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestGetLeaseStatus_ActiveLease_PlacementFastPath verifies FIX A: for an ACTIVE
+// lease WITH a placement record, findProvision takes the O(1) placement
+// fast-path — only the placed backend's GetProvision is invoked; the OTHER
+// backend is NOT queried (no full fan-out on the read-heavy common case).
+func TestGetLeaseStatus_ActiveLease_PlacementFastPath(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{Uuid: leaseUUID, Tenant: kp.Address, ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_ACTIVE}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	placed := readyProvisionServer(t, leaseUUID)
+	var otherHits atomic.Int64
+	other := countingNotProvisionedServer(t, &otherHits)
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			// "other" is the default/first backend — a naive fan-out over Backends()
+			// would query it; the placement fast-path must avoid that.
+			{Backend: httpBackend(t, "other", other.URL), IsDefault: true},
+			{Backend: httpBackend(t, "placed", placed.URL)},
+		},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{getFunc: func(_ string) string { return "placed" }}
+	h := &Handlers{client: chainClient, backendRouter: router, placementLookup: placement, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+	req.SetPathValue("lease_uuid", leaseUUID)
+	rec := httptest.NewRecorder()
+	h.GetLeaseStatus(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var resp LeaseStatusResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "ready", resp.ProvisionStatus, "placement fast-path must resolve the placed backend's live status")
+	assert.Equal(t, int64(0), otherHits.Load(), "the non-placed backend must NOT be queried when placement hits (no fan-out)")
+}
+
+// TestGetLeaseProvision_ActiveLease_PlacementFastPath is the GET /provision
+// counterpart of the placement fast-path.
+func TestGetLeaseProvision_ActiveLease_PlacementFastPath(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{Uuid: leaseUUID, Tenant: kp.Address, ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_ACTIVE}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	placed := readyProvisionServer(t, leaseUUID)
+	var otherHits atomic.Int64
+	other := countingNotProvisionedServer(t, &otherHits)
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: httpBackend(t, "other", other.URL), IsDefault: true},
+			{Backend: httpBackend(t, "placed", placed.URL)},
+		},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{getFunc: func(_ string) string { return "placed" }}
+	h := &Handlers{client: chainClient, backendRouter: router, placementLookup: placement, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/provision", nil)
+	req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+	req.SetPathValue("lease_uuid", leaseUUID)
+	rec := httptest.NewRecorder()
+	h.GetLeaseProvision(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var resp LeaseProvisionResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "ready", resp.Status)
+	assert.Equal(t, int64(0), otherHits.Load(), "the non-placed backend must NOT be queried when placement hits (no fan-out)")
+}
+
+// TestGetLeaseStatus_StalePlacement_FallsBackToFanOut verifies the fast-path
+// degrades gracefully: when the placed backend returns ErrNotProvisioned (stale
+// placement — e.g. a closed/retained lease whose placement wasn't cleaned), the
+// fan-out still finds the holder.
+func TestGetLeaseStatus_StalePlacement_FallsBackToFanOut(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	retainedUntil := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{Uuid: leaseUUID, Tenant: kp.Address, ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_CLOSED}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	// Placement points at "stale", which no longer holds the lease (404). The
+	// holder "holder" is found by the fan-out fallback.
+	stale := notProvisionedServer(t)
+	holder := retainedProvisionServer(t, leaseUUID, kp.Address, retainedUntil)
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: httpBackend(t, "stale", stale.URL), IsDefault: true},
+			{Backend: httpBackend(t, "holder", holder.URL)},
+		},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{getFunc: func(_ string) string { return "stale" }}
+	h := &Handlers{client: chainClient, backendRouter: router, placementLookup: placement, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+	req.SetPathValue("lease_uuid", leaseUUID)
+	rec := httptest.NewRecorder()
+	h.GetLeaseStatus(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var resp LeaseStatusResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "retained", resp.ProvisionStatus, "stale placement must fall back to the fan-out and find the holder")
 }

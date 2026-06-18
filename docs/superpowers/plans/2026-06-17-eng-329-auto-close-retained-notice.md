@@ -1,6 +1,6 @@
 # ENG-329 — A tenant whose lease auto-closed can't learn their data is retained
 
-**Status:** spec for review (not yet implemented) — **Rev 3** (pull-side gaps resolved after a second best-practices review; design converged)
+**Status:** IMPLEMENTED in PR #118 — **Rev 3.1** (design converged after two best-practices reviews; pull-side gaps resolved, `ProvisionInfo.Tenant` serialized over the trusted backend→providerd hop for the authz fallback)
 **Date:** 2026-06-17
 **Parent:** ENG-325 (soft-delete + restore), PR #114
 **Worktree/branch:** `.claude/worktrees/eng-329-retained-notice` / `eng-329-retained-notice` (off `main` @ 74e87f8)
