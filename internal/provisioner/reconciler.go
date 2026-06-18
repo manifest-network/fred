@@ -737,6 +737,7 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 				if rec := recover(); rec != nil {
 					slog.Error("reconciler retentions fetch panic — recovering",
 						"backend", b.Name(), "panic", rec, "stack", string(debug.Stack()))
+					metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions").Inc()
 					mu.Lock()
 					complete = false
 					mu.Unlock()

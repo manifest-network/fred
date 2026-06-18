@@ -3842,6 +3842,44 @@ func TestReconciler_SkipsRetentionFetch_WhenPlacementDisabled(t *testing.T) {
 	require.NoError(t, reconciler.RunOnce(t.Context()))
 }
 
+// listRetentionsPanicBackend panics in ListRetentions, exercising the
+// fetchAllRetentions panic-recovery path.
+type listRetentionsPanicBackend struct {
+	*backend.MockBackend
+}
+
+func (b *listRetentionsPanicBackend) ListRetentions(context.Context) ([]backend.RetainedLease, error) {
+	panic("simulated retentions fetch panic")
+}
+
+func TestReconciler_RetentionFetchPanic_RecordsMetric(t *testing.T) {
+	// A panic in a backend's ListRetentions must be recovered (RunOnce does not
+	// crash) AND counted in ReconcilerPanicsTotal, like every other recovered
+	// panic site (fetch_provisions / process_lease / process_orphan).
+	before := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions"))
+
+	mb := &listRetentionsPanicBackend{
+		MockBackend: backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"}),
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// Non-nil placementStore so the retentions fetch actually runs.
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, &mockPlacementStore{})
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()), "retention-fetch panic must be recovered")
+
+	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions"))
+	assert.Equal(t, before+1, after,
+		"recovered retention-fetch panic must increment ReconcilerPanicsTotal{fetch_retentions}")
+}
+
 // TestRestoreAffinity_EndToEnd_MultiBackend proves that, on a multi-backend
 // pool, the reconciler derives the source lease's placement from the backend
 // that RETAINS it — regardless of load-based routing. b1 is the least-loaded
