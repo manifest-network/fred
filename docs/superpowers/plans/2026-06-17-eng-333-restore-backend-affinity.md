@@ -1305,15 +1305,26 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `cmd/providerd/main.go`
 - Test: `internal/backend/docker/integration_restore_test.go` (mirror existing docker integration tests)
 
-- [ ] **Step 1: Wire the orchestrator as `RestoreRecorder`**
+- [ ] **Step 1: Wire the recorder via a `Manager` delegation**
 
-In `cmd/providerd/main.go`, where `api.ServerDeps{...}` (or the equivalent server construction) is built, set the new field to the orchestrator instance that owns the placement store:
+`cmd/providerd/main.go` assembles `api.ServerDeps` from the `*provisioner.Manager` (which already satisfies several `ServerDeps` interfaces). The `ProvisionOrchestrator` is **private inside `Manager`** (`m.orchestrator`), so expose the recorder through `Manager` rather than referencing the orchestrator directly (keeps `Manager` the single DI target).
+
+(a) Add a thin delegation to `Manager` (in `internal/provisioner/inflight.go`, next to the existing `Manager.InFlightCountsByBackend` delegation, or wherever `Manager`'s methods live):
 
 ```go
-		RestoreRecorder: orchestrator, // *provisioner.ProvisionOrchestrator implements RestorePlacementRecorder
+// RecordRestorePlacement delegates to the orchestrator (ENG-333).
+func (m *Manager) RecordRestorePlacement(newLeaseUUID, backendName string) {
+	m.orchestrator.RecordRestorePlacement(newLeaseUUID, backendName)
+}
 ```
 
-(Find the existing `PlacementLookup:` wiring in `cmd/providerd/main.go` and add `RestoreRecorder:` alongside it, using the same orchestrator variable that was constructed with the placement store.)
+(b) In `cmd/providerd/main.go`, find the existing `PlacementLookup:` wiring in the `api.ServerDeps{...}` literal and add alongside it (using the same `Manager` variable — likely `provisionMgr` or similar):
+
+```go
+		RestoreRecorder: provisionMgr, // *provisioner.Manager delegates RecordRestorePlacement to its orchestrator
+```
+
+(Confirm the actual `Manager` variable name and the `m.orchestrator` field name by reading `main.go` and `internal/provisioner/manager.go`.)
 
 Run: `go build ./...`
 Expected: success (compile-time check that `*ProvisionOrchestrator` satisfies `api.RestorePlacementRecorder`).
