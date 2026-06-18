@@ -327,3 +327,23 @@ func serviceImages(sm *manifest.StackManifest) map[string]string {
 func (b *Backend) Stats() shared.ResourceStats {
 	return b.pool.Stats()
 }
+
+// Compile-time check that *Backend satisfies the full backend.Backend interface.
+// The integration tests use *Backend directly as a backend.Backend (in-process,
+// no HTTP); without this guard a missing interface method only surfaces under
+// `-tags integration` — which is how ENG-318's GetLoadStats omission on this
+// backend went unnoticed until the nightly integration build.
+var _ backend.Backend = (*Backend)(nil)
+
+// GetLoadStats returns the backend's current CPU-load snapshot for least-loaded
+// provision routing (ENG-318). It wraps the resource pool's Stats() — the same
+// source the HTTP GET /stats endpoint serves — so the in-process docker backend
+// exposes the same load signal as the HTTP path.
+func (b *Backend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	stats := b.Stats()
+	return &backend.LoadStats{
+		TotalCPUCores:     stats.TotalCPU,
+		AllocatedCPUCores: stats.AllocatedCPU,
+		ActiveContainers:  stats.AllocationCount,
+	}, nil
+}
