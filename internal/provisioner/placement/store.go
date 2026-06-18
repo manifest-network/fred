@@ -74,7 +74,7 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	if err := db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
 		return b.ForEach(func(k, v []byte) error {
-			cache[string(k)] = decodeRecord(v)
+			cache[string(k)] = decodeRecord(string(k), v)
 			return nil
 		})
 	}); err != nil {
@@ -90,21 +90,27 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(s)
 	}
+	// A WithClock(nil) misuse must not nil out the clock and panic later in Set.
+	if s.now == nil {
+		s.now = time.Now
+	}
 	return s, nil
 }
 
 // decodeRecord parses a stored value. New values are JSON objects (first byte
 // '{'); anything else is a legacy raw backend name written before ENG-335,
 // loaded with a zero SetAt so the pruner may remove it immediately.
-func decodeRecord(v []byte) record {
+func decodeRecord(leaseUUID string, v []byte) record {
 	if len(v) > 0 && v[0] == '{' {
 		var r record
 		if err := json.Unmarshal(v, &r); err != nil {
 			// First byte says JSON but it will not parse — a corrupt entry.
 			// Return an empty record (no backend, zero SetAt) so it reads as
 			// "no placement" and the pruner can clear it, rather than treating
-			// the raw bytes as a backend name.
-			slog.Warn("placement: dropping unparseable record", "error", err)
+			// the raw bytes as a backend name. Include the key so the corrupt
+			// bbolt entry can be located.
+			slog.Warn("placement: dropping unparseable record",
+				"lease_uuid", leaseUUID, "error", err)
 			return record{}
 		}
 		return r

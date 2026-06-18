@@ -130,6 +130,19 @@ func TestNewStore_EmptyPath(t *testing.T) {
 	assert.Contains(t, err.Error(), "placement db path is required")
 }
 
+func TestNewStore_WithNilClock_DefaultsToTimeNow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath, WithClock(nil))
+	require.NoError(t, err)
+	defer s.Close()
+
+	// A nil clock must fall back to time.Now rather than nil-panic in Set.
+	require.NoError(t, s.Set("lease-1", "backend-a"))
+	at, ok := s.SetAt("lease-1")
+	require.True(t, ok)
+	assert.False(t, at.IsZero(), "nil clock must fall back to a real time")
+}
+
 func TestStore_Count(t *testing.T) {
 	s := newTestStore(t)
 
