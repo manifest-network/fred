@@ -452,6 +452,13 @@ func (b *Backend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
 	return nil, nil
 }
 
+// ListRetentions returns an empty slice: the k3s backend has no retention
+// store (retention/restore is docker-only, ENG-325). Implemented so the k3s
+// backend satisfies the backend.Backend interface (ENG-333).
+func (b *Backend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	return []backend.RetainedLease{}, nil
+}
+
 // Stats returns the resource pool's current snapshot. The k3s scaffold
 // never allocates against the pool (the stub provisioner doesn't call
 // pool.TryAllocate), so AllocationCount is always 0 and Available* ==

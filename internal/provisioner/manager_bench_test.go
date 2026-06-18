@@ -69,6 +69,10 @@ func (m *mockBenchBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, 
 	return nil, nil
 }
 
+func (m *mockBenchBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	return nil, nil
+}
+
 // BenchmarkWatermill_Publish benchmarks Watermill message publishing.
 func BenchmarkWatermill_Publish(b *testing.B) {
 	logger := watermill.NopLogger{}

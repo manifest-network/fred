@@ -52,8 +52,8 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	sku := ExtractRoutingSKU(lease)
 	totalQuantity := TotalLeaseQuantity(lease)
 
-	// Route to appropriate backend using least-loaded selection
-	backendClient := o.router.RouteForProvision(ctx, sku, o.tracker.InFlightCountsByBackend())
+	// Route to appropriate backend, honoring existing placement for restored/placed leases (ENG-333)
+	backendClient := routeForProvisionHonoringPlacement(ctx, o.router, o.placementStore, lease.Uuid, sku, o.tracker.InFlightCountsByBackend())
 	if backendClient == nil {
 		slog.Error("no backend available for provisioning",
 			"lease_uuid", lease.Uuid,
@@ -138,12 +138,57 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	return nil
 }
 
+// routeForProvisionHonoringPlacement returns the backend that already holds the
+// lease's data (from placement) when one is recorded and reachable; otherwise it
+// falls back to least-loaded selection. This keeps a restored or already-placed
+// lease pinned to the backend with its volumes (ENG-333), preventing data drift
+// on re-provision/reconcile.
+func routeForProvisionHonoringPlacement(
+	ctx context.Context,
+	router BackendRouter,
+	placementStore PlacementStore,
+	leaseUUID, sku string,
+	inFlightByBackend map[string]int,
+) backend.Backend {
+	if placementStore != nil {
+		if name := placementStore.Get(leaseUUID); name != "" {
+			if b := router.GetBackendByName(name); b != nil {
+				return b
+			}
+			slog.Warn("placement backend not found, falling back to least-loaded routing",
+				"lease_uuid", leaseUUID,
+				"placement_backend", name,
+			)
+		}
+	}
+	return router.RouteForProvision(ctx, sku, inFlightByBackend)
+}
+
 // DeletePlacement removes the placement record for a lease. Called when a
 // lease reaches a terminal state (e.g., rejected after a failure callback)
 // without going through the full Deprovision flow.
 func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
 	if o.placementStore != nil {
 		o.placementStore.Delete(leaseUUID)
+	}
+}
+
+// RecordRestorePlacement optimistically records the NEW lease's placement after
+// a successful restore (the new lease now lives on the backend that held the
+// source's retained data). No-op when no placement store is configured (nil
+// interface). It deliberately does NOT delete the source placement: restore is
+// asynchronous (202 + adopt), so deleting source state before the adopt confirms
+// is a saga anti-pattern, and source-placement
+// cleanup is owned solely by the reconciler (which prunes it once the retention
+// disappears from /retentions). This just closes the post-restore reconcile
+// window for the new lease (ENG-333).
+func (o *ProvisionOrchestrator) RecordRestorePlacement(newLeaseUUID, backendName string) {
+	if o.placementStore == nil {
+		return
+	}
+	if err := o.placementStore.Set(newLeaseUUID, backendName); err != nil {
+		slog.Warn("failed to record restore placement",
+			"lease_uuid", newLeaseUUID, "backend", backendName, "error", err)
 	}
 }
 
@@ -214,10 +259,11 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, err)
 		}
 
-		// Clean up placement record
-		if o.placementStore != nil {
-			o.placementStore.Delete(leaseUUID)
-		}
+		// Placement is intentionally NOT deleted here (ENG-333). It is a derived
+		// index of where the lease's data lives; if the backend retained the
+		// volumes, the placement must survive close so a restore can route to it.
+		// The reconciler is the sole pruner (cleanupOrphanedPlacements), gated on
+		// the lease being terminal on chain AND absent from all backends.
 
 		slog.Info("deprovisioned successfully",
 			"lease_uuid", leaseUUID,
@@ -251,11 +297,7 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 		}
 	}
 
-	// Always clean up placement record after fallback deprovision —
-	// if we reached the fallback path, the placement was already stale.
-	if o.placementStore != nil {
-		o.placementStore.Delete(leaseUUID)
-	}
+	// Placement is intentionally NOT deleted here (ENG-333); see resolved-backend path comment.
 
 	if !deprovisioned && lastErr != nil {
 		return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, lastErr)

@@ -44,6 +44,7 @@ type backendService interface {
 	LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	Restart(ctx context.Context, req backend.RestartRequest) error
 	Update(ctx context.Context, req backend.UpdateRequest) error
+	ListRetentions(ctx context.Context) ([]backend.RetainedLease, error)
 	ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	Health(ctx context.Context) error
@@ -79,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
 	mux.Handle("POST /restart", authMw(http.HandlerFunc(s.handleRestart)))
 	mux.Handle("POST /update", authMw(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("GET /retentions", authMw(http.HandlerFunc(s.handleListRetentions)))
 	mux.Handle("POST /reconcile_custom_domain", authMw(http.HandlerFunc(s.handleReconcileCustomDomain)))
 	mux.Handle("GET /releases/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetReleases)))
 
@@ -252,6 +254,19 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusAccepted, StatusResponse{Status: "restarting"})
+}
+
+func (s *Server) handleListRetentions(w http.ResponseWriter, r *http.Request) {
+	retentions, err := s.backend.ListRetentions(r.Context())
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Serialize as `[]` not `null` even if the backend returned a nil slice.
+	if retentions == nil {
+		retentions = []backend.RetainedLease{}
+	}
+	s.writeJSON(w, http.StatusOK, backend.ListRetentionsResponse{Retentions: retentions})
 }
 
 func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Request) {

@@ -443,7 +443,8 @@ func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
 
-	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after deprovision")
+	// ENG-333: placement must survive deprovision; the reconciler is the sole pruner.
+	assert.Equal(t, "test-backend", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
 }
 
 func TestOrchestrator_Deprovision_StalePlacement_FallsToSKU(t *testing.T) {
@@ -476,8 +477,9 @@ func TestOrchestrator_Deprovision_StalePlacement_FallsToSKU(t *testing.T) {
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
 
-	// Placement should still be cleaned up after successful deprovision via SKU fallback
-	assert.Empty(t, ps.Get("lease-1"))
+	// ENG-333: stale placement is still retained; the reconciler prunes orphans once the
+	// lease is terminal on chain and absent from all backends.
+	assert.Equal(t, "removed-backend", ps.Get("lease-1"), "stale placement must survive deprovision (ENG-333)")
 }
 
 func TestOrchestrator_Deprovision_PlacementTakesPriorityOverInFlight(t *testing.T) {
@@ -515,7 +517,7 @@ func TestOrchestrator_Deprovision_PlacementTakesPriorityOverInFlight(t *testing.
 	mbInFlight.mu.Unlock()
 }
 
-func TestOrchestrator_Deprovision_FallbackAllBackends_CleansPlacement(t *testing.T) {
+func TestOrchestrator_Deprovision_FallbackAllBackends_KeepsPlacement(t *testing.T) {
 	mb1 := &mockManagerBackend{name: "b1"}
 	router := &mockBackendRouter{
 		backendsFn: func() []backend.Backend { return []backend.Backend{mb1} },
@@ -529,7 +531,33 @@ func TestOrchestrator_Deprovision_FallbackAllBackends_CleansPlacement(t *testing
 	err := orch.Deprovision(context.Background(), "lease-1", "")
 	require.NoError(t, err)
 
-	assert.Empty(t, ps.Get("lease-1"), "stale placement should be cleaned up after fallback deprovision")
+	// ENG-333: placement survives even on the fallback path; the reconciler is the sole pruner.
+	assert.Equal(t, "stale-backend", ps.Get("lease-1"), "placement must survive fallback deprovision (ENG-333)")
+}
+
+// TestOrchestrator_Deprovision_KeepsPlacement asserts that Deprovision does NOT delete
+// the placement record (ENG-333). The placement is a derived index of where the lease's
+// retained volumes live; the reconciler (cleanupOrphanedPlacements) is the sole pruner,
+// gated on the lease being terminal on chain AND absent from all backends.
+func TestOrchestrator_Deprovision_KeepsPlacement(t *testing.T) {
+	mb := &mockManagerBackend{name: "backend-a"}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == "backend-a" {
+				return mb
+			}
+			return nil
+		},
+	}
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "backend-a")
+
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, NewInFlightTracker(), ps)
+
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1", "sku-1"))
+
+	// Placement must SURVIVE deprovision (restore affinity); reconciler prunes later.
+	assert.Equal(t, "backend-a", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
 }
 
 func TestOrchestrator_DeletePlacement(t *testing.T) {
@@ -599,6 +627,51 @@ func (e *errorPlacementStore) SetBatch(placements map[string]string) error {
 	return e.mockPlacementStore.SetBatch(placements)
 }
 
+func TestOrchestrator_StartProvisioning_HonorsPlacement(t *testing.T) {
+	// When a placement record exists, StartProvisioning must route to the
+	// placement-pinned backend, not the least-loaded one (ENG-333).
+	pinned := &mockManagerBackend{name: "backend-pinned"}
+	leastLoaded := &mockManagerBackend{name: "backend-least"}
+
+	byName := map[string]backend.Backend{
+		"backend-pinned": pinned,
+		"backend-least":  leastLoaded,
+	}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend { return byName[name] },
+		// RouteForProvision would normally pick the least-loaded backend.
+		routeForProvisionFn: func(_ context.Context, _ string, _ map[string]int) backend.Backend {
+			return leastLoaded
+		},
+	}
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "backend-pinned")
+
+	tracker := NewInFlightTracker()
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, tracker, ps)
+
+	lease := &billingtypes.Lease{
+		Uuid:   "lease-1",
+		Tenant: "t",
+		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+
+	// The placement-pinned backend must have received the Provision call.
+	pinned.mu.Lock()
+	pinnedCalls := len(pinned.provisionCalls)
+	pinned.mu.Unlock()
+
+	leastLoaded.mu.Lock()
+	leastCalls := len(leastLoaded.provisionCalls)
+	leastLoaded.mu.Unlock()
+
+	assert.Equal(t, 1, pinnedCalls, "pinned backend must receive the Provision call")
+	assert.Equal(t, 0, leastCalls, "least-loaded backend must NOT receive the Provision call")
+}
+
 func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testing.T) {
 	mb := &mockManagerBackend{
 		name:         "test-backend",
@@ -624,4 +697,26 @@ func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testi
 
 	after := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("test-backend"))
 	assert.Equal(t, 1.0, after-before, "BackendInsufficientResourcesTotal should increment by 1")
+}
+
+// --- RecordRestorePlacement tests ---
+
+func TestOrchestrator_RecordRestorePlacement(t *testing.T) {
+	placements := &mockPlacementStore{}
+	_ = placements.Set("source-lease", "backend-a") // preserved across close
+
+	o := NewProvisionOrchestrator("prov-1", "http://cb", &mockBackendRouter{}, NewInFlightTracker(), placements)
+
+	o.RecordRestorePlacement("new-lease", "backend-a")
+
+	assert.Equal(t, "backend-a", placements.Get("new-lease"), "new lease adopts the restore backend")
+	// Source placement is NOT touched here — the reconciler prunes it once the
+	// retention is consumed (no premature delete on an unconfirmed async restore).
+	assert.Equal(t, "backend-a", placements.Get("source-lease"), "source placement left for the reconciler to prune")
+}
+
+func TestOrchestrator_RecordRestorePlacement_NilStore(t *testing.T) {
+	o := NewProvisionOrchestrator("prov-1", "http://cb", &mockBackendRouter{}, NewInFlightTracker(), nil)
+	// Must not panic with a nil placement store.
+	o.RecordRestorePlacement("new-lease", "backend-a")
 }

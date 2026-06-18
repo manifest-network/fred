@@ -503,6 +503,10 @@ func (m *mockLatencyBackend) GetLoadStats(_ context.Context) (*backend.LoadStats
 	return nil, nil
 }
 
+func (m *mockLatencyBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	return nil, nil
+}
+
 // TestManager_HighConcurrencySustained tests sustained high concurrency.
 func TestManager_HighConcurrencySustained(t *testing.T) {
 	if testing.Short() {
