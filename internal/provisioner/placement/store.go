@@ -19,6 +19,16 @@ var bucketName = []byte("placements")
 // first learned that placement (SetAt). SetAt gates the reconciler's pruner so
 // a placement set during a slow reconcile sweep is not mistaken for an orphan
 // (ENG-335). Encoded as JSON in bbolt.
+//
+// Compatibility note: the JSON format is forward-compatible (decodeRecord still
+// reads the pre-ENG-335 raw backend-name strings), but it is NOT downgrade-safe
+// — an older binary would read this JSON blob as a backend name. Binary rollback
+// across this change is therefore not a supported procedure. The blast radius is
+// small: this store is a derived index the reconciler repaves from live backend
+// state every sweep (SetBatch over allProvisions ∪ allRetentions), so a downgrade
+// only briefly degrades routing before self-healing. Revisit (e.g. a separate
+// SetAt bucket keeping the backend name raw) if rollback ever becomes a hard
+// requirement.
 type record struct {
 	Backend string    `json:"backend"`
 	SetAt   time.Time `json:"set_at"`
