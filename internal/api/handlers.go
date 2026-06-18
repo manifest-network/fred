@@ -280,6 +280,9 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 			continue
 		}
 		if info != nil {
+			// Stamp the answering backend (BackendName is json:"-", empty over
+			// the wire) so downstream logging/diagnostics identify it.
+			info.BackendName = b.Name()
 			return info, nil
 		}
 	}
@@ -303,6 +306,10 @@ func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*b
 			if b := h.backendRouter.GetBackendByName(name); b != nil {
 				info, err := b.GetProvision(ctx, leaseUUID)
 				if err == nil && info != nil {
+					// BackendName is json:"-", so HTTP backends leave it empty on
+					// the wire — stamp the answering backend so downstream
+					// logging/diagnostics identify it (mirrors reconciler.go:638).
+					info.BackendName = b.Name()
 					return info, nil
 				}
 				// Miss on the placed backend. ErrNotProvisioned (stale placement,

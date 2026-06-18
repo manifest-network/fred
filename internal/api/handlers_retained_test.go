@@ -463,6 +463,37 @@ func TestGetLeaseStatus_Retained_ExpiredLease(t *testing.T) {
 	require.NotEmpty(t, resp.Items)
 }
 
+// TestFindProvision_StampsBackendName: ProvisionInfo.BackendName is json:"-" so
+// HTTP backends leave it empty on the wire; both the placement fast-path and the
+// fan-out must stamp the answering backend so downstream logging identifies it.
+func TestFindProvision_StampsBackendName(t *testing.T) {
+	leaseUUID := testutil.ValidUUID1
+	placed := readyProvisionServer(t, leaseUUID)
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: httpBackend(t, "placed", placed.URL), IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// Fast path (placement hit).
+	hFast := &Handlers{
+		backendRouter:   router,
+		placementLookup: &mockPlacementLookup{getFunc: func(_ string) string { return "placed" }},
+	}
+	info, err := hFast.findProvision(context.Background(), leaseUUID, "")
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.Equal(t, "placed", info.BackendName, "fast-path must stamp the answering backend")
+
+	// Fan-out (no placement).
+	hFan := &Handlers{backendRouter: router}
+	info, err = hFan.findProvisionAcrossBackends(context.Background(), leaseUUID, "")
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.Equal(t, "placed", info.BackendName, "fan-out must stamp the answering backend")
+}
+
 // readyProvisionServer serves a ready (live, ACTIVE) ProvisionInfo for matchLease.
 func readyProvisionServer(t *testing.T, matchLease string) *httptest.Server {
 	t.Helper()
