@@ -30,6 +30,7 @@ type mockReconcilerBackend struct {
 	mu                        sync.Mutex
 	name                      string
 	provisions                []backend.ProvisionInfo
+	retentions                []backend.RetainedLease // returned by ListRetentions
 	provisionCalls            []backend.ProvisionRequest
 	deprovisionCalls          []string
 	listProvisionsCalls       int
@@ -146,7 +147,14 @@ func (m *mockReconcilerBackend) GetLoadStats(_ context.Context) (*backend.LoadSt
 }
 
 func (m *mockReconcilerBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
-	return nil, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.retentions) == 0 {
+		return nil, nil
+	}
+	out := make([]backend.RetainedLease, len(m.retentions))
+	copy(out, m.retentions)
+	return out, nil
 }
 
 func TestNewReconciler_Validation(t *testing.T) {
@@ -2722,7 +2730,18 @@ func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
 }
 
 func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.T) {
-	// Setup: No lease on chain, provisioned on backend (orphan). Placement should be cleaned up.
+	// Setup: No lease on chain, provisioned on backend (orphan). The backend has no
+	// retention for this lease, so the placement should eventually be pruned.
+	//
+	// ENG-333: processOrphan no longer eagerly deletes placement. The gated pruner
+	// (cleanupOrphanedPlacements) is the sole owner. However, backendLeases is built
+	// from the pre-sweep snapshot (allProvisions ∪ allRetentions), so the orphan's
+	// lease UUID is present in backendLeases even after it is deprovisioned this
+	// sweep. The pruner therefore keeps the placement this sweep (gate b: "still on
+	// backend" = true in snapshot). It will be pruned on the NEXT sweep, when the
+	// backend no longer reports the provision and there is no retention.
+	// See TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement for the retained-
+	// lease case that ENG-333 was specifically designed to protect.
 	mockChain := &chaintest.MockClient{}
 	mb := &mockReconcilerBackend{
 		name: "test",
@@ -2746,11 +2765,26 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
-	assert.Empty(t, ps.Get("orphan-1"), "placement should be cleaned up after orphan deprovision")
+	// ENG-333: placement is NOT eagerly deleted by processOrphan anymore. It
+	// survives this sweep because the pre-sweep backendLeases snapshot still
+	// contains orphan-1 (it was in allProvisions at the start of RunOnce).
+	// The gated pruner will remove it on the next sweep once the backend no
+	// longer reports the provision and there is no retention.
+	assert.Equal(t, "test", ps.Get("orphan-1"), "placement survives the orphan-deprovision sweep (gated pruner owns deletion, ENG-333)")
 }
 
 func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
-	// Setup: Active lease, failed provision exhausted retries. After close, placement cleaned up.
+	// Setup: Active lease, failed provision exhausted retries. closeLease is called.
+	//
+	// ENG-333: cleanupTerminalLease (called by closeLease) no longer eagerly
+	// deletes placement. The gated pruner is the sole owner. In this sweep:
+	//   - backendLeases snapshot contains lease-1 (it was in allProvisions)
+	//   - chainLeases snapshot contains lease-1 as ACTIVE
+	// So the pruner keeps placement this sweep (both gate a and the chain-terminal
+	// gate protect it). It will be pruned on the NEXT sweep, once the chain
+	// reports the lease as closed/terminal and the backend no longer lists it.
+	// See TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement for the
+	// retained-lease case that ENG-333 was specifically designed to protect.
 	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
@@ -2788,7 +2822,65 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
-	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after lease close")
+	// ENG-333: placement is NOT eagerly deleted by cleanupTerminalLease anymore.
+	// It survives this sweep because the pre-sweep snapshots (backendLeases from
+	// allProvisions, chainLeases from chain) still contain lease-1. The gated
+	// pruner will remove it on the next sweep once the chain reports it as
+	// terminal and the backend no longer lists it (and no retention exists).
+	assert.Equal(t, "test", ps.Get("lease-1"), "placement survives the close-lease sweep (gated pruner owns deletion, ENG-333)")
+}
+
+// TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement verifies the
+// core ENG-333 invariant: when an orphan provision is deprovisioned and the
+// backend retains its data (RetainOnClose pool), the placement record must
+// survive the reconcile sweep so that a restore request can resolve the
+// correct backend.
+//
+// lease-ret is an orphan (provisioned, absent from chain) that the backend
+// ALSO retains. After the fix, processOrphan no longer eager-deletes its
+// placement, so the gated pruner sees it: it is in backendLeases (here via
+// BOTH allProvisions and allRetentions, since the mock's Deprovision is a
+// no-op that does not remove the entry from m.provisions), so gate (b) keeps
+// it. Pre-fix, processOrphan deleted the placement before the pruner ran and
+// this assertion would FAIL — that is what this test guards against. (The
+// retention-only gate-(b) path — placement kept because the lease is in
+// allRetentions but NOT allProvisions — is isolated separately by
+// TestReconciler_PrunesOrphanedPlacement / the Task 9 prune tests.)
+func TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement(t *testing.T) {
+	// Setup: lease-ret is an orphan (no chain lease) but the backend retains it.
+	mockChain := &chaintest.MockClient{}
+	mb := &mockReconcilerBackend{
+		name: "backend-a",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-ret", Status: backend.ProvisionStatusReady, BackendName: "backend-a"},
+		},
+		// Simulate a RetainOnClose backend: Deprovision soft-deletes the data and
+		// ListRetentions returns the lease UUID to signal "data still here".
+		retentions: []backend.RetainedLease{
+			{LeaseUUID: "lease-ret"},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-ret", "backend-a")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// The placement MUST survive: the backend retained the lease's data, so
+	// restore affinity must remain intact (ENG-333). If this assertion fails,
+	// the eager delete was re-introduced or the gated pruner has a gate gap.
+	assert.Equal(t, "backend-a", ps.Get("lease-ret"),
+		"retained lease must keep its placement after orphan deprovision (ENG-333)")
 }
 
 // --- Gap tests: fetchAllProvisions, payload lifecycle, RefreshState ---

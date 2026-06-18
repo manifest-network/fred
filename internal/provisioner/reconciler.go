@@ -559,6 +559,13 @@ func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) 
 
 	r.cleanupTerminalLease(leaseUUID)
 
+	// Eagerly delete placement for rejected PENDING leases: a PENDING lease was
+	// never active long enough to have retained data on a backend, so there is
+	// no restore-affinity window to protect (ENG-333).
+	if r.placementStore != nil {
+		r.placementStore.Delete(leaseUUID)
+	}
+
 	slog.Info("reconcile: rejected lease",
 		"lease_uuid", leaseUUID,
 		"rejected", rejected,
@@ -588,16 +595,23 @@ func (r *Reconciler) closeLease(ctx context.Context, leaseUUID, reason string) e
 	return nil
 }
 
-// cleanupTerminalLease removes stored payload and placement records for a
-// lease that has reached a terminal state (rejected or closed).
+// cleanupTerminalLease removes the stored payload for a lease that has reached
+// a terminal state (rejected or closed).
+//
+// Placement is intentionally NOT deleted here (ENG-333): if the backend
+// retained the volumes on close, the placement record must survive so that a
+// subsequent restore request can resolve the correct backend. The gated pruner
+// (cleanupOrphanedPlacements) is the sole owner of placement deletion for
+// closed leases — it keeps a still-retained lease and prunes a
+// genuinely-gone one once every gate is satisfied.
+//
+// Exception: rejectLease — which handles PENDING leases that never had retained
+// data — deletes the placement eagerly after calling cleanupTerminalLease.
 func (r *Reconciler) cleanupTerminalLease(leaseUUID string) {
 	if r.tracker != nil {
 		if ps := r.tracker.PayloadStore(); ps != nil {
 			ps.Delete(leaseUUID)
 		}
-	}
-	if r.placementStore != nil {
-		r.placementStore.Delete(leaseUUID)
 	}
 }
 
@@ -1076,10 +1090,12 @@ func (r *Reconciler) processOrphan(
 		return
 	}
 
-	// Clean up placement record
-	if r.placementStore != nil {
-		r.placementStore.Delete(leaseUUID)
-	}
+	// Placement is NOT deleted here (ENG-333): if the backend retained the
+	// volumes (RetainOnClose pool), placement must survive so that a restore
+	// request can resolve the correct backend. The gated reconciler pruner
+	// (cleanupOrphanedPlacements) is the sole owner of placement deletion —
+	// it keeps a still-retained lease and prunes a genuinely-gone one once
+	// every gate is satisfied.
 }
 
 // cleanupOrphanedPayloads removes stored payloads for leases that are no longer pending.
