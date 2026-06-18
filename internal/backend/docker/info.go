@@ -156,7 +156,12 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 	if b.retentionStore != nil {
 		rec, retErr := b.retentionStore.Get(leaseUUID)
 		if retErr != nil {
+			// Fail CLOSED: a transient retention-store error must not fall through
+			// to the diagnostics fallback (which could return Status=failed),
+			// misreporting a RETAINED lease as failed and violating the
+			// "never regresses to failed" invariant. Surface the error instead.
 			b.logger.Warn("retention store lookup failed", "lease_uuid", leaseUUID, "error", retErr)
+			return nil, fmt.Errorf("retention lookup for %s: %w", leaseUUID, retErr)
 		}
 		if rec != nil && (rec.Status == shared.RetentionStatusActive || rec.Status == shared.RetentionStatusRestoring) {
 			return &backend.ProvisionInfo{

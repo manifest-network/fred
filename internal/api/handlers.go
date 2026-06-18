@@ -297,6 +297,7 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 // Deliberately does NOT use resolveBackend: its Route(sku) fallback would query
 // a single, likely-wrong backend rather than fanning out across all candidates.
 func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
+	var fastErr error
 	if h.placementLookup != nil && h.backendRouter != nil {
 		if name := h.placementLookup.Get(leaseUUID); name != "" {
 			if b := h.backendRouter.GetBackendByName(name); b != nil {
@@ -304,13 +305,30 @@ func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*b
 				if err == nil && info != nil {
 					return info, nil
 				}
-				// Miss on the placed backend (stale placement or ErrNotProvisioned,
-				// e.g. a closed/retained lease whose placement was deleted) — fall
-				// through to the bounded fan-out below.
+				// Miss on the placed backend. ErrNotProvisioned (stale placement,
+				// e.g. a closed/retained lease whose placement was deleted) is
+				// benign — fall through to the fan-out. A GENUINE error must not be
+				// swallowed: retain it so it can be surfaced if the fan-out finds
+				// nothing and has no error of its own (preserves the 500-not-404
+				// error-surfacing contract).
+				if err != nil && !errors.Is(err, backend.ErrNotProvisioned) {
+					fastErr = err
+				}
 			}
 		}
 	}
-	return h.findProvisionAcrossBackends(ctx, leaseUUID, sku)
+
+	info, fanErr := h.findProvisionAcrossBackends(ctx, leaseUUID, sku)
+	if info != nil {
+		// A fan-out hit (e.g. stale placement but found elsewhere) wins even over a
+		// genuine placed-backend error.
+		return info, nil
+	}
+	if fanErr != nil {
+		// A fan-out error takes precedence over the placed-backend's error.
+		return nil, fanErr
+	}
+	return nil, fastErr
 }
 
 // ConnectionResponse represents the response for connection details.

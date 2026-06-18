@@ -150,3 +150,41 @@ func TestGetProvision_NilRetentionStore_FallsBackToDiagnostics(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.Contains(t, info.LastError, "image pull failed")
 }
+
+// TestGetProvision_RetentionStoreError_FailsClosed verifies (FIX 2) the
+// fail-closed invariant: a transient retention-store error must NOT fall through
+// to the diagnostics fallback (which could return Status=failed) and misreport a
+// RETAINED lease as failed. GetProvision must surface the error.
+//
+// The error is forced WITHOUT any prod-only seam: retentionStore is a concrete
+// *shared.RetentionStore, so we Close() its bbolt db — a closed db returns an
+// error on Get/View. A stale Failed diagnostics entry is also seeded to prove
+// the function does NOT silently degrade to it.
+func TestGetProvision_RetentionStoreError_FailsClosed(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+
+	// Seed a stale Failed diagnostics entry for the same lease — if the
+	// retention error were swallowed, GetProvision would return this.
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "diag.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = diagStore.Close() })
+	b.diagnosticsStore = diagStore
+	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
+		LeaseUUID:    "lease-x",
+		ProviderUUID: "prov-1",
+		Error:        "old failure",
+		FailCount:    2,
+		CreatedAt:    time.Now(),
+	}))
+
+	// Close the retention store so its bbolt Get returns a real error. (Close is
+	// idempotent via closeOnce, so the t.Cleanup double-close is harmless.)
+	require.NoError(t, rs.Close())
+
+	info, err := b.GetProvision(context.Background(), "lease-x")
+	require.Error(t, err, "a retention-store error must be surfaced, not swallowed")
+	assert.NotErrorIs(t, err, backend.ErrNotProvisioned, "must not collapse a store error into ErrNotProvisioned")
+	assert.Nil(t, info, "no ProvisionInfo (especially not a Failed diagnostics entry) on a retention-store error")
+}

@@ -631,3 +631,61 @@ func TestGetLeaseStatus_StalePlacement_FallsBackToFanOut(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	assert.Equal(t, "retained", resp.ProvisionStatus, "stale placement must fall back to the fan-out and find the holder")
 }
+
+// TestGetLeaseProvision_PlacedBackendError_NotInFanOut_Returns500 verifies FIX 1:
+// findProvision must NOT swallow a genuine placed-backend error. The placed
+// backend (resolved via GetBackendByName) returns a real 500, and it is NOT in
+// the lease SKU's RouteAll set — so the fan-out queries a different backend that
+// only 404s and finds nothing. The placed-backend error must be surfaced
+// (handler → 500), not masked as (nil,nil) → 404.
+func TestGetLeaseProvision_PlacedBackendError_NotInFanOut_Returns500(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	// Chain lease carries an item whose SKU routes ONLY to "fanout" — so the
+	// erroring "placed" backend (a different SKU) is excluded from RouteAll(sku)
+	// and is never re-queried by the fan-out.
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+					Items:        []billingtypes.LeaseItem{{SkuUuid: "sku-fanout"}},
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	placed := erroringBackendServer(t) // genuine 500 on GetProvision
+	var fanoutHits atomic.Int64
+	fanout := countingNotProvisionedServer(t, &fanoutHits) // 404s; finds nothing
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			// "placed" matches a DIFFERENT sku → excluded from RouteAll("sku-fanout").
+			{Backend: httpBackend(t, "placed", placed.URL), Match: backend.MatchCriteria{SKUs: []string{"sku-placed"}}},
+			// "fanout" is the only RouteAll("sku-fanout") candidate.
+			{Backend: httpBackend(t, "fanout", fanout.URL), Match: backend.MatchCriteria{SKUs: []string{"sku-fanout"}}, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{getFunc: func(_ string) string { return "placed" }}
+	h := &Handlers{client: chainClient, backendRouter: router, placementLookup: placement, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/provision", nil)
+	req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+	req.SetPathValue("lease_uuid", leaseUUID)
+	rec := httptest.NewRecorder()
+	h.GetLeaseProvision(rec, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code,
+		"a genuine placed-backend error must surface as 500 when the fan-out finds nothing, not be masked as 404")
+	// Sanity: the fan-out ran (and only 404'd) — the placed backend was not in it.
+	assert.Equal(t, int64(1), fanoutHits.Load(), "the fan-out candidate must have been queried exactly once")
+}
