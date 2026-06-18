@@ -291,7 +291,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write failing tests**
 
-Add to `internal/provisioner/placement/store_test.go` (add `"encoding/json"`, `"time"`, and `bolt "go.etcd.io/bbolt"` to the imports):
+Add to `internal/provisioner/placement/store_test.go` (add `"time"` and `bolt "go.etcd.io/bbolt"` to the imports — the test bodies below do not reference `encoding/json`, so do NOT add it or the build fails on an unused import; `encoding/json` belongs in `store.go`):
 
 ```go
 func TestStore_SetAt_RoundTrip(t *testing.T) {
