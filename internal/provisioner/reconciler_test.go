@@ -3711,3 +3711,43 @@ func TestReconciler_SyncsPlacementFromRetentions(t *testing.T) {
 	assert.Equal(t, "backend-a", ps.Get("retained-1"),
 		"reconciler must derive placement for a retained lease")
 }
+
+// TestRestoreAffinity_EndToEnd_MultiBackend proves that, on a multi-backend
+// pool, the reconciler derives the source lease's placement from the backend
+// that RETAINS it — regardless of load-based routing. b1 is the least-loaded
+// (naive routing would pick it), but the source lease is retained only on b2,
+// so placement[source] must resolve to b2 (ENG-333).
+func TestRestoreAffinity_EndToEnd_MultiBackend(t *testing.T) {
+	b1 := backend.NewMockBackend(backend.MockBackendConfig{Name: "b1"})
+	b2 := backend.NewMockBackend(backend.MockBackendConfig{Name: "b2"})
+
+	// b2 retains the source lease; b1 retains nothing.
+	b2.SetRetentions([]backend.RetainedLease{{LeaseUUID: "source"}})
+
+	// b1 is the least-loaded backend — naive routing would pick the wrong one.
+	b1.SetLoadStats(&backend.LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 0})
+	b2.SetLoadStats(&backend.LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 90})
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: b1, IsDefault: true},
+			{Backend: b2, Match: backend.MatchCriteria{SKUs: []string{"b2-only-sku"}}},
+		},
+	})
+	require.NoError(t, err)
+
+	ps := &mockPlacementStore{}
+
+	// Chain returns no leases — the reconciler must derive placement[source]
+	// purely from b2's /retentions response, not from active-provision syncing.
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+
+	assert.Equal(t, "b2", ps.Get("source"),
+		"restore affinity: source placement must resolve to the retaining backend, not the least-loaded one")
+}

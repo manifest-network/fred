@@ -79,3 +79,14 @@ func (m *Manager) TimeoutChecker() *TimeoutChecker {
 func (m *Manager) checkCallbackTimeouts(ctx context.Context) {
 	m.timeoutChecker.CheckOnce(ctx)
 }
+
+// RecordRestorePlacement delegates to the orchestrator (ENG-333).
+func (m *Manager) RecordRestorePlacement(newLeaseUUID, backendName string) {
+	m.orchestrator.RecordRestorePlacement(newLeaseUUID, backendName)
+}
+
+// Compile-time check that *Manager can serve as the API's restore placement
+// recorder (ENG-333). Structural to avoid importing the api package.
+var _ interface {
+	RecordRestorePlacement(newLeaseUUID, backendName string)
+} = (*Manager)(nil)
