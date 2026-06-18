@@ -197,10 +197,17 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 	slog.Info("fetched backend provisions", "total", len(allProvisions))
 
-	// Retained leases also pin a backend (restore affinity, ENG-333). Derive
-	// their placement from ground truth alongside active provisions.
-	allRetentions, retentionsComplete := r.fetchAllRetentions(ctx)
-	slog.Info("fetched backend retentions", "total", len(allRetentions), "complete", retentionsComplete)
+	// Retained leases also pin a backend (restore affinity, ENG-333). Fetch them
+	// only when placement tracking is enabled: the results feed solely the
+	// placement sync and the gated pruner below, both of which no-op without a
+	// placement store. Skipping avoids pointless per-backend /retentions calls and
+	// log noise on placement-disabled deployments.
+	var allRetentions map[string]string
+	var retentionsComplete bool
+	if r.placementStore != nil {
+		allRetentions, retentionsComplete = r.fetchAllRetentions(ctx)
+		slog.Info("fetched backend retentions", "total", len(allRetentions), "complete", retentionsComplete)
+	}
 
 	// Sync placements from actual backend state (handles cold start and drift).
 	// NOTE: This only adds/updates — it never prunes stale records for leases

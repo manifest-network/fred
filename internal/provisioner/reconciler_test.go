@@ -3804,6 +3804,44 @@ func TestReconciler_SyncsPlacementFromRetentions(t *testing.T) {
 		"reconciler must derive placement for a retained lease")
 }
 
+// listRetentionsFailBackend fails the test if ListRetentions is ever called.
+// Used to prove the reconciler skips the retentions fetch when placement
+// tracking is disabled (nil placementStore), where the result would be unused.
+type listRetentionsFailBackend struct {
+	*backend.MockBackend
+	t *testing.T
+}
+
+func (b *listRetentionsFailBackend) ListRetentions(context.Context) ([]backend.RetainedLease, error) {
+	b.t.Errorf("ListRetentions must not be called when placementStore is nil (ENG-333)")
+	return nil, nil
+}
+
+func TestReconciler_SkipsRetentionFetch_WhenPlacementDisabled(t *testing.T) {
+	// With placement tracking disabled (nil placementStore), retained-lease
+	// placement is never derived/pruned, so the reconciler must not query
+	// /retentions at all — avoiding pointless per-backend calls every sweep.
+	mb := &listRetentionsFailBackend{
+		MockBackend: backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"}),
+		t:           t,
+	}
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// nil tracker AND nil placementStore => placement subsystem disabled.
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, nil)
+	require.NoError(t, err)
+
+	// If fetchAllRetentions runs, the backend's ListRetentions t.Errorf's.
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+}
+
 // TestRestoreAffinity_EndToEnd_MultiBackend proves that, on a multi-backend
 // pool, the reconciler derives the source lease's placement from the backend
 // that RETAINS it — regardless of load-based routing. b1 is the least-loaded
