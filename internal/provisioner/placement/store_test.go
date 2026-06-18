@@ -6,9 +6,11 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -256,6 +258,96 @@ func TestStore_DeletePersistence(t *testing.T) {
 	assert.Equal(t, "backend-b", s2.Get("lease-2"))
 	assert.Equal(t, 1, s2.Count())
 }
+
+func TestStore_SetAt_RoundTrip(t *testing.T) {
+	fixed := time.Date(2026, 6, 18, 17, 11, 15, 0, time.UTC)
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath, WithClock(func() time.Time { return fixed }))
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, s.Set("lease-1", "backend-a"))
+
+	got, ok := s.SetAt("lease-1")
+	require.True(t, ok)
+	assert.True(t, got.Equal(fixed), "SetAt should equal the injected clock time")
+
+	_, ok = s.SetAt("missing")
+	assert.False(t, ok)
+}
+
+func TestStore_SetAt_PersistsAcrossReopen(t *testing.T) {
+	fixed := time.Date(2026, 6, 18, 17, 11, 15, 0, time.UTC)
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+
+	s1, err := NewStore(dbPath, WithClock(func() time.Time { return fixed }))
+	require.NoError(t, err)
+	require.NoError(t, s1.Set("lease-1", "backend-a"))
+	require.NoError(t, s1.Close())
+
+	s2, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer s2.Close()
+
+	assert.Equal(t, "backend-a", s2.Get("lease-1"))
+	got, ok := s2.SetAt("lease-1")
+	require.True(t, ok)
+	assert.True(t, got.Equal(fixed))
+}
+
+func TestStore_LegacyRawValue_LoadsWithZeroSetAt(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+
+	// Write a legacy raw backend-name value (pre-ENG-335 format) directly.
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("placements"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("legacy-lease"), []byte("backend-legacy"))
+	}))
+	require.NoError(t, db.Close())
+
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer s.Close()
+
+	assert.Equal(t, "backend-legacy", s.Get("legacy-lease"), "legacy backend name must load")
+	got, ok := s.SetAt("legacy-lease")
+	require.True(t, ok)
+	assert.True(t, got.IsZero(), "legacy record must have zero SetAt (immediately prunable)")
+}
+
+func TestStore_SetBatch_PreservesExistingSetAt(t *testing.T) {
+	t0 := time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC)
+	t1 := time.Date(2026, 6, 18, 11, 0, 0, 0, time.UTC)
+	clk := &fakeClock{now: t0}
+
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath, WithClock(clk.Now))
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, s.Set("lease-1", "backend-a")) // SetAt = t0
+
+	clk.now = t1
+	require.NoError(t, s.SetBatch(map[string]string{
+		"lease-1": "backend-a", // existing → SetAt preserved at t0
+		"lease-2": "backend-b", // new → SetAt = t1
+	}))
+
+	at1, _ := s.SetAt("lease-1")
+	at2, _ := s.SetAt("lease-2")
+	assert.True(t, at1.Equal(t0), "existing placement SetAt must be preserved (not reset by sync)")
+	assert.True(t, at2.Equal(t1), "new placement SetAt must be the sync time")
+}
+
+// fakeClock is a trivial settable clock for deterministic time in tests.
+type fakeClock struct{ now time.Time }
+
+func (c *fakeClock) Now() time.Time { return c.now }
 
 func TestStore_ConcurrentMixedOps(t *testing.T) {
 	s := newTestStore(t)
