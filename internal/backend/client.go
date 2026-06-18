@@ -271,6 +271,19 @@ type ListProvisionsResponse struct {
 	Provisions []ProvisionInfo `json:"provisions"`
 }
 
+// RetainedLease identifies a lease whose data this backend currently retains
+// (soft-deleted, awaiting restore or grace-reap). The reconciler consumes this
+// to keep placement affinity for retained leases so a restore routes to the
+// backend holding the source data (ENG-333).
+type RetainedLease struct {
+	LeaseUUID string `json:"lease_uuid"`
+}
+
+// ListRetentionsResponse is the response from the GET /retentions endpoint.
+type ListRetentionsResponse struct {
+	Retentions []RetainedLease `json:"retentions"`
+}
+
 // CallbackPayload is sent by backends to fred's callback endpoint.
 type CallbackPayload struct {
 	LeaseUUID string         `json:"lease_uuid"`
@@ -466,6 +479,7 @@ type HTTPClient struct {
 	maxLogsBytes             int64
 	maxReleasesBytes         int64
 	maxStatsBytes            int64
+	maxRetentionsBytes       int64
 
 	// Optional Prometheus metrics (nil = skip recording)
 	requestDuration *prometheus.HistogramVec
@@ -488,6 +502,7 @@ const (
 	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
 	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
 	DefaultMaxStatsBytes            int64 = 1 << 20  // 1 MiB — load stats snapshot (small JSON)
+	DefaultMaxRetentionsBytes       int64 = 1 << 20  // 1 MiB — retained-lease list (small, UUID-only JSON)
 )
 
 // HTTPClientConfig configures an HTTP backend client.
@@ -519,6 +534,7 @@ type HTTPClientConfig struct {
 	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
 	MaxReleasesBytes         int64 // GetReleases response limit (default: 8 MiB)
 	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
+	MaxRetentionsBytes       int64 // ListRetentions response limit (default: 1 MiB)
 
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
@@ -619,6 +635,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		maxLogsBytes:             positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
 		maxReleasesBytes:         positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
 		maxStatsBytes:            positiveOr(cfg.MaxStatsBytes, DefaultMaxStatsBytes),
+		maxRetentionsBytes:       positiveOr(cfg.MaxRetentionsBytes, DefaultMaxRetentionsBytes),
 		requestDuration:          cfg.RequestDuration,
 		requestsTotal:            cfg.RequestsTotal,
 	}
@@ -1186,6 +1203,16 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 // GET /stats. Used by the router for least-loaded provision placement.
 func (c *HTTPClient) GetLoadStats(ctx context.Context) (*LoadStats, error) {
 	return doGet[LoadStats](c, ctx, "get_load_stats", c.baseURL+"/stats", c.maxStatsBytes)
+}
+
+// ListRetentions retrieves the leases whose data this backend currently retains
+// (GET /retentions). Used by the reconciler for restore backend affinity.
+func (c *HTTPClient) ListRetentions(ctx context.Context) ([]RetainedLease, error) {
+	result, err := doGet[ListRetentionsResponse](c, ctx, "list_retentions", c.baseURL+"/retentions", c.maxRetentionsBytes)
+	if err != nil {
+		return nil, err
+	}
+	return result.Retentions, nil
 }
 
 // Health checks if the backend is reachable and healthy.

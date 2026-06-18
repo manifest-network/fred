@@ -2064,3 +2064,32 @@ func TestHTTPClientRestore_WithHMAC(t *testing.T) {
 	err = hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature should verify successfully")
 }
+
+func TestHTTPClient_ListRetentions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/retentions", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"retentions":[{"lease_uuid":"lease-a"},{"lease_uuid":"lease-b"}]}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+
+	got, err := client.ListRetentions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "lease-a", got[0].LeaseUUID)
+	assert.Equal(t, "lease-b", got[1].LeaseUUID)
+}
+
+func TestHTTPClient_ListRetentions_Empty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"retentions":[]}`))
+	}))
+	defer server.Close()
+	client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+	got, err := client.ListRetentions(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
