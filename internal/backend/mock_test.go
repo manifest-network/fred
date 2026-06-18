@@ -216,6 +216,22 @@ func TestMockBackend_Name(t *testing.T) {
 	assert.Equal(t, "mock", mock2.Name())
 }
 
+func TestMockBackend_ListRetentions(t *testing.T) {
+	m := NewMockBackend(MockBackendConfig{Name: "m"})
+
+	// Unset → empty, non-nil (a backend with no retentions).
+	got, err := m.ListRetentions(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	assert.NotNil(t, got)
+
+	m.SetRetentions([]RetainedLease{{LeaseUUID: "x"}, {LeaseUUID: "y"}})
+	got, err = m.ListRetentions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "x", got[0].LeaseUUID)
+}
+
 func TestMockBackend_GetLoadStats(t *testing.T) {
 	m := NewMockBackend(MockBackendConfig{Name: "m"})
 

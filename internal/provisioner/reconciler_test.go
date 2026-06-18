@@ -145,6 +145,10 @@ func (m *mockReconcilerBackend) GetLoadStats(_ context.Context) (*backend.LoadSt
 	return nil, nil
 }
 
+func (m *mockReconcilerBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	return nil, nil
+}
+
 func TestNewReconciler_Validation(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
@@ -1519,6 +1523,10 @@ func (m *mockCancellingBackend) GetLoadStats(_ context.Context) (*backend.LoadSt
 	return nil, nil
 }
 
+func (m *mockCancellingBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	return nil, nil
+}
+
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
 	mockChain := &chaintest.MockClient{
@@ -1946,6 +1954,10 @@ func (m *mockConcurrencyBackend) GetReleases(ctx context.Context, leaseUUID stri
 }
 
 func (m *mockConcurrencyBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
+func (m *mockConcurrencyBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
 	return nil, nil
 }
 

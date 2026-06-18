@@ -107,6 +107,12 @@ type Backend interface {
 	// track load may return a snapshot whose CPUAllocatedRatio is not ok.
 	GetLoadStats(ctx context.Context) (*LoadStats, error)
 
+	// ListRetentions returns the leases whose data this backend currently
+	// retains (soft-deleted, awaiting restore or grace-reap). Used by the
+	// reconciler to keep placement affinity for retained leases (ENG-333).
+	// Backends without retention (e.g. k3s) return an empty slice.
+	ListRetentions(ctx context.Context) ([]RetainedLease, error)
+
 	// Name returns the backend's configured name.
 	Name() string
 }
