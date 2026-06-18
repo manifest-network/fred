@@ -570,8 +570,8 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	// Include provision status from the backend for ANY lease state (ENG-329
 	// lifts the former ACTIVE-only gate so a non-ACTIVE lease whose data was
 	// retained surfaces provision_status=retained). findProvision takes the O(1)
-	// placement fast-path for the ACTIVE common case and falls back to the
-	// bounded fan-out for closed/retained leases (placement is deleted on close).
+	// placement fast-path (ACTIVE leases, and retained leases once ENG-333 re-pins
+	// their placement) and falls back to the bounded fan-out otherwise.
 	// Errors are intentionally ignored — provision status on /status is
 	// best-effort and ErrNotProvisioned during initial setup is expected.
 	if h.backendRouter != nil {
@@ -687,8 +687,8 @@ type LeaseLogsResponse struct {
 // GetLeaseProvision handles GET /v1/leases/{lease_uuid}/provision
 //
 // Like GetLeaseStatus, authz is chain-primary with a retained-record fallback
-// (ENG-329 #5), and provision discovery uses the bounded fan-out (placement is
-// deleted on close). Within the grace window a retained lease returns
+// (ENG-329 #5), and provision discovery uses findProvision (placement fast-path,
+// bounded fan-out fallback). Within the grace window a retained lease returns
 // status=retained (with retained_until + items), not 404.
 func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 	leaseUUID := r.PathValue("lease_uuid")
