@@ -154,7 +154,13 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 	assert.Error(t, err, "handleLeaseCreated() should return error for chain error")
 }
 
-func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
+// TestHandleLeaseClosed_NoPlacement_SweepsAllBackends verifies the ENG-335
+// behavior at the close-handler level: a not-in-flight lease with no placement
+// record is no longer SKU-routed to a single (default) backend — close now
+// sweeps ALL backends idempotently so the real holder is torn down even when the
+// lease's SKU does not pin it to one backend. This replaces the former
+// RouteBySKU test, which asserted the removed SKU→backend deprovision guess.
+func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 	gpuBackend := &mockManagerBackend{name: "gpu-backend"}
 	k8sBackend := &mockManagerBackend{name: "k8s-backend"}
 
@@ -165,16 +171,7 @@ func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
 		},
 	})
 
-	mockChain := &chaintest.MockClient{
-		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-			return &billingtypes.Lease{
-				Uuid:   leaseUUID,
-				Tenant: "tenant-1",
-				State:  billingtypes.LEASE_STATE_ACTIVE,
-				Items:  []billingtypes.LeaseItem{{SkuUuid: "gpu-a100"}},
-			}, nil
-		},
-	}
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -182,7 +179,7 @@ func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
-	// NOT in-flight, lease found on chain -> deprovision via SKU routing
+	// NOT in-flight, no placement -> deprovision sweeps ALL backends (ENG-335).
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
 		LeaseUUID: "lease-1",
@@ -191,19 +188,16 @@ func TestHandleLeaseClosed_RouteBySKU(t *testing.T) {
 	err = manager.handleLeaseClosed(msg)
 	assert.NoError(t, err, "handleLeaseClosed()")
 
-	// GPU backend should have received the deprovision call
+	// Both backends must be swept (idempotent); the SKU no longer narrows it.
 	gpuBackend.mu.Lock()
 	gpuCalls := len(gpuBackend.deprovisionCalls)
 	gpuBackend.mu.Unlock()
-
 	assert.Equal(t, 1, gpuCalls, "deprovision calls to GPU backend")
 
-	// K8s backend should NOT have received any calls
 	k8sBackend.mu.Lock()
 	k8sCalls := len(k8sBackend.deprovisionCalls)
 	k8sBackend.mu.Unlock()
-
-	assert.Equal(t, 0, k8sCalls, "deprovision calls to K8s backend")
+	assert.Equal(t, 1, k8sCalls, "deprovision calls to K8s backend")
 }
 
 func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {

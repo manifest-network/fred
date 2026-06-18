@@ -169,20 +169,6 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 		}
 	}
 
-	// Get SKU hint from chain for routing if lease is not in-flight.
-	// The orchestrator will try in-flight tracking first, then fall back to SKU hint.
-	var skuHint string
-	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)
-	if err != nil {
-		slog.Warn("failed to fetch lease details for deprovision routing",
-			"lease_uuid", event.LeaseUUID,
-			"error", err,
-		)
-		// Continue without SKU hint - orchestrator will try all backends
-	} else if lease != nil {
-		skuHint = ExtractRoutingSKU(lease)
-	}
-
 	// ENG-329: the retained notice is NOT emitted here (on close intent). At
 	// close time providerd cannot know whether the backend actually retained,
 	// so the former optimistic emit fired regardless of outcome. The notice now
@@ -191,7 +177,7 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 	// retention status (GET /status, GET /provision).
 
 	// Delegate to orchestrator for deprovisioning
-	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID, skuHint)
+	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID)
 }
 
 // HandleBackendCallback processes callbacks from backends.

@@ -192,116 +192,85 @@ func (o *ProvisionOrchestrator) RecordRestorePlacement(newLeaseUUID, backendName
 	}
 }
 
-// Deprovision handles deprovisioning a lease from the appropriate backend.
-// It tries to determine the backend in this order:
-//  0. From the placement store (most reliable for completed provisions)
-//  1. From in-flight tracking (reliable for provisions still awaiting callback)
-//  2. Route by SKU using the provided skuHint (consistent with provisioning path)
-//  3. Fallback: deprovision from all backends (ensures cleanup even if routing differs)
+// Deprovision tears down a lease's backend resources. The backend is resolved
+// POSITIVELY — from the placement record, then the in-flight tracker. It never
+// guesses a default backend from the SKU: in a multi-backend pool a SKU is not
+// pinned to one backend, so a guessed deprovision is a phantom no-op that
+// reports success while stranding the real volume on another backend (ENG-335).
+// When the backend cannot be positively resolved, all backends are swept;
+// deprovision is idempotent, so the real holder is torn down and the rest are
+// harmless no-ops.
 //
 // Returns nil on success or if the lease was not provisioned anywhere.
-// Returns an error only if all deprovision attempts fail.
-func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID string, skuHint string) error {
-	// Try to determine backend from in-flight tracking first
+// Returns an error only if every attempted deprovision failed.
+func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID string) error {
 	provision, wasInFlight := o.tracker.PopInFlight(leaseUUID)
 
 	var backendClient backend.Backend
 
-	// Case 0: Check placement store (most reliable for completed provisions)
+	// Case 0: placement store (most reliable for completed provisions).
 	if o.placementStore != nil {
 		if placedBackend := o.placementStore.Get(leaseUUID); placedBackend != "" {
 			backendClient = o.router.GetBackendByName(placedBackend)
 			if backendClient != nil {
 				slog.Debug("routing deprovision by placement",
-					"lease_uuid", leaseUUID,
-					"backend", placedBackend,
-				)
+					"lease_uuid", leaseUUID, "backend", placedBackend)
 			} else {
-				slog.Warn("placement backend not found, will try other methods",
-					"lease_uuid", leaseUUID,
-					"backend_name", placedBackend,
-				)
+				slog.Warn("placement backend not found, will sweep all backends",
+					"lease_uuid", leaseUUID, "backend_name", placedBackend)
 			}
 		}
 	}
 
+	// Case 1: in-flight tracked backend.
 	if backendClient == nil && wasInFlight && provision.Backend != "" {
-		// Case 1: Was in-flight - use the tracked backend
 		backendClient = o.router.GetBackendByName(provision.Backend)
 		if backendClient == nil {
-			slog.Warn("backend not found by name, will route by SKU",
-				"lease_uuid", leaseUUID,
-				"backend_name", provision.Backend,
-			)
-		}
-	}
-
-	if backendClient == nil && skuHint != "" {
-		// Case 2: Try to route by SKU
-		backendClient = o.router.Route(skuHint)
-		if backendClient != nil {
-			slog.Debug("routing deprovision by SKU",
-				"lease_uuid", leaseUUID,
-				"sku", skuHint,
-				"backend", backendClient.Name(),
-			)
+			slog.Warn("in-flight backend not found, will sweep all backends",
+				"lease_uuid", leaseUUID, "backend_name", provision.Backend)
 		}
 	}
 
 	if backendClient != nil {
-		// Deprovision from the determined backend
 		if err := backendClient.Deprovision(ctx, leaseUUID); err != nil {
 			slog.Error("failed to deprovision",
-				"lease_uuid", leaseUUID,
-				"backend", backendClient.Name(),
-				"error", err,
-			)
+				"lease_uuid", leaseUUID, "backend", backendClient.Name(), "error", err)
 			return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, err)
 		}
-
 		// Placement is intentionally NOT deleted here (ENG-333). It is a derived
 		// index of where the lease's data lives; if the backend retained the
 		// volumes, the placement must survive close so a restore can route to it.
-		// The reconciler is the sole pruner (cleanupOrphanedPlacements), gated on
-		// the lease being terminal on chain AND absent from all backends.
-
+		// The reconciler is the sole pruner (cleanupOrphanedPlacements).
 		slog.Info("deprovisioned successfully",
-			"lease_uuid", leaseUUID,
-			"backend", backendClient.Name(),
-		)
+			"lease_uuid", leaseUUID, "backend", backendClient.Name())
 		return nil
 	}
 
-	// Case 3: Fallback - deprovision from all backends
-	// This ensures cleanup even if we can't determine the correct backend
-	slog.Warn("could not determine backend for deprovision, trying all backends",
-		"lease_uuid", leaseUUID,
-	)
-
+	// Fallback: backend could not be positively resolved → sweep all backends.
+	// Idempotent, so the holder is torn down and the rest no-op. We deliberately
+	// do NOT emit a per-backend "deprovisioned successfully" here — that
+	// phantom-success line (against a backend that never held the lease) is what
+	// made ENG-335 hard to diagnose. One summary line names the outcome instead.
+	backends := o.router.Backends()
 	var lastErr error
-	deprovisioned := false
-	for _, b := range o.router.Backends() {
+	swept := make([]string, 0, len(backends))
+	failed := make([]string, 0)
+	for _, b := range backends {
 		if err := b.Deprovision(ctx, leaseUUID); err != nil {
-			slog.Debug("deprovision from backend returned error",
-				"lease_uuid", leaseUUID,
-				"backend", b.Name(),
-				"error", err,
-			)
 			lastErr = err
+			failed = append(failed, b.Name())
 		} else {
-			slog.Info("deprovisioned successfully",
-				"lease_uuid", leaseUUID,
-				"backend", b.Name(),
-			)
-			deprovisioned = true
+			swept = append(swept, b.Name())
 		}
 	}
-
-	// Placement is intentionally NOT deleted here (ENG-333); see resolved-backend path comment.
-
-	if !deprovisioned && lastErr != nil {
+	slog.Warn("deprovision swept all backends (placement unresolved, ENG-335)",
+		"lease_uuid", leaseUUID,
+		"swept_ok_or_noop", swept,
+		"failed", failed,
+	)
+	// Placement is intentionally NOT deleted here (ENG-333); see resolved path.
+	if len(swept) == 0 && lastErr != nil {
 		return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, lastErr)
 	}
-
 	return nil
 }
