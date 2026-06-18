@@ -342,9 +342,9 @@ func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*b
 			info.BackendName = b.Name()
 			return info, nil
 		}
-		// Miss on the placed backend. ErrNotProvisioned (stale placement, or the
-		// post-close window before the retention→placement sync) is benign — fall
-		// through to the fan-out. A GENUINE error must NOT be swallowed: retain it
+		// Miss on the placed backend. ErrNotProvisioned (a stale placement pointing
+		// at a backend that no longer holds the lease) is benign — fall through to
+		// the fan-out. A GENUINE error must NOT be swallowed: retain it
 		// so it can be surfaced if the fan-out finds nothing and has no error of
 		// its own (preserves the 500-not-404 error-surfacing contract).
 		if err != nil && !errors.Is(err, backend.ErrNotProvisioned) {
