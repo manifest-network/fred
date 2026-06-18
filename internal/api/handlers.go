@@ -271,13 +271,12 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 const restoreHint = "to restore before retained_until: create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
 
 // findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4): the
-// fallback used when placement can't resolve the holder. Placement is deleted on
-// close and only re-pinned for retained leases on the next reconcile tick (ENG-333
-// restore-affinity sync), so in the post-close window — and on placement-disabled
-// deployments — the holder is found by querying GetProvision across every backend
-// that could hold the lease: RouteAll(sku) when the SKU is known, else Backends().
-// Returns the first found provision (live or retained); non-holders return
-// ErrNotProvisioned and are skipped; a single backend is one call.
+// fallback used when placement can't resolve the holder — placement-disabled
+// deployments, or a lease with no surviving placement record. It queries
+// GetProvision across every backend that could hold the lease: RouteAll(sku) when
+// the SKU is known, else Backends(). Returns the first found provision (live or
+// retained); non-holders return ErrNotProvisioned and are skipped; a single
+// backend is one call.
 //
 // Returns:
 //   - (info, nil)  when some backend holds the lease;
@@ -323,12 +322,12 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 
 // findProvision locates a lease's provision, preferring an O(1) placement hit
 // (via resolveBackendByPlacement) before the bounded fan-out. Placement resolves
-// the holder directly — a single GetProvision call — for ACTIVE leases and, since
-// ENG-333 re-pins retained leases for restore affinity, for retained leases too
-// once the reconciler has synced them. Only an actual placement hit that yields a
-// provision takes the fast path; a missing/stale placement, or ErrNotProvisioned
-// on the placed backend (e.g. just after close, before the retention→placement
-// sync), falls through to findProvisionAcrossBackends.
+// the holder directly — a single GetProvision call — for ACTIVE leases and for
+// retained leases too: ENG-333 keeps a retained lease's placement alive on close
+// (restore affinity), so it stays resolvable through the grace window. Only an
+// actual placement hit that yields a provision takes the fast path; a missing
+// placement, or ErrNotProvisioned on the placed backend, falls through to
+// findProvisionAcrossBackends.
 //
 // Uses resolveBackendByPlacement (not resolveBackend) so a placement miss goes
 // straight to the fan-out rather than guessing a single SKU-routed backend.
@@ -570,8 +569,8 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	// Include provision status from the backend for ANY lease state (ENG-329
 	// lifts the former ACTIVE-only gate so a non-ACTIVE lease whose data was
 	// retained surfaces provision_status=retained). findProvision takes the O(1)
-	// placement fast-path (ACTIVE leases, and retained leases once ENG-333 re-pins
-	// their placement) and falls back to the bounded fan-out otherwise.
+	// placement fast-path (ACTIVE leases, and retained leases whose placement
+	// ENG-333 keeps alive on close) and falls back to the bounded fan-out otherwise.
 	// Errors are intentionally ignored — provision status on /status is
 	// best-effort and ErrNotProvisioned during initial setup is expected.
 	if h.backendRouter != nil {
