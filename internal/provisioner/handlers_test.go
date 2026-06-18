@@ -211,12 +211,9 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 		},
 	})
 
-	// Not in-flight, lease NOT on chain -> deprovision on all backends
-	mockChain := &chaintest.MockClient{
-		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-			return nil, nil // Lease not found
-		},
-	}
+	// Not in-flight, no placement -> deprovision sweeps all backends (ENG-335;
+	// close no longer fetches the lease from chain for SKU routing).
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",
@@ -257,12 +254,8 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 		},
 	})
 
-	// Not in-flight, lease NOT on chain -> fallback to all backends, all fail
-	mockChain := &chaintest.MockClient{
-		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-			return nil, nil
-		},
-	}
+	// Not in-flight, no placement -> sweeps all backends, all fail (ENG-335).
+	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
 		ProviderUUID:    "provider-1",

@@ -65,9 +65,9 @@ func (m *mockPlacementStore) Set(leaseUUID, backendName string) error {
 		m.setAt = make(map[string]time.Time)
 	}
 	m.placements[leaseUUID] = backendName
-	if _, ok := m.setAt[leaseUUID]; !ok {
-		m.setAt[leaseUUID] = time.Now()
-	}
+	// Mirror the real Store.Set, which always restamps SetAt on an explicit
+	// placement (provision/restore). SetBatch is the preserve-on-resync path.
+	m.setAt[leaseUUID] = time.Now()
 	return nil
 }
 
@@ -75,6 +75,7 @@ func (m *mockPlacementStore) Delete(leaseUUID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.placements, leaseUUID)
+	delete(m.setAt, leaseUUID) // keep setAt in sync with the real store
 }
 
 func (m *mockPlacementStore) SetBatch(placements map[string]string) error {
