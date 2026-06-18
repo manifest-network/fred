@@ -214,10 +214,11 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, err)
 		}
 
-		// Clean up placement record
-		if o.placementStore != nil {
-			o.placementStore.Delete(leaseUUID)
-		}
+		// Placement is intentionally NOT deleted here (ENG-333). It is a derived
+		// index of where the lease's data lives; if the backend retained the
+		// volumes, the placement must survive close so a restore can route to it.
+		// The reconciler is the sole pruner (cleanupOrphanedPlacements), gated on
+		// the lease being terminal on chain AND absent from all backends.
 
 		slog.Info("deprovisioned successfully",
 			"lease_uuid", leaseUUID,
@@ -251,11 +252,7 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 		}
 	}
 
-	// Always clean up placement record after fallback deprovision —
-	// if we reached the fallback path, the placement was already stale.
-	if o.placementStore != nil {
-		o.placementStore.Delete(leaseUUID)
-	}
+	// Placement is intentionally NOT deleted here (ENG-333); see resolved-backend path comment.
 
 	if !deprovisioned && lastErr != nil {
 		return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, lastErr)

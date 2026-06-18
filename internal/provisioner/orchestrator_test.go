@@ -443,7 +443,8 @@ func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
 
-	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after deprovision")
+	// ENG-333: placement must survive deprovision; the reconciler is the sole pruner.
+	assert.Equal(t, "test-backend", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
 }
 
 func TestOrchestrator_Deprovision_StalePlacement_FallsToSKU(t *testing.T) {
@@ -476,8 +477,9 @@ func TestOrchestrator_Deprovision_StalePlacement_FallsToSKU(t *testing.T) {
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
 
-	// Placement should still be cleaned up after successful deprovision via SKU fallback
-	assert.Empty(t, ps.Get("lease-1"))
+	// ENG-333: stale placement is still retained; the reconciler prunes orphans once the
+	// lease is terminal on chain and absent from all backends.
+	assert.Equal(t, "removed-backend", ps.Get("lease-1"), "stale placement must survive deprovision (ENG-333)")
 }
 
 func TestOrchestrator_Deprovision_PlacementTakesPriorityOverInFlight(t *testing.T) {
@@ -515,7 +517,7 @@ func TestOrchestrator_Deprovision_PlacementTakesPriorityOverInFlight(t *testing.
 	mbInFlight.mu.Unlock()
 }
 
-func TestOrchestrator_Deprovision_FallbackAllBackends_CleansPlacement(t *testing.T) {
+func TestOrchestrator_Deprovision_FallbackAllBackends_KeepsPlacement(t *testing.T) {
 	mb1 := &mockManagerBackend{name: "b1"}
 	router := &mockBackendRouter{
 		backendsFn: func() []backend.Backend { return []backend.Backend{mb1} },
@@ -529,7 +531,33 @@ func TestOrchestrator_Deprovision_FallbackAllBackends_CleansPlacement(t *testing
 	err := orch.Deprovision(context.Background(), "lease-1", "")
 	require.NoError(t, err)
 
-	assert.Empty(t, ps.Get("lease-1"), "stale placement should be cleaned up after fallback deprovision")
+	// ENG-333: placement survives even on the fallback path; the reconciler is the sole pruner.
+	assert.Equal(t, "stale-backend", ps.Get("lease-1"), "placement must survive fallback deprovision (ENG-333)")
+}
+
+// TestOrchestrator_Deprovision_KeepsPlacement asserts that Deprovision does NOT delete
+// the placement record (ENG-333). The placement is a derived index of where the lease's
+// retained volumes live; the reconciler (cleanupOrphanedPlacements) is the sole pruner,
+// gated on the lease being terminal on chain AND absent from all backends.
+func TestOrchestrator_Deprovision_KeepsPlacement(t *testing.T) {
+	mb := &mockManagerBackend{name: "backend-a"}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == "backend-a" {
+				return mb
+			}
+			return nil
+		},
+	}
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "backend-a")
+
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, NewInFlightTracker(), ps)
+
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1", "sku-1"))
+
+	// Placement must SURVIVE deprovision (restore affinity); reconciler prunes later.
+	assert.Equal(t, "backend-a", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
 }
 
 func TestOrchestrator_DeletePlacement(t *testing.T) {
