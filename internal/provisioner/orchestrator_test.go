@@ -233,7 +233,7 @@ func TestOrchestrator_Deprovision_ViaInFlightTracking(t *testing.T) {
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "")
+	err := orch.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 
 	mb.mu.Lock()
@@ -242,27 +242,6 @@ func TestOrchestrator_Deprovision_ViaInFlightTracking(t *testing.T) {
 
 	// Should have been popped from tracker
 	assert.False(t, tracker.IsInFlight("lease-1"))
-}
-
-func TestOrchestrator_Deprovision_ViaSKURouting(t *testing.T) {
-	mb := &mockManagerBackend{name: "test-backend"}
-	router := &mockBackendRouter{
-		routeFn: func(sku string) backend.Backend {
-			if sku == "sku-1" {
-				return mb
-			}
-			return nil
-		},
-	}
-	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
-
-	err := orch.Deprovision(context.Background(), "lease-1", "sku-1")
-	require.NoError(t, err)
-
-	mb.mu.Lock()
-	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
-	mb.mu.Unlock()
 }
 
 func TestOrchestrator_Deprovision_FallbackAllBackends(t *testing.T) {
@@ -274,7 +253,7 @@ func TestOrchestrator_Deprovision_FallbackAllBackends(t *testing.T) {
 	tracker := NewInFlightTracker()
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "")
+	err := orch.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 
 	mb1.mu.Lock()
@@ -295,7 +274,7 @@ func TestOrchestrator_Deprovision_AllBackendsFail(t *testing.T) {
 	tracker := NewInFlightTracker()
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "")
+	err := orch.Deprovision(context.Background(), "lease-1")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrDeprovisionFailed)
 }
@@ -310,47 +289,52 @@ func TestOrchestrator_Deprovision_PartialBackendSuccess(t *testing.T) {
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
 	// At least one succeeds -> no error
-	err := orch.Deprovision(context.Background(), "lease-1", "")
+	err := orch.Deprovision(context.Background(), "lease-1")
 	assert.NoError(t, err)
 }
 
-func TestOrchestrator_Deprovision_InFlightBackendNotFound_FallsToSKU(t *testing.T) {
+// TestOrchestrator_Deprovision_PlacementMissing_SweepsAllBackends is the ENG-335
+// regression guard. With no placement and no in-flight entry, Deprovision must
+// NOT route to a single default backend (the old SKU-route → defaultBackend
+// phantom that reported success against docker-1 while the real volume on
+// docker-2 was stranded). It must sweep ALL backends so the real holder is
+// torn down.
+func TestOrchestrator_Deprovision_PlacementMissing_SweepsAllBackends(t *testing.T) {
+	mb1 := &mockManagerBackend{name: "docker-1"} // default/first — did NOT hold the lease
+	mb2 := &mockManagerBackend{name: "docker-2"} // the actual holder
+	mb3 := &mockManagerBackend{name: "docker-3"}
+	router := &mockBackendRouter{
+		// Route() would have returned the default (docker-1) — the phantom path.
+		routeFn:    func(sku string) backend.Backend { return mb1 },
+		backendsFn: func() []backend.Backend { return []backend.Backend{mb1, mb2, mb3} },
+	}
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, NewInFlightTracker(), &mockPlacementStore{})
+
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
+
+	for _, mb := range []*mockManagerBackend{mb1, mb2, mb3} {
+		mb.mu.Lock()
+		assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls, "backend %s must be swept", mb.name)
+		mb.mu.Unlock()
+	}
+}
+
+func TestOrchestrator_Deprovision_InFlightBackendNotFound_FallsToAllBackends(t *testing.T) {
 	mb := &mockManagerBackend{name: "real-backend"}
 	router := &mockBackendRouter{
-		getBackendByNameFn: func(name string) backend.Backend {
-			return nil // Backend gone
-		},
-		routeFn: func(sku string) backend.Backend {
-			if sku == "sku-1" {
-				return mb
-			}
-			return nil
-		},
+		getBackendByNameFn: func(name string) backend.Backend { return nil }, // in-flight backend gone
+		backendsFn:         func() []backend.Backend { return []backend.Backend{mb} },
 	}
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "t", testItems("sku-1"), "deleted-backend")
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "sku-1")
-	require.NoError(t, err)
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
 
 	mb.mu.Lock()
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
-}
-
-func TestOrchestrator_Deprovision_SKURoutingFails(t *testing.T) {
-	mb := &mockManagerBackend{name: "backend", deprovisionErr: errors.New("unavailable")}
-	router := &mockBackendRouter{
-		routeFn: func(sku string) backend.Backend { return mb },
-	}
-	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
-
-	err := orch.Deprovision(context.Background(), "lease-1", "sku-1")
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrDeprovisionFailed)
 }
 
 // --- Placement integration tests ---
@@ -436,7 +420,7 @@ func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "")
+	err := orch.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 
 	mb.mu.Lock()
@@ -447,38 +431,30 @@ func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {
 	assert.Equal(t, "test-backend", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
 }
 
-func TestOrchestrator_Deprovision_StalePlacement_FallsToSKU(t *testing.T) {
+func TestOrchestrator_Deprovision_StalePlacement_FallsToAllBackends(t *testing.T) {
 	mb := &mockManagerBackend{name: "real-backend"}
 	router := &mockBackendRouter{
 		getBackendByNameFn: func(name string) backend.Backend {
-			// "removed-backend" is no longer configured
 			if name == "real-backend" {
 				return mb
 			}
-			return nil
+			return nil // "removed-backend" is no longer configured
 		},
-		routeFn: func(sku string) backend.Backend {
-			if sku == "sku-1" {
-				return mb
-			}
-			return nil
-		},
+		backendsFn: func() []backend.Backend { return []backend.Backend{mb} },
 	}
 	tracker := NewInFlightTracker()
 	ps := &mockPlacementStore{}
-	ps.Set("lease-1", "removed-backend") // stale placement
+	ps.Set("lease-1", "removed-backend") // stale placement → GetBackendByName misses
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "sku-1")
-	require.NoError(t, err)
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
 
 	mb.mu.Lock()
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
 
-	// ENG-333: stale placement is still retained; the reconciler prunes orphans once the
-	// lease is terminal on chain and absent from all backends.
+	// ENG-333: stale placement survives; the reconciler prunes orphans later.
 	assert.Equal(t, "removed-backend", ps.Get("lease-1"), "stale placement must survive deprovision (ENG-333)")
 }
 
@@ -504,7 +480,7 @@ func TestOrchestrator_Deprovision_PlacementTakesPriorityOverInFlight(t *testing.
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "")
+	err := orch.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 
 	// Placement backend should have been used, not in-flight backend
@@ -528,7 +504,7 @@ func TestOrchestrator_Deprovision_FallbackAllBackends_KeepsPlacement(t *testing.
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 
-	err := orch.Deprovision(context.Background(), "lease-1", "")
+	err := orch.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 
 	// ENG-333: placement survives even on the fallback path; the reconciler is the sole pruner.
@@ -554,7 +530,7 @@ func TestOrchestrator_Deprovision_KeepsPlacement(t *testing.T) {
 
 	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, NewInFlightTracker(), ps)
 
-	require.NoError(t, orch.Deprovision(context.Background(), "lease-1", "sku-1"))
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
 
 	// Placement must SURVIVE deprovision (restore affinity); reconciler prunes later.
 	assert.Equal(t, "backend-a", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")

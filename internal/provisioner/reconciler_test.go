@@ -3645,8 +3645,8 @@ func TestCleanupOrphanedPlacements_GateD(t *testing.T) {
 	// the passed-in maps), so this hand-built literal is safe. Any future change
 	// that makes the pruner read other Reconciler fields must set them here too,
 	// or this white-box test will nil-panic.
-	r := &Reconciler{placementStore: ps, tracker: tracker}
-	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true)
+	r := &Reconciler{placementStore: ps, tracker: tracker, interval: time.Minute}
+	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true, time.Now().Add(time.Hour))
 
 	assert.Equal(t, 2, pruned)
 	assert.Equal(t, "backend-a", ps.Get("active-chain-lease"), "gate d: ACTIVE on chain must keep")
@@ -3663,7 +3663,10 @@ func TestReconciler_PrunesOrphanedPlacement(t *testing.T) {
 	// "gone-lease" has a placement but is on no backend, not in-flight,
 	// not on chain.  "retained-1" is still retained → must survive.
 	ps := &mockPlacementStore{}
-	ps.Set("gone-lease", "backend-a")
+	// Backdate well past the 10m grace (default 5m interval × 2) so the orphan is
+	// prunable this sweep; a freshly-set placement would be kept by the ENG-335
+	// grace window (covered by TestCleanupOrphanedPlacements_GraceWindow).
+	ps.setWithTime("gone-lease", "backend-a", time.Now().Add(-time.Hour))
 	ps.Set("retained-1", "backend-a")
 
 	mb := backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"})
@@ -3686,6 +3689,35 @@ func TestReconciler_PrunesOrphanedPlacement(t *testing.T) {
 
 	assert.Equal(t, "", ps.Get("gone-lease"), "orphan placement must be pruned")
 	assert.Equal(t, "backend-a", ps.Get("retained-1"), "retained lease placement must be kept")
+}
+
+// TestCleanupOrphanedPlacements_GraceWindow verifies ENG-335: a placement that
+// is chain-terminal, absent from all backends, and not in-flight is still KEPT
+// when it was set within 2× the reconcile interval (a lease that provisioned
+// during a slow sweep is absent from the stale snapshot but is live). Once it
+// ages past the grace window it is pruned.
+func TestCleanupOrphanedPlacements_GraceWindow(t *testing.T) {
+	const interval = time.Minute // grace = 2*interval = 2m
+	t0 := time.Date(2026, 6, 18, 17, 11, 15, 0, time.UTC)
+
+	ps := &mockPlacementStore{}
+	ps.setWithTime("young-lease", "backend-a", t0) // set at t0
+
+	// chain-terminal (absent from chain), absent from backends, not in-flight.
+	chainLeases := map[string]billingtypes.Lease{}
+	backendLeases := map[string]struct{}{}
+	tracker := newMockInFlightTracker(nil)
+	r := &Reconciler{placementStore: ps, tracker: tracker, interval: interval}
+
+	// now = t0 + 1m  → within the 2m grace → KEEP.
+	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true, t0.Add(time.Minute))
+	assert.Equal(t, 0, pruned, "young placement within grace must be kept")
+	assert.Equal(t, "backend-a", ps.Get("young-lease"))
+
+	// now = t0 + 2m + 1s → past grace → PRUNE.
+	pruned = r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true, t0.Add(2*time.Minute+time.Second))
+	assert.Equal(t, 1, pruned, "aged placement past grace must be pruned")
+	assert.Equal(t, "", ps.Get("young-lease"))
 }
 
 // TestReconciler_DoesNotPruneOnIncompleteRetentions verifies gate (a):

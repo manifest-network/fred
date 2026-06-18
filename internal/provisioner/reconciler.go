@@ -385,7 +385,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// 6. Prune orphaned placements (ENG-333 — sole pruner; see cleanupOrphanedPlacements).
 	// Per-lease deletions are logged inside the method; the aggregate count is
 	// surfaced via the reconciliation-complete summary below.
-	prunedPlacements := r.cleanupOrphanedPlacements(ctx, chainLeases, backendLeases, retentionsComplete)
+	prunedPlacements := r.cleanupOrphanedPlacements(ctx, chainLeases, backendLeases, retentionsComplete, startTime)
 
 	logFunc := slog.Info
 	if leaseErrorCount > 0 {
@@ -1182,6 +1182,7 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 	chainLeases map[string]billingtypes.Lease,
 	backendLeases map[string]struct{},
 	retentionsComplete bool,
+	now time.Time,
 ) int {
 	if r.placementStore == nil || !retentionsComplete {
 		return 0
@@ -1207,6 +1208,24 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 		// main loop owns re-provisioning those; pruning would race it).
 		if lease, exists := chainLeases[leaseUUID]; exists &&
 			(lease.State == billingtypes.LEASE_STATE_PENDING || lease.State == billingtypes.LEASE_STATE_ACTIVE) {
+			continue
+		}
+		// ENG-335: keep a placement that was set within the grace window. A lease
+		// that provisioned entirely during a slow reconcile sweep is absent from
+		// this sweep's (stale) snapshot of chain + backends, yet is live; pruning
+		// it here strands its volume at close. The placement is a derived index —
+		// keeping a young one is harmless (processOrphan GCs the real resource and
+		// a closed lease is never restored) — so we never prune within 2× the
+		// reconcile interval, comfortably longer than one sweep.
+		grace := 2 * r.interval
+		if setAt, ok := r.placementStore.SetAt(leaseUUID); ok && grace > 0 && now.Sub(setAt) < grace {
+			// Log the raw timestamps rather than a derived age: now is the
+			// sweep-start time, so a placement Set during this sweep has
+			// set_at > sweep_start (a negative "age") — the timestamps make
+			// that case self-explanatory instead of printing a confusing
+			// negative duration.
+			slog.Debug("reconcile: keeping placement within grace window",
+				"lease_uuid", leaseUUID, "set_at", setAt, "sweep_start", now, "grace", grace)
 			continue
 		}
 		// Chain-terminal, absent from all backends, not in-flight → orphan.

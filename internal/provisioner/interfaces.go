@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -33,6 +34,7 @@ var _ BackendRouter = (*backend.Router)(nil)
 // read operations reach the correct backend after provision routing.
 type PlacementStore interface {
 	Get(leaseUUID string) string
+	SetAt(leaseUUID string) (time.Time, bool)
 	Set(leaseUUID, backendName string) error
 	Delete(leaseUUID string)
 	SetBatch(placements map[string]string) error
