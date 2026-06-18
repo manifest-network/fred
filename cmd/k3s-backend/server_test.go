@@ -859,6 +859,57 @@ func TestHandleListProvisions(t *testing.T) {
 	})
 }
 
+func TestHandleListRetentions(t *testing.T) {
+	t.Run("success returns 200 with retentions", func(t *testing.T) {
+		mb := &mockBackend{
+			ListRetentionsFunc: func(context.Context) ([]backend.RetainedLease, error) {
+				return []backend.RetainedLease{{LeaseUUID: "ret-1"}}, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/retentions"))
+
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp backend.ListRetentionsResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		require.Len(t, resp.Retentions, 1)
+		assert.Equal(t, "ret-1", resp.Retentions[0].LeaseUUID)
+	})
+
+	t.Run("nil slice serializes as []", func(t *testing.T) {
+		mb := &mockBackend{
+			ListRetentionsFunc: func(context.Context) ([]backend.RetainedLease, error) {
+				return nil, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/retentions"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), `"retentions":[]`)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			ListRetentionsFunc: func(context.Context) ([]backend.RetainedLease, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/retentions"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+
+	t.Run("missing signature returns 401", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/retentions", nil)
+		w := httptest.NewRecorder()
+		newTestHandler().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		assert.Contains(t, w.Body.String(), "missing signature")
+	})
+}
+
 func TestHandleListProvisions_Filtered(t *testing.T) {
 	const u1 = "01234567-89ab-cdef-0123-456789abcdef"
 	const u2 = "abcdef01-2345-6789-abcd-ef0123456789"
