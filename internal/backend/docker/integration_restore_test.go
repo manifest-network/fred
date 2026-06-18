@@ -102,6 +102,9 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	// Wait for Deprovisioned callback.
 	cb = waitForCallback(t, callbackCh, origLease, 30*time.Second)
 	require.Equal(t, backend.CallbackStatusDeprovisioned, cb.Status)
+	// ENG-329 ground truth: a real btrfs soft-delete must set Retained=true on the
+	// terminal deprovision callback (the best-effort push's observed outcome).
+	require.True(t, cb.Retained, "real btrfs retain must set the ground-truth Retained flag on the deprovision callback")
 
 	// ── STEP 4a: Canonical volume is gone; retained volume exists ─────────
 	canonicalPath := filepath.Join(mountPath, canonicalVolumeID)
@@ -128,6 +131,21 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	assert.Equal(t, "test-tenant", rec.Tenant)
 	require.Len(t, rec.RetainedVolumeNames, 1)
 	assert.Equal(t, retainedVolumeID, rec.RetainedVolumeNames[0])
+
+	// ── STEP 4d: GetProvision surfaces the queryable retention status ─────
+	//
+	// ENG-329 Part A on REAL retained state: with the provision gone from the
+	// in-memory map, GetProvision must report Status=retained with a non-zero
+	// RetainedUntil (CreatedAt + RetentionMaxAge) and the restore-shape Items —
+	// the offline-tenant self-serve path.
+	info, err := b.GetProvision(ctx, origLease)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.Equal(t, backend.ProvisionStatusRetained, info.Status, "GetProvision must report retained for soft-deleted state")
+	assert.False(t, info.RetainedUntil.IsZero(), "retained provision must carry a RetainedUntil deadline")
+	assert.Equal(t, rec.CreatedAt.Add(b.cfg.RetentionMaxAge), info.RetainedUntil, "RetainedUntil = CreatedAt + RetentionMaxAge")
+	assert.Equal(t, "test-tenant", info.Tenant, "Tenant must be populated for the closed-lease authz fallback")
+	require.NotEmpty(t, info.Items, "retained provision must carry the restore-shape Items")
 
 	// ── STEP 5: Restore into a new lease ──────────────────────────────────
 	newLease := fmt.Sprintf("retain-restore-new-%d", time.Now().UnixNano())

@@ -359,3 +359,105 @@ func TestGetLeaseStatus_MultiBackendFanOut(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	assert.Equal(t, "retained", resp.ProvisionStatus, "fan-out must find the holder past the non-holder")
 }
+
+// TestAuthorizeRetained_EmptyTenantNeverAuthorizes directly exercises the
+// isolation-boundary reject branch (GAP 2a): authorizeRetained must NEVER
+// authorize when the caller tenant OR the retained record's tenant is empty —
+// even if both happen to be the empty string. This is the branch the
+// handler-level happy-path tests don't reach.
+func TestAuthorizeRetained_EmptyTenantNeverAuthorizes(t *testing.T) {
+	retained := func(tenant string) *backend.ProvisionInfo {
+		return &backend.ProvisionInfo{Status: backend.ProvisionStatusRetained, Tenant: tenant}
+	}
+	cases := []struct {
+		name         string
+		info         *backend.ProvisionInfo
+		callerTenant string
+		want         bool
+	}{
+		{"nil info", nil, "manifest1abc", false},
+		{"non-retained status", &backend.ProvisionInfo{Status: backend.ProvisionStatusReady, Tenant: "manifest1abc"}, "manifest1abc", false},
+		{"empty record tenant", retained(""), "manifest1abc", false},
+		{"empty caller tenant", retained("manifest1abc"), "", false},
+		{"both empty", retained(""), "", false},
+		{"mismatched tenants", retained("manifest1owner"), "manifest1other", false},
+		{"matching non-empty tenants", retained("manifest1abc"), "manifest1abc", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, authorizeRetained(tc.info, tc.callerTenant))
+		})
+	}
+}
+
+// TestGetLeaseStatus_ChainPruned_EmptyRecordTenant_Returns404 is the handler-level
+// counterpart (GAP 2a): a chain-pruned lease whose retained record carries an
+// EMPTY tenant must NOT authorize the caller (404), never binding on "" == "".
+func TestGetLeaseStatus_ChainPruned_EmptyRecordTenant_Returns404(t *testing.T) {
+	caller := testutil.NewTestKeyPair("some-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	retainedUntil := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+
+	chainClient := &mockChainClient{getLeaseFunc: func(_ context.Context, _ string) (*billingtypes.Lease, error) { return nil, nil }}
+	// Retained record with an EMPTY Tenant (e.g. a corrupt/legacy record).
+	srv := retainedProvisionServer(t, leaseUUID, "", retainedUntil)
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: httpBackend(t, "b1", srv.URL), IsDefault: true}},
+	})
+	require.NoError(t, err)
+	h := &Handlers{client: chainClient, backendRouter: router, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(caller, leaseUUID, time.Now()))
+	req.SetPathValue("lease_uuid", leaseUUID)
+	rec := httptest.NewRecorder()
+	h.GetLeaseStatus(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code,
+		"an empty retained-record tenant must never authorize a caller (no empty-tenant binding)")
+}
+
+// TestGetLeaseStatus_Retained_ExpiredLease verifies the EXPIRED-state authz
+// variant (GAP 2b): a chain lease in EXPIRED state (not just CLOSED/pruned) whose
+// data was retained → the owner is authorized and GET /status returns retained.
+func TestGetLeaseStatus_Retained_ExpiredLease(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	retainedUntil := time.Now().Add(60 * 24 * time.Hour).Truncate(time.Second)
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_EXPIRED, // expired, not closed/pruned
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+	srv := retainedProvisionServer(t, leaseUUID, kp.Address, retainedUntil)
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: httpBackend(t, "b1", srv.URL), IsDefault: true}},
+	})
+	require.NoError(t, err)
+	h := &Handlers{client: chainClient, backendRouter: router, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+	req.SetPathValue("lease_uuid", leaseUUID)
+	rec := httptest.NewRecorder()
+	h.GetLeaseStatus(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var resp LeaseStatusResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "LEASE_STATE_EXPIRED", resp.State)
+	assert.Equal(t, "retained", resp.ProvisionStatus, "an EXPIRED lease with retained data must surface retained")
+	assert.Equal(t, retainedUntil.Format(time.RFC3339), resp.RetainedUntil)
+	require.NotEmpty(t, resp.Items)
+}
