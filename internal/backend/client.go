@@ -264,6 +264,17 @@ type ProvisionInfo struct {
 	LastError    string          `json:"last_error,omitempty"`
 	BackendName  string          `json:"-"` // Set by the backend or reconciler; excluded from JSON serialization
 
+	// RetainedUntil is the grace-window deadline (CreatedAt + RetentionMaxAge)
+	// for a soft-deleted (Status=retained) lease. Zero for live provisions.
+	RetainedUntil time.Time `json:"retained_until,omitempty"`
+	// Tenant is the owning tenant. It crosses the backend→providerd hop (an
+	// HMAC-signed, trusted internal hop, like RestoreRequest.Tenant) so the
+	// closed-lease authz fallback (when the chain has pruned the lease) can bind
+	// a retained record to its owner. It MUST NOT be copied into tenant-facing
+	// API responses (LeaseStatusResponse/LeaseProvisionResponse), which would
+	// leak one tenant's address to another.
+	Tenant string `json:"tenant,omitempty"`
+
 	// Workload metadata — populated by ListProvisions/GetProvision to describe what is running.
 	Image         string            `json:"image,omitempty"`          // Docker image (non-stack leases)
 	SKU           string            `json:"sku,omitempty"`            // SKU identifier (non-stack leases)
@@ -296,6 +307,10 @@ type CallbackPayload struct {
 	Status    CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
 	Error     string         `json:"error,omitempty"`
 	Backend   string         `json:"backend,omitempty"` // Backend name; empty from pre-upgrade senders.
+	// Retained is set true on a deprovisioned callback when the backend actually
+	// soft-deleted (retained) the lease's volumes. Best-effort ground truth for
+	// the optimistic push; the queryable retention status is the durable backstop.
+	Retained bool `json:"retained,omitempty"`
 }
 
 // RestartRequest contains the data needed to restart a lease's containers.

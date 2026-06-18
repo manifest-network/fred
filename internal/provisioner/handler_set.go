@@ -183,11 +183,12 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 		skuHint = ExtractRoutingSKU(lease)
 	}
 
-	// Best-effort: notify the tenant that their data may be retained.
-	// Fired regardless of whether the backend has retain_on_close enabled —
-	// providerd does not know the backend's retain config at close time.
-	h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusRetained,
-		"data may be retained if provider retention is enabled; restore is best-effort and capacity-bounded — restore within the grace window")
+	// ENG-329: the retained notice is NOT emitted here (on close intent). At
+	// close time providerd cannot know whether the backend actually retained,
+	// so the former optimistic emit fired regardless of outcome. The notice now
+	// fires on observed ground truth from the deprovision callback (Retained=true)
+	// in HandleBackendCallback, and the durable backstop is the queryable
+	// retention status (GET /status, GET /provision).
 
 	// Delegate to orchestrator for deprovisioning
 	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID, skuHint)
@@ -226,8 +227,16 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		case backend.CallbackStatusFailed:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
 		case backend.CallbackStatusDeprovisioned:
-			// No lease event, no chain action: the backend tore down a lease
-			// that was not in-flight here. Chain state is unchanged.
+			// No chain action: the backend tore down a lease that was not
+			// in-flight here. Chain state is unchanged. ENG-329: if the backend
+			// reports it actually retained the data, emit the retained notice on
+			// observed ground truth (best-effort/fire-and-forget — the queryable
+			// retention status is the durable backstop, so there is no marker or
+			// reaper here). A non-retain deprovision emits nothing.
+			if callback.Retained {
+				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusRetained,
+					"your lease data was retained and can be restored within the grace window: create a fresh PENDING lease of matching shape, then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID")
+			}
 		default:
 			slog.Warn("unexpected callback status for non-in-flight lease",
 				"lease_uuid", callback.LeaseUUID,

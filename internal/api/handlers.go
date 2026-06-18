@@ -127,6 +127,29 @@ type AuthenticatedRequest struct {
 //
 // Returns AuthenticatedRequest on success, or an error with the appropriate HTTP status code.
 func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, checkReplay bool, requireActive bool) (*AuthenticatedRequest, int, error) {
+	token, status, err := h.authenticateLeaseToken(r, leaseUUID, checkReplay)
+	if err != nil {
+		return nil, status, err
+	}
+
+	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, requireActive)
+	if err != nil {
+		return nil, status, err
+	}
+
+	return &AuthenticatedRequest{
+		Token: token,
+		Lease: lease,
+	}, http.StatusOK, nil
+}
+
+// authenticateLeaseToken performs the pre-chain half of AuthenticateLeaseRequest:
+// validate the lease UUID format, extract/validate the ADR-036-signed bearer
+// token, run the optional replay check, and confirm the token's lease UUID
+// matches the request. It does NOT query the chain — callers needing the
+// closed-lease authz fallback (ENG-329) verify the lease separately so they can
+// fall back to the retained record's tenant when the chain has pruned the lease.
+func (h *Handlers) authenticateLeaseToken(r *http.Request, leaseUUID string, checkReplay bool) (*AuthToken, int, error) {
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {
 		return nil, http.StatusBadRequest, errors.New(errMsgInvalidLeaseUUID)
@@ -172,15 +195,7 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 		return nil, http.StatusUnauthorized, errors.New(errMsgUnauthorized)
 	}
 
-	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, requireActive)
-	if err != nil {
-		return nil, status, err
-	}
-
-	return &AuthenticatedRequest{
-		Token: token,
-		Lease: lease,
-	}, http.StatusOK, nil
+	return token, http.StatusOK, nil
 }
 
 // authenticateAndResolve performs the common handler preamble: extract lease UUID
@@ -249,6 +264,105 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 		}
 	}
 	return h.backendRouter.Route(sku)
+}
+
+// restoreHint is the short, human-readable next-step surfaced alongside a
+// retained provision so a returning tenant knows how to recover their data.
+const restoreHint = "to restore before retained_until: create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
+
+// findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4): the
+// fallback used when placement can't resolve the holder — placement-disabled
+// deployments, or a lease with no surviving placement record. It queries
+// GetProvision across every backend that could hold the lease: RouteAll(sku) when
+// the SKU is known, else Backends(). Returns the first found provision (live or
+// retained); non-holders return ErrNotProvisioned and are skipped; a single
+// backend is one call.
+//
+// Returns:
+//   - (info, nil)  when some backend holds the lease;
+//   - (nil, nil)   when every candidate reported ErrNotProvisioned (truly absent);
+//   - (nil, err)   when no backend held it AND at least one returned a genuine
+//     (non-ErrNotProvisioned) error — surfaced so the caller can 500 rather than
+//     mask a transient backend failure as a 404.
+func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
+	if h.backendRouter == nil {
+		return nil, nil
+	}
+	candidates := h.backendRouter.RouteAll(sku)
+	if len(candidates) == 0 {
+		// Unknown/unmatched SKU (e.g. the chain pruned the lease, so we have no
+		// item to derive it from): fan out over every backend.
+		candidates = h.backendRouter.Backends()
+	}
+	var firstErr error
+	for _, b := range candidates {
+		info, err := b.GetProvision(ctx, leaseUUID)
+		if err != nil {
+			if !errors.Is(err, backend.ErrNotProvisioned) {
+				slog.Warn("fan-out GetProvision error, skipping backend",
+					"lease_uuid", leaseUUID,
+					"backend", b.Name(),
+					"error", err,
+				)
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+			continue
+		}
+		if info != nil {
+			// Stamp the answering backend (BackendName is json:"-", empty over
+			// the wire) so downstream logging/diagnostics identify it.
+			info.BackendName = b.Name()
+			return info, nil
+		}
+	}
+	return nil, firstErr
+}
+
+// findProvision locates a lease's provision, preferring an O(1) placement hit
+// (via resolveBackendByPlacement) before the bounded fan-out. Placement resolves
+// the holder directly — a single GetProvision call — for ACTIVE leases and for
+// retained leases too: ENG-333 keeps a retained lease's placement alive on close
+// (restore affinity), so it stays resolvable through the grace window. Only an
+// actual placement hit that yields a provision takes the fast path; a missing
+// placement, or ErrNotProvisioned on the placed backend, falls through to
+// findProvisionAcrossBackends.
+//
+// Uses resolveBackendByPlacement (not resolveBackend) so a placement miss goes
+// straight to the fan-out rather than guessing a single SKU-routed backend.
+func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
+	var fastErr error
+	if b := h.resolveBackendByPlacement(leaseUUID); b != nil {
+		info, err := b.GetProvision(ctx, leaseUUID)
+		if err == nil && info != nil {
+			// BackendName is json:"-", so HTTP backends leave it empty on the
+			// wire — stamp the answering backend so downstream logging/diagnostics
+			// identify it (mirrors reconciler.go:638).
+			info.BackendName = b.Name()
+			return info, nil
+		}
+		// Miss on the placed backend. ErrNotProvisioned (a stale placement pointing
+		// at a backend that no longer holds the lease) is benign — fall through to
+		// the fan-out. A GENUINE error must NOT be swallowed: retain it
+		// so it can be surfaced if the fan-out finds nothing and has no error of
+		// its own (preserves the 500-not-404 error-surfacing contract).
+		if err != nil && !errors.Is(err, backend.ErrNotProvisioned) {
+			fastErr = err
+		}
+	}
+
+	info, fanErr := h.findProvisionAcrossBackends(ctx, leaseUUID, sku)
+	if info != nil {
+		// A fan-out hit (e.g. stale placement but found elsewhere) wins even over a
+		// genuine placed-backend error.
+		return info, nil
+	}
+	if fanErr != nil {
+		// A fan-out error takes precedence over the placed-backend's error.
+		return nil, fanErr
+	}
+	return nil, fastErr
 }
 
 // resolveBackendByPlacement returns the backend recorded in placement for the
@@ -385,30 +499,61 @@ type LeaseStatusResponse struct {
 	ProvisionStatus     string `json:"provision_status,omitempty"`
 	FailCount           int    `json:"fail_count,omitempty"`
 	LastError           string `json:"last_error,omitempty"`
+	// Retention fields (populated when provision_status=retained, ENG-329).
+	// RetainedUntil is RFC3339; Items is the restore shape (service name + SKU +
+	// quantity) the tenant uses to build a matching fresh PENDING lease;
+	// RestoreHint is a short human-readable next-step. The owning Tenant from
+	// ProvisionInfo is intentionally NOT surfaced here (cross-tenant leak guard).
+	RetainedUntil string              `json:"retained_until,omitempty"`
+	Items         []backend.LeaseItem `json:"items,omitempty"`
+	RestoreHint   string              `json:"restore_hint,omitempty"`
 }
 
 // GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
+//
+// Authz is chain-primary with a retained-record fallback (ENG-329 #5): the
+// ADR-036-signed token is validated first, then the chain lease is queried
+// (any state). If the chain still has the lease, tenant/provider ownership is
+// verified against it (the existing path). If the chain has PRUNED the lease
+// (auto-closed cohort), the request is authorized iff the signed caller's
+// tenant equals the retained record's Tenant, surfaced via the bounded fan-out
+// GetProvision — mirroring restore's cross-tenant guard. A cross-tenant caller,
+// or an absent retained record, is rejected.
 func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	leaseUUID := r.PathValue("lease_uuid")
 
-	// Authenticate and authorize the request (any lease state, no replay check for read-heavy endpoint)
-	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, false, false)
+	// Pre-chain auth (no replay check for this read-heavy endpoint).
+	token, status, err := h.authenticateLeaseToken(r, leaseUUID, false)
 	if err != nil {
 		writeError(w, err.Error(), status)
 		return
 	}
 
-	// Build status response
-	hasMetaHash := len(auth.Lease.MetaHash) > 0
+	// Query the chain (any lease state). nil means the chain has pruned a
+	// closed/expired lease — fall back to the retained record below.
+	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, false)
+	if err != nil && status != http.StatusNotFound {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if lease == nil {
+		// Chain-absent: authorize and answer solely from the retained record.
+		h.serveRetainedStatusFallback(w, r, leaseUUID, token.Tenant)
+		return
+	}
+
+	// Build status response from the chain lease.
+	hasMetaHash := len(lease.MetaHash) > 0
 	response := LeaseStatusResponse{
 		LeaseUUID:       leaseUUID,
-		Tenant:          auth.Token.Tenant,
+		Tenant:          token.Tenant,
 		ProviderUUID:    h.providerUUID,
-		State:           auth.Lease.State.String(),
+		State:           lease.State.String(),
 		RequiresPayload: hasMetaHash,
 	}
 	if hasMetaHash {
-		response.MetaHashHex = hex.EncodeToString(auth.Lease.MetaHash)
+		response.MetaHashHex = hex.EncodeToString(lease.MetaHash)
 	}
 
 	// Check provisioning status if checker is available
@@ -421,28 +566,98 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		response.ProvisioningStarted = h.statusChecker.IsInFlight(leaseUUID)
 	}
 
-	// For active leases, include provision status from the backend
-	if h.backendRouter != nil && auth.Lease.State == billingtypes.LEASE_STATE_ACTIVE {
-		sku := provisioner.ExtractRoutingSKU(auth.Lease)
-		if backendClient := h.resolveBackend(leaseUUID, sku); backendClient != nil {
-			info, err := backendClient.GetProvision(r.Context(), leaseUUID)
-			if err == nil {
-				response.ProvisionStatus = string(info.Status)
-				response.FailCount = info.FailCount
-				response.LastError = info.LastError
-			}
-			// Errors are intentionally ignored — provision status is best-effort.
-			// ErrNotProvisioned during initial setup is expected and safe to skip.
+	// Include provision status from the backend for ANY lease state (ENG-329
+	// lifts the former ACTIVE-only gate so a non-ACTIVE lease whose data was
+	// retained surfaces provision_status=retained). findProvision takes the O(1)
+	// placement fast-path (ACTIVE leases, and retained leases whose placement
+	// ENG-333 keeps alive on close) and falls back to the bounded fan-out otherwise.
+	// Errors are intentionally ignored — provision status on /status is
+	// best-effort and ErrNotProvisioned during initial setup is expected.
+	if h.backendRouter != nil {
+		sku := provisioner.ExtractRoutingSKU(lease)
+		info, fanErr := h.findProvision(r.Context(), leaseUUID, sku)
+		if fanErr != nil {
+			slog.Warn("provision status lookup failed (best-effort)", "lease_uuid", leaseUUID, "error", fanErr)
+		}
+		if info != nil {
+			response.ProvisionStatus = string(info.Status)
+			response.FailCount = info.FailCount
+			response.LastError = info.LastError
+			applyRetentionFields(&response, info)
 		}
 	}
 
 	slog.Info("lease status served",
 		"lease_uuid", leaseUUID,
-		"tenant", auth.Token.Tenant,
+		"tenant", token.Tenant,
 		"state", response.State,
 	)
 
 	writeJSON(w, response, http.StatusOK)
+}
+
+// serveRetainedStatusFallback answers GET /status for a lease the chain has
+// pruned. It authorizes via the retained record's tenant (ENG-329 #5) and, on a
+// match, returns provision_status=retained with the restore shape. A
+// cross-tenant caller or an absent/non-retained record yields 404 (never
+// authorize on an empty/mismatched tenant).
+func (h *Handlers) serveRetainedStatusFallback(w http.ResponseWriter, r *http.Request, leaseUUID, callerTenant string) {
+	// SKU is unknown (no chain lease to derive it from): fan out over all backends.
+	// A genuine fan-out error is logged but treated as "not found" — we must not
+	// confirm a lease's existence to an unauthenticated-against-chain caller.
+	info, fanErr := h.findProvisionAcrossBackends(r.Context(), leaseUUID, "")
+	if fanErr != nil {
+		slog.Warn("retained fallback fan-out failed", "lease_uuid", leaseUUID, "error", fanErr)
+	}
+	if !authorizeRetained(info, callerTenant) {
+		// Indistinguishable from a genuinely unknown lease — do not leak existence.
+		writeError(w, errMsgLeaseNotFound, http.StatusNotFound)
+		return
+	}
+
+	response := LeaseStatusResponse{
+		LeaseUUID:       leaseUUID,
+		Tenant:          callerTenant,
+		ProviderUUID:    h.providerUUID,
+		State:           billingtypes.LEASE_STATE_UNSPECIFIED.String(),
+		ProvisionStatus: string(info.Status),
+		FailCount:       info.FailCount,
+		LastError:       info.LastError,
+	}
+	applyRetentionFields(&response, info)
+
+	slog.Info("lease status served from retained record (chain-pruned lease)",
+		"lease_uuid", leaseUUID,
+		"tenant", callerTenant,
+	)
+
+	writeJSON(w, response, http.StatusOK)
+}
+
+// authorizeRetained returns true iff info is a retained record owned by
+// callerTenant. It rejects a nil/non-retained record and a mismatched OR empty
+// tenant — never authorize on an empty tenant (the isolation boundary).
+func authorizeRetained(info *backend.ProvisionInfo, callerTenant string) bool {
+	if info == nil || info.Status != backend.ProvisionStatusRetained {
+		return false
+	}
+	if callerTenant == "" || info.Tenant == "" {
+		return false
+	}
+	return info.Tenant == callerTenant
+}
+
+// applyRetentionFields populates the retention-specific response fields when the
+// provision is retained. Tenant from ProvisionInfo is intentionally NOT copied.
+func applyRetentionFields(resp *LeaseStatusResponse, info *backend.ProvisionInfo) {
+	if info.Status != backend.ProvisionStatusRetained {
+		return
+	}
+	if !info.RetainedUntil.IsZero() {
+		resp.RetainedUntil = info.RetainedUntil.Format(time.RFC3339)
+	}
+	resp.Items = info.Items
+	resp.RestoreHint = restoreHint
 }
 
 // LeaseProvisionResponse represents the response for provision diagnostics.
@@ -453,6 +668,11 @@ type LeaseProvisionResponse struct {
 	Status       string `json:"status"`
 	FailCount    int    `json:"fail_count"`
 	LastError    string `json:"last_error,omitempty"`
+	// Retention fields (populated when status=retained, ENG-329). See
+	// LeaseStatusResponse; the owning Tenant from ProvisionInfo is NOT surfaced.
+	RetainedUntil string              `json:"retained_until,omitempty"`
+	Items         []backend.LeaseItem `json:"items,omitempty"`
+	RestoreHint   string              `json:"restore_hint,omitempty"`
 }
 
 // LeaseLogsResponse represents the response for container logs.
@@ -464,37 +684,89 @@ type LeaseLogsResponse struct {
 }
 
 // GetLeaseProvision handles GET /v1/leases/{lease_uuid}/provision
+//
+// Like GetLeaseStatus, authz is chain-primary with a retained-record fallback
+// (ENG-329 #5), and provision discovery uses findProvision (placement fast-path,
+// bounded fan-out fallback). Within the grace window a retained lease returns
+// status=retained (with retained_until + items), not 404.
 func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
-	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, false, false)
-	if !ok {
+	leaseUUID := r.PathValue("lease_uuid")
+
+	token, status, err := h.authenticateLeaseToken(r, leaseUUID, false)
+	if err != nil {
+		writeError(w, err.Error(), status)
 		return
 	}
 
-	info, err := backendClient.GetProvision(r.Context(), leaseUUID)
-	if err != nil {
-		if errors.Is(err, backend.ErrNotProvisioned) {
-			writeError(w, "provision not found", http.StatusNotFound)
+	// Query the chain (any state). A tenant/provider mismatch (403) or other
+	// non-NotFound error surfaces here; nil lease means the chain pruned it.
+	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, false)
+	if err != nil && status != http.StatusNotFound {
+		writeError(w, err.Error(), status)
+		return
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	var sku string
+	if lease != nil {
+		sku = provisioner.ExtractRoutingSKU(lease)
+	}
+	// Placement fast-path for the ACTIVE common case; bounded fan-out otherwise.
+	info, fanErr := h.findProvision(r.Context(), leaseUUID, sku)
+
+	switch {
+	case lease == nil:
+		// Chain-pruned: the caller is NOT yet authorized (the chain can no longer
+		// vouch for ownership). Authorize solely against the retained record's
+		// tenant. A genuine fan-out error is logged but treated as "not found" —
+		// surfacing a 500 here would leak backend-health/existence to a caller who
+		// has not proven ownership (symmetric with serveRetainedStatusFallback).
+		if fanErr != nil {
+			slog.Warn("provision fan-out failed during chain-pruned authz", "lease_uuid", leaseUUID, "error", fanErr)
+		}
+		if !authorizeRetained(info, token.Tenant) {
+			writeError(w, errMsgLeaseNotFound, http.StatusNotFound)
 			return
 		}
-		slog.Error("failed to get provision from backend", "error", err, "lease_uuid", leaseUUID)
+	case fanErr != nil:
+		// Chain has the lease and the caller is already authorized: a genuine
+		// backend error (not ErrNotProvisioned) should surface as 500 rather than
+		// masking a transient failure as a 404.
+		slog.Error("failed to get provision from backend", "error", fanErr, "lease_uuid", leaseUUID)
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	case info == nil:
+		// Chain has the lease but no backend holds a provision (live or retained).
+		writeError(w, "provision not found", http.StatusNotFound)
 		return
 	}
 
 	response := LeaseProvisionResponse{
 		LeaseUUID:    leaseUUID,
-		Tenant:       auth.Token.Tenant,
+		Tenant:       token.Tenant,
 		ProviderUUID: h.providerUUID,
 		Status:       string(info.Status),
 		FailCount:    info.FailCount,
 		LastError:    info.LastError,
 	}
+	if info.Status == backend.ProvisionStatusRetained {
+		if !info.RetainedUntil.IsZero() {
+			response.RetainedUntil = info.RetainedUntil.Format(time.RFC3339)
+		}
+		response.Items = info.Items
+		response.RestoreHint = restoreHint
+	}
 
 	slog.Info("lease provision info served",
 		"lease_uuid", leaseUUID,
-		"tenant", auth.Token.Tenant,
+		"tenant", token.Tenant,
 		"status", info.Status,
-		"backend", backendClient.Name(),
+		"backend", info.BackendName,
 	)
 
 	writeJSON(w, response, http.StatusOK)

@@ -27,7 +27,10 @@ type CallbackEntry struct {
 	Status      backend.CallbackStatus `json:"status,omitempty"`
 	Backend     string                 `json:"backend,omitempty"`
 	Error       string                 `json:"error,omitempty"`
-	CreatedAt   time.Time              `json:"created_at"`
+	// Retained persists the best-effort deprovision retain-success flag so a
+	// restart-replayed callback keeps it. Legacy entries default to false.
+	Retained  bool      `json:"retained,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // CallbackStore persists pending callbacks in bbolt so they survive restarts.

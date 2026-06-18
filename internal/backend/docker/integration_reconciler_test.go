@@ -912,6 +912,22 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "recon-restore-sentinel")
 
+	// 3b. ENG-329 Part A on the REAL auto-close path: after the reconciler orphan
+	// sweep soft-deletes (the actual ENG-329 trigger — lease vanished from chain),
+	// GetProvision must surface the queryable retention status so the offline
+	// tenant can self-serve. This is the key new behavior exercised end-to-end.
+	rec0, err := env.backend.retentionStore.Get(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, rec0)
+	info, err := env.backend.GetProvision(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.Equal(t, backend.ProvisionStatusRetained, info.Status, "auto-closed + retained lease must report retained via GetProvision")
+	assert.False(t, info.RetainedUntil.IsZero(), "retained provision must carry a RetainedUntil deadline")
+	assert.Equal(t, rec0.CreatedAt.Add(env.backend.cfg.RetentionMaxAge), info.RetainedUntil, "RetainedUntil = CreatedAt + RetentionMaxAge")
+	assert.Equal(t, tenant, info.Tenant, "Tenant must be populated for the closed-lease authz fallback")
+	require.NotEmpty(t, info.Items, "retained provision must carry the restore-shape Items")
+
 	// 4. Restore into a NEW lease.
 	newLease := fmt.Sprintf("recon-restore-new-%d", time.Now().UnixNano())
 	require.NoError(t, env.backend.Restore(ctx, backend.RestoreRequest{

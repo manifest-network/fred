@@ -206,6 +206,7 @@ func (b *Backend) runStubProvisioner(p *provision) {
 		b.cfg.Name,
 		backend.CallbackStatusFailed,
 		stubProvisionerErrMsg,
+		false, // k3s stub never retains
 	)
 }
 
