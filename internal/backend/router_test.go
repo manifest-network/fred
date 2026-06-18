@@ -3,8 +3,11 @@ package backend
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -591,4 +594,175 @@ func (c *contextAwareBackend) Health(ctx context.Context) error {
 
 func (c *contextAwareBackend) Name() string {
 	return c.name
+}
+
+func newLeastLoadedRouter(t *testing.T, ratios map[string]float64) (*Router, map[string]*MockBackend) {
+	t.Helper()
+	backends := make(map[string]*MockBackend, len(ratios))
+	var entries []BackendEntry
+	first := true
+	// Deterministic order for IsDefault assignment.
+	for _, name := range []string{"b1", "b2", "b3"} {
+		r, ok := ratios[name]
+		if !ok {
+			continue
+		}
+		mb := NewMockBackend(MockBackendConfig{Name: name})
+		mb.SetLoadStats(&LoadStats{TotalCPUCores: 100, AllocatedCPUCores: r * 100})
+		backends[name] = mb
+		entries = append(entries, BackendEntry{
+			Backend:   mb,
+			Match:     MatchCriteria{SKUs: []string{"s"}},
+			IsDefault: first,
+		})
+		first = false
+	}
+	router, err := NewRouter(RouterConfig{Backends: entries})
+	require.NoError(t, err)
+	return router, backends
+}
+
+func TestRouter_RouteForProvision_LeastLoaded(t *testing.T) {
+	router, _ := newLeastLoadedRouter(t, map[string]float64{"b1": 0.8, "b2": 0.2, "b3": 0.5})
+	got := router.RouteForProvision(context.Background(), "s", nil)
+	assert.Equal(t, "b2", got.Name())
+}
+
+func TestRouter_RouteForProvision_TieBrokenByInFlight(t *testing.T) {
+	router, _ := newLeastLoadedRouter(t, map[string]float64{"b1": 0.5, "b2": 0.5})
+	got := router.RouteForProvision(context.Background(), "s", map[string]int{"b1": 3, "b2": 0})
+	assert.Equal(t, "b2", got.Name(), "equal ratio → fewer in-flight wins")
+}
+
+func TestRouter_RouteForProvision_SingleAndNoMatch(t *testing.T) {
+	b1 := NewMockBackend(MockBackendConfig{Name: "b1"})
+	def := NewMockBackend(MockBackendConfig{Name: "def"})
+	router, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+		{Backend: def, Match: MatchCriteria{SKUs: []string{"other"}}, IsDefault: true},
+		{Backend: b1, Match: MatchCriteria{SKUs: []string{"s"}}},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "b1", router.RouteForProvision(context.Background(), "s", nil).Name())
+	assert.Equal(t, "def", router.RouteForProvision(context.Background(), "nope", nil).Name())
+}
+
+func TestRouter_RouteForProvision_FallbackToRoundRobinWhenNoStats(t *testing.T) {
+	b1 := NewMockBackend(MockBackendConfig{Name: "b1"}) // no SetLoadStats → nil
+	b2 := NewMockBackend(MockBackendConfig{Name: "b2"})
+	router, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+		{Backend: b1, Match: MatchCriteria{SKUs: []string{"s"}}, IsDefault: true},
+		{Backend: b2, Match: MatchCriteria{SKUs: []string{"s"}}},
+	}})
+	require.NoError(t, err)
+	seen := map[string]int{}
+	for i := 0; i < 100; i++ {
+		seen[router.RouteForProvision(context.Background(), "s", nil).Name()]++
+	}
+	assert.Greater(t, seen["b1"], 0)
+	assert.Greater(t, seen["b2"], 0)
+}
+
+// statsErrBackend wraps a MockBackend to make GetLoadStats fail or block on the
+// context, exercising RouteForProvision's degraded paths (a real backend's
+// GetLoadStats can return ErrCircuitOpen / a transport error / a deadline error;
+// MockBackend alone never can). Test-only; no production code changes.
+type statsErrBackend struct {
+	*MockBackend
+	err      error // returned from GetLoadStats when non-nil
+	blockCtx bool  // when true, GetLoadStats waits for ctx and returns ctx.Err()
+}
+
+func (b *statsErrBackend) GetLoadStats(ctx context.Context) (*LoadStats, error) {
+	if b.blockCtx {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return nil, b.err
+}
+
+func TestRouter_RouteForProvision_PartialFailurePicksHealthy(t *testing.T) {
+	// One candidate's stats error out; the only usable candidate must be chosen
+	// (NOT round-robin fallback) even though its ratio is high.
+	good := NewMockBackend(MockBackendConfig{Name: "good"})
+	good.SetLoadStats(&LoadStats{TotalCPUCores: 10, AllocatedCPUCores: 9}) // ratio 0.9, but only usable one
+	bad := &statsErrBackend{
+		MockBackend: NewMockBackend(MockBackendConfig{Name: "bad"}),
+		err:         errors.New("circuit open"),
+	}
+	router, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+		{Backend: good, Match: MatchCriteria{SKUs: []string{"s"}}, IsDefault: true},
+		{Backend: bad, Match: MatchCriteria{SKUs: []string{"s"}}},
+	}})
+	require.NoError(t, err)
+	// Repeat: a buggy fallback would round-robin and eventually return "bad".
+	for i := 0; i < 50; i++ {
+		assert.Equal(t, "good", router.RouteForProvision(context.Background(), "s", nil).Name())
+	}
+}
+
+func TestRouter_RouteForProvision_AllErrorsFallBackAndCount(t *testing.T) {
+	fallback := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_routing_fallback_total", Help: "test"})
+	b1 := &statsErrBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "b1"}), err: errors.New("boom")}
+	b2 := &statsErrBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "b2"}), err: errors.New("boom")}
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: b1, Match: MatchCriteria{SKUs: []string{"s"}}, IsDefault: true},
+			{Backend: b2, Match: MatchCriteria{SKUs: []string{"s"}}},
+		},
+		RoutingFallback: fallback,
+	})
+	require.NoError(t, err)
+	seen := map[string]int{}
+	for i := 0; i < 50; i++ {
+		seen[router.RouteForProvision(context.Background(), "s", nil).Name()]++
+	}
+	assert.Greater(t, seen["b1"], 0, "all-error → round-robin distributes")
+	assert.Greater(t, seen["b2"], 0, "all-error → round-robin distributes")
+	assert.Equal(t, float64(50), promtestutil.ToFloat64(fallback), "every all-error decision increments the fallback counter")
+}
+
+func TestRouter_RouteForProvision_TimeoutExcludesSlowBackend(t *testing.T) {
+	// A backend that never returns stats within the deadline is excluded; the
+	// fast healthy backend is chosen. Deterministic via a short caller deadline
+	// (which dominates statsFetchTimeout) — no sleeps.
+	good := NewMockBackend(MockBackendConfig{Name: "good"})
+	good.SetLoadStats(&LoadStats{TotalCPUCores: 10, AllocatedCPUCores: 5})
+	slow := &statsErrBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "slow"}), blockCtx: true}
+	router, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+		{Backend: good, Match: MatchCriteria{SKUs: []string{"s"}}, IsDefault: true},
+		{Backend: slow, Match: MatchCriteria{SKUs: []string{"s"}}},
+	}})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	assert.Equal(t, "good", router.RouteForProvision(ctx, "s", nil).Name())
+}
+
+func TestRouter_RouteForProvision_ConcurrentBurstSpread(t *testing.T) {
+	// Identical ratio + zero in-flight everywhere → exact ties. The round-robin
+	// counter must spread the burst, not pile it onto one backend. Run with -race
+	// to validate the parallel /stats fan-out and counter concurrency.
+	router, _ := newLeastLoadedRouter(t, map[string]float64{"b1": 0.5, "b2": 0.5})
+	var mu sync.Mutex
+	seen := map[string]int{}
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b := router.RouteForProvision(context.Background(), "s", map[string]int{})
+			mu.Lock()
+			seen[b.Name()]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	// Deterministic, NOT statistical: the shared atomic counter hands out 200
+	// distinct indices (a permutation of 0..199) regardless of scheduling, so
+	// exactly half land on each tied backend. The -race coverage comes from the
+	// parallel /stats fan-out goroutines + the shared counter; the count split is
+	// scheduling-independent. (Asserting ==100 catches a regression that >50 would
+	// silently tolerate, e.g. replacing the shared counter with a per-goroutine source.)
+	assert.Equal(t, 100, seen["b1"], "exact-tie burst must split evenly via the RR counter")
+	assert.Equal(t, 100, seen["b2"], "exact-tie burst must split evenly via the RR counter")
 }

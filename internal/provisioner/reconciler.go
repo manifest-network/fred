@@ -58,7 +58,7 @@ type Reconciler struct {
 	acknowledger    Acknowledger // Routes acks through the batcher for parallel signing
 	backendRouter   BackendRouter
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
-	placementStore  PlacementStore    // Optional placement store for round-robin routing
+	placementStore  PlacementStore    // Optional placement store for backend routing
 
 	interval               time.Duration
 	maxWorkers             int         // Maximum concurrent workers for lease processing
@@ -82,7 +82,7 @@ type ReconcilerConfig struct {
 // NewReconciler creates a new reconciler.
 // The acknowledger (required) routes ack operations through the batcher for parallel signing.
 // The tracker parameter is optional - if nil, the reconciler will not coordinate with the event-driven path.
-// The placementStore parameter is optional - if nil, round-robin placement tracking is disabled.
+// The placementStore parameter is optional - if nil, placement tracking is disabled.
 func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, acknowledger Acknowledger, backendRouter BackendRouter, tracker ReconcilerTracker, placementStore PlacementStore) (*Reconciler, error) {
 	if chainClient == nil {
 		return nil, errors.New("chain client is required")
@@ -385,8 +385,12 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// Extract SKU for routing
 	sku := ExtractRoutingSKU(&lease)
 
-	// Route to appropriate backend using round-robin for load distribution
-	backendClient := r.backendRouter.RouteRoundRobin(sku)
+	// Route to appropriate backend using least-loaded selection
+	var inFlightByBackend map[string]int
+	if r.tracker != nil {
+		inFlightByBackend = r.tracker.InFlightCountsByBackend()
+	}
+	backendClient := r.backendRouter.RouteForProvision(ctx, sku, inFlightByBackend)
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}

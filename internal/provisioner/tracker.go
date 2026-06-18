@@ -64,6 +64,11 @@ type InFlightTracker interface {
 	// InFlightCount returns the number of provisions currently in flight.
 	InFlightCount() int
 
+	// InFlightCountsByBackend returns a snapshot of the number of in-flight
+	// provisions per backend name. Used by the router's burst guard to spread
+	// concurrent provisions that observe an identical backend load snapshot.
+	InFlightCountsByBackend() map[string]int
+
 	// GetInFlightLeases returns a snapshot of all in-flight lease UUIDs.
 	GetInFlightLeases() []string
 
@@ -183,6 +188,18 @@ func (t *DefaultInFlightTracker) InFlightCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.inFlight)
+}
+
+// InFlightCountsByBackend returns a snapshot of in-flight provision counts keyed
+// by backend name.
+func (t *DefaultInFlightTracker) InFlightCountsByBackend() map[string]int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	counts := make(map[string]int, len(t.inFlight))
+	for _, p := range t.inFlight {
+		counts[p.Backend]++
+	}
+	return counts
 }
 
 // GetInFlightLeases returns a snapshot of all in-flight lease UUIDs.

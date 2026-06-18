@@ -45,6 +45,7 @@ func (m *mockBenchBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID 
 func (m *mockBenchBackend) GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error) {
 	return nil, ErrNotProvisioned
 }
+func (m *mockBenchBackend) GetLoadStats(_ context.Context) (*LoadStats, error) { return nil, nil }
 
 // BenchmarkRouter_Route benchmarks SKU-based routing decisions.
 func BenchmarkRouter_Route(b *testing.B) {
