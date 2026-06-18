@@ -496,11 +496,17 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 func decodeRecord(v []byte) record {
 	if len(v) > 0 && v[0] == '{' {
 		var r record
-		if err := json.Unmarshal(v, &r); err == nil {
-			return r
+		if err := json.Unmarshal(v, &r); err != nil {
+			// First byte says JSON but it will not parse — a corrupt entry.
+			// Return an empty record (no backend, zero SetAt) so it reads as
+			// "no placement" and the pruner can clear it, rather than treating
+			// the raw bytes as a backend name.
+			slog.Warn("placement: dropping unparseable record", "error", err)
+			return record{}
 		}
-		// Corrupt JSON: fall through to legacy interpretation rather than drop.
+		return r
 	}
+	// Legacy pre-ENG-335 value: a raw backend name with no timestamp.
 	return record{Backend: string(v)}
 }
 
@@ -525,12 +531,15 @@ func (s *Store) SetAt(leaseUUID string) (time.Time, bool) {
 }
 
 // Set records a lease→backend mapping, stamping SetAt with the current clock.
-// Holds the write lock for the entire operation so concurrent reads never see
-// stale data.
+// SetAt is stored in UTC: t.UTC() canonicalizes storage AND strips the monotonic
+// clock reading, so the in-memory value matches the JSON-reloaded value exactly
+// (a time.Time keeps a monotonic reading that JSON drops; UTC removes it up front
+// so comparisons are consistent across a persist boundary). Holds the write lock
+// for the entire operation so concurrent reads never see stale data.
 func (s *Store) Set(leaseUUID, backendName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r := record{Backend: backendName, SetAt: s.now()}
+	r := record{Backend: backendName, SetAt: s.now().UTC()}
 	return s.put(leaseUUID, r)
 }
 
@@ -578,7 +587,7 @@ func (s *Store) SetBatch(placements map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := s.now()
+	now := s.now().UTC() // UTC: canonical + strips monotonic (see Set)
 	merged := make(map[string]record, len(placements))
 	for leaseUUID, backendName := range placements {
 		setAt := now
