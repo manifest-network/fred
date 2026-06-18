@@ -385,12 +385,12 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// Extract SKU for routing
 	sku := ExtractRoutingSKU(&lease)
 
-	// Route to appropriate backend using least-loaded selection
+	// Route to appropriate backend, honoring existing placement for restored/placed leases (ENG-333)
 	var inFlightByBackend map[string]int
 	if r.tracker != nil {
 		inFlightByBackend = r.tracker.InFlightCountsByBackend()
 	}
-	backendClient := r.backendRouter.RouteForProvision(ctx, sku, inFlightByBackend)
+	backendClient := routeForProvisionHonoringPlacement(ctx, r.backendRouter, r.placementStore, lease.Uuid, sku, inFlightByBackend)
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}

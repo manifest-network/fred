@@ -627,6 +627,51 @@ func (e *errorPlacementStore) SetBatch(placements map[string]string) error {
 	return e.mockPlacementStore.SetBatch(placements)
 }
 
+func TestOrchestrator_StartProvisioning_HonorsPlacement(t *testing.T) {
+	// When a placement record exists, StartProvisioning must route to the
+	// placement-pinned backend, not the least-loaded one (ENG-333).
+	pinned := &mockManagerBackend{name: "backend-pinned"}
+	leastLoaded := &mockManagerBackend{name: "backend-least"}
+
+	byName := map[string]backend.Backend{
+		"backend-pinned": pinned,
+		"backend-least":  leastLoaded,
+	}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend { return byName[name] },
+		// RouteForProvision would normally pick the least-loaded backend.
+		routeForProvisionFn: func(_ context.Context, _ string, _ map[string]int) backend.Backend {
+			return leastLoaded
+		},
+	}
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "backend-pinned")
+
+	tracker := NewInFlightTracker()
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, tracker, ps)
+
+	lease := &billingtypes.Lease{
+		Uuid:   "lease-1",
+		Tenant: "t",
+		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+
+	// The placement-pinned backend must have received the Provision call.
+	pinned.mu.Lock()
+	pinnedCalls := len(pinned.provisionCalls)
+	pinned.mu.Unlock()
+
+	leastLoaded.mu.Lock()
+	leastCalls := len(leastLoaded.provisionCalls)
+	leastLoaded.mu.Unlock()
+
+	assert.Equal(t, 1, pinnedCalls, "pinned backend must receive the Provision call")
+	assert.Equal(t, 0, leastCalls, "least-loaded backend must NOT receive the Provision call")
+}
+
 func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testing.T) {
 	mb := &mockManagerBackend{
 		name:         "test-backend",

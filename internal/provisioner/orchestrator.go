@@ -52,8 +52,8 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	sku := ExtractRoutingSKU(lease)
 	totalQuantity := TotalLeaseQuantity(lease)
 
-	// Route to appropriate backend using least-loaded selection
-	backendClient := o.router.RouteForProvision(ctx, sku, o.tracker.InFlightCountsByBackend())
+	// Route to appropriate backend, honoring existing placement for restored/placed leases (ENG-333)
+	backendClient := routeForProvisionHonoringPlacement(ctx, o.router, o.placementStore, lease.Uuid, sku, o.tracker.InFlightCountsByBackend())
 	if backendClient == nil {
 		slog.Error("no backend available for provisioning",
 			"lease_uuid", lease.Uuid,
@@ -136,6 +136,32 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	}
 
 	return nil
+}
+
+// routeForProvisionHonoringPlacement returns the backend that already holds the
+// lease's data (from placement) when one is recorded and reachable; otherwise it
+// falls back to least-loaded selection. This keeps a restored or already-placed
+// lease pinned to the backend with its volumes (ENG-333), preventing data drift
+// on re-provision/reconcile.
+func routeForProvisionHonoringPlacement(
+	ctx context.Context,
+	router BackendRouter,
+	placementStore PlacementStore,
+	leaseUUID, sku string,
+	inFlightByBackend map[string]int,
+) backend.Backend {
+	if placementStore != nil {
+		if name := placementStore.Get(leaseUUID); name != "" {
+			if b := router.GetBackendByName(name); b != nil {
+				return b
+			}
+			slog.Warn("placement backend not found, falling back to least-loaded routing",
+				"lease_uuid", leaseUUID,
+				"placement_backend", name,
+			)
+		}
+	}
+	return router.RouteForProvision(ctx, sku, inFlightByBackend)
 }
 
 // DeletePlacement removes the placement record for a lease. Called when a

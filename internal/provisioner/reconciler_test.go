@@ -3464,3 +3464,50 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 	assert.True(t, okLeaseProvisioned,
 		"the non-panicking lease must still be processed; one bad lease must not block others")
 }
+
+func TestReconciler_doStartProvisioning_HonorsPlacement(t *testing.T) {
+	// When a placement record exists, doStartProvisioning (via ReconcileAll) must
+	// route to the placement-pinned backend, not the least-loaded default (ENG-333).
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+
+	// pinned is NOT the router default — without placement it would be bypassed.
+	pinned := &mockReconcilerBackend{name: "backend-pinned"}
+	// leastLoaded is the router default — what would be chosen without placement.
+	leastLoaded := &mockReconcilerBackend{name: "backend-least"}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: pinned, Match: backend.MatchCriteria{SKUs: []string{"pinned-only-sku"}}},
+			{Backend: leastLoaded, IsDefault: true},
+		},
+	})
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "backend-pinned")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	// The placement-pinned backend must have received the Provision call.
+	pinned.mu.Lock()
+	pinnedCalls := len(pinned.provisionCalls)
+	pinned.mu.Unlock()
+
+	leastLoaded.mu.Lock()
+	leastCalls := len(leastLoaded.provisionCalls)
+	leastLoaded.mu.Unlock()
+
+	assert.Equal(t, 1, pinnedCalls, "pinned backend must receive the Provision call")
+	assert.Equal(t, 0, leastCalls, "least-loaded (default) backend must NOT receive the Provision call")
+}
