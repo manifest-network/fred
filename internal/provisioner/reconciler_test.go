@@ -3511,3 +3511,31 @@ func TestReconciler_doStartProvisioning_HonorsPlacement(t *testing.T) {
 	assert.Equal(t, 1, pinnedCalls, "pinned backend must receive the Provision call")
 	assert.Equal(t, 0, leastCalls, "least-loaded (default) backend must NOT receive the Provision call")
 }
+
+func TestReconciler_SyncsPlacementFromRetentions(t *testing.T) {
+	// Setup: A backend with a retained lease. Chain returns no leases (so the
+	// retained UUID cannot come from active-provision syncing — it must come
+	// from the new fetchAllRetentions path).
+	mb := backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"})
+	mb.SetRetentions([]backend.RetainedLease{{LeaseUUID: "retained-1"}})
+	// ListProvisions returns empty (no active provisions) so "retained-1"
+	// can only appear in the placement store via the retentions path.
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	ps := &mockPlacementStore{}
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+
+	assert.Equal(t, "backend-a", ps.Get("retained-1"),
+		"reconciler must derive placement for a retained lease")
+}

@@ -197,17 +197,30 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 	slog.Info("fetched backend provisions", "total", len(allProvisions))
 
+	// Retained leases also pin a backend (restore affinity, ENG-333). Derive
+	// their placement from ground truth alongside active provisions.
+	allRetentions, retentionsComplete := r.fetchAllRetentions(ctx)
+	slog.Info("fetched backend retentions", "total", len(allRetentions), "complete", retentionsComplete)
+	_ = retentionsComplete // used by placement pruning in a later task
+
 	// Sync placements from actual backend state (handles cold start and drift).
 	// NOTE: This only adds/updates — it never prunes stale records for leases
 	// that completed while fred was down. A naive prune is unsafe because a
 	// concurrent StartProvisioning may have just Set a placement that backends
 	// haven't reported yet. Stale records are harmless (reads fall back to SKU
 	// routing) and grow only by the number of leases that close during downtime.
-	if r.placementStore != nil && len(allProvisions) > 0 {
-		placements := make(map[string]string, len(allProvisions))
+	if r.placementStore != nil && (len(allProvisions) > 0 || len(allRetentions) > 0) {
+		placements := make(map[string]string, len(allProvisions)+len(allRetentions))
 		for leaseUUID, provision := range allProvisions {
 			if provision.BackendName != "" {
 				placements[leaseUUID] = provision.BackendName
+			}
+		}
+		// Retained leases pin their backend too. Active provisions take precedence
+		// (if a stale retention races a fresh provision, the provision wins).
+		for leaseUUID, backendName := range allRetentions {
+			if _, isActive := placements[leaseUUID]; !isActive {
+				placements[leaseUUID] = backendName
 			}
 		}
 		if len(placements) > 0 {
@@ -665,6 +678,57 @@ func (r *Reconciler) fetchAllProvisions(ctx context.Context) (map[string]backend
 	}
 
 	return allProvisions, nil
+}
+
+// fetchAllRetentions queries every backend's retained leases in parallel,
+// returning leaseUUID→backendName and whether ALL backends answered
+// successfully. The complete flag gates placement pruning (a later task): a
+// partial result must never prune (a transient backend outage would look like
+// "data gone"). For the additive placement SYNC, a partial result is fine.
+func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string, bool) {
+	backends := r.backendRouter.Backends()
+
+	var mu sync.Mutex
+	out := make(map[string]string)
+	complete := true
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(len(backends))
+	for _, b := range backends {
+		g.Go(func() (goErr error) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					slog.Error("reconciler retentions fetch panic — recovering",
+						"backend", b.Name(), "panic", rec, "stack", string(debug.Stack()))
+					mu.Lock()
+					complete = false
+					mu.Unlock()
+					goErr = nil
+				}
+			}()
+			// No RefreshState needed: ListRetentions reads the backend's persistent
+			// retention store (always current), unlike ListProvisions' in-memory state.
+			retentions, err := b.ListRetentions(gctx)
+			if err != nil {
+				slog.Warn("failed to list retentions from backend",
+					"backend", b.Name(), "error", err)
+				mu.Lock()
+				complete = false
+				mu.Unlock()
+				return nil // collect from other backends; don't cancel
+			}
+			mu.Lock()
+			for _, ret := range retentions {
+				out[ret.LeaseUUID] = b.Name()
+			}
+			mu.Unlock()
+			slog.Debug("fetched backend retentions", "backend", b.Name(), "count", len(retentions))
+			return nil
+		})
+	}
+	_ = g.Wait() // closures never return non-nil; errors captured via complete
+
+	return out, complete
 }
 
 // handleProvisionError handles errors from provisioning attempts during reconciliation.
