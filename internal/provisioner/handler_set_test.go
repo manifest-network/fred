@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/ThreeDotsLabs/watermill"
@@ -42,6 +43,7 @@ func (m *mockAcknowledger) Acknowledge(ctx context.Context, leaseUUID string) (b
 type mockPlacementStore struct {
 	mu         sync.Mutex
 	placements map[string]string
+	setAt      map[string]time.Time
 }
 
 func (m *mockPlacementStore) Get(leaseUUID string) string {
@@ -59,7 +61,13 @@ func (m *mockPlacementStore) Set(leaseUUID, backendName string) error {
 	if m.placements == nil {
 		m.placements = make(map[string]string)
 	}
+	if m.setAt == nil {
+		m.setAt = make(map[string]time.Time)
+	}
 	m.placements[leaseUUID] = backendName
+	if _, ok := m.setAt[leaseUUID]; !ok {
+		m.setAt[leaseUUID] = time.Now()
+	}
 	return nil
 }
 
@@ -75,10 +83,38 @@ func (m *mockPlacementStore) SetBatch(placements map[string]string) error {
 	if m.placements == nil {
 		m.placements = make(map[string]string)
 	}
+	if m.setAt == nil {
+		m.setAt = make(map[string]time.Time)
+	}
 	for k, v := range placements {
 		m.placements[k] = v
+		if _, ok := m.setAt[k]; !ok {
+			m.setAt[k] = time.Now()
+		}
 	}
 	return nil
+}
+
+func (m *mockPlacementStore) SetAt(leaseUUID string) (time.Time, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.setAt[leaseUUID]
+	return t, ok
+}
+
+// setWithTime sets a placement with an explicit first-seen time (test helper
+// for the reconciler grace-window tests).
+func (m *mockPlacementStore) setWithTime(leaseUUID, backendName string, t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.placements == nil {
+		m.placements = make(map[string]string)
+	}
+	if m.setAt == nil {
+		m.setAt = make(map[string]time.Time)
+	}
+	m.placements[leaseUUID] = backendName
+	m.setAt[leaseUUID] = t
 }
 
 func (m *mockPlacementStore) Count() int {
