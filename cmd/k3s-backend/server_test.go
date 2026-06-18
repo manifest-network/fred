@@ -109,6 +109,7 @@ type mockBackend struct {
 	LookupProvisionsFunc      func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	RestartFunc               func(ctx context.Context, req backend.RestartRequest) error
 	UpdateFunc                func(ctx context.Context, req backend.UpdateRequest) error
+	ListRetentionsFunc        func(ctx context.Context) ([]backend.RetainedLease, error)
 	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleasesFunc           func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	HealthFunc                func(ctx context.Context) error
@@ -176,6 +177,13 @@ func (m *mockBackend) Update(ctx context.Context, req backend.UpdateRequest) err
 		panic("mockBackend.Update called but not configured")
 	}
 	return m.UpdateFunc(ctx, req)
+}
+
+func (m *mockBackend) ListRetentions(ctx context.Context) ([]backend.RetainedLease, error) {
+	if m.ListRetentionsFunc == nil {
+		panic("mockBackend.ListRetentions called but not configured")
+	}
+	return m.ListRetentionsFunc(ctx)
 }
 
 func (m *mockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
