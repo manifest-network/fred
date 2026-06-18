@@ -210,11 +210,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	}
 
 	// Sync placements from actual backend state (handles cold start and drift).
-	// NOTE: This only adds/updates — it never prunes stale records for leases
-	// that completed while fred was down. A naive prune is unsafe because a
-	// concurrent StartProvisioning may have just Set a placement that backends
-	// haven't reported yet. Stale records are harmless (reads fall back to SKU
-	// routing) and grow only by the number of leases that close during downtime.
+	// NOTE: This sync only adds/updates. Pruning of orphaned placements is done
+	// separately and gated — see cleanupOrphanedPlacements below. A naive prune
+	// HERE would be unsafe because a concurrent StartProvisioning may have just
+	// Set a placement that backends haven't reported yet; that race is exactly
+	// why the pruner gates on chain-terminal + absent-from-all-backends +
+	// not-in-flight rather than pruning during this additive sync.
 	if r.placementStore != nil && (len(allProvisions) > 0 || len(allRetentions) > 0) {
 		placements := make(map[string]string, len(allProvisions)+len(allRetentions))
 		for leaseUUID, provision := range allProvisions {

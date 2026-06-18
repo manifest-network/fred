@@ -175,9 +175,10 @@ func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
 
 // RecordRestorePlacement optimistically records the NEW lease's placement after
 // a successful restore (the new lease now lives on the backend that held the
-// source's retained data). Typed-nil safe. It deliberately does NOT delete the
-// source placement: restore is asynchronous (202 + adopt), so deleting source
-// state before the adopt confirms is a saga anti-pattern, and source-placement
+// source's retained data). No-op when no placement store is configured (nil
+// interface). It deliberately does NOT delete the source placement: restore is
+// asynchronous (202 + adopt), so deleting source state before the adopt confirms
+// is a saga anti-pattern, and source-placement
 // cleanup is owned solely by the reconciler (which prunes it once the retention
 // disappears from /retentions). This just closes the post-restore reconcile
 // window for the new lease (ENG-333).
