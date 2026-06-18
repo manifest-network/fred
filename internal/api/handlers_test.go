@@ -5372,3 +5372,162 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
 	assert.Equal(t, "no retained data found for that lease", errResp.Error)
 }
+
+// fakeRestoreRecorder captures the arguments passed to RecordRestorePlacement.
+type fakeRestoreRecorder struct {
+	newLease, backend string
+	called            bool
+}
+
+func (f *fakeRestoreRecorder) RecordRestorePlacement(n, b string) {
+	f.called, f.newLease, f.backend = true, n, b
+}
+
+// TestRestoreLease_RecorderCalledOnSuccess verifies that after a successful
+// restore the handler calls RecordRestorePlacement(newLeaseUUID, backendName)
+// on the injected RestorePlacementRecorder. The backend name must be that of
+// the source-placement backend ("backend-src"), not any arbitrary backend
+// (ENG-333).
+func TestRestoreLease_RecorderCalledOnSuccess(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	// A backend named "backend-src" that accepts the restore and returns 202.
+	srcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/restore" && r.Method == "POST" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		t.Errorf("unexpected request on src backend: %s %s", r.Method, r.URL.Path)
+	}))
+	defer srcServer.Close()
+
+	srcBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "backend-src",
+		BaseURL: srcServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: srcBackend, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// Placement maps the SOURCE lease to "backend-src".
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string {
+			if uuid == fromLeaseUUID {
+				return "backend-src"
+			}
+			return ""
+		},
+	}
+
+	recorder := &fakeRestoreRecorder{}
+
+	h := NewHandlers(HandlersConfig{
+		Client:          chainClient,
+		BackendRouter:   router,
+		PlacementLookup: placement,
+		RestoreRecorder: recorder,
+		ProviderUUID:    providerUUID,
+		Bech32Prefix:    "manifest",
+	})
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	resp := httptest.NewRecorder()
+	h.RestoreLease(resp, req)
+
+	require.Equal(t, http.StatusAccepted, resp.Code, "body: %s", resp.Body.String())
+	assert.True(t, recorder.called, "RecordRestorePlacement should have been called on success")
+	assert.Equal(t, leaseUUID, recorder.newLease, "recorder should receive the new lease UUID")
+	assert.Equal(t, "backend-src", recorder.backend, "recorder should receive the source-placement backend name")
+}
+
+// TestRestoreLease_RecorderNotCalledOnMissingSourcePlacement verifies that when
+// the source lease has no recorded placement (404, restore never reaches the
+// success path), the RestorePlacementRecorder is NOT invoked. The recorder must
+// only fire on a confirmed adopt, never on an error path (ENG-333).
+func TestRestoreLease_RecorderNotCalledOnMissingSourcePlacement(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no backend should be called when placement is missing: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// placementLookup always returns "" — no recorded placement for the source lease.
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string { return "" },
+	}
+
+	recorder := &fakeRestoreRecorder{}
+
+	h := NewHandlers(HandlersConfig{
+		Client:          chainClient,
+		BackendRouter:   router,
+		PlacementLookup: placement,
+		RestoreRecorder: recorder,
+		ProviderUUID:    providerUUID,
+		Bech32Prefix:    "manifest",
+	})
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	resp := httptest.NewRecorder()
+	h.RestoreLease(resp, req)
+
+	require.Equal(t, http.StatusNotFound, resp.Code, "body: %s", resp.Body.String())
+	assert.False(t, recorder.called, "RecordRestorePlacement must NOT be called when restore fails before the success path")
+}

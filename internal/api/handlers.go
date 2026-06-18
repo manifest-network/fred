@@ -46,6 +46,13 @@ type PlacementLookup interface {
 	Healthy() error
 }
 
+// RestorePlacementRecorder records the NEW lease's placement after a successful
+// restore (it adopts the source's backend). The source placement is left for the
+// reconciler to prune. Optional — when nil, the reconciler still converges (ENG-333).
+type RestorePlacementRecorder interface {
+	RecordRestorePlacement(newLeaseUUID, backendName string)
+}
+
 // Handlers contains HTTP request handlers.
 type Handlers struct {
 	client            ChainClient
@@ -53,6 +60,7 @@ type Handlers struct {
 	tokenTracker      TokenTrackerInterface
 	statusChecker     StatusChecker
 	placementLookup   PlacementLookup
+	restoreRecorder   RestorePlacementRecorder
 	eventBroker       *EventBroker
 	wsUpgrader        websocket.Upgrader
 	wsMaxMessageSize  int64         // max bytes the server will read from a client message on /events
@@ -66,10 +74,11 @@ type Handlers struct {
 type HandlersConfig struct {
 	Client          ChainClient
 	BackendRouter   *backend.Router
-	TokenTracker    TokenTrackerInterface // optional but recommended for replay attack protection
-	StatusChecker   StatusChecker         // optional but required for the /status endpoint
-	PlacementLookup PlacementLookup       // optional — used for routing reads to the correct backend
-	EventBroker     *EventBroker          // optional — if nil, the events endpoint will return 501
+	TokenTracker    TokenTrackerInterface    // optional but recommended for replay attack protection
+	StatusChecker   StatusChecker            // optional but required for the /status endpoint
+	PlacementLookup PlacementLookup          // optional — used for routing reads to the correct backend
+	RestoreRecorder RestorePlacementRecorder // optional — restore placement bookkeeping (ENG-333)
+	EventBroker     *EventBroker             // optional — if nil, the events endpoint will return 501
 	ProviderUUID    string
 	Bech32Prefix    string
 	CallbackBaseURL string // used for restart/update callbacks to the backend
@@ -83,6 +92,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		tokenTracker:    cfg.TokenTracker,
 		statusChecker:   cfg.StatusChecker,
 		placementLookup: cfg.PlacementLookup,
+		restoreRecorder: cfg.RestoreRecorder,
 		eventBroker:     cfg.EventBroker,
 		wsUpgrader: websocket.Upgrader{
 			// Allow all origins: this API is not browser-facing. Clients are
@@ -672,6 +682,14 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 			writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		}
 		return
+	}
+
+	// Adopt bookkeeping: optimistically record that the new lease now lives on the
+	// source's backend (closes the post-restore reconcile window). The SOURCE
+	// placement is intentionally left for the reconciler to prune once the
+	// retention is consumed — never deleted on this unconfirmed async step (ENG-333).
+	if h.restoreRecorder != nil {
+		h.restoreRecorder.RecordRestorePlacement(leaseUUID, backendClient.Name())
 	}
 
 	if h.eventBroker != nil {

@@ -698,3 +698,25 @@ func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testi
 	after := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("test-backend"))
 	assert.Equal(t, 1.0, after-before, "BackendInsufficientResourcesTotal should increment by 1")
 }
+
+// --- RecordRestorePlacement tests ---
+
+func TestOrchestrator_RecordRestorePlacement(t *testing.T) {
+	placements := &mockPlacementStore{}
+	_ = placements.Set("source-lease", "backend-a") // preserved across close
+
+	o := NewProvisionOrchestrator("prov-1", "http://cb", &mockBackendRouter{}, NewInFlightTracker(), placements)
+
+	o.RecordRestorePlacement("new-lease", "backend-a")
+
+	assert.Equal(t, "backend-a", placements.Get("new-lease"), "new lease adopts the restore backend")
+	// Source placement is NOT touched here — the reconciler prunes it once the
+	// retention is consumed (no premature delete on an unconfirmed async restore).
+	assert.Equal(t, "backend-a", placements.Get("source-lease"), "source placement left for the reconciler to prune")
+}
+
+func TestOrchestrator_RecordRestorePlacement_NilStore(t *testing.T) {
+	o := NewProvisionOrchestrator("prov-1", "http://cb", &mockBackendRouter{}, NewInFlightTracker(), nil)
+	// Must not panic with a nil placement store.
+	o.RecordRestorePlacement("new-lease", "backend-a")
+}

@@ -173,6 +173,24 @@ func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
 	}
 }
 
+// RecordRestorePlacement optimistically records the NEW lease's placement after
+// a successful restore (the new lease now lives on the backend that held the
+// source's retained data). Typed-nil safe. It deliberately does NOT delete the
+// source placement: restore is asynchronous (202 + adopt), so deleting source
+// state before the adopt confirms is a saga anti-pattern, and source-placement
+// cleanup is owned solely by the reconciler (which prunes it once the retention
+// disappears from /retentions). This just closes the post-restore reconcile
+// window for the new lease (ENG-333).
+func (o *ProvisionOrchestrator) RecordRestorePlacement(newLeaseUUID, backendName string) {
+	if o.placementStore == nil {
+		return
+	}
+	if err := o.placementStore.Set(newLeaseUUID, backendName); err != nil {
+		slog.Warn("failed to record restore placement",
+			"lease_uuid", newLeaseUUID, "backend", backendName, "error", err)
+	}
+}
+
 // Deprovision handles deprovisioning a lease from the appropriate backend.
 // It tries to determine the backend in this order:
 //  0. From the placement store (most reliable for completed provisions)
