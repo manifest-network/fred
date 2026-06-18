@@ -818,16 +818,18 @@ func TestOrchestrator_RecordRestorePlacement(t *testing.T) {
 
 	o := NewProvisionOrchestrator("prov-1", "http://cb", newMockBackendRouter(), NewInFlightTracker(), placements)
 
-	o.RecordRestorePlacement("new-lease", "source-lease", "backend-a")
+	o.RecordRestorePlacement("new-lease", "backend-a")
 
-	assert.Equal(t, "backend-a", placements.Get("new-lease"), "new lease adopts the source backend")
-	assert.Equal(t, "", placements.Get("source-lease"), "source placement released on adopt")
+	assert.Equal(t, "backend-a", placements.Get("new-lease"), "new lease adopts the restore backend")
+	// Source placement is NOT touched here — the reconciler prunes it once the
+	// retention is consumed (no premature delete on an unconfirmed async restore).
+	assert.Equal(t, "backend-a", placements.Get("source-lease"), "source placement left for the reconciler to prune")
 }
 
 func TestOrchestrator_RecordRestorePlacement_NilStore(t *testing.T) {
 	o := NewProvisionOrchestrator("prov-1", "http://cb", newMockBackendRouter(), NewInFlightTracker(), nil)
 	// Must not panic with a nil placement store.
-	o.RecordRestorePlacement("new-lease", "source-lease", "backend-a")
+	o.RecordRestorePlacement("new-lease", "backend-a")
 }
 ```
 
@@ -841,12 +843,15 @@ Expected: compile failure — `RecordRestorePlacement` undefined.
 In `internal/provisioner/orchestrator.go`, after `DeletePlacement` (~line 148), add:
 
 ```go
-// RecordRestorePlacement records placement bookkeeping after a successful
-// restore: the new lease adopts the backend that held the source's retained
-// data, and the source lease's placement is released. Typed-nil safe. The
-// reconciler converges to the same state from backend ground truth; this just
-// closes the post-restore reconcile window (ENG-333).
-func (o *ProvisionOrchestrator) RecordRestorePlacement(newLeaseUUID, sourceLeaseUUID, backendName string) {
+// RecordRestorePlacement optimistically records the NEW lease's placement after
+// a successful restore (the new lease now lives on the backend that held the
+// source's retained data). Typed-nil safe. It deliberately does NOT delete the
+// source placement: restore is asynchronous (202 + adopt), so deleting source
+// state before the adopt confirms is a saga anti-pattern, and source-placement
+// cleanup is owned solely by the reconciler (which prunes it once the retention
+// disappears from /retentions). This just closes the post-restore reconcile
+// window for the new lease (ENG-333).
+func (o *ProvisionOrchestrator) RecordRestorePlacement(newLeaseUUID, backendName string) {
 	if o.placementStore == nil {
 		return
 	}
@@ -854,7 +859,6 @@ func (o *ProvisionOrchestrator) RecordRestorePlacement(newLeaseUUID, sourceLease
 		slog.Warn("failed to record restore placement",
 			"lease_uuid", newLeaseUUID, "backend", backendName, "error", err)
 	}
-	o.placementStore.Delete(sourceLeaseUUID)
 }
 ```
 
@@ -865,11 +869,11 @@ In `internal/api/handlers.go`:
 (a) After the `PlacementLookup` interface (~line 47), add:
 
 ```go
-// RestorePlacementRecorder records placement bookkeeping after a successful
-// restore (new lease adopts the source's backend; source placement released).
-// Optional — when nil, the reconciler still converges (ENG-333).
+// RestorePlacementRecorder records the NEW lease's placement after a successful
+// restore (it adopts the source's backend). The source placement is left for the
+// reconciler to prune. Optional — when nil, the reconciler still converges (ENG-333).
 type RestorePlacementRecorder interface {
-	RecordRestorePlacement(newLeaseUUID, sourceLeaseUUID, backendName string)
+	RecordRestorePlacement(newLeaseUUID, backendName string)
 }
 ```
 
@@ -894,11 +898,12 @@ type RestorePlacementRecorder interface {
 (e) In `RestoreLease`, after the `backendClient.Restore(...)` call returns success (after the `if err != nil { ... }` block, before/around the `h.eventBroker` publish, ~line 627), add:
 
 ```go
-	// Adopt bookkeeping: the new lease now lives on the source's backend; release
-	// the source placement. Owned by the orchestrator (state owner); the
-	// reconciler converges to the same regardless (ENG-333).
+	// Adopt bookkeeping: optimistically record that the new lease now lives on the
+	// source's backend (closes the post-restore reconcile window). The SOURCE
+	// placement is intentionally left for the reconciler to prune once the
+	// retention is consumed — never deleted on this unconfirmed async step (ENG-333).
 	if h.restoreRecorder != nil {
-		h.restoreRecorder.RecordRestorePlacement(leaseUUID, body.FromLeaseUUID, backendClient.Name())
+		h.restoreRecorder.RecordRestorePlacement(leaseUUID, backendClient.Name())
 	}
 ```
 
@@ -920,16 +925,16 @@ In `internal/api/server.go`:
 
 - [ ] **Step 6: Write + run an API test for the recorder call**
 
-Add to `internal/api/handlers_test.go` a test that injects a fake `RestorePlacementRecorder` (records its args) and asserts that after a successful restore it was called with `(newLease, sourceLease, "backend-src")`. Mirror `TestRestoreLease_RoutesToSourcePlacementBackend` for setup.
+Add to `internal/api/handlers_test.go` a test that injects a fake `RestorePlacementRecorder` (records its args) and asserts that after a successful restore it was called with `(newLease, "backend-src")`. Mirror `TestRestoreLease_RoutesToSourcePlacementBackend` for setup.
 
 ```go
 type fakeRestoreRecorder struct {
-	newLease, sourceLease, backend string
-	called                        bool
+	newLease, backend string
+	called            bool
 }
 
-func (f *fakeRestoreRecorder) RecordRestorePlacement(n, s, b string) {
-	f.called, f.newLease, f.sourceLease, f.backend = true, n, s, b
+func (f *fakeRestoreRecorder) RecordRestorePlacement(n, b string) {
+	f.called, f.newLease, f.backend = true, n, b
 }
 ```
 
@@ -1321,7 +1326,7 @@ In `internal/provisioner/orchestrator.go`, near the top (after imports), add:
 // Compile-time check that the orchestrator can serve as the API's restore
 // placement recorder (ENG-333).
 var _ interface {
-	RecordRestorePlacement(newLeaseUUID, sourceLeaseUUID, backendName string)
+	RecordRestorePlacement(newLeaseUUID, backendName string)
 } = (*ProvisionOrchestrator)(nil)
 ```
 
@@ -1390,7 +1395,7 @@ Expected: no new findings. (Watch for `misspell` and unused-parameter lints, as 
 |-----------|------|
 | Restore routes to the backend holding the source lease's retained data, independent of new-lease routing | 6 (resolve via source placement) + 1/2/3/8 (placement populated from retentions) |
 | Source lease's placement survives a retain-close | 4 (stop deleting on deprovision) |
-| Source placement cleaned up on adopt-success | 7 (`RecordRestorePlacement`) |
+| Source placement cleaned up on adopt-success | 9 (reconciler prunes once the retention is consumed — NOT deleted synchronously on the unconfirmed async restore) |
 | Source placement cleaned up on grace-reap | 8/9 (reconciler re-derives, then prunes when retention gone) |
 | Source has no retained placement ⇒ `ErrNotRetained` (404), unchanged | 6 (`resolveBackendByPlacement` → 404, no SKU fallback) |
 | Restart/reconcile of a restored lease stays on the same backend | 5 (honor placement before `RouteForProvision`) |
@@ -1400,6 +1405,7 @@ Expected: no new findings. (Watch for `misspell` and unused-parameter lints, as 
 
 - **No `Backend.Deprovision` signature change** (interface-segregation/YAGNI). Placement survives close by deletion-removal (Task 4); the reconciler is the sole pruner (Task 9).
 - **Pruning is gated** to answer the documented additive-only race (Task 9 gates: retentionsComplete + absent-from-backends + not-in-flight + chain-terminal). Provisions completeness is guaranteed because `fetchAllProvisions` aborts reconciliation on any backend error.
-- **Edge optimizations justified by the 5-minute reconcile interval** (`reconciler.go:104`): Task 4 (placement survives close, no post-close window) and Task 7 (post-restore placement write, no post-restore window). The reconciler converges regardless.
-- **Type consistency:** `RetainedLease{LeaseUUID string}`, `ListRetentionsResponse{Retentions []RetainedLease}`, `ListRetentions(ctx) ([]RetainedLease, error)`, `RecordRestorePlacement(new, source, backend string)`, `routeForProvisionHonoringPlacement(...)`, `resolveBackendByPlacement(leaseUUID)`, `RestorePlacementRecorder` — used consistently across tasks.
+- **Edge optimizations justified by the 5-minute reconcile interval** (`reconciler.go:104`): Task 4 (placement survives close, no post-close window) and Task 7 (post-restore placement write for the NEW lease, no post-restore window). The reconciler converges regardless.
+- **No premature source-placement deletion (saga / single-ownership):** Task 7 only `Set`s the new lease's placement; it never deletes `placement[source]`. Restore is async (202 + adopt), so deleting source state before the adopt confirms would 404 a retry on adopt-failure (retention reverts to active). Source-placement deletion is owned **solely** by the reconciler prune (Task 9), which fires once the retention disappears from `/retentions`. This also avoids two owners for the same deletion.
+- **Type consistency:** `RetainedLease{LeaseUUID string}`, `ListRetentionsResponse{Retentions []RetainedLease}`, `ListRetentions(ctx) ([]RetainedLease, error)`, `RecordRestorePlacement(newLeaseUUID, backendName string)`, `routeForProvisionHonoringPlacement(...)`, `resolveBackendByPlacement(leaseUUID)`, `RestorePlacementRecorder` — used consistently across tasks.
 - **k3s parity:** k3s implements `ListRetentions` (empty) and exposes `GET /retentions` (empty) so a k3s backend in the pool does not disable pruning (which requires every backend to answer).

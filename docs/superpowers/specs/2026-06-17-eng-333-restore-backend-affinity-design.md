@@ -51,9 +51,9 @@ Confirmed root facts in current source (`origin/main` @ `8a7b895`, post ENG-325 
 - Prevents a restored (or any already-placed) lease drifting off its data. In the reconcile loop this is consistent because placement is synced from backend state **before** provisioning decisions (`reconciler.go:206` already runs first).
 
 ### #4 Restore-success bookkeeping (optimistic, owned by the orchestrator)
-- On successful `Restore`, optimistically record `placement[new_lease] = backend` and delete `placement[source]`.
-- **Justified by the 5-minute reconcile interval:** without it, a freshly-restored lease would mis-route reads/restarts for up to one sweep. **Owned by the orchestrator** (a small method the restore handler calls), not the API handler — the state owner does optimistic updates; the API layer stays a stateless router. Typed-nil safe.
-- The reconciler (#5) converges to the same result regardless, so this is purely a window-closer.
+- On a successful `Restore` (202 Accepted), optimistically record **only** `placement[new_lease] = backend`. Do **NOT** delete `placement[source]` here.
+- **Why not delete the source placement synchronously:** restore is asynchronous (202, then rides the restart/adopt machinery). Deleting source state on an unconfirmed step is a saga anti-pattern — if the adopt fails, the backend reverts the retention to active (data still present) but the source placement would be gone, 404-ing a retry until the reconciler re-derives it. It also gives source-placement deletion **two owners** (handler + reconciler), violating single-ownership. Source cleanup is owned **solely by the reconciler** (#5): once the adopt consumes the retention, the source drops from `/retentions`, is chain-terminal, and is on no backend → pruned. If the adopt fails, the retention reverts → source stays in `/retentions` → placement kept → retry works.
+- **Setting `placement[new]` is safe** (idempotent; the reconciler converges it to the same value) and **justified by the 5-minute reconcile interval** — without it a freshly-restored lease would mis-route reads/restarts for up to one sweep. **Owned by the orchestrator** (a small method the restore handler calls), not the API handler — the state owner does optimistic updates; the API layer stays a stateless router. Typed-nil safe.
 
 ### #5 Reconciler = single authority (derive from provisions ∪ retentions; sole pruner)
 - Add `GET /retentions` to backends (docker: from `RetentionStore.List()` → lease UUIDs; k3s: empty). New `Backend` method + `HTTPClient` + `MockBackend`.
@@ -70,7 +70,7 @@ Confirmed root facts in current source (`origin/main` @ `8a7b895`, post ENG-325 
 2. Close with retain → `B2.Deprovision` retains; orchestrator **does not delete** `placement[source]` (survives immediately; reconciler would also re-derive it from B2's `/retentions`).
 3. New PENDING lease **L_new**; `POST /v1/leases/L_new/restore {from_lease_uuid: source}`.
 4. Handler authenticates L_new, resolves `placement[source]=B2`, calls `B2.Restore(...)`.
-5. Success: orchestrator records `placement[L_new]=B2`, deletes `placement[source]`. Reconciler converges identically from B2's `/provisions` (L_new active) and `/retentions` (source consumed).
+5. Success (202): orchestrator records `placement[L_new]=B2` (optimistic). `placement[source]` is left alone — the reconciler prunes it once B2's `/retentions` no longer lists source (adopt consumed it). Reconciler converges identically from B2's `/provisions` (L_new active) and `/retentions` (source gone).
 6. Later re-provision/reconcile of L_new honors `placement[L_new]=B2`.
 7. Source never restored → grace-reaped on B2 → drops from `/retentions` → reconciler prunes `placement[source]` (terminal on chain + absent from all backends, full successful sweep).
 
@@ -90,7 +90,7 @@ Confirmed root facts in current source (`origin/main` @ `8a7b895`, post ENG-325 
 
 ## Acceptance criteria mapping
 - Restore routes to the source's backend, independent of new-lease routing → #2 (index from #1/#5).
-- Source placement survives retain-close; cleaned up on adopt-success → #1, #4; grace-reap → #5 (reconciler prune).
+- Source placement survives retain-close → #1; cleaned up on adopt-success AND grace-reap → #5 (reconciler prunes once the retention is consumed/reaped; never deleted synchronously on the unconfirmed async restore).
 - Source has no retained placement ⇒ `ErrNotRetained` (404) → #2.
 - Restart/reconcile of a restored lease stays on the same backend → #3.
 - loadtest scenarios 14/15/16 green → external validation.
