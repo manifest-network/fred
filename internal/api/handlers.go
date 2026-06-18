@@ -270,13 +270,14 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 // retained provision so a returning tenant knows how to recover their data.
 const restoreHint = "to restore before retained_until: create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
 
-// findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4) used to
-// locate a lease's holding backend. The lease→backend placement is deleted on
-// close, so the status query cannot rely on it: instead it queries GetProvision
-// across every backend that could hold the lease — RouteAll(sku) when the SKU is
-// known, else Backends() — and returns the first found provision (live or
-// retained). All non-holders return ErrNotProvisioned and are skipped; a single
-// backend is one call.
+// findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4): the
+// fallback used when placement can't resolve the holder. Placement is deleted on
+// close and only re-pinned for retained leases on the next reconcile tick (ENG-333
+// restore-affinity sync), so in the post-close window — and on placement-disabled
+// deployments — the holder is found by querying GetProvision across every backend
+// that could hold the lease: RouteAll(sku) when the SKU is known, else Backends().
+// Returns the first found provision (live or retained); non-holders return
+// ErrNotProvisioned and are skipped; a single backend is one call.
 //
 // Returns:
 //   - (info, nil)  when some backend holds the lease;
@@ -321,38 +322,34 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 }
 
 // findProvision locates a lease's provision, preferring an O(1) placement hit
-// before the bounded fan-out. For an ACTIVE lease the placement record resolves
-// the holding backend directly — a single GetProvision call — which is the
-// read-heavy common case. Only on an ACTUAL placement hit that yields a
-// provision is the fast path taken; a missing/stale placement, or
-// ErrNotProvisioned on the placed backend (the closed/retained case, where
-// placement was deleted on close), falls through to findProvisionAcrossBackends.
+// (via resolveBackendByPlacement) before the bounded fan-out. Placement resolves
+// the holder directly — a single GetProvision call — for ACTIVE leases and, since
+// ENG-333 re-pins retained leases for restore affinity, for retained leases too
+// once the reconciler has synced them. Only an actual placement hit that yields a
+// provision takes the fast path; a missing/stale placement, or ErrNotProvisioned
+// on the placed backend (e.g. just after close, before the retention→placement
+// sync), falls through to findProvisionAcrossBackends.
 //
-// Deliberately does NOT use resolveBackend: its Route(sku) fallback would query
-// a single, likely-wrong backend rather than fanning out across all candidates.
+// Uses resolveBackendByPlacement (not resolveBackend) so a placement miss goes
+// straight to the fan-out rather than guessing a single SKU-routed backend.
 func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
 	var fastErr error
-	if h.placementLookup != nil && h.backendRouter != nil {
-		if name := h.placementLookup.Get(leaseUUID); name != "" {
-			if b := h.backendRouter.GetBackendByName(name); b != nil {
-				info, err := b.GetProvision(ctx, leaseUUID)
-				if err == nil && info != nil {
-					// BackendName is json:"-", so HTTP backends leave it empty on
-					// the wire — stamp the answering backend so downstream
-					// logging/diagnostics identify it (mirrors reconciler.go:638).
-					info.BackendName = b.Name()
-					return info, nil
-				}
-				// Miss on the placed backend. ErrNotProvisioned (stale placement,
-				// e.g. a closed/retained lease whose placement was deleted) is
-				// benign — fall through to the fan-out. A GENUINE error must not be
-				// swallowed: retain it so it can be surfaced if the fan-out finds
-				// nothing and has no error of its own (preserves the 500-not-404
-				// error-surfacing contract).
-				if err != nil && !errors.Is(err, backend.ErrNotProvisioned) {
-					fastErr = err
-				}
-			}
+	if b := h.resolveBackendByPlacement(leaseUUID); b != nil {
+		info, err := b.GetProvision(ctx, leaseUUID)
+		if err == nil && info != nil {
+			// BackendName is json:"-", so HTTP backends leave it empty on the
+			// wire — stamp the answering backend so downstream logging/diagnostics
+			// identify it (mirrors reconciler.go:638).
+			info.BackendName = b.Name()
+			return info, nil
+		}
+		// Miss on the placed backend. ErrNotProvisioned (stale placement, or the
+		// post-close window before the retention→placement sync) is benign — fall
+		// through to the fan-out. A GENUINE error must NOT be swallowed: retain it
+		// so it can be surfaced if the fan-out finds nothing and has no error of
+		// its own (preserves the 500-not-404 error-surfacing contract).
+		if err != nil && !errors.Is(err, backend.ErrNotProvisioned) {
+			fastErr = err
 		}
 	}
 
