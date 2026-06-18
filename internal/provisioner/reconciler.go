@@ -201,7 +201,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// their placement from ground truth alongside active provisions.
 	allRetentions, retentionsComplete := r.fetchAllRetentions(ctx)
 	slog.Info("fetched backend retentions", "total", len(allRetentions), "complete", retentionsComplete)
-	_ = retentionsComplete // used by placement pruning in a later task
 
 	// Sync placements from actual backend state (handles cold start and drift).
 	// NOTE: This only adds/updates — it never prunes stale records for leases
@@ -228,6 +227,17 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				slog.Warn("failed to sync placements from backend state", "error", err)
 			}
 		}
+	}
+
+	// Snapshot of leases whose data lives on some backend (active or retained).
+	// Built BEFORE allProvisions is mutated by orphan detection below — the pruner
+	// needs the full pre-mutation set.
+	backendLeases := make(map[string]struct{}, len(allProvisions)+len(allRetentions))
+	for leaseUUID := range allProvisions {
+		backendLeases[leaseUUID] = struct{}{}
+	}
+	for leaseUUID := range allRetentions {
+		backendLeases[leaseUUID] = struct{}{}
 	}
 
 	// Check for cancellation before reconciliation loop
@@ -364,6 +374,11 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// 5. Clean up orphaned payloads (payloads for leases that are no longer pending)
 	orphanedPayloads := r.cleanupOrphanedPayloads(ctx, chainLeases)
 
+	// 6. Prune orphaned placements (ENG-333 — sole pruner; see cleanupOrphanedPlacements).
+	// Per-lease deletions are logged inside the method; the aggregate count is
+	// surfaced via the reconciliation-complete summary below.
+	prunedPlacements := r.cleanupOrphanedPlacements(ctx, chainLeases, backendLeases, retentionsComplete)
+
 	logFunc := slog.Info
 	if leaseErrorCount > 0 {
 		logFunc = slog.Warn
@@ -375,6 +390,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		"orphans", orphansCount,
 		"errors", leaseErrorCount,
 		"orphaned_payloads_cleaned", orphanedPayloads,
+		"orphaned_placements_pruned", prunedPlacements,
 	)
 
 	return nil
@@ -1119,6 +1135,60 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 		}
 	}
 
+	return cleaned
+}
+
+// cleanupOrphanedPlacements is the SOLE pruner of the placement index (ENG-333).
+// It deletes a placement only when ALL of these hold, so it never races a
+// concurrent StartProvisioning Set nor wipes valid placement on a backend
+// outage:
+//   - retentionsComplete: every backend answered ListRetentions this sweep
+//     (provisions completeness is already guaranteed — fetchAllProvisions aborts
+//     reconciliation on any backend error before we reach here);
+//   - the lease is absent from backendLeases (provisions ∪ retentions);
+//   - the lease is not in-flight (a just-Set placement the backends haven't
+//     reported yet — the exact race the old additive-only code avoided);
+//   - the lease is chain-terminal: absent from chainLeases, or present but
+//     neither PENDING nor ACTIVE (closed/rejected/expired).
+//
+// Returns the number of placements pruned.
+func (r *Reconciler) cleanupOrphanedPlacements(
+	ctx context.Context,
+	chainLeases map[string]billingtypes.Lease,
+	backendLeases map[string]struct{},
+	retentionsComplete bool,
+) int {
+	if r.placementStore == nil || !retentionsComplete {
+		return 0
+	}
+
+	cleaned := 0
+	for _, leaseUUID := range r.placementStore.List() {
+		if ctx.Err() != nil {
+			break
+		}
+		// Data still lives on a backend (active provision or retained) → keep.
+		if _, onBackend := backendLeases[leaseUUID]; onBackend {
+			continue
+		}
+		// A provision Set this placement moments ago; backends/chain may not
+		// reflect it yet → keep (the documented additive-only race).
+		if r.tracker != nil {
+			if _, inFlight := r.tracker.GetInFlight(leaseUUID); inFlight {
+				continue
+			}
+		}
+		// Keep if the lease is still PENDING/ACTIVE on chain (the reconciler's
+		// main loop owns re-provisioning those; pruning would race it).
+		if lease, exists := chainLeases[leaseUUID]; exists &&
+			(lease.State == billingtypes.LEASE_STATE_PENDING || lease.State == billingtypes.LEASE_STATE_ACTIVE) {
+			continue
+		}
+		// Chain-terminal, absent from all backends, not in-flight → orphan.
+		r.placementStore.Delete(leaseUUID)
+		cleaned++
+		slog.Info("reconcile: pruned orphaned placement", "lease_uuid", leaseUUID)
+	}
 	return cleaned
 }
 
