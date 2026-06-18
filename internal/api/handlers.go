@@ -203,6 +203,27 @@ func (h *Handlers) authenticateAndResolve(w http.ResponseWriter, r *http.Request
 	return auth, leaseUUID, b, true
 }
 
+// authenticateLease authenticates a lease request WITHOUT resolving a backend.
+// Restore uses this because it must resolve the backend from the SOURCE lease's
+// placement (read from the request body), not from the path-param (new) lease.
+func (h *Handlers) authenticateLease(w http.ResponseWriter, r *http.Request, checkReplay, requireActive bool) (auth *AuthenticatedRequest, leaseUUID string, ok bool) {
+	leaseUUID = r.PathValue("lease_uuid")
+
+	auth, status, err := h.AuthenticateLeaseRequest(r, leaseUUID, checkReplay, requireActive)
+	if err != nil {
+		writeError(w, err.Error(), status)
+		return nil, leaseUUID, false
+	}
+
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return nil, leaseUUID, false
+	}
+
+	return auth, leaseUUID, true
+}
+
 // resolveBackend determines the correct backend for a lease.
 // Checks placement first (handles round-robin routing), falls back to SKU routing.
 func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
@@ -218,6 +239,22 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 		}
 	}
 	return h.backendRouter.Route(sku)
+}
+
+// resolveBackendByPlacement returns the backend recorded in placement for the
+// given lease, or nil when there is no placement or the named backend is gone.
+// Unlike resolveBackend it never falls back to SKU routing — for restore, a
+// missing placement means "no retained data here", which must surface as 404,
+// not a guess at an arbitrary backend (ENG-333).
+func (h *Handlers) resolveBackendByPlacement(leaseUUID string) backend.Backend {
+	if h.placementLookup == nil || h.backendRouter == nil {
+		return nil
+	}
+	name := h.placementLookup.Get(leaseUUID)
+	if name == "" {
+		return nil
+	}
+	return h.backendRouter.GetBackendByName(name)
 }
 
 // ConnectionResponse represents the response for connection details.
@@ -562,7 +599,10 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 	// requireActive=FALSE: a fresh restore lease is PENDING (not yet active), so
 	// GetActiveLease would 404. Authenticate against GetLease.
-	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, false)
+	// We do NOT resolve a backend here — the backend must be the one that holds
+	// the SOURCE lease's retained data, which we discover from the request body
+	// (from_lease_uuid) via placementLookup, not from the new lease's placement.
+	auth, leaseUUID, ok := h.authenticateLease(w, r, true, false)
 	if !ok {
 		return
 	}
@@ -591,6 +631,15 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 	}
 	if !config.IsValidUUID(body.FromLeaseUUID) {
 		writeError(w, "from_lease_uuid is not a valid UUID", http.StatusBadRequest)
+		return
+	}
+
+	// Resolve the backend that holds the SOURCE lease's retained data. Restore
+	// is same-backend: the retained volumes live only where the source lease was
+	// provisioned (ENG-333). No placement / backend gone => no retained data here.
+	backendClient := h.resolveBackendByPlacement(body.FromLeaseUUID)
+	if backendClient == nil {
+		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 		return
 	}
 
