@@ -1218,10 +1218,12 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 		// a closed lease is never restored) — so we never prune within 2× the
 		// reconcile interval, comfortably longer than one sweep.
 		grace := 2 * r.interval
-		if setAt, ok := r.placementStore.SetAt(leaseUUID); ok && grace > 0 && now.Sub(setAt) < grace {
-			slog.Debug("reconcile: keeping placement within grace window",
-				"lease_uuid", leaseUUID, "age", now.Sub(setAt), "grace", grace)
-			continue
+		if setAt, ok := r.placementStore.SetAt(leaseUUID); ok && grace > 0 {
+			if age := now.Sub(setAt); age < grace {
+				slog.Debug("reconcile: keeping placement within grace window",
+					"lease_uuid", leaseUUID, "age", age, "grace", grace)
+				continue
+			}
 		}
 		// Chain-terminal, absent from all backends, not in-flight → orphan.
 		r.placementStore.Delete(leaseUUID)

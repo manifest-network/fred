@@ -263,11 +263,24 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			swept = append(swept, b.Name())
 		}
 	}
-	slog.Warn("deprovision swept all backends (placement unresolved, ENG-335)",
+	// Log level depends on whether an unresolved placement is expected. With the
+	// placement store disabled, the sweep is the normal resolution path for any
+	// not-in-flight close, so it is not anomalous — reserve WARN for actual
+	// backend failures and for the ENG-335 case where placement IS enabled but
+	// could not resolve the backend.
+	logArgs := []any{
 		"lease_uuid", leaseUUID,
 		"swept_ok_or_noop", swept,
 		"failed", failed,
-	)
+	}
+	switch {
+	case len(failed) > 0:
+		slog.Warn("deprovision swept all backends with failures", logArgs...)
+	case o.placementStore == nil:
+		slog.Info("deprovision swept all backends (placement store disabled)", logArgs...)
+	default:
+		slog.Warn("deprovision swept all backends (placement unresolved, ENG-335)", logArgs...)
+	}
 	// Placement is intentionally NOT deleted here (ENG-333); see resolved path.
 	if len(swept) == 0 && lastErr != nil {
 		return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, lastErr)
