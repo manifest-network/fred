@@ -103,8 +103,9 @@ type ServerDeps struct {
 	CallbackPublisher CallbackPublisher
 	PayloadPublisher  PayloadPublisher
 	StatusChecker     StatusChecker
-	PlacementLookup   PlacementLookup // Optional — if nil, placement routing is disabled.
-	EventBroker       *EventBroker    // Optional — if nil, the events endpoint returns 501.
+	PlacementLookup   PlacementLookup          // Optional — if nil, placement routing is disabled.
+	RestoreRecorder   RestorePlacementRecorder // Optional — restore placement bookkeeping (ENG-333).
+	EventBroker       *EventBroker             // Optional — if nil, the events endpoint returns 501.
 }
 
 // NewServer creates a new API server.
@@ -145,6 +146,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		TokenTracker:    tracker,
 		StatusChecker:   statusChecker,
 		PlacementLookup: placementLookup,
+		RestoreRecorder: deps.RestoreRecorder,
 		EventBroker:     eventBroker,
 		ProviderUUID:    cfg.ProviderUUID,
 		Bech32Prefix:    cfg.Bech32Prefix,

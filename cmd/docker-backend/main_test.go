@@ -545,6 +545,7 @@ type mockBackend struct {
 	RestartFunc               func(ctx context.Context, req backend.RestartRequest) error
 	UpdateFunc                func(ctx context.Context, req backend.UpdateRequest) error
 	RestoreFunc               func(ctx context.Context, req backend.RestoreRequest) error
+	ListRetentionsFunc        func(ctx context.Context) ([]backend.RetainedLease, error)
 	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleasesFunc           func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	HealthFunc                func(ctx context.Context) error
@@ -619,6 +620,13 @@ func (m *mockBackend) Restore(ctx context.Context, req backend.RestoreRequest) e
 		panic("mockBackend.Restore called but not configured")
 	}
 	return m.RestoreFunc(ctx, req)
+}
+
+func (m *mockBackend) ListRetentions(ctx context.Context) ([]backend.RetainedLease, error) {
+	if m.ListRetentionsFunc == nil {
+		panic("mockBackend.ListRetentions called but not configured")
+	}
+	return m.ListRetentionsFunc(ctx)
 }
 
 func (m *mockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
@@ -1579,6 +1587,58 @@ func TestRestore_InvalidCallbackURL(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "invalid callback_url")
+}
+
+func TestHandleListRetentions(t *testing.T) {
+	t.Run("success returns 200 with retentions", func(t *testing.T) {
+		mb := &mockBackend{
+			ListRetentionsFunc: func(context.Context) ([]backend.RetainedLease, error) {
+				return []backend.RetainedLease{{LeaseUUID: "ret-1"}}, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/retentions"))
+
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp backend.ListRetentionsResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		require.Len(t, resp.Retentions, 1)
+		assert.Equal(t, "ret-1", resp.Retentions[0].LeaseUUID)
+	})
+
+	t.Run("nil slice serializes as []", func(t *testing.T) {
+		mb := &mockBackend{
+			ListRetentionsFunc: func(context.Context) ([]backend.RetainedLease, error) {
+				return nil, nil
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/retentions"))
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), `"retentions":[]`)
+	})
+
+	t.Run("generic error returns 500", func(t *testing.T) {
+		mb := &mockBackend{
+			ListRetentionsFunc: func(context.Context) ([]backend.RetainedLease, error) {
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedGetRequest("/retentions"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+	})
+
+	t.Run("requires auth", func(t *testing.T) {
+		handler := newTestHandler()
+		req := httptest.NewRequest("GET", "/retentions", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		assert.Contains(t, w.Body.String(), "missing signature")
+	})
 }
 
 func TestHandleRestore(t *testing.T) {

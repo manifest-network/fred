@@ -46,6 +46,9 @@ func (m *mockBenchBackend) GetReleases(ctx context.Context, leaseUUID string) ([
 	return nil, ErrNotProvisioned
 }
 func (m *mockBenchBackend) GetLoadStats(_ context.Context) (*LoadStats, error) { return nil, nil }
+func (m *mockBenchBackend) ListRetentions(_ context.Context) ([]RetainedLease, error) {
+	return nil, nil
+}
 
 // BenchmarkRouter_Route benchmarks SKU-based routing decisions.
 func BenchmarkRouter_Route(b *testing.B) {

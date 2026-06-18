@@ -27,6 +27,9 @@ type MockBackend struct {
 	// loadStats is returned by GetLoadStats. nil = simulate a backend that
 	// exposes no usable load signal (exercises the router's round-robin fallback).
 	loadStats *LoadStats
+
+	// retentions is returned by ListRetentions. nil/empty = no retained leases.
+	retentions []RetainedLease
 }
 
 type mockProvision struct {
@@ -87,6 +90,23 @@ func (m *MockBackend) GetLoadStats(_ context.Context) (*LoadStats, error) {
 	}
 	cp := *m.loadStats
 	return &cp, nil
+}
+
+// SetRetentions configures the slice returned by ListRetentions.
+func (m *MockBackend) SetRetentions(r []RetainedLease) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retentions = r
+}
+
+// ListRetentions returns the configured retained leases (a copy), or an empty
+// non-nil slice when unset.
+func (m *MockBackend) ListRetentions(_ context.Context) ([]RetainedLease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]RetainedLease, len(m.retentions))
+	copy(out, m.retentions)
+	return out, nil
 }
 
 // Name returns the backend's name.

@@ -118,6 +118,10 @@ func (m *mockManagerBackend) GetLoadStats(_ context.Context) (*backend.LoadStats
 	return nil, nil
 }
 
+func (m *mockManagerBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	return nil, nil
+}
+
 func TestNewManager_Validation(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{

@@ -30,6 +30,7 @@ type mockReconcilerBackend struct {
 	mu                        sync.Mutex
 	name                      string
 	provisions                []backend.ProvisionInfo
+	retentions                []backend.RetainedLease // returned by ListRetentions
 	provisionCalls            []backend.ProvisionRequest
 	deprovisionCalls          []string
 	listProvisionsCalls       int
@@ -143,6 +144,17 @@ func (m *mockReconcilerBackend) GetReleases(ctx context.Context, leaseUUID strin
 
 func (m *mockReconcilerBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
 	return nil, nil
+}
+
+func (m *mockReconcilerBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.retentions) == 0 {
+		return nil, nil
+	}
+	out := make([]backend.RetainedLease, len(m.retentions))
+	copy(out, m.retentions)
+	return out, nil
 }
 
 func TestNewReconciler_Validation(t *testing.T) {
@@ -1519,6 +1531,10 @@ func (m *mockCancellingBackend) GetLoadStats(_ context.Context) (*backend.LoadSt
 	return nil, nil
 }
 
+func (m *mockCancellingBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
+	return nil, nil
+}
+
 func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
 	mockChain := &chaintest.MockClient{
@@ -1946,6 +1962,10 @@ func (m *mockConcurrencyBackend) GetReleases(ctx context.Context, leaseUUID stri
 }
 
 func (m *mockConcurrencyBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
+	return nil, nil
+}
+
+func (m *mockConcurrencyBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
 	return nil, nil
 }
 
@@ -2710,7 +2730,18 @@ func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
 }
 
 func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.T) {
-	// Setup: No lease on chain, provisioned on backend (orphan). Placement should be cleaned up.
+	// Setup: No lease on chain, provisioned on backend (orphan). The backend has no
+	// retention for this lease, so the placement should eventually be pruned.
+	//
+	// ENG-333: processOrphan no longer eagerly deletes placement. The gated pruner
+	// (cleanupOrphanedPlacements) is the sole owner. However, backendLeases is built
+	// from the pre-sweep snapshot (allProvisions ∪ allRetentions), so the orphan's
+	// lease UUID is present in backendLeases even after it is deprovisioned this
+	// sweep. The pruner therefore keeps the placement this sweep (gate b: "still on
+	// backend" = true in snapshot). It will be pruned on the NEXT sweep, when the
+	// backend no longer reports the provision and there is no retention.
+	// See TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement for the retained-
+	// lease case that ENG-333 was specifically designed to protect.
 	mockChain := &chaintest.MockClient{}
 	mb := &mockReconcilerBackend{
 		name: "test",
@@ -2734,11 +2765,26 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
-	assert.Empty(t, ps.Get("orphan-1"), "placement should be cleaned up after orphan deprovision")
+	// ENG-333: placement is NOT eagerly deleted by processOrphan anymore. It
+	// survives this sweep because the pre-sweep backendLeases snapshot still
+	// contains orphan-1 (it was in allProvisions at the start of RunOnce).
+	// The gated pruner will remove it on the next sweep once the backend no
+	// longer reports the provision and there is no retention.
+	assert.Equal(t, "test", ps.Get("orphan-1"), "placement survives the orphan-deprovision sweep (gated pruner owns deletion, ENG-333)")
 }
 
 func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
-	// Setup: Active lease, failed provision exhausted retries. After close, placement cleaned up.
+	// Setup: Active lease, failed provision exhausted retries. closeLease is called.
+	//
+	// ENG-333: cleanupTerminalLease (called by closeLease) no longer eagerly
+	// deletes placement. The gated pruner is the sole owner. In this sweep:
+	//   - backendLeases snapshot contains lease-1 (it was in allProvisions)
+	//   - chainLeases snapshot contains lease-1 as ACTIVE
+	// So the pruner keeps placement this sweep (both gate a and the chain-terminal
+	// gate protect it). It will be pruned on the NEXT sweep, once the chain
+	// reports the lease as closed/terminal and the backend no longer lists it.
+	// See TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement for the
+	// retained-lease case that ENG-333 was specifically designed to protect.
 	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
@@ -2776,7 +2822,65 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
-	assert.Empty(t, ps.Get("lease-1"), "placement should be cleaned up after lease close")
+	// ENG-333: placement is NOT eagerly deleted by cleanupTerminalLease anymore.
+	// It survives this sweep because the pre-sweep snapshots (backendLeases from
+	// allProvisions, chainLeases from chain) still contain lease-1. The gated
+	// pruner will remove it on the next sweep once the chain reports it as
+	// terminal and the backend no longer lists it (and no retention exists).
+	assert.Equal(t, "test", ps.Get("lease-1"), "placement survives the close-lease sweep (gated pruner owns deletion, ENG-333)")
+}
+
+// TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement verifies the
+// core ENG-333 invariant: when an orphan provision is deprovisioned and the
+// backend retains its data (RetainOnClose pool), the placement record must
+// survive the reconcile sweep so that a restore request can resolve the
+// correct backend.
+//
+// lease-ret is an orphan (provisioned, absent from chain) that the backend
+// ALSO retains. After the fix, processOrphan no longer eager-deletes its
+// placement, so the gated pruner sees it: it is in backendLeases (here via
+// BOTH allProvisions and allRetentions, since the mock's Deprovision is a
+// no-op that does not remove the entry from m.provisions), so gate (b) keeps
+// it. Pre-fix, processOrphan deleted the placement before the pruner ran and
+// this assertion would FAIL — that is what this test guards against. (The
+// retention-only gate-(b) path — placement kept because the lease is in
+// allRetentions but NOT allProvisions — is isolated separately by
+// TestReconciler_PrunesOrphanedPlacement / the Task 9 prune tests.)
+func TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement(t *testing.T) {
+	// Setup: lease-ret is an orphan (no chain lease) but the backend retains it.
+	mockChain := &chaintest.MockClient{}
+	mb := &mockReconcilerBackend{
+		name: "backend-a",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "lease-ret", Status: backend.ProvisionStatusReady, BackendName: "backend-a"},
+		},
+		// Simulate a RetainOnClose backend: Deprovision soft-deletes the data and
+		// ListRetentions returns the lease UUID to signal "data still here".
+		retentions: []backend.RetainedLease{
+			{LeaseUUID: "lease-ret"},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-ret", "backend-a")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	assert.NoError(t, reconciler.ReconcileAll(ctx))
+
+	// The placement MUST survive: the backend retained the lease's data, so
+	// restore affinity must remain intact (ENG-333). If this assertion fails,
+	// the eager delete was re-introduced or the gated pruner has a gate gap.
+	assert.Equal(t, "backend-a", ps.Get("lease-ret"),
+		"retained lease must keep its placement after orphan deprovision (ENG-333)")
 }
 
 // --- Gap tests: fetchAllProvisions, payload lifecycle, RefreshState ---
@@ -3451,4 +3555,367 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 	}
 	assert.True(t, okLeaseProvisioned,
 		"the non-panicking lease must still be processed; one bad lease must not block others")
+}
+
+func TestReconciler_doStartProvisioning_HonorsPlacement(t *testing.T) {
+	// When a placement record exists, doStartProvisioning (via ReconcileAll) must
+	// route to the placement-pinned backend, not the least-loaded default (ENG-333).
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+
+	// pinned is NOT the router default — without placement it would be bypassed.
+	pinned := &mockReconcilerBackend{name: "backend-pinned"}
+	// leastLoaded is the router default — what would be chosen without placement.
+	leastLoaded := &mockReconcilerBackend{name: "backend-least"}
+
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: pinned, Match: backend.MatchCriteria{SKUs: []string{"pinned-only-sku"}}},
+			{Backend: leastLoaded, IsDefault: true},
+		},
+	})
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "backend-pinned")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	// The placement-pinned backend must have received the Provision call.
+	pinned.mu.Lock()
+	pinnedCalls := len(pinned.provisionCalls)
+	pinned.mu.Unlock()
+
+	leastLoaded.mu.Lock()
+	leastCalls := len(leastLoaded.provisionCalls)
+	leastLoaded.mu.Unlock()
+
+	assert.Equal(t, 1, pinnedCalls, "pinned backend must receive the Provision call")
+	assert.Equal(t, 0, leastCalls, "least-loaded (default) backend must NOT receive the Provision call")
+}
+
+// --- Placement pruning tests (ENG-333) ---
+
+// statsErrRetentionBackend wraps MockBackend to make ListRetentions fail,
+// exercising the "retentionsComplete=false → no prune" gate.
+type statsErrRetentionBackend struct {
+	*backend.MockBackend
+}
+
+func (b *statsErrRetentionBackend) ListRetentions(context.Context) ([]backend.RetainedLease, error) {
+	return nil, errors.New("retentions unavailable")
+}
+
+// TestCleanupOrphanedPlacements_GateD is a white-box unit test that calls
+// cleanupOrphanedPlacements directly with hand-built maps. It isolates gate
+// (d) — the chain-terminal check — which the end-to-end reconciler tests
+// cannot exercise cleanly: an active-but-backend-absent lease takes the
+// anomaly re-provision path, which marks it in-flight and lets gate (c)
+// short-circuit before gate (d) is reached. Calling the method directly also
+// covers the otherwise-untested CLOSED-on-chain → prune branch.
+//
+// mockInFlightTracker (empty) is used because the Reconciler.tracker field is
+// typed ReconcilerTracker, which DefaultInFlightTracker does not implement.
+func TestCleanupOrphanedPlacements_GateD(t *testing.T) {
+	ps := &mockPlacementStore{}
+	ps.Set("active-chain-lease", "backend-a")  // ACTIVE on chain, absent from backends → keep (gate d)
+	ps.Set("pending-chain-lease", "backend-b") // PENDING on chain, absent from backends → keep (gate d)
+	ps.Set("closed-chain-lease", "backend-a")  // CLOSED on chain, absent from backends → prune
+	ps.Set("off-chain-lease", "backend-a")     // absent from chain entirely → prune
+
+	chainLeases := map[string]billingtypes.Lease{
+		"active-chain-lease":  {Uuid: "active-chain-lease", State: billingtypes.LEASE_STATE_ACTIVE},
+		"pending-chain-lease": {Uuid: "pending-chain-lease", State: billingtypes.LEASE_STATE_PENDING},
+		"closed-chain-lease":  {Uuid: "closed-chain-lease", State: billingtypes.LEASE_STATE_CLOSED},
+	}
+	backendLeases := map[string]struct{}{} // empty — none on a backend
+	tracker := newMockInFlightTracker(nil) // empty — none in-flight
+
+	// cleanupOrphanedPlacements reads ONLY r.placementStore and r.tracker (plus
+	// the passed-in maps), so this hand-built literal is safe. Any future change
+	// that makes the pruner read other Reconciler fields must set them here too,
+	// or this white-box test will nil-panic.
+	r := &Reconciler{placementStore: ps, tracker: tracker}
+	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true)
+
+	assert.Equal(t, 2, pruned)
+	assert.Equal(t, "backend-a", ps.Get("active-chain-lease"), "gate d: ACTIVE on chain must keep")
+	assert.Equal(t, "backend-b", ps.Get("pending-chain-lease"), "gate d: PENDING on chain must keep")
+	assert.Equal(t, "", ps.Get("closed-chain-lease"), "gate d: CLOSED on chain must prune")
+	assert.Equal(t, "", ps.Get("off-chain-lease"), "absent from chain must prune")
+}
+
+// TestReconciler_PrunesOrphanedPlacement verifies the happy-path prune:
+// a placement whose lease is absent from chain, all backends, and the
+// in-flight tracker is removed. A retained lease on the same backend
+// must survive.
+func TestReconciler_PrunesOrphanedPlacement(t *testing.T) {
+	// "gone-lease" has a placement but is on no backend, not in-flight,
+	// not on chain.  "retained-1" is still retained → must survive.
+	ps := &mockPlacementStore{}
+	ps.Set("gone-lease", "backend-a")
+	ps.Set("retained-1", "backend-a")
+
+	mb := backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"})
+	mb.SetRetentions([]backend.RetainedLease{{LeaseUUID: "retained-1"}})
+	// ListProvisions returns empty — gone-lease has no active provision.
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// Chain returns no leases → gone-lease is chain-terminal (absent).
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+
+	assert.Equal(t, "", ps.Get("gone-lease"), "orphan placement must be pruned")
+	assert.Equal(t, "backend-a", ps.Get("retained-1"), "retained lease placement must be kept")
+}
+
+// TestReconciler_DoesNotPruneOnIncompleteRetentions verifies gate (a):
+// when a backend's ListRetentions fails, retentionsComplete=false and no
+// placement must be pruned (a backend outage must not wipe valid placements).
+func TestReconciler_DoesNotPruneOnIncompleteRetentions(t *testing.T) {
+	ps := &mockPlacementStore{}
+	ps.Set("gone-lease", "backend-a")
+
+	failing := &statsErrRetentionBackend{
+		MockBackend: backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"}),
+	}
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: failing, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// Chain returns no leases → gone-lease would be chain-terminal, but
+	// retentionsComplete=false must block the prune entirely.
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+
+	assert.Equal(t, "backend-a", ps.Get("gone-lease"),
+		"placement must NOT be pruned when a backend's retentions could not be fetched (gate a)")
+}
+
+// TestReconciler_DoesNotPruneActiveOrInFlight verifies the in-flight gate (c)
+// end-to-end through ReconcileAll:
+//   - (c) inflight-lease is in the in-flight tracker → kept
+//
+// active-lease is also kept, but by gate (b): it is provisioned on the backend,
+// so it lands in allProvisions → backendLeases and is kept before gate (d) is
+// ever evaluated. Gate (d) (chain-terminal) is NOT exercised by this test — it
+// is covered directly by TestCleanupOrphanedPlacements_GateD. active-lease is
+// included here only to confirm a healthy provisioned+ACTIVE lease survives.
+func TestReconciler_DoesNotPruneActiveOrInFlight(t *testing.T) {
+	ps := &mockPlacementStore{}
+	ps.Set("active-lease", "backend-a")
+	ps.Set("inflight-lease", "backend-a")
+
+	// Use the test-local mockReconcilerBackend so we can pre-seed provisions.
+	// active-lease is provisioned+ready (kept by gate b); inflight-lease has no
+	// provision and is kept only by the in-flight gate (c).
+	mb := &mockReconcilerBackend{
+		name: "backend-a",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "active-lease", Status: backend.ProvisionStatusReady, BackendName: "backend-a"},
+		},
+	}
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// Inject in-flight tracker with inflight-lease already tracked.
+	tracker := newMockInFlightTracker(nil)
+	tracker.TrackInFlight("inflight-lease", "tenant-a", nil, "backend-a")
+
+	// Chain: active-lease is ACTIVE; inflight-lease is not on chain.
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "active-lease", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, tracker, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+
+	// active-lease: gate (b) — provisioned on the backend → placement kept.
+	assert.Equal(t, "backend-a", ps.Get("active-lease"),
+		"active provisioned lease placement must be kept (gate b)")
+	// inflight-lease: gate (c) — in-flight tracker → placement kept.
+	assert.Equal(t, "backend-a", ps.Get("inflight-lease"),
+		"in-flight lease placement must be kept (gate c)")
+}
+
+func TestReconciler_SyncsPlacementFromRetentions(t *testing.T) {
+	// Setup: A backend with a retained lease. Chain returns no leases (so the
+	// retained UUID cannot come from active-provision syncing — it must come
+	// from the new fetchAllRetentions path).
+	mb := backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"})
+	mb.SetRetentions([]backend.RetainedLease{{LeaseUUID: "retained-1"}})
+	// ListProvisions returns empty (no active provisions) so "retained-1"
+	// can only appear in the placement store via the retentions path.
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	ps := &mockPlacementStore{}
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+
+	assert.Equal(t, "backend-a", ps.Get("retained-1"),
+		"reconciler must derive placement for a retained lease")
+}
+
+// listRetentionsFailBackend fails the test if ListRetentions is ever called.
+// Used to prove the reconciler skips the retentions fetch when placement
+// tracking is disabled (nil placementStore), where the result would be unused.
+type listRetentionsFailBackend struct {
+	*backend.MockBackend
+	t *testing.T
+}
+
+func (b *listRetentionsFailBackend) ListRetentions(context.Context) ([]backend.RetainedLease, error) {
+	b.t.Errorf("ListRetentions must not be called when placementStore is nil (ENG-333)")
+	return nil, nil
+}
+
+func TestReconciler_SkipsRetentionFetch_WhenPlacementDisabled(t *testing.T) {
+	// With placement tracking disabled (nil placementStore), retained-lease
+	// placement is never derived/pruned, so the reconciler must not query
+	// /retentions at all — avoiding pointless per-backend calls every sweep.
+	mb := &listRetentionsFailBackend{
+		MockBackend: backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"}),
+		t:           t,
+	}
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// nil tracker AND nil placementStore => placement subsystem disabled.
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, nil)
+	require.NoError(t, err)
+
+	// If fetchAllRetentions runs, the backend's ListRetentions t.Errorf's.
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+}
+
+// listRetentionsPanicBackend panics in ListRetentions, exercising the
+// fetchAllRetentions panic-recovery path.
+type listRetentionsPanicBackend struct {
+	*backend.MockBackend
+}
+
+func (b *listRetentionsPanicBackend) ListRetentions(context.Context) ([]backend.RetainedLease, error) {
+	panic("simulated retentions fetch panic")
+}
+
+func TestReconciler_RetentionFetchPanic_RecordsMetric(t *testing.T) {
+	// A panic in a backend's ListRetentions must be recovered (RunOnce does not
+	// crash) AND counted in ReconcilerPanicsTotal, like every other recovered
+	// panic site (fetch_provisions / process_lease / process_orphan).
+	before := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions"))
+
+	mb := &listRetentionsPanicBackend{
+		MockBackend: backend.NewMockBackend(backend.MockBackendConfig{Name: "backend-a"}),
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mb, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// Non-nil placementStore so the retentions fetch actually runs.
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, &mockPlacementStore{})
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()), "retention-fetch panic must be recovered")
+
+	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions"))
+	assert.Equal(t, before+1, after,
+		"recovered retention-fetch panic must increment ReconcilerPanicsTotal{fetch_retentions}")
+}
+
+// TestRestoreAffinity_EndToEnd_MultiBackend proves that, on a multi-backend
+// pool, the reconciler derives the source lease's placement from the backend
+// that RETAINS it — regardless of load-based routing. b1 is the least-loaded
+// (naive routing would pick it), but the source lease is retained only on b2,
+// so placement[source] must resolve to b2 (ENG-333).
+func TestRestoreAffinity_EndToEnd_MultiBackend(t *testing.T) {
+	b1 := backend.NewMockBackend(backend.MockBackendConfig{Name: "b1"})
+	b2 := backend.NewMockBackend(backend.MockBackendConfig{Name: "b2"})
+
+	// b2 retains the source lease; b1 retains nothing.
+	b2.SetRetentions([]backend.RetainedLease{{LeaseUUID: "source"}})
+
+	// b1 is the least-loaded backend — naive routing would pick the wrong one.
+	b1.SetLoadStats(&backend.LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 0})
+	b2.SetLoadStats(&backend.LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 90})
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: b1, IsDefault: true},
+			{Backend: b2, Match: backend.MatchCriteria{SKUs: []string{"b2-only-sku"}}},
+		},
+	})
+	require.NoError(t, err)
+
+	ps := &mockPlacementStore{}
+
+	// Chain returns no leases — the reconciler must derive placement[source]
+	// purely from b2's /retentions response, not from active-provision syncing.
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.RunOnce(t.Context()))
+
+	assert.Equal(t, "b2", ps.Get("source"),
+		"restore affinity: source placement must resolve to the retaining backend, not the least-loaded one")
 }
