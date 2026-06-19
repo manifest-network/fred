@@ -241,8 +241,8 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `tls_key_file` | TLS private key file (PEM). | `""` |
 | `withdraw_interval` | How often to withdraw funds | `1h` |
 | `bech32_prefix` | Address prefix for validation | `manifest` |
-| `rate_limit_rps` | Global API rate limit (requests/second) | `10` |
-| `rate_limit_burst` | Global rate limit burst size | `20` |
+| `rate_limit_rps` | Per-IP API rate limit (req/s); one bucket shared across all routes | `10` |
+| `rate_limit_burst` | Per-IP rate limit burst size | `20` |
 | `tenant_rate_limit_rps` | Per-tenant rate limit (requests/second) | `5` |
 | `tenant_rate_limit_burst` | Per-tenant burst size | `10` |
 | `trusted_proxies` | CIDR blocks of trusted proxies for X-Forwarded-For | `[]` |
@@ -1301,7 +1301,7 @@ Chain State (leases)     Backend State (provisions)
 - **Tenant Authentication**: ADR-036 secp256k1 signatures with 30-second token expiry and low-S normalization
 - **Replay Protection**: Persistent token tracking (bbolt) with fail-closed semantics on mutating endpoints
 - **Callback Authentication**: HMAC-SHA256 with timestamp-based replay protection (5-minute window)
-- **Rate Limiting**: Dual-layer token bucket — global per-IP (10 RPS) and per-tenant (5 RPS)
+- **Rate Limiting**: Dual-layer token bucket — one per-IP limiter shared across all routes (10 RPS) and a per-tenant limiter (5 RPS); behind a proxy, set `trusted_proxies` so it keys on the real client IP
 - **Container Hardening**: Drop all capabilities, no-new-privileges, read-only rootfs, PID limits, network isolation
 - **Input Validation**: UUID format checks, URL scheme/host validation, manifest parsing, image allowlisting
 - **Production Mode**: Enforces replay protection, blocks TLS skip-verify, SSRF checks on all URLs

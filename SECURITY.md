@@ -173,7 +173,7 @@ Payloads uploaded via `POST /data` are verified against the on-chain `meta_hash`
 
 ### Global (Per-IP)
 
-Token bucket rate limiting applied to all requests based on client IP.
+A single token-bucket limiter applied to **all** HTTP routes, keyed per client IP. It is "global" in the sense of being one limiter shared across every route (not per-route), reported as `fred_api_rate_limit_rejections_total{limiter="global"}` (a single series, no route/path dimension). It is **not** one shared budget for the whole API — each distinct client IP gets its own bucket.
 
 | Parameter | Default |
 |-----------|---------|
@@ -182,7 +182,9 @@ Token bucket rate limiting applied to all requests based on client IP.
 | Max tracked IPs | 10,000 (LRU eviction) |
 | TTL per entry | 3 minutes |
 
-Trusted proxies can be configured via CIDR ranges. When the direct connection comes from a trusted proxy, `X-Forwarded-For` is used to extract the real client IP. Untrusted `X-Forwarded-For` headers are ignored.
+Because the bucket is shared across routes, all direct API operations from one client IP contend for the same budget — lease restore, update, restart, and `/data` uploads draw from a single bucket, so a burst of one can `429` the others. The defaults above are protective production values; for load tests or high-throughput direct-API workloads, raise `rate_limit_rps`/`rate_limit_burst` (and/or set `trusted_proxies`) or the limiter, not the backends, becomes the binding throughput ceiling.
+
+Trusted proxies can be configured via CIDR ranges. When the direct connection comes from a trusted proxy, `X-Forwarded-For` is used to extract the real client IP. Untrusted `X-Forwarded-For` headers are ignored. **If fred runs behind a reverse proxy and `trusted_proxies` is not configured, every request appears to come from the proxy's IP, collapsing all clients into one bucket — effectively a single global cap at `rate_limit_rps`.**
 
 ### Per-Tenant
 
