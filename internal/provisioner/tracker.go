@@ -13,13 +13,38 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
+// ProvisionKind distinguishes a fresh provision from a restore. A restore IS a
+// provisioning operation — it brings a lease's deployment up from retained
+// volumes instead of a fresh manifest — so it shares the provisioning metrics
+// and is differentiated by an operation label rather than a separate metric,
+// per Prometheus naming guidance (sum/avg across the dimension stays meaningful).
+// ENG-358 tracks restores in-flight so their callback is acknowledged inline;
+// the Kind keeps restore latency/outcomes labeled distinctly from fresh
+// provisions (which ENG-357 deliberately kept separable).
+type ProvisionKind uint8
+
+const (
+	KindProvision ProvisionKind = iota // zero value: a fresh provision
+	KindRestore                        // a restore from retained volumes (ENG-358)
+)
+
+// operationLabel maps the kind to the Prometheus `operation` label value used on
+// provisioning_total / provisioning_duration_seconds.
+func (k ProvisionKind) operationLabel() string {
+	if k == KindRestore {
+		return metrics.OperationRestore
+	}
+	return metrics.OperationProvision
+}
+
 // InFlightProvision represents a lease that is currently being provisioned.
 type InFlightProvision struct {
 	LeaseUUID string
 	Tenant    string
 	Items     []backend.LeaseItem // All items being provisioned
 	Backend   string
-	StartTime time.Time // For duration metrics
+	StartTime time.Time     // For duration metrics
+	Kind      ProvisionKind // Provision vs restore — labels callback metrics (ENG-358)
 }
 
 // RoutingSKU returns the first SKU for backend routing decisions.
@@ -43,6 +68,11 @@ type InFlightTracker interface {
 	// Returns true if the lease was successfully tracked (was not already in-flight),
 	// false if the lease was already being provisioned.
 	TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
+
+	// TryTrackRestoreInFlight is TryTrackInFlight for a restore: the entry is
+	// marked KindRestore so the restore's provision callback is acknowledged
+	// inline rather than by the reconciler, and its metrics carry operation=restore (ENG-358).
+	TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
 
 	// TrackInFlight registers a lease as being provisioned.
 	TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string)
@@ -129,6 +159,20 @@ func (t *DefaultInFlightTracker) TrackInFlight(leaseUUID, tenant string, items [
 // Returns true if the lease was successfully tracked (was not already in-flight),
 // false if the lease was already being provisioned.
 func (t *DefaultInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
+	return t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision)
+}
+
+// TryTrackRestoreInFlight is TryTrackInFlight for a restore: it marks the entry
+// as KindRestore so the provision callback is acknowledged inline (ENG-358) and
+// its metrics carry operation=restore. Like TryTrackInFlight it is atomic and
+// returns false (leaving any existing entry untouched) when the lease is already
+// in-flight, so a duplicate restore or a racing reconciler is a no-op for the caller.
+func (t *DefaultInFlightTracker) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
+	return t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore)
+}
+
+// tryTrack is the shared atomic track-if-absent implementation.
+func (t *DefaultInFlightTracker) tryTrack(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, kind ProvisionKind) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, exists := t.inFlight[leaseUUID]; exists {
@@ -140,6 +184,7 @@ func (t *DefaultInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, item
 		Items:     items,
 		Backend:   backendName,
 		StartTime: time.Now(),
+		Kind:      kind,
 	}
 	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 	return true

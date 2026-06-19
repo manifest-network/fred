@@ -105,6 +105,7 @@ type ServerDeps struct {
 	StatusChecker     StatusChecker
 	PlacementLookup   PlacementLookup          // Optional — if nil, placement routing is disabled.
 	RestoreRecorder   RestorePlacementRecorder // Optional — restore placement bookkeeping (ENG-333).
+	RestoreTracker    RestoreInFlightTracker   // Optional — inline-ack restore in-flight tracking (ENG-358).
 	EventBroker       *EventBroker             // Optional — if nil, the events endpoint returns 501.
 }
 
@@ -147,6 +148,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		StatusChecker:   statusChecker,
 		PlacementLookup: placementLookup,
 		RestoreRecorder: deps.RestoreRecorder,
+		RestoreTracker:  deps.RestoreTracker,
 		EventBroker:     eventBroker,
 		ProviderUUID:    cfg.ProviderUUID,
 		Bech32Prefix:    cfg.Bech32Prefix,

@@ -17,6 +17,14 @@ func (m *Manager) TryTrackInFlight(leaseUUID, tenant string, items []backend.Lea
 	return m.tracker.TryTrackInFlight(leaseUUID, tenant, items, backendName)
 }
 
+// TryTrackRestoreInFlight delegates to the tracker. It lets the API restore
+// handler register the new lease in-flight (as a restore) so the restore's
+// provision callback is acknowledged inline rather than ~one reconciler interval
+// later (ENG-358).
+func (m *Manager) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
+	return m.tracker.TryTrackRestoreInFlight(leaseUUID, tenant, items, backendName)
+}
+
 // UntrackInFlight delegates to the tracker.
 func (m *Manager) UntrackInFlight(leaseUUID string) {
 	m.tracker.UntrackInFlight(leaseUUID)
@@ -86,7 +94,10 @@ func (m *Manager) RecordRestorePlacement(newLeaseUUID, backendName string) {
 }
 
 // Compile-time check that *Manager can serve as the API's restore placement
-// recorder (ENG-333). Structural to avoid importing the api package.
+// recorder (ENG-333) and restore in-flight tracker (ENG-358). Structural to
+// avoid importing the api package.
 var _ interface {
 	RecordRestorePlacement(newLeaseUUID, backendName string)
+	TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
+	UntrackInFlight(leaseUUID string)
 } = (*Manager)(nil)

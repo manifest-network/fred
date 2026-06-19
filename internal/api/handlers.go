@@ -53,6 +53,22 @@ type RestorePlacementRecorder interface {
 	RecordRestorePlacement(newLeaseUUID, backendName string)
 }
 
+// RestoreInFlightTracker registers the NEW restore lease in the provisioner's
+// in-flight tracker so the restore's provision callback is acknowledged inline
+// (like a fresh provision) instead of ~one reconciler interval later (ENG-358).
+// Optional — when nil, restore still converges via the reconciler ack backstop.
+type RestoreInFlightTracker interface {
+	// TryTrackRestoreInFlight registers the new lease as an in-flight restore.
+	// Returns false if the lease is already in-flight (a duplicate restore or a
+	// racing reconciler provision), in which case the caller must NOT call the
+	// backend and must NOT untrack — the entry is owned by the other writer.
+	TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
+	// UntrackInFlight removes the entry. Called only to undo a successful track
+	// when the synchronous Restore() call subsequently fails, so a failed restore
+	// never leaves a phantom in-flight lease for the TimeoutChecker to reject.
+	UntrackInFlight(leaseUUID string)
+}
+
 // Handlers contains HTTP request handlers.
 type Handlers struct {
 	client            ChainClient
@@ -61,6 +77,7 @@ type Handlers struct {
 	statusChecker     StatusChecker
 	placementLookup   PlacementLookup
 	restoreRecorder   RestorePlacementRecorder
+	restoreTracker    RestoreInFlightTracker
 	eventBroker       *EventBroker
 	wsUpgrader        websocket.Upgrader
 	wsMaxMessageSize  int64         // max bytes the server will read from a client message on /events
@@ -78,6 +95,7 @@ type HandlersConfig struct {
 	StatusChecker   StatusChecker            // optional but required for the /status endpoint
 	PlacementLookup PlacementLookup          // optional — used for routing reads to the correct backend
 	RestoreRecorder RestorePlacementRecorder // optional — restore placement bookkeeping (ENG-333)
+	RestoreTracker  RestoreInFlightTracker   // optional — inline-ack restore in-flight tracking (ENG-358)
 	EventBroker     *EventBroker             // optional — if nil, the events endpoint will return 501
 	ProviderUUID    string
 	Bech32Prefix    string
@@ -93,6 +111,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		statusChecker:   cfg.StatusChecker,
 		placementLookup: cfg.PlacementLookup,
 		restoreRecorder: cfg.RestoreRecorder,
+		restoreTracker:  cfg.RestoreTracker,
 		eventBroker:     cfg.EventBroker,
 		wsUpgrader: websocket.Upgrader{
 			// Allow all origins: this API is not browser-facing. Clients are
@@ -939,6 +958,24 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 
 	items := provisioner.ExtractLeaseItems(auth.Lease)
 
+	// Register the NEW lease in-flight as a restore BEFORE calling the backend, so
+	// the restore's provision callback is acknowledged inline rather than ~one
+	// reconciler interval later (ENG-358). This mirrors StartProvisioning, which
+	// tracks in-flight before backend.Provision. Optional: when no tracker is wired
+	// the restore still converges via the reconciler ack backstop.
+	tracked := false
+	if h.restoreTracker != nil {
+		if !h.restoreTracker.TryTrackRestoreInFlight(leaseUUID, auth.Token.Tenant, items, backendClient.Name()) {
+			// Already in-flight — a duplicate restore POST or a reconciler that
+			// raced in a fresh provision of this PENDING lease. Do NOT call the
+			// backend and do NOT untrack: the in-flight entry is owned by the other
+			// writer, and proceeding could race a second deployment onto the lease.
+			writeError(w, "lease is already being provisioned or restored", http.StatusConflict)
+			return
+		}
+		tracked = true
+	}
+
 	err := backendClient.Restore(r.Context(), backend.RestoreRequest{
 		LeaseUUID:     leaseUUID,
 		FromLeaseUUID: body.FromLeaseUUID,
@@ -948,6 +985,13 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		CallbackURL:   provisioner.BuildCallbackURL(h.callbackBaseURL),
 	})
 	if err != nil {
+		// Undo the in-flight registration on a synchronous restore failure so it
+		// does not leave a phantom entry the TimeoutChecker would later reject.
+		// (An ASYNC worker failure instead emits a failure callback that the
+		// in-flight branch of HandleBackendCallback untracks — a distinct path.)
+		if tracked {
+			h.restoreTracker.UntrackInFlight(leaseUUID)
+		}
 		switch {
 		case errors.Is(err, backend.ErrNotRetained):
 			writeError(w, "no retained data found for that lease", http.StatusNotFound)

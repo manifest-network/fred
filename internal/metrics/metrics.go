@@ -32,22 +32,27 @@ var (
 		Help:      "Number of provisions currently in progress",
 	})
 
-	// ProvisioningTotal tracks the total number of provisioning operations by outcome.
+	// ProvisioningTotal tracks the total number of provisioning operations by
+	// outcome and operation (provision|restore). A restore is a kind of
+	// provisioning operation; the operation label keeps it separable from fresh
+	// provisions (ENG-357/ENG-358) while sum()-ing across it stays meaningful.
 	ProvisioningTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "provisioning_total",
-		Help:      "Total number of provisioning operations by outcome",
-	}, []string{"outcome", "backend"})
+		Help:      "Total number of provisioning operations by outcome and operation (provision|restore)",
+	}, []string{"outcome", "backend", "operation"})
 
-	// ProvisioningDuration tracks the duration of provisioning operations.
+	// ProvisioningDuration tracks the duration of provisioning operations,
+	// labeled by operation (provision|restore) so restore latency stays
+	// separable from fresh-provision latency (ENG-358).
 	ProvisioningDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "provisioning_duration_seconds",
-		Help:      "Duration of provisioning operations in seconds",
+		Help:      "Duration of provisioning operations in seconds by operation (provision|restore)",
 		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 0.1s to ~7min
-	}, []string{"backend"})
+	}, []string{"backend", "operation"})
 
 	// AckBatchFeeGasErrorsTotal counts ack-batch failures classified as
 	// insufficient-fee or out-of-gas that are surfaced to callers without
@@ -423,6 +428,15 @@ const (
 	OutcomePartial = "partial"
 	OutcomeError   = "error"
 	OutcomeFailed  = "failed"
+)
+
+// Operation constants for the `operation` label on provisioning_total /
+// provisioning_duration_seconds. A restore is a kind of provisioning operation,
+// so it shares those metrics and is differentiated by this label rather than a
+// separate metric name (ENG-358).
+const (
+	OperationProvision = "provision"
+	OperationRestore   = "restore"
 )
 
 // Action constants for reconciliation

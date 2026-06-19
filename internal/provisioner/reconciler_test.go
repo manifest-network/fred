@@ -2000,6 +2000,22 @@ func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, items [
 	return true
 }
 
+func (m *mockInFlightTracker) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.inFlight[leaseUUID]; exists {
+		return false
+	}
+	m.inFlight[leaseUUID] = InFlightProvision{
+		LeaseUUID: leaseUUID,
+		Tenant:    tenant,
+		Items:     items,
+		Backend:   backendName,
+		Kind:      KindRestore,
+	}
+	return true
+}
+
 func (m *mockInFlightTracker) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -398,6 +398,7 @@ func run(cmd *cobra.Command, args []string) error {
 		StatusChecker:     provisionMgr,
 		PlacementLookup:   placementStore,
 		RestoreRecorder:   provisionMgr,
+		RestoreTracker:    provisionMgr,
 		EventBroker:       eventBroker,
 	})
 	if err != nil {
