@@ -66,6 +66,40 @@ func TestTracker_TryTrackInFlight(t *testing.T) {
 	assert.Equal(t, "backend-1", prov.Backend)
 }
 
+func TestTracker_TryTrackInFlight_DefaultsToProvisionKind(t *testing.T) {
+	tracker := NewInFlightTracker()
+	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}
+
+	require.True(t, tracker.TryTrackInFlight("lease-1", "tenant-a", items, "backend-1"))
+
+	prov, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, KindProvision, prov.Kind, "a fresh provision must be tracked as KindProvision")
+}
+
+func TestTracker_TryTrackRestoreInFlight(t *testing.T) {
+	tracker := NewInFlightTracker()
+	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}
+
+	ok := tracker.TryTrackRestoreInFlight("lease-1", "tenant-a", items, "backend-1")
+	assert.True(t, ok, "first TryTrackRestoreInFlight should succeed")
+	assert.True(t, tracker.IsInFlight("lease-1"))
+
+	prov, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, KindRestore, prov.Kind, "a restore must be tracked as KindRestore so its callback metrics carry operation=restore")
+	assert.Equal(t, "tenant-a", prov.Tenant)
+	assert.Equal(t, "backend-1", prov.Backend)
+
+	// Idempotent like TryTrackInFlight: a second attempt on the same lease fails
+	// and leaves the original entry intact (so a duplicate restore POST is a 409,
+	// not an overwrite).
+	ok = tracker.TryTrackRestoreInFlight("lease-1", "tenant-b", items, "backend-2")
+	assert.False(t, ok, "second TryTrackRestoreInFlight should fail for same lease")
+	prov, _ = tracker.GetInFlight("lease-1")
+	assert.Equal(t, "tenant-a", prov.Tenant)
+}
+
 func TestTracker_TryTrackInFlight_Concurrent(t *testing.T) {
 	tracker := NewInFlightTracker()
 	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}

@@ -323,6 +323,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	}()
 
 	// Per-service image setup.
+	imgStart := time.Now()
 	imageSetups = make(map[string]*imageSetup)
 	for svcName, svc := range op.Stack.Services {
 		imgSetup, setupErr := b.inspectImageForSetup(ctx, svc.Image, svc.User)
@@ -333,6 +334,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 		}
 		imageSetups[svcName] = imgSetup
 	}
+	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseImageSetup).Observe(time.Since(imgStart).Seconds())
 
 	// Read provision metadata.
 	b.provisionsMu.RLock()
@@ -360,12 +362,14 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	}
 
 	// Ensure volumes exist for all services/instances.
+	volStart := time.Now()
 	volBinds, _, volErr := b.setupVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
 	if volErr != nil {
 		err = volErr
 		callbackErr = op.Operation + " failed"
 		return
 	}
+	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseVolumeSetup).Observe(time.Since(volStart).Seconds())
 
 	// Build Compose project and bring it up.
 	// ForceRecreate is used for restarts (config unchanged but containers need replacing).
@@ -388,11 +392,13 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 
 	op.Logger.Info("compose up for "+op.Operation, "project", projectName, "services", len(project.Services))
 	forceRecreate := op.Operation == "restart"
+	upStart := time.Now()
 	if upErr := b.compose.Up(ctx, project, composeUpOpts{ForceRecreate: forceRecreate}); upErr != nil {
 		err = fmt.Errorf("compose up failed: %w", upErr)
 		callbackErr = op.Operation + " failed"
 		return
 	}
+	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseComposeUp).Observe(time.Since(upStart).Seconds())
 
 	// Discover new container IDs via Compose PS.
 	containers, psErr := b.compose.PS(ctx, projectName)
@@ -405,6 +411,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	newContainerIDs, newServiceContainers = mapComposeContainers(containers, op.Items)
 
 	// Verify startup per-service so each service uses its own health check config.
+	verifyStart := time.Now()
 	for svcName, svcCIDs := range newServiceContainers {
 		svc := op.Stack.Services[svcName]
 		if err = b.verifyStartup(ctx, svc, svcCIDs, op.Logger.With("service", svcName)); err != nil {
@@ -412,6 +419,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			return
 		}
 	}
+	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseVerifyStartup).Observe(time.Since(verifyStart).Seconds())
 
 	op.Logger.Info(op.Operation+" completed (stack)", "containers", len(newContainerIDs))
 	return

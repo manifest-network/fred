@@ -5448,6 +5448,30 @@ func (f *fakeRestoreRecorder) RecordRestorePlacement(n, b string) {
 	f.called, f.newLease, f.backend = true, n, b
 }
 
+// fakeRestoreTracker records how RestoreLease drives the in-flight tracker (ENG-358).
+type fakeRestoreTracker struct {
+	trackResult bool // what TryTrackRestoreInFlight returns
+
+	tryCalled  bool
+	tryLease   string
+	tryTenant  string
+	tryBackend string
+
+	untrackCalled bool
+	untrackLease  string
+}
+
+func (f *fakeRestoreTracker) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
+	f.tryCalled = true
+	f.tryLease, f.tryTenant, f.tryBackend = leaseUUID, tenant, backendName
+	return f.trackResult
+}
+
+func (f *fakeRestoreTracker) UntrackInFlight(leaseUUID string) {
+	f.untrackCalled = true
+	f.untrackLease = leaseUUID
+}
+
 // TestRestoreLease_RecorderCalledOnSuccess verifies that after a successful
 // restore the handler calls RecordRestorePlacement(newLeaseUUID, backendName)
 // on the injected RestorePlacementRecorder. The backend name must be that of
@@ -5595,4 +5619,375 @@ func TestRestoreLease_RecorderNotCalledOnMissingSourcePlacement(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, resp.Code, "body: %s", resp.Body.String())
 	assert.False(t, recorder.called, "RecordRestorePlacement must NOT be called when restore fails before the success path")
+}
+
+// restoreTrackerTestSetup builds a RestoreLease request whose source lease routes
+// to a backend served by `backendHandler`, with `tracker` injected as the restore
+// in-flight tracker. It returns the recorder after invoking the handler.
+func restoreTrackerTestSetup(t *testing.T, tracker RestoreInFlightTracker, backendHandler http.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	srcServer := httptest.NewServer(backendHandler)
+	t.Cleanup(srcServer.Close)
+
+	srcBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "backend-src",
+		BaseURL: srcServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: srcBackend, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string {
+			if uuid == fromLeaseUUID {
+				return "backend-src"
+			}
+			return ""
+		},
+	}
+
+	h := NewHandlers(HandlersConfig{
+		Client:          chainClient,
+		BackendRouter:   router,
+		PlacementLookup: placement,
+		RestoreTracker:  tracker,
+		ProviderUUID:    providerUUID,
+		Bech32Prefix:    "manifest",
+	})
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	resp := httptest.NewRecorder()
+	h.RestoreLease(resp, req)
+	return resp
+}
+
+// TestRestoreLease_TracksRestoreInFlightOnSuccess is the API half of ENG-358: a
+// successful restore must register the NEW lease in the in-flight tracker (so its
+// provision callback is acked inline), keyed on the new lease and the SOURCE
+// backend, and must NOT untrack on the success path.
+func TestRestoreLease_TracksRestoreInFlightOnSuccess(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: true}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/restore" && r.Method == "POST" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	})
+
+	require.Equal(t, http.StatusAccepted, resp.Code, "body: %s", resp.Body.String())
+	assert.True(t, tracker.tryCalled, "restore must register the new lease in-flight")
+	assert.Equal(t, testutil.ValidUUID1, tracker.tryLease, "must track the NEW lease UUID")
+	assert.Equal(t, "backend-src", tracker.tryBackend, "must track against the SOURCE backend (ENG-333)")
+	assert.NotEmpty(t, tracker.tryTenant, "must track the authenticated tenant")
+	assert.False(t, tracker.untrackCalled, "must NOT untrack on the success path")
+}
+
+// TestRestoreLease_UntracksOnBackendError verifies the phantom-entry guard: if the
+// synchronous Restore() call fails, the handler must untrack the in-flight entry
+// it just registered, otherwise the TimeoutChecker would later reject a valid lease.
+func TestRestoreLease_UntracksOnBackendError(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: true}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		// Backend rejects the restore — drives Restore() to return an error.
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	require.NotEqual(t, http.StatusAccepted, resp.Code, "backend error must not yield 202")
+	assert.True(t, tracker.tryCalled, "restore must have registered in-flight before calling the backend")
+	assert.True(t, tracker.untrackCalled, "must untrack the in-flight entry when Restore() fails")
+	assert.Equal(t, testutil.ValidUUID1, tracker.untrackLease, "must untrack the NEW lease UUID")
+}
+
+// TestRestoreLease_UntracksOnNonDefaultErrorBranch complements
+// TestRestoreLease_UntracksOnBackendError (which drives the generic default
+// branch). The untrack runs unconditionally BEFORE the error-classification
+// switch, so it must fire on a SPECIFIC sentinel branch too — here a 422 from the
+// backend → ErrNotRetained → 404. This locks the untrack-before-switch ordering
+// against a regression that moves the untrack into a single error case.
+func TestRestoreLease_UntracksOnNonDefaultErrorBranch(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: true}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		// 422 → backend.ErrNotRetained → the handler's first (non-default) error branch.
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	})
+
+	require.Equal(t, http.StatusNotFound, resp.Code, "422/ErrNotRetained must map to 404, body: %s", resp.Body.String())
+	assert.True(t, tracker.untrackCalled, "must untrack on a non-default sync Restore() error branch too")
+	assert.Equal(t, testutil.ValidUUID1, tracker.untrackLease, "must untrack the NEW lease UUID")
+}
+
+// TestRestoreLease_AlreadyInFlightReturns409 verifies that when the new lease is
+// already being provisioned/restored (TryTrackRestoreInFlight==false — e.g. a
+// duplicate POST or a racing reconciler fresh-provision), the handler returns 409,
+// never calls the backend, and never untracks the foreign entry.
+func TestRestoreLease_AlreadyInFlightReturns409(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: false}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("backend must not be called when the lease is already in-flight: %s %s", r.Method, r.URL.Path)
+	})
+
+	require.Equal(t, http.StatusConflict, resp.Code, "already-in-flight restore must be 409, body: %s", resp.Body.String())
+	assert.True(t, tracker.tryCalled, "handler must have attempted to track in-flight")
+	assert.False(t, tracker.untrackCalled, "must NOT untrack a foreign in-flight entry it does not own")
+}
+
+// --- ENG-361: restore-route security gates (pre-mainnet) -------------------
+//
+// The headline cross-tenant data-theft gate (rec.Tenant != req.Tenant) is
+// pinned at the backend layer by TestRestore_TenantMismatch_CollapsesToNotRetained
+// (internal/backend/docker/restore_test.go). The three tests below pin the
+// restore ROUTE's own enforcement so a refactor of RestoreLease — that skipped
+// authenticateLease, or forwarded a tenant other than the ADR-036 signer to the
+// backend — would be caught here, not only by inspecting that restore is wired
+// with the same withAuthRL wrapper as restart/update.
+
+// TestRestoreLease_RejectsUnauthenticated verifies PROPERTY 1 (ADR-036 auth) for
+// the restore route: a missing, expired, or wrong-lease-bound token is rejected
+// with 401 before any chain or backend work. Restore is authenticated exactly
+// like restart/update — not an unauthenticated outlier.
+func TestRestoreLease_RejectsUnauthenticated(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	for _, tc := range []struct {
+		name        string
+		authHeader  string // "" means no Authorization header
+		description string
+	}{
+		{"missing_auth", "", "no Authorization header at all"},
+		{"expired_token", "Bearer " + testutil.CreateExpiredToken(kp, leaseUUID), "token past MaxTokenAge"},
+		// A token validly signed for a DIFFERENT lease must not authorize restore
+		// onto leaseUUID: token.LeaseUUID is a signed field, so it cannot be
+		// retargeted without the tenant's key (authenticateLeaseToken rejects a
+		// token whose signed LeaseUUID does not match the path lease).
+		{"wrong_target_lease_binding", "Bearer " + testutil.CreateTestToken(kp, testutil.ValidUUID3, time.Now()), "token bound to a different lease UUID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// client is nil and no backend is wired: auth must fail before either is
+			// touched. A regression that reached them would nil-deref and fail loudly.
+			h := &Handlers{
+				client:       nil,
+				providerUUID: providerUUID,
+				bech32Prefix: "manifest",
+			}
+
+			reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+			if tc.authHeader != "" {
+				req.Header.Set("Authorization", tc.authHeader)
+			}
+			req.SetPathValue("lease_uuid", leaseUUID)
+
+			rec := httptest.NewRecorder()
+			h.RestoreLease(rec, req)
+
+			assert.Equal(t, http.StatusUnauthorized, rec.Code, "%s: body: %s", tc.description, rec.Body.String())
+		})
+	}
+}
+
+// TestRestoreLease_RejectsNonOwnedTarget verifies PROPERTY 2a (caller owns the
+// TARGET lease) for the restore route: even with a cryptographically valid token,
+// a caller who does not own the path (target) lease — or whose lease belongs to a
+// different provider — is rejected with 403 and the backend is never contacted.
+func TestRestoreLease_RejectsNonOwnedTarget(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	for _, tc := range []struct {
+		name  string
+		lease *billingtypes.Lease
+	}{
+		{
+			name: "tenant_mismatch",
+			// Target lease is owned by a DIFFERENT tenant than the signer.
+			lease: &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       "manifest1different",
+				ProviderUuid: providerUUID,
+				State:        billingtypes.LEASE_STATE_PENDING,
+			},
+		},
+		{
+			name: "provider_mismatch",
+			// Target lease belongs to a different provider.
+			lease: &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				Tenant:       kp.Address,
+				ProviderUuid: testutil.ValidUUID3,
+				State:        billingtypes.LEASE_STATE_PENDING,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chainClient := &mockChainClient{
+				getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+					if uuid == leaseUUID {
+						return tc.lease, nil
+					}
+					return nil, nil
+				},
+			}
+
+			backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("backend must NOT be called when the caller does not own the target: %s %s", r.Method, r.URL.Path)
+			}))
+			defer backendServer.Close()
+
+			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name:    "test-backend",
+				BaseURL: backendServer.URL,
+				Timeout: 5 * time.Second,
+			})
+			router, err := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+			})
+			require.NoError(t, err)
+
+			h := &Handlers{
+				client:        chainClient,
+				backendRouter: router,
+				providerUUID:  providerUUID,
+				bech32Prefix:  "manifest",
+			}
+
+			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+			reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+			req.Header.Set("Authorization", "Bearer "+validToken)
+			req.SetPathValue("lease_uuid", leaseUUID)
+
+			rec := httptest.NewRecorder()
+			h.RestoreLease(rec, req)
+
+			assert.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+		})
+	}
+}
+
+// TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource verifies PROPERTY 2b
+// plumbing at the restore route: the handler forwards the ADR-036 SIGNER's tenant
+// (auth.Token.Tenant) to the backend — never a body- or path-derived value — and
+// surfaces the backend's ErrNotRetained as an indistinguishable 404. This is what
+// makes the backend's source-ownership gate (rec.Tenant != req.Tenant) effective:
+// the caller owns the fresh TARGET lease but supplies another tenant's retained
+// from_lease_uuid; the backend (here simulated with 422) sees the signer's tenant
+// and rejects, and the caller cannot tell cross-tenant from not-found.
+func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	// The caller legitimately owns the fresh PENDING target lease.
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	var receivedBody []byte
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/restore" && r.Method == "POST" {
+			var err error
+			receivedBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read body: %v", err)
+			}
+			// Simulate the docker backend's cross-tenant rejection
+			// (rec.Tenant(other) != req.Tenant(signer) -> ErrNotRetained).
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string {
+			if uuid == fromLeaseUUID {
+				return "test-backend"
+			}
+			return ""
+		},
+	}
+
+	h := &Handlers{
+		client:          chainClient,
+		backendRouter:   router,
+		placementLookup: placement,
+		providerUUID:    providerUUID,
+		bech32Prefix:    "manifest",
+	}
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.RestoreLease(rec, req)
+
+	// Cross-tenant source is indistinguishable from not-found: 404, same message.
+	assert.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+	var errResp ErrorResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+	assert.Equal(t, "no retained data found for that lease", errResp.Error)
+
+	// The handler must have forwarded the SIGNER's tenant — the value the backend
+	// gate compares against the retained record — not the body's from_lease_uuid
+	// or any caller-supplied field. (RestoreRequest carries no tenant field for the
+	// caller to set; this pins that RestoreLease sets the backend request's Tenant
+	// from the authenticated token, i.e. Tenant: auth.Token.Tenant.)
+	require.NotNil(t, receivedBody, "backend should have received a request body")
+	var backendReq map[string]any
+	require.NoError(t, json.Unmarshal(receivedBody, &backendReq))
+	assert.Equal(t, kp.Address, backendReq["tenant"], "handler must forward the ADR-036 signer's tenant to the backend")
+	assert.Equal(t, fromLeaseUUID, backendReq["from_lease_uuid"], "handler must forward the requested source lease")
 }

@@ -335,6 +335,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | `POST` | `/v1/leases/{uuid}/data` | ADR-036 | No | Pending | Has own idempotency (409 on duplicate) |
 | `POST` | `/v1/leases/{uuid}/restart` | ADR-036 | Yes | Active | Mutating — replaying would restart again |
 | `POST` | `/v1/leases/{uuid}/update` | ADR-036 | Yes | Active | Mutating — replaying would redeploy again |
+| `POST` | `/v1/leases/{uuid}/restore` | ADR-036 | Yes | Pending | Restore a soft-deleted lease's data into this fresh lease |
 | `GET` | `/v1/leases/{uuid}/events` | ADR-036 | No | Any | WebSocket stream of lease status events |
 
 #### Operational
@@ -473,9 +474,14 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `meta_hash_hex` - Expected payload hash in hex (omitted if no meta_hash)
 - `payload_received` - True if payload has been uploaded
 - `provisioning_started` - True if provisioning is in progress
-- `provision_status` - Backend provision status (omitted if not provisioned)
+- `provision_status` - Backend provision status (omitted if not provisioned). May be `retained` for a closed/expired lease whose data was soft-deleted and is restorable (see [retention](internal/backend/docker/README.md#soft-delete--restore))
 - `fail_count` - Number of provisioning failures (omitted if zero)
 - `last_error` - Most recent provisioning error (omitted if none)
+- `retained_until` - RFC3339 grace-window deadline; present only when `provision_status` is `retained`
+- `items` - Restore shape (`service_name`, `sku`, `quantity`) to request when opening the fresh lease to restore into; present only when `retained`
+- `restore_hint` - Short human-readable next step for restoring; present only when `retained`
+
+> **Chain-pruned leases:** after a lease is auto-closed and pruned from the chain, this endpoint still answers from the retained record. In that case authorization is by the retained record's tenant (the signed caller must own it); a cross-tenant caller or an absent record gets `404`.
 
 ### Get Provision Diagnostics
 
@@ -499,9 +505,10 @@ Returns provision diagnostics for a lease, including status, error details, and 
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, or `unknown`. `failing` is a transient state between container-death detection and the Failed callback; `deprovisioning` covers the container-removal window
+- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`, or `unknown`. `failing` is a transient state between container-death detection and the Failed callback; `deprovisioning` covers the container-removal window; `retained` marks a closed/expired lease whose data was soft-deleted and is restorable
 - `fail_count` - Number of provision attempts that failed
 - `last_error` - Detailed error message (only present on failure)
+- `retained_until`, `items`, `restore_hint` - Present only when `status` is `retained` (grace-window deadline, restore shape, and next-step hint); see [Get Lease Status](#get-lease-status)
 
 **Response Codes:**
 - `200 OK` - Provision found
@@ -617,6 +624,36 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Lease is in a state that cannot be updated (e.g., currently restarting)
 
+### Restore Lease
+
+```
+POST /v1/leases/{lease_uuid}/restore
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "from_lease_uuid": "<original-closed-lease-uuid>"
+}
+```
+
+Restore a soft-deleted lease's retained data into a **new** lease. The path `lease_uuid` is the new, fresh `PENDING` lease the data is adopted into; `from_lease_uuid` in the body names the original closed/expired lease whose volumes were retained (see [retention](internal/backend/docker/README.md#soft-delete--restore)). Fred resolves the backend that holds the source lease's retained data (restore is same-backend, ENG-333), then re-deploys the retained manifest onto the adopted volumes. The new lease's requested service names and quantities must shape-match the original.
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "provisioning"
+}
+```
+
+**Response Codes:**
+- `202 Accepted` - Restore initiated (the lease then transitions through `restarting` to `ready`/`failed`)
+- `400 Bad Request` - Missing/invalid `from_lease_uuid`, or items don't match the retained set
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - No retained data found for `from_lease_uuid` (absent, expired, cross-tenant, or its backend is gone)
+- `409 Conflict` - Target lease is not `PENDING`, is already provisioned, or is not in a restorable state
+- `503 Service Unavailable` - Insufficient resources to restore, or placement routing is not configured
+
 ### Get Release History
 
 ```
@@ -672,7 +709,7 @@ GET /v1/leases/{lease_uuid}/events
 Authorization: Bearer <token>
 ```
 
-Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`).
+Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`). A `retained` event is pushed when a closed/expired lease's data is soft-deleted (best-effort, only to currently-connected clients), signalling that the data may be restorable within the grace window. For that event the `status` field is the enum `retained`, and the human-readable restore instruction is carried in the `error` field.
 
 **Authentication:** Bearer token via the `Authorization` header or the `?token=` query parameter (since the WebSocket API cannot set custom headers during upgrade). Auth is verified before the WebSocket upgrade, so failures return standard HTTP error responses.
 
@@ -711,11 +748,14 @@ Called by backends to report provisioning status. Requires HMAC-SHA256 authentic
 {
   "lease_uuid": "...",
   "status": "success",
-  "error": ""
+  "error": "",
+  "retained": false
 }
 ```
 
 Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third is used by backends that perform autonomous deprovisioning, e.g. after a failed provision rollback).
+
+- `retained` (optional bool) — set `true` on a `deprovisioned` callback when the backend soft-deleted (retained) the lease's volumes instead of destroying them. Fred uses this to push the optimistic `retained` notice to the tenant; the queryable retained status (`GET /v1/leases/{uuid}/status`) is the durable backstop. Omitted/`false` means the volumes were destroyed.
 
 **Response Codes:**
 - `200 OK` - Callback processed successfully (or already processed)
@@ -752,9 +792,13 @@ All endpoints except `/health`, `/stats`, and `/metrics` require HMAC-SHA256 sig
 |--------|------|------|-------------|
 | `POST` | `/restart` | HMAC | Restart containers (async, callback on completion) |
 | `POST` | `/update` | HMAC | Deploy new manifest (async, callback on completion) |
+| `POST` | `/restore` | HMAC | Restore a retained lease's data into a new lease (async, callback on completion) |
+| `GET` | `/retentions` | HMAC | List leases whose data this backend currently retains (restore affinity) |
 | `GET` | `/releases/{uuid}` | HMAC | Release history |
 | `GET` | `/stats` | None | Resource capacity and usage |
 | `GET` | `/metrics` | None | Prometheus metrics |
+
+Backends without soft-delete/retention support still serve `/restore` and `/retentions`: `/restore` returns `422` (no retained data) and `/retentions` returns an empty list.
 
 ### POST /provision
 
@@ -932,6 +976,52 @@ Deploy a new manifest for a lease, replacing containers (async).
 - `400 Bad Request` - Invalid manifest or validation error
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for update
+
+### POST /restore
+
+Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its retained manifest (async). `lease_uuid` is the new lease; `from_lease_uuid` is the original retained lease. `items` must shape-match the retained set.
+
+**Request:**
+```json
+{
+  "lease_uuid": "<new-lease-uuid>",
+  "from_lease_uuid": "<original-retained-lease-uuid>",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
+  "callback_url": "http://fred.example.com:8080/callbacks/provision"
+}
+```
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "restoring"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` - Missing `lease_uuid`/`from_lease_uuid`/`callback_url`, or items/manifest validation error
+- `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"`, so the two are distinguished by the presence of that discriminator
+- `422 Unprocessable Entity` - No retained data for the source lease (also returned by backends that don't support retention)
+- `503 Service Unavailable` - Insufficient resources
+
+> Fred maps the backend's `422` to a tenant-facing `404` on `POST /v1/leases/{uuid}/restore`.
+
+### GET /retentions
+
+List the leases whose data this backend currently retains (soft-deleted, awaiting restore or grace-reap). Fred's reconciler polls this on every backend to keep restore routing affinity (a restore is routed to the backend that holds the source data). Backends without retention return an empty list.
+
+**Response:** `200 OK`
+```json
+{
+  "retentions": [
+    {"lease_uuid": "550e8400-e29b-41d4-a716-446655440000"}
+  ]
+}
+```
+
+The `retentions` array is always present (`[]` when empty, never `null`).
 
 ### GET /releases/{lease_uuid}
 

@@ -109,18 +109,20 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 		}
 
 		// Only untrack AFTER successful rejection
+		operation := p.Kind.operationLabel()
 		c.tracker.UntrackInFlight(p.LeaseUUID)
 		metrics.CallbackTimeoutsTotal.Inc()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend).Inc()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend, operation).Inc()
 
 		// Record duration (from start until timeout)
 		duration := now.Sub(p.StartTime).Seconds()
-		metrics.ProvisioningDuration.WithLabelValues(p.Backend).Observe(duration)
+		metrics.ProvisioningDuration.WithLabelValues(p.Backend, operation).Observe(duration)
 
 		slog.Warn("rejected timed-out provision",
 			"lease_uuid", p.LeaseUUID,
 			"tenant", p.Tenant,
 			"backend", p.Backend,
+			"operation", operation,
 			"age", now.Sub(p.StartTime),
 			"rejected", rejected,
 			"tx_hashes", txHashes,

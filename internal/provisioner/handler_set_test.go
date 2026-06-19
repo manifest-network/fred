@@ -486,6 +486,75 @@ func TestHandlerSet_HandleBackendCallback_Success(t *testing.T) {
 	assert.False(t, tracker.IsInFlight("lease-1"))
 }
 
+// TestHandlerSet_HandleBackendCallback_Restore_InlineAcksWithOperationLabel is
+// the heart of ENG-358: a restore registered in-flight (KindRestore) must be
+// acknowledged INLINE on its success callback (not deferred to the reconciler),
+// and its outcome must be counted under operation=restore so it does not pollute
+// the fresh-provision series (ENG-357 separation).
+func TestHandlerSet_HandleBackendCallback_Restore_InlineAcksWithOperationLabel(t *testing.T) {
+	var ackCalls int
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			ackCalls++
+			return true, "tx-restore", nil
+		},
+	}
+	mb := &mockManagerBackend{name: "test-backend"}
+	mockChain := &chaintest.MockClient{}
+
+	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	// Mirror what the fixed RestoreLease handler does: track the new lease as a restore.
+	require.True(t, tracker.TryTrackRestoreInFlight("lease-r", "tenant-a", testItems("sku-1"), "test-backend"))
+
+	before := promtestutil.ToFloat64(
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, "test-backend", metrics.OperationRestore))
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-r",
+		Status:    backend.CallbackStatusSuccess,
+	})
+
+	err := hs.HandleBackendCallback(msg)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, ackCalls, "restore success callback must acknowledge the lease INLINE (not via the reconciler)")
+	assert.False(t, tracker.IsInFlight("lease-r"), "lease should be untracked after inline ack")
+
+	after := promtestutil.ToFloat64(
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, "test-backend", metrics.OperationRestore))
+	assert.Equal(t, 1.0, after-before, "restore success must be counted under operation=restore")
+}
+
+// TestHandlerSet_HandleBackendCallback_UntrackedRestore_SkipsAck documents the
+// bug ENG-358 fixes: a restore callback whose lease was NEVER tracked in-flight
+// falls into the non-in-flight (restart/update) branch and is NOT acknowledged
+// here — the lease then waits for the reconciler. This is why RestoreLease must
+// register the lease in-flight.
+func TestHandlerSet_HandleBackendCallback_UntrackedRestore_SkipsAck(t *testing.T) {
+	var ackCalls int
+	ack := &mockAcknowledger{
+		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			ackCalls++
+			return true, "tx", nil
+		},
+	}
+	mb := &mockManagerBackend{name: "test-backend"}
+	mockChain := &chaintest.MockClient{}
+
+	hs, _ := newTestHandlerSet(mockChain, mb, ack, nil)
+	// Intentionally do NOT track the lease in-flight.
+
+	msg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID: "lease-untracked",
+		Status:    backend.CallbackStatusSuccess,
+		Backend:   "test-backend",
+	})
+
+	err := hs.HandleBackendCallback(msg)
+	require.NoError(t, err)
+	assert.Equal(t, 0, ackCalls, "an untracked restore callback must NOT be acknowledged inline (the bug ENG-358 fixes)")
+}
+
 func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError(t *testing.T) {
 	ack := &mockAcknowledger{
 		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
