@@ -5448,6 +5448,30 @@ func (f *fakeRestoreRecorder) RecordRestorePlacement(n, b string) {
 	f.called, f.newLease, f.backend = true, n, b
 }
 
+// fakeRestoreTracker records how RestoreLease drives the in-flight tracker (ENG-358).
+type fakeRestoreTracker struct {
+	trackResult bool // what TryTrackRestoreInFlight returns
+
+	tryCalled  bool
+	tryLease   string
+	tryTenant  string
+	tryBackend string
+
+	untrackCalled bool
+	untrackLease  string
+}
+
+func (f *fakeRestoreTracker) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
+	f.tryCalled = true
+	f.tryLease, f.tryTenant, f.tryBackend = leaseUUID, tenant, backendName
+	return f.trackResult
+}
+
+func (f *fakeRestoreTracker) UntrackInFlight(leaseUUID string) {
+	f.untrackCalled = true
+	f.untrackLease = leaseUUID
+}
+
 // TestRestoreLease_RecorderCalledOnSuccess verifies that after a successful
 // restore the handler calls RecordRestorePlacement(newLeaseUUID, backendName)
 // on the injected RestorePlacementRecorder. The backend name must be that of
@@ -5595,4 +5619,140 @@ func TestRestoreLease_RecorderNotCalledOnMissingSourcePlacement(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, resp.Code, "body: %s", resp.Body.String())
 	assert.False(t, recorder.called, "RecordRestorePlacement must NOT be called when restore fails before the success path")
+}
+
+// restoreTrackerTestSetup builds a RestoreLease request whose source lease routes
+// to a backend served by `backendHandler`, with `tracker` injected as the restore
+// in-flight tracker. It returns the recorder after invoking the handler.
+func restoreTrackerTestSetup(t *testing.T, tracker RestoreInFlightTracker, backendHandler http.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	srcServer := httptest.NewServer(backendHandler)
+	t.Cleanup(srcServer.Close)
+
+	srcBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "backend-src",
+		BaseURL: srcServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: srcBackend, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string {
+			if uuid == fromLeaseUUID {
+				return "backend-src"
+			}
+			return ""
+		},
+	}
+
+	h := NewHandlers(HandlersConfig{
+		Client:          chainClient,
+		BackendRouter:   router,
+		PlacementLookup: placement,
+		RestoreTracker:  tracker,
+		ProviderUUID:    providerUUID,
+		Bech32Prefix:    "manifest",
+	})
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	resp := httptest.NewRecorder()
+	h.RestoreLease(resp, req)
+	return resp
+}
+
+// TestRestoreLease_TracksRestoreInFlightOnSuccess is the API half of ENG-358: a
+// successful restore must register the NEW lease in the in-flight tracker (so its
+// provision callback is acked inline), keyed on the new lease and the SOURCE
+// backend, and must NOT untrack on the success path.
+func TestRestoreLease_TracksRestoreInFlightOnSuccess(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: true}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/restore" && r.Method == "POST" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	})
+
+	require.Equal(t, http.StatusAccepted, resp.Code, "body: %s", resp.Body.String())
+	assert.True(t, tracker.tryCalled, "restore must register the new lease in-flight")
+	assert.Equal(t, testutil.ValidUUID1, tracker.tryLease, "must track the NEW lease UUID")
+	assert.Equal(t, "backend-src", tracker.tryBackend, "must track against the SOURCE backend (ENG-333)")
+	assert.NotEmpty(t, tracker.tryTenant, "must track the authenticated tenant")
+	assert.False(t, tracker.untrackCalled, "must NOT untrack on the success path")
+}
+
+// TestRestoreLease_UntracksOnBackendError verifies the phantom-entry guard: if the
+// synchronous Restore() call fails, the handler must untrack the in-flight entry
+// it just registered, otherwise the TimeoutChecker would later reject a valid lease.
+func TestRestoreLease_UntracksOnBackendError(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: true}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		// Backend rejects the restore — drives Restore() to return an error.
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	require.NotEqual(t, http.StatusAccepted, resp.Code, "backend error must not yield 202")
+	assert.True(t, tracker.tryCalled, "restore must have registered in-flight before calling the backend")
+	assert.True(t, tracker.untrackCalled, "must untrack the in-flight entry when Restore() fails")
+	assert.Equal(t, testutil.ValidUUID1, tracker.untrackLease, "must untrack the NEW lease UUID")
+}
+
+// TestRestoreLease_UntracksOnNonDefaultErrorBranch complements
+// TestRestoreLease_UntracksOnBackendError (which drives the generic default
+// branch). The untrack runs unconditionally BEFORE the error-classification
+// switch, so it must fire on a SPECIFIC sentinel branch too — here a 422 from the
+// backend → ErrNotRetained → 404. This locks the untrack-before-switch ordering
+// against a regression that moves the untrack into a single error case.
+func TestRestoreLease_UntracksOnNonDefaultErrorBranch(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: true}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		// 422 → backend.ErrNotRetained → the handler's first (non-default) error branch.
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	})
+
+	require.Equal(t, http.StatusNotFound, resp.Code, "422/ErrNotRetained must map to 404, body: %s", resp.Body.String())
+	assert.True(t, tracker.untrackCalled, "must untrack on a non-default sync Restore() error branch too")
+	assert.Equal(t, testutil.ValidUUID1, tracker.untrackLease, "must untrack the NEW lease UUID")
+}
+
+// TestRestoreLease_AlreadyInFlightReturns409 verifies that when the new lease is
+// already being provisioned/restored (TryTrackRestoreInFlight==false — e.g. a
+// duplicate POST or a racing reconciler fresh-provision), the handler returns 409,
+// never calls the backend, and never untracks the foreign entry.
+func TestRestoreLease_AlreadyInFlightReturns409(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: false}
+	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("backend must not be called when the lease is already in-flight: %s %s", r.Method, r.URL.Path)
+	})
+
+	require.Equal(t, http.StatusConflict, resp.Code, "already-in-flight restore must be 409, body: %s", resp.Body.String())
+	assert.True(t, tracker.tryCalled, "handler must have attempted to track in-flight")
+	assert.False(t, tracker.untrackCalled, "must NOT untrack a foreign in-flight entry it does not own")
 }

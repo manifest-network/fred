@@ -244,11 +244,13 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		"backend", provision.Backend,
 	)
 
-	// Record provisioning duration if we have the start time
+	// Record provisioning duration if we have the start time. The operation label
+	// (provision|restore) keeps restore latency separable from fresh provisions (ENG-358).
+	operation := provision.Kind.operationLabel()
 	recordDuration := func() {
 		if !provision.StartTime.IsZero() {
 			duration := time.Since(provision.StartTime).Seconds()
-			metrics.ProvisioningDuration.WithLabelValues(provision.Backend).Observe(duration)
+			metrics.ProvisioningDuration.WithLabelValues(provision.Backend, operation).Observe(duration)
 		}
 	}
 
@@ -264,7 +266,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 				// already acknowledged it. Treat as success - the lease is active.
 				h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
 				recordDuration()
-				metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
+				metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend, operation).Inc()
 				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
 				slog.Info("lease already acknowledged, skipping",
 					"lease_uuid", callback.LeaseUUID,
@@ -285,7 +287,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		// Only remove from in-flight after successful acknowledgment
 		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
 		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend).Inc()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend, operation).Inc()
 
 		// Payload is intentionally NOT deleted here. The lease is now ACTIVE
 		// but the container could crash later, requiring re-provisioning with
@@ -299,6 +301,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		slog.Info("lease acknowledged after provisioning",
 			"lease_uuid", callback.LeaseUUID,
 			"tenant", provision.Tenant,
+			"operation", operation,
 			"acknowledged", acknowledged,
 			"tx_hash", txHash,
 		)
@@ -325,7 +328,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			// let the reconciler detect the still-failed backend state.
 			h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
 			recordDuration()
-			metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+			metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend, operation).Inc()
 
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, reason)
 
@@ -356,7 +359,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		// Only untrack AFTER successful rejection
 		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
 		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend).Inc()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend, operation).Inc()
 
 		// Clean up payload and placement after successful rejection.
 		// Placement was recorded when the backend accepted the provision
@@ -383,7 +386,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		// and handle it based on its actual chain/backend state.
 		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
 		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, provision.Backend).Inc()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, provision.Backend, operation).Inc()
 
 		slog.Warn("unknown callback status, treating as terminal",
 			"lease_uuid", callback.LeaseUUID,

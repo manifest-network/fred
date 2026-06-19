@@ -91,10 +91,12 @@ func TestMetricsRegistered(t *testing.T) {
 func TestCounterVecLabels(t *testing.T) {
 	// Verify each Vec metric accepts its documented labels without panic.
 	assert.NotPanics(t, func() {
-		ProvisioningTotal.WithLabelValues("success", "docker")
+		ProvisioningTotal.WithLabelValues("success", "docker", "provision")
+		ProvisioningTotal.WithLabelValues("success", "docker", "restore")
 	})
 	assert.NotPanics(t, func() {
-		ProvisioningDuration.WithLabelValues("docker")
+		ProvisioningDuration.WithLabelValues("docker", "provision")
+		ProvisioningDuration.WithLabelValues("docker", "restore")
 	})
 	assert.NotPanics(t, func() {
 		ReconciliationTotal.WithLabelValues("success")
