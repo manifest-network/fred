@@ -221,15 +221,19 @@ worktree transcripts):
   of its own — i.e. exactly the case the global cap exists for — so it adds machinery for no benefit in
   v1.
 
-**Tenant-facing signal (corrected).** A refused lease writes **no** retention record, so today's
+**Observability of a refusal.** A refused lease writes **no** retention record, so today's
 `GetProvision` (`info.go:166`) would *not* report it as retained — it falls through to the diagnostics
 fallback (`Status=failed`) or 404, **indistinguishable from any other failed close**. (An earlier draft
-wrongly claimed the ENG-329 close-notice already distinguishes this; it does not.) Because a tenant who
-set `retain_on_close: true` is being silently denied a grace window they cannot see, the close-notice /
-`GetProvision` response must carry an explicit status distinguishing **"retained (grace until T)"** from
-**"retention refused — data destroyed (provider retained-capacity cap reached)"**. Best practice is to
-be transparent about quota/throttling so clients aren't caught off guard. The operator-facing signal is
-the `fred_docker_backend_retention_refused_total` counter + a WARN log.
+wrongly claimed the ENG-329 close-notice already distinguishes this; verified false.)
+
+- **v1 (this PR): operator signal.** The `fred_docker_backend_retention_refused_total` counter + a WARN
+  log make every refusal explicit to operators, who are the actors that resize/reclaim capacity.
+- **Follow-up (deferred, §6): tenant-facing distinct status.** A tenant who set `retain_on_close: true`
+  ideally learns their data was destroyed, not retained. But refuse-to-retain is *semantically a
+  successful close* — routing it through the `failed` diagnostics path would mislead, and a proper
+  signal requires a new status threaded through the ENG-329 **close-notice** surface (its own area).
+  Deferred so v1 stays focused; transparency-about-quota best practice is satisfied for operators now
+  and tracked for tenants as a follow-up.
 
 ### 3.4 Metrics (`internal/backend/docker/metrics.go`)
 
@@ -313,8 +317,6 @@ Pin behavior before implementing. Pair `-race` with `-short` (stress tests OOM u
 **Cap + breach:**
 - Close+retain that would breach `max_retained_disk_mb` → volumes destroyed immediately, no retention
   record written, `retention_refused_total` increments, WARN logged.
-- A refused close's `GetProvision`/close-notice reports the distinct "retention refused — data
-  destroyed" status, **not** a generic `failed`/404.
 - `Validate()` rejects `max_retained_disk_mb < 0`, `> total_disk_mb`, or `< largest stateful SKU`; WARNs
   when `max_retained_disk_mb > 0 && max_retained_leases_per_tenant == 0`.
 
@@ -336,7 +338,6 @@ Pin behavior before implementing. Pair `-race` with `-short` (stress tests OOM u
 | `internal/backend/docker/deprovision.go` | refuse-to-retain breach check at close; call `refreshRetentionAccounting` |
 | `internal/backend/docker/restore.go` | call `refreshRetentionAccounting` on reap/evict/restore |
 | `internal/backend/docker/recover.go` | rebuild retained projection on recover |
-| `internal/backend/docker/info.go` | distinct "retention refused — data destroyed" status |
 | `internal/backend/docker/metrics.go` | 5 new metrics + exporter wiring |
 | `internal/backend/docker/backend.go` | `refreshRetentionAccounting` helper; startup statfs WARN |
 | `OPERATIONS.md`, `ARCHITECTURE.md`, `docker-backend.example.yaml`, `internal/backend/docker/README.md`, `CHANGELOG.md` | docs |
@@ -355,6 +356,10 @@ Pin behavior before implementing. Pair `-race` with `-short` (stress tests OOM u
 - **`retention_recorded_total` attempts counter** — a companion counter incremented on successful
   retention-record write, so consumers can compute a refused/attempted *rate* rather than just an
   absolute refusal count. Low value for v1 (a non-zero rise in `retention_refused_total` already alerts).
+- **Tenant-facing "retention refused — data destroyed" status** — surface a refusal to the *tenant* (not
+  just operators) via a new status threaded through the ENG-329 close-notice surface. Deferred from v1
+  because refuse-to-retain is semantically a successful close (the `failed` diagnostics path would
+  mislead) and the close-notice is a separate area. v1 ships the operator counter + WARN. (§3.3.)
 - **Record `SizeMB` on `RetentionEntry`** — v1 derives retained bytes from `Items` + `GetSKUProfile` at
   recompute time. Pinning the bytes on the record at close time would make accounting immune to
   mid-retention SKU-profile edits and cheaper to sum. Optional optimization.
