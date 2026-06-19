@@ -80,14 +80,16 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 		if err != nil {
 			if isTerminalAcknowledgeError(err) {
 				// The lease is no longer PENDING (ErrLeaseNotPending) or no longer
-				// exists (ErrLeaseNotFound). This in-flight entry is an ACTIVE-lease
-				// re-provision the reconciler registered in this same shared tracker
-				// (reconciler.go) whose callback was lost. RejectLeases can NEVER
-				// succeed for a non-PENDING lease, so retrying it forever would wedge
-				// the lease in-flight permanently and inflate InFlightProvisions
-				// (which also skews capacity/routing signals). Untrack it and hand it
-				// back to the reconciler, which owns the ACTIVE-lease re-provision /
-				// FailCount / close path. (ENG-337)
+				// exists (ErrLeaseNotFound), so RejectLeases can NEVER succeed for
+				// it. This can be a reconciler-registered ACTIVE-lease re-provision
+				// (reconciler.go) whose callback was lost, or an originally-PENDING
+				// entry whose state changed concurrently in the unlocked window
+				// between GetTimedOutProvisions and this reject (e.g. a racing
+				// success-ack that already flipped it ACTIVE). Either way, retrying
+				// forever would wedge the lease in-flight permanently and inflate
+				// InFlightProvisions (which also skews capacity/routing signals).
+				// Untrack it and hand it back to the reconciler, which owns the
+				// re-provision / FailCount / close path. (ENG-337)
 				c.tracker.UntrackInFlight(p.LeaseUUID)
 				metrics.CallbackTimeoutsTotal.Inc()
 				slog.Warn("timed-out provision is not a pending lease; untracked and handed back to reconciler",
