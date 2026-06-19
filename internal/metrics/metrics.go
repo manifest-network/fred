@@ -91,7 +91,7 @@ var (
 	// recover exists specifically to prevent one bad lease/orphan/backend
 	// from crashing the fred process. Any non-zero value is a latent bug
 	// to fix at its source — not business-as-usual. Label values:
-	// "process_lease", "process_orphan", "fetch_provisions".
+	// "process_lease", "process_orphan", "fetch_provisions", "fetch_retentions".
 	ReconcilerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
