@@ -643,10 +643,10 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			return
 		}
 		if resultRet.Err == nil {
-			// Record restore-to-ACTIVE latency on success only (mirrors the
-			// loadtest's success-only rs_restore_duration). The synchronous adopt
+			// Record the restore re-deploy worker latency on success only (mirrors
+			// the loadtest's success-only rs_restore_duration). The synchronous adopt
 			// phase ran before this worker; restore_duration_seconds covers the
-			// async re-deploy, which is the ~3-4x cost ENG-357 targets.
+			// async re-deploy worker span, which is the ~3-4x cost ENG-357 targets.
 			restoreDurationSeconds.Observe(time.Since(restoreStart).Seconds())
 			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
 				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
