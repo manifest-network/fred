@@ -108,20 +108,25 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~17min
 	})
 
-	// restoreDurationSeconds tracks end-to-end restore-to-ACTIVE time (the async
+	// restoreDurationSeconds tracks the restore re-deploy worker span — the async
 	// re-deploy of a retained lease via the replace machinery, recorded only on
-	// success). Buckets mirror provisionDurationSeconds so the two can be overlaid
-	// on the dashboard for the restore-vs-fresh-provision question ENG-357 targets.
-	// Caveat: the overlay is approximate, not like-for-like — provisionDurationSeconds
-	// is observed on BOTH success and failure (provision.go, before its error branch)
-	// and carries no outcome label, whereas this histogram is success-only. The
-	// comparison is robust at the median but biased at the tail by failed-provision
-	// latencies (image-pull timeouts, failure-path cleanup). Read it as indicative.
+	// success. It measures doRestore (compose up + verify startup) and therefore
+	// EXCLUDES the synchronous adopt prelude (the volume rename, tracked separately
+	// as replace_phase_duration_seconds{phase=adopt}) and stops when the worker
+	// returns, before the actor flips the lease to ACTIVE. Buckets mirror
+	// provisionDurationSeconds (itself the doProvision worker span) so the two can
+	// be overlaid on the dashboard for the restore-vs-fresh-provision question
+	// ENG-357 targets. Caveat: the overlay is approximate, not like-for-like —
+	// provisionDurationSeconds is observed on BOTH success and failure (provision.go,
+	// before its error branch) and carries no outcome label, whereas this histogram
+	// is success-only. The comparison is robust at the median but biased at the tail
+	// by failed-provision latencies (image-pull timeouts, failure-path cleanup).
+	// Read it as indicative.
 	restoreDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "restore_duration_seconds",
-		Help:      "End-to-end restore-to-ACTIVE duration in seconds (success only)",
+		Help:      "Restore re-deploy worker duration in seconds (success only; excludes the synchronous adopt prelude)",
 		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~17min
 	})
 

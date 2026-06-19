@@ -84,7 +84,8 @@ func TestReplaceContainers_RecordsPhaseDurationsByOperation(t *testing.T) {
 
 // TestRestore_RecordsRestoreDurationAndPhases pins the restore-specific
 // instrumentation across a full successful Restore():
-//   - restore_duration_seconds records one observation (end-to-end, success only),
+//   - restore_duration_seconds records one observation (the async re-deploy worker
+//     span, success only; excludes the adopt prelude),
 //   - the adopt phase is recorded under operation=restore (volume rename in the
 //     synchronous prelude), and
 //   - the shared compose_up phase is recorded under operation=restore (proving the
