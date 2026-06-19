@@ -279,7 +279,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`
+- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed lease whose data is retained, alongside `retained_until` (RFC3339) and `items` (the restore shape)
 - `fail_count` - Number of provision failures
 - `last_error` - Full diagnostic error message (exit codes, OOM, truncated logs)
 
@@ -373,6 +373,57 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 - `400 Bad Request` - Invalid manifest or validation error
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for update (e.g., currently restarting or provisioning)
+
+### POST /restore (optional — retention support)
+
+Restore a soft-deleted lease's retained data into a **new** lease (async, callback on completion). Only meaningful for backends that implement soft-delete on close (`retain_on_close`). A backend without retention support must still serve this route and return `422`.
+
+**Request:**
+```json
+{
+  "lease_uuid": "<new-lease-uuid>",
+  "from_lease_uuid": "<original-retained-lease-uuid>",
+  "tenant": "manifest1abc...",
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
+  "callback_url": "http://fred:8080/callbacks/provision"
+}
+```
+
+`lease_uuid` is the new lease; `from_lease_uuid` is the original retained lease. `items` must shape-match (service name → summed quantity) the retained set.
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "restoring"
+}
+```
+
+**Behavior:**
+1. Validate the retained record exists and is owned by `tenant`; re-deploy strictly from the **retained manifest** captured at close time (the request carries no manifest)
+2. Adopt the retained volumes into the new lease's namespace, then bring up the stack and POST a callback
+3. On failure, re-quarantine the volumes (data preserved) and POST a failure callback
+
+**Error Responses:**
+- `400 Bad Request` - Missing required fields or items/manifest validation error
+- `409 Conflict` - Invalid state for restore (bare body), or already provisioned (body `code: "already_provisioned"`)
+- `422 Unprocessable Entity` - No retained data for `from_lease_uuid` (also the correct response for backends without retention support)
+- `503 Service Unavailable` - Insufficient resources
+
+### GET /retentions (optional — retention support)
+
+List the leases whose data this backend currently retains. Fred's reconciler polls this on every backend each tick to keep restore routing affinity (route a restore to the backend holding the source data). Backends without retention return an empty list.
+
+**Response:** `200 OK`
+```json
+{
+  "retentions": [
+    {"lease_uuid": "550e8400-e29b-41d4-a716-446655440000"}
+  ]
+}
+```
+
+Always return `{"retentions": []}` (never `null`) when nothing is retained.
 
 ### POST /reconcile_custom_domain
 
