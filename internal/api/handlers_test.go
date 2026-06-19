@@ -5764,7 +5764,8 @@ func TestRestoreLease_AlreadyInFlightReturns409(t *testing.T) {
 // (internal/backend/docker/restore_test.go). The three tests below pin the
 // restore ROUTE's own enforcement so a refactor of RestoreLease — that skipped
 // authenticateLease, or forwarded a tenant other than the ADR-036 signer to the
-// backend — would be caught here, not only by reading server.go:248-250.
+// backend — would be caught here, not only by inspecting that restore is wired
+// with the same withAuthRL wrapper as restart/update.
 
 // TestRestoreLease_RejectsUnauthenticated verifies PROPERTY 1 (ADR-036 auth) for
 // the restore route: a missing, expired, or wrong-lease-bound token is rejected
@@ -5784,7 +5785,8 @@ func TestRestoreLease_RejectsUnauthenticated(t *testing.T) {
 		{"expired_token", "Bearer " + testutil.CreateExpiredToken(kp, leaseUUID), "token past MaxTokenAge"},
 		// A token validly signed for a DIFFERENT lease must not authorize restore
 		// onto leaseUUID: token.LeaseUUID is a signed field, so it cannot be
-		// retargeted without the tenant's key (handlers.go:209).
+		// retargeted without the tenant's key (authenticateLeaseToken rejects a
+		// token whose signed LeaseUUID does not match the path lease).
 		{"wrong_target_lease_binding", "Bearer " + testutil.CreateTestToken(kp, testutil.ValidUUID3, time.Now()), "token bound to a different lease UUID"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5981,7 +5983,8 @@ func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
 	// The handler must have forwarded the SIGNER's tenant — the value the backend
 	// gate compares against the retained record — not the body's from_lease_uuid
 	// or any caller-supplied field. (RestoreRequest carries no tenant field for the
-	// caller to set; this pins handlers.go:982 Tenant: auth.Token.Tenant.)
+	// caller to set; this pins that RestoreLease sets the backend request's Tenant
+	// from the authenticated token, i.e. Tenant: auth.Token.Tenant.)
 	require.NotNil(t, receivedBody, "backend should have received a request body")
 	var backendReq map[string]any
 	require.NoError(t, json.Unmarshal(receivedBody, &backendReq))
