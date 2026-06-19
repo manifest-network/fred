@@ -208,9 +208,10 @@ Fred-internal runtime status of the provisioned resource. Surfaced via `GET /v1/
 | `ready` | Resource is healthy and serving traffic. | No |
 | `failing` | Container death detected; diagnostics being gathered. Brief transient — collapses to `failed` (or `deprovisioning` if a Deprovision arrives in this window). | No |
 | `failed` | Provisioning or runtime failure. May be re-provisioned, restarted, updated, or deprovisioned. | Yes (until next request) |
-| `restarting` | Containers are being recreated with the same manifest. | No |
+| `restarting` | Containers are being recreated with the same manifest. Also the status a **restore** rides on — it reuses the restart machinery (`evRestoreRequested → Restarting`). | No |
 | `updating` | New manifest is being deployed (containers replaced). | No |
 | `deprovisioning` | Containers/volumes are being removed. | Yes (transient before actor exits) |
+| `retained` | The lease was closed/expired and its data soft-deleted (volumes renamed into the `fred-retained-` namespace), restorable within the grace window. Derived from the backend's retention record (ENG-329), not an in-memory provision state; surfaced by the queryable status API. | Yes |
 | `unknown` | Reserved safety state — should never appear in normal flow. | — |
 
 The full transition matrix lives in [internal/backend/docker/README.md](internal/backend/docker/README.md#lease-state-machine). The reconciler matrix in [README.md](README.md#reconciliation) shows how chain state × provision status maps to corrective actions.
@@ -265,8 +266,37 @@ The full transition matrix lives in [internal/backend/docker/README.md](internal
    a. Clean up stored payload (if any)
    b. Fetch lease from chain for SKU routing hint
    c. Route to backend by SKU, call backend POST /deprovision
-   d. Backend cleans up resources (idempotent)
+   d. Backend cleans up resources (idempotent). With `retain_on_close`, the
+      backend soft-deletes volumes instead of destroying them and reports
+      `retained: true` on its deprovisioned callback.
 ```
+
+The lease's **placement record survives close** (only the payload is cleaned up). This is deliberate: it keeps the closed lease's backend resolvable so a later restore can be routed to the node that holds its retained data (restore affinity, ENG-333). A `PENDING` lease that is *rejected* (never provisioned) deletes its placement eagerly, since there is no retention to protect.
+
+### Lease Restore
+
+Restore adopts a soft-deleted lease's retained data into a new lease (see the [docker backend restore flow](internal/backend/docker/README.md#soft-delete--restore)):
+
+```
+1. Tenant opens a fresh PENDING lease matching the closed lease's shape
+2. Tenant POSTs /v1/leases/{new}/restore with from_lease_uuid = {closed}
+3. RestoreLease:
+   a. Resolve the backend that holds the SOURCE lease's retained data, via the
+      source lease's surviving placement (restore is same-backend, ENG-333)
+   b. Track the new lease in-flight as a restore BEFORE calling the backend
+   c. Call backend POST /restore; optimistically record the new lease's
+      placement on the source backend
+4. Backend adopts the retained volumes and re-deploys the retained manifest async
+5. Backend POSTs the success callback:
+   a. Because the lease was tracked in-flight (step 3b), the callback is
+      acknowledged INLINE on-chain (ENG-358) — no ~reconciler-interval wait
+```
+
+Reconciler interplay (level-triggered backstop):
+
+- **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path; if no restore tracker is wired, the restore still converges because the reconciler acks a `PENDING` + `ready` lease. The reconciler *skips* acking a lease the in-flight tracker already owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
+- **Restore affinity sync (ENG-333).** Each reconcile tick fans out `GET /retentions` to every backend and syncs the `lease → backend` map into the placement store, so retained leases stay routable to their source node across restarts.
+- **Placement prune grace + deprovision fail-safe (ENG-335).** The reconciler will not prune a placement set younger than a grace window (`2 × reconcile_interval`, measured from sweep start), so a lease that provisioned during a slow sweep is not mis-pruned. When a lease exhausts its re-provision attempts and is closed, the reconciler eagerly calls `backend.Deprovision` on its backend instead of waiting for the next orphan-cleanup cycle (logged at WARN, non-fatal).
 
 ## Concurrency Model
 
@@ -539,13 +569,13 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `fred_provisioner_in_flight_provisions` | gauge | — | Current in-flight provisions |
-| `fred_provisioner_provisioning_total` | counter | `outcome, backend` | Provisioning operations by outcome/backend |
-| `fred_provisioner_provisioning_duration_seconds` | histogram | `backend` | Provisioning latency |
+| `fred_provisioner_provisioning_total` | counter | `outcome, backend, operation` | Provisioning operations by outcome/backend. `operation` ∈ `provision`/`restore` separates fresh provisions from restores (ENG-358) |
+| `fred_provisioner_provisioning_duration_seconds` | histogram | `backend, operation` | Provisioning latency. `operation` ∈ `provision`/`restore` |
 | `fred_provisioner_callback_timeouts_total` | counter | — | Backend callback timeouts |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` | counter | `lane` | Ack-batch failures classified as insufficient-fee or out-of-gas — sustained non-zero indicates `gas_limit`/`max_gas_limit`/fee misconfiguration |
 | `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
 | `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
-| `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`) — any non-zero is a latent bug |
+| `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`, `fetch_retentions`) — any non-zero is a latent bug |
 
 **Reconciler:**
 
