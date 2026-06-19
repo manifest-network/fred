@@ -623,6 +623,8 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_provision_duration_seconds` | histogram | — | End-to-end provision time |
 | `fred_docker_backend_image_pull_duration_seconds` | histogram | — | Image pull duration |
 | `fred_docker_backend_container_create_duration_seconds` | histogram | — | Container create duration |
+| `fred_docker_backend_restore_duration_seconds` | histogram | — | End-to-end restore-to-ACTIVE time (success only). Buckets mirror `provision_duration_seconds` for direct restore-vs-fresh-provision comparison |
+| `fred_docker_backend_replace_phase_duration_seconds` | histogram | `operation, phase` | Per-phase duration of the shared replace machinery. `operation` ∈ `restart`/`update`/`restore`; `phase` ∈ `adopt` (restore-only volume rename), `image_setup`, `volume_setup` (incl. VOLUME-subdir chown), `compose_up`, `verify_startup` |
 | `fred_docker_backend_resource_cpu_allocated_ratio` | gauge | — | Allocated/total CPU |
 | `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
 | `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total disk |

@@ -12,6 +12,19 @@ const (
 	metricsSubsystem = "docker_backend"
 )
 
+// Phase labels for replacePhaseDurationSeconds. They name the timed sub-steps
+// of the shared replace machinery (doReplaceContainers) plus the restore-only
+// volume adoption that runs in Restore's synchronous prelude. Kept as
+// constants so the production instrumentation and the dashboard/tests cannot
+// drift on a string typo.
+const (
+	phaseAdopt         = "adopt"          // restore-only: rename retained → canonical volumes
+	phaseImageSetup    = "image_setup"    // inspect image VOLUMEs / user / writable paths
+	phaseVolumeSetup   = "volume_setup"   // create volume binds + VOLUME-subdir chown
+	phaseComposeUp     = "compose_up"     // compose Up (stop old + create/start new)
+	phaseVerifyStartup = "verify_startup" // health-wait / fixed startup verification
+)
+
 var (
 	// provisionsTotal tracks the total number of provision attempts by outcome.
 	provisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -94,6 +107,34 @@ var (
 		Help:      "Duration of image pull operations in seconds",
 		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~17min
 	})
+
+	// restoreDurationSeconds tracks end-to-end restore-to-ACTIVE time (the async
+	// re-deploy of a retained lease via the replace machinery, recorded only on
+	// success). Buckets mirror provisionDurationSeconds so the two histograms are
+	// directly comparable on the dashboard — restore-vs-fresh-provision is the
+	// core question ENG-357 exists to answer.
+	restoreDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "restore_duration_seconds",
+		Help:      "End-to-end restore-to-ACTIVE duration in seconds (success only)",
+		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~17min
+	})
+
+	// replacePhaseDurationSeconds breaks the shared replace machinery
+	// (restart/update/restore) into per-phase timings so the dominant cost of a
+	// restore re-deploy is visible. Labeled by operation (restart|update|restore)
+	// and phase (adopt|image_setup|volume_setup|compose_up|verify_startup). Finer,
+	// lower-floor buckets than the end-to-end histograms because individual phases
+	// (adopt, image_setup) are routinely sub-second while others (compose_up,
+	// verify_startup) run for seconds.
+	replacePhaseDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "replace_phase_duration_seconds",
+		Help:      "Per-phase duration of the shared replace machinery (restart/update/restore) in seconds",
+		Buckets:   prometheus.ExponentialBuckets(0.05, 2, 16), // 50ms to ~27min
+	}, []string{"operation", "phase"})
 
 	// reconciliationTotal tracks reconciliation runs by outcome.
 	reconciliationTotal = promauto.NewCounterVec(prometheus.CounterOpts{

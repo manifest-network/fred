@@ -557,11 +557,16 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 
 	// (e) Adopt: rename retained->canonical. On failure, full rollback. The
 	// worker never ran, so no actor terminal transition is coming — drop the
-	// reservation (dropProvision=true).
+	// reservation (dropProvision=true). Timed as the restore "adopt" phase: it
+	// is the only re-deploy work outside the async worker (doReplaceContainers),
+	// so it must be measured here, in the synchronous prelude, to rule the
+	// rename in/out as a contributor to restore latency.
+	adoptStart := time.Now()
 	if err := b.adoptRetainedVolumes(req.LeaseUUID, claimed); err != nil {
 		b.rollbackRestoreAdoption(ctx, req.LeaseUUID, allocatedIDs, claimed, true, logger)
 		return fmt.Errorf("adopt retained volumes: %w", err)
 	}
+	replacePhaseDurationSeconds.WithLabelValues("restore", phaseAdopt).Observe(time.Since(adoptStart).Seconds())
 
 	// (f) Hand off to the actor; doRestore's terminal defer owns
 	// success/failure/panic.
@@ -612,6 +617,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 // the callback; the periodic reaper / a subsequent op reconciles the entry.)
 func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.RetentionEntry,
 	profiles map[string]SKUProfile, allocatedIDs []string, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
+	restoreStart := time.Now()
 	defer func() {
 		// N2: a panic leaves resultRet.Err==nil; force the failure path so we never
 		// delete the record while the lease is not Ready. Convert panic -> Failed.
@@ -637,6 +643,11 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			return
 		}
 		if resultRet.Err == nil {
+			// Record restore-to-ACTIVE latency on success only (mirrors the
+			// loadtest's success-only rs_restore_duration). The synchronous adopt
+			// phase ran before this worker; restore_duration_seconds covers the
+			// async re-deploy, which is the ~3-4x cost ENG-357 targets.
+			restoreDurationSeconds.Observe(time.Since(restoreStart).Seconds())
 			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
 				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
 			}
