@@ -110,9 +110,13 @@ var (
 
 	// restoreDurationSeconds tracks end-to-end restore-to-ACTIVE time (the async
 	// re-deploy of a retained lease via the replace machinery, recorded only on
-	// success). Buckets mirror provisionDurationSeconds so the two histograms are
-	// directly comparable on the dashboard — restore-vs-fresh-provision is the
-	// core question ENG-357 exists to answer.
+	// success). Buckets mirror provisionDurationSeconds so the two can be overlaid
+	// on the dashboard for the restore-vs-fresh-provision question ENG-357 targets.
+	// Caveat: the overlay is approximate, not like-for-like — provisionDurationSeconds
+	// is observed on BOTH success and failure (provision.go, before its error branch)
+	// and carries no outcome label, whereas this histogram is success-only. The
+	// comparison is robust at the median but biased at the tail by failed-provision
+	// latencies (image-pull timeouts, failure-path cleanup). Read it as indicative.
 	restoreDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,

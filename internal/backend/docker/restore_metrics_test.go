@@ -97,6 +97,9 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
+	// Defer teardown so the backend's goroutines (lease actor, restore worker,
+	// reaper) are cancelled and awaited even when an assertion below fails early.
+	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	seedActiveRetained(t, rs, "u1")
@@ -108,14 +111,8 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
 
-	callbackReceived := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		select {
-		case <-callbackReceived:
-		default:
-			close(callbackReceived)
-		}
 	}))
 	defer server.Close()
 
@@ -126,10 +123,9 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
 	require.NoError(t, err)
 
-	<-callbackReceived
-
-	// u2 reaching Ready guarantees the restore worker (and its terminal defer,
-	// which records restore_duration_seconds) has completed.
+	// The restore worker records restore_duration_seconds in its terminal defer,
+	// which runs before the actor flips Status=Ready — so this bounded wait for
+	// Ready is a sufficient, fail-fast gate for the metric assertions below.
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
@@ -145,7 +141,4 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	assert.Equal(t, composeBefore+1,
 		observerSampleCount(t, replacePhaseDurationSeconds.WithLabelValues("restore", phaseComposeUp)),
 		"compose_up phase must be recorded under operation=restore")
-
-	b.stopCancel()
-	b.wg.Wait()
 }
