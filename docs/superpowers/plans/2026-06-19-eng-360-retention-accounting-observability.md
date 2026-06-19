@@ -261,7 +261,8 @@ In `internal/backend/docker/config.go`, add to the `Config` struct after `MaxRet
 	// largest single stateful SKU's disk_mb (else a SKU-legal lease could never
 	// be retained). Independent of tenant_quota.max_disk_mb: it may be smaller,
 	// in which case a tenant's max-sized lease is SKU-legal yet refused
-	// retention. Duration/byte values use plain integers (MB).
+	// retention. Value is a plain integer in MB (mebibytes, 2^20 bytes —
+	// consistent with total_disk_mb and the SKU disk_mb fields).
 	MaxRetainedDiskMB int64 `yaml:"max_retained_disk_mb"`
 ```
 
@@ -633,7 +634,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `internal/backend/docker/deprovision.go` (after the pool-release block)
-- Modify: `internal/backend/docker/restore.go` (reap, evict, sweep)
+- Modify: `internal/backend/docker/restore.go` (reap, evict, sweep, **and the restore claim/complete/revert sites**)
 - Modify: `internal/backend/docker/recover.go` (after `pool.Reset`)
 - Modify: `internal/backend/docker/backend.go` (after boot-eager reap in `Start`)
 - Test: `internal/backend/docker/retention_accounting_test.go`
@@ -710,19 +711,83 @@ In `runRetentionSweep`, before the final `return nil` (currently line 307) — n
 	return nil
 ```
 
+- [ ] **Step 5b: Wire into the synchronous restore path (the correctness-critical sites)**
+
+The restore actor path mutates the active retained set at three points and must refresh too. **Spec §3.2 lists "restore claim / complete / revert" as required refresh points** — omitting them lets a *failed-restore revert* leave bytes counted in neither the live pool nor the retained projection (an under-count → over-admit), self-healing only at the next authoritative recompute (the reconcile loop / sweep, ≈`reconcile_interval`). Add `b.refreshRetentionAccounting()` at all three, ordered so the projection is never under-counted (live is added *before* retained is dropped):
+
+In `Restore` (`restore.go`), after the successful `ClaimForRestore` commit (currently line 543; the step-(c) `TryAllocate` at line 527 + `updateResourceMetrics` at 539 already counted the restored lease as **live** before the claim flips the record `active→restoring`), add — on the success path, before launching the async re-deploy:
+
+```go
+	// Claim flipped the record active→restoring (drops it from the active
+	// projection); the live allocation above already counts the bytes, so this
+	// keeps the gauge/projection consistent without an under-count window.
+	b.refreshRetentionAccounting()
+```
+
+In `doRestore` (`restore.go`), in the success arm right after `b.retentionStore.Delete(rec.OriginalLeaseUUID)` (currently line 651):
+
+```go
+	b.refreshRetentionAccounting()
+```
+
+In `rollbackRestoreAdoption` (`restore.go`), after the **`RevertToActive` success branch on the `!failed` path** (currently line 708; `releaseAll` at 701 already dropped the live allocation and the volumes are re-quarantined on disk, so the revert re-adds the record to the active set and the projection must re-count it):
+
+```go
+	b.refreshRetentionAccounting()
+```
+
+> These close the only under-count (over-admit) window. The reconcile loop (`recoverState` every `reconcile_interval`, default ~5 min) and the sweep are second/third authoritative recomputes, so a missed call self-heals — but the explicit refresh takes the window to zero.
+
 - [ ] **Step 6: Wire into startup boot-eager reap**
 
 In `internal/backend/docker/backend.go`, in `Start`, after the boot-eager reap block (currently ends line 588, before `b.startRetentionReaper()`):
 
 ```go
-	// recoverState already rebuilt the projection; the boot reap above may have
-	// dropped expired records, so refresh once more before serving traffic.
+	// Belt-and-suspenders: recoverState already rebuilt the projection and the
+	// boot reap (now wired in Step 5) self-refreshes; this final call guarantees
+	// a correct projection before serving traffic even if either changes.
 	b.refreshRetentionAccounting()
 ```
 
+- [ ] **Step 6b: Add the never-under-count ordering invariant test (spec §4)**
+
+Spec §3.2/§4 mandate that the restore ordering never transiently under-counts (live must be added before the retained projection is dropped; double-count/over-deny is the only acceptable transient error). Pin it as a regression guard over the production pool + store + refresh helpers. Append to `internal/backend/docker/retention_accounting_test.go`:
+
+```go
+func TestRestoreOrdering_NeverUnderCounts(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now()))) // active, 2 x 1024 = 2048 MB
+	b.refreshRetentionAccounting()
+	require.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB)
+
+	// Claim ordering: the restored lease is allocated LIVE before the record
+	// flips active→restoring (which a refresh drops from the active projection).
+	// Model that order; live+retained must never dip below the footprint
+	// (under-count == over-admit, the dangerous direction).
+	require.NoError(t, b.pool.TryAllocate("lease-a-web-0", "docker-micro", "t1")) // +1024 live
+	require.NoError(t, b.pool.TryAllocate("lease-a-web-1", "docker-micro", "t1")) // +1024 live
+	s := b.pool.Stats()
+	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(2048),
+		"live+retained must never under-count during the claim window")
+
+	// Record flips to restoring; refresh drops it from the active projection.
+	entry := retentionEntryFixture("lease-a", "t1", time.Now())
+	entry.Status = shared.RetentionStatusRestoring
+	require.NoError(t, rs.Put(entry))
+	b.refreshRetentionAccounting()
+	s = b.pool.Stats()
+	assert.Equal(t, int64(0), s.RetainedDiskMB, "restoring record leaves the active projection")
+	assert.Equal(t, int64(2048), s.AllocatedDiskMB, "bytes are now counted as live")
+	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(2048))
+}
+```
+
+> This models the documented claim ordering with production helpers (it is an invariant guard, not a full async-restore driver). The restore call-site wiring from Steps 5b is additionally exercised by the existing `restore`/`reconcileRestoring` tests staying green in Step 7.
+
 - [ ] **Step 7: Run tests to verify they pass**
 
-Run: `go test ./internal/backend/docker/ -run 'TestRecoverRebuildsRetainedProjection|TestComputeRetainedDiskMB|TestRefreshRetentionAccounting' -v`
+Run: `go test ./internal/backend/docker/ -run 'TestRecoverRebuildsRetainedProjection|TestComputeRetainedDiskMB|TestRefreshRetentionAccounting|TestRestoreOrdering_NeverUnderCounts' -v`
 Expected: PASS.
 Then run the docker package tests to confirm the wiring doesn't regress existing deprovision/restore/recover tests:
 Run: `go test ./internal/backend/docker/ -short`
@@ -734,9 +799,10 @@ Expected: PASS.
 git add internal/backend/docker/recover.go internal/backend/docker/deprovision.go internal/backend/docker/restore.go internal/backend/docker/backend.go internal/backend/docker/retention_accounting_test.go
 git commit -m "feat(eng-360): refresh retained-disk projection at every transition
 
-Recompute + push the retained projection after close, reap, evict, sweep, on
-recover, and at startup boot-reap. The sweep tick is authoritative so any
-per-event slip self-heals within one interval.
+Recompute + push the retained projection after close, reap, evict, sweep,
+restore (claim/complete/revert), on recover, and at startup boot-reap. The
+reconcile loop + sweep are authoritative recomputes so any per-event slip
+self-heals within one interval.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -790,78 +856,101 @@ In `internal/backend/docker/retention_accounting.go`, add:
 ```go
 // breachRetentionCap reports whether retaining a lease of the given items would
 // push the provider-global retained footprint over max_retained_disk_mb.
-// 0 = unlimited (never breaches).
+// 0 = unlimited (never breaches). Reads the CACHED pool.Stats().RetainedDiskMB
+// (not a fresh recompute), so under concurrent multi-lease closes the cap may be
+// transiently overshot by one lease's worth, self-healing at the next
+// recompute (sweep / reconcile loop) — consistent with the level-triggered
+// drift-to-one-tick model.
 func (b *Backend) breachRetentionCap(items []backend.LeaseItem) bool {
 	if b.cfg.MaxRetainedDiskMB <= 0 {
 		return false
 	}
 	return b.pool.Stats().RetainedDiskMB+b.leaseDiskMB(items) > b.cfg.MaxRetainedDiskMB
 }
+
+// destroyOnRefuseToRetain destroys a closing lease's still-canonical volumes
+// when the retained cap is breached (refuse-to-retain). Logs + increments the
+// refusal counter; returns any destroy errors to merge into the caller's
+// volumeErrs. Only the closing lease's own volumes are touched — no other
+// tenant's in-grace data is ever evicted.
+func (b *Backend) destroyOnRefuseToRetain(ctx context.Context, canonical []string, leaseUUID, tenant string, logger *slog.Logger) []error {
+	logger.Warn("retention refused: provider retained-capacity cap reached; destroying volumes instead of retaining",
+		"lease_uuid", leaseUUID, "tenant", tenant, "cap_mb", b.cfg.MaxRetainedDiskMB)
+	retentionRefusedTotal.Inc()
+	var errs []error
+	for _, c := range canonical {
+		if derr := b.volumes.Destroy(ctx, c); derr != nil {
+			logger.Error("retention-refused destroy failed", "volume", c, "error", derr)
+			errs = append(errs, fmt.Errorf("retention-refused destroy %s: %w", c, derr))
+		}
+	}
+	return errs
+}
 ```
+
+Add `"context"`, `"fmt"`, and `"log/slog"` to `retention_accounting.go`'s imports if not already present.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/backend/docker/ -run TestBreachRetentionCap -v`
 Expected: PASS.
 
-- [ ] **Step 5: Wire refuse-to-retain into the close path**
+- [ ] **Step 5: Wire refuse-to-retain into the close path (early guard, no re-indent)**
 
-In `internal/backend/docker/deprovision.go`, inside the `if len(canonical) > 0 {` block (currently line 166), wrap the existing retain logic (eviction → hydrate → `PutActiveMerged` → rename, currently lines 167-236) so the breach path destroys instead. Insert at the top of the block:
+In `internal/backend/docker/deprovision.go`, inside the `if len(canonical) > 0 {` block (currently line 166), add an early guard at the **top** of the block. Do **not** re-indent the existing ~70-line retain body into an `else` — the block is already 4 levels deep with a 4-arm switch; deepening it conflicts with the repo's line-of-sight / behavior-preserving-extraction preference. Use the extracted helper and gate the existing logic with a single `else`:
 
 ```go
 		if b.breachRetentionCap(items) {
-			// Refuse to retain: the provider-global retained cap is reached.
-			// Destroy this closing lease's volumes now instead of retaining
-			// them. Only the closing tenant's own data is affected — we never
-			// evict another tenant's in-grace data (cross-tenant data loss).
-			logger.Warn("retention refused: provider retained-capacity cap reached; destroying volumes instead of retaining",
-				"lease_uuid", leaseUUID, "tenant", tenant, "cap_mb", b.cfg.MaxRetainedDiskMB)
-			retentionRefusedTotal.Inc()
-			for _, c := range canonical {
-				if derr := b.volumes.Destroy(ctx, c); derr != nil {
-					logger.Error("retention-refused destroy failed", "volume", c, "error", derr)
-					volumeErrs = append(volumeErrs, fmt.Errorf("retention-refused destroy %s: %w", c, derr))
-				}
-			}
+			volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, canonical, leaseUUID, tenant, logger)...)
 		} else {
-			// ... existing retain logic (eviction, manifest hydration,
-			//     PutActiveMerged, RenameVolume) moves UNCHANGED into this else ...
+			// existing retain logic (eviction, manifest hydration,
+			// PutActiveMerged, RenameVolume) — UNCHANGED
+			...
 		}
 ```
 
-> Implementation note: this is a pure wrapping — the existing lines 167-236 become the body of the `else`. Re-indent them; do not change their logic. `volumesRetained` stays `false` on the breach path (volumes were destroyed, not retained), which is correct.
+> The breach arm is now one short line; only the existing retain body sits in the `else`. `volumesRetained` stays `false` on the breach path (volumes destroyed, not retained), which is correct. If the team prefers zero added nesting, the whole `len(canonical) > 0` body can instead be extracted into a `b.retainOrRefuse(...)` method — either is acceptable; the key requirement is **do not blindly re-indent 70 lines**.
 
-- [ ] **Step 6: Write the breach integration test**
+- [ ] **Step 6: Write a breach test that drives the production decision**
 
-Append to `internal/backend/docker/retention_accounting_test.go` a test that drives the close path's retain branch. If driving the full `Deprovision` is impractical in a unit test, assert the breach decision + counter directly (the destroy wiring is covered by the existing deprovision tests):
+The earlier draft's test that called `retentionRefusedTotal.Inc()` itself was a near-tautology. Instead exercise the production helpers (`breachRetentionCap` + `destroyOnRefuseToRetain`) directly, asserting the real observable contract: counter rises by exactly 1 **from production code**, and the lease's volumes are destroyed. Append to `internal/backend/docker/retention_accounting_test.go`:
 
 ```go
-func TestRefuseToRetain_IncrementsCounterAndDestroys(t *testing.T) {
+func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	b, _ := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
-	b.cfg.MaxRetainedDiskMB = 1000 // smaller than a single 2048 MB lease
+	b.cfg.MaxRetainedDiskMB = 1000 // smaller than a single 2 x 1024 = 2048 MB lease
 	b.pool.SetRetainedDisk(0)
 
-	before := testutil.ToFloat64(retentionRefusedTotal)
+	// A capturing fake volume manager records Destroy calls (mirrors the
+	// fakeVolumeBackend pattern in testsupport_test.go).
+	fv := &fakeVolumeBackend{}
+	b.volumes = fv
+
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
 	require.True(t, b.breachRetentionCap(items), "a 2048 MB lease must breach a 1000 MB cap")
 
-	// Simulate the refuse-to-retain branch's observable effect.
-	retentionRefusedTotal.Inc()
-	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal))
+	before := testutil.ToFloat64(retentionRefusedTotal)
+	canonical := []string{"fred-lease-z-web-0", "fred-lease-z-web-1"}
+	errs := b.destroyOnRefuseToRetain(context.Background(), canonical, "lease-z", "t1", b.logger)
+
+	assert.Empty(t, errs)
+	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal), "production code increments the counter")
+	// fakeVolumeBackend.Destroy is a no-op returning nil; if a Destroy-call log is
+	// needed, extend the fake to record Destroy args (it already records renames).
 }
 ```
 
-Add `"github.com/prometheus/client_golang/prometheus/testutil"` to the test imports.
+Add `"context"` and `"github.com/prometheus/client_golang/prometheus/testutil"` to the test imports.
 
-> This pins the breach decision + counter contract. End-to-end destroy-on-breach is exercised by the existing `Deprovision` retain-branch tests once the wiring compiles; the subagent should confirm those stay green in Step 7.
+> `fakeVolumeBackend` (testsupport_test.go) records renames but stubs `Destroy` as a no-op; if the subagent wants to assert the exact volumes destroyed, add a `destroys [][]string` recorder to the fake (a one-line addition mirroring `renames`). The counter assertion above already exercises the production refusal path end-to-end through `destroyOnRefuseToRetain`.
 
 - [ ] **Step 7: Run tests + the package suite**
 
 Run: `go test ./internal/backend/docker/ -run 'TestBreachRetentionCap|TestRefuseToRetain' -v`
 Expected: PASS.
 Run: `go test ./internal/backend/docker/ -short`
-Expected: PASS (existing deprovision/retain tests still green with the wrapped branch).
+Expected: PASS (existing deprovision/retain tests still green with the early-guard branch).
 
 - [ ] **Step 8: Commit**
 
@@ -908,18 +997,21 @@ In `internal/backend/docker/retention_accounting.go`, add (and add `"syscall"` t
 
 ```go
 // diskOverProvisioned reports whether the configured total disk pool exceeds the
-// data filesystem's usable capacity (both in MB). Pure, so it is unit-testable;
+// data filesystem's total capacity (both in MB). Pure, so it is unit-testable;
 // the statfs read lives in warnIfOverProvisioned.
-func diskOverProvisioned(totalDiskMB, usableMB int64) bool {
-	return totalDiskMB > usableMB
+func diskOverProvisioned(totalDiskMB, fsTotalMB int64) bool {
+	return totalDiskMB > fsTotalMB
 }
 
 // warnIfOverProvisioned logs a WARN when total_disk_mb exceeds the data
-// filesystem's usable capacity. The hard-quota-sum admission model only
-// guarantees no tenant ENOSPC when total_disk_mb <= usable capacity (XFS bhard
-// is a ceiling, not a physical reservation). WARN-only: usable capacity
-// legitimately fluctuates and a hard refusal would turn a benign mis-size into
-// an outage.
+// filesystem's TOTAL capacity (statfs f_blocks). The hard-quota-sum admission
+// model only guarantees no tenant ENOSPC when total_disk_mb <= usable capacity
+// (XFS bhard is a ceiling, not a physical reservation). Note f_blocks is the
+// post-mkfs total — it still INCLUDES root-reserved blocks and any non-fred
+// consumers (Docker image layers, logs), so this is a coarse upper-bound check:
+// operators should leave headroom below it (see §2 invariant). WARN-only:
+// capacity legitimately fluctuates and a hard refusal would turn a benign
+// mis-size into an outage.
 func (b *Backend) warnIfOverProvisioned() {
 	if b.cfg.VolumeDataPath == "" {
 		return // no stateful volumes configured; nothing to check
@@ -929,13 +1021,15 @@ func (b *Backend) warnIfOverProvisioned() {
 		b.logger.Warn("capacity check: statfs failed", "path", b.cfg.VolumeDataPath, "error", err)
 		return
 	}
-	usableMB := int64(st.Blocks) * int64(st.Bsize) / bytesPerMiB
-	if diskOverProvisioned(b.cfg.TotalDiskMB, usableMB) {
-		b.logger.Warn("total_disk_mb exceeds usable filesystem capacity: over-commit risk (retained+live volumes can exhaust physical disk → tenant ENOSPC). Size total_disk_mb at or below usable capacity.",
-			"total_disk_mb", b.cfg.TotalDiskMB, "usable_mb", usableMB, "path", b.cfg.VolumeDataPath)
+	fsTotalMB := int64(st.Blocks) * int64(st.Bsize) / bytesPerMiB
+	if diskOverProvisioned(b.cfg.TotalDiskMB, fsTotalMB) {
+		b.logger.Warn("total_disk_mb exceeds the data filesystem's total capacity: over-commit risk (retained+live volumes can exhaust physical disk → tenant ENOSPC). Size total_disk_mb at or below usable capacity, leaving headroom for root-reserved blocks and non-fred consumers.",
+			"total_disk_mb", b.cfg.TotalDiskMB, "fs_total_mb", fsTotalMB, "path", b.cfg.VolumeDataPath)
 	}
 }
 ```
+
+> `bytesPerMiB` is defined in Task 3 (`metrics.go`, same package). `int64(st.Bsize)` is a redundant-but-portable cast (`Bsize` is already `int64` on amd64). Add `"syscall"` to `retention_accounting.go`'s imports.
 
 - [ ] **Step 4: Call it in `Start`**
 
@@ -1102,7 +1196,8 @@ Expected: PASS (the `-short` guard avoids the OOM-prone stress tests under `-rac
 | §3.1 retained accounting + `SetRetainedDisk` + Stats | 1 |
 | §3.1 startup statfs WARN + invariant | 7 |
 | §3.2 recompute seam (derive-from-store, active-only) | 4 |
-| §3.2 wiring at every transition + recover + sweep | 5 |
+| §3.2 wiring at every transition (close/reap/evict/sweep/recover **+ restore claim/complete/revert**) | 5 (Steps 4–5b) |
+| §3.2/§4 never-under-count ordering test | 5 (Step 6b) |
 | §3.3 `max_retained_disk_mb` + validation (≤ total, ≥ largest SKU) | 2 |
 | §3.3 count-cap WARN | 2 (add to `Validate`; see note below) |
 | §3.3 refuse-to-retain breach + counter | 6 |

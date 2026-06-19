@@ -161,7 +161,10 @@ Called at every point the retained set changes, alongside the existing `updateRe
 - **reap** (`restore.go reapExpiredRetentions`),
 - **cap-eviction** (`restore.go evictRetentionsToCap`),
 - **restore claim / complete / revert** (`restore.go`),
-- **startup recovery** (`recover.go`, which already reads the retention store at `recover.go:581`),
+- **startup recovery** (`recover.go`, which already reads the retention store at `recover.go:581`) —
+  and, because `recoverState` runs on the reconcile loop (every `reconcile_interval`, default ~5 min),
+  this is a **second authoritative recompute** alongside the sweep, bounding any transient projection
+  drift to `min(reconcile_interval, sweep_interval)`,
 - **the retention sweep tick** (`runRetentionSweep`) so the gauges stay fresh between lease events.
 
 **Active vs restoring:** the projection counts `Status == active` entries only, matching the existing
@@ -247,11 +250,12 @@ the subsystem already names the backend; existing metrics carry none) and **no p
 | `fred_docker_backend_retained_volumes` | gauge | count | Number of active retained leases. (No `_total` suffix — it is a gauge.) |
 | `fred_docker_backend_retention_refused_total` | counter | events | Count of close-time refuse-to-retain events due to `max_retained_disk_mb`. |
 | `fred_docker_backend_disk_pool_bytes` | gauge | bytes | The admission ceiling (`total_disk_mb << 20`). Denominator so dashboards don't hardcode the pool size. |
-| `fred_docker_backend_retained_disk_cap_bytes` | gauge | bytes | The per-provider retained cap (`max_retained_disk_mb << 20`), emitted only when the cap is set (`> 0`). Alert denominator. |
+| `fred_docker_backend_retained_disk_cap_bytes` | gauge | bytes | The per-provider retained cap (`max_retained_disk_mb << 20`). A registered gauge always exports, so it reads **0 when the cap is unset**; alert queries MUST guard `> 0` before dividing by it. Alert denominator. |
 
 These are exactly what the (separate-repo) Grafana panel + alert consume: the panel computes
 `retained_volume_bytes / disk_pool_bytes` to attribute pressure to retained vs live, the alert fires on
-`retained_volume_bytes / retained_disk_cap_bytes` approaching 1 and on `retention_refused_total`
+`retained_volume_bytes / retained_disk_cap_bytes` (guarded with `retained_disk_cap_bytes > 0` to avoid
+a divide-by-zero `+Inf` false positive on providers with no cap configured) approaching 1 and on `retention_refused_total`
 increasing — **with no hardcoded constants**. Shipping the limit alongside the state mirrors
 `node_filesystem_size_bytes` (next to `avail`) and `kube_resourcequota` (`type=hard` next to
 `type=used`); both denominator values are already in memory, so the gauges are near-free.
@@ -325,7 +329,7 @@ Pin behavior before implementing. Pair `-race` with `-short` (stress tests OOM u
   usable bytes (statfs stubbed in test).
 
 **Metrics:** retained gauges reflect the projection after each transition; bytes = MB << 20;
-`disk_pool_bytes` = `total_disk_mb << 20`; `retained_disk_cap_bytes` emitted only when the cap is set.
+`disk_pool_bytes` = `total_disk_mb << 20`; `retained_disk_cap_bytes` = `max_retained_disk_mb << 20` (0 when the cap is unset).
 
 ---
 
