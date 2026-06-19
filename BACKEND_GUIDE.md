@@ -406,7 +406,7 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
 
 **Error Responses:**
 - `400 Bad Request` - Missing required fields or items/manifest validation error
-- `409 Conflict` - Invalid state for restore (bare body), or already provisioned (body `code: "already_provisioned"`)
+- `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"` (the invalid-state case omits `code`), so the two are distinguished by that discriminator
 - `422 Unprocessable Entity` - No retained data for `from_lease_uuid` (also the correct response for backends without retention support)
 - `503 Service Unavailable` - Insufficient resources
 

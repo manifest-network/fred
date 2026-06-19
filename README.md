@@ -709,7 +709,7 @@ GET /v1/leases/{lease_uuid}/events
 Authorization: Bearer <token>
 ```
 
-Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`). A `retained` event is pushed when a closed/expired lease's data is soft-deleted (best-effort, only to currently-connected clients), signalling that the data may be restorable within the grace window; its `status` field carries a human-readable restore instruction.
+Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`). A `retained` event is pushed when a closed/expired lease's data is soft-deleted (best-effort, only to currently-connected clients), signalling that the data may be restorable within the grace window. For that event the `status` field is the enum `retained`, and the human-readable restore instruction is carried in the `error` field.
 
 **Authentication:** Bearer token via the `Authorization` header or the `?token=` query parameter (since the WebSocket API cannot set custom headers during upgrade). Auth is verified before the WebSocket upgrade, so failures return standard HTTP error responses.
 
@@ -1002,7 +1002,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
 
 **Error Responses:**
 - `400 Bad Request` - Missing `lease_uuid`/`from_lease_uuid`/`callback_url`, or items/manifest validation error
-- `409 Conflict` - Invalid state for restore (bare body), or already provisioned (body `code: "already_provisioned"`); the two are distinguished by the error code
+- `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"`, so the two are distinguished by the presence of that discriminator
 - `422 Unprocessable Entity` - No retained data for the source lease (also returned by backends that don't support retention)
 - `503 Service Unavailable` - Insufficient resources
 
