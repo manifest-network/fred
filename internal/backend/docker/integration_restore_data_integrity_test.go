@@ -412,17 +412,11 @@ func TestIntegration_Docker_RetainRestore_OwnershipBoundary(t *testing.T) {
 func TestIntegration_Docker_RetainRestore_WritablePathWipeContract(t *testing.T) {
 	mountPath := setupBtrfsLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
-	b := testBackendWithRealDocker(t, func(cfg *Config) {
-		cfg.NetworkIsolation = ptrBool(false)
-		cfg.VolumeDataPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
-		cfg.RetainOnClose = true
-		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
-		cfg.RetentionMaxAge = 0 // reaping disabled
-		cfg.RetentionReapInterval = 0
-		// Writable-path detection only runs under a read-only rootfs.
-		cfg.ContainerReadonlyRootfs = ptrBool(true)
-	})
+	b := retainRestoreBackend(t, mountPath)
+	// Writable-path detection only runs under a read-only rootfs. That is the
+	// DefaultConfig default retainRestoreBackend inherits (config.go); set here
+	// explicitly to document this test's dependency on it.
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
 
 	ctx := context.Background()
 	origLease := fmt.Sprintf("retain-wp-orig-%d", time.Now().UnixNano())
