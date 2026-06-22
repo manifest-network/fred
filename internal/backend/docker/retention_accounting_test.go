@@ -160,6 +160,15 @@ func TestDiskOverProvisioned(t *testing.T) {
 	assert.False(t, diskOverProvisioned(50, 100), "below usable is fine")
 }
 
+func TestRetentionCapNeedsTenantLever(t *testing.T) {
+	// cap set, no per-tenant count cap → needs the lever (warn).
+	assert.True(t, retentionCapNeedsTenantLever(Config{MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0}))
+	// cap set, per-tenant count cap also set → fine.
+	assert.False(t, retentionCapNeedsTenantLever(Config{MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 5}))
+	// no cap → nothing to warn about.
+	assert.False(t, retentionCapNeedsTenantLever(Config{MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 0}))
+}
+
 func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	b, _ := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)

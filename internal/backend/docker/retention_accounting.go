@@ -17,6 +17,15 @@ func diskOverProvisioned(totalDiskMB, fsTotalMB int64) bool {
 	return totalDiskMB > fsTotalMB
 }
 
+// retentionCapNeedsTenantLever reports whether a per-provider retained cap is set
+// without a per-tenant count cap. In that state one well-funded tenant can fill
+// the entire retained pool, degrading every other tenant's close to
+// refuse-to-retain (an availability DoS on the retention feature). Pure, so it is
+// unit-testable; the WARN is emitted by the caller (New).
+func retentionCapNeedsTenantLever(cfg Config) bool {
+	return cfg.MaxRetainedDiskMB > 0 && cfg.MaxRetainedLeasesPerTenant == 0
+}
+
 // warnIfOverProvisioned logs a WARN when total_disk_mb exceeds the data
 // filesystem's TOTAL capacity (statfs f_blocks). The hard-quota-sum admission
 // model only guarantees no tenant ENOSPC when total_disk_mb <= usable capacity
