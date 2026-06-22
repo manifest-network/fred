@@ -59,16 +59,6 @@ func TestRefreshRetentionAccounting_PushesToPoolAndMetrics(t *testing.T) {
 	assert.Equal(t, float64(0), testutil.ToFloat64(retainedVolumes))
 }
 
-func TestLeaseDiskMB_UnknownSKUSkipped(t *testing.T) {
-	b, _ := newBackendWithRetention(t)
-	withMicroSKU(b, 1024)
-	items := []backend.LeaseItem{
-		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}, // 2048
-		{SKU: "ghost-sku", Quantity: 5, ServiceName: "db"},     // unknown → skipped
-	}
-	assert.Equal(t, int64(2048), b.leaseDiskMB(items))
-}
-
 func TestRecoverRebuildsRetainedProjection(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
@@ -219,4 +209,29 @@ func TestShouldRefuseRetention_SkipsWhenAlreadyRetained(t *testing.T) {
 	require.NoError(t, rs.Put(retentionEntryFixture("lease-x", "t1", time.Now()))) // active, docker-micro qty 2
 	b.pool.SetRetainedDisk(2048)                                                   // reflects the existing record
 	assert.False(t, b.shouldRefuseRetention("lease-x", items), "retry of an already-retained lease must not be refused")
+}
+
+func TestLeaseDiskMB_UnknownSKUSkipped(t *testing.T) {
+	b, _ := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	items := []backend.LeaseItem{
+		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}, // 2048
+		{SKU: "ghost-sku", Quantity: 5, ServiceName: "db"},     // unknown → skipped + reported
+	}
+	mb, unresolved := b.leaseDiskMB(items)
+	assert.Equal(t, int64(2048), mb)
+	assert.Equal(t, []string{"ghost-sku"}, unresolved)
+}
+
+func TestShouldRefuseRetention_SkipsWhenRestoring(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedDiskMB = 1000 // tight: a 2x1024 lease would breach
+	b.pool.SetRetainedDisk(2048)
+	entry := retentionEntryFixture("lease-x", "t1", time.Now())
+	entry.Status = shared.RetentionStatusRestoring
+	require.NoError(t, rs.Put(entry))
+	assert.False(t, b.shouldRefuseRetention("lease-x",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+		"a restore-claimed (restoring) record must not be refused — defer to PutActiveMerged ok=false")
 }

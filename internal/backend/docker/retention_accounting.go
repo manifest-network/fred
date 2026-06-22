@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"syscall"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -52,19 +53,20 @@ func (b *Backend) warnIfOverProvisioned() {
 }
 
 // leaseDiskMB sums the declared SKU disk reservation (profile.DiskMB * Quantity)
-// for a lease's items. Unknown SKUs (e.g. an operator removed a profile after
-// the lease was retained) contribute 0 and are skipped silently — a rare edge
-// that would only undercount a stale record.
-func (b *Backend) leaseDiskMB(items []backend.LeaseItem) int64 {
-	var mb int64
+// for a lease's items. Items whose SKU no longer resolves (e.g. an operator
+// removed/renamed a profile after the lease was retained) contribute 0 and their
+// SKU is returned in `unresolved` so the caller can warn — accounting silently
+// undercounting would risk over-admission.
+func (b *Backend) leaseDiskMB(items []backend.LeaseItem) (mb int64, unresolved []string) {
 	for _, item := range items {
 		profile, err := b.cfg.GetSKUProfile(item.SKU)
 		if err != nil {
+			unresolved = append(unresolved, item.SKU)
 			continue
 		}
 		mb += profile.DiskMB * int64(item.Quantity)
 	}
-	return mb
+	return mb, unresolved
 }
 
 // computeRetainedDiskMB derives the retained-disk projection from the retention
@@ -81,12 +83,26 @@ func (b *Backend) computeRetainedDiskMB() (mb int64, count int, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	unknown := make(map[string]struct{})
 	for _, e := range entries {
 		if e.Status != shared.RetentionStatusActive {
 			continue
 		}
 		count++
-		mb += b.leaseDiskMB(e.Items)
+		emb, eunres := b.leaseDiskMB(e.Items)
+		mb += emb
+		for _, s := range eunres {
+			unknown[s] = struct{}{}
+		}
+	}
+	if len(unknown) > 0 {
+		skus := make([]string, 0, len(unknown))
+		for s := range unknown {
+			skus = append(skus, s)
+		}
+		sort.Strings(skus)
+		b.logger.Warn("retained record references unknown SKU profile(s); retained-disk accounting UNDERCOUNTS (risk of over-admission/ENOSPC) until the profile is restored or the retained records are reconciled",
+			"unknown_skus", skus)
 	}
 	return mb, count, nil
 }
@@ -117,26 +133,32 @@ func (b *Backend) breachRetentionCap(items []backend.LeaseItem) bool {
 	if b.cfg.MaxRetainedDiskMB <= 0 {
 		return false
 	}
-	return b.pool.Stats().RetainedDiskMB+b.leaseDiskMB(items) > b.cfg.MaxRetainedDiskMB
+	mb, _ := b.leaseDiskMB(items)
+	return b.pool.Stats().RetainedDiskMB+mb > b.cfg.MaxRetainedDiskMB
 }
 
 // shouldRefuseRetention decides whether a closing lease must be refused retention
 // due to the provider cap. When the cap is unlimited (MaxRetainedDiskMB <= 0) it
 // returns false immediately, skipping the per-close retention-store read.
-// Otherwise it returns false when the lease ALREADY has an active retention record
-// (a retry after a partial-rename failure): its footprint is already counted in
-// retainedDisk and the cap was honored when the record was first written, so
-// re-checking would double-count it and could spuriously refuse the retry, leaving
-// an inconsistent destroy-some/retain-some state. A retention-store read error is
-// treated as "no existing record" so the cap check still runs (conservative —
-// over-refusing, never over-admitting).
+// Otherwise it returns false when the lease ALREADY has any retention record
+// (active OR restoring): an active record means its footprint is already counted
+// in retainedDisk and the cap was honored on first write (re-deciding would
+// double-count on a retry); a restoring record means an in-flight restore owns
+// the lease's still-canonical volumes, so destroying them here would race the
+// restore and bypass the safe PutActiveMerged ok=false defer. A retention-store
+// read error is treated as "no existing record" so the cap check still runs
+// (conservative — over-refusing, never over-admitting).
 func (b *Backend) shouldRefuseRetention(leaseUUID string, items []backend.LeaseItem) bool {
 	if b.cfg.MaxRetainedDiskMB <= 0 {
 		return false // unlimited: never refuse, and skip the per-close retention-store read
 	}
-	// Cap is set: a lease that already has an active record was counted on the
-	// first attempt — don't re-decide (avoids double-counting on a close retry).
-	if rec, err := b.retentionStore.Get(leaseUUID); err == nil && rec != nil && rec.Status == shared.RetentionStatusActive {
+	// Cap is set, but an existing retention record means the cap was already
+	// honored on a prior close attempt (active) OR a restore now owns the record
+	// (restoring). In both cases do not refuse here: re-deciding would double-count
+	// a retry, or destroy volumes an in-flight restore needs. Let the normal retain
+	// path run — PutActiveMerged returns ok=false on a restore-claimed record and
+	// defers safely.
+	if rec, err := b.retentionStore.Get(leaseUUID); err == nil && rec != nil {
 		return false
 	}
 	return b.breachRetentionCap(items)

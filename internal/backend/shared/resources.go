@@ -98,8 +98,8 @@ func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
 			profile.MemoryMB, p.totalMemory-p.allocatedMemory)
 	}
 	if p.allocatedDisk+p.retainedDisk+profile.DiskMB > p.totalDisk {
-		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
-			profile.DiskMB, p.totalDisk-p.allocatedDisk-p.retainedDisk)
+		available := max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk)
+		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available", profile.DiskMB, available)
 	}
 
 	// Check per-tenant quota if configured

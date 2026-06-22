@@ -411,3 +411,14 @@ func TestResetPreservesRetainedDisk(t *testing.T) {
 	p.Reset([]ResourceAllocation{{LeaseUUID: "l1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}})
 	assert.Equal(t, int64(1024), p.Stats().RetainedDiskMB)
 }
+
+func TestTryAllocate_AvailableNeverNegativeInError(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 100}, nil
+	}
+	p := NewResourcePool(8, 8192, 1000, resolver, nil)
+	p.SetRetainedDisk(2000) // retained alone exceeds total (e.g. after a total_disk_mb shrink)
+	err := p.TryAllocate("l1", "sku", "t1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "have 0 MB available", "available must clamp to 0, never negative")
+}
