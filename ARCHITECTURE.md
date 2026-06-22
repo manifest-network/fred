@@ -561,7 +561,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 |---|---|---|---|
 | `fred_api_requests_total` | counter | `method, path, status` | API request count |
 | `fred_api_request_duration_seconds` | histogram | `method, path, status` | Request latency |
-| `fred_api_rate_limit_rejections_total` | counter | `limiter` | Rate limit rejections (`global`, `tenant`) |
+| `fred_api_rate_limit_rejections_total` | counter | `limiter` | Rate limit rejections. `limiter="global"` = the single per-IP limiter shared across all routes (no route/path dimension); `limiter="tenant"` = per-tenant limiter |
 | `fred_api_non_in_flight_callbacks_total` | counter | `backend, status` | Callbacks for leases not tracked in-flight (restart/update completions, late delivery, intentional deprovision) |
 
 **Provisioner:**

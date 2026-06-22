@@ -261,7 +261,7 @@ server {
 }
 ```
 
-Configure `trusted_proxies` in `config.yaml` to include the proxy's IP CIDR so per-IP rate limiting uses the real client address from `X-Forwarded-For`. Untrusted `X-Forwarded-For` headers are ignored.
+Configure `trusted_proxies` in `config.yaml` to include the proxy's IP CIDR so per-IP rate limiting uses the real client address from `X-Forwarded-For`. Untrusted `X-Forwarded-For` headers are ignored. Without this, every request appears to originate from the proxy, collapsing all clients into a single per-IP bucket — effectively a global `rate_limit_rps` cap shared across restore/update/restart/`/data`. Raise `rate_limit_rps`/`rate_limit_burst` or set `trusted_proxies` for high-throughput direct-API workloads.
 
 ### 2. providerd → backend (HMAC-authenticated)
 
