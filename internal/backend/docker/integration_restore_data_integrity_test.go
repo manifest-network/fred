@@ -462,6 +462,7 @@ func TestIntegration_Docker_RetainRestore_WritablePathWipeContract(t *testing.T)
 	require.NoError(t, b.Deprovision(ctx, origLease))
 	cb = waitForCallback(t, callbackCh, origLease, 30*time.Second)
 	require.Equal(t, backend.CallbackStatusDeprovisioned, cb.Status)
+	require.True(t, cb.Retained, "real btrfs retain must set the ground-truth Retained flag (the _wp wipe assertion below is meaningful only if the volume was actually retained + adopted back)")
 
 	// Restore into a new lease.
 	newLease := fmt.Sprintf("retain-wp-new-%d", time.Now().UnixNano())
