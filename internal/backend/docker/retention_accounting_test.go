@@ -192,6 +192,17 @@ func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	assert.Equal(t, canonical, fv.destroyed, "both canonical volumes must be destroyed on refuse-to-retain")
 }
 
+func TestShouldRefuseRetention_UnlimitedSkipsStoreRead(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedDiskMB = 0 // unlimited
+	// Close the store so any Get would error; the unlimited path must not touch it.
+	require.NoError(t, rs.Close())
+	assert.False(t, b.shouldRefuseRetention("lease-x",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+		"unlimited cap must return false without reading the retention store")
+}
+
 func TestShouldRefuseRetention_SkipsWhenAlreadyRetained(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)

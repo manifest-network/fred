@@ -121,14 +121,21 @@ func (b *Backend) breachRetentionCap(items []backend.LeaseItem) bool {
 }
 
 // shouldRefuseRetention decides whether a closing lease must be refused retention
-// due to the provider cap. It returns false when the lease ALREADY has an active
-// retention record (a retry after a partial-rename failure): its footprint is
-// already counted in retainedDisk and the cap was honored when the record was
-// first written, so re-checking would double-count it and could spuriously
-// refuse the retry, leaving an inconsistent destroy-some/retain-some state.
-// A retention-store read error is treated as "no existing record" so the cap
-// check still runs (conservative — over-refusing, never over-admitting).
+// due to the provider cap. When the cap is unlimited (MaxRetainedDiskMB <= 0) it
+// returns false immediately, skipping the per-close retention-store read.
+// Otherwise it returns false when the lease ALREADY has an active retention record
+// (a retry after a partial-rename failure): its footprint is already counted in
+// retainedDisk and the cap was honored when the record was first written, so
+// re-checking would double-count it and could spuriously refuse the retry, leaving
+// an inconsistent destroy-some/retain-some state. A retention-store read error is
+// treated as "no existing record" so the cap check still runs (conservative —
+// over-refusing, never over-admitting).
 func (b *Backend) shouldRefuseRetention(leaseUUID string, items []backend.LeaseItem) bool {
+	if b.cfg.MaxRetainedDiskMB <= 0 {
+		return false // unlimited: never refuse, and skip the per-close retention-store read
+	}
+	// Cap is set: a lease that already has an active record was counted on the
+	// first attempt — don't re-decide (avoids double-counting on a close retry).
 	if rec, err := b.retentionStore.Get(leaseUUID); err == nil && rec != nil && rec.Status == shared.RetentionStatusActive {
 		return false
 	}

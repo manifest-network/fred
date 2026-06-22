@@ -351,9 +351,9 @@ func updateRetentionMetrics(retainedMB int64, count int) {
 // setStaticPoolMetrics sets the constant denominator gauges once at startup.
 func setStaticPoolMetrics(cfg Config) {
 	diskPoolBytes.Set(float64(cfg.TotalDiskMB) * bytesPerMiB)
-	if cfg.MaxRetainedDiskMB > 0 {
-		retainedDiskCapBytes.Set(float64(cfg.MaxRetainedDiskMB) * bytesPerMiB)
-	}
+	// Set unconditionally so a re-construction with no cap resets the gauge to 0
+	// (a registered gauge always exports; 0 == "no cap configured").
+	retainedDiskCapBytes.Set(float64(cfg.MaxRetainedDiskMB) * bytesPerMiB)
 }
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
