@@ -314,13 +314,13 @@ func (c *Config) HasStatefulSKUs() bool {
 // profiles (0 if none are stateful). Used to validate that a retained-disk cap
 // can hold at least a one-unit lease of every SKU.
 func (c *Config) largestSKUDiskMB() int64 {
-	var max int64
+	var largest int64
 	for _, p := range c.SKUProfiles {
-		if p.DiskMB > max {
-			max = p.DiskMB
+		if p.DiskMB > largest {
+			largest = p.DiskMB
 		}
 	}
-	return max
+	return largest
 }
 
 // DefaultConfig returns a Config with sensible defaults.

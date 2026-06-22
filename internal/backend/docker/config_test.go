@@ -615,6 +615,7 @@ func TestConfig_RetentionDefaults(t *testing.T) {
 	assert.Equal(t, 90*24*time.Hour, cfg.RetentionMaxAge)
 	assert.Equal(t, time.Hour, cfg.RetentionReapInterval)
 	assert.Equal(t, 0, cfg.MaxRetainedLeasesPerTenant)
+	assert.Equal(t, int64(0), cfg.MaxRetainedDiskMB)
 }
 
 func TestConfig_RetentionValidation(t *testing.T) {
@@ -834,6 +835,16 @@ func TestValidate_MaxRetainedDiskMB(t *testing.T) {
 	t.Run("valid positive accepted", func(t *testing.T) {
 		c := base()
 		c.MaxRetainedDiskMB = 4096
+		require.NoError(t, c.Validate())
+	})
+	t.Run("equal to total_disk_mb accepted", func(t *testing.T) {
+		c := base()
+		c.MaxRetainedDiskMB = c.TotalDiskMB
+		require.NoError(t, c.Validate())
+	})
+	t.Run("equal to largest SKU disk_mb accepted", func(t *testing.T) {
+		c := base()
+		c.MaxRetainedDiskMB = 1024 // exactly the largest SKU
 		require.NoError(t, c.Validate())
 	})
 }
