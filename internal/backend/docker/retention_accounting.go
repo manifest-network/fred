@@ -116,10 +116,20 @@ func (b *Backend) computeRetainedDiskMB() (mb int64, count int, err error) {
 
 // refreshRetentionAccounting recomputes the retained-disk projection and pushes
 // it to the admission pool and the gauges. Call at every retention transition
-// (close, reap, evict), on recover, and on the periodic sweep tick. On a store
-// error it logs and returns WITHOUT mutating the projection — keeping the last
-// good value, since an under-count would over-admit (the dangerous direction).
+// (close, reap, evict), on recover, and on the periodic sweep tick.
+//
+// The recompute-from-store and SetRetainedDisk are serialized under
+// retentionAccountingMu so concurrent refreshes cannot interleave: without the
+// mutex a stale snapshot's Set could land after a fresher one, causing the
+// projection to under-count retained bytes → over-admit live allocations
+// (ENOSPC risk). On a store error the lock is still held across the return so
+// the last valid value stands without a concurrent stale Set overwriting it.
+//
+// NOTE: breachRetentionCap calls computeRetainedDiskMB directly (a read for an
+// admission decision) and must NOT take this mutex — only the writer does.
 func (b *Backend) refreshRetentionAccounting() {
+	b.retentionAccountingMu.Lock()
+	defer b.retentionAccountingMu.Unlock()
 	mb, count, err := b.computeRetainedDiskMB()
 	if err != nil {
 		b.logger.Warn("failed to recompute retained disk accounting; keeping last value", "error", err)

@@ -98,6 +98,11 @@ type Backend struct {
 	// the same ready→failed transitions and send duplicate callbacks.
 	recoverMu sync.Mutex
 
+	// retentionAccountingMu serializes refreshRetentionAccounting's
+	// recompute-from-store + SetRetainedDisk so a stale snapshot can never
+	// clobber a fresher one (which would under-count → over-admit).
+	retentionAccountingMu sync.Mutex
+
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore
 
