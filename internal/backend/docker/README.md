@@ -87,6 +87,9 @@ When a provision fails (during provisioning, state recovery, or partial deprovis
 | RetentionMaxAge | `retention_max_age` | duration | `2160h` (90 days) | How long retained volumes are kept before the grace reaper destroys them. Set to `0` to disable automatic reaping (volumes are kept until the per-tenant cap evicts them). |
 | RetentionReapInterval | `retention_reap_interval` | duration | `1h` | How often the grace reaper runs to destroy expired retained volumes |
 | MaxRetainedLeasesPerTenant | `max_retained_leases_per_tenant` | int | `0` (unlimited) | Maximum number of retained leases kept per tenant. When the cap is reached, the tenant's oldest retained lease is eagerly reaped to make room. `0` means no cap. |
+| MaxRetainedDiskMB | `max_retained_disk_mb` | int64 | `0` (unlimited) | Per-provider cap on the aggregate retained-volume disk footprint (MB) across all tenants. When retaining a closing lease would exceed this cap, the lease is destroyed immediately instead of retained (existing in-grace data is never evicted). `0` means no cap. Must be ≤ `total_disk_mb` when set. |
+
+> **Duration syntax:** `retention_max_age` and `retention_reap_interval` use Go duration syntax — valid units are `h`, `m`, `s` (e.g. `2160h` for 90 days, `336h` for 14 days). The units `d` (days) and `w` (weeks) are **not** valid and will fail config validation.
 
 ### Tenant Quotas
 
