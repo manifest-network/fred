@@ -4,10 +4,43 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"syscall"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
+
+// diskOverProvisioned reports whether the configured total disk pool exceeds the
+// data filesystem's total capacity (both in MB). Pure, so it is unit-testable;
+// the statfs read lives in warnIfOverProvisioned.
+func diskOverProvisioned(totalDiskMB, fsTotalMB int64) bool {
+	return totalDiskMB > fsTotalMB
+}
+
+// warnIfOverProvisioned logs a WARN when total_disk_mb exceeds the data
+// filesystem's TOTAL capacity (statfs f_blocks). The hard-quota-sum admission
+// model only guarantees no tenant ENOSPC when total_disk_mb <= usable capacity
+// (XFS bhard is a ceiling, not a physical reservation). Note f_blocks is the
+// post-mkfs total — it still INCLUDES root-reserved blocks and any non-fred
+// consumers (Docker image layers, logs), so this is a coarse upper-bound check:
+// operators should leave headroom below it (see §2 invariant). WARN-only:
+// capacity legitimately fluctuates and a hard refusal would turn a benign
+// mis-size into an outage.
+func (b *Backend) warnIfOverProvisioned() {
+	if b.cfg.VolumeDataPath == "" {
+		return // no stateful volumes configured; nothing to check
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(b.cfg.VolumeDataPath, &st); err != nil {
+		b.logger.Warn("capacity check: statfs failed", "path", b.cfg.VolumeDataPath, "error", err)
+		return
+	}
+	fsTotalMB := int64(st.Blocks) * int64(st.Bsize) / bytesPerMiB
+	if diskOverProvisioned(b.cfg.TotalDiskMB, fsTotalMB) {
+		b.logger.Warn("total_disk_mb exceeds the data filesystem's total capacity: over-commit risk (retained+live volumes can exhaust physical disk → tenant ENOSPC). Size total_disk_mb at or below usable capacity, leaving headroom for root-reserved blocks and non-fred consumers.",
+			"total_disk_mb", b.cfg.TotalDiskMB, "fs_total_mb", fsTotalMB, "path", b.cfg.VolumeDataPath)
+	}
+}
 
 // leaseDiskMB sums the declared SKU disk reservation (profile.DiskMB * Quantity)
 // for a lease's items. Unknown SKUs (e.g. an operator removed a profile after

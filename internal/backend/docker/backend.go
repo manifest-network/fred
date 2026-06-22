@@ -559,6 +559,10 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("volume manager validation failed: %w", err)
 	}
 
+	// ENG-360: warn loudly if the operator over-sized the disk pool relative to
+	// physical capacity (the invariant the hard-quota-sum model depends on).
+	b.warnIfOverProvisioned()
+
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(ctx)
 

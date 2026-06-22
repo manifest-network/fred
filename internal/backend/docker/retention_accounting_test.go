@@ -154,6 +154,12 @@ func TestRestoreOrdering_NeverUnderCounts(t *testing.T) {
 	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(1024))
 }
 
+func TestDiskOverProvisioned(t *testing.T) {
+	assert.True(t, diskOverProvisioned(200, 100), "total above usable is over-provisioned")
+	assert.False(t, diskOverProvisioned(100, 100), "equal is fine")
+	assert.False(t, diskOverProvisioned(50, 100), "below usable is fine")
+}
+
 func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	b, _ := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
