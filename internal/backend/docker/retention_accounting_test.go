@@ -440,6 +440,207 @@ func TestDeprovision_RetainHandoff_LiveMovesToRetained(t *testing.T) {
 		"after successful retain close, F must be counted as retained (hand-off complete)")
 }
 
+// TestDeprovision_BranchSelection_OverCap pins doDeprovision's refuse-to-retain
+// branch: when max_retained_disk_mb is tighter than the lease footprint (store
+// empty → no existing retained bytes → retained+incoming > cap), doDeprovision
+// must:
+//   - Destroy the canonical volumes (NOT rename them)
+//   - NOT write any retention record (retentionStore.Get returns nil after close)
+//   - Increment retention_refused_total by 1
+//
+// This is an end-to-end drive of the real doDeprovision; the volume fake records
+// Destroy calls so the test can assert the volumes were destroyed, not retained.
+func TestDeprovision_BranchSelection_OverCap(t *testing.T) {
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
+	// Cap = 500 MB < 1024 MB → shouldRefuseRetention returns true (breach).
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+	canonical0 := canonicalVolumeName("lease-oc", "web", 0)
+	canonical1 := canonicalVolumeName("lease-oc", "web", 1)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-oc": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-oc", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.cfg.MaxRetainedDiskMB = 500 // tight: 1024 MB lease breaches immediately
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-oc-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("lease-oc-web-1", "docker-micro", "tenant-a"))
+
+	// Track which volumes were destroyed vs renamed.
+	var destroyed []string
+	var renamed [][2]string
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{canonical0, canonical1}, nil
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			destroyed = append(destroyed, id)
+			return nil
+		},
+		RenameVolumeFn: func(old, newName string) error {
+			renamed = append(renamed, [2]string{old, newName})
+			return nil
+		},
+	}
+
+	before := testutil.ToFloat64(retentionRefusedTotal)
+	require.NoError(t, b.Deprovision(context.Background(), "lease-oc"))
+
+	// Wait for terminal callback (deferred accounting runs before it).
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	// Volumes must be DESTROYED (not renamed).
+	assert.ElementsMatch(t, []string{canonical0, canonical1}, destroyed,
+		"over-cap: canonical volumes must be destroyed, not retained")
+	assert.Empty(t, renamed, "over-cap: no volumes must be renamed")
+
+	// Counter must have incremented by exactly 1.
+	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal),
+		"over-cap: retention_refused_total must increment by 1")
+
+	// No retention record must exist in the store.
+	rec, err := rs.Get("lease-oc")
+	require.NoError(t, err)
+	assert.Nil(t, rec, "over-cap: no active retention record must be written")
+}
+
+// TestDeprovision_BranchSelection_UnderCap pins doDeprovision's normal retain
+// branch: when the cap is generous (or unlimited), doDeprovision must:
+//   - Rename the canonical volumes into the retained namespace (NOT destroy them)
+//   - Write an ACTIVE retention record in the store
+//   - NOT increment retention_refused_total
+//
+// This is the inverse of TestDeprovision_BranchSelection_OverCap and together
+// they pin the branch-selecting predicate inside doDeprovision end-to-end.
+func TestDeprovision_BranchSelection_UnderCap(t *testing.T) {
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
+	// Cap = 0 (unlimited) → shouldRefuseRetention returns false immediately.
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+	canonical0 := canonicalVolumeName("lease-uc", "web", 0)
+	canonical1 := canonicalVolumeName("lease-uc", "web", 1)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-uc": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-uc", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.cfg.MaxRetainedDiskMB = 0 // unlimited: never refuse
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-uc-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("lease-uc-web-1", "docker-micro", "tenant-a"))
+
+	// Track which volumes were renamed vs destroyed.
+	var destroyed []string
+	var renamed [][2]string
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{canonical0, canonical1}, nil
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			destroyed = append(destroyed, id)
+			return nil
+		},
+		RenameVolumeFn: func(old, newName string) error {
+			renamed = append(renamed, [2]string{old, newName})
+			return nil
+		},
+	}
+
+	before := testutil.ToFloat64(retentionRefusedTotal)
+	require.NoError(t, b.Deprovision(context.Background(), "lease-uc"))
+
+	// Wait for terminal callback (deferred accounting runs before it).
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	// Volumes must be RENAMED into retained namespace (not destroyed).
+	assert.Empty(t, destroyed, "under-cap: no volumes must be destroyed")
+	assert.Len(t, renamed, 2, "under-cap: both canonical volumes must be renamed")
+	for _, r := range renamed {
+		assert.True(t, r[0] == canonical0 || r[0] == canonical1,
+			"under-cap: renamed source must be a canonical volume")
+		assert.Equal(t, retainedName(r[0]), r[1],
+			"under-cap: rename target must be the retained-namespace name")
+	}
+
+	// Counter must NOT have incremented.
+	assert.Equal(t, before, testutil.ToFloat64(retentionRefusedTotal),
+		"under-cap: retention_refused_total must not increment")
+
+	// An ACTIVE retention record must exist in the store.
+	rec, err := rs.Get("lease-uc")
+	require.NoError(t, err)
+	require.NotNil(t, rec, "under-cap: an active retention record must be written")
+	assert.Equal(t, shared.RetentionStatusActive, rec.Status,
+		"under-cap: retention record must be active")
+}
+
 // TestDeprovision_RetainFailure_KeepsLiveCounted verifies that when the retain
 // path fails (rename fails → volume-cleanup error → lease kept Failed), the
 // live pool allocation is NOT released. Volumes are still on disk under canonical

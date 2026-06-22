@@ -121,10 +121,24 @@ crowds out new provisioning, reclaim it least-destructive-first:
 4. **Force a sweep.** Restart the backend to trigger the boot-eager reaper.
 
 `max_retained_disk_mb` directly trades retained-grace capacity against
-live-provision capacity within the single `total_disk_mb` pool. **Invariant:**
-size `total_disk_mb` at or below the data filesystem's usable capacity, or
-retained+live volumes can exhaust physical disk (tenant ENOSPC) — fred WARNs at
-startup if you exceed it.
+live-provision capacity within the single `total_disk_mb` pool.
+
+**Sizing `total_disk_mb`.** Fred WARNs at startup only when `total_disk_mb`
+exceeds the filesystem's **gross** total (`statfs` f_blocks × block-size) — this
+is a coarse upper-bound guard, not a usable-capacity check. Root-reserved blocks
+and non-fred consumers (Docker image layers, logs, etc.) are **not** excluded from
+f_blocks, so the WARN fires late. Operators must leave their own headroom below
+the true usable capacity; a silent miss here means retained+live volumes can
+exhaust physical disk (tenant ENOSPC).
+
+**Per-tenant fairness.** `max_retained_leases_per_tenant` is a **count** cap: it
+limits how many retained leases one tenant may hold, but not how much **disk** they
+occupy. Under `max_retained_disk_mb`, one tenant using large-disk SKUs can fill the
+entire retained pool, after which other tenants' `RetainOnClose` closes degrade to
+refuse-to-retain (destroy, no grace window). This is an availability DoS on the
+retention feature for those tenants, not a data-theft risk — destroy only touches
+the closing lease's own volumes. True per-tenant disk fairness would require a
+per-tenant retained-disk quota (a possible follow-up).
 
 ---
 
