@@ -72,6 +72,9 @@ func TestLeaseDiskMB_UnknownSKUSkipped(t *testing.T) {
 func TestRecoverRebuildsRetainedProjection(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
+	// 1024 (not 512 like the ordering test) is fine: this test exercises only the
+	// computeRetainedDiskMB path (reads b.cfg.GetSKUProfile), never b.pool.TryAllocate,
+	// so the pool's constructor-time resolver is not involved.
 	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now()))) // 2048 MB
 
 	// Wire ListManagedContainers to return no containers so recoverState can
