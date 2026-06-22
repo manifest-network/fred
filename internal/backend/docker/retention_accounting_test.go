@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -842,6 +843,104 @@ func TestDeprovision_RetainListError_KeepsLiveCounted(t *testing.T) {
 	s := b.pool.Stats()
 	assert.Equal(t, int64(512), s.AllocatedDiskMB,
 		"a List() error must keep live counted (volumes likely still on disk)")
+}
+
+// TestRestoreRollback_Success_HandsOffLiveToRetained verifies that a successful
+// re-quarantine rollback (all RenameVolume calls succeed) transfers the live
+// footprint to the retained projection without a gap:
+//
+//   - Pre-condition: new-lease live allocation = F (AllocatedDiskMB == F).
+//   - Post-condition: AllocatedDiskMB == 0 AND RetainedDiskMB == F.
+//
+// The correct order is: revert record to active → refreshRetentionAccounting
+// (retained += F) → releaseAll (live -= F). Any other order creates a moment
+// where the footprint is counted in neither pool (undercount → over-admit).
+func TestRestoreRollback_Success_HandsOffLiveToRetained(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	// Use 512 MB to match the pool resolver (defaultTestSKUProfiles: docker-micro DiskMB=512).
+	// qty=1 → footprint F = 512 MB.
+	withMicroSKU(b, 512)
+
+	origLease := "orig-lease"
+	newLease := "new-lease"
+
+	// Write a restoring retention record for the original lease.
+	rec := shared.RetentionEntry{
+		OriginalLeaseUUID:   origLease,
+		NewLeaseUUID:        newLease,
+		Tenant:              "t1",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          1,
+		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
+		RetainedVolumeNames: []string{"fred-retained-orig-lease-web-0"},
+	}
+	require.NoError(t, rs.Put(rec))
+
+	// Allocate the new-lease live footprint in the pool (simulates the restore
+	// pool allocation from Restore() step c). The allocation id format must
+	// match what rollbackRestoreAdoption passes to releaseAll.
+	allocID := newLease + "-web-0"
+	require.NoError(t, b.pool.TryAllocate(allocID, "docker-micro", "t1"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+	require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "pre-condition: retained=0 (record is restoring)")
+
+	// RenameVolume SUCCEEDS → rollback can revert the record to active.
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	logger := slog.Default()
+	// dropProvision=false: no provision entry to remove, avoids a map write under provisionsMu.
+	b.rollbackRestoreAdoption(context.Background(), newLease, []string{allocID}, &rec, false, logger)
+
+	s := b.pool.Stats()
+	assert.Equal(t, int64(0), s.AllocatedDiskMB,
+		"after successful rollback live must be zero (released)")
+	assert.Equal(t, int64(512), s.RetainedDiskMB,
+		"after successful rollback retained must equal F (record reverted to active + refreshed before release)")
+}
+
+// TestRestoreRollback_FailedRequarantine_KeepsLiveCounted verifies that when
+// re-quarantine renames FAIL, the live allocation is NOT released. The volumes
+// remain on disk under the new-lease canonical name and the record stays
+// 'restoring' (excluded from the retained projection), so releasing the live
+// allocation would leave the footprint counted in neither pool → over-admit.
+//
+// This test FAILS before Fix #1 (the bug: releaseAll runs unconditionally before
+// the failed-branch early return, so AllocatedDiskMB is wrongly zeroed).
+func TestRestoreRollback_FailedRequarantine_KeepsLiveCounted(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 512) // F = 512 MB (qty=1)
+
+	origLease := "orig-lease2"
+	newLease := "new-lease2"
+
+	rec := shared.RetentionEntry{
+		OriginalLeaseUUID:   origLease,
+		NewLeaseUUID:        newLease,
+		Tenant:              "t1",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          1,
+		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
+		RetainedVolumeNames: []string{"fred-retained-orig-lease2-web-0"},
+	}
+	require.NoError(t, rs.Put(rec))
+
+	allocID := newLease + "-web-0"
+	require.NoError(t, b.pool.TryAllocate(allocID, "docker-micro", "t1"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+
+	// RenameVolume ERRORS → failed re-quarantine; live must remain counted.
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return fmt.Errorf("rename failed: device busy") },
+	}
+
+	logger := slog.Default()
+	b.rollbackRestoreAdoption(context.Background(), newLease, []string{allocID}, &rec, false, logger)
+
+	s := b.pool.Stats()
+	assert.Equal(t, int64(512), s.AllocatedDiskMB,
+		"failed re-quarantine: live must remain counted (volumes still on disk, record stays restoring)")
 }
 
 // TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted verifies that a

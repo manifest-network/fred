@@ -707,19 +707,29 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 			failed = true
 		}
 	}
-	releaseAll(b.pool, allocatedIDs)
-	updateResourceMetrics(b.pool.Stats())
 	if failed {
-		logger.Warn("restore rollback: re-quarantine rename failed; leaving record restoring for reconcile sweep",
+		// Re-quarantine rename failed: the bytes remain on disk under the new-lease
+		// canonical name and the record stays 'restoring' for the next reconcile
+		// sweep. KEEP the live allocation counted (do NOT releaseAll) — releasing
+		// while the bytes persist and the restoring record is excluded from the
+		// retained projection would under-count → over-admit. The dead lease's live
+		// allocation is reclaimed when it is deprovisioned / on recover.
+		logger.Warn("restore rollback: re-quarantine rename failed; leaving record restoring + live counted for reconcile sweep",
 			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID)
-		return // do NOT RevertToActive, do NOT removeProvision; next reconcile sweep retries safely
+		return
 	}
+	// Re-quarantine succeeded: revert the record to active and re-count it as
+	// retained BEFORE releasing the live allocation, so the footprint is counted
+	// continuously (transient double-count = over-deny = safe), mirroring the
+	// deprovision retain hand-off.
 	if ok, err := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation); err != nil {
 		logger.Error("restore rollback: revert record failed", "error", err)
 	} else if !ok {
 		logger.Warn("restore rollback: record generation changed; reaper will reconcile", "lease_uuid", rec.OriginalLeaseUUID)
 	}
-	b.refreshRetentionAccounting()
+	b.refreshRetentionAccounting() // retained += F (record now active)
+	releaseAll(b.pool, allocatedIDs)
+	updateResourceMetrics(b.pool.Stats())
 	if dropProvision {
 		b.removeProvision(leaseUUID)
 	}
