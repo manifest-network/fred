@@ -83,14 +83,9 @@ func TestRecoverRebuildsRetainedProjection(t *testing.T) {
 	assert.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB)
 }
 
-// TestRestoreOrdering_NeverUnderCounts verifies that live+retained never dips
-// below the lease's footprint during the claim window (active→restoring flip).
-// Note: the pool resolver was bound at construction time to the original cfg
-// (DiskMB=512 for docker-micro from defaultTestSKUProfiles), while
-// b.cfg.GetSKUProfile (used by computeRetainedDiskMB) sees the withMicroSKU
-// override. To keep the invariant consistent, this test uses DiskMB=512 so
-// both the pool allocator and the retention projection agree on the per-unit
-// cost. The fixture has qty=2 → footprint = 2 * 512 = 1024 MB.
+// TestBreachRetentionCap covers the cap predicate: an unset cap (0) never
+// breaches, and the boundary where current retained + the incoming lease's
+// footprint crosses max_retained_disk_mb.
 func TestBreachRetentionCap(t *testing.T) {
 	b, _ := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
@@ -113,6 +108,14 @@ func TestBreachRetentionCap(t *testing.T) {
 	assert.False(t, b.breachRetentionCap(incoming))
 }
 
+// TestRestoreOrdering_NeverUnderCounts verifies that live+retained never dips
+// below the lease's footprint during the claim window (active→restoring flip).
+// Note: the pool resolver was bound at construction time to the original cfg
+// (DiskMB=512 for docker-micro from defaultTestSKUProfiles), while
+// b.cfg.GetSKUProfile (used by computeRetainedDiskMB) sees the withMicroSKU
+// override. To keep the invariant consistent, this test uses DiskMB=512 so
+// both the pool allocator and the retention projection agree on the per-unit
+// cost. The fixture has qty=2 → footprint = 2 * 512 = 1024 MB.
 func TestRestoreOrdering_NeverUnderCounts(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	// Use 512 MB to match the pool resolver's view of docker-micro

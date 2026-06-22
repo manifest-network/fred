@@ -45,7 +45,9 @@ func (b *Backend) warnIfOverProvisioned() {
 		b.logger.Warn("capacity check: statfs failed", "path", b.cfg.VolumeDataPath, "error", err)
 		return
 	}
-	fsTotalMB := int64(st.Blocks) * st.Bsize / bytesPerMiB
+	// Compute in uint64 (st.Blocks is uint64) to avoid int64 overflow on extreme
+	// capacities; the MB result is small, so the final conversion is safe.
+	fsTotalMB := int64(st.Blocks * uint64(st.Bsize) / bytesPerMiB)
 	if diskOverProvisioned(b.cfg.TotalDiskMB, fsTotalMB) {
 		b.logger.Warn("total_disk_mb exceeds the data filesystem's total capacity: over-commit risk (retained+live volumes can exhaust physical disk → tenant ENOSPC). Size total_disk_mb at or below usable capacity, leaving headroom for root-reserved blocks and non-fred consumers.",
 			"total_disk_mb", b.cfg.TotalDiskMB, "fs_total_mb", fsTotalMB, "path", b.cfg.VolumeDataPath)

@@ -412,6 +412,11 @@ func TestResetPreservesRetainedDisk(t *testing.T) {
 	assert.Equal(t, int64(1024), p.Stats().RetainedDiskMB)
 }
 
+func TestAvailableDiskMB_ClampsToZero(t *testing.T) {
+	s := ResourceStats{TotalDiskMB: 1000, RetainedDiskMB: 2000}
+	assert.Equal(t, int64(0), s.AvailableDiskMB(), "available disk must clamp to 0, never negative (e.g. after a total_disk_mb shrink)")
+}
+
 func TestTryAllocate_AvailableNeverNegativeInError(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 100}, nil

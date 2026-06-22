@@ -263,9 +263,11 @@ func (s ResourceStats) AvailableMemoryMB() int64 {
 }
 
 // AvailableDiskMB returns disk available for new allocations: total minus live
-// allocations minus retained (soft-deleted) reservations.
+// allocations minus retained (soft-deleted) reservations, clamped to >= 0 (a
+// total_disk_mb shrink or stale retained projection must not surface a negative
+// "available" via the /stats endpoints).
 func (s ResourceStats) AvailableDiskMB() int64 {
-	return s.TotalDiskMB - s.AllocatedDiskMB - s.RetainedDiskMB
+	return max(int64(0), s.TotalDiskMB-s.AllocatedDiskMB-s.RetainedDiskMB)
 }
 
 // Reset clears all allocations and rebuilds from a list of allocations.
