@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -46,11 +47,15 @@ func TestRefreshRetentionAccounting_PushesToPoolAndMetrics(t *testing.T) {
 
 	b.refreshRetentionAccounting()
 	assert.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB)
+	assert.Equal(t, float64(2048)*bytesPerMiB, testutil.ToFloat64(retainedVolumeBytes))
+	assert.Equal(t, float64(1), testutil.ToFloat64(retainedVolumes))
 
 	// Remove the record and refresh → projection drops to 0.
 	require.NoError(t, rs.Delete("lease-a"))
 	b.refreshRetentionAccounting()
 	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB)
+	assert.Equal(t, float64(0), testutil.ToFloat64(retainedVolumeBytes))
+	assert.Equal(t, float64(0), testutil.ToFloat64(retainedVolumes))
 }
 
 func TestLeaseDiskMB_UnknownSKUSkipped(t *testing.T) {
