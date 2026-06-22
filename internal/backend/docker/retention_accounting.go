@@ -148,19 +148,26 @@ func (b *Backend) breachRetentionCap(items []backend.LeaseItem) bool {
 // double-count on a retry); a restoring record means an in-flight restore owns
 // the lease's still-canonical volumes, so destroying them here would race the
 // restore and bypass the safe PutActiveMerged ok=false defer. A retention-store
-// read error is treated as "no existing record" so the cap check still runs
-// (conservative — over-refusing, never over-admitting).
+// read error causes an early false return (fail-open): refuse-to-retain DESTROYS
+// the closing lease's volumes, so under any uncertainty the data-safe direction
+// is to NOT refuse — an unreadable active/restoring record must not be treated
+// as "no record" and trigger irreversible destruction.
 func (b *Backend) shouldRefuseRetention(leaseUUID string, items []backend.LeaseItem) bool {
 	if b.cfg.MaxRetainedDiskMB <= 0 {
 		return false // unlimited: never refuse, and skip the per-close retention-store read
 	}
-	// Cap is set, but an existing retention record means the cap was already
-	// honored on a prior close attempt (active) OR a restore now owns the record
-	// (restoring). In both cases do not refuse here: re-deciding would double-count
-	// a retry, or destroy volumes an in-flight restore needs. Let the normal retain
-	// path run — PutActiveMerged returns ok=false on a restore-claimed record and
-	// defers safely.
-	if rec, err := b.retentionStore.Get(leaseUUID); err == nil && rec != nil {
+	// Refuse-to-retain DESTROYS the closing lease's volumes, so the data-safe
+	// direction under any uncertainty is to NOT refuse. A read error means we
+	// cannot rule out an existing record (active = cap already honored on a prior
+	// attempt; restoring = a restore owns it), so fall through to the normal retain
+	// path, which never destroys (PutActiveMerged succeeds, or errors → defers).
+	rec, err := b.retentionStore.Get(leaseUUID)
+	if err != nil {
+		b.logger.Warn("retention store read failed in refuse-to-retain decision; not refusing (data-safe)",
+			"lease_uuid", leaseUUID, "error", err)
+		return false
+	}
+	if rec != nil {
 		return false
 	}
 	return b.breachRetentionCap(items)

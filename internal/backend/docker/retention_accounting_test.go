@@ -238,3 +238,14 @@ func TestShouldRefuseRetention_SkipsWhenRestoring(t *testing.T) {
 		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
 		"a restore-claimed (restoring) record must not be refused — defer to PutActiveMerged ok=false")
 }
+
+func TestShouldRefuseRetention_StoreReadErrorDoesNotRefuse(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedDiskMB = 1000 // tight: would breach if the cap check were reached
+	b.pool.SetRetainedDisk(2048)
+	require.NoError(t, rs.Close()) // any Get now errors (closeOnce makes the t.Cleanup double-close harmless)
+	assert.False(t, b.shouldRefuseRetention("lease-x",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+		"a retention-store read error must NOT refuse (refuse destroys volumes; fail-open is data-safe)")
+}
