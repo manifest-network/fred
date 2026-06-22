@@ -78,6 +78,29 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 		// not in-flight and tries to provision it again.
 		rejected, txHashes, err := c.rejecter.RejectLeases(ctx, []string{p.LeaseUUID}, truncateRejectReason("callback timeout"))
 		if err != nil {
+			if isTerminalAcknowledgeError(err) {
+				// The lease is no longer PENDING (ErrLeaseNotPending) or no longer
+				// exists (ErrLeaseNotFound), so RejectLeases can NEVER succeed for
+				// it. This can be a reconciler-registered ACTIVE-lease re-provision
+				// (reconciler.go) whose callback was lost, or an originally-PENDING
+				// entry whose state changed concurrently in the unlocked window
+				// between GetTimedOutProvisions and this reject (e.g. a racing
+				// success-ack that already flipped it ACTIVE). Either way, retrying
+				// forever would wedge the lease in-flight permanently and inflate
+				// InFlightProvisions (which also skews capacity/routing signals).
+				// Untrack it and hand it back to the reconciler, which owns the
+				// re-provision / FailCount / close path. (ENG-337)
+				c.tracker.UntrackInFlight(p.LeaseUUID)
+				metrics.CallbackTimeoutsTotal.Inc()
+				slog.Warn("timed-out provision is not a pending lease; untracked and handed back to reconciler",
+					"lease_uuid", p.LeaseUUID,
+					"tenant", p.Tenant,
+					"backend", p.Backend,
+					"age", now.Sub(p.StartTime),
+					"error", err,
+				)
+				continue
+			}
 			slog.Error("failed to reject timed-out lease, keeping in-flight to prevent re-provision",
 				"lease_uuid", p.LeaseUUID,
 				"error", err,

@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
 	"github.com/manifest-network/fred/internal/backend"
 )
 
@@ -89,6 +91,58 @@ func TestCheckOnce_RejectFailure_KeepsInFlight(t *testing.T) {
 
 	assert.True(t, tracker.IsInFlight("lease-stuck"),
 		"lease should remain in-flight when rejection fails")
+}
+
+// TestCheckOnce_ActiveReprovisionNotPending_UntracksAndHandsBack covers ENG-337.
+// The reconciler registers ACTIVE-lease re-provisions in the SAME shared in-flight
+// tracker the checker scans. When such a re-provision's callback is lost, the
+// timed-out lease is no longer PENDING, so the chain rejects RejectLeases with
+// ErrLeaseNotPending. The checker must NOT keep retrying reject forever (which
+// wedges the lease in-flight permanently and inflates InFlightProvisions); it must
+// untrack the lease and hand it back to the reconciler, which owns the ACTIVE-lease
+// re-provision / FailCount / close path.
+func TestCheckOnce_ActiveReprovisionNotPending_UntracksAndHandsBack(t *testing.T) {
+	tracker := NewInFlightTracker()
+	tracker.TrackInFlightWithStartTime("lease-active", "tenant-1",
+		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
+		time.Now().Add(-20*time.Minute))
+
+	rejectCalls := 0
+	rejecter := &mockRejecter{
+		rejectFn: func(_ context.Context, _ []string, _ string) (uint64, []string, error) {
+			rejectCalls++
+			return 0, nil, billingtypes.ErrLeaseNotPending
+		},
+	}
+
+	checker := newTimeoutCheckerForTest(tracker, rejecter, 10*time.Minute)
+	checker.CheckOnce(context.Background())
+
+	assert.Equal(t, 1, rejectCalls, "should attempt reject once, not retry a non-pending lease")
+	assert.False(t, tracker.IsInFlight("lease-active"),
+		"non-pending lease must be untracked and handed back to the reconciler, not kept in-flight")
+}
+
+// TestCheckOnce_LeaseNotFound_Untracks ensures a timed-out provision for a lease
+// that no longer exists on chain is untracked rather than retried forever. Like
+// ErrLeaseNotPending, ErrLeaseNotFound is terminal for RejectLeases.
+func TestCheckOnce_LeaseNotFound_Untracks(t *testing.T) {
+	tracker := NewInFlightTracker()
+	tracker.TrackInFlightWithStartTime("lease-gone", "tenant-1",
+		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
+		time.Now().Add(-20*time.Minute))
+
+	rejecter := &mockRejecter{
+		rejectFn: func(_ context.Context, _ []string, _ string) (uint64, []string, error) {
+			return 0, nil, billingtypes.ErrLeaseNotFound
+		},
+	}
+
+	checker := newTimeoutCheckerForTest(tracker, rejecter, 10*time.Minute)
+	checker.CheckOnce(context.Background())
+
+	assert.False(t, tracker.IsInFlight("lease-gone"),
+		"lease that no longer exists must be untracked, not retried forever")
 }
 
 func TestCheckOnce_ContextCanceled_StopsEarly(t *testing.T) {
