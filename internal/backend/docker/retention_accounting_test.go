@@ -943,6 +943,145 @@ func TestRestoreRollback_FailedRequarantine_KeepsLiveCounted(t *testing.T) {
 		"failed re-quarantine: live must remain counted (volumes still on disk, record stays restoring)")
 }
 
+// TestReconcileRestoring_OrphanedArm_ReleasesNewLeaseLive verifies Fix #1: when
+// the periodic sweep's reconcileRestoring handles an orphaned restoring record
+// (no live provision/containers for the new lease) and the re-quarantine renames
+// SUCCEED, the new lease's live pool allocation must be released after the record
+// is reverted to active.
+//
+// Before the fix: reconcileRestoring called removeProvision (map delete) but never
+// pool.Release → the new-lease live allocation lingered → retained F counted
+// (from refreshRetentionAccounting after RevertToActive) + live F still counted =
+// 2F over-count (over-deny, data-safe, but a real steady-state inaccuracy).
+//
+// Post-fix invariant: AllocatedDiskMB == 0 AND RetainedDiskMB == F (= 512 MB).
+func TestReconcileRestoring_OrphanedArm_ReleasesNewLeaseLive(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	// DiskMB=512 to match the pool resolver (defaultTestSKUProfiles: docker-micro DiskMB=512).
+	// qty=1 → footprint F = 512 MB.
+	withMicroSKU(b, 512)
+
+	origLease := "orig-orphaned"
+	newLease := "new-orphaned"
+
+	// Write a restoring retention record for the original lease.
+	entry := shared.RetentionEntry{
+		OriginalLeaseUUID:   origLease,
+		NewLeaseUUID:        newLease,
+		Tenant:              "t1",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          1,
+		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
+		RetainedVolumeNames: []string{"fred-retained-orig-orphaned-web-0"},
+	}
+	require.NoError(t, rs.Put(entry))
+
+	// Allocate the new-lease live footprint (simulates the pool allocation from
+	// Restore() step c). The id scheme matches {newLease}-{svc}-{idx}.
+	allocID := newLease + "-web-0"
+	require.NoError(t, b.pool.TryAllocate(allocID, "docker-micro", "t1"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+	require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "pre-condition: retained=0 (record restoring)")
+
+	// No live provision entry for newLease → orphaned arm runs.
+	// (The provisions map was initialised empty by newBackendWithRetention.)
+
+	// RenameVolume SUCCEEDS → re-quarantine works, orphaned arm can revert.
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+	// compose.Down must succeed (default mockComposeExecutor.DownFn is nil → no-op).
+
+	b.reconcileRestoring(context.Background(), entry)
+
+	s := b.pool.Stats()
+	assert.Equal(t, int64(0), s.AllocatedDiskMB,
+		"after orphaned revert, new-lease live allocation must be released (no 2F over-count)")
+	assert.Equal(t, int64(512), s.RetainedDiskMB,
+		"after orphaned revert, retained must equal F (record reverted to active + refreshed)")
+}
+
+// TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted verifies that
+// when the refuse-to-retain path fires (cap breach) and destroyOnRefuseToRetain
+// ERRORS, the live allocation is NOT released. The volumes may still be on disk
+// and a subsequent retry may reclaim them; releasing live here would leave the
+// footprint counted in neither pool → over-admit.
+//
+// This guards against a future refactor that unconditionally sets
+// releaseLiveOnRetainPath=true on the refuse branch regardless of destroy errors.
+func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
+	// Cap = 500 MB < 1024 MB → shouldRefuseRetention returns true (breach).
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+	canonical0 := canonicalVolumeName("lease-rf", "web", 0)
+	canonical1 := canonicalVolumeName("lease-rf", "web", 1)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-rf": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-rf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.cfg.MaxRetainedDiskMB = 500 // tight: 1024 MB lease breaches immediately
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-rf-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("lease-rf-web-1", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
+
+	// Destroy FAILS → volumes may still be on disk; live must remain counted.
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{canonical0, canonical1}, nil
+		},
+		DestroyFn: func(_ context.Context, _ string) error {
+			return fmt.Errorf("destroy failed: device busy")
+		},
+	}
+
+	// Deprovision returns an error (volume cleanup failed) and the lease is kept
+	// Failed for retry — not the give-up path (VolumeCleanupAttempts < max).
+	err = b.Deprovision(context.Background(), "lease-rf")
+	require.Error(t, err, "destroy failure must bubble as a volume-cleanup error")
+
+	// The live allocation must NOT have been released.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(1024), s.AllocatedDiskMB,
+		"refuse-to-retain destroy failure: live must remain counted (volumes still on disk, not released)")
+
+	// No retention record must have been written (refuse path never writes a record).
+	rec, rerr := rs.Get("lease-rf")
+	require.NoError(t, rerr)
+	assert.Nil(t, rec, "refuse-to-retain: no retention record must be written")
+}
+
 // TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted verifies that a
 // NON-retain close whose container teardown PARTIALLY fails (compose down fails
 // AND the per-container RemoveContainer fallback also fails → stuck containers

@@ -169,6 +169,22 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	if ok, err := b.retentionStore.RevertToActive(e.OriginalLeaseUUID, e.Generation); err != nil {
 		b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
 	} else if ok {
+		// Re-count retained BEFORE releasing the new lease's live allocation so the
+		// footprint is continuously counted (transient double-count = over-deny = safe),
+		// mirroring rollbackRestoreAdoption's success arm. Without this, the new-lease
+		// live pool allocation lingered after removeProvision (map delete only), leaving
+		// retained F + live F = 2F in steady state (ENG-360 Fix #1).
+		b.refreshRetentionAccounting()
+		// Derive and release the new lease's live allocation ids using the same
+		// {newLease}-{svc}-{idx} scheme as Restore()'s TryAllocateAdopt loop.
+		var liveIDs []string
+		for _, item := range e.Items {
+			for i := range item.Quantity {
+				liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
+			}
+		}
+		releaseAll(b.pool, liveIDs)
+		updateResourceMetrics(b.pool.Stats())
 		b.removeProvision(e.NewLeaseUUID)
 	}
 }
