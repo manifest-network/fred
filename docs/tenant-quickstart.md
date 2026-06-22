@@ -286,10 +286,10 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 
 | Layer | Default |
 |---|---|
-| Per-IP global | 10 RPS, burst 20 |
+| Per-IP (all routes) | 10 RPS, burst 20 |
 | Per-tenant | 5 RPS, burst 10 |
 
-Rate-limited responses include a `Retry-After` header (seconds). Tokens are validated cryptographically **before** the per-tenant bucket is consumed, so attackers cannot burn your quota with forged tokens.
+The per-IP layer is a single bucket shared across **all** routes, so your restore, update, restart, and `/data` upload calls from the same IP draw from one budget — pace bursts of one operation so they don't `429` the others. Rate-limited responses include a `Retry-After` header (seconds). Tokens are validated cryptographically **before** the per-tenant bucket is consumed, so attackers cannot burn your quota with forged tokens.
 
 ---
 

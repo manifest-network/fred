@@ -112,7 +112,7 @@ test-integration-volume:
 # Usage: sudo make test-integration-restore
 test-integration-restore:
 	@echo "Running retain/restore integration tests (requires root + Docker + btrfs-progs)..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Docker_BtrfsRenameVolume_PreservesNestedMetadata|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
 
 # Run k3s-backend integration tests (requires `go` toolchain; cmd/k3s-backend/integration_test.go
 # self-builds the binary into t.TempDir and exercises the full HTTP + callback path against a fake Fred).

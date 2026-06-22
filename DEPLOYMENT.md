@@ -224,9 +224,9 @@ WantedBy=multi-user.target
 
 `docker-backend.service` is the same shape with two differences:
 - It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root.
-- `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, and `volume_data_path`.
+- `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `volume_data_path`, and — when retention is enabled — `retention_db_path`.
 
-`TimeoutStopSec` should comfortably exceed `shutdown_timeout` from your config (default 30s) so systemd doesn't SIGKILL during graceful drain.
+`TimeoutStopSec` should comfortably exceed the graceful-drain window so systemd doesn't SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your config (default 30s); the `docker-backend` uses a fixed 30s drain (not configurable).
 
 ---
 
@@ -261,7 +261,7 @@ server {
 }
 ```
 
-Configure `trusted_proxies` in `config.yaml` to include the proxy's IP CIDR so per-IP rate limiting uses the real client address from `X-Forwarded-For`. Untrusted `X-Forwarded-For` headers are ignored.
+Configure `trusted_proxies` in `config.yaml` to include the proxy's IP CIDR so per-IP rate limiting uses the real client address from `X-Forwarded-For`. Untrusted `X-Forwarded-For` headers are ignored. Without this, every request appears to originate from the proxy, collapsing all clients into a single per-IP bucket — effectively a global `rate_limit_rps` cap shared across restore/update/restart/`/data`. Raise `rate_limit_rps`/`rate_limit_burst` or set `trusted_proxies` for high-throughput direct-API workloads.
 
 ### 2. providerd → backend (HMAC-authenticated)
 
@@ -355,6 +355,7 @@ The bbolt files are the persistent state. None of them is a single point of trut
 | File | Backup priority | Restore behavior |
 |---|---|---|
 | `<docker>/releases.db` | High — release history is not reconstructible | Lost on disk failure |
+| `<docker>/retention.db` | High — index of soft-deleted leases (tenant, manifest, retained volume names); not reconstructible from chain or daemon | Lost on disk failure → retained volumes can no longer be restored *or* reaped (orphaned on disk). Only present when `retain_on_close` is enabled |
 | `<docker>/diagnostics.db` | Medium — failure diagnostics for past 7 days | Lost on disk failure |
 | `<docker>/callbacks.db` | Low — pending callbacks, ephemeral | Bbolt rebuilds; some callbacks lost |
 | `placement_store_db_path` | Low — rebuilt by reconciler from backend `ListProvisions` on startup | Brief misroute window during rebuild |
@@ -375,7 +376,7 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
 
 Fred does not currently support graceful in-place upgrades. The startup sequence (chain reconnect, reconciliation, accept callbacks) takes seconds; the brief downtime is generally acceptable. For zero-downtime, use the multi-instance pattern under [Secret rotation](#secret-rotation).
 
-Schema migrations: bbolt schemas are versioned implicitly; Fred handles forward migrations transparently. Backward compatibility (rolling back to an older Fred) is not guaranteed once a newer version has written to the bbolt files.
+Schema migrations: the bbolt files carry no explicit schema version, and Fred does **not** run schema migrations on them. An entry a newer build cannot decode is dropped (not migrated) the next time that store's age-based cleanup runs. Rolling back to an older Fred after a newer version has written is likewise not guaranteed. **Take a backup before upgrading.**
 
 ---
 

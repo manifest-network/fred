@@ -84,9 +84,9 @@ When a provision fails (during provisioning, state recovery, or partial deprovis
 |---|---|---|---|---|
 | RetainOnClose | `retain_on_close` | bool | `false` | When true, managed volumes are renamed into a `fred-retained-` namespace on lease close/expire instead of being destroyed. Tenants can restore data into a new lease via `POST /v1/leases/{new_lease_uuid}/restore`. |
 | RetentionDBPath | `retention_db_path` | string | `"retention.db"` | Path to bbolt database tracking retained lease records |
-| RetentionMaxAge | `retention_max_age` | duration | `2160h` (90 days) | How long retained volumes are kept before the grace reaper destroys them. Set to `0` to disable automatic reaping (volumes are kept until the per-tenant cap evicts them). |
-| RetentionReapInterval | `retention_reap_interval` | duration | `1h` | How often the grace reaper runs to destroy expired retained volumes |
-| MaxRetainedLeasesPerTenant | `max_retained_leases_per_tenant` | int | `0` (unlimited) | Maximum number of retained leases kept per tenant. When the cap is reached, the tenant's oldest retained lease is eagerly reaped to make room. `0` means no cap. |
+| RetentionMaxAge | `retention_max_age` | duration | `2160h` (90 days) | How long retained volumes are kept before the grace reaper destroys them. When `> 0` it also gates restore eligibility — a retained record older than this is no longer restorable. Set to `0` to disable age-based reaping **and** the age gate: retained volumes are then kept **indefinitely** and stay restorable until evicted, unless a per-tenant cap (`max_retained_leases_per_tenant > 0`) is configured to evict them. |
+| RetentionReapInterval | `retention_reap_interval` | duration | `1h` | Cadence of the background retention sweep, which destroys expired retained volumes and reconciles in-flight restores. If set to `0` it falls back to `retention_max_age`, then to a hard-coded `1h`. The sweep still runs (to reconcile restores) when `retain_on_close` is set even with `retention_max_age: 0`. |
+| MaxRetainedLeasesPerTenant | `max_retained_leases_per_tenant` | int | `0` (unlimited) | Maximum number of retained leases kept per tenant. When a soft-delete would exceed the cap, the tenant's oldest retained lease(s) are **evicted (hard-deleted)** at close time — oldest-first until `cap-1` remain (so a single close can drop multiple old leases). Never touches other tenants and never evicts a record being restored. `0` means no cap. |
 | MaxRetainedDiskMB | `max_retained_disk_mb` | int64 | `0` (unlimited) | Per-provider cap on the aggregate retained-volume disk footprint (MB) across all tenants. When retaining a closing lease would exceed this cap, the lease is destroyed immediately instead of retained (existing in-grace data is never evicted). `0` means no cap. Must be ≤ `total_disk_mb` when set. |
 
 > **Duration syntax:** `retention_max_age` and `retention_reap_interval` use Go duration syntax — valid units are `h`, `m`, `s` (e.g. `2160h` for 90 days, `336h` for 14 days). The units `d` (days) and `w` (weeks) are **not** valid and will fail config validation.
@@ -216,13 +216,26 @@ To restore data from a closed lease into a new lease:
 
 1. Open a **fresh lease on the same provider** by requesting the **same service names and quantities** as the original closed lease. The new lease UUID (`new_lease_uuid`) will be in `PENDING` state.
 2. Call `POST /v1/leases/{new_lease_uuid}/restore` with body `{"from_lease_uuid": "<original_closed_lease_uuid>"}`. Fred validates the request and delegates to the backend.
-3. The backend re-deploys the **retained manifest** (the exact deployment that was running at close time) onto the adopted volumes. The new lease becomes active with the same data. To change the image or configuration after restore, use the normal update path once the lease is active.
+3. The backend renames the retained volumes into the new lease's namespace (the synchronous **adopt** phase) and re-deploys the **retained manifest** (the exact deployment that was running at close time) onto them. The new lease becomes active with the same data. To change the image or configuration after restore, use the normal update path once the lease is active.
+
+Restore-specific re-deploy behavior worth knowing:
+
+- **Image must already be present on the node.** Restore re-uses the replace machinery, which **inspects** the image but does **not** pull it. If the image was garbage-collected from the node since close, restore fails with an image-inspect error — pre-pull the image (or restore before the node's image GC runs).
+- **Image and configuration are fixed.** Restore deploys strictly from the retained `StackManifest` and items; the request carries no manifest. The new lease's requested service names and quantities must shape-match the retained set exactly (otherwise the restore is rejected with a validation error).
+- **Containers are recreated, ownership is not rewritten.** Restore does not force-recreate beyond the normal replace, and the volume chown is non-recursive (it sets ownership on the VOLUME mount point only), so existing files keep their on-disk ownership.
 
 ### Limitations
 
-- **Best-effort and capacity-bounded**: retention is not a guarantee. The per-tenant cap (`max_retained_leases_per_tenant`) may evict a tenant's oldest retained lease before `retention_max_age` expires to make room for a newer one. Always restore within the grace window.
-- **Same-backend-node only**: restore works only on the backend node that holds the retained volumes. In single-backend deployments this is always satisfied. Multi-node routing affinity (routing a new lease to the node holding its retained data) is a future enhancement.
+- **Best-effort and capacity-bounded**: retention is not a guarantee. When a per-tenant cap (`max_retained_leases_per_tenant > 0`) is configured, a soft-delete may evict that tenant's oldest retained lease(s) — independent of age — to make room for the newer one. Always restore within the grace window.
+- **Same-backend-node only**: a restore can only run on the backend node that physically holds the retained volumes (the rename is local; nothing is copied between nodes). In single-backend deployments this is always satisfied. In multi-node deployments restore routing is automatic: the reconciler queries each backend's `GET /retentions` and records each retained lease's backend in the placement store, so a restore is routed to the node holding the source data (ENG-333). Restore returns `404` if no backend still holds that lease's retained data.
 - **Not a backup**: retained data is a single copy on the node's local disk (RAID-backed by the operator). It provides a grace window against accidental lease closure, not protection against node-level data loss. Operators should run separate backup procedures for production data.
+
+### Failure handling & crash recovery
+
+Restore is crash-safe and self-healing. A retention record carries one of two persisted statuses — `active` (awaiting restore or reap) and `restoring` (a restore is in flight) — and the adopt rename is the only on-disk mutation:
+
+- **Restore failure (or worker panic)**: the new lease's compose project is torn down, the adopted volumes are **re-quarantined** back into the `fred-retained-` namespace, pool allocations are released, and the record is reverted `restoring → active`. The original data is preserved and the lease can be restored again. The new lease settles as a `Failed` lease (a failure callback is still emitted), exactly like a failed restart/update.
+- **Crash mid-restore**: on the next startup (and on every periodic sweep) the backend reconciles dangling `restoring` records — finalizing those that completed and rolling back (re-quarantining) those that did not, before the orphan-volume reaper runs. A record is written before the rename, so a crash in the narrow window between the two is repaired by re-quarantine rather than data loss.
 
 ## Provisioning Lifecycle
 
