@@ -259,6 +259,19 @@ func TestLeaseDiskMB_UnknownSKUSkipped(t *testing.T) {
 	assert.Equal(t, []string{"ghost-sku"}, unresolved)
 }
 
+func TestLeaseDiskMB_NonPositiveQuantitySkipped(t *testing.T) {
+	b, _ := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	items := []backend.LeaseItem{
+		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},  // 2048
+		{SKU: "docker-micro", Quantity: -3, ServiceName: "bad"}, // invalid → must contribute 0, not reduce
+		{SKU: "docker-micro", Quantity: 0, ServiceName: "zero"}, // 0 → 0
+	}
+	mb, _ := b.leaseDiskMB(items)
+	assert.Equal(t, int64(2048), mb,
+		"non-positive quantities must contribute 0 (never reduce the projection into the over-admit direction)")
+}
+
 func TestShouldRefuseRetention_SkipsWhenRestoring(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)

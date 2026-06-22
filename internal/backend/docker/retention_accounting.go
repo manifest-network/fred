@@ -58,7 +58,10 @@ func (b *Backend) warnIfOverProvisioned() {
 // for a lease's items. Items whose SKU no longer resolves (e.g. an operator
 // removed/renamed a profile after the lease was retained) contribute 0 and their
 // SKU is returned in `unresolved` so the caller can warn — accounting silently
-// undercounting would risk over-admission.
+// undercounting would risk over-admission. A non-positive Quantity (a corrupt
+// record or an upstream uint→int overflow) likewise contributes 0 rather than a
+// negative term, so invalid data can never push the projection in the undercount
+// (over-admit) direction.
 func (b *Backend) leaseDiskMB(items []backend.LeaseItem) (mb int64, unresolved []string) {
 	for _, item := range items {
 		profile, err := b.cfg.GetSKUProfile(item.SKU)
@@ -66,7 +69,9 @@ func (b *Backend) leaseDiskMB(items []backend.LeaseItem) (mb int64, unresolved [
 			unresolved = append(unresolved, item.SKU)
 			continue
 		}
-		mb += profile.DiskMB * int64(item.Quantity)
+		if item.Quantity > 0 {
+			mb += profile.DiskMB * int64(item.Quantity)
+		}
 	}
 	return mb, unresolved
 }
