@@ -26,7 +26,7 @@ func TestComputeRetainedDiskMB(t *testing.T) {
 	withMicroSKU(b, 1024)
 
 	// Two active retained leases: one with qty 2, one with qty 1 → 3 * 1024 MB.
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now())))     // qty 2
+	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now()))) // qty 2
 	one := retentionEntryFixture("lease-b", "t1", time.Now())
 	one.Items = []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
 	require.NoError(t, rs.Put(one))
