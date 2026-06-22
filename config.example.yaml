@@ -170,9 +170,9 @@ tls_key_file: ""
 #
 # TUNING: the defaults below are protective values suitable for production. For
 # load tests or high-throughput direct-API workloads (sustained restore/update/
-# restart), raise rate_limit_rps/rate_limit_burst well above the defaults — and/
-# or set trusted_proxies — otherwise the limiter, not the backend/chain, becomes
-# the binding throughput ceiling.
+# restart), raise rate_limit_rps/rate_limit_burst well above the defaults
+# (and/or set trusted_proxies) — otherwise the limiter, not the backend/chain,
+# becomes the binding throughput ceiling.
 
 # Maximum sustained requests per second allowed from a single client IP.
 # Requests exceeding this rate receive HTTP 429 (Too Many Requests).
