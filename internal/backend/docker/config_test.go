@@ -798,3 +798,46 @@ func TestConfig_Helpers(t *testing.T) {
 		assert.True(t, cfg.HasStatefulSKUs())
 	})
 }
+
+func TestValidate_MaxRetainedDiskMB(t *testing.T) {
+	// A config whose largest stateful SKU is 1024 MB and pool is 102400 MB.
+	base := func() Config {
+		c := validConfig()
+		c.TotalDiskMB = 102400
+		c.SKUProfiles = map[string]SKUProfile{
+			"docker-small": {CPUCores: 1, MemoryMB: 512, DiskMB: 1024},
+		}
+		c.SKUMapping = map[string]string{"019c1ee7-1aaf-7000-802c-ad775c72cc27": "docker-small"}
+		return c
+	}
+
+	t.Run("zero is unlimited and valid", func(t *testing.T) {
+		c := base()
+		c.MaxRetainedDiskMB = 0
+		require.NoError(t, c.Validate())
+	})
+	t.Run("negative rejected", func(t *testing.T) {
+		c := base()
+		c.MaxRetainedDiskMB = -1
+		require.ErrorContains(t, c.Validate(), "max_retained_disk_mb must be non-negative")
+	})
+	t.Run("exceeding total_disk_mb rejected", func(t *testing.T) {
+		c := base()
+		c.MaxRetainedDiskMB = c.TotalDiskMB + 1
+		require.ErrorContains(t, c.Validate(), "max_retained_disk_mb")
+	})
+	t.Run("below largest stateful SKU rejected", func(t *testing.T) {
+		c := base()
+		c.MaxRetainedDiskMB = 512 // < 1024 largest SKU → a SKU-legal lease could never be retained
+		require.ErrorContains(t, c.Validate(), "largest")
+	})
+	t.Run("valid positive accepted", func(t *testing.T) {
+		c := base()
+		c.MaxRetainedDiskMB = 4096
+		require.NoError(t, c.Validate())
+	})
+}
+
+func TestDefaultConfig_MaxRetainedDiskMBUnlimited(t *testing.T) {
+	assert.Equal(t, int64(0), DefaultConfig().MaxRetainedDiskMB)
+}
