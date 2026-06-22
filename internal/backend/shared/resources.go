@@ -181,6 +181,9 @@ func (p *ResourcePool) Release(leaseUUID string) {
 // pushes it here; TryAllocate subtracts it from available disk so retained
 // volumes keep counting against the pool until reaped. Idempotent.
 func (p *ResourcePool) SetRetainedDisk(mb int64) {
+	if mb < 0 {
+		mb = 0
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.retainedDisk = mb
@@ -216,6 +219,9 @@ func (p *ResourcePool) Stats() ResourceStats {
 }
 
 // TenantStats returns resource usage statistics for a specific tenant.
+// RetainedDiskMB is intentionally left 0: retained disk is a provider-level
+// term (not attributed per tenant), so AvailableDiskMB() on a tenant snapshot
+// intentionally excludes it.
 func (p *ResourcePool) TenantStats(tenant string) ResourceStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()

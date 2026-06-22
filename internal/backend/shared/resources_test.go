@@ -392,6 +392,13 @@ func TestStatsIncludesRetainedDisk(t *testing.T) {
 	assert.Equal(t, int64(4096-1500), s.AvailableDiskMB())
 }
 
+func TestSetRetainedDiskClampsNegative(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) { return SKUProfile{}, nil }
+	p := NewResourcePool(8, 8192, 4096, resolver, nil)
+	p.SetRetainedDisk(-500)
+	assert.Equal(t, int64(0), p.Stats().RetainedDiskMB, "negative retained disk must clamp to 0 (never over-admit)")
+}
+
 func TestResetPreservesRetainedDisk(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
