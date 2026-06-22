@@ -92,7 +92,8 @@ the raw device minus filesystem/metadata/inode and XFS per-AG reservation overhe
 non-fred consumers sharing the disk — Docker image layers, logs), so operators must leave a few percent
 headroom rather than set `total_disk_mb` to the raw device size. Sizing `total_disk_mb` above usable
 capacity re-introduces thin-provisioning over-commit and the exact ENOSPC class this work eliminates.
-This invariant is stated to operators in the docs and enforced as a startup WARN (§3.1).
+This invariant is stated to operators in the docs and reinforced at startup (§3.1), though the startup
+WARN is a coarse guard only (see §3.1 for the exact check performed).
 
 ### Non-goals (explicit)
 
@@ -128,18 +129,18 @@ store is already crash-safe and reconciled across restart/partial-reap (`ReapIfE
 re-record-on-failure). Rebuilding the projection from the store removes any "two counters drift"
 failure mode.
 
-**Startup capacity sanity check (defense-in-depth, WARN-only).** The data filesystem already exposes
-usable/free bytes via the `syscall.Statfs` call that `volume.go` plumbs for FS-type detection. At
-startup, read usable capacity from the same syscall and **WARN** if `total_disk_mb` exceeds it — turning
-the silent mis-size that caused the original danger into a loud log line that enforces the §2 invariant.
-This is *WARN-only, not refuse-to-start*: usable capacity legitimately fluctuates (other disk consumers,
-reserved blocks, a growing FS), and a hard refusal would turn a benign mis-size into an outage. Mirrors
-how Kubernetes pairs request-based admission with a reactive measured-free-space safety net (kubelet
-node-pressure eviction reads `nodefs.available`/`imagefs.available` from real `statfs`; default hard
-thresholds `nodefs.available<5%`, `imagefs.available<5%`). A *periodic* statfs admission tripwire
-(refuse new provisions when measured free < headroom) is an explicit **non-goal** for v1 — the
-hard-quota-sum model plus the startup check is sufficient for a single-node backend, and a live tripwire
-adds a poller + reconciliation surface we don't need yet.
+**Startup capacity sanity check (defense-in-depth, WARN-only).** At startup, `warnIfOverProvisioned`
+calls `syscall.Statfs` on `VolumeDataPath` and **WARNs** if `total_disk_mb` exceeds the filesystem's
+**gross total** (`f_blocks × block-size`). This is a *coarse upper-bound guard*, not a usable-capacity
+check: `f_blocks` is the post-mkfs total and still INCLUDES root-reserved blocks and non-fred consumers
+(Docker image layers, logs, etc.), so the WARN fires only when `total_disk_mb` exceeds even the raw
+device size — a late signal. Operators must therefore size `total_disk_mb` below the true usable
+capacity themselves; the WARN will NOT fire if `total_disk_mb` is merely above usable but below
+gross total. This matches the already-accurate OPERATIONS.md wording. *WARN-only, not refuse-to-start*:
+capacity legitimately fluctuates and a hard refusal would turn a benign mis-size into an outage. A
+*periodic* statfs admission tripwire is an explicit **non-goal** for v1 — the hard-quota-sum model
+plus the startup check is sufficient for a single-node backend, and a live tripwire adds a poller +
+reconciliation surface we don't need yet.
 
 ### 3.2 Recompute seam (`internal/backend/docker`)
 
