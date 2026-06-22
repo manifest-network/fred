@@ -70,10 +70,28 @@ func NewResourcePool(totalCPU float64, totalMemoryMB, totalDiskMB int64, resolve
 	}
 }
 
-// TryAllocate attempts to reserve resources for a lease based on SKU profile.
-// The tenant parameter is used for per-tenant quota enforcement.
-// Returns nil if allocation succeeds, error if SKU is unknown or insufficient resources.
+// TryAllocate attempts to reserve resources for a new provision (gates all of
+// CPU, memory, disk, and tenant quota).
 func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
+	return p.tryAllocate(leaseUUID, sku, tenant, true)
+}
+
+// TryAllocateAdopt reserves resources for a lease being RESTORED by adopting an
+// existing retained volume (rename, not new disk). It gates CPU, memory, and
+// tenant quota normally but SKIPS the global disk capacity check: the adopted
+// bytes are already committed on disk and counted in the retained projection, so
+// re-gating them would double-count the lease's own footprint and spuriously deny
+// a restore that physically fits. DiskMB is still added to allocatedDisk for
+// correct live accounting; the retained projection drops it when the record flips
+// to restoring.
+func (p *ResourcePool) TryAllocateAdopt(leaseUUID, sku, tenant string) error {
+	return p.tryAllocate(leaseUUID, sku, tenant, false)
+}
+
+// tryAllocate is the shared implementation for TryAllocate and TryAllocateAdopt.
+// When gateDisk is true the global disk capacity check is enforced; when false
+// (adopt/restore) the check is skipped because the disk was already committed.
+func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -97,9 +115,9 @@ func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
 		return fmt.Errorf("insufficient memory: need %d MB, have %d MB available",
 			profile.MemoryMB, p.totalMemory-p.allocatedMemory)
 	}
-	if p.allocatedDisk+p.retainedDisk+profile.DiskMB > p.totalDisk {
-		available := max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk)
-		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available", profile.DiskMB, available)
+	if gateDisk && p.allocatedDisk+p.retainedDisk+profile.DiskMB > p.totalDisk {
+		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
+			profile.DiskMB, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
 	}
 
 	// Check per-tenant quota if configured

@@ -427,3 +427,26 @@ func TestTryAllocate_AvailableNeverNegativeInError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "have 0 MB available", "available must clamp to 0, never negative")
 }
+
+func TestTryAllocateAdopt_SkipsDiskGate(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 200}, nil
+	}
+	p := NewResourcePool(8, 8192, 1000, resolver, nil)
+	p.SetRetainedDisk(900) // 900 retained (other leases) + a 200 adopt would be 1100 > 1000
+
+	// A normal provision is correctly denied (would over-commit disk).
+	require.Error(t, p.TryAllocate("fresh", "sku", "t1"))
+	// Adopting a retained volume must SUCCEED (net-zero new disk) ...
+	require.NoError(t, p.TryAllocateAdopt("restore", "sku", "t1"))
+	// ... and still records the disk in live accounting.
+	assert.Equal(t, int64(200), p.Stats().AllocatedDiskMB)
+}
+
+func TestTryAllocateAdopt_StillGatesCPU(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 10, MemoryMB: 256, DiskMB: 200}, nil // 10 cores > 8 total
+	}
+	p := NewResourcePool(8, 8192, 1000, resolver, nil)
+	require.Error(t, p.TryAllocateAdopt("restore", "sku", "t1"), "adopt must still gate CPU/memory (new containers)")
+}

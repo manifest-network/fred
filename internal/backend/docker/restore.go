@@ -527,7 +527,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	for _, item := range rec.Items {
 		for i := range item.Quantity {
 			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if aerr := b.pool.TryAllocate(id, item.SKU, rec.Tenant); aerr != nil {
+			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
 				releaseAll(b.pool, allocatedIDs)
 				updateResourceMetrics(b.pool.Stats())
 				b.removeProvision(req.LeaseUUID)
