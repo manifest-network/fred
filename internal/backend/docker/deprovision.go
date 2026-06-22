@@ -124,7 +124,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	retaining := b.cfg.RetainOnClose && b.retentionStore != nil
 	if !retaining {
 		// Non-retain close: volumes will be destroyed below; release live now
-		// (UNCHANGED from prior behaviour for this path).
+		// (UNCHANGED from prior behavior for this path).
 		releaseLive()
 	}
 	// Retaining close: keep the live allocation counted until the retained
@@ -191,13 +191,17 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// never drops already-retained volumes (which would leak them) or overwrites
 		// the prior record with a shorter list — and never clobbers a record that a
 		// concurrent restore claimed (active→restoring) mid-flight.
-		if len(canonical) == 0 {
-			// No canonical volumes remain under this lease (all were already renamed
-			// into fred-retained-* on a prior attempt, or the lease had no stateful
-			// volumes). No canonical bytes are on disk under the live name, so it is
-			// safe to release the live allocation.
-			releaseLiveOnRetainPath = true
-		} else if b.shouldRefuseRetention(leaseUUID, items) {
+		switch {
+		case len(canonical) == 0:
+			// No canonical volumes enumerated. If List SUCCEEDED, none remain under
+			// the live name (already renamed on a prior attempt, or a stateless
+			// lease) → safe to release live. If List ERRORED, volumes may still be
+			// on disk → keep live counted (flag stays false); volumeErrs already
+			// carries the List error so the lease retries.
+			if listErr == nil {
+				releaseLiveOnRetainPath = true
+			}
+		case b.shouldRefuseRetention(leaseUUID, items):
 			prevErrCount := len(volumeErrs)
 			volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, canonical, leaseUUID, tenant, logger)...)
 			if len(volumeErrs) == prevErrCount {
@@ -205,8 +209,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				// so it is safe to release the live allocation.
 				releaseLiveOnRetainPath = true
 			}
-		} else {
-			// existing retain logic — moved here UNCHANGED, just re-indented one level
+		default:
+			// existing retain logic — UNCHANGED, just moved under `default:`
 			retained := make([]string, 0, len(canonical))
 			for _, c := range canonical {
 				retained = append(retained, retainedName(c))
@@ -328,6 +332,16 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		if attempts >= maxVolumeCleanupAttempts {
 			// Too many failed attempts — give up and remove the provision.
 			// The leaked volumes require manual cleanup by the operator.
+			//
+			// Release live UNCONDITIONALLY here: the provision is about to be
+			// deleted and `return nil`, so the deferred hand-off (which only
+			// releases on the success flag) can never run a retry to free it. On
+			// the retain path the flag is still false, so without this the live
+			// allocation would leak forever and — if a record was written —
+			// double-count the footprint as both live and retained (2F), wedging
+			// any later restore. Release is idempotent: on the non-retain path
+			// live was already freed early, making this a harmless no-op.
+			releaseLive()
 			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 				p.ContainerIDs = nil // containers are gone
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",

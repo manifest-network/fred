@@ -700,3 +700,133 @@ func TestDeprovision_RetainFailure_KeepsLiveCounted(t *testing.T) {
 	assert.Equal(t, int64(512), s.AllocatedDiskMB,
 		"after failed retain close, live must remain counted (volume still on disk under canonical name)")
 }
+
+// TestDeprovision_RetainGiveUp_ReleasesLive verifies that when a retain close
+// exhausts maxVolumeCleanupAttempts (rename keeps failing), the give-up branch
+// — which deletes the provision and returns nil so no retry can ever run — still
+// releases the live pool allocation. Without this, live would leak forever
+// (allocatedDisk never returns to 0) AND, if a retention record was written,
+// the footprint would be double-counted as both live and retained (2F), wedging
+// any later restore via the pool's "already has allocated resources" guard.
+func TestDeprovision_RetainGiveUp_ReleasesLive(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+	canonical := canonicalVolumeName("lease-g", "web", 0)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-g": {
+			ProvisionState: leasesm.ProvisionState{
+				LeaseUUID: "lease-g", Tenant: "tenant-a", ProviderUUID: "prov-1",
+				Status:        backend.ProvisionStatusReady,
+				ContainerIDs:  []string{"c1"},
+				CallbackURL:   server.URL,
+				Items:         items,
+				StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+			},
+			// One short of the limit so a single Deprovision (increment to the
+			// limit) hits the give-up branch immediately.
+			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
+		},
+	})
+
+	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-g-web-0", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{canonical}, nil },
+		RenameVolumeFn: func(_, _ string) error {
+			return fmt.Errorf("rename failed: disk full")
+		},
+	}
+
+	// Give-up branch returns nil (not an error) — the lease is abandoned.
+	require.NoError(t, b.Deprovision(context.Background(), "lease-g"))
+
+	// Provision is gone (give-up deletes it).
+	b.provisionsMu.RLock()
+	_, ok := b.provisions["lease-g"]
+	b.provisionsMu.RUnlock()
+	require.False(t, ok, "provision must be deleted after give-up")
+
+	// Live MUST be released even on the abandoned retain path — otherwise it
+	// leaks forever (no retry left) and double-counts against retained.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(0), s.AllocatedDiskMB,
+		"give-up branch must release live (no leak); was %d", s.AllocatedDiskMB)
+}
+
+// TestDeprovision_RetainListError_KeepsLiveCounted verifies that when the
+// retain path cannot enumerate the lease's volumes (List() errors), the live
+// allocation is NOT released. The volumes are likely still on disk (List just
+// failed to read them) and no retention record was written, so releasing live
+// would leave the footprint counted in neither pool → over-admit. The lease must
+// keep live counted and retry on a later attempt.
+func TestDeprovision_RetainListError_KeepsLiveCounted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-le": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-le", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512) // F = 512 MB
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-le-web-0", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+
+	// List() errors → canonical stays empty, but volumes are NOT actually absent.
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return nil, fmt.Errorf("list failed: I/O error") },
+	}
+
+	// The List error surfaces as a volume-cleanup error → under-limit retry path.
+	err = b.Deprovision(context.Background(), "lease-le")
+	require.Error(t, err, "a List error must bubble as a volume-cleanup error (keep lease for retry)")
+
+	// Live MUST remain counted — the volumes were never confirmed absent, so the
+	// footprint must keep counting until a successful enumeration handles it.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(512), s.AllocatedDiskMB,
+		"a List() error must keep live counted (volumes likely still on disk)")
+}
