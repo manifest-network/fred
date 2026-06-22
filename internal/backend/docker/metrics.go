@@ -303,11 +303,11 @@ var (
 		Help:      "Reserved disk capacity (SKU quota) pinned by retained/soft-deleted volumes, in bytes",
 	})
 
-	// retainedVolumes is the number of active retained (soft-deleted) leases.
-	retainedVolumes = promauto.NewGauge(prometheus.GaugeOpts{
+	// retainedLeases is the number of active retained (soft-deleted) leases.
+	retainedLeases = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
-		Name:      "retained_volumes",
+		Name:      "retained_leases",
 		Help:      "Number of active retained (soft-deleted) leases",
 	})
 
@@ -345,7 +345,7 @@ const bytesPerMiB = 1 << 20
 // projection (MB) and active-lease count.
 func updateRetentionMetrics(retainedMB int64, count int) {
 	retainedVolumeBytes.Set(float64(retainedMB) * bytesPerMiB)
-	retainedVolumes.Set(float64(count))
+	retainedLeases.Set(float64(count))
 }
 
 // setStaticPoolMetrics sets the constant denominator gauges once at startup.

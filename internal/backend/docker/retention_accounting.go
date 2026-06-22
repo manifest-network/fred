@@ -78,7 +78,7 @@ func (b *Backend) leaseDiskMB(items []backend.LeaseItem) (mb int64, unresolved [
 
 // computeRetainedDiskMB derives the retained-disk projection from the retention
 // store: the sum of leaseDiskMB over ACTIVE records. Returns both the total MB
-// and the active-record count (for the retained_volumes gauge). This is the
+// and the active-record count (for the retained_leases gauge). This is the
 // single source of truth (bbolt) — never an independently-mutated counter.
 // Restoring records are excluded (their bytes move to the live pool via the
 // restored lease's TryAllocate).

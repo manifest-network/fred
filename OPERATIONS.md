@@ -104,7 +104,7 @@ When SKU resource pools are full, provision requests get HTTP 503 with `insuffic
 
 Retained (soft-deleted) volumes count against the disk admission pool until they
 are reaped (`fred_docker_backend_retained_volume_bytes` shows the reserved
-footprint; `fred_docker_backend_retained_volumes` the count). When retained data
+footprint; `fred_docker_backend_retained_leases` the count). When retained data
 crowds out new provisioning, reclaim it least-destructive-first:
 
 1. **Assess.** Compare `fred_docker_backend_retained_volume_bytes` against

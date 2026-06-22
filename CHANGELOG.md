@@ -11,7 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `max_retained_disk_mb` docker-backend config key: per-provider cap on the
   retained-volume tier, with refuse-to-retain on breach (ENG-360).
 - Retained-volume metrics: `fred_docker_backend_retained_volume_bytes`,
-  `fred_docker_backend_retained_volumes`, `fred_docker_backend_retention_refused_total`,
+  `fred_docker_backend_retained_leases`, `fred_docker_backend_retention_refused_total`,
   and `fred_docker_backend_disk_pool_bytes` / `..._retained_disk_cap_bytes`
   denominator gauges (ENG-360).
 

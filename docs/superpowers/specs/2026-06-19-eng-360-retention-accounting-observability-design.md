@@ -151,7 +151,7 @@ func (b *Backend) refreshRetentionAccounting(ctx) {
     mb := Σ over active entries: Σ items GetSKUProfile(item.SKU).DiskMB × item.Quantity
     b.pool.SetRetainedDiskMB(mb)
     set fred_docker_backend_retained_volume_bytes = mb << 20
-    set fred_docker_backend_retained_volumes      = len(active entries)
+    set fred_docker_backend_retained_leases       = len(active entries)
 }
 ```
 
@@ -247,7 +247,7 @@ the subsystem already names the backend; existing metrics carry none) and **no p
 | Metric | Type | Unit | Meaning |
 |---|---|---|---|
 | `fred_docker_backend_retained_volume_bytes` | gauge | bytes | Reserved capacity (SKU quota) currently pinned by retained volumes. Converted MB→bytes at the exporter boundary (Prometheus base-unit convention). Help text notes this is reserved quota, not measured usage. |
-| `fred_docker_backend_retained_volumes` | gauge | count | Number of active retained leases. (No `_total` suffix — it is a gauge.) |
+| `fred_docker_backend_retained_leases` | gauge | count | Number of active retained leases. (No `_total` suffix — it is a gauge.) |
 | `fred_docker_backend_retention_refused_total` | counter | events | Count of close-time refuse-to-retain events due to `max_retained_disk_mb`. |
 | `fred_docker_backend_disk_pool_bytes` | gauge | bytes | The admission ceiling (`total_disk_mb << 20`). Denominator so dashboards don't hardcode the pool size. |
 | `fred_docker_backend_retained_disk_cap_bytes` | gauge | bytes | The per-provider retained cap (`max_retained_disk_mb << 20`). A registered gauge always exports, so it reads **0 when the cap is unset**; alert queries MUST guard `> 0` before dividing by it. Alert denominator. |

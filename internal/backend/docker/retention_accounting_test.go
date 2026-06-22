@@ -55,14 +55,14 @@ func TestRefreshRetentionAccounting_PushesToPoolAndMetrics(t *testing.T) {
 	b.refreshRetentionAccounting()
 	assert.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB)
 	assert.Equal(t, float64(2048)*bytesPerMiB, testutil.ToFloat64(retainedVolumeBytes))
-	assert.Equal(t, float64(1), testutil.ToFloat64(retainedVolumes))
+	assert.Equal(t, float64(1), testutil.ToFloat64(retainedLeases))
 
 	// Remove the record and refresh → projection drops to 0.
 	require.NoError(t, rs.Delete("lease-a"))
 	b.refreshRetentionAccounting()
 	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB)
 	assert.Equal(t, float64(0), testutil.ToFloat64(retainedVolumeBytes))
-	assert.Equal(t, float64(0), testutil.ToFloat64(retainedVolumes))
+	assert.Equal(t, float64(0), testutil.ToFloat64(retainedLeases))
 }
 
 func TestRecoverRebuildsRetainedProjection(t *testing.T) {
