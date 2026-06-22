@@ -361,3 +361,46 @@ func TestResourcePool(t *testing.T) {
 		})
 	})
 }
+
+func TestRetainedDiskCountsAgainstPool(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+	}
+	// Total disk 2048 MB.
+	p := NewResourcePool(8, 8192, 2048, resolver, nil)
+
+	// Reserve 1024 MB as retained (a soft-deleted volume still on disk).
+	p.SetRetainedDisk(1024)
+
+	// A 1024 MB live allocation exactly fills the remaining headroom.
+	require.NoError(t, p.TryAllocate("lease-1", "sku", "tenant"))
+
+	// A second 1024 MB allocation must be denied:
+	// 1024 (live) + 1024 (retained) + 1024 (new) > 2048.
+	err := p.TryAllocate("lease-2", "sku", "tenant")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "insufficient disk")
+}
+
+func TestStatsIncludesRetainedDisk(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) { return SKUProfile{}, nil }
+	p := NewResourcePool(8, 8192, 4096, resolver, nil)
+	p.SetRetainedDisk(1500)
+
+	s := p.Stats()
+	assert.Equal(t, int64(1500), s.RetainedDiskMB)
+	assert.Equal(t, int64(4096-1500), s.AvailableDiskMB())
+}
+
+func TestResetPreservesRetainedDisk(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+	}
+	p := NewResourcePool(8, 8192, 4096, resolver, nil)
+	p.SetRetainedDisk(1024)
+	// Reset rebuilds live allocations; it must NOT clobber the retained projection
+	// (the backend re-pushes it via refreshRetentionAccounting after recover, but
+	// Reset itself owns only live state).
+	p.Reset([]ResourceAllocation{{LeaseUUID: "l1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}})
+	assert.Equal(t, int64(1024), p.Stats().RetainedDiskMB)
+}

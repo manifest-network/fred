@@ -34,6 +34,14 @@ type ResourcePool struct {
 	allocatedMemory int64
 	allocatedDisk   int64
 
+	// retainedDisk is the aggregate disk (MB) reserved by soft-deleted
+	// (retained) volumes. It is a projection pushed by the owner via
+	// SetRetainedDisk (derived from the retention store), subtracted from
+	// available disk in TryAllocate so retained volumes keep counting against
+	// the pool until they are actually reaped. Not touched by Reset (which owns
+	// only live allocations) — the owner re-pushes it after recover.
+	retainedDisk int64
+
 	// Per-lease tracking
 	allocations map[string]ResourceAllocation
 
@@ -89,9 +97,9 @@ func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
 		return fmt.Errorf("insufficient memory: need %d MB, have %d MB available",
 			profile.MemoryMB, p.totalMemory-p.allocatedMemory)
 	}
-	if p.allocatedDisk+profile.DiskMB > p.totalDisk {
+	if p.allocatedDisk+p.retainedDisk+profile.DiskMB > p.totalDisk {
 		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
-			profile.DiskMB, p.totalDisk-p.allocatedDisk)
+			profile.DiskMB, p.totalDisk-p.allocatedDisk-p.retainedDisk)
 	}
 
 	// Check per-tenant quota if configured
@@ -168,6 +176,16 @@ func (p *ResourcePool) Release(leaseUUID string) {
 	delete(p.allocations, leaseUUID)
 }
 
+// SetRetainedDisk records the aggregate disk (MB) reserved by retained
+// (soft-deleted) volumes. The owner derives this from the retention store and
+// pushes it here; TryAllocate subtracts it from available disk so retained
+// volumes keep counting against the pool until reaped. Idempotent.
+func (p *ResourcePool) SetRetainedDisk(mb int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.retainedDisk = mb
+}
+
 // GetAllocation returns the allocation for a lease, or nil if not allocated.
 func (p *ResourcePool) GetAllocation(leaseUUID string) *ResourceAllocation {
 	p.mu.Lock()
@@ -192,6 +210,7 @@ func (p *ResourcePool) Stats() ResourceStats {
 		AllocatedCPU:      p.allocatedCPU,
 		AllocatedMemoryMB: p.allocatedMemory,
 		AllocatedDiskMB:   p.allocatedDisk,
+		RetainedDiskMB:    p.retainedDisk,
 		AllocationCount:   len(p.allocations),
 	}
 }
@@ -223,6 +242,7 @@ type ResourceStats struct {
 	AllocatedCPU      float64
 	AllocatedMemoryMB int64
 	AllocatedDiskMB   int64
+	RetainedDiskMB    int64
 	AllocationCount   int
 }
 
@@ -236,9 +256,10 @@ func (s ResourceStats) AvailableMemoryMB() int64 {
 	return s.TotalMemoryMB - s.AllocatedMemoryMB
 }
 
-// AvailableDiskMB returns available disk in MB.
+// AvailableDiskMB returns disk available for new allocations: total minus live
+// allocations minus retained (soft-deleted) reservations.
 func (s ResourceStats) AvailableDiskMB() int64 {
-	return s.TotalDiskMB - s.AllocatedDiskMB
+	return s.TotalDiskMB - s.AllocatedDiskMB - s.RetainedDiskMB
 }
 
 // Reset clears all allocations and rebuilds from a list of allocations.
