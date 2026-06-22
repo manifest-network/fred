@@ -174,4 +174,5 @@ func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 
 	assert.Empty(t, errs)
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal), "production code increments the counter")
+	assert.Equal(t, canonical, fv.destroyed, "both canonical volumes must be destroyed on refuse-to-retain")
 }
