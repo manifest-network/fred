@@ -120,6 +120,21 @@ func (b *Backend) breachRetentionCap(items []backend.LeaseItem) bool {
 	return b.pool.Stats().RetainedDiskMB+b.leaseDiskMB(items) > b.cfg.MaxRetainedDiskMB
 }
 
+// shouldRefuseRetention decides whether a closing lease must be refused retention
+// due to the provider cap. It returns false when the lease ALREADY has an active
+// retention record (a retry after a partial-rename failure): its footprint is
+// already counted in retainedDisk and the cap was honored when the record was
+// first written, so re-checking would double-count it and could spuriously
+// refuse the retry, leaving an inconsistent destroy-some/retain-some state.
+// A retention-store read error is treated as "no existing record" so the cap
+// check still runs (conservative — over-refusing, never over-admitting).
+func (b *Backend) shouldRefuseRetention(leaseUUID string, items []backend.LeaseItem) bool {
+	if rec, err := b.retentionStore.Get(leaseUUID); err == nil && rec != nil && rec.Status == shared.RetentionStatusActive {
+		return false
+	}
+	return b.breachRetentionCap(items)
+}
+
 // destroyOnRefuseToRetain destroys a closing lease's still-canonical volumes
 // when the retained cap is breached (refuse-to-retain). Logs + increments the
 // refusal counter; returns any destroy errors to merge into the caller's

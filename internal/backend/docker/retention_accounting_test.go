@@ -191,3 +191,21 @@ func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal), "production code increments the counter")
 	assert.Equal(t, canonical, fv.destroyed, "both canonical volumes must be destroyed on refuse-to-retain")
 }
+
+func TestShouldRefuseRetention_SkipsWhenAlreadyRetained(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedDiskMB = 1000 // tight: a 2 x 1024 = 2048 MB lease breaches
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+
+	// No record yet → breach → refuse.
+	b.pool.SetRetainedDisk(0)
+	assert.True(t, b.shouldRefuseRetention("lease-x", items))
+
+	// A prior attempt already wrote an ACTIVE record for this lease (retry case);
+	// its footprint is already in retainedDisk. Re-deciding must NOT refuse
+	// (no double-count, no inconsistent destroy-some/retain-some state).
+	require.NoError(t, rs.Put(retentionEntryFixture("lease-x", "t1", time.Now()))) // active, docker-micro qty 2
+	b.pool.SetRetainedDisk(2048)                                                   // reflects the existing record
+	assert.False(t, b.shouldRefuseRetention("lease-x", items), "retry of an already-retained lease must not be refused")
+}

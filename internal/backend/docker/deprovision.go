@@ -167,7 +167,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// the prior record with a shorter list — and never clobbers a record that a
 		// concurrent restore claimed (active→restoring) mid-flight.
 		if len(canonical) > 0 {
-			if b.breachRetentionCap(items) {
+			if b.shouldRefuseRetention(leaseUUID, items) {
 				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, canonical, leaseUUID, tenant, logger)...)
 			} else {
 				// existing retain logic — moved here UNCHANGED, just re-indented one level
