@@ -126,17 +126,23 @@ func (b *Backend) refreshRetentionAccounting() {
 
 // breachRetentionCap reports whether retaining a lease of the given items would
 // push the provider-global retained footprint over max_retained_disk_mb.
-// 0 = unlimited (never breaches). Reads the CACHED pool.Stats().RetainedDiskMB
-// (not a fresh recompute), so under concurrent multi-lease closes the cap may be
-// transiently overshot by one lease's worth, self-healing at the next
-// recompute (sweep / reconcile loop) — consistent with the level-triggered
-// drift-to-one-tick model.
+// 0 = unlimited (never breaches). It recomputes the retained total from the
+// retention store (the source of truth) rather than the cached pool projection,
+// because the cache lags store mutations (reap/claim) — a stale-HIGH cache could
+// otherwise wrongly refuse-to-retain and DESTROY a closing lease's volumes that
+// fit under the true cap. On a store read error it fails OPEN (does not refuse):
+// refuse-to-retain destroys data, so uncertainty must never trigger it.
 func (b *Backend) breachRetentionCap(items []backend.LeaseItem) bool {
 	if b.cfg.MaxRetainedDiskMB <= 0 {
 		return false
 	}
-	mb, _ := b.leaseDiskMB(items)
-	return b.pool.Stats().RetainedDiskMB+mb > b.cfg.MaxRetainedDiskMB
+	incoming, _ := b.leaseDiskMB(items)
+	retained, _, err := b.computeRetainedDiskMB()
+	if err != nil {
+		b.logger.Warn("retention cap check: store read failed; not refusing (data-safe)", "error", err)
+		return false
+	}
+	return retained+incoming > b.cfg.MaxRetainedDiskMB
 }
 
 // shouldRefuseRetention decides whether a closing lease must be refused retention

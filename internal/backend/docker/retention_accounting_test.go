@@ -85,27 +85,54 @@ func TestRecoverRebuildsRetainedProjection(t *testing.T) {
 
 // TestBreachRetentionCap covers the cap predicate: an unset cap (0) never
 // breaches, and the boundary where current retained + the incoming lease's
-// footprint crosses max_retained_disk_mb.
+// footprint crosses max_retained_disk_mb. Baseline is seeded via the retention
+// store (the authoritative source) — not the cached pool projection.
 func TestBreachRetentionCap(t *testing.T) {
-	b, _ := newBackendWithRetention(t)
-	withMicroSKU(b, 1024)
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1000) // 1000 MB per unit for clean math
+	// Store holds one active retained lease = qty2 * 1000 = 2000 MB (TRUE retained).
+	require.NoError(t, rs.Put(retentionEntryFixture("other", "t1", time.Now())))
+	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}} // 2000 MB
 
-	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}} // 2048 MB
-
-	// Cap unset (0) → never breaches.
+	// Cap unset (0) → never breaches (even with a stale-high cache).
 	b.cfg.MaxRetainedDiskMB = 0
 	b.pool.SetRetainedDisk(1_000_000)
 	assert.False(t, b.breachRetentionCap(incoming))
 
-	// Cap 3000 MB, 2000 already retained: 2000 + 2048 > 3000 → breach.
+	// Cap 3000: true 2000 + incoming 2000 = 4000 > 3000 → breach.
 	b.cfg.MaxRetainedDiskMB = 3000
-	b.pool.SetRetainedDisk(2000)
 	assert.True(t, b.breachRetentionCap(incoming))
 
-	// Cap 5000 MB, 2000 already retained: 2000 + 2048 <= 5000 → no breach.
+	// Cap 5000: 2000 + 2000 = 4000 <= 5000 → no breach.
 	b.cfg.MaxRetainedDiskMB = 5000
-	b.pool.SetRetainedDisk(2000)
 	assert.False(t, b.breachRetentionCap(incoming))
+}
+
+// TestBreachRetentionCap_UsesStoreNotStaleCache pins that the cap decision reads
+// the retention store (the source of truth), not the cached pool projection. A
+// stale-HIGH cache must not trigger a false breach.
+func TestBreachRetentionCap_UsesStoreNotStaleCache(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1000)
+	b.cfg.MaxRetainedDiskMB = 5000
+	require.NoError(t, rs.Put(retentionEntryFixture("other", "t1", time.Now())))            // TRUE retained = 2000
+	b.pool.SetRetainedDisk(9_999_999)                                                       // stale-HIGH cache (e.g. a just-reaped record not yet refreshed)
+	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}} // 2000
+	// TRUE: 2000 + 2000 = 4000 <= 5000 → must NOT breach, even though the stale cache (9.9M) would.
+	assert.False(t, b.breachRetentionCap(incoming),
+		"cap decision must use the authoritative store total, not the stale cached projection")
+}
+
+// TestBreachRetentionCap_StoreErrorFailsOpen verifies that a retention store read
+// error causes breachRetentionCap to fail open (not refuse). Refuse-to-retain
+// destroys volumes; uncertainty must never trigger destruction.
+func TestBreachRetentionCap_StoreErrorFailsOpen(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1000)
+	b.cfg.MaxRetainedDiskMB = 100  // tight: would breach if it reached the comparison
+	require.NoError(t, rs.Close()) // computeRetainedDiskMB now errors
+	assert.False(t, b.breachRetentionCap([]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+		"a store read error must fail open (not breach → not destroy)")
 }
 
 // TestRestoreOrdering_NeverUnderCounts verifies that live+retained never dips
