@@ -407,7 +407,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		cfg.GetSKUProfile, // Use Config's resolver to avoid duplicating SKU mapping logic
 		cfg.TenantQuota,
 	)
-	setStaticPoolMetrics(cfg)
+	setStaticPoolMetrics(cfg) // ENG-360: export static pool/cap denominators for dashboards
 
 	// Create HTTP client for callbacks
 	httpClient := &http.Client{
