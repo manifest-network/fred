@@ -142,7 +142,7 @@ func TestCheckOnce_LeaseNotFound_Untracks(t *testing.T) {
 	checker.CheckOnce(context.Background())
 
 	assert.False(t, tracker.IsInFlight("lease-gone"),
-		"deleted lease must be untracked, not retried forever")
+		"lease that no longer exists must be untracked, not retried forever")
 }
 
 func TestCheckOnce_ContextCanceled_StopsEarly(t *testing.T) {
