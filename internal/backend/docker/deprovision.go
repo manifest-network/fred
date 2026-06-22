@@ -122,11 +122,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		updateResourceMetrics(b.pool.Stats())
 	}
 	retaining := b.cfg.RetainOnClose && b.retentionStore != nil
-	if !retaining {
-		// Non-retain close: volumes will be destroyed below; release live now
-		// (UNCHANGED from prior behavior for this path).
-		releaseLive()
-	}
+	// Non-retain release is deferred to AFTER the partial-container-failure
+	// early-return below (see the `if !retaining` block just before the volume
+	// branch), so a teardown that only partially succeeds keeps resources counted
+	// for the retry rather than freeing them while stuck containers still run.
+	//
 	// Retaining close: keep the live allocation counted until the retained
 	// record is recorded+refreshed (or the volumes are destroyed) — see the
 	// deferred hand-off below — so the footprint is never momentarily
@@ -165,6 +165,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// diagSnap is zero-value and persistDiagnostics no-ops on its empty guard.
 		b.persistDiagnostics(diagSnap, failedIDs)
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
+	}
+
+	if !retaining {
+		// Non-retain close: container teardown SUCCEEDED (the partial-failure
+		// early-return above did not fire) and the volumes will be destroyed
+		// below — release live now. Placing this AFTER the early-return means a
+		// partial-container-failure keeps resources counted for the retry rather
+		// than freeing CPU/mem/disk while stuck containers still run.
+		releaseLive()
 	}
 
 	// Destroy managed volumes for all instances — or soft-delete them into the

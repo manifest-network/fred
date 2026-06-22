@@ -843,3 +843,71 @@ func TestDeprovision_RetainListError_KeepsLiveCounted(t *testing.T) {
 	assert.Equal(t, int64(512), s.AllocatedDiskMB,
 		"a List() error must keep live counted (volumes likely still on disk)")
 }
+
+// TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted verifies that a
+// NON-retain close whose container teardown PARTIALLY fails (compose down fails
+// AND the per-container RemoveContainer fallback also fails → stuck containers
+// remain) does NOT release the live pool allocation. The early non-retain
+// release must run only AFTER teardown succeeds; otherwise CPU/mem/disk are
+// freed while the stuck containers still run → undercount → over-admit (ENOSPC).
+func TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+
+	// compose down fails → falls back to per-container removal, which also fails →
+	// errs is non-empty → doDeprovision takes the partial-failure early-return.
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error {
+			return fmt.Errorf("container stuck: device or resource busy")
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-pf": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-pf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+			return fmt.Errorf("compose down failed")
+		},
+	}
+
+	withMicroSKU(b, 512) // F = 512 MB
+	// RetainOnClose stays false (default) — pure non-retain close.
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-pf-web-0", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+
+	// Partial container-teardown failure → returns an error, lease kept Failed.
+	err := b.Deprovision(context.Background(), "lease-pf")
+	require.Error(t, err, "a partial container-teardown failure must return an error")
+
+	// The lease is kept visible in Failed with the stuck container for retry.
+	b.provisionsMu.RLock()
+	p, ok := b.provisions["lease-pf"]
+	var gotStatus backend.ProvisionStatus
+	if ok {
+		gotStatus = p.Status
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, ok, "provision must stay visible for retry after a partial teardown failure")
+	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus)
+
+	// Live MUST remain counted — the stuck container is still running, so its
+	// CPU/mem/disk must keep counting until a later retry tears it down cleanly.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(512), s.AllocatedDiskMB,
+		"a partial container-teardown failure must keep live counted (stuck container still running)")
+}
