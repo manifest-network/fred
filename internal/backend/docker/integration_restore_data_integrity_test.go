@@ -388,3 +388,112 @@ func TestIntegration_Docker_RetainRestore_OwnershipBoundary(t *testing.T) {
 	assert.Equal(t, uint32(priorUID), ownerUID(t, nestedFile),
 		"nested file keeps its prior owner (chown is non-recursive) — tenant responsibility on drift")
 }
+
+// TestIntegration_Docker_RetainRestore_WritablePathWipeContract pins the
+// writable-path (_wp) durability contract across restore (ENG-367). Unlike a
+// declared VOLUME, a "writable path" — a non-VOLUME directory the image chowns
+// to the container user (e.g. grafana's /var/lib/grafana) — is backed by a _wp
+// subdir that setupWritablePathBinds RemoveAll's and re-extracts fresh from the
+// image on EVERY deploy, including restore (doRestore → doReplaceContainers →
+// setupVolBinds → setupWritablePathBinds). So tenant data written under a
+// writable path does NOT survive a close→restore: it is wiped and reseeded,
+// even though the managed volume itself is retained and adopted back.
+//
+// This is the deliberate, current contract: only declared VOLUMEs are
+// restore-durable (see TestIntegration_Docker_RetainRestore_DataIntegrity for
+// the surviving side). The assertion FAILS LOUDLY if writable-path data ever
+// starts surviving restore, forcing that to be a conscious change.
+//
+// Fixture: grafana/grafana:11.1.0 — non-root (uid 472), declares NO VOLUMEs,
+// and /var/lib/grafana is owned by 472, so fred detects it as a writable path
+// and backs it with _wp. Command is overridden to `sleep` so grafana-server
+// never starts (the writable path is detected at image-inspect time and bound
+// regardless of the command).
+func TestIntegration_Docker_RetainRestore_WritablePathWipeContract(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	callbackServer, callbackCh := startCallbackServer(t)
+	b := retainRestoreBackend(t, mountPath)
+	// Writable-path detection only runs under a read-only rootfs. That is the
+	// DefaultConfig default retainRestoreBackend inherits (config.go); set here
+	// explicitly to document this test's dependency on it.
+	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
+
+	ctx := context.Background()
+	origLease := fmt.Sprintf("retain-wp-orig-%d", time.Now().UnixNano())
+
+	const wpPath = "/var/lib/grafana" // grafana writable path (NOT a declared VOLUME)
+	const sentinelName = "tenant-wrote-this.txt"
+	const sentinelContent = "wp-sentinel-ZULU"
+
+	appManifest := manifest.Manifest{Image: "grafana/grafana:11.1.0", Command: []string{"sleep", "3600"}}
+	payload, err := json.Marshal(appManifest)
+	require.NoError(t, err)
+
+	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:    origLease,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	}))
+	cb := waitForCallback(t, callbackCh, origLease, 3*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+
+	// Guard against a vacuous pass: the writable path must actually be wired as a
+	// bind mount (i.e. fred detected /var/lib/grafana and backed it with _wp). If
+	// this fails, the fixture no longer exercises the _wp path and the rest of the
+	// test would prove nothing.
+	containerID := getContainerID(t, origLease)
+	require.True(t, containerHasBindMount(t, containerID, wpPath),
+		"%s must be a detected writable-path bind mount on the original lease", wpPath)
+
+	// Tenant writes data under the writable path.
+	execInContainer(t, containerID, []string{"sh", "-c",
+		fmt.Sprintf("printf '%%s' '%s' > %s/%s", sentinelContent, wpPath, sentinelName)})
+
+	// It must exist on the host _wp subdir before close (sanity).
+	canonical := canonicalVolumeName(origLease, manifest.DefaultServiceName, 0)
+	hostWPSentinel := filepath.Join(mountPath, canonical, "_wp", "var", "lib", "grafana", sentinelName)
+	_, err = os.Stat(hostWPSentinel)
+	require.NoError(t, err, "writable-path sentinel must exist on host _wp before deprovision")
+
+	// Soft-delete (retain) — the managed volume (including its _wp subdir) is retained.
+	require.NoError(t, b.Deprovision(ctx, origLease))
+	cb = waitForCallback(t, callbackCh, origLease, 30*time.Second)
+	require.Equal(t, backend.CallbackStatusDeprovisioned, cb.Status)
+	require.True(t, cb.Retained, "real btrfs retain must set the ground-truth Retained flag (the _wp wipe assertion below is meaningful only if the volume was actually retained + adopted back)")
+
+	// Restore into a new lease.
+	newLease := fmt.Sprintf("retain-wp-new-%d", time.Now().UnixNano())
+	require.NoError(t, b.Restore(ctx, backend.RestoreRequest{
+		LeaseUUID:     newLease,
+		FromLeaseUUID: origLease,
+		Tenant:        "test-tenant",
+		ProviderUUID:  "test-provider",
+		Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:   callbackServer.URL,
+	}))
+	cb = waitForCallback(t, callbackCh, newLease, 3*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "restore must succeed; error: %s", cb.Error)
+
+	// ── Contract: writable-path tenant data is WIPED + reseeded on restore ──
+	newContainerID := getContainerID(t, newLease)
+	require.True(t, containerHasBindMount(t, newContainerID, wpPath),
+		"writable-path bind must still be wired after restore (proves a reseed, not a broken/absent mount)")
+	gone := strings.TrimSpace(execInContainer(t, newContainerID, []string{"sh", "-c",
+		fmt.Sprintf("test -f %s/%s && echo PRESENT || echo GONE", wpPath, sentinelName)}))
+	assert.Equal(t, "GONE", gone,
+		"tenant data under a writable path must NOT survive restore (it is reseeded from the image); "+
+			"only declared VOLUMEs are restore-durable")
+
+	// And gone from the restored host _wp too.
+	newCanonical := canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)
+	_, err = os.Stat(filepath.Join(mountPath, newCanonical, "_wp", "var", "lib", "grafana", sentinelName))
+	assert.True(t, errors.Is(err, fs.ErrNotExist),
+		"writable-path sentinel must be gone from the restored host _wp")
+
+	// Cleanup: hard-delete the restored lease (reaper is off in this test).
+	b.cfg.RetainOnClose = false
+	require.NoError(t, b.Deprovision(ctx, newLease))
+}
