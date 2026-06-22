@@ -122,6 +122,9 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// Update gauges immediately after releasing allocations so metrics stay
 	// accurate on every path (partial failure, volume-cleanup retry, success).
 	updateResourceMetrics(b.pool.Stats())
+	// Retained set may have changed (this close may have added a retained
+	// record below, or a prior attempt did); refresh after the volume branch.
+	defer b.refreshRetentionAccounting()
 
 	if len(errs) > 0 {
 		// Partial failure: keep provision visible with only the stuck containers.

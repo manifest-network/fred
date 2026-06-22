@@ -587,6 +587,10 @@ func (b *Backend) Start(ctx context.Context) error {
 	if _, err := b.reapExpiredRetentions(b.stopCtx); err != nil {
 		b.logger.Warn("retention boot reap failed", "error", err)
 	}
+	// Belt-and-suspenders: recoverState already rebuilt the projection and the
+	// boot reap (now wired in Step 5) self-refreshes; this final call guarantees
+	// a correct projection before serving traffic even if either changes.
+	b.refreshRetentionAccounting()
 	b.startRetentionReaper()
 
 	// Replay any pending callbacks from a previous run

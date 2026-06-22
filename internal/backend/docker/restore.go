@@ -237,6 +237,7 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 			}
 		}
 	}
+	b.refreshRetentionAccounting()
 	return nil
 }
 
@@ -282,6 +283,7 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 		}
 		n++
 	}
+	b.refreshRetentionAccounting()
 	return n, nil
 }
 
@@ -304,6 +306,7 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 	for _, e := range recs {
 		b.reconcileRestoring(ctx, e)
 	}
+	b.refreshRetentionAccounting()
 	return nil
 }
 
@@ -555,6 +558,11 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		}
 	}
 
+	// Claim flipped the record active→restoring (drops it from the active
+	// projection); the live allocation above already counts the bytes, so this
+	// keeps the gauge/projection consistent without an under-count window.
+	b.refreshRetentionAccounting()
+
 	// (e) Adopt: rename retained->canonical. On failure, full rollback. The
 	// worker never ran, so no actor terminal transition is coming — drop the
 	// reservation (dropProvision=true). Timed as the restore "adopt" phase: it
@@ -651,6 +659,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
 				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
 			}
+			b.refreshRetentionAccounting()
 			return
 		}
 		b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
@@ -710,6 +719,7 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 	} else if !ok {
 		logger.Warn("restore rollback: record generation changed; reaper will reconcile", "lease_uuid", rec.OriginalLeaseUUID)
 	}
+	b.refreshRetentionAccounting()
 	if dropProvision {
 		b.removeProvision(leaseUUID)
 	}
