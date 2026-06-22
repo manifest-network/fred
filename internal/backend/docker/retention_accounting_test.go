@@ -101,6 +101,28 @@ func TestRecoverRebuildsRetainedProjection(t *testing.T) {
 // override. To keep the invariant consistent, this test uses DiskMB=512 so
 // both the pool allocator and the retention projection agree on the per-unit
 // cost. The fixture has qty=2 → footprint = 2 * 512 = 1024 MB.
+func TestBreachRetentionCap(t *testing.T) {
+	b, _ := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+
+	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}} // 2048 MB
+
+	// Cap unset (0) → never breaches.
+	b.cfg.MaxRetainedDiskMB = 0
+	b.pool.SetRetainedDisk(1_000_000)
+	assert.False(t, b.breachRetentionCap(incoming))
+
+	// Cap 3000 MB, 2000 already retained: 2000 + 2048 > 3000 → breach.
+	b.cfg.MaxRetainedDiskMB = 3000
+	b.pool.SetRetainedDisk(2000)
+	assert.True(t, b.breachRetentionCap(incoming))
+
+	// Cap 5000 MB, 2000 already retained: 2000 + 2048 <= 5000 → no breach.
+	b.cfg.MaxRetainedDiskMB = 5000
+	b.pool.SetRetainedDisk(2000)
+	assert.False(t, b.breachRetentionCap(incoming))
+}
+
 func TestRestoreOrdering_NeverUnderCounts(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	// Use 512 MB to match the pool resolver's view of docker-micro
@@ -130,4 +152,26 @@ func TestRestoreOrdering_NeverUnderCounts(t *testing.T) {
 	assert.Equal(t, int64(0), s.RetainedDiskMB, "restoring record leaves the active projection")
 	assert.Equal(t, int64(1024), s.AllocatedDiskMB, "bytes are now counted as live")
 	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(1024))
+}
+
+func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
+	b, _ := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedDiskMB = 1000 // smaller than a single 2 x 1024 = 2048 MB lease
+	b.pool.SetRetainedDisk(0)
+
+	// A capturing fake volume manager records Destroy calls (mirrors the
+	// fakeVolumeBackend pattern in testsupport_test.go).
+	fv := &fakeVolumeBackend{}
+	b.volumes = fv
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+	require.True(t, b.breachRetentionCap(items), "a 2048 MB lease must breach a 1000 MB cap")
+
+	before := testutil.ToFloat64(retentionRefusedTotal)
+	canonical := []string{"fred-lease-z-web-0", "fred-lease-z-web-1"}
+	errs := b.destroyOnRefuseToRetain(context.Background(), canonical, "lease-z", "t1", b.logger)
+
+	assert.Empty(t, errs)
+	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal), "production code increments the counter")
 }

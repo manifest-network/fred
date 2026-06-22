@@ -167,74 +167,79 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// the prior record with a shorter list — and never clobbers a record that a
 		// concurrent restore claimed (active→restoring) mid-flight.
 		if len(canonical) > 0 {
-			retained := make([]string, 0, len(canonical))
-			for _, c := range canonical {
-				retained = append(retained, retainedName(c))
-			}
-			// Best-effort cap room BEFORE the write. Dropping the standalone Get-guard
-			// means a rare wasted eviction here if PutActiveMerged then defers (a
-			// restore raced in): acceptable — it evicts the tenant's oldest, which the
-			// next attempt would evict anyway.
-			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
-				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
-			}
-			// Hydrate a nil StackManifest from the release store so the retained data
-			// stays API-restorable. A cold-start recover restores the manifest
-			// best-effort (recover.go) and leaves it nil if the active release is
-			// missing/unparseable/store-nil; Restore rejects a nil-manifest record as
-			// corrupt, so without this the volumes are retained but un-restorable.
-			// Mirror recover.go's LatestActive + ParsePayload guard exactly.
-			if stackManifest == nil && b.releaseStore != nil {
-				if rel, relErr := b.releaseStore.LatestActive(leaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
-					if stackM, payloadErr := manifest.ParsePayload(rel.Manifest); payloadErr != nil {
-						logger.Warn("soft-delete: failed to parse release manifest for retention hydration", "error", payloadErr)
-					} else {
-						stackManifest = stackM
-					}
-				}
-			}
-			if stackManifest == nil {
-				// Still nil after hydration: preserve the data (write the record) but
-				// warn loudly that it cannot be restored through the API.
-				logger.Warn("soft-delete: retained data will NOT be API-restorable (no manifest for lease); volumes preserved for manual recovery",
-					"lease_uuid", leaseUUID)
-			}
-
-			// RECORD-FIRST + ATOMIC: PutActiveMerged persists the active record (with
-			// the MERGED retained set) before any rename in ONE bbolt txn. CreatedAt
-			// (grace clock) and Generation (CAS) are preserved across retries by the
-			// store. ok=false means a restore claimed the record concurrently — defer.
-			base := shared.RetentionEntry{
-				OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
-				Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
-				RetainedVolumeNames: retained, Status: shared.RetentionStatusActive,
-				CreatedAt: time.Now(), Generation: 0,
-			}
-			ok, err := b.retentionStore.PutActiveMerged(base)
-			switch {
-			case err != nil:
-				logger.Error("failed to write retention record", "lease_uuid", leaseUUID, "error", err)
-				volumeErrs = append(volumeErrs, fmt.Errorf("write retention record: %w", err))
-			case !ok:
-				// A restore claimed the record (active→restoring) between our volume
-				// enumeration and the write. Renaming or reverting now would corrupt the
-				// restore rollback's generation-CAS. Defer — keep the lease Failed so the
-				// volume-cleanup retry re-attempts after the restore resolves (the record
-				// is back to active, or gone if the restore succeeded).
-				logger.Warn("soft-delete deferred: record claimed for restore concurrently; will retry")
-				volumeErrs = append(volumeErrs, fmt.Errorf("retention record for %s is being restored; deferring", leaseUUID))
-			default:
-				// Only the STILL-canonical volumes need renaming; the already-retained
-				// ones (from a prior attempt) are done.
+			if b.breachRetentionCap(items) {
+				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, canonical, leaseUUID, tenant, logger)...)
+			} else {
+				// existing retain logic — moved here UNCHANGED, just re-indented one level
+				retained := make([]string, 0, len(canonical))
 				for _, c := range canonical {
-					if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
-						logger.Error("failed to retain volume", "volume", c, "error", err)
-						volumeErrs = append(volumeErrs, fmt.Errorf("retain volume %s: %w", c, err))
+					retained = append(retained, retainedName(c))
+				}
+				// Best-effort cap room BEFORE the write. Dropping the standalone Get-guard
+				// means a rare wasted eviction here if PutActiveMerged then defers (a
+				// restore raced in): acceptable — it evicts the tenant's oldest, which the
+				// next attempt would evict anyway.
+				if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
+					logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
+				}
+				// Hydrate a nil StackManifest from the release store so the retained data
+				// stays API-restorable. A cold-start recover restores the manifest
+				// best-effort (recover.go) and leaves it nil if the active release is
+				// missing/unparseable/store-nil; Restore rejects a nil-manifest record as
+				// corrupt, so without this the volumes are retained but un-restorable.
+				// Mirror recover.go's LatestActive + ParsePayload guard exactly.
+				if stackManifest == nil && b.releaseStore != nil {
+					if rel, relErr := b.releaseStore.LatestActive(leaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
+						if stackM, payloadErr := manifest.ParsePayload(rel.Manifest); payloadErr != nil {
+							logger.Warn("soft-delete: failed to parse release manifest for retention hydration", "error", payloadErr)
+						} else {
+							stackManifest = stackM
+						}
 					}
 				}
-				if len(volumeErrs) == 0 {
-					volumesRetained = true
-					logger.Info("soft-deleted lease volumes", "lease_uuid", leaseUUID, "retained", len(retained))
+				if stackManifest == nil {
+					// Still nil after hydration: preserve the data (write the record) but
+					// warn loudly that it cannot be restored through the API.
+					logger.Warn("soft-delete: retained data will NOT be API-restorable (no manifest for lease); volumes preserved for manual recovery",
+						"lease_uuid", leaseUUID)
+				}
+
+				// RECORD-FIRST + ATOMIC: PutActiveMerged persists the active record (with
+				// the MERGED retained set) before any rename in ONE bbolt txn. CreatedAt
+				// (grace clock) and Generation (CAS) are preserved across retries by the
+				// store. ok=false means a restore claimed the record concurrently — defer.
+				base := shared.RetentionEntry{
+					OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
+					Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
+					RetainedVolumeNames: retained, Status: shared.RetentionStatusActive,
+					CreatedAt: time.Now(), Generation: 0,
+				}
+				ok, err := b.retentionStore.PutActiveMerged(base)
+				switch {
+				case err != nil:
+					logger.Error("failed to write retention record", "lease_uuid", leaseUUID, "error", err)
+					volumeErrs = append(volumeErrs, fmt.Errorf("write retention record: %w", err))
+				case !ok:
+					// A restore claimed the record (active→restoring) between our volume
+					// enumeration and the write. Renaming or reverting now would corrupt the
+					// restore rollback's generation-CAS. Defer — keep the lease Failed so the
+					// volume-cleanup retry re-attempts after the restore resolves (the record
+					// is back to active, or gone if the restore succeeded).
+					logger.Warn("soft-delete deferred: record claimed for restore concurrently; will retry")
+					volumeErrs = append(volumeErrs, fmt.Errorf("retention record for %s is being restored; deferring", leaseUUID))
+				default:
+					// Only the STILL-canonical volumes need renaming; the already-retained
+					// ones (from a prior attempt) are done.
+					for _, c := range canonical {
+						if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
+							logger.Error("failed to retain volume", "volume", c, "error", err)
+							volumeErrs = append(volumeErrs, fmt.Errorf("retain volume %s: %w", c, err))
+						}
+					}
+					if len(volumeErrs) == 0 {
+						volumesRetained = true
+						logger.Info("soft-deleted lease volumes", "lease_uuid", leaseUUID, "retained", len(retained))
+					}
 				}
 			}
 		}

@@ -1,6 +1,10 @@
 package docker
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
@@ -58,4 +62,37 @@ func (b *Backend) refreshRetentionAccounting() {
 	}
 	b.pool.SetRetainedDisk(mb)
 	updateRetentionMetrics(mb, count)
+}
+
+// breachRetentionCap reports whether retaining a lease of the given items would
+// push the provider-global retained footprint over max_retained_disk_mb.
+// 0 = unlimited (never breaches). Reads the CACHED pool.Stats().RetainedDiskMB
+// (not a fresh recompute), so under concurrent multi-lease closes the cap may be
+// transiently overshot by one lease's worth, self-healing at the next
+// recompute (sweep / reconcile loop) — consistent with the level-triggered
+// drift-to-one-tick model.
+func (b *Backend) breachRetentionCap(items []backend.LeaseItem) bool {
+	if b.cfg.MaxRetainedDiskMB <= 0 {
+		return false
+	}
+	return b.pool.Stats().RetainedDiskMB+b.leaseDiskMB(items) > b.cfg.MaxRetainedDiskMB
+}
+
+// destroyOnRefuseToRetain destroys a closing lease's still-canonical volumes
+// when the retained cap is breached (refuse-to-retain). Logs + increments the
+// refusal counter; returns any destroy errors to merge into the caller's
+// volumeErrs. Only the closing lease's own volumes are touched — no other
+// tenant's in-grace data is ever evicted.
+func (b *Backend) destroyOnRefuseToRetain(ctx context.Context, canonical []string, leaseUUID, tenant string, logger *slog.Logger) []error {
+	logger.Warn("retention refused: provider retained-capacity cap reached; destroying volumes instead of retaining",
+		"lease_uuid", leaseUUID, "tenant", tenant, "cap_mb", b.cfg.MaxRetainedDiskMB)
+	retentionRefusedTotal.Inc()
+	var errs []error
+	for _, c := range canonical {
+		if derr := b.volumes.Destroy(ctx, c); derr != nil {
+			logger.Error("retention-refused destroy failed", "volume", c, "error", derr)
+			errs = append(errs, fmt.Errorf("retention-refused destroy %s: %w", c, derr))
+		}
+	}
+	return errs
 }
