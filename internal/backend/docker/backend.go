@@ -407,6 +407,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		cfg.GetSKUProfile, // Use Config's resolver to avoid duplicating SKU mapping logic
 		cfg.TenantQuota,
 	)
+	setStaticPoolMetrics(cfg)
 
 	// Create HTTP client for callbacks
 	httpClient := &http.Client{
