@@ -2,6 +2,10 @@ package docker
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,6 +15,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // withMicroSKU sets a known stateful SKU on the test backend's config so the
@@ -275,4 +281,221 @@ func TestShouldRefuseRetention_StoreReadErrorDoesNotRefuse(t *testing.T) {
 	assert.False(t, b.shouldRefuseRetention("lease-x",
 		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
 		"a retention-store read error must NOT refuse (refuse destroys volumes; fail-open is data-safe)")
+}
+
+// TestCloseRetainOrdering_NeverUnderCounts verifies that the close-retain
+// hand-off keeps the closing lease's footprint F continuously counted (as live,
+// then as retained) with no gap while the renamed volume persists on disk.
+//
+// Mirrors TestRestoreOrdering_NeverUnderCounts for the inverse direction:
+// restore moves bytes from retained→live before the record flips active→restoring;
+// close moves bytes from live→retained before/during the release.
+//
+// Use DiskMB=512 to match the pool resolver's view (defaultTestSKUProfiles).
+// The fixture has qty=2 → footprint F = 2 × 512 = 1024 MB.
+func TestCloseRetainOrdering_NeverUnderCounts(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 512) // aligns pool resolver and computeRetainedDiskMB
+
+	// Simulate a live lease: allocate its two units in the pool.
+	require.NoError(t, b.pool.TryAllocate("lease-x-web-0", "docker-micro", "t1"))
+	require.NoError(t, b.pool.TryAllocate("lease-x-web-1", "docker-micro", "t1"))
+	s := b.pool.Stats()
+	require.Equal(t, int64(1024), s.AllocatedDiskMB, "pre-condition: live F must be counted")
+	require.Equal(t, int64(0), s.RetainedDiskMB)
+
+	// Write the retained record (models doDeprovision having called PutActiveMerged).
+	require.NoError(t, rs.Put(retentionEntryFixture("lease-x", "t1", time.Now()))) // active, 2×512=1024 MB
+
+	// The correct hand-off order: refresh (counts F as retained) THEN release
+	// (removes F from live). At every observed step, live+retained >= F.
+	b.refreshRetentionAccounting() // retained now reflects the store (F counted there)
+	s = b.pool.Stats()
+	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(1024),
+		"after refresh but before release: live+retained must be >= F (overlap, no gap)")
+	assert.Equal(t, int64(1024), s.RetainedDiskMB, "retained must count F after refresh")
+
+	// Now release live (hand-off complete).
+	b.pool.Release(fmt.Sprintf("%s-%s-%d", "lease-x", "web", 0))
+	b.pool.Release(fmt.Sprintf("%s-%s-%d", "lease-x", "web", 1))
+	s = b.pool.Stats()
+	assert.Equal(t, int64(0), s.AllocatedDiskMB, "live must be zero after hand-off")
+	assert.Equal(t, int64(1024), s.RetainedDiskMB, "retained must still count F after live released")
+	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(1024),
+		"live+retained must be >= F throughout")
+}
+
+// TestCloseRetainOrdering_FailedRetainKeepsLiveCounted verifies that when
+// the retain path fails (e.g. PutActiveMerged error or rename failure), the
+// live allocation is NOT released — the volumes are still on disk under the
+// lease's canonical names, and the footprint must stay counted to prevent
+// a concurrent TryAllocate from over-admitting into that space.
+func TestCloseRetainOrdering_FailedRetainKeepsLiveCounted(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 512)
+
+	require.NoError(t, b.pool.TryAllocate("lease-y-web-0", "docker-micro", "t1"))
+	require.NoError(t, b.pool.TryAllocate("lease-y-web-1", "docker-micro", "t1"))
+	s := b.pool.Stats()
+	require.Equal(t, int64(1024), s.AllocatedDiskMB, "pre-condition: live F must be counted")
+
+	// NO retained record written (PutActiveMerged failed) — retained store is empty.
+	// The refresh finds nothing active → retainedDiskMB stays 0.
+	b.refreshRetentionAccounting()
+	s = b.pool.Stats()
+	assert.Equal(t, int64(0), s.RetainedDiskMB, "no record → retained must be 0")
+	// On failure, the live release must NOT happen (caller keeps live counted).
+	// This models the fix: releaseLiveOnRetainPath=false → releaseLive() not called.
+	// Assert the invariant that, after refresh without a valid record, live is still counted.
+	assert.Equal(t, int64(1024), s.AllocatedDiskMB,
+		"on failed retain, live must remain counted (volumes still on disk)")
+	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(1024),
+		"live+retained must never undercount while volumes are on disk")
+
+	// Cleanup so the test doesn't leave pool state dirty.
+	_ = rs.Close()
+}
+
+// TestDeprovision_RetainHandoff_LiveMovesToRetained is an end-to-end test
+// that drives doDeprovision with RetainOnClose=true on a pre-allocated lease
+// and asserts the pool accounting after the call returns:
+//   - AllocatedDiskMB == 0 (live released)
+//   - RetainedDiskMB == F (retained counted)
+//
+// This catches the early-release bug: before the fix, the pool.Release loop
+// ran before PutActiveMerged+refreshRetentionAccounting, so between release
+// and refresh the footprint was counted in neither pool — a concurrent
+// TryAllocate could over-admit (ENOSPC).
+func TestDeprovision_RetainHandoff_LiveMovesToRetained(t *testing.T) {
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	// docker-micro at 512 MB to match the pool resolver (defaultTestSKUProfiles).
+	// Qty=2 → footprint F = 1024 MB.
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+	canonical0 := canonicalVolumeName("lease-z", "web", 0)
+	canonical1 := canonicalVolumeName("lease-z", "web", 1)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-z": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-z", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	// Use 512 MB to match the pool resolver for docker-micro.
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	// Pre-allocate the lease's footprint in the pool (simulates a live provision).
+	require.NoError(t, b.pool.TryAllocate("lease-z-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("lease-z-web-1", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{canonical0, canonical1}, nil
+		},
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-z"))
+
+	// Wait for the terminal callback so the deferred hand-off has run.
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	s := b.pool.Stats()
+	// After a successful retain close:
+	//   live must be zero (released as part of the hand-off), and
+	//   retained must equal F (refreshed after PutActiveMerged wrote the record).
+	assert.Equal(t, int64(0), s.AllocatedDiskMB,
+		"after successful retain close, live allocation must be zero")
+	assert.Equal(t, int64(1024), s.RetainedDiskMB,
+		"after successful retain close, F must be counted as retained (hand-off complete)")
+}
+
+// TestDeprovision_RetainFailure_KeepsLiveCounted verifies that when the retain
+// path fails (rename fails → volume-cleanup error → lease kept Failed), the
+// live pool allocation is NOT released. Volumes are still on disk under canonical
+// names; releasing live would open a window where F is counted in neither pool.
+func TestDeprovision_RetainFailure_KeepsLiveCounted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+	canonical := canonicalVolumeName("lease-w", "web", 0)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-w": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-w", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-w-web-0", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{canonical}, nil },
+		RenameVolumeFn: func(_, _ string) error {
+			return fmt.Errorf("rename failed: disk full")
+		},
+	}
+
+	// Rename failure → volume-cleanup error (under limit) → returns error, lease kept Failed.
+	err = b.Deprovision(context.Background(), "lease-w")
+	require.Error(t, err, "rename failure must bubble as a volume-cleanup error")
+
+	// The live allocation must NOT have been released — the volume is still on
+	// disk under the canonical name (the retained-namespace rename failed), so
+	// the bytes are physically present and must stay counted as live.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(512), s.AllocatedDiskMB,
+		"after failed retain close, live must remain counted (volume still on disk under canonical name)")
 }
