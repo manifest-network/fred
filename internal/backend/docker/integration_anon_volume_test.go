@@ -218,7 +218,7 @@ func TestImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
 	require.NoError(t, err)
 	_, _, err = docker.DetectVolumeOwner(ctx, img, []string{"/data"})
 	require.NoError(t, err)
-	_, err = docker.DetectWritablePaths(ctx, img, 0, []string{"/"})
+	_, err = docker.DetectWritablePaths(ctx, img, 0, []string{"/data"}) // small dir; only the temp-container create/remove path matters here
 	require.NoError(t, err)
 
 	after := dockerVolumeSet(t, ctx, docker)
