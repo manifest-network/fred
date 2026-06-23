@@ -330,7 +330,8 @@ var (
 	})
 
 	// retainedDiskCapBytes is the per-provider retained cap (max_retained_disk_mb
-	// in bytes), set only when the cap is configured (> 0). Alert denominator.
+	// in bytes), set unconditionally by setStaticPoolMetrics (0 when the cap is
+	// unset, since a registered gauge always exports). Alert denominator.
 	retainedDiskCapBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
