@@ -306,7 +306,7 @@ func (d *DockerClient) readFileFromImage(ctx context.Context, imageName, path st
 	}
 	defer func() {
 		// Use a fresh timeout, not the caller ctx: if the caller's ctx is
-		// cancelled/timed-out by the time this runs, the removal would no-op and
+		// canceled/timed-out by the time this runs, the removal would no-op and
 		// leak the temp container + its anonymous volume — the exact failure this
 		// reap targets. Matches the other image-introspection helpers (ENG-372).
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
