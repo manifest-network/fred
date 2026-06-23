@@ -57,7 +57,10 @@ flag are needed (the happy paths are behavior-preserving — only the failure/ab
 ## Testing conventions
 
 - Run every task's tests with `go test -race -short` (fred convention: unguarded stress tests
-  OOM the runner under `-race`).
+  OOM the runner under `-race`). **NEVER run `-race` without `-short`** — the stress tests
+  (e.g. the 100K-event manager tests) exit 137 (OOM-kill) under the race detector. Scoped
+  `-run <SpecificTest>` invocations may omit `-race` for speed, but any `-race` run MUST add
+  `-short`.
 - **Do NOT add `t.Parallel()`** to tests that assert on the global `retention_*` Prometheus
   metrics — they share process-global state and would flake. Counter assertions use a
   before/after delta (`leakBefore := testutil.ToFloat64(...)`) so they stay order-independent;
@@ -532,8 +535,10 @@ func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
 
 - [ ] **Step 2: Run it under the race detector**
 
-Run: `go test -race ./internal/backend/shared/ -run TestMarkReaping_VsClaimForRestore_Concurrent -count=1`
-Expected: PASS, no data races. (If `MarkReapingIfActive` is missing, this fails to compile — it should already exist from Task 2.)
+Run: `go test -race -short ./internal/backend/shared/ -run TestMarkReaping_VsClaimForRestore_Concurrent -count=1`
+Expected: PASS, no data races. (`-short` is mandatory with `-race`; the `-run` filter already
+scopes to this one test. If `MarkReapingIfActive` is missing, this fails to compile — it should
+already exist from Task 2.)
 
 - [ ] **Step 3: Commit**
 
