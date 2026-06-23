@@ -1,8 +1,10 @@
 package docker
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -237,4 +239,66 @@ func TestReconcileOrphaned_PartialPresenceNeverPruned(t *testing.T) {
 	}
 	got, _ := s.Get("uM")
 	assert.NotNil(t, got, "a record with any present volume must never be pruned")
+}
+
+// Test #8: a real restore (ClaimForRestore active→restoring) racing the reconcile's
+// DeleteIfActive must never corrupt state — the record ends EITHER pruned (reconcile
+// won) OR restoring under the new lease (restore won), never deleted-while-restoring.
+//
+// The post-state either/or assertion (testify) is the proof of correctness; -race is
+// a regression guard for any future shared backend state (today both contended methods
+// run inside bolt.DB.Update, which serializes them, so -race rarely fires). The loop
+// re-creates a clean ACTIVE record each iteration so both bbolt-serialized interleavings
+// recur within a single run; N=1 so one reconcile sweep attempts the delete.
+func TestReconcileOrphaned_ConcurrentRestoreRace(t *testing.T) {
+	b, s := newOrphanReconcileBackend(t, 1, true, nil /*all absent*/, nil)
+
+	var sawPruned, sawRestored bool
+	for i := 0; i < 100; i++ {
+		require.NoError(t, s.Put(shared.RetentionEntry{
+			OriginalLeaseUUID:   "uA",
+			Tenant:              "t1",
+			Status:              shared.RetentionStatusActive,
+			RetainedVolumeNames: []string{"fred-retained-uA-app-0"},
+			CreatedAt:           time.Now(),
+		}))
+		b.orphanStreaks = make(map[string]int) // start the streak fresh so N=1 deletes this sweep
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var claimErr error
+		go func() { defer wg.Done(); _, _ = b.reconcileOrphanedRetentions() }()
+		go func() { defer wg.Done(); _, claimErr = s.ClaimForRestore("uA", "uNew", time.Hour) }()
+		wg.Wait()
+
+		rec, err := s.Get("uA")
+		require.NoError(t, err)
+		if claimErr == nil {
+			// Restore won the CAS: record survives in restoring state — never deleted-while-restoring.
+			require.NotNil(t, rec, "restore claimed the record; reconcile must not have deleted it")
+			assert.Equal(t, shared.RetentionStatusRestoring, rec.Status)
+			assert.Equal(t, "uNew", rec.NewLeaseUUID)
+			sawRestored = true
+		} else {
+			// Reconcile won: record pruned, claim observed it gone.
+			require.Nil(t, rec, "reconcile pruned the record; claim must have failed")
+			sawPruned = true
+		}
+	}
+	// Both interleavings preserve the invariant; over 100 iterations we expect each at
+	// least once. Logged, not hard-asserted, to avoid scheduler-dependent flakiness.
+	t.Logf("concurrent race: observed pruned=%v restored=%v", sawPruned, sawRestored)
+}
+
+// Wiring: runRetentionSweep invokes the orphan reconcile. With N=1 and an absent
+// volume, a single sweep prunes the orphaned record.
+func TestRunRetentionSweep_PrunesOrphans(t *testing.T) {
+	b, s := newOrphanReconcileBackend(t, 1, true, nil /*absent*/, nil)
+	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour // keep the grace reaper a no-op for this record
+	putActiveRetention(t, s, "uA", []string{"fred-retained-uA-app-0"})
+
+	require.NoError(t, b.runRetentionSweep(context.Background()))
+
+	got, _ := s.Get("uA")
+	assert.Nil(t, got, "runRetentionSweep must prune the orphaned record")
 }

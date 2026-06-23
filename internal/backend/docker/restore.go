@@ -407,9 +407,11 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// runRetentionSweep is the PERIODIC reaper body: reap expired + reconcile any
+// runRetentionSweep is the PERIODIC reaper body: reap expired, reconcile any
 // restoring records (a running-process backstop for restores that failed since
-// the last tick). The BOOT path does NOT call this: at startup reconcileRetentions
+// the last tick), and prune ACTIVE records whose volumes have been absent for
+// >= N consecutive sweeps (orphan reconcile, ENG-370). The BOOT path does NOT
+// call this: at startup reconcileRetentions
 // (before cleanup) handles restoring records and an eager reapExpiredRetentions
 // (after cleanup) handles expired ones, so restoring records aren't double-reconciled.
 func (b *Backend) runRetentionSweep(ctx context.Context) error {
@@ -425,6 +427,9 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 	}
 	for _, e := range recs {
 		b.reconcileRestoring(ctx, e)
+	}
+	if _, err := b.reconcileOrphanedRetentions(); err != nil {
+		return err
 	}
 	return nil
 }
