@@ -25,7 +25,7 @@ const (
 	phaseVerifyStartup = "verify_startup" // health-wait / fixed startup verification
 )
 
-// Skip reasons for retentionOrphanSweepsSkippedTotal (ENG-370). Kept as
+// Skip reasons for retentionOrphanSkipsTotal (ENG-370). Kept as
 // constants so the reconcile, the pre-init, and the tests cannot drift on a typo.
 const (
 	orphanSkipListError        = "list_error"        // volumes.List() failed (uncertain → fail-safe skip)
@@ -198,15 +198,18 @@ var (
 		Help:      "Total retention records pruned due to confirmed-absent backing volumes",
 	})
 
-	// retentionOrphanSweepsSkippedTotal counts orphan-reconcile passes/prunes
-	// that bailed in the fail-safe direction, by reason. Without it, a sweep that
-	// skips forever (e.g. a mis-mounted volume root) is indistinguishable from a
+	// retentionOrphanSkipsTotal counts orphan-reconcile skips by reason, at TWO
+	// granularities: whole-sweep bailouts (list_error/root_unverifiable/store_error/
+	// disabled — one per skipped sweep) AND per-record prune attempts skipped (raced
+	// — one per record). Filter by reason rather than summing across (the units
+	// differ); the name says "skips", not "sweeps", deliberately. Without it, a sweep
+	// that skips forever (e.g. a mis-mounted volume root) is indistinguishable from a
 	// healthy "0 pruned" on the success counter alone. reason ∈ orphanSkipReasons.
-	retentionOrphanSweepsSkippedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	retentionOrphanSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
-		Name:      "retention_orphan_sweeps_skipped_total",
-		Help:      "Orphan-reconcile passes/prunes skipped in the fail-safe direction, by reason",
+		Name:      "retention_orphan_skips_total",
+		Help:      "Orphan-reconcile skips by reason (sweep-level bailouts + per-record raced prune attempts)",
 	}, []string{"reason"})
 
 	// containerRemovalWaitFailuresTotal counts RemoveContainer calls where

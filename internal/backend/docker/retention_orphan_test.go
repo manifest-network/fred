@@ -157,7 +157,7 @@ func TestReconcileOrphaned_SkipsRestoringRecords(t *testing.T) {
 func TestReconcileOrphaned_MissingRootSkips(t *testing.T) {
 	b, s := newOrphanReconcileBackend(t, 1, false /*root missing*/, nil, nil)
 	putActiveRetention(t, s, "uA", []string{"fred-retained-uA-app-0"})
-	before := testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRootUnverifiable))
+	before := testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRootUnverifiable))
 
 	for i := 0; i < 5; i++ {
 		pruned, err := b.reconcileOrphanedRetentions()
@@ -166,21 +166,21 @@ func TestReconcileOrphaned_MissingRootSkips(t *testing.T) {
 	}
 	got, _ := s.Get("uA")
 	assert.NotNil(t, got, "missing root must prevent any prune")
-	assert.Equal(t, before+5, testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRootUnverifiable)))
+	assert.Equal(t, before+5, testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRootUnverifiable)))
 }
 
 // Test #7: a List() error skips the pass (fail-safe) and surfaces the error.
 func TestReconcileOrphaned_ListErrorSkips(t *testing.T) {
 	b, s := newOrphanReconcileBackend(t, 1, true, nil, errors.New("list boom"))
 	putActiveRetention(t, s, "uA", []string{"fred-retained-uA-app-0"})
-	before := testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipListError))
+	before := testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError))
 
 	pruned, err := b.reconcileOrphanedRetentions()
 	require.Error(t, err)
 	assert.Equal(t, 0, pruned)
 	got, _ := s.Get("uA")
 	assert.NotNil(t, got, "list error must prevent prune")
-	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipListError)))
+	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError)))
 }
 
 // Test #9: an empty-name (legacy zero-volume) record is vacuously all-absent → pruned
@@ -222,14 +222,14 @@ func TestReconcileOrphaned_UnconfiguredRootSkipsVolumeRecords(t *testing.T) {
 func TestReconcileOrphaned_DisabledKillSwitch(t *testing.T) {
 	b, s := newOrphanReconcileBackend(t, 0 /*disabled*/, true, nil, nil)
 	putActiveRetention(t, s, "uA", []string{"fred-retained-uA-app-0"})
-	before := testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipDisabled))
+	before := testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipDisabled))
 
 	pruned, err := b.reconcileOrphanedRetentions()
 	require.NoError(t, err)
 	assert.Equal(t, 0, pruned)
 	got, _ := s.Get("uA")
 	assert.NotNil(t, got, "kill-switch must prevent prune")
-	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipDisabled)))
+	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipDisabled)))
 }
 
 // A multi-volume active record with ONE volume still present is never pruned

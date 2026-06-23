@@ -299,7 +299,7 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 	if n <= 0 {
 		// Kill-switch (0 = disabled). Log once per sweep so a flip-to-0 is not silent.
 		b.logger.Info("orphan retention reconcile disabled (retention_orphan_confirmations=0)")
-		retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipDisabled).Inc()
+		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipDisabled).Inc()
 		return 0, nil
 	}
 
@@ -314,7 +314,7 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 			b.logger.Warn("orphan retention reconcile skipped: volume data root absent or unreadable (fail-safe)",
 				"path", b.cfg.VolumeDataPath, "error", statErr)
 			b.orphanStreaks = map[string]int{}
-			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRootUnverifiable).Inc()
+			retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRootUnverifiable).Inc()
 			return 0, nil
 		}
 	}
@@ -328,7 +328,7 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 	existing, err := b.volumes.List()
 	if err != nil {
 		b.orphanStreaks = map[string]int{}
-		retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipListError).Inc()
+		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError).Inc()
 		return 0, err
 	}
 	present := make(map[string]bool, len(existing))
@@ -339,7 +339,7 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 	recs, err := b.retentionStore.List()
 	if err != nil {
 		b.orphanStreaks = map[string]int{}
-		retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipStoreError).Inc()
+		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipStoreError).Inc()
 		return 0, err
 	}
 
@@ -372,7 +372,7 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 			// deleted=false: record no longer ACTIVE-and-present — concurrently restore-claimed
 			// (active→restoring) OR already removed (e.g. cap-eviction). Benign either way; the
 			// other path owns it. Drop the streak (omit from next); don't prune.
-			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRaced).Inc()
+			retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRaced).Inc()
 		default:
 			pruned++
 			retentionOrphansPrunedTotal.Inc()

@@ -528,7 +528,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	// set is closed and known, so alert queries see 0 instead of no-data before
 	// the first skip event.
 	for _, r := range orphanSkipReasons {
-		retentionOrphanSweepsSkippedTotal.WithLabelValues(r).Add(0)
+		retentionOrphanSkipsTotal.WithLabelValues(r).Add(0)
 	}
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
