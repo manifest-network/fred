@@ -98,11 +98,22 @@ ledger — the existing record (with a new status) is the single source of truth
 
 ### B. Accounting + metrics
 
-- `computeRetainedDiskMB` counts `active` **+** `reaping` (the bytes occupy disk → never
-  under-counts a still-on-disk volume). The `retained_leases` **count** gauge stays
-  `active`-only (reaping = being removed, not "held/restorable").
-- `retained_volume_bytes` now includes reaping footprints — documented; it stays equal to the
-  admission `SetRetainedDisk` value (the projection and the gauge remain identical).
+- **Two consumers, opposite safe-directions** (the `safe-direction-depends-on-the-gate-action`
+  invariant). The reaping footprint is included in the **admission** projection but **not** the
+  **cap-breach** check:
+  - `computeRetainedDiskMB` stays **`active`-only** (unchanged). Its sole admission-side reader
+    is `breachRetentionCap`, whose `true` result triggers **refuse-to-retain = DESTROY**. For a
+    destroy gate, over-counting is the *dangerous* direction — transient reaping bytes must
+    **never** inflate it and spuriously destroy a closing lease's data. Keeping it active-only
+    is data-safe and leaves the existing tests + `breachRetentionCap` untouched.
+  - New `computeReapingDiskMB` returns the `reaping` subset.
+  - `refreshRetentionAccounting` sets the admission pool to **active + reaping**
+    (`pool.SetRetainedDisk(activeMB + reapingMB)`). That gate's action is *deny a new provision*,
+    where over-counting is safe — so including reaping there prevents the under-count →
+    over-admit → ENOSPC, with no destroy risk.
+- The `retained_leases` **count** gauge stays `active`-only (reaping = being removed, not
+  "held/restorable"). `retained_volume_bytes` now reflects the admission total (active +
+  reaping) — documented; it stays equal to `SetRetainedDisk`.
 - New metrics (`metrics.go`):
   - `fred_docker_backend_retention_leaked_total` (counter) — incremented on every give-up /
     stuck-reap leak-log path. Satisfies AC #2 ("leak exported as a metric, not only logged");
