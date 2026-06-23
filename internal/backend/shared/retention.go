@@ -138,6 +138,44 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 	return ok, err
 }
 
+// PutReaping writes a reaping tombstone for an ABANDONED on-disk footprint (a
+// deprovision give-up). It is idempotent and never clobbers a still-counted record:
+//   - absent: writes a fresh reaping record (stamps ReapingSince=now).
+//   - existing reaping: unions RetainedVolumeNames and PRESERVES ReapingSince (aging).
+//   - existing active/restoring: writes NOTHING, returns ok=false — that record
+//     already counts the footprint (or owns it for restore); a blind reaping write
+//     would corrupt accounting/CAS. Caller treats ok=false as "already tracked".
+//
+// Single txn, so it is safe against a concurrent ClaimForRestore. (ENG-376)
+func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
+	base.Status = RetentionStatusReaping
+	base.ReapingSince = time.Now()
+	var ok bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
+			var stored RetentionEntry
+			if err := json.Unmarshal(raw, &stored); err != nil {
+				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			}
+			switch stored.Status {
+			case RetentionStatusActive, RetentionStatusRestoring:
+				return nil // already counted/owned — refuse, ok stays false
+			case RetentionStatusReaping:
+				base.ReapingSince = stored.ReapingSince // preserve aging
+				base.RetainedVolumeNames = dedupUnion(stored.RetainedVolumeNames, base.RetainedVolumeNames)
+			}
+		}
+		data, err := json.Marshal(base)
+		if err != nil {
+			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		ok = true
+		return bkt.Put([]byte(base.OriginalLeaseUUID), data)
+	})
+	return ok, err
+}
+
 // dedupUnion returns the order-preserving deduplicated union of a and b
 // (a's entries first, then b's not already present).
 func dedupUnion(a, b []string) []string {

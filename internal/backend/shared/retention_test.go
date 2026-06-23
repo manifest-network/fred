@@ -486,6 +486,44 @@ func TestListReaping(t *testing.T) {
 	assert.Equal(t, "reaping-1", got[0].OriginalLeaseUUID)
 }
 
+// TestPutReaping writes a fresh reaping tombstone, refuses to clobber an
+// active/restoring record (ok=false), and unions names + preserves ReapingSince
+// when an existing reaping record is present (idempotent re-leak).
+func TestPutReaping(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	base := sampleEntry("lease-x")
+	base.RetainedVolumeNames = []string{"fred-lease-x-app-0"}
+	ok, err := s.PutReaping(base)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	got, err := s.Get("lease-x")
+	require.NoError(t, err)
+	assert.Equal(t, RetentionStatusReaping, got.Status)
+	assert.False(t, got.ReapingSince.IsZero())
+	first := got.ReapingSince
+
+	// Re-leak with an extra volume → union, ReapingSince preserved.
+	base2 := sampleEntry("lease-x")
+	base2.RetainedVolumeNames = []string{"fred-lease-x-app-0", "fred-lease-x-app-1"}
+	ok, err = s.PutReaping(base2)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	got, err = s.Get("lease-x")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"fred-lease-x-app-0", "fred-lease-x-app-1"}, got.RetainedVolumeNames)
+	assert.Equal(t, first, got.ReapingSince, "ReapingSince preserved across re-leak")
+
+	// Refuse to clobber an ACTIVE record.
+	require.NoError(t, s.Put(sampleEntry("lease-active")))
+	ok, err = s.PutReaping(sampleEntry("lease-active"))
+	require.NoError(t, err)
+	assert.False(t, ok)
+	got, err = s.Get("lease-active")
+	require.NoError(t, err)
+	assert.Equal(t, RetentionStatusActive, got.Status, "active record must be untouched")
+}
+
 // TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
 // absent key writes the base entry verbatim and returns ok=true.
 func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {
