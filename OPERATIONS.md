@@ -40,6 +40,7 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck or panicking | Logs + `fred_reconciler_runs_total{outcome="error"}` |
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
+| `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps (or `..._retention_leaked_total` rising) | A retained/leaked volume's destroy keeps failing — uncounted-then-tracked orphan the sweep can't reclaim | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
 
 ---
 
@@ -139,6 +140,27 @@ refuse-to-retain (destroy, no grace window). This is an availability DoS on the
 retention feature for those tenants, not a data-theft risk — destroy only touches
 the closing lease's own volumes. True per-tenant disk fairness would require a
 per-tenant retained-disk quota (a possible follow-up).
+
+### Reclaiming leaked / stuck-reaping orphan volumes
+
+A `fred-retained-*` (or leaked-canonical) volume whose destroy fails under a degraded
+filesystem/store becomes a **reaping tombstone**: its footprint keeps counting in the admission
+pool (so it never silently over-admits) and the retention sweep **auto-retries** the destroy
+every interval. `cleanupOrphanedVolumes` deliberately never touches `fred-retained-*` names, so
+the sweep is the only automatic reclaimer.
+
+- **Signal.** `fred_docker_backend_retention_reaping_bytes` / `..._retention_reaping_leases` > 0.
+  A transient EBUSY clears within one sweep; a value sustained across several sweeps is a stuck
+  volume. `..._retention_leaked_total` increments on every failed-destroy / give-up / uncommitted
+  revert (DLQ-style: even one warrants a look).
+- **Diagnose.** Find the volume(s): `ls <volume_data_path> | grep -E 'fred-retained-|fred-'`.
+  Check why destroy fails — a container still bind-mounting it (`docker ps`, then stop it), or a
+  filesystem error (`dmesg`).
+- **Reclaim (only after confirming no live/restoring lease references it).** Once the blocker is
+  cleared the next sweep reclaims it automatically. To force it sooner, restart the backend
+  (boot runs the reaping reconcile). If the volume is genuinely unrecoverable, remove it
+  manually (`docker volume rm <name>` or `rm -rf <volume_data_path>/<name>`) — the next sweep
+  then deletes the now-dangling tombstone (its destroy is an idempotent no-op).
 
 ---
 
