@@ -108,6 +108,13 @@ func (s *composeService) Down(ctx context.Context, projectName string, timeout t
 	return s.backend.Down(ctx, projectName, composeapi.DownOptions{
 		Timeout:       &timeout,
 		RemoveOrphans: true,
+		// Reap anonymous volumes attached to the project's containers (ENG-372).
+		// fred's persistent data lives in bind mounts (applyVolumeBinds) and the
+		// project declares no top-level `volumes:` section, so Volumes:true only
+		// removes the anonymous volumes Docker auto-creates for image VOLUME
+		// directives the tmpfs override doesn't cover — never tenant data. Without
+		// this, every close leaks one anonymous volume per such container.
+		Volumes: true,
 	})
 }
 

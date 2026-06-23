@@ -305,7 +305,13 @@ func (d *DockerClient) readFileFromImage(ctx context.Context, imageName, path st
 		return nil, fmt.Errorf("failed to create temp container: %w", err)
 	}
 	defer func() {
-		_ = d.client.ContainerRemove(ctx, resp.ID, container.RemoveOptions{})
+		// Use a fresh timeout, not the caller ctx: if the caller's ctx is
+		// canceled/timed-out by the time this runs, the removal would no-op and
+		// leak the temp container + its anonymous volume — the exact failure this
+		// reap targets. Matches the other image-introspection helpers (ENG-372).
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true})
 	}()
 
 	return readFileFromContainer(ctx, d.client, resp.ID, path)
@@ -330,7 +336,7 @@ func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName string, 
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{})
+		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
 	}()
 
 	firstUID, firstGID := -1, -1
@@ -402,7 +408,7 @@ func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName string
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{})
+		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
 	}()
 
 	var paths []string
@@ -490,7 +496,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{})
+		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
 	}()
 
 	var failures map[string]error
@@ -1283,6 +1289,12 @@ const (
 func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) error {
 	err := d.client.ContainerRemove(ctx, containerID, container.RemoveOptions{
 		Force: true,
+		// Reap the container's anonymous volumes (ENG-372). fred keeps tenant data
+		// in bind mounts / FS-managed volume dirs, never anonymous volumes, so this
+		// only removes the throwaway volumes Docker auto-creates for uncovered image
+		// VOLUME directives. Mirrors the compose Down Volumes:true reap for the
+		// fallback/rollback paths that bypass compose.
+		RemoveVolumes: true,
 	})
 	if err != nil {
 		if client.IsErrNotFound(err) {
