@@ -4,6 +4,7 @@ package docker
 
 import (
 	"context"
+	"regexp"
 	"testing"
 	"time"
 
@@ -16,6 +17,25 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
+
+// anonVolNameRE matches Docker's anonymous-volume naming (64 lowercase hex).
+// The leak this suite guards against is specifically these volumes, so the
+// before/after diff filters to them — staying immune to unrelated named volumes
+// that may already exist (or be created by something else) on a shared daemon.
+var anonVolNameRE = regexp.MustCompile("^[0-9a-f]{64}$")
+
+// newIntegrationDockerClient returns a real DockerClient for integration tests,
+// registering Close cleanup and skipping the test if the daemon is unreachable.
+func newIntegrationDockerClient(t *testing.T, ctx context.Context) *DockerClient {
+	t.Helper()
+	docker, err := NewDockerClient("", "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = docker.Close() })
+	if err := docker.Ping(ctx); err != nil {
+		t.Skip("Docker not available:", err)
+	}
+	return docker
+}
 
 // dockerVolumeSet returns the set of all Docker volume names currently present.
 func dockerVolumeSet(t *testing.T, ctx context.Context, docker *DockerClient) map[string]bool {
@@ -40,15 +60,13 @@ func dockerVolumeSet(t *testing.T, ctx context.Context, docker *DockerClient) ma
 // container on every close, which is the source of the thousands of orphaned
 // 64-hex volumes observed accumulating on dev backends.
 func TestComposeDown_RemovesAnonymousVolumes(t *testing.T) {
-	docker, err := NewDockerClient("", "")
-	require.NoError(t, err)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	docker := newIntegrationDockerClient(t, ctx)
 
-	if err := docker.Ping(ctx); err != nil {
-		t.Skip("Docker not available:", err)
-	}
+	// fred provisions with PullPolicy=never, so the image must be present before
+	// Up — otherwise Up errors on a clean daemon instead of pulling.
+	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
 
 	composeSvc, err := newComposeService("")
 	require.NoError(t, err)
@@ -114,15 +132,11 @@ func TestComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 // create-rollback, so it too must reap the container's anonymous volumes —
 // otherwise the leak survives whenever the compose path is bypassed.
 func TestRemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
-	docker, err := NewDockerClient("", "")
-	require.NoError(t, err)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	docker := newIntegrationDockerClient(t, ctx)
 
-	if err := docker.Ping(ctx); err != nil {
-		t.Skip("Docker not available:", err)
-	}
+	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
 
 	name := "fred-eng372-rmvol"
 	// Clean any stale container from a prior run.
@@ -171,20 +185,14 @@ func TestRemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
 // remove them. These run on the provision path (cache-missed image setup), so
 // a leak here accumulates per distinct image and across backend restarts.
 func TestImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
-	docker, err := NewDockerClient("", "")
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	docker := newIntegrationDockerClient(t, ctx)
 
-	if err := docker.Ping(ctx); err != nil {
-		t.Skip("Docker not available:", err)
-	}
-
-	const img = "redis:7" // declares VOLUME /data
-	if _, _, err := docker.client.ImageInspectWithRaw(ctx, img); err != nil {
-		t.Skipf("test image %s not present: %v", img, err)
-	}
+	const img = "redis:7-alpine" // declares VOLUME /data
+	// Pull rather than skip-if-absent: a skip here would silently turn the leak
+	// assertion into a false green on a clean CI daemon.
+	require.NoError(t, docker.PullImage(ctx, img, 120*time.Second))
 
 	before := dockerVolumeSet(t, ctx, docker)
 
@@ -198,9 +206,11 @@ func TestImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
 
 	after := dockerVolumeSet(t, ctx, docker)
 
+	// Count only newly-appeared anonymous (64-hex) volumes — the leak shape —
+	// so an unrelated named volume on a shared daemon can't cause a false fail.
 	var leaked []string
 	for v := range after {
-		if !before[v] {
+		if !before[v] && anonVolNameRE.MatchString(v) {
 			leaked = append(leaked, v)
 		}
 	}
