@@ -469,6 +469,23 @@ func TestMarkReapingIfExpired(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// TestListReaping returns only reaping records.
+func TestListReaping(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("active-1")))             // active
+	reaping := sampleEntry("reaping-1")
+	reaping.Status = RetentionStatusReaping
+	require.NoError(t, s.Put(reaping))
+	restoring := sampleEntry("restoring-1")
+	restoring.Status = RetentionStatusRestoring
+	require.NoError(t, s.Put(restoring))
+
+	got, err := s.ListReaping()
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "reaping-1", got[0].OriginalLeaseUUID)
+}
+
 // TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
 // absent key writes the base entry verbatim and returns ok=true.
 func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {

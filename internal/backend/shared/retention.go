@@ -213,6 +213,13 @@ func (s *RetentionStore) ListRestoring() ([]RetentionEntry, error) {
 	})
 }
 
+// ListReaping returns all entries currently in the reaping (pending-destroy) state.
+func (s *RetentionStore) ListReaping() ([]RetentionEntry, error) {
+	return s.filter(func(e *RetentionEntry) bool {
+		return e.Status == RetentionStatusReaping
+	})
+}
+
 // filter iterates all bucket entries and returns those for which keep returns true.
 func (s *RetentionStore) filter(keep func(*RetentionEntry) bool) ([]RetentionEntry, error) {
 	var results []RetentionEntry
