@@ -269,10 +269,11 @@ func TestReconcileOrphaned_ConcurrentRestoreRace(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(2)
-		var claimErr error
-		go func() { defer wg.Done(); _, _ = b.reconcileOrphanedRetentions() }()
+		var claimErr, reconcileErr error
+		go func() { defer wg.Done(); _, reconcileErr = b.reconcileOrphanedRetentions() }()
 		go func() { defer wg.Done(); _, claimErr = s.ClaimForRestore("uA", "uNew", time.Hour) }()
 		wg.Wait()
+		require.NoError(t, reconcileErr) // reconcile must not error on this happy path; guards future regressions
 
 		rec, err := s.Get("uA")
 		require.NoError(t, err)
