@@ -189,11 +189,61 @@ func TestDiskOverProvisioned(t *testing.T) {
 
 func TestRetentionCapNeedsTenantLever(t *testing.T) {
 	// cap set, no per-tenant count cap → needs the lever (warn).
-	assert.True(t, retentionCapNeedsTenantLever(Config{MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0}))
+	assert.True(t, retentionCapNeedsTenantLever(Config{RetainOnClose: true, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0}))
 	// cap set, per-tenant count cap also set → fine.
-	assert.False(t, retentionCapNeedsTenantLever(Config{MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 5}))
+	assert.False(t, retentionCapNeedsTenantLever(Config{RetainOnClose: true, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 5}))
 	// no cap → nothing to warn about.
-	assert.False(t, retentionCapNeedsTenantLever(Config{MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 0}))
+	assert.False(t, retentionCapNeedsTenantLever(Config{RetainOnClose: true, MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 0}))
+	// retention disabled + cap set + per-tenant 0 → must NOT warn (nothing is ever retained).
+	assert.False(t, retentionCapNeedsTenantLever(Config{RetainOnClose: false, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0}),
+		"retain_on_close=false: warn must be suppressed even with cap set and per-tenant limit 0")
+}
+
+// TestRetentionCapSetButDisabled verifies the companion helper: returns true
+// when retain_on_close=false but a cap or per-tenant knob is configured (dead
+// config that misleads the operator), and false otherwise.
+func TestRetentionCapSetButDisabled(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{
+			name: "disabled+disk cap set → true (cap has no effect)",
+			cfg:  Config{RetainOnClose: false, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0},
+			want: true,
+		},
+		{
+			name: "disabled+per-tenant cap set → true (cap has no effect)",
+			cfg:  Config{RetainOnClose: false, MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 5},
+			want: true,
+		},
+		{
+			name: "disabled+both caps set → true",
+			cfg:  Config{RetainOnClose: false, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 5},
+			want: true,
+		},
+		{
+			name: "disabled+no caps → false (nothing misconfigured)",
+			cfg:  Config{RetainOnClose: false, MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 0},
+			want: false,
+		},
+		{
+			name: "enabled+disk cap set → false (retention is live; cap is meaningful)",
+			cfg:  Config{RetainOnClose: true, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0},
+			want: false,
+		},
+		{
+			name: "enabled+no caps → false",
+			cfg:  Config{RetainOnClose: true, MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 0},
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, retentionCapSetButDisabled(tc.cfg))
+		})
+	}
 }
 
 func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
@@ -1080,6 +1130,139 @@ func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T
 	rec, rerr := rs.Get("lease-rf")
 	require.NoError(t, rerr)
 	assert.Nil(t, rec, "refuse-to-retain: no retention record must be written")
+}
+
+// TestDeprovision_NonRetain_DestroyFailure_KeepsLiveCounted verifies that on
+// the non-retain path, if volumes.Destroy fails (the lease is kept Failed for
+// retry), the live pool allocation is NOT released. Before the fix, releaseLive()
+// was called BEFORE the volume-destroy loop, so a Destroy failure left the
+// volume on disk but the live pool freed → footprint uncounted → over-admit
+// / ENOSPC window while the lease retried.
+//
+// This test MUST fail before Fix A (live drops to 0 on Destroy error) and pass
+// after (live stays at F until all volumes are destroyed without error).
+func TestDeprovision_NonRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Two items, qty=1 each → F = 2 × 512 = 1024 MB.
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-nd": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "lease-nd",
+			Tenant:        "tenant-a",
+			ProviderUUID:  "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
+	// RetainOnClose stays false (default) — non-retain close.
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-nd-web-0", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+
+	// Destroy FAILS → volume still on disk; lease kept Failed for retry.
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, _ string) error {
+			return fmt.Errorf("destroy failed: device busy")
+		},
+	}
+
+	err := b.Deprovision(context.Background(), "lease-nd")
+	require.Error(t, err, "volume destroy failure must return an error")
+
+	// Lease must be kept Failed for retry (not deleted).
+	b.provisionsMu.RLock()
+	p, ok := b.provisions["lease-nd"]
+	var gotStatus backend.ProvisionStatus
+	if ok {
+		gotStatus = p.Status
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, ok, "provision must stay visible for retry after a volume destroy failure")
+	assert.Equal(t, backend.ProvisionStatusFailed, gotStatus)
+
+	// The live allocation MUST NOT have been released — the volume is still on
+	// disk, so the footprint must keep counting to prevent an over-admit window.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(512), s.AllocatedDiskMB,
+		"non-retain destroy failure: live must remain counted (volume still on disk)")
+}
+
+// TestDeprovision_NonRetain_Success_ReleasesLive verifies that on the non-retain
+// path, when ALL volumes are destroyed successfully, the live pool allocation IS
+// released. This guards that the moved release still fires on the happy path.
+func TestDeprovision_NonRetain_Success_ReleasesLive(t *testing.T) {
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-ns": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "lease-ns",
+			Tenant:        "tenant-a",
+			ProviderUUID:  "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512) // F = 512 MB
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-ns-web-0", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
+
+	// Destroy succeeds → all bytes are gone; live must be released.
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, _ string) error { return nil },
+	}
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-ns"))
+
+	// Wait for terminal callback to ensure the deferred accounting has run.
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	// Live MUST be released — all bytes are gone.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(0), s.AllocatedDiskMB,
+		"non-retain success: live must be released after all volumes destroyed")
+
+	// Provision must be deleted (not kept).
+	b.provisionsMu.RLock()
+	_, ok := b.provisions["lease-ns"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, ok, "provision must be deleted after successful non-retain close")
 }
 
 // TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted verifies that a

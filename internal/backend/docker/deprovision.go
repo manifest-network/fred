@@ -109,10 +109,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	// releaseLive releases all pool allocations for this lease and updates
-	// resource metrics. On the non-retain path it is called immediately (below);
-	// on the retain path it is deferred until after refreshRetentionAccounting
-	// counts the retained record, so the footprint is never momentarily
-	// uncounted while the renamed volume persists on disk (no over-admit gap).
+	// resource metrics. On the non-retain path it is called AFTER all volumes
+	// are destroyed without error (mirroring the refuse-to-retain arm); on the
+	// retain path it is deferred until after refreshRetentionAccounting counts
+	// the retained record, so the footprint is never momentarily uncounted while
+	// the renamed volume persists on disk (no over-admit gap).
 	releaseLive := func() {
 		for _, item := range items {
 			for i := range item.Quantity {
@@ -122,10 +123,10 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		updateResourceMetrics(b.pool.Stats())
 	}
 	retaining := b.cfg.RetainOnClose && b.retentionStore != nil
-	// Non-retain release is deferred to AFTER the partial-container-failure
-	// early-return below (see the `if !retaining` block just before the volume
-	// branch), so a teardown that only partially succeeds keeps resources counted
-	// for the retry rather than freeing them while stuck containers still run.
+	// Non-retain release happens AFTER successful volume destroy (see the
+	// else branch below). A teardown that only partially succeeds (container
+	// or volume error) keeps resources counted for the retry rather than
+	// freeing them while stuck containers still run or volumes remain on disk.
 	//
 	// Retaining close: keep the live allocation counted until the retained
 	// record is recorded+refreshed (or the volumes are destroyed) — see the
@@ -165,15 +166,6 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// diagSnap is zero-value and persistDiagnostics no-ops on its empty guard.
 		b.persistDiagnostics(diagSnap, failedIDs)
 		return fmt.Errorf("deprovision partially failed: %w", errors.Join(errs...))
-	}
-
-	if !retaining {
-		// Non-retain close: container teardown SUCCEEDED (the partial-failure
-		// early-return above did not fire) and the volumes will be destroyed
-		// below — release live now. Placing this AFTER the early-return means a
-		// partial-container-failure keeps resources counted for the retry rather
-		// than freeing CPU/mem/disk while stuck containers still run.
-		releaseLive()
 	}
 
 	// Destroy managed volumes for all instances — or soft-delete them into the
@@ -306,6 +298,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				}
 			}
 		}
+		if len(volumeErrs) == 0 {
+			// All volumes destroyed — bytes are gone, so release the live allocation
+			// now. Releasing only on success (not before the loop) keeps the footprint
+			// counted while a failed Destroy leaves bytes on disk and the lease is kept
+			// Failed for retry, preventing an over-admit/ENOSPC window. Symmetric with
+			// the refuse-to-retain arm (releaseLiveOnRetainPath set only when
+			// len(volumeErrs) == prevErrCount).
+			releaseLive()
+		}
 	}
 
 	if len(volumeErrs) > 0 {
@@ -343,13 +344,16 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// The leaked volumes require manual cleanup by the operator.
 			//
 			// Release live UNCONDITIONALLY here: the provision is about to be
-			// deleted and `return nil`, so the deferred hand-off (which only
-			// releases on the success flag) can never run a retry to free it. On
-			// the retain path the flag is still false, so without this the live
-			// allocation would leak forever and — if a record was written —
+			// deleted and `return nil`, so no retry can ever run to free it.
+			// On the retain path the flag is still false, so without this the
+			// live allocation would leak forever and — if a record was written —
 			// double-count the footprint as both live and retained (2F), wedging
-			// any later restore. Release is idempotent: on the non-retain path
-			// live was already freed early, making this a harmless no-op.
+			// any later restore. On the non-retain path, live was not freed
+			// before the destroy loop (it is only freed when all destroys succeed);
+			// a destroy failure that reaches give-up means the volume is abandoned
+			// for manual cleanup and the provision is deleted — this call performs
+			// the real release. pool.Release is idempotent on an absent/already-
+			// released id, so this is always safe.
 			releaseLive()
 			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 				p.ContainerIDs = nil // containers are gone
