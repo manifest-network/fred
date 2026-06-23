@@ -376,11 +376,17 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 		default:
 			pruned++
 			retentionOrphansPrunedTotal.Inc()
-			b.logger.Info("pruned orphaned retention record (all retained volumes confirmed absent)",
+			// Per-record at DEBUG: the first cleanup can prune a large backlog (~14k on
+			// dev) in a single sweep, so an aggregate INFO below carries the signal
+			// without flooding the log; the metric is the precise per-record count.
+			b.logger.Debug("pruned orphaned retention record (all retained volumes confirmed absent)",
 				"lease_uuid", e.OriginalLeaseUUID, "confirmations", streak)
 		}
 	}
 	b.orphanStreaks = next
+	if pruned > 0 {
+		b.logger.Info("pruned orphaned retention records (backing volumes confirmed absent)", "count", pruned)
+	}
 	return pruned, nil
 }
 

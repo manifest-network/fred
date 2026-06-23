@@ -183,7 +183,9 @@ func TestReconcileOrphaned_ListErrorSkips(t *testing.T) {
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipListError)))
 }
 
-// Test #9: an empty-name (legacy zero-volume) record prunes after N regardless of root.
+// Test #9: an empty-name (legacy zero-volume) record is vacuously all-absent → pruned
+// after N (the per-record verifiability rule doesn't block empty names; root is
+// configured+present here so G2 passes).
 func TestReconcileOrphaned_EmptyNamesPruned(t *testing.T) {
 	b, s := newOrphanReconcileBackend(t, 1, true, nil, nil)
 	putActiveRetention(t, s, "uLegacy", nil) // no volume names
