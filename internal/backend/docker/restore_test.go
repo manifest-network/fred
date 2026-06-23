@@ -1562,6 +1562,45 @@ func TestReap_DestroySuccess_DeletesRecord(t *testing.T) {
 	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB)
 }
 
+// TestRetryReapingRecords_ReclaimsWhenDestroyRecovers verifies a stuck reaping
+// record is auto-reclaimed by a later sweep once Destroy starts succeeding.
+func TestRetryReapingRecords_ReclaimsWhenDestroyRecovers(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+	withMicroSKU(b, 1024)
+	rs := attachRetentionStore(t, b)
+
+	reaping := retentionEntryFixture("lease-r", "t1", time.Now())
+	reaping.Status = shared.RetentionStatusReaping
+	reaping.RetainedVolumeNames = []string{"fred-retained-lease-r-app-0"}
+	require.NoError(t, rs.Put(reaping))
+
+	var fail atomic.Bool
+	fail.Store(true)
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, _ string) error {
+			if fail.Load() {
+				return errors.New("EBUSY")
+			}
+			return nil
+		},
+	}
+
+	// First sweep: destroy fails → record stays reaping.
+	require.NoError(t, b.retryReapingRecords(context.Background()))
+	got, err := rs.Get("lease-r")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
+
+	// Destroy recovers; next sweep reclaims + deletes.
+	fail.Store(false)
+	require.NoError(t, b.retryReapingRecords(context.Background()))
+	got, err = rs.Get("lease-r")
+	require.NoError(t, err)
+	assert.Nil(t, got, "reaping record deleted after destroy recovers")
+}
+
 // TestRunRetentionSweep_ReconcilesRestoring verifies that the periodic sweep
 // rolls back an orphaned restoring record (no live provision for the new lease).
 // This mirrors TestReconcileRestoring_RollsBackOrphan but exercises runRetentionSweep

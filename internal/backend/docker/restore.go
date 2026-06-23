@@ -103,6 +103,10 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 			}
 		case shared.RetentionStatusRestoring:
 			b.reconcileRestoring(ctx, e)
+		case shared.RetentionStatusReaping:
+			// Finalizer retry at boot: re-attempt destroy of any record stranded
+			// reaping by a prior crash/destroy-failure; delete it when confirmed gone.
+			b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, e.RetainedVolumeNames)
 		}
 	}
 	return nil
@@ -317,17 +321,38 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// runRetentionSweep is the PERIODIC reaper body: reap expired + reconcile any
-// restoring records (a running-process backstop for restores that failed since
-// the last tick). The BOOT path does NOT call this: at startup reconcileRetentions
-// (before cleanup) handles restoring records and an eager reapExpiredRetentions
-// (after cleanup) handles expired ones, so restoring records aren't double-reconciled.
+// retryReapingRecords re-attempts destruction of every reaping record's volumes
+// (the finalizer retry) and deletes each record whose volumes are confirmed gone.
+// Runs on the periodic sweep AND at boot. Fail-closed: on a store List error the
+// records are kept (footprint keeps counting). (ENG-376)
+func (b *Backend) retryReapingRecords(ctx context.Context) error {
+	if b.retentionStore == nil {
+		return nil
+	}
+	recs, err := b.retentionStore.ListReaping()
+	if err != nil {
+		return err
+	}
+	for _, e := range recs {
+		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, e.RetainedVolumeNames)
+	}
+	return nil
+}
+
+// runRetentionSweep is the PERIODIC reaper body: reap expired + retry any
+// reaping records + reconcile any restoring records (a running-process backstop
+// for restores that failed since the last tick). The BOOT path does NOT call
+// this: at startup reconcileRetentions (before cleanup) handles restoring and
+// reaping records, so they aren't double-reconciled.
 func (b *Backend) runRetentionSweep(ctx context.Context) error {
 	if _, err := b.reapExpiredRetentions(ctx); err != nil {
 		return err
 	}
 	if b.retentionStore == nil {
 		return nil
+	}
+	if err := b.retryReapingRecords(ctx); err != nil {
+		return err
 	}
 	recs, err := b.retentionStore.ListRestoring()
 	if err != nil {
