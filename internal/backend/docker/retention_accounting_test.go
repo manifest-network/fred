@@ -1332,3 +1332,66 @@ func TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted(t *testing.T) {
 	assert.Equal(t, int64(512), s.AllocatedDiskMB,
 		"a partial container-teardown failure must keep live counted (stuck container still running)")
 }
+
+// TestRefreshRetentionAccounting_StoreError_KeepsLastValue (G1) verifies the
+// fail-safe inside refreshRetentionAccounting: when computeRetainedDiskMB
+// returns an error (store closed/unreadable), the function logs and returns
+// WITHOUT calling SetRetainedDisk — so the last valid projection stays in
+// the pool rather than being silently zeroed, which would cause over-admission.
+func TestRefreshRetentionAccounting_StoreError_KeepsLastValue(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+
+	// Seed one ACTIVE record with a known footprint F = 2 * 1024 = 2048 MB.
+	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now())))
+
+	// First refresh with a working store → pool must reflect F.
+	b.refreshRetentionAccounting()
+	require.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB,
+		"pre-condition: working refresh must set RetainedDiskMB to F")
+
+	// Close the store so computeRetainedDiskMB now errors on the next List().
+	// (t.Cleanup will call Close again; the closeOnce inside boltStore makes
+	// the double-close harmless — mirrors TestBreachRetentionCap_StoreErrorFailsOpen.)
+	require.NoError(t, rs.Close())
+
+	// Second refresh with a broken store must NOT zero the pool.
+	b.refreshRetentionAccounting()
+
+	// RetainedDiskMB must STILL equal F — the keep-last-value fail-safe held.
+	assert.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB,
+		"store error must keep the last valid retained projection (not reset to 0)")
+}
+
+// TestComputeRetainedDiskMB_UnknownSKUInActiveRecord (G2) verifies that when
+// an ACTIVE retention record references a mix of a resolvable SKU and an
+// unresolvable one, computeRetainedDiskMB:
+//   - returns err == nil (the unknown SKU is only a warn, not a fatal error),
+//   - includes the record in the count,
+//   - sums only the resolvable item's DiskMB×Quantity (the unknown item
+//     contributes 0 — conservative undercount, flagged by the WARN log).
+func TestComputeRetainedDiskMB_UnknownSKUInActiveRecord(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	// Only "docker-micro" is known; "ghost-sku" is absent.
+	withMicroSKU(b, 1024)
+
+	// One ACTIVE record whose Items mix a resolvable and an unresolvable SKU.
+	// docker-micro qty=2 → 2 * 1024 = 2048 MB (resolvable).
+	// ghost-sku qty=3 → 0 MB (unresolvable → skipped + logged).
+	e := retentionEntryFixture("lease-mixed", "t1", time.Now())
+	e.Items = []backend.LeaseItem{
+		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
+		{SKU: "ghost-sku", Quantity: 3, ServiceName: "db"},
+	}
+	require.NoError(t, rs.Put(e))
+
+	mb, count, err := b.computeRetainedDiskMB()
+
+	// Must not error — unknown SKU is a warn-and-undercount, not a fatal.
+	require.NoError(t, err)
+	// The record IS counted (even with a partially-unresolvable Items set).
+	assert.Equal(t, 1, count, "record with mixed SKUs must still be counted")
+	// Only the resolvable docker-micro contributes; ghost-sku contributes 0.
+	assert.Equal(t, int64(2048), mb,
+		"unknown SKU must contribute 0 to the disk projection (resolvable part only)")
+}
