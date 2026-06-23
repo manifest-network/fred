@@ -320,9 +320,11 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 	}
 
 	// G1 — a failed enumeration is uncertainty, not "no volumes". Skip + reset.
-	// No local log: returning err makes StartCleanupLoop log it once (matches the
-	// sibling reapExpiredRetentions, which bare-returns store errors). The metric is
-	// the precise alerting signal.
+	// No local log: returning err lets the cleanup loop (StartCleanupLoop) log it
+	// once per failing sweep rather than twice — matching the sibling
+	// reapExpiredRetentions, which bare-returns store errors. (A persistent failure
+	// therefore logs once per tick, i.e. hourly; the metric is the precise alerting
+	// signal.)
 	existing, err := b.volumes.List()
 	if err != nil {
 		b.orphanStreaks = map[string]int{}
