@@ -367,7 +367,10 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 			b.logger.Error("orphan retention reconcile: delete failed", "lease_uuid", e.OriginalLeaseUUID, "error", derr)
 			next[e.OriginalLeaseUUID] = streak // keep streak; retry next sweep
 		case !deleted:
-			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRacedRestore).Inc() // raced into restore; leave it
+			// deleted=false: record no longer ACTIVE-and-present — concurrently restore-claimed
+			// (active→restoring) OR already removed (e.g. cap-eviction). Benign either way; the
+			// other path owns it. Drop the streak (omit from next); don't prune.
+			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRaced).Inc()
 		default:
 			pruned++
 			retentionOrphansPrunedTotal.Inc()
