@@ -77,6 +77,16 @@ func putActiveRetention(t *testing.T, s *shared.RetentionStore, lease string, vo
 	}))
 }
 
+// getRetention fetches a record and asserts the store read itself succeeded, so a
+// Get error can't masquerade as "record pruned" (a nil result on error). Use this
+// instead of `rec, _ := s.Get(...)` for prune assertions.
+func getRetention(t *testing.T, s *shared.RetentionStore, lease string) *shared.RetentionEntry {
+	t.Helper()
+	rec, err := s.Get(lease)
+	require.NoError(t, err)
+	return rec
+}
+
 // Test #1 + #12: absent volumes prune exactly at sweep N; present ones never do.
 func TestReconcileOrphaned_PrunesAfterNSweeps(t *testing.T) {
 	b, s := newOrphanReconcileBackend(t, 3, true, []string{"fred-retained-uB-app-0"}, nil)
@@ -90,7 +100,7 @@ func TestReconcileOrphaned_PrunesAfterNSweeps(t *testing.T) {
 		pruned, err := b.reconcileOrphanedRetentions()
 		require.NoError(t, err)
 		assert.Equal(t, 0, pruned)
-		got, _ := s.Get("uA")
+		got := getRetention(t, s, "uA")
 		assert.NotNil(t, got, "uA must survive before N sweeps")
 	}
 	// Sweep 3: confirmed → pruned.
@@ -98,9 +108,9 @@ func TestReconcileOrphaned_PrunesAfterNSweeps(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, pruned)
 
-	goneA, _ := s.Get("uA")
+	goneA := getRetention(t, s, "uA")
 	assert.Nil(t, goneA, "uA pruned after N sweeps")
-	keptB, _ := s.Get("uB")
+	keptB := getRetention(t, s, "uB")
 	assert.NotNil(t, keptB, "uB (present volume) never pruned")
 	assert.NotContains(t, b.orphanStreaks, "uB", "present-volume record must not accumulate a streak")
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphansPrunedTotal))
@@ -131,7 +141,7 @@ func TestReconcileOrphaned_ReappearanceResetsStreak(t *testing.T) {
 	pruned, err := b.reconcileOrphanedRetentions() // streak 1, NOT >= 3
 	require.NoError(t, err)
 	assert.Equal(t, 0, pruned)
-	got, _ := s.Get("uA")
+	got := getRetention(t, s, "uA")
 	assert.NotNil(t, got, "reset streak must prevent prune")
 }
 
@@ -149,7 +159,7 @@ func TestReconcileOrphaned_SkipsRestoringRecords(t *testing.T) {
 	pruned, err := b.reconcileOrphanedRetentions()
 	require.NoError(t, err)
 	assert.Equal(t, 0, pruned)
-	got, _ := s.Get("uR")
+	got := getRetention(t, s, "uR")
 	assert.NotNil(t, got, "restoring record must never be pruned")
 }
 
@@ -164,7 +174,7 @@ func TestReconcileOrphaned_MissingRootSkips(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 0, pruned)
 	}
-	got, _ := s.Get("uA")
+	got := getRetention(t, s, "uA")
 	assert.NotNil(t, got, "missing root must prevent any prune")
 	assert.Equal(t, before+5, testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRootUnverifiable)))
 }
@@ -178,7 +188,7 @@ func TestReconcileOrphaned_ListErrorSkips(t *testing.T) {
 	pruned, err := b.reconcileOrphanedRetentions()
 	require.Error(t, err)
 	assert.Equal(t, 0, pruned)
-	got, _ := s.Get("uA")
+	got := getRetention(t, s, "uA")
 	assert.NotNil(t, got, "list error must prevent prune")
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError)))
 }
@@ -192,7 +202,7 @@ func TestReconcileOrphaned_EmptyNamesPruned(t *testing.T) {
 	pruned, err := b.reconcileOrphanedRetentions()
 	require.NoError(t, err)
 	assert.Equal(t, 1, pruned)
-	got, _ := s.Get("uLegacy")
+	got := getRetention(t, s, "uLegacy")
 	assert.Nil(t, got, "legacy zero-volume record pruned")
 }
 
@@ -214,7 +224,7 @@ func TestReconcileOrphaned_UnconfiguredRootSkipsVolumeRecords(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 0, pruned)
 	}
-	got, _ := s.Get("uV")
+	got := getRetention(t, s, "uV")
 	assert.NotNil(t, got, "volume-bearing record unverifiable without a root → never pruned")
 }
 
@@ -227,7 +237,7 @@ func TestReconcileOrphaned_DisabledKillSwitch(t *testing.T) {
 	pruned, err := b.reconcileOrphanedRetentions()
 	require.NoError(t, err)
 	assert.Equal(t, 0, pruned)
-	got, _ := s.Get("uA")
+	got := getRetention(t, s, "uA")
 	assert.NotNil(t, got, "kill-switch must prevent prune")
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipDisabled)))
 }
@@ -242,7 +252,7 @@ func TestReconcileOrphaned_PartialPresenceNeverPruned(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 0, pruned)
 	}
-	got, _ := s.Get("uM")
+	got := getRetention(t, s, "uM")
 	assert.NotNil(t, got, "a record with any present volume must never be pruned")
 }
 
@@ -305,6 +315,6 @@ func TestRunRetentionSweep_PrunesOrphans(t *testing.T) {
 
 	require.NoError(t, b.runRetentionSweep(context.Background()))
 
-	got, _ := s.Get("uA")
+	got := getRetention(t, s, "uA")
 	assert.Nil(t, got, "runRetentionSweep must prune the orphaned record")
 }
