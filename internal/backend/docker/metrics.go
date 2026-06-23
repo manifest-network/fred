@@ -292,7 +292,70 @@ var (
 		Name:      "lease_worker_panics_total",
 		Help:      "Panics recovered in lease worker goroutines, by worker type",
 	}, []string{"worker_type"})
+
+	// retainedVolumeBytes is the reserved disk capacity (sum of active retained
+	// leases' SKU disk_mb, converted to bytes) currently pinned by soft-deleted
+	// volumes. Reserved quota, not measured on-disk usage (see ENG-360 spec).
+	retainedVolumeBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retained_volume_bytes",
+		Help:      "Reserved disk capacity (SKU quota) pinned by retained/soft-deleted volumes, in bytes",
+	})
+
+	// retainedLeases is the number of active retained (soft-deleted) leases.
+	retainedLeases = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retained_leases",
+		Help:      "Number of active retained (soft-deleted) leases",
+	})
+
+	// retentionRefusedTotal counts close-time refuse-to-retain events caused by
+	// the max_retained_disk_mb cap (volumes destroyed instead of retained).
+	retentionRefusedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_refused_total",
+		Help:      "Close-time refuse-to-retain events due to the max_retained_disk_mb cap",
+	})
+
+	// diskPoolBytes is the admission ceiling (total_disk_mb in bytes). A
+	// denominator so dashboards don't hardcode the pool size.
+	diskPoolBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "disk_pool_bytes",
+		Help:      "Total disk admission pool (total_disk_mb) in bytes",
+	})
+
+	// retainedDiskCapBytes is the per-provider retained cap (max_retained_disk_mb
+	// in bytes), set unconditionally by setStaticPoolMetrics (0 when the cap is
+	// unset, since a registered gauge always exports). Alert denominator.
+	retainedDiskCapBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retained_disk_cap_bytes",
+		Help:      "Per-provider retained-volume cap (max_retained_disk_mb) in bytes; 0 when unset",
+	})
 )
+
+const bytesPerMiB = 1 << 20
+
+// updateRetentionMetrics sets the retained-volume gauges from the current
+// projection (MB) and active-lease count.
+func updateRetentionMetrics(retainedMB int64, count int) {
+	retainedVolumeBytes.Set(float64(retainedMB) * bytesPerMiB)
+	retainedLeases.Set(float64(count))
+}
+
+// setStaticPoolMetrics sets the constant denominator gauges once at startup.
+func setStaticPoolMetrics(cfg Config) {
+	diskPoolBytes.Set(float64(cfg.TotalDiskMB) * bytesPerMiB)
+	// Set unconditionally so a re-construction with no cap resets the gauge to 0
+	// (a registered gauge always exports; 0 == "no cap configured").
+	retainedDiskCapBytes.Set(float64(cfg.MaxRetainedDiskMB) * bytesPerMiB)
+}
 
 // updateResourceMetrics updates the resource allocation ratio gauges.
 func updateResourceMetrics(stats shared.ResourceStats) {

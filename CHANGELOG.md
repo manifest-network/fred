@@ -8,7 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `max_retained_disk_mb` docker-backend config key: per-provider cap on the
+  retained-volume tier, with refuse-to-retain on breach (ENG-360).
+- Retained-volume metrics: `fred_docker_backend_retained_volume_bytes`,
+  `fred_docker_backend_retained_leases`, `fred_docker_backend_retention_refused_total`,
+  and `fred_docker_backend_disk_pool_bytes` / `..._retained_disk_cap_bytes`
+  denominator gauges (ENG-360).
+
 ### Changed
+
+- **Behavior change:** Retained (soft-deleted) volumes now count against the
+  disk admission pool until they are reaped, closing a disk over-commit / ENOSPC
+  risk. **Operators:** if `retain_on_close` is enabled, re-check `total_disk_mb`
+  headroom — effective live capacity now decreases by the retained footprint. See
+  the OPERATIONS.md "Reclaiming retained volumes under disk pressure" runbook.
+  (ENG-360)
 
 ### Deprecated
 

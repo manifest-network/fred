@@ -2959,3 +2959,60 @@ func TestDeprovision_Retain_NilManifestNoRelease_StillRetains(t *testing.T) {
 	// Manifest stays nil (no release to hydrate from) — the warn path, no panic.
 	assert.Nil(t, entry.StackManifest, "manifest stays nil when no release exists to hydrate from")
 }
+
+// TestRestore_AdoptInsufficientResources_RollsBack (G3) verifies that when
+// TryAllocateAdopt fails because the pool lacks sufficient CPU or memory
+// headroom (CPU gate fires; disk is NOT re-gated on adopt), Restore returns
+// ErrInsufficientResources, the pool has no live allocation leak, and the
+// reservation (provision entry) is removed.
+//
+// Setup: rebuild b.pool with TotalCPUCores=0.1, which is less than the
+// docker-small profile's 0.5 cores — so TryAllocateAdopt's CPU check fires.
+// (TryAllocateAdopt skips the disk gate but still gates CPU and memory.)
+func TestRestore_AdoptInsufficientResources_RollsBack(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	seedActiveRetained(t, rs, "u1") // docker-small qty=1 → 0.5 CPU, 512 MB, 1024 MB disk
+
+	// Rebuild the pool with insufficient CPU headroom (0.1 < 0.5 required by
+	// docker-small). DiskMB is generous (TryAllocateAdopt skips that gate anyway).
+	b.cfg.TotalCPUCores = 0.1
+	b.pool = shared.NewResourcePool(b.cfg.TotalCPUCores, b.cfg.TotalMemoryMB, b.cfg.TotalDiskMB, b.cfg.GetSKUProfile, nil)
+
+	renameCalled := false
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
+	}
+
+	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://localhost/cb"))
+
+	// Must surface ErrInsufficientResources.
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInsufficientResources,
+		"TryAllocateAdopt CPU failure must map to ErrInsufficientResources")
+
+	// Pool must be fully released — no allocation leaked.
+	s := b.pool.Stats()
+	assert.Equal(t, int64(0), s.AllocatedDiskMB,
+		"pool must be fully released after TryAllocateAdopt failure (no live leak)")
+	assert.Equal(t, float64(0), s.AllocatedCPU,
+		"CPU must be fully released after TryAllocateAdopt failure")
+
+	// Provision entry must have been removed by the rollback.
+	b.provisionsMu.RLock()
+	_, has := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, has, "provision entry must be removed after TryAllocateAdopt failure rollback")
+
+	// No rename must have happened — adopt only runs after TryAllocateAdopt succeeds.
+	assert.False(t, renameCalled, "no volume rename must occur before TryAllocateAdopt fails")
+
+	// The retained record for u1 must remain active (no claim happened).
+	entry, rerr := rs.Get("u1")
+	require.NoError(t, rerr)
+	require.NotNil(t, entry, "retained record must remain after TryAllocateAdopt failure")
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status,
+		"retained record must stay active (no ClaimForRestore was attempted)")
+	assert.Equal(t, 1, entry.Generation, "generation must be unchanged (no claim)")
+}

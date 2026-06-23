@@ -237,6 +237,15 @@ releases_max_age: 2160h
 # Default: 0 (unlimited).
 # max_retained_leases_per_tenant: 0
 
+# Per-provider cap on the aggregate retained-volume disk footprint (MB) across
+# all tenants. When retaining a closing lease would exceed this, the lease is
+# destroyed immediately instead of retained (never evicting another tenant's
+# in-grace data). 0 = unlimited (default). Must be <= total_disk_mb and, when
+# set, >= the largest stateful SKU's disk_mb.
+# NOTE: duration keys (retention_max_age, retention_reap_interval) use Go units
+# (h/m/s) — write 2160h for 90 days, 336h for 14 days; days/weeks are NOT valid.
+# max_retained_disk_mb: 0
+
 # =============================================================================
 # HOST CONFIGURATION
 # =============================================================================

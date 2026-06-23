@@ -659,6 +659,16 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
 | `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total disk |
 
+**Retention:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_docker_backend_retained_volume_bytes` | gauge | — | Reserved disk capacity (SKU quota) pinned by retained/soft-deleted volumes, in bytes |
+| `fred_docker_backend_retained_leases` | gauge | — | Number of active retained (soft-deleted) leases |
+| `fred_docker_backend_retention_refused_total` | counter | — | Close-time refuse-to-retain events due to the max_retained_disk_mb cap |
+| `fred_docker_backend_disk_pool_bytes` | gauge | — | Total disk admission pool (total_disk_mb) in bytes |
+| `fred_docker_backend_retained_disk_cap_bytes` | gauge | — | Per-provider retained-volume cap (max_retained_disk_mb) in bytes; 0 when unset |
+
 **Callbacks:**
 
 | Metric | Type | Labels | Description |

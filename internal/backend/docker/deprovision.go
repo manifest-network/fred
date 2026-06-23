@@ -108,20 +108,59 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		logger.Info("compose down completed", "project", composeProjectName(leaseUUID))
 	}
 
-	// Release resource pool allocations regardless of outcome — the lease
-	// is being abandoned and these resources should be freed. Allocation IDs
-	// are always service-aware now ({lease}-{service}-{idx}); the legacy
-	// {lease}-{idx} scheme is gone from the live path. Task 9's recover-time
-	// migration releases / re-allocates legacy allocs as part of converting
-	// on-disk artifacts.
-	for _, item := range items {
-		for i := range item.Quantity {
-			b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
+	// releaseLive releases all pool allocations for this lease and updates
+	// resource metrics. On the non-retain path it is called AFTER all volumes
+	// are destroyed without error (mirroring the refuse-to-retain arm); on the
+	// retain path it is deferred until after refreshRetentionAccounting counts
+	// the retained record, so the footprint is never momentarily uncounted while
+	// the renamed volume persists on disk (no over-admit gap).
+	releaseLive := func() {
+		for _, item := range items {
+			for i := range item.Quantity {
+				b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
+			}
 		}
+		updateResourceMetrics(b.pool.Stats())
 	}
-	// Update gauges immediately after releasing allocations so metrics stay
-	// accurate on every path (partial failure, volume-cleanup retry, success).
-	updateResourceMetrics(b.pool.Stats())
+	retaining := b.cfg.RetainOnClose && b.retentionStore != nil
+	// Non-retain release happens AFTER successful volume destroy (see the
+	// else branch below). A teardown that only partially succeeds (container
+	// or volume error) keeps resources counted for the retry rather than
+	// freeing them while stuck containers still run or volumes remain on disk.
+	//
+	// Retaining close: keep the live allocation counted until the retained
+	// record is recorded+refreshed (or the volumes are destroyed) — see the
+	// deferred hand-off below — so the footprint is never momentarily
+	// uncounted while the renamed volume persists on disk (prevents a
+	// concurrent over-admit / ENOSPC).
+
+	// releaseLiveOnRetainPath is set true at retain-path terminal points where
+	// the closing lease's footprint F is either recorded-as-retained or
+	// destroyed. The deferred hand-off releases live AFTER the retained
+	// projection is refreshed, ensuring overlap, never a gap. On error paths
+	// (no record written, volumes still canonical on disk) it stays false so
+	// the live allocation keeps counting the bytes.
+	var releaseLiveOnRetainPath bool
+
+	// Retained set may have changed (this close may have added a retained
+	// record below, or a prior attempt did); refresh after the volume branch.
+	// For the retain path, also release live AFTER refresh (overlap, no gap).
+	//
+	// Gated on `retaining`: the non-retain else branch only destroys this lease's
+	// own canonical volumes and never touches the retention store, so the retained
+	// projection cannot change on a non-retain close — skip the O(#retained) bbolt
+	// List() scan entirely on that (hot) path. releaseLiveOnRetainPath is only ever
+	// set inside the retain branch, and non-retain releases live inline after a
+	// successful destroy, so nothing is missed by returning early here.
+	defer func() {
+		if !retaining {
+			return
+		}
+		b.refreshRetentionAccounting()
+		if releaseLiveOnRetainPath {
+			releaseLive()
+		}
+	}()
 
 	if len(errs) > 0 {
 		// Partial failure: keep provision visible with only the stuck containers.
@@ -163,7 +202,26 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// never drops already-retained volumes (which would leak them) or overwrites
 		// the prior record with a shorter list — and never clobbers a record that a
 		// concurrent restore claimed (active→restoring) mid-flight.
-		if len(canonical) > 0 {
+		switch {
+		case len(canonical) == 0:
+			// No canonical volumes enumerated. If List SUCCEEDED, none remain under
+			// the live name (already renamed on a prior attempt, or a stateless
+			// lease) → safe to release live. If List ERRORED, volumes may still be
+			// on disk → keep live counted (flag stays false); volumeErrs already
+			// carries the List error so the lease retries.
+			if listErr == nil {
+				releaseLiveOnRetainPath = true
+			}
+		case b.shouldRefuseRetention(leaseUUID, items):
+			prevErrCount := len(volumeErrs)
+			volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, canonical, leaseUUID, tenant, logger)...)
+			if len(volumeErrs) == prevErrCount {
+				// All canonical volumes destroyed without error — bytes are gone,
+				// so it is safe to release the live allocation.
+				releaseLiveOnRetainPath = true
+			}
+		default:
+			// existing retain logic — UNCHANGED, just moved under `default:`
 			retained := make([]string, 0, len(canonical))
 			for _, c := range canonical {
 				retained = append(retained, retainedName(c))
@@ -231,6 +289,11 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				}
 				if len(volumeErrs) == 0 {
 					volumesRetained = true
+					// All renames succeeded: F is now recorded-as-retained in the
+					// store (PutActiveMerged) and volumes live under fred-retained-*
+					// names. Signal the deferred hand-off to release live AFTER
+					// refresh — bytes stay continuously counted, no gap.
+					releaseLiveOnRetainPath = true
 					logger.Info("soft-deleted lease volumes", "lease_uuid", leaseUUID, "retained", len(retained))
 				}
 			}
@@ -244,6 +307,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 					volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
 				}
 			}
+		}
+		if len(volumeErrs) == 0 {
+			// All volumes destroyed — bytes are gone, so release the live allocation
+			// now. Releasing only on success (not before the loop) keeps the footprint
+			// counted while a failed Destroy leaves bytes on disk and the lease is kept
+			// Failed for retry, preventing an over-admit/ENOSPC window. Symmetric with
+			// the refuse-to-retain arm (releaseLiveOnRetainPath set only when
+			// len(volumeErrs) == prevErrCount).
+			releaseLive()
 		}
 	}
 
@@ -280,6 +352,19 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		if attempts >= maxVolumeCleanupAttempts {
 			// Too many failed attempts — give up and remove the provision.
 			// The leaked volumes require manual cleanup by the operator.
+			//
+			// Release live UNCONDITIONALLY here: the provision is about to be
+			// deleted and `return nil`, so no retry can ever run to free it.
+			// On the retain path the flag is still false, so without this the
+			// live allocation would leak forever and — if a record was written —
+			// double-count the footprint as both live and retained (2F), wedging
+			// any later restore. On the non-retain path, live was not freed
+			// before the destroy loop (it is only freed when all destroys succeed);
+			// a destroy failure that reaches give-up means the volume is abandoned
+			// for manual cleanup and the provision is deleted — this call performs
+			// the real release. pool.Release is idempotent on an absent/already-
+			// released id, so this is always safe.
+			releaseLive()
 			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 				p.ContainerIDs = nil // containers are gone
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",

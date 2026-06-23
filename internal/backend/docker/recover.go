@@ -405,6 +405,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// during normal Provision/Deprovision, but recoverState replaces the map.
 	activeProvisions.Set(readyCount)
 	updateResourceMetrics(b.pool.Stats())
+	b.refreshRetentionAccounting()
 
 	// Gather diagnostics for cold-start failures only. Ready→Failed
 	// transitions (failedLeases) are handled by the SM's Failing state,
