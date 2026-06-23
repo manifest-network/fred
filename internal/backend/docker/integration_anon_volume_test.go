@@ -4,6 +4,7 @@ package docker
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"testing"
 	"time"
@@ -23,6 +24,12 @@ import (
 // before/after diff filters to them — staying immune to unrelated named volumes
 // that may already exist (or be created by something else) on a shared daemon.
 var anonVolNameRE = regexp.MustCompile("^[0-9a-f]{64}$")
+
+// cleanupTimeout bounds each test-cleanup Docker call. Cleanups use a fresh
+// context (the test ctx is already canceled by the time t.Cleanup runs) but
+// must also be time-bounded so a hung daemon can't stall the suite — mirroring
+// cleanupTestContainers/cleanupTestNetworks.
+const cleanupTimeout = 30 * time.Second
 
 // newIntegrationDockerClient returns a real DockerClient for integration tests,
 // registering Close cleanup and skipping the test if the daemon is unreachable.
@@ -73,9 +80,10 @@ func TestComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 
 	// Build a valid project via the real builder, then force an anonymous
 	// volume onto the service (a volume mount with no Source => Docker
-	// allocates a 64-hex anonymous volume).
+	// allocates a 64-hex anonymous volume). The lease UUID is unique per run so
+	// a crashed prior run can't collide on the project/container names.
 	params := baseProjectParams()
-	params.LeaseUUID = "eng372-anonvol"
+	params.LeaseUUID = fmt.Sprintf("eng372-anonvol-%d", time.Now().UnixNano())
 	params.NetworkName = "" // use compose's default network; no pre-created tenant net
 	params.Stack.Services["web"] = &manifest.Manifest{
 		Image:   "busybox:latest",
@@ -93,7 +101,9 @@ func TestComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 	containerName := "fred-" + params.LeaseUUID + "-web-0"
 
 	t.Cleanup(func() {
-		_ = composeSvc.Down(context.Background(), projectName, 5*time.Second)
+		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer ccancel()
+		_ = composeSvc.Down(cctx, projectName, 5*time.Second)
 	})
 
 	require.NoError(t, composeSvc.Up(ctx, project, composeUpOpts{}))
@@ -115,7 +125,9 @@ func TestComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 
 	// Best-effort reap if the assertion below fails (the pre-fix RED run leaks it).
 	t.Cleanup(func() {
-		_ = docker.client.VolumeRemove(context.Background(), anonVol, true)
+		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer ccancel()
+		_ = docker.client.VolumeRemove(cctx, anonVol, true)
 	})
 
 	// Tear down the project. This MUST also remove the anonymous volume.
@@ -138,9 +150,8 @@ func TestRemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
 
 	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
 
-	name := "fred-eng372-rmvol"
-	// Clean any stale container from a prior run.
-	_ = docker.client.ContainerRemove(ctx, name, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	// Unique per run so concurrent runs / a crashed prior run can't collide.
+	name := fmt.Sprintf("fred-eng372-rmvol-%d", time.Now().UnixNano())
 
 	created, err := docker.client.ContainerCreate(ctx,
 		&container.Config{
@@ -162,8 +173,10 @@ func TestRemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
 	require.NotEmpty(t, anonVol, "expected an anonymous volume on the created container")
 
 	t.Cleanup(func() {
-		_ = docker.client.ContainerRemove(context.Background(), created.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
-		_ = docker.client.VolumeRemove(context.Background(), anonVol, true)
+		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer ccancel()
+		_ = docker.client.ContainerRemove(cctx, created.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+		_ = docker.client.VolumeRemove(cctx, anonVol, true)
 	})
 
 	_, err = docker.client.VolumeInspect(ctx, anonVol)
@@ -196,13 +209,17 @@ func TestImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
 
 	before := dockerVolumeSet(t, ctx, docker)
 
-	// Drive the three introspection entrypoints; each creates one temp
-	// container from the image (sites readFileFromImage / DetectVolumeOwner /
-	// DetectWritablePaths). Return values are irrelevant — the leak, if any,
-	// happens on the temp container's removal regardless of outcome.
-	_, _, _ = docker.ResolveImageUser(ctx, img, "redis") // → readFileFromImage(/etc/passwd)
-	_, _, _ = docker.DetectVolumeOwner(ctx, img, []string{"/data"})
-	_, _ = docker.DetectWritablePaths(ctx, img, 0, []string{"/"})
+	// Drive the three introspection entrypoints; each creates one temp container
+	// from the image (sites readFileFromImage / DetectVolumeOwner /
+	// DetectWritablePaths). Require success: if a helper failed before creating
+	// its container, the diff would be empty and the leak assertion would
+	// false-green without ever exercising the reap path.
+	_, _, err := docker.ResolveImageUser(ctx, img, "redis") // → readFileFromImage(/etc/passwd)
+	require.NoError(t, err)
+	_, _, err = docker.DetectVolumeOwner(ctx, img, []string{"/data"})
+	require.NoError(t, err)
+	_, err = docker.DetectWritablePaths(ctx, img, 0, []string{"/"})
+	require.NoError(t, err)
 
 	after := dockerVolumeSet(t, ctx, docker)
 
@@ -216,8 +233,10 @@ func TestImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
 	}
 	// Best-effort cleanup so a RED run doesn't pollute the daemon.
 	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer ccancel()
 		for _, v := range leaked {
-			_ = docker.client.VolumeRemove(context.Background(), v, true)
+			_ = docker.client.VolumeRemove(cctx, v, true)
 		}
 	})
 
