@@ -260,6 +260,108 @@ func allVolumesAbsent(names []string, present map[string]bool) bool {
 	return true
 }
 
+// reconcileOrphanedRetentions prunes ACTIVE retention records whose every
+// RetainedVolumeName has been absent from the node for >= N consecutive periodic
+// sweeps (ENG-370 — records orphaned when their backing volumes vanish out-of-band).
+//
+// Fail-safe by construction: any uncertainty skips the whole pass and resets the
+// in-memory confirmation streaks, because the gated action is DELETION — discarding
+// a record throws away the only restore handle for a volume that may merely be
+// transiently unlisted (a missing volume root makes listVolumeIDs return
+// empty-with-no-error; an unreadable root is caught by the G2 gate below). Streaks
+// are in-memory so a cold restart can never prune on
+// its first sweep (boot-before-mount fail-safe). Returns the number pruned.
+//
+// No ctx: the prune does no context-bound IO (volumes are already gone, so there is
+// nothing to Destroy), unlike reapExpiredRetentions which Destroys under ctx.
+func (b *Backend) reconcileOrphanedRetentions() (int, error) {
+	if b.retentionStore == nil {
+		return 0, nil
+	}
+	n := b.cfg.RetentionOrphanConfirmations
+	if n <= 0 {
+		// Kill-switch (0 = disabled). Log once per sweep so a flip-to-0 is not silent.
+		b.logger.Info("orphan retention reconcile disabled (retention_orphan_confirmations=0)")
+		retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipDisabled).Inc()
+		return 0, nil
+	}
+
+	// G2 — warm-view gate. A configured-but-absent/unreadable volume root makes the
+	// volume enumeration untrustworthy. Skip + reset streaks. An unconfigured root
+	// (noop manager) is allowed through here; the per-record verifiability check below
+	// handles it.
+	rootConfigured := b.cfg.VolumeDataPath != ""
+	if rootConfigured {
+		exists, statErr := pathExists(b.cfg.VolumeDataPath)
+		if volumeRootUnverifiable(exists, statErr) {
+			b.logger.Warn("orphan retention reconcile skipped: volume data root absent or unreadable (fail-safe)",
+				"path", b.cfg.VolumeDataPath, "error", statErr)
+			b.orphanStreaks = map[string]int{}
+			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipMissingRoot).Inc()
+			return 0, nil
+		}
+	}
+
+	// G1 — a failed enumeration is uncertainty, not "no volumes". Skip + reset.
+	// No local log: returning err makes StartCleanupLoop log it once (matches the
+	// sibling reapExpiredRetentions, which bare-returns store errors). The metric is
+	// the precise alerting signal.
+	existing, err := b.volumes.List()
+	if err != nil {
+		b.orphanStreaks = map[string]int{}
+		retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipListError).Inc()
+		return 0, err
+	}
+	present := make(map[string]bool, len(existing))
+	for _, v := range existing {
+		present[v] = true
+	}
+
+	recs, err := b.retentionStore.List()
+	if err != nil {
+		b.orphanStreaks = map[string]int{}
+		retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipStoreError).Inc()
+		return 0, err
+	}
+
+	next := make(map[string]int, len(b.orphanStreaks))
+	var pruned int
+	for _, e := range recs {
+		if e.Status != shared.RetentionStatusActive {
+			continue // never touch a restoring record (volumes renamed away → would look absent)
+		}
+		if !allVolumesAbsent(e.RetainedVolumeNames, present) {
+			continue // a volume is present → not orphaned → streak resets (omit from next)
+		}
+		if !rootConfigured && len(e.RetainedVolumeNames) > 0 {
+			continue // unverifiable without a configured root → never prune
+		}
+		streak := b.orphanStreaks[e.OriginalLeaseUUID] + 1
+		if streak < n {
+			next[e.OriginalLeaseUUID] = streak // not yet confirmed; carry forward
+			continue
+		}
+		// Confirmed across >= n consecutive sweeps. Prune via the ACTIVE-only CAS so a
+		// concurrent restore (active→restoring) is never clobbered. Volumes are already
+		// gone — nothing to Destroy.
+		_, deleted, derr := b.retentionStore.DeleteIfActive(e.OriginalLeaseUUID)
+		switch {
+		case derr != nil:
+			b.logger.Error("orphan retention reconcile: delete failed", "lease_uuid", e.OriginalLeaseUUID, "error", derr)
+			next[e.OriginalLeaseUUID] = streak // keep streak; retry next sweep
+		case !deleted:
+			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRacedRestore).Inc() // raced into restore; leave it
+		default:
+			pruned++
+			retentionOrphansPrunedTotal.Inc()
+			b.logger.Info("pruned orphaned retention record (all retained volumes confirmed absent)",
+				"lease_uuid", e.OriginalLeaseUUID, "confirmations", streak)
+		}
+	}
+	b.orphanStreaks = next
+	return pruned, nil
+}
+
 // reapExpiredRetentions hard-deletes retained volumes past RetentionMaxAge.
 // Returns the count of records FULLY reaped (all volumes destroyed AND the
 // record removed). If a Destroy fails after ReapIfExpired atomically removed the

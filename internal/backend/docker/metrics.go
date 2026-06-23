@@ -32,11 +32,12 @@ const (
 	orphanSkipMissingRoot  = "missing_root"  // volume data root absent/unreadable (fail-safe skip)
 	orphanSkipRacedRestore = "raced_restore" // record claimed for restore between snapshot and delete
 	orphanSkipDisabled     = "disabled"      // retention_orphan_confirmations == 0 (kill-switch)
+	orphanSkipStoreError   = "store_error"   // retentionStore.List() failed (fail-safe skip)
 )
 
 // orphanSkipReasons is the closed reason set, used to pre-initialize the
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
-var orphanSkipReasons = []string{orphanSkipListError, orphanSkipMissingRoot, orphanSkipRacedRestore, orphanSkipDisabled}
+var orphanSkipReasons = []string{orphanSkipListError, orphanSkipMissingRoot, orphanSkipRacedRestore, orphanSkipDisabled, orphanSkipStoreError}
 
 var (
 	// provisionsTotal tracks the total number of provision attempts by outcome.
