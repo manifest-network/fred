@@ -1504,62 +1504,62 @@ func TestReapExpiredRetentions_DisabledWhenMaxAgeZero(t *testing.T) {
 	assert.False(t, destroyCalled, "Destroy must NOT be called when RetentionMaxAge==0")
 }
 
-// TestReapExpiredRetentions_DestroyFailureReRecordsForRetry verifies the
-// self-heal path: when a Destroy fails after ReapIfExpired atomically removed
-// the record, the (still-expired) entry is re-recorded so the next sweep retries
-// the destroy — avoiding a permanent orphaned-volume disk leak. A subsequent
-// sweep with a succeeding Destroy then fully reaps it.
-func TestReapExpiredRetentions_DestroyFailureReRecordsForRetry(t *testing.T) {
+// TestReap_DestroyFail_LeavesReapingCounted verifies the finalizer fix: when a
+// volume Destroy fails during reap, the record is left in the REAPING state (NOT
+// deleted, NOT re-recorded) so computeRetainedDiskMB-via-pool keeps counting the
+// footprint, the leak counter increments, and no under-count occurs. ENG-376 AC#1.
+func TestReap_DestroyFail_LeavesReapingCounted(t *testing.T) {
+	leakBefore := testutil.ToFloat64(retentionLeakedTotal)
 	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+	withMicroSKU(b, 1024)
+	b.cfg.RetentionMaxAge = time.Hour
 	rs := attachRetentionStore(t, b)
-	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour
 
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "old-active",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-old-app-0"},
-		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
-	}))
+	exp := retentionEntryFixture("lease-exp", "t1", time.Now().Add(-2*time.Hour)) // expired, qty 2
+	exp.RetainedVolumeNames = []string{"fred-retained-lease-exp-app-0"}
+	require.NoError(t, rs.Put(exp))
 
-	var mu sync.Mutex
-	failDestroy := true
 	b.volumes = &mockVolumeManager{
-		DestroyFn: func(_ context.Context, _ string) error {
-			mu.Lock()
-			fail := failDestroy
-			mu.Unlock()
-			if fail {
-				return errors.New("docker destroy failed")
-			}
-			return nil
-		},
+		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
 	}
 
-	// First sweep: Destroy fails -> record must be re-recorded for retry.
 	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, 0, n, "a Destroy failure must NOT count as reaped")
+	assert.Equal(t, 0, n, "destroy failed → not counted as reaped")
 
-	entry, err := rs.Get("old-active")
+	got, err := rs.Get("lease-exp")
 	require.NoError(t, err)
-	require.NotNil(t, entry, "record must be re-recorded after Destroy failure so the next sweep retries")
-	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "re-recorded entry must stay active+expired")
-	assert.Equal(t, []string{"fred-retained-old-app-0"}, entry.RetainedVolumeNames)
+	require.NotNil(t, got, "record must NOT be deleted on destroy failure")
+	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
 
-	// Second sweep: Destroy succeeds -> record fully reaped.
-	mu.Lock()
-	failDestroy = false
-	mu.Unlock()
+	// Footprint still counted in the admission pool (no under-count).
+	assert.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB)
+	assert.Greater(t, testutil.ToFloat64(retentionLeakedTotal), leakBefore)
+}
 
-	n, err = b.reapExpiredRetentions(context.Background())
+// TestReap_DestroySuccess_DeletesRecord verifies the happy path: destroy succeeds
+// → record deleted → projection drops to 0.
+func TestReap_DestroySuccess_DeletesRecord(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+	withMicroSKU(b, 1024)
+	b.cfg.RetentionMaxAge = time.Hour
+	rs := attachRetentionStore(t, b)
+
+	exp := retentionEntryFixture("lease-exp", "t1", time.Now().Add(-2*time.Hour))
+	exp.RetainedVolumeNames = []string{"fred-retained-lease-exp-app-0"}
+	require.NoError(t, rs.Put(exp))
+
+	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return nil }}
+
+	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, 1, n, "retry with a succeeding Destroy must reap the record")
-
-	entry, err = rs.Get("old-active")
+	assert.Equal(t, 1, n)
+	got, err := rs.Get("lease-exp")
 	require.NoError(t, err)
-	assert.Nil(t, entry, "record must be removed after a successful retry")
+	assert.Nil(t, got, "record deleted after confirmed destroy")
+	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB)
 }
 
 // TestRunRetentionSweep_ReconcilesRestoring verifies that the periodic sweep

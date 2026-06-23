@@ -257,11 +257,38 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 	return nil
 }
 
+// destroyReapingVolumes destroys every volume of a reaping record and, ONLY if all
+// destroys succeed, Delete()s the record. Returns true iff the record was fully
+// reaped (deleted). On any destroy failure it LEAVES the record reaping (the
+// finalizer retry) and bumps retentionLeakedTotal — the footprint stays counted
+// and the next sweep retries. Idempotent: already-gone volume names no-op, and a
+// Delete failure leaves the record reaping for a later retry (no under-count). (ENG-376)
+func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names []string) bool {
+	destroyFailed := false
+	for _, name := range names {
+		if derr := b.volumes.Destroy(ctx, name); derr != nil {
+			b.logger.Error("reap: destroy volume", "volume", name, "error", derr)
+			destroyFailed = true
+		}
+	}
+	if destroyFailed {
+		retentionLeakedTotal.Inc()
+		b.logger.Warn("reap: volume(s) still on disk; record left reaping for retry (footprint stays counted)",
+			"lease_uuid", orig)
+		return false
+	}
+	if derr := b.retentionStore.Delete(orig); derr != nil {
+		b.logger.Warn("reap: destroy ok but record delete failed; next sweep retries", "lease_uuid", orig, "error", derr)
+		return false
+	}
+	return true
+}
+
 // reapExpiredRetentions hard-deletes retained volumes past RetentionMaxAge.
 // Returns the count of records FULLY reaped (all volumes destroyed AND the
-// record removed). If a Destroy fails after ReapIfExpired atomically removed the
-// record, the (still-expired) entry is re-recorded so the next sweep retries the
-// destroy; that record is NOT counted as reaped.
+// record removed). Each expired active record is atomically transitioned to
+// reaping before its volumes are destroyed, so a destroy failure leaves the
+// record as a counted finalizer tombstone rather than creating an under-count.
 func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 	if b.retentionStore == nil || b.cfg.RetentionMaxAge <= 0 {
 		return 0, nil
@@ -272,32 +299,19 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 	}
 	var n int
 	for _, e := range candidates {
-		names, err := b.retentionStore.ReapIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
-		if err != nil {
-			b.logger.Error("reap: store error", "lease_uuid", e.OriginalLeaseUUID, "error", err)
+		// Atomic active→reaping (the record is NEVER deleted before its volumes are
+		// confirmed gone, so a destroy failure cannot drop a still-on-disk footprint).
+		names, ok, merr := b.retentionStore.MarkReapingIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
+		if merr != nil {
+			b.logger.Error("reap: store error", "lease_uuid", e.OriginalLeaseUUID, "error", merr)
 			continue
 		}
-		if names == nil {
+		if !ok {
 			continue // concurrently claimed/changed since the snapshot — skip
 		}
-		destroyFailed := false
-		for _, name := range names {
-			if derr := b.volumes.Destroy(ctx, name); derr != nil {
-				b.logger.Error("reap: destroy volume", "volume", name, "error", derr)
-				destroyFailed = true
-			}
+		if b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, names) {
+			n++
 		}
-		if destroyFailed {
-			// A Destroy failed AFTER ReapIfExpired atomically removed the record.
-			// Re-record the (still-expired) entry so the next sweep retries the
-			// destroy; ClaimForRestore rejects expired records, so it cannot be
-			// adopted in the meantime. (Idempotent: already-destroyed names no-op.)
-			if perr := b.retentionStore.Put(e); perr != nil {
-				b.logger.Error("reap: re-record for retry failed; volume(s) leaked until manual cleanup", "lease_uuid", e.OriginalLeaseUUID, "error", perr)
-			}
-			continue // not counted as reaped
-		}
-		n++
 	}
 	b.refreshRetentionAccounting()
 	return n, nil
