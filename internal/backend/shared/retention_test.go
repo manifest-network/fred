@@ -603,3 +603,25 @@ func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusAudit_ClaimForRestore_RejectsReaping ensures a reaping record cannot be restored.
+func TestStatusAudit_ClaimForRestore_RejectsReaping(t *testing.T) {
+	s := newTestRetentionStore(t)
+	r := sampleEntry("lease-r")
+	r.Status = RetentionStatusReaping
+	require.NoError(t, s.Put(r))
+	_, err := s.ClaimForRestore("lease-r", "new", time.Hour)
+	require.Error(t, err, "ClaimForRestore must reject a reaping record")
+}
+
+// TestStatusAudit_ListExpired_ExcludesReaping ensures the reaper never re-marks a reaping record.
+func TestStatusAudit_ListExpired_ExcludesReaping(t *testing.T) {
+	s := newTestRetentionStore(t)
+	r := sampleEntry("lease-r")
+	r.Status = RetentionStatusReaping
+	r.CreatedAt = time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.Put(r))
+	got, err := s.ListExpired(time.Hour)
+	require.NoError(t, err)
+	assert.Empty(t, got, "ListExpired returns active-only")
+}

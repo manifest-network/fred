@@ -3072,3 +3072,25 @@ func TestRollback_RevertStoreError_KeepsLiveCounted(t *testing.T) {
 	assert.Equal(t, allocBefore, b.pool.Stats().AllocatedDiskMB, "live stays counted on revert store-error")
 	assert.Greater(t, testutil.ToFloat64(retentionLeakedTotal), leakBefore)
 }
+
+// TestStatusAudit_Cleanup_DoesNotProtectReapingCanonical ensures a reaping record's
+// canonical volume is NOT added to the orphan-cleanup protected set (it must be reaped).
+func TestStatusAudit_Cleanup_DoesNotProtectReapingCanonical(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+	rs := attachRetentionStore(t, b)
+
+	reaping := retentionEntryFixture("lease-r", "t1", time.Now())
+	reaping.Status = shared.RetentionStatusReaping
+	reaping.RetainedVolumeNames = []string{"fred-retained-lease-r-app-0"}
+	require.NoError(t, rs.Put(reaping))
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{"fred-lease-r-app-0"}, nil }, // a stray CANONICAL
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+
+	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+	assert.Contains(t, destroyed, "fred-lease-r-app-0", "reaping canonical must NOT be protected from orphan cleanup")
+}
