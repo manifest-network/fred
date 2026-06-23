@@ -416,6 +416,9 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	if retentionCapNeedsTenantLever(cfg) {
 		logger.Warn("max_retained_disk_mb is set but max_retained_leases_per_tenant is 0 (unlimited): one tenant can fill the retained pool, degrading others to refuse-to-retain; set a per-tenant count cap")
 	}
+	if retentionCapSetButDisabled(cfg) {
+		logger.Warn("retention cap/limit configured (max_retained_disk_mb / max_retained_leases_per_tenant) but retain_on_close=false: the cap has no effect; enable retain_on_close or remove the cap")
+	}
 
 	// Create HTTP client for callbacks
 	httpClient := &http.Client{

@@ -19,12 +19,24 @@ func diskOverProvisioned(totalDiskMB, fsTotalMB int64) bool {
 }
 
 // retentionCapNeedsTenantLever reports whether a per-provider retained cap is set
-// without a per-tenant count cap. In that state one well-funded tenant can fill
-// the entire retained pool, degrading every other tenant's close to
-// refuse-to-retain (an availability DoS on the retention feature). Pure, so it is
-// unit-testable; the WARN is emitted by the caller (New).
+// without a per-tenant count cap AND retention is enabled. In that state one
+// well-funded tenant can fill the entire retained pool, degrading every other
+// tenant's close to refuse-to-retain (an availability DoS on the retention
+// feature). Gated on RetainOnClose so it does not fire when nothing can ever be
+// retained (the warn would be misleading noise). Pure, so it is unit-testable;
+// the WARN is emitted by the caller (New).
 func retentionCapNeedsTenantLever(cfg Config) bool {
-	return cfg.MaxRetainedDiskMB > 0 && cfg.MaxRetainedLeasesPerTenant == 0
+	return cfg.RetainOnClose && cfg.MaxRetainedDiskMB > 0 && cfg.MaxRetainedLeasesPerTenant == 0
+}
+
+// retentionCapSetButDisabled reports whether any retention cap knob
+// (max_retained_disk_mb or max_retained_leases_per_tenant) is configured while
+// retain_on_close=false. In that state nothing is ever retained, so the cap has
+// no effect — the operator likely misconfigured the backend (e.g., copied a
+// retain-enabled template but forgot to set retain_on_close=true). Pure, so it
+// is unit-testable; the WARN is emitted by the caller (New).
+func retentionCapSetButDisabled(cfg Config) bool {
+	return !cfg.RetainOnClose && (cfg.MaxRetainedDiskMB > 0 || cfg.MaxRetainedLeasesPerTenant > 0)
 }
 
 // warnIfOverProvisioned logs a WARN when total_disk_mb exceeds the data
