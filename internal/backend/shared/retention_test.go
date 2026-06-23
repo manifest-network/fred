@@ -437,6 +437,38 @@ func TestMarkReapingIfActive(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// TestMarkReapingIfExpired verifies the reap mark only fires for active+expired
+// records, stamps ReapingSince, returns names, and guards fresh/non-active/zero-age.
+func TestMarkReapingIfExpired(t *testing.T) {
+	s := newTestRetentionStore(t)
+	maxAge := time.Hour
+
+	expired := sampleEntry("lease-exp")
+	expired.CreatedAt = time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.Put(expired))
+
+	names, ok, err := s.MarkReapingIfExpired("lease-exp", maxAge)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.ElementsMatch(t, []string{"vol-a", "vol-b"}, names)
+	got, err := s.Get("lease-exp")
+	require.NoError(t, err)
+	assert.Equal(t, RetentionStatusReaping, got.Status)
+	assert.False(t, got.ReapingSince.IsZero())
+
+	// Fresh record → not reaped.
+	fresh := sampleEntry("lease-fresh") // CreatedAt = now
+	require.NoError(t, s.Put(fresh))
+	_, ok, err = s.MarkReapingIfExpired("lease-fresh", maxAge)
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	// maxAge<=0 → no-op.
+	_, ok, err = s.MarkReapingIfExpired("lease-exp", 0)
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
 // TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
 // absent key writes the base entry verbatim and returns ok=true.
 func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {

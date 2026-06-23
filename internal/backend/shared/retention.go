@@ -363,6 +363,48 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 	return names, ok, err
 }
 
+// MarkReapingIfExpired atomically transitions an ACTIVE, expired record to
+// reaping (mirrors ReapIfExpired's guards) and returns its volume names for the
+// caller to destroy AFTER the txn commits. The record is NOT deleted — it stays a
+// counted tombstone until the volumes are confirmed gone. Returns ok=false when
+// absent, not active, or not yet expired, and a no-op when maxAge<=0. (ENG-376)
+func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration) ([]string, bool, error) {
+	if maxAge <= 0 {
+		return nil, false, nil
+	}
+	var (
+		names []string
+		ok    bool
+	)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		raw := bkt.Get([]byte(orig))
+		if raw == nil {
+			return nil
+		}
+		var e RetentionEntry
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+		}
+		if e.Status != RetentionStatusActive {
+			return nil
+		}
+		if time.Since(e.CreatedAt) < maxAge {
+			return nil
+		}
+		e.Status = RetentionStatusReaping
+		e.ReapingSince = time.Now()
+		names = e.RetainedVolumeNames
+		data, err := json.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		ok = true
+		return bkt.Put([]byte(orig), data)
+	})
+	return names, ok, err
+}
+
 // RevertToActive transitions a restoring record back to active, using a
 // compare-and-swap on Generation. Returns (true, nil) on success, (false, nil)
 // when the record is absent, not in restoring state, or the generation does not
