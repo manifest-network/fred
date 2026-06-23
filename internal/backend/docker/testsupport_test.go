@@ -89,7 +89,8 @@ type fakeDocker struct {
 // introduced by Task 10; the migration logic (Task 9) will call it via a
 // type assertion so this fake compiles cleanly today.
 type fakeVolumeBackend struct {
-	renames [][2]string // (oldName, newName) pairs, in call order
+	renames   [][2]string // (oldName, newName) pairs, in call order
+	destroyed []string    // volume ids passed to Destroy, in call order
 }
 
 // Create returns a deterministic path so any production code that calls it
@@ -98,9 +99,12 @@ func (f *fakeVolumeBackend) Create(_ context.Context, id string, _ int64) (strin
 	return filepath.Join("/var/lib/fred/volumes", id), true, nil
 }
 
-func (f *fakeVolumeBackend) Destroy(_ context.Context, _ string) error { return nil }
-func (f *fakeVolumeBackend) List() ([]string, error)                   { return nil, nil }
-func (f *fakeVolumeBackend) Validate() error                           { return nil }
+func (f *fakeVolumeBackend) Destroy(_ context.Context, id string) error {
+	f.destroyed = append(f.destroyed, id)
+	return nil
+}
+func (f *fakeVolumeBackend) List() ([]string, error) { return nil, nil }
+func (f *fakeVolumeBackend) Validate() error         { return nil }
 
 // RenameVolume captures the rename request. Returns nil unconditionally —
 // migration tests assert on the recorded renames slice rather than on a

@@ -230,6 +230,20 @@ type Config struct {
 	// by Validate. Defaults to 3.
 	RetentionOrphanConfirmations int `yaml:"retention_orphan_confirmations"`
 
+	// MaxRetainedDiskMB caps the aggregate disk (MB) the provider will hold in
+	// the retained (soft-deleted) tier across ALL tenants. When retaining a
+	// closing lease would push the total over this cap, the lease is destroyed
+	// immediately instead of retained (refuse-to-retain) — never evicting
+	// another tenant's in-grace data. 0 means unlimited (default; retained
+	// volumes still count against total_disk_mb via the admission gate, but are
+	// not separately bounded). Must be <= total_disk_mb and, when set, >= the
+	// largest single stateful SKU's disk_mb (else a SKU-legal lease could never
+	// be retained). Independent of tenant_quota.max_disk_mb: it may be smaller,
+	// in which case a tenant's max-sized lease is SKU-legal yet refused
+	// retention. Value is a plain integer in MB (mebibytes, 2^20 bytes —
+	// consistent with total_disk_mb and the SKU disk_mb fields).
+	MaxRetainedDiskMB int64 `yaml:"max_retained_disk_mb"`
+
 	// MigrationGracePeriod is how long the renamed `-prev` legacy container
 	// lingers after a successful recover-time migration before forced
 	// removal. Preserves rollback potential if the operator interrupts fred
@@ -304,6 +318,19 @@ func (c *Config) HasStatefulSKUs() bool {
 		}
 	}
 	return false
+}
+
+// largestSKUDiskMB returns the maximum disk_mb across all configured SKU
+// profiles (0 if none are stateful). Used to validate that a retained-disk cap
+// can hold at least a one-unit lease of every SKU.
+func (c *Config) largestSKUDiskMB() int64 {
+	var largest int64
+	for _, p := range c.SKUProfiles {
+		if p.DiskMB > largest {
+			largest = p.DiskMB
+		}
+	}
+	return largest
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -511,6 +538,17 @@ func (c *Config) Validate() error {
 
 	if c.RetentionOrphanConfirmations < 0 {
 		return fmt.Errorf("retention_orphan_confirmations must be non-negative")
+	}
+	if c.MaxRetainedDiskMB < 0 {
+		return fmt.Errorf("max_retained_disk_mb must be non-negative")
+	}
+	if c.MaxRetainedDiskMB > 0 {
+		if c.MaxRetainedDiskMB > c.TotalDiskMB {
+			return fmt.Errorf("max_retained_disk_mb (%d) must not exceed total_disk_mb (%d)", c.MaxRetainedDiskMB, c.TotalDiskMB)
+		}
+		if largest := c.largestSKUDiskMB(); largest > 0 && c.MaxRetainedDiskMB < largest {
+			return fmt.Errorf("max_retained_disk_mb (%d) must be >= the largest stateful SKU disk_mb (%d), else a SKU-legal lease could never be retained", c.MaxRetainedDiskMB, largest)
+		}
 	}
 
 	// Volume management validation

@@ -39,6 +39,7 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_payload_leases_awaiting > 0` for >5 min | Tenant created lease with `meta_hash` but never uploaded payload | Tenant-side issue; the lease will eventually expire |
 | `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck or panicking | Logs + `fred_reconciler_runs_total{outcome="error"}` |
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
+| `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 
 ---
 
@@ -96,6 +97,48 @@ When SKU resource pools are full, provision requests get HTTP 503 with `insuffic
 2. **Tighten SKU profiles**: smaller CPU/memory/disk per SKU lets more leases fit.
 3. **Tenant quotas**: if one tenant is hogging resources, set `tenant_quota` in `docker-backend.yaml` to cap them.
 4. **Force reconciliation**: orphan provisions (lease closed but containers still running) consume budget. The reconciler removes them on its cycle, but you can restart the backend to force an immediate cleanup.
+
+---
+
+## Reclaiming retained volumes under disk pressure
+
+Retained (soft-deleted) volumes count against the disk admission pool until they
+are reaped (`fred_docker_backend_retained_volume_bytes` shows the reserved
+footprint; `fred_docker_backend_retained_leases` the count). When retained data
+crowds out new provisioning, reclaim it least-destructive-first:
+
+1. **Assess.** Compare `fred_docker_backend_retained_volume_bytes` against
+   `fred_docker_backend_disk_pool_bytes` (and `..._retained_disk_cap_bytes` if a
+   cap is set). A rising `fred_docker_backend_retention_refused_total` means
+   closes are already being denied a grace window.
+2. **Shorten the grace window.** Lower `retention_max_age` so the reaper sweeps
+   sooner. Duration values use Go syntax (`h`/`m`/`s`) — `336h` = 14 days, not
+   `14d`.
+3. **Bound the tier.** Set/lower `max_retained_disk_mb` (per-provider) and/or
+   `max_retained_leases_per_tenant` (per-tenant). New closes over the cap
+   refuse-to-retain (destroy immediately); existing in-grace data is never
+   evicted to admit another tenant.
+4. **Force a sweep.** Restart the backend to trigger the boot-eager reaper.
+
+`max_retained_disk_mb` directly trades retained-grace capacity against
+live-provision capacity within the single `total_disk_mb` pool.
+
+**Sizing `total_disk_mb`.** Fred WARNs at startup only when `total_disk_mb`
+exceeds the filesystem's **gross** total (`statfs` f_blocks × block-size) — this
+is a coarse upper-bound guard, not a usable-capacity check. Root-reserved blocks
+and non-fred consumers (Docker image layers, logs, etc.) are **not** excluded from
+f_blocks, so the WARN fires late. Operators must leave their own headroom below
+the true usable capacity; a silent miss here means retained+live volumes can
+exhaust physical disk (tenant ENOSPC).
+
+**Per-tenant fairness.** `max_retained_leases_per_tenant` is a **count** cap: it
+limits how many retained leases one tenant may hold, but not how much **disk** they
+occupy. Under `max_retained_disk_mb`, one tenant using large-disk SKUs can fill the
+entire retained pool, after which other tenants' `RetainOnClose` closes degrade to
+refuse-to-retain (destroy, no grace window). This is an availability DoS on the
+retention feature for those tenants, not a data-theft risk — destroy only touches
+the closing lease's own volumes. True per-tenant disk fairness would require a
+per-tenant retained-disk quota (a possible follow-up).
 
 ---
 

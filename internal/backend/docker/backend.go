@@ -98,6 +98,11 @@ type Backend struct {
 	// the same ready→failed transitions and send duplicate callbacks.
 	recoverMu sync.Mutex
 
+	// retentionAccountingMu serializes refreshRetentionAccounting's
+	// recompute-from-store + SetRetainedDisk so a stale snapshot can never
+	// clobber a fresher one (which would under-count → over-admit).
+	retentionAccountingMu sync.Mutex
+
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore
 
@@ -421,6 +426,13 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		cfg.GetSKUProfile, // Use Config's resolver to avoid duplicating SKU mapping logic
 		cfg.TenantQuota,
 	)
+	setStaticPoolMetrics(cfg) // ENG-360: export static pool/cap denominators for dashboards
+	if retentionCapNeedsTenantLever(cfg) {
+		logger.Warn("max_retained_disk_mb is set but max_retained_leases_per_tenant is 0 (unlimited): one tenant can fill the retained pool, degrading others to refuse-to-retain; set a per-tenant count cap")
+	}
+	if retentionCapSetButDisabled(cfg) {
+		logger.Warn("retention cap/limit configured (max_retained_disk_mb / max_retained_leases_per_tenant) but retain_on_close=false: the cap has no effect; enable retain_on_close or remove the cap")
+	}
 
 	// Create HTTP client for callbacks
 	httpClient := &http.Client{
@@ -580,6 +592,10 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("volume manager validation failed: %w", err)
 	}
 
+	// ENG-360: warn loudly if the operator over-sized the disk pool relative to
+	// physical capacity (the invariant the hard-quota-sum model depends on).
+	b.warnIfOverProvisioned()
+
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(ctx)
 
@@ -608,6 +624,10 @@ func (b *Backend) Start(ctx context.Context) error {
 	if _, err := b.reapExpiredRetentions(b.stopCtx); err != nil {
 		b.logger.Warn("retention boot reap failed", "error", err)
 	}
+	// Belt-and-suspenders: recoverState already rebuilt the projection and the
+	// boot reap (now wired in Step 5) self-refreshes; this final call guarantees
+	// a correct projection before serving traffic even if either changes.
+	b.refreshRetentionAccounting()
 	b.startRetentionReaper()
 
 	// Replay any pending callbacks from a previous run

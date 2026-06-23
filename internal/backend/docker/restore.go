@@ -169,6 +169,22 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	if ok, err := b.retentionStore.RevertToActive(e.OriginalLeaseUUID, e.Generation); err != nil {
 		b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
 	} else if ok {
+		// Re-count retained BEFORE releasing the new lease's live allocation so the
+		// footprint is continuously counted (transient double-count = over-deny = safe),
+		// mirroring rollbackRestoreAdoption's success arm. Without this, the new-lease
+		// live pool allocation lingered after removeProvision (map delete only), leaving
+		// retained F + live F = 2F in steady state (ENG-360 Fix #1).
+		b.refreshRetentionAccounting()
+		// Derive and release the new lease's live allocation ids using the same
+		// {newLease}-{svc}-{idx} scheme as Restore()'s TryAllocateAdopt loop.
+		var liveIDs []string
+		for _, item := range e.Items {
+			for i := range item.Quantity {
+				liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
+			}
+		}
+		releaseAll(b.pool, liveIDs)
+		updateResourceMetrics(b.pool.Stats())
 		b.removeProvision(e.NewLeaseUUID)
 	}
 }
@@ -237,6 +253,7 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 			}
 		}
 	}
+	b.refreshRetentionAccounting()
 	return nil
 }
 
@@ -404,6 +421,7 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 		}
 		n++
 	}
+	b.refreshRetentionAccounting()
 	return n, nil
 }
 
@@ -428,10 +446,14 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 	for _, e := range recs {
 		b.reconcileRestoring(ctx, e)
 	}
-	if _, err := b.reconcileOrphanedRetentions(); err != nil {
-		return err
-	}
-	return nil
+	// ENG-370: prune orphaned records BEFORE ENG-360's accounting refresh so the
+	// retained-disk projection reflects this sweep's prunes. The refresh runs even
+	// when the prune returns a fail-safe error (the prune mutated nothing in that
+	// case, but the reaper above may have, and refresh is keep-last-value on a store
+	// read error).
+	_, orphanErr := b.reconcileOrphanedRetentions()
+	b.refreshRetentionAccounting()
+	return orphanErr
 }
 
 // retentionSweepInterval is the pure gating decision for the periodic sweep.
@@ -651,7 +673,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	for _, item := range rec.Items {
 		for i := range item.Quantity {
 			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if aerr := b.pool.TryAllocate(id, item.SKU, rec.Tenant); aerr != nil {
+			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
 				releaseAll(b.pool, allocatedIDs)
 				updateResourceMetrics(b.pool.Stats())
 				b.removeProvision(req.LeaseUUID)
@@ -681,6 +703,11 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			return fmt.Errorf("claim retention: %w", err)
 		}
 	}
+
+	// Claim flipped the record active→restoring (drops it from the active
+	// projection); the live allocation above already counts the bytes, so this
+	// keeps the gauge/projection consistent without an under-count window.
+	b.refreshRetentionAccounting()
 
 	// (e) Adopt: rename retained->canonical. On failure, full rollback. The
 	// worker never ran, so no actor terminal transition is coming — drop the
@@ -778,6 +805,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
 				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
 			}
+			b.refreshRetentionAccounting()
 			return
 		}
 		b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
@@ -825,18 +853,29 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 			failed = true
 		}
 	}
-	releaseAll(b.pool, allocatedIDs)
-	updateResourceMetrics(b.pool.Stats())
 	if failed {
-		logger.Warn("restore rollback: re-quarantine rename failed; leaving record restoring for reconcile sweep",
+		// Re-quarantine rename failed: the bytes remain on disk under the new-lease
+		// canonical name and the record stays 'restoring' for the next reconcile
+		// sweep. KEEP the live allocation counted (do NOT releaseAll) — releasing
+		// while the bytes persist and the restoring record is excluded from the
+		// retained projection would under-count → over-admit. The dead lease's live
+		// allocation is reclaimed when it is deprovisioned / on recover.
+		logger.Warn("restore rollback: re-quarantine rename failed; leaving record restoring + live counted for reconcile sweep",
 			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID)
-		return // do NOT RevertToActive, do NOT removeProvision; next reconcile sweep retries safely
+		return
 	}
+	// Re-quarantine succeeded: revert the record to active and re-count it as
+	// retained BEFORE releasing the live allocation, so the footprint is counted
+	// continuously (transient double-count = over-deny = safe), mirroring the
+	// deprovision retain hand-off.
 	if ok, err := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation); err != nil {
 		logger.Error("restore rollback: revert record failed", "error", err)
 	} else if !ok {
 		logger.Warn("restore rollback: record generation changed; reaper will reconcile", "lease_uuid", rec.OriginalLeaseUUID)
 	}
+	b.refreshRetentionAccounting() // retained += F (record now active)
+	releaseAll(b.pool, allocatedIDs)
+	updateResourceMetrics(b.pool.Stats())
 	if dropProvision {
 		b.removeProvision(leaseUUID)
 	}
