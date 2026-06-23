@@ -120,10 +120,13 @@ func TestReconcileOrphaned_ReappearanceResetsStreak(t *testing.T) {
 	b.retentionStore = s
 	putActiveRetention(t, s, "uA", []string{"fred-retained-uA-app-0"})
 
-	_, _ = b.reconcileOrphanedRetentions()         // streak 1
-	_, _ = b.reconcileOrphanedRetentions()         // streak 2
-	present = []string{"fred-retained-uA-app-0"}   // volume reappears
-	_, _ = b.reconcileOrphanedRetentions()         // streak reset → 0
+	_, err = b.reconcileOrphanedRetentions() // streak 1
+	require.NoError(t, err)
+	_, err = b.reconcileOrphanedRetentions() // streak 2
+	require.NoError(t, err)
+	present = []string{"fred-retained-uA-app-0"} // volume reappears
+	_, err = b.reconcileOrphanedRetentions()     // streak reset → 0
+	require.NoError(t, err)
 	present = []string{}                           // absent again
 	pruned, err := b.reconcileOrphanedRetentions() // streak 1, NOT >= 3
 	require.NoError(t, err)
@@ -154,7 +157,7 @@ func TestReconcileOrphaned_SkipsRestoringRecords(t *testing.T) {
 func TestReconcileOrphaned_MissingRootSkips(t *testing.T) {
 	b, s := newOrphanReconcileBackend(t, 1, false /*root missing*/, nil, nil)
 	putActiveRetention(t, s, "uA", []string{"fred-retained-uA-app-0"})
-	before := testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipMissingRoot))
+	before := testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRootUnverifiable))
 
 	for i := 0; i < 5; i++ {
 		pruned, err := b.reconcileOrphanedRetentions()
@@ -163,7 +166,7 @@ func TestReconcileOrphaned_MissingRootSkips(t *testing.T) {
 	}
 	got, _ := s.Get("uA")
 	assert.NotNil(t, got, "missing root must prevent any prune")
-	assert.Equal(t, before+5, testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipMissingRoot)))
+	assert.Equal(t, before+5, testutil.ToFloat64(retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRootUnverifiable)))
 }
 
 // Test #7: a List() error skips the pass (fail-safe) and surfaces the error.

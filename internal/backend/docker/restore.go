@@ -314,7 +314,7 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 			b.logger.Warn("orphan retention reconcile skipped: volume data root absent or unreadable (fail-safe)",
 				"path", b.cfg.VolumeDataPath, "error", statErr)
 			b.orphanStreaks = map[string]int{}
-			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipMissingRoot).Inc()
+			retentionOrphanSweepsSkippedTotal.WithLabelValues(orphanSkipRootUnverifiable).Inc()
 			return 0, nil
 		}
 	}

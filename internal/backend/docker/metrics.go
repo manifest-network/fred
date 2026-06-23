@@ -28,16 +28,16 @@ const (
 // Skip reasons for retentionOrphanSweepsSkippedTotal (ENG-370). Kept as
 // constants so the reconcile, the pre-init, and the tests cannot drift on a typo.
 const (
-	orphanSkipListError   = "list_error"   // volumes.List() failed (uncertain → fail-safe skip)
-	orphanSkipMissingRoot = "missing_root" // volume data root absent/unreadable (fail-safe skip)
-	orphanSkipRaced       = "raced"        // record no longer ACTIVE-and-present at delete time: concurrently restore-claimed (active→restoring) OR already removed (e.g. cap-eviction) — benign, another path owns it
-	orphanSkipDisabled    = "disabled"     // retention_orphan_confirmations == 0 (kill-switch)
-	orphanSkipStoreError  = "store_error"  // retentionStore.List() failed (fail-safe skip)
+	orphanSkipListError        = "list_error"        // volumes.List() failed (uncertain → fail-safe skip)
+	orphanSkipRootUnverifiable = "root_unverifiable" // volume data root absent OR unreadable (fail-safe skip; the specific cause is in the warn log's error field)
+	orphanSkipRaced            = "raced"             // record no longer ACTIVE-and-present at delete time: concurrently restore-claimed (active→restoring) OR already removed (e.g. cap-eviction) — benign, another path owns it
+	orphanSkipDisabled         = "disabled"          // retention_orphan_confirmations == 0 (kill-switch)
+	orphanSkipStoreError       = "store_error"       // retentionStore.List() failed (fail-safe skip)
 )
 
 // orphanSkipReasons is the closed reason set, used to pre-initialize the
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
-var orphanSkipReasons = []string{orphanSkipListError, orphanSkipMissingRoot, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
+var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRootUnverifiable, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
 
 var (
 	// provisionsTotal tracks the total number of provision attempts by outcome.
