@@ -38,6 +38,37 @@ record + its status) — no separate ledger. Plus a `retention_leaked_total` cou
 
 ---
 
+## Migration & rollback compatibility
+
+The `reaping` status is an **additive** schema change to the bbolt retention records (a new
+`Status` string value + an optional `ReapingSince` field). No data-migration step and no feature
+flag are needed (the happy paths are behavior-preserving — only the failure/abandon arms change):
+
+- **New binary, old records:** fully backward-compatible — every pre-existing `active`/`restoring`
+  record reads and behaves exactly as before.
+- **Old binary, new records (rollback during a fault window):** a `reaping` record is only ever
+  created under a degraded-store fault. An older binary has no `reaping` case, so its status
+  switches fall through to their default (**ignore**) — it will not destroy, restore, or reap the
+  record. The footprint is merely uncounted (the pre-existing under-count this ticket fixes) and
+  is reclaimed on re-upgrade. No data loss and no destructive mishandling: the unknown-status
+  default is the *inert/safe* direction (the canonical "map unknown enum → no-op" forward-compat
+  guard). This is the same safe-direction reasoning as the destroy-gate analysis in the spec.
+
+## Testing conventions
+
+- Run every task's tests with `go test -race -short` (fred convention: unguarded stress tests
+  OOM the runner under `-race`).
+- **Do NOT add `t.Parallel()`** to tests that assert on the global `retention_*` Prometheus
+  metrics — they share process-global state and would flake. Counter assertions use a
+  before/after delta (`leakBefore := testutil.ToFloat64(...)`) so they stay order-independent;
+  gauge assertions (`Set`-based) require the test to own the store state at assertion time.
+- For the store guard matrices (active / non-active / absent / expired / fresh / zero-age), a
+  **table-driven** form is idiomatic Go and preferred over copy-pasted cases.
+- The concurrency test (Task 5b) loops the interleaving many times under `-race`; a single pass
+  of a concurrent test proves nothing.
+
+---
+
 ## Task 1: Add `reaping` status + `ReapingSince` field
 
 **Files:**
@@ -434,6 +465,81 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 ```bash
 git add internal/backend/shared/retention.go internal/backend/shared/retention_test.go
 git commit -m "feat(retention): PutReaping tombstone for abandoned footprints (ENG-376)"
+```
+
+---
+
+## Task 5b: Concurrency — mark-reaping vs claim-for-restore CAS safety
+
+The reaper goroutine (`runRetentionSweep` → mark-reaping) and a `Restore()` call
+(`ClaimForRestore`) race on the same record. The old in-txn *delete* closed this race; the new
+mark-reaping must too. bbolt serializes the two `Update` txns, so this is a state-machine
+guard-composition test, not a data-race hunt — but per fred discipline a green `-race` on
+synchronous tests proves nothing, so we exercise the real interleaving many times.
+
+**Files:**
+- Test: `internal/backend/shared/retention_test.go`
+
+- [ ] **Step 1: Write the failing test**
+
+```go
+// TestMarkReaping_VsClaimForRestore_Concurrent races mark-reaping against a restore
+// claim on the SAME record many times and asserts the two atomic transitions never
+// both win: a record is never both reaping AND restoring, and exactly one wins each
+// round (whichever bbolt serializes first; the loser observes it and no-ops). ENG-376.
+func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for iter := 0; iter < 200; iter++ {
+		require.NoError(t, s.Put(sampleEntry("lease-c"))) // reset to active each round
+
+		var (
+			wg       sync.WaitGroup
+			reapOK   bool
+			reapErr  error
+			claimErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, reapOK, reapErr = s.MarkReapingIfActive("lease-c")
+		}()
+		go func() {
+			defer wg.Done()
+			_, claimErr = s.ClaimForRestore("lease-c", "new", time.Hour)
+		}()
+		wg.Wait()
+
+		require.NoError(t, reapErr)
+		claimOK := claimErr == nil
+		if !claimOK {
+			require.ErrorIs(t, claimErr, ErrNotRestorable, "claim loses only because the record is reaping")
+		}
+		assert.False(t, reapOK && claimOK, "mark-reaping and claim-for-restore must never both succeed")
+		assert.True(t, reapOK || claimOK, "exactly one transition must win each round")
+
+		got, err := s.Get("lease-c")
+		require.NoError(t, err)
+		if reapOK {
+			assert.Equal(t, RetentionStatusReaping, got.Status)
+		} else {
+			assert.Equal(t, RetentionStatusRestoring, got.Status)
+		}
+	}
+}
+```
+
+(Add `"sync"` to the test file's imports if not already present.)
+
+- [ ] **Step 2: Run it under the race detector**
+
+Run: `go test -race ./internal/backend/shared/ -run TestMarkReaping_VsClaimForRestore_Concurrent -count=1`
+Expected: PASS, no data races. (If `MarkReapingIfActive` is missing, this fails to compile — it should already exist from Task 2.)
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add internal/backend/shared/retention_test.go
+git commit -m "test(retention): concurrent mark-reaping vs claim-for-restore CAS safety (ENG-376)"
 ```
 
 ---

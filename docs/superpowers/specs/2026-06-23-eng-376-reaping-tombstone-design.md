@@ -205,6 +205,17 @@ test, so the audit is provably complete rather than best-effort.
   rollback left counted; `releaseAll` is idempotent so a later deprovision/recover is harmless.
 - **Idempotent destroy** is relied upon throughout (existing contract: already-destroyed names
   no-op).
+- **Additive schema / rollback-safe.** `reaping` is a new `Status` string value + an optional
+  `ReapingSince` field — a forward-compatible, additive change. A new binary reads every old
+  record unchanged; an older binary (rolled back during a fault window) has no `reaping` case, so
+  its status switches fall through to their default (ignore) — never destroying, restoring, or
+  reaping it. The footprint is merely uncounted (the pre-existing under-count) until re-upgrade:
+  the unknown-status default is the inert/safe direction. No data migration or feature flag is
+  needed (happy paths are behavior-preserving).
+- **CAS concurrency is tested, not asserted.** The reaper-vs-restore race (mark-reaping vs
+  `ClaimForRestore`) is covered by a looped concurrent test under `-race` (a green `-race` on
+  synchronous tests proves nothing); bbolt serializes the two `Update` txns and the guards
+  compose so exactly one transition wins.
 - **Deliberate divergence from the finalizer "give up after max retries" rule.** K8s operators
   eventually *remove a stuck finalizer and delete the object* to avoid blocking namespace
   deletion forever — accepting the leak. We do the **opposite**: a reaping record is **never**
