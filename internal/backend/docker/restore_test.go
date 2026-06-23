@@ -500,55 +500,34 @@ func TestEvictRetentionsToCap_ExcludesClosingLease(t *testing.T) {
 	require.NotNil(t, got, "closing lease's own retention record must NOT be evicted")
 }
 
-// TestEvictRetentionsToCap_ReRecordsOnDestroyFailure verifies HOLE 3: after
-// DeleteIfActive removes the record in-txn, a FAILED Destroy must re-record the
-// snapshot entry so the volume stays tracked/retryable instead of being leaked
-// permanently (mirrors reapExpiredRetentions' self-heal). The evicted record
-// must STILL be present in the store afterward.
-func TestEvictRetentionsToCap_ReRecordsOnDestroyFailure(t *testing.T) {
+// TestEvict_DestroyFail_LeavesReapingCounted verifies cap-eviction marks the
+// evicted record reaping (removing it from the active cap set), and a destroy
+// failure leaves it reaping + counted in the pool, never under-counting. ENG-376.
+func TestEvict_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedLeasesPerTenant = 1
 	rs := attachRetentionStore(t, b)
 
-	// Tenant has two active records; cap=1 forces eviction of the oldest.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "old-lease",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-old-lease-app-0"},
-		CreatedAt:           time.Now().Add(-2 * time.Hour),
-	}))
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "newer-lease",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-newer-lease-app-0"},
-		CreatedAt:           time.Now().Add(-time.Hour),
-	}))
+	// Two active records for the same tenant → evicting to cap (1) removes the oldest.
+	old := retentionEntryFixture("lease-old", "t1", time.Now().Add(-2*time.Hour))
+	old.RetainedVolumeNames = []string{"fred-retained-lease-old-app-0"}
+	require.NoError(t, rs.Put(old))
+	newer := retentionEntryFixture("lease-new", "t1", time.Now())
+	require.NoError(t, rs.Put(newer))
 
-	b.volumes = &mockVolumeManager{
-		DestroyFn: func(_ context.Context, _ string) error {
-			return errors.New("docker destroy failed")
-		},
-	}
+	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") }}
 
-	// excludeLease is the (third) closing lease; cap=1 means evict down to 0 of
-	// the remaining → both old-lease and newer-lease are eviction candidates, but
-	// oldest-first to maxPerTenant-1=0 evicts both. The Destroy failure must
-	// re-record each so nothing is lost.
-	err := b.evictRetentionsToCap(context.Background(), "tenant-a", 1, "closing")
+	err := b.evictRetentionsToCap(context.Background(), "t1", 1, "lease-new")
 	require.NoError(t, err)
 
-	// The evicted records must STILL be present (re-recorded), not lost.
-	got, err := rs.Get("old-lease")
+	got, err := rs.Get("lease-old")
 	require.NoError(t, err)
-	require.NotNil(t, got, "evicted record must be re-recorded after Destroy failure, not leaked")
-	assert.Equal(t, shared.RetentionStatusActive, got.Status)
-	assert.Equal(t, []string{"fred-retained-old-lease-app-0"}, got.RetainedVolumeNames)
-
-	got2, err := rs.Get("newer-lease")
-	require.NoError(t, err)
-	require.NotNil(t, got2, "second evicted record must also be re-recorded after Destroy failure")
+	require.NotNil(t, got, "evicted record kept as reaping tombstone on destroy fail")
+	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
+	// Pool still counts both footprints (active lease-new + reaping lease-old).
+	assert.Equal(t, int64(2*2048), b.pool.Stats().RetainedDiskMB)
 }
 
 // TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError verifies the

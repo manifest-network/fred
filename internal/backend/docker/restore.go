@@ -223,39 +223,20 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 		return nil
 	}
 	sort.Slice(active, func(i, j int) bool { return active[i].CreatedAt.Before(active[j].CreatedAt) })
-	// Evict oldest-first until maxPerTenant-1 remain (making room for one new entry).
-	// DeleteIfActive removes the record IN-TXN before we destroy its volumes, so a
-	// ClaimForRestore racing between the ListByTenant snapshot above and this loop
-	// can never have its record evicted out from under it (TOCTOU-safe): a now-
-	// restoring record returns deleted=false and is skipped.
 	for i := 0; i <= len(active)-maxPerTenant; i++ {
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap", "tenant", tenant, "lease_uuid", active[i].OriginalLeaseUUID)
-		names, deleted, err := b.retentionStore.DeleteIfActive(active[i].OriginalLeaseUUID)
-		if err != nil {
-			return err
+		// Atomic active→reaping (TOCTOU-safe: a record concurrently claimed for
+		// restore returns ok=false and is skipped). The record is the finalizer
+		// tombstone — it is removed from the active cap set immediately (making room)
+		// but stays counted in the admission pool until its volumes are confirmed gone.
+		names, ok, merr := b.retentionStore.MarkReapingIfActive(active[i].OriginalLeaseUUID)
+		if merr != nil {
+			return merr
 		}
-		if !deleted {
+		if !ok {
 			continue // concurrently claimed for restore (or already gone) — skip
 		}
-		destroyFailed := false
-		for _, name := range names {
-			if derr := b.volumes.Destroy(ctx, name); derr != nil {
-				b.logger.Error("evict: destroy retained volume failed", "volume", name, "error", derr)
-				destroyFailed = true
-			}
-		}
-		if destroyFailed {
-			// A Destroy failed AFTER DeleteIfActive atomically removed the record,
-			// which would otherwise leave the volume with NO record (never reaped/
-			// enumerable = permanent leak). Re-record the snapshot entry so the volume
-			// stays tracked and the next sweep/eviction retries (mirrors
-			// reapExpiredRetentions). Bounded, accepted re-claim possibility: the
-			// re-recorded active entry becomes restore-claimable again until reaped —
-			// same trade-off the reaper makes. (Idempotent: already-destroyed names no-op.)
-			if perr := b.retentionStore.Put(active[i]); perr != nil {
-				b.logger.Error("evict: re-record for retry failed; volume(s) leaked until manual cleanup", "lease_uuid", active[i].OriginalLeaseUUID, "error", perr)
-			}
-		}
+		b.destroyReapingVolumes(ctx, active[i].OriginalLeaseUUID, names)
 	}
 	b.refreshRetentionAccounting()
 	return nil
