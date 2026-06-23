@@ -305,7 +305,10 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 // retryReapingRecords re-attempts destruction of every reaping record's volumes
 // (the finalizer retry) and deletes each record whose volumes are confirmed gone.
 // Runs on the periodic sweep AND at boot. Fail-closed: on a store List error the
-// records are kept (footprint keeps counting). (ENG-376)
+// records are kept (footprint keeps counting). It deliberately does NOT call
+// refreshRetentionAccounting itself — the CALLER owns the refresh (runRetentionSweep
+// refreshes at the end; the boot path refreshes via reapExpiredRetentions/recoverState).
+// A new caller MUST refresh after invoking this. (ENG-376)
 func (b *Backend) retryReapingRecords(ctx context.Context) error {
 	if b.retentionStore == nil {
 		return nil
