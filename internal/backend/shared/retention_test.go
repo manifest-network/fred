@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -689,4 +690,48 @@ func TestPutActiveMerged_RestoringRefuses(t *testing.T) {
 	assert.Equal(t, RetentionStatusRestoring, got.Status)
 	assert.Equal(t, 5, got.Generation)
 	assert.Equal(t, "new-lease", got.NewLeaseUUID)
+}
+
+// TestMarkReaping_VsClaimForRestore_Concurrent races mark-reaping against a restore
+// claim on the SAME record many times and asserts the two atomic transitions never
+// both win: a record is never both reaping AND restoring, and exactly one wins each
+// round (whichever bbolt serializes first; the loser observes it and no-ops). ENG-376.
+func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for iter := 0; iter < 200; iter++ {
+		require.NoError(t, s.Put(sampleEntry("lease-c"))) // reset to active each round
+
+		var (
+			wg       sync.WaitGroup
+			reapOK   bool
+			reapErr  error
+			claimErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, reapOK, reapErr = s.MarkReapingIfActive("lease-c")
+		}()
+		go func() {
+			defer wg.Done()
+			_, claimErr = s.ClaimForRestore("lease-c", "new", time.Hour)
+		}()
+		wg.Wait()
+
+		require.NoError(t, reapErr)
+		claimOK := claimErr == nil
+		if !claimOK {
+			require.ErrorIs(t, claimErr, ErrNotRestorable, "claim loses only because the record is reaping")
+		}
+		assert.False(t, reapOK && claimOK, "mark-reaping and claim-for-restore must never both succeed")
+		assert.True(t, reapOK || claimOK, "exactly one transition must win each round")
+
+		got, err := s.Get("lease-c")
+		require.NoError(t, err)
+		if reapOK {
+			assert.Equal(t, RetentionStatusReaping, got.Status)
+		} else {
+			assert.Equal(t, RetentionStatusRestoring, got.Status)
+		}
+	}
 }
