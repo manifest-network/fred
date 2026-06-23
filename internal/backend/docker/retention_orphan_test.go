@@ -296,7 +296,11 @@ func TestReconcileOrphaned_ConcurrentRestoreRace(t *testing.T) {
 			assert.Equal(t, "uNew", rec.NewLeaseUUID)
 			sawRestored = true
 		} else {
-			// Reconcile won: record pruned, claim observed it gone.
+			// Reconcile won: record pruned, claim observed it gone. Assert the SPECIFIC
+			// error (record absent), so an unexpected ClaimForRestore failure
+			// (ErrNotRestorable, store error) fails the test loudly instead of masquerading
+			// as a successful prune.
+			require.ErrorIs(t, claimErr, shared.ErrNoRetention)
 			require.Nil(t, rec, "reconcile pruned the record; claim must have failed")
 			sawPruned = true
 		}
