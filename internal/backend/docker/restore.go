@@ -711,8 +711,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // restore. N1: compose.Down the new project FIRST (stop containers on the
 // bind-mounted volumes) BEFORE renaming volumes back — otherwise a still-running
 // container holds the volume's bind mount open. It then re-quarantines each
-// adopted volume to the retained namespace, releases the pool allocations, and
-// CAS-reverts the record to active.
+// adopted volume to the retained namespace, and CAS-reverts the record to active.
 //
 // dropProvision controls the new-lease reservation:
 //   - true  (synchronous paths: adopt failure, route failure, ack abort): no
@@ -730,6 +729,13 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // provision's expected-set entry (cleanupOrphanedVolumes' restoring arm) protects
 // the canonical volume from the orphan reaper. Reverting here would make that
 // still-live data eligible for cleanup/reaping.
+//
+// Make-before-break (ENG-376 site 4): when RevertToActive returns a STORE ERROR
+// the revert did NOT commit. The live allocation is KEPT counted (no releaseAll)
+// so the footprint is never under-counted. reconcileRestoring's orphaned arm will
+// resume the revert (via removeProvision when dropProvision=true) and release the
+// same liveIDs. For the !ok (generation changed) and success arms the prior
+// release behavior is preserved.
 func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 	allocatedIDs []string, rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger) {
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
@@ -754,16 +760,30 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID)
 		return
 	}
-	// Re-quarantine succeeded: revert the record to active and re-count it as
-	// retained BEFORE releasing the live allocation, so the footprint is counted
-	// continuously (transient double-count = over-deny = safe), mirroring the
-	// deprovision retain hand-off.
-	if ok, err := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation); err != nil {
-		logger.Error("restore rollback: revert record failed", "error", err)
-	} else if !ok {
+	// Re-quarantine succeeded. Make-before-break: only release the live allocation
+	// AFTER the destination owner (the active record) durably commits. A store ERROR
+	// means the revert did NOT commit, so we KEEP live counted (F stays counted as
+	// live — no under-count) and let reconcileRestoring resume the revert and release
+	// the same liveIDs. We still removeProvision for dropProvision=true so reconcile's
+	// orphaned arm (live=false) runs — a lingering Provisioning provision would make
+	// reconcileRestoring defer forever.
+	ok, rerr := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation)
+	if rerr != nil {
+		retentionLeakedTotal.Inc()
+		logger.Error("restore rollback: revert record failed; keeping live allocation counted until reconcile resumes the revert",
+			"lease_uuid", rec.OriginalLeaseUUID, "error", rerr)
+		if dropProvision {
+			b.removeProvision(leaseUUID)
+		}
+		return
+	}
+	if !ok {
+		// Generation changed: the record was reverted/re-claimed elsewhere (now active
+		// or owned by a new restore). It is counted there, so RELEASE live to avoid a
+		// 2F double-count — matching the prior behavior for this benign case.
 		logger.Warn("restore rollback: record generation changed; reaper will reconcile", "lease_uuid", rec.OriginalLeaseUUID)
 	}
-	b.refreshRetentionAccounting() // retained += F (record now active)
+	b.refreshRetentionAccounting() // retained += F (record now active, if ok)
 	releaseAll(b.pool, allocatedIDs)
 	updateResourceMetrics(b.pool.Stats())
 	if dropProvision {
