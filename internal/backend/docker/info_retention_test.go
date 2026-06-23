@@ -84,6 +84,24 @@ func TestGetProvision_Retained_Restoring(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusRetained, info.Status)
 }
 
+// TestStatusAudit_GetProvision_ReapingNotReported pins the §E "apply it evenly"
+// audit for the GetProvision retained-status reader (info.go): a record in the
+// reaping (pending-destroy) state must NOT be reported as retained. A reaping
+// tombstone is an expired/evicted record being reaped OR a deprovision give-up's
+// leaked footprint — never restorable — so reporting it as retained would tell a
+// tenant their closed/expired lease is restorable. With no provision/diagnostics
+// it must fall through to ErrNotProvisioned. (ENG-376)
+func TestStatusAudit_GetProvision_ReapingNotReported(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	entry := retentionEntryFixture("lease-r", "tenant-a", time.Now())
+	entry.Status = shared.RetentionStatusReaping
+	require.NoError(t, rs.Put(entry))
+
+	_, err := b.GetProvision(context.Background(), "lease-r")
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned,
+		"a reaping record must not be reported as retained; it falls through")
+}
+
 // TestGetProvision_NoRetentionRecord_NotProvisioned asserts that with a
 // retention store present but no record (and no provision/diagnostics), the
 // result is ErrNotProvisioned.
