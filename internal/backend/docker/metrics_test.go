@@ -9,9 +9,11 @@ import (
 )
 
 func TestUpdateRetentionMetrics(t *testing.T) {
-	updateRetentionMetrics(2048, 3) // 2048 MB, 3 retained leases
+	updateRetentionMetrics(2048, 3, 512, 1) // 2048 MB admission total, 3 active, 512 MB reaping (1 record)
 	assert.Equal(t, float64(2048)*bytesPerMiB, testutil.ToFloat64(retainedVolumeBytes))
 	assert.Equal(t, float64(3), testutil.ToFloat64(retainedLeases))
+	assert.Equal(t, float64(512)*bytesPerMiB, testutil.ToFloat64(retentionReapingBytes))
+	assert.Equal(t, float64(1), testutil.ToFloat64(retentionReapingLeases))
 }
 
 func TestSetStaticPoolMetrics(t *testing.T) {
