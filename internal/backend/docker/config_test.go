@@ -615,6 +615,7 @@ func TestConfig_RetentionDefaults(t *testing.T) {
 	assert.Equal(t, 90*24*time.Hour, cfg.RetentionMaxAge)
 	assert.Equal(t, time.Hour, cfg.RetentionReapInterval)
 	assert.Equal(t, 0, cfg.MaxRetainedLeasesPerTenant)
+	assert.Equal(t, 3, cfg.RetentionOrphanConfirmations)
 }
 
 func TestConfig_RetentionValidation(t *testing.T) {
@@ -639,11 +640,17 @@ func TestConfig_RetentionValidation(t *testing.T) {
 			wantErr: "max_retained_leases_per_tenant must be non-negative",
 		},
 		{
+			name:    "negative retention_orphan_confirmations",
+			mutate:  func(c *Config) { c.RetentionOrphanConfirmations = -1 },
+			wantErr: "retention_orphan_confirmations must be non-negative",
+		},
+		{
 			name: "zero retention values are valid",
 			mutate: func(c *Config) {
 				c.RetentionMaxAge = 0
 				c.RetentionReapInterval = 0
 				c.MaxRetainedLeasesPerTenant = 0
+				c.RetentionOrphanConfirmations = 0
 			},
 		},
 	}
