@@ -64,7 +64,7 @@ type RetentionStore struct {
 
 // NewRetentionStore opens or creates a bbolt database for retention persistence.
 // No background cleanup loop is started; the docker backend drives reaping
-// explicitly via ReapIfExpired / ListExpired.
+// explicitly via MarkReapingIfExpired / ListExpired.
 func NewRetentionStore(cfg RetentionStoreConfig) (*RetentionStore, error) {
 	base, err := openBoltStore(boltStoreConfig{
 		DBPath:     cfg.DBPath,
@@ -312,66 +312,6 @@ func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Dura
 	return out, err
 }
 
-// ReapIfExpired deletes the record only if it is STILL active AND expired.
-// Returns the retained volume names for the caller to destroy AFTER the
-// transaction commits. Returns nil, nil when the record is absent, not active,
-// or not yet expired.
-func (s *RetentionStore) ReapIfExpired(orig string, maxAge time.Duration) ([]string, error) {
-	if maxAge <= 0 {
-		return nil, nil
-	}
-	var names []string
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket(retentionBucketName)
-		raw := bkt.Get([]byte(orig))
-		if raw == nil {
-			return nil
-		}
-		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
-		}
-		if e.Status != RetentionStatusActive {
-			return nil
-		}
-		if time.Since(e.CreatedAt) < maxAge {
-			return nil
-		}
-		names = e.RetainedVolumeNames
-		return bkt.Delete([]byte(orig))
-	})
-	return names, err
-}
-
-// DeleteIfActive atomically removes a record ONLY if it is still ACTIVE,
-// returning its retained volume names for the caller to destroy AFTER the
-// txn commits. deleted=false (nil names) when absent or not active (e.g.
-// concurrently claimed for restore), so cap-eviction never races a restore.
-func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
-	var (
-		names   []string
-		deleted bool
-	)
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket(retentionBucketName)
-		raw := bkt.Get([]byte(orig))
-		if raw == nil {
-			return nil
-		}
-		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
-		}
-		if e.Status != RetentionStatusActive {
-			return nil
-		}
-		names = e.RetainedVolumeNames
-		deleted = true
-		return bkt.Delete([]byte(orig))
-	})
-	return names, deleted, err
-}
-
 // MarkReapingIfActive atomically transitions an ACTIVE record to reaping and
 // returns its volume names for the caller to destroy AFTER the txn commits.
 // ok=false (nil names) when absent or not active (e.g. concurrently claimed for
@@ -409,7 +349,7 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 }
 
 // MarkReapingIfExpired atomically transitions an ACTIVE, expired record to
-// reaping (mirrors ReapIfExpired's guards) and returns its volume names for the
+// reaping and returns its volume names for the
 // caller to destroy AFTER the txn commits. The record is NOT deleted — it stays a
 // counted tombstone until the volumes are confirmed gone. Returns ok=false when
 // absent, not active, or not yet expired, and a no-op when maxAge<=0. (ENG-376)
