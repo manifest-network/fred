@@ -145,9 +145,19 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// Retained set may have changed (this close may have added a retained
 	// record below, or a prior attempt did); refresh after the volume branch.
 	// For the retain path, also release live AFTER refresh (overlap, no gap).
+	//
+	// Gated on `retaining`: the non-retain else branch only destroys this lease's
+	// own canonical volumes and never touches the retention store, so the retained
+	// projection cannot change on a non-retain close — skip the O(#retained) bbolt
+	// List() scan entirely on that (hot) path. releaseLiveOnRetainPath is only ever
+	// set inside the retain branch, and non-retain releases live inline after a
+	// successful destroy, so nothing is missed by returning early here.
 	defer func() {
+		if !retaining {
+			return
+		}
 		b.refreshRetentionAccounting()
-		if retaining && releaseLiveOnRetainPath {
+		if releaseLiveOnRetainPath {
 			releaseLive()
 		}
 	}()
