@@ -409,6 +409,34 @@ func TestDeleteIfActive_AbsentNoOp(t *testing.T) {
 	assert.Nil(t, names)
 }
 
+// TestMarkReapingIfActive verifies active→reaping is atomic, returns the volume
+// names, stamps ReapingSince, and refuses non-active records (ok=false, untouched).
+func TestMarkReapingIfActive(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("lease-a"))) // active, vols [vol-a vol-b]
+
+	names, ok, err := s.MarkReapingIfActive("lease-a")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.ElementsMatch(t, []string{"vol-a", "vol-b"}, names)
+
+	got, err := s.Get("lease-a")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, RetentionStatusReaping, got.Status)
+	assert.False(t, got.ReapingSince.IsZero(), "ReapingSince must be stamped")
+
+	// Second call: already reaping → ok=false, no error.
+	_, ok, err = s.MarkReapingIfActive("lease-a")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	// Absent key → ok=false, no error.
+	_, ok, err = s.MarkReapingIfActive("nonexistent")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
 // TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
 // absent key writes the base entry verbatim and returns ok=true.
 func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {

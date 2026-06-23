@@ -327,6 +327,42 @@ func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
 	return names, deleted, err
 }
 
+// MarkReapingIfActive atomically transitions an ACTIVE record to reaping and
+// returns its volume names for the caller to destroy AFTER the txn commits.
+// ok=false (nil names) when absent or not active (e.g. concurrently claimed for
+// restore). The record is NOT deleted — it is the finalizer tombstone that keeps
+// the footprint counted until the volumes are confirmed gone. (ENG-376)
+func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error) {
+	var (
+		names []string
+		ok    bool
+	)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		raw := bkt.Get([]byte(orig))
+		if raw == nil {
+			return nil
+		}
+		var e RetentionEntry
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+		}
+		if e.Status != RetentionStatusActive {
+			return nil
+		}
+		e.Status = RetentionStatusReaping
+		e.ReapingSince = time.Now()
+		names = e.RetainedVolumeNames
+		data, err := json.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		ok = true
+		return bkt.Put([]byte(orig), data)
+	})
+	return names, ok, err
+}
+
 // RevertToActive transitions a restoring record back to active, using a
 // compare-and-swap on Generation. Returns (true, nil) on success, (false, nil)
 // when the record is absent, not in restoring state, or the generation does not
