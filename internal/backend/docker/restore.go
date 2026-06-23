@@ -297,8 +297,11 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 	}
 	n := b.cfg.RetentionOrphanConfirmations
 	if n <= 0 {
-		// Kill-switch (0 = disabled). Log once per sweep so a flip-to-0 is not silent.
-		b.logger.Info("orphan retention reconcile disabled (retention_orphan_confirmations=0)")
+		// Kill-switch (0 = disabled). DEBUG-level (not INFO): the sweep cadence is
+		// configurable, so an INFO every sweep would be sustained noise when pruning is
+		// intentionally disabled. The retentionOrphanSkipsTotal{reason="disabled"} counter
+		// is the always-on, queryable "feature is off" signal.
+		b.logger.Debug("orphan retention reconcile disabled (retention_orphan_confirmations=0)")
 		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipDisabled).Inc()
 		return 0, nil
 	}
