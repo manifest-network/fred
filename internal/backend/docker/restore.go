@@ -240,6 +240,26 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 	return nil
 }
 
+// volumeRootUnverifiable reports whether a volume-root probe means the orphan
+// reconcile must skip this pass (fail-safe). exists/statErr come from pathExists:
+// an absent root (false,nil) OR any stat error (false,err — permission denied,
+// EIO, …) is unverifiable. Deliberately NOT an os.IsNotExist-only check: an
+// unreadable root is as uncertain as a missing one (kubelet #72257 hazard).
+func volumeRootUnverifiable(exists bool, statErr error) bool {
+	return statErr != nil || !exists
+}
+
+// allVolumesAbsent reports whether none of names is in the present set. An empty
+// name set is vacuously absent (covers legacy zero-volume records).
+func allVolumesAbsent(names []string, present map[string]bool) bool {
+	for _, n := range names {
+		if present[n] {
+			return false
+		}
+	}
+	return true
+}
+
 // reapExpiredRetentions hard-deletes retained volumes past RetentionMaxAge.
 // Returns the count of records FULLY reaped (all volumes destroyed AND the
 // record removed). If a Destroy fails after ReapIfExpired atomically removed the
