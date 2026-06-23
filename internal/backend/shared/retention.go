@@ -20,6 +20,13 @@ const RetentionStatusActive = "active"
 // RetentionStatusRestoring is the status of an entry currently being restored.
 const RetentionStatusRestoring = "restoring"
 
+// RetentionStatusReaping marks a record whose volumes are pending physical
+// destruction: the bytes are still on disk (so the footprint must keep counting
+// in the admission projection) but the record is NOT restore-claimable. It is a
+// finalizer tombstone — kept until every volume is confirmed destroyed, then
+// Delete()d. See ENG-376.
+const RetentionStatusReaping = "reaping"
+
 var (
 	// ErrNoRetention is returned when no retained data exists for a given lease UUID.
 	ErrNoRetention = errors.New("no retained data for lease")
@@ -41,6 +48,7 @@ type RetentionEntry struct {
 	Generation          int                     `json:"generation"`
 	CreatedAt           time.Time               `json:"created_at"`
 	RestoringSince      time.Time               `json:"restoring_since,omitempty"`
+	ReapingSince        time.Time               `json:"reaping_since,omitempty"`
 }
 
 // RetentionStoreConfig configures the retention store.
