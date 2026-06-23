@@ -76,6 +76,11 @@ ledger — the existing record (with a new status) is the single source of truth
   volumes are pending destruction, the bytes are still on disk, and it is **not**
   restore-claimable. `ClaimForRestore` and `PutActiveMerged` already reject non-`active`
   records, so the restore race stays closed with **zero new guard code**.
+- New field `ReapingSince time.Time` (mirrors the existing `RestoringSince`), stamped on the
+  `active`→`reaping` transition / `PutReaping`. It powers stuck-vs-transient triage: a record
+  reaping for seconds is a normal in-flight destroy; one reaping for days is a poison-pill the
+  operator must reclaim. Consistent with the codebase's `Status` + `*Since` convention (chosen
+  over the generic "prefer a `deleted_at` flag" advice precisely to match the existing model).
 - New store methods:
   - `MarkReapingIfExpired(orig, maxAge) (names []string, ok bool, err error)` — atomic
     `active`→`reaping` for an expired record; returns the volume names. Replaces the
@@ -105,6 +110,10 @@ ledger — the existing record (with a new status) is the single source of truth
   - `fred_docker_backend_retention_reaping_bytes` (gauge) — outstanding pending-cleanup
     footprint (reaping subset), set during refresh. Alertable: a non-zero, non-decreasing value
     means a leak the sweep cannot reclaim → operator action.
+  - `fred_docker_backend_retention_reaping_leases` (gauge) — count of reaping records (DLQ-style
+    "depth"). Following the DLQ best practice *"alert on depth > 0; even one means investigate,"*
+    the OPERATIONS alert fires when `reaping_bytes`/`reaping_leases` stay > 0 across multiple
+    sweep intervals (a transient destroy retry clears within one).
 
 ### C. The four sites
 
@@ -138,10 +147,37 @@ ledger — the existing record (with a new status) is the single source of truth
   (idempotent; already-gone names no-op) → `Delete` the record when **all** destroys succeed;
   leave `reaping` + `retention_leaked_total`++ otherwise.
 - Wire it into both the periodic `runRetentionSweep` and the boot `reconcileRetentions`.
+- **Confirm-gone semantics:** the record is deleted when `Destroy` returns nil for every name.
+  Because `Destroy` is idempotent (already-gone names no-op), this also reclaims a volume an
+  operator deleted out-of-band (manual `rm`) on the next sweep. Single-sweep delete is safe here
+  — destroy is *terminal* (the volume is being removed), so there is no create/restore race like
+  ENG-370's orphan prune (which needs N-sweep confirmation because its target may be mid-creation).
 - Fail-closed: on a store/`List` error, keep the records (keep counting). A reaping record's
   canonical volume is **not** added to `cleanupOrphanedVolumes`' protected set (we *want* it
   reaped); `fred-retained-*` reaping volumes are already skipped by `isRetainedVolume` and are
   handled by `retryReapingRecords`.
+
+### E. The "apply it evenly" audit (tombstone pitfall #1)
+
+The most common soft-delete/tombstone defect is a new status that *leaks through a code path
+which did not get the same handling* — totals drift, or a background job acts on a record it
+should have skipped. Introducing `reaping` therefore requires an **exhaustive audit of every
+site that reads `RetentionEntry.Status`**, as a hard acceptance gate. Known sites and the
+required handling:
+
+| Site | `reaping` handling |
+| --- | --- |
+| `computeRetainedDiskMB` | **count** (active + reaping) |
+| `retained_leases` gauge / cap count in `evictRetentionsToCap` | **exclude** (active-only) |
+| `ClaimForRestore`, `PutActiveMerged` | **reject** (already active-only — verify) |
+| `reconcileRetentions` (boot switch) | **new arm** → `retryReapingRecords` |
+| `cleanupOrphanedVolumes` protected-set | **do not protect** reaping canonicals |
+| `ListExpired` (re-mark) | **exclude** (never re-mark a reaping record) |
+| `shouldRefuseRetention` (`rec != nil` → don't refuse) | non-nil reaping → don't refuse (data-safe; verify) |
+| `recoverState` retention rebuild | reaping records counted via refresh; not restored |
+
+The plan must grep for every `e.Status ==` / `Status !=` and add the site to this table with a
+test, so the audit is provably complete rather than best-effort.
 
 ## Concurrency & safety review
 
@@ -158,6 +194,15 @@ ledger — the existing record (with a new status) is the single source of truth
   rollback left counted; `releaseAll` is idempotent so a later deprovision/recover is harmless.
 - **Idempotent destroy** is relied upon throughout (existing contract: already-destroyed names
   no-op).
+- **Deliberate divergence from the finalizer "give up after max retries" rule.** K8s operators
+  eventually *remove a stuck finalizer and delete the object* to avoid blocking namespace
+  deletion forever — accepting the leak. We do the **opposite**: a reaping record is **never**
+  auto-deleted while its volumes persist, because the record *is* the accounting and deleting it
+  re-introduces the original under-count. There is therefore no `maxAttempts` give-up on the
+  reaping retry. The escalation path is the **alert** (`retention_reaping_bytes` /
+  `retention_reaping_leases` > 0 sustained, `ReapingSince` aging) and the **manual runbook
+  reclaim**, not auto-deletion. This is the right trade-off for an *accounting* tombstone versus
+  a *deletion-blocking* finalizer.
 
 ## Testing (TDD)
 
@@ -175,16 +220,23 @@ ledger — the existing record (with a new status) is the single source of truth
   reflects the outstanding reaping footprint.
 - **store-method unit tests** for `MarkReaping*` / `ListReaping` / `PutReaping` (CAS, guards,
   idempotency), mirroring the existing `RevertToActive`/`ReapIfExpired` tests.
+- **status-branch audit test:** for each row of the §E table, a test asserting the correct
+  `reaping` behavior (e.g. `ClaimForRestore` rejects a reaping record, `cleanupOrphanedVolumes`
+  does not protect a reaping canonical, `ListExpired` never returns a reaping record). This is
+  how the "apply it evenly" gate is made provable.
 - Run with `-race -short` (fred convention).
 
 ## Docs
 
 - **OPERATIONS.md** — new subsection under "Reclaiming retained volumes under disk pressure":
   "Reclaiming leaked / stuck-reaping orphan volumes" — keyed off `retention_leaked_total` /
-  `retention_reaping_bytes`, explaining that `fred-retained-*` (and leaked-canonical) orphans
-  are deliberately skipped by `cleanupOrphanedVolumes`, that the sweep now auto-retries reaping
-  records, and the manual `docker volume`/`rm -rf <data-dir>` reclaim procedure for a volume the
-  sweep cannot destroy (with the caution to confirm no live/restoring record references it).
+  `retention_reaping_bytes` / `retention_reaping_leases`, explaining that `fred-retained-*` (and
+  leaked-canonical) orphans are deliberately skipped by `cleanupOrphanedVolumes`, that the sweep
+  now auto-retries reaping records, and the manual `docker volume`/`rm -rf <data-dir>` reclaim
+  procedure for a volume the sweep cannot destroy (with the caution to confirm no live/restoring
+  record references it). Includes the **alert rule** (DLQ-style): `retention_reaping_bytes > 0`
+  sustained across several sweep intervals (a transient destroy clears within one) → investigate;
+  add a row to the "Common alerts" table.
 - **Linear ENG-376** — comment that reaping-tombstone + make-before-break supersedes Option A
   (single source of truth; no addend bucket; site 4 fixed via the codebase's own make-before-break
   idiom rather than a side-ledger).
