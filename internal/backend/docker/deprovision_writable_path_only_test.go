@@ -497,13 +497,6 @@ func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 	assert.NotNil(t, rec, "ambiguous volume must be retained with a record")
 }
 
-// TestSetupWritablePathBinds_WipesStaleContentAndReseeds pins the ENG-367
-// writable-path wipe mechanism at the unit level: setupWritablePathBinds
-// RemoveAll's any prior _wp content (a stale extraction or tenant writes) and
-// re-extracts fresh from the image on every call. This is the durability contract
-// that makes ENG-406's reclaim-at-close behavior-preserving — writable-path data
-// is image-derived and never survives a redeploy/restore. It re-pins, at the unit
-// level, the contract the repurposed grafana integration test used to assert.
 // TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName guards a data-loss
 // name collision the ENG-406 review surfaced: sanitizeVolumePath can legally
 // produce "_wp" (an image declaring VOLUME /_wp, or /_wp/...). Without a guard,
@@ -527,6 +520,91 @@ func TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName(t *testing.T) 
 	require.Len(t, binds, 1)
 }
 
+// TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained guards a data-loss edge
+// (ENG-406 review): a declared VOLUME that sanitizes to the xfs marker name
+// (.fred-project-id) creates a STATEFUL directory of that name under the volume
+// root. The detector must whitelist the marker only as a regular FILE (the real
+// xfs quota marker) — a directory of that name is tenant data, so a volume holding
+// such a dir alongside a _wp scaffolding subtree must be RETAINED, not destroyed.
+// (On btrfs/zfs there is no real marker; on xfs such a VOLUME collides with the
+// marker file and fails at provision.)
+func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
+	server, callbackDone := retainCloseServer(t)
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+	canonical0 := canonicalVolumeName("lease-mk", "web", 0)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-mk": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-mk", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-mk-web-0", "docker-micro", "tenant-a"))
+
+	// A stateful directory named like the xfs marker, alongside a _wp subtree.
+	volRoot := t.TempDir()
+	stageVolumeDirs(t, volRoot, map[string][]string{
+		canonical0: {projectIDFile, filepath.Join(writablePathSubdir, "var")},
+	})
+
+	var destroyed []string
+	var renamed [][2]string
+	b.volumes = &mockVolumeManager{
+		defaultDir: volRoot,
+		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			destroyed = append(destroyed, id)
+			return nil
+		},
+		RenameVolumeFn: func(old, newName string) error {
+			renamed = append(renamed, [2]string{old, newName})
+			return nil
+		},
+	}
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-mk"))
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	assert.Empty(t, destroyed, "a marker-NAMED stateful directory is tenant data → must not be destroyed")
+	assert.Equal(t, [][2]string{{canonical0, retainedName(canonical0)}}, renamed,
+		"volume with a marker-named stateful dir (plus _wp) must be retained")
+	rec, err := rs.Get("lease-mk")
+	require.NoError(t, err)
+	assert.NotNil(t, rec)
+}
+
+// TestSetupWritablePathBinds_WipesStaleContentAndReseeds pins the ENG-367
+// writable-path wipe mechanism at the unit level: setupWritablePathBinds
+// RemoveAll's any prior _wp content (a stale extraction or tenant writes) and
+// re-extracts fresh from the image on every call. This is the durability contract
+// that makes ENG-406's reclaim-at-close behavior-preserving — writable-path data
+// is image-derived and never survives a redeploy/restore. It re-pins, at the unit
+// level, the contract the repurposed grafana integration test used to assert.
 func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})

@@ -46,9 +46,13 @@ func (b *Backend) isWritablePathOnly(name string) bool {
 			// the container can't write the volume root, so a file/symlink named _wp
 			// is unexpected — fall through to retain rather than destroy.
 			sawWritablePathDir = true
-		case e.Name() == projectIDFile:
-			// xfs writes this quota marker file inside every volume root; it is
+		case e.Name() == projectIDFile && !e.IsDir():
+			// xfs writes this quota marker FILE inside every volume root; it is
 			// fred housekeeping, not tenant data. btrfs/zfs write nothing here.
+			// Only a regular file is the real marker — a DIRECTORY of this name is
+			// tenant data from a declared VOLUME (e.g. VOLUME /.fred-project-id) and
+			// must NOT be whitelisted, or the volume would be misclassified and
+			// destroyed. Such a dir falls through to the default arm → retain.
 		default:
 			// Any other top-level entry is a declared-VOLUME data subdir (created by
 			// buildStatefulVolumeBinds), or an unexpected/non-directory _wp → stateful
