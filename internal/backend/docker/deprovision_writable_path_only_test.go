@@ -683,6 +683,86 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 		"both retained volumes must be counted (the dangerous direction is UNDER-count → over-admit)")
 }
 
+// TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted guards the
+// over-admit hazard the ENG-406 review flagged (Copilot): in the refuse-to-retain
+// branch, releasing the live allocation must be gated on the OVERALL volume-error
+// count, not just NEW errors from destroyOnRefuseToRetain. A writable-path-only
+// Destroy that failed BEFORE the switch leaves bytes on disk; if the subsequent
+// refuse-destroy succeeds, the old `len(volumeErrs) == prevErrCount` guard would
+// still release live (under-count → over-admit/ENOSPC). Here the wp-only Destroy
+// fails while the refused stateful Destroy succeeds, so live must stay counted.
+func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T) {
+	server, _ := retainCloseServer(t)
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	items := []backend.LeaseItem{
+		{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},   // stateful → refused (destroyed OK)
+		{SKU: "docker-micro", Quantity: 1, ServiceName: "dash"}, // writable-path-only → Destroy FAILS
+	}
+	dbVol := canonicalVolumeName("lease-rf", "db", 0)
+	dashVol := canonicalVolumeName("lease-rf", "dash", 0)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-rf": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-rf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1"},
+			CallbackURL:  server.URL,
+			Items:        items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				"db":   {Image: "redis:7"},
+				"dash": {Image: "grafana/grafana:11.1.0"},
+			}},
+		}},
+	})
+
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.cfg.MaxRetainedDiskMB = 300 // < 512 → durableItems=[db]=512 breaches → refuse-to-retain
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-rf-db-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("lease-rf-dash-0", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
+
+	volRoot := t.TempDir()
+	stageVolumeDirs(t, volRoot, map[string][]string{
+		dbVol:   {"data"},                                   // stateful
+		dashVol: {filepath.Join(writablePathSubdir, "var")}, // writable-path-only
+	})
+
+	b.volumes = &mockVolumeManager{
+		defaultDir: volRoot,
+		ListFn:     func() ([]string, error) { return []string{dbVol, dashVol}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			if id == dashVol {
+				return assert.AnError // the writable-path-only Destroy fails (bytes remain on disk)
+			}
+			return nil // the refused stateful Destroy succeeds
+		},
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	// The close errors because the wp-only Destroy failed; the lease stays Failed
+	// for retry. The deferred hand-off runs on return.
+	require.Error(t, b.Deprovision(context.Background(), "lease-rf"),
+		"close must surface the failed writable-path-only Destroy")
+
+	// Live must NOT be released: dash's bytes remain on disk, so counting them
+	// keeps admission honest until the retry destroys them.
+	assert.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB,
+		"live must stay counted when a reclaimed wp-only volume's Destroy failed (bytes still on disk)")
+}
+
 // TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively guards the
 // detector hardening (Copilot): a top-level entry NAMED _wp but that is a file or
 // symlink (not a directory) is unexpected — setupWritablePathBinds always creates

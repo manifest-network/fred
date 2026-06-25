@@ -274,11 +274,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				releaseLiveOnRetainPath = true
 			}
 		case b.shouldRefuseRetention(leaseUUID, durableItems):
-			prevErrCount := len(volumeErrs)
 			volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, logger)...)
-			if len(volumeErrs) == prevErrCount {
-				// All canonical volumes destroyed without error — bytes are gone,
-				// so it is safe to release the live allocation.
+			if len(volumeErrs) == 0 {
+				// Every byte is gone — the refused stateful volumes here AND any
+				// writable-path-only volumes reclaimed before the switch — so release
+				// the live allocation. Guard on the OVERALL error count (not just new
+				// errors from destroyOnRefuseToRetain): a pre-switch wp-only Destroy
+				// failure already in volumeErrs leaves bytes on disk, so keep live
+				// counted and let the retry re-attempt rather than under-count
+				// (over-admit/ENOSPC). Consistent with the other release-live arms.
 				releaseLiveOnRetainPath = true
 			}
 		default:
