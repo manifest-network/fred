@@ -504,6 +504,29 @@ func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 // that makes ENG-406's reclaim-at-close behavior-preserving — writable-path data
 // is image-derived and never survives a redeploy/restore. It re-pins, at the unit
 // level, the contract the repurposed grafana integration test used to assert.
+// TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName guards a data-loss
+// name collision the ENG-406 review surfaced: sanitizeVolumePath can legally
+// produce "_wp" (an image declaring VOLUME /_wp, or /_wp/...). Without a guard,
+// buildStatefulVolumeBinds would create that service's STATEFUL data under the
+// volume root's _wp directory, which isWritablePathOnly then misclassifies as
+// ephemeral scaffolding and DESTROYS at close. Since _wp is reserved for
+// writable-path scaffolding, a colliding declared VOLUME must be rejected at
+// provision (fail closed) rather than silently lost at close.
+func TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName(t *testing.T) {
+	host := t.TempDir()
+
+	_, err := buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir}, 0, 0)
+	require.Error(t, err, "a VOLUME that sanitizes to the reserved _wp name must be rejected")
+
+	_, err = buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir + "/data"}, 0, 0)
+	require.Error(t, err, "a VOLUME nested under the reserved _wp dir must also be rejected")
+
+	// A normal declared VOLUME is unaffected.
+	binds, err := buildStatefulVolumeBinds(host, []string{"/data"}, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, binds, 1)
+}
+
 func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})

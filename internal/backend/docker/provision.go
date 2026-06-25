@@ -402,6 +402,14 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 		if sanitized == "" {
 			return nil, fmt.Errorf("image declares unsupported VOLUME path %q", volPath)
 		}
+		// Reserve the _wp directory for writable-path scaffolding. A declared VOLUME
+		// that sanitizes to _wp (e.g. VOLUME /_wp) or nests under it would place
+		// STATEFUL data under the volume root's _wp subtree, which isWritablePathOnly
+		// (deprovision.go) would then misclassify as ephemeral scaffolding and DESTROY
+		// at close — silent tenant data loss. Fail closed at provision instead.
+		if sanitized == writablePathSubdir || strings.HasPrefix(sanitized, writablePathSubdir+"/") {
+			return nil, fmt.Errorf("image declares VOLUME %q that collides with the reserved writable-path directory %q", volPath, writablePathSubdir)
+		}
 		subdir := filepath.Join(hostPath, sanitized)
 		if err := os.MkdirAll(subdir, 0o700); err != nil {
 			return nil, fmt.Errorf("volume subdir %q: %w", subdir, err)
