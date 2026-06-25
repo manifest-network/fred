@@ -393,6 +393,39 @@ func TestPutReaping(t *testing.T) {
 	assert.Equal(t, RetentionStatusActive, got.Status, "active record must be untouched")
 }
 
+// TestPutReaping_ReLeakPreservesStoredAccounting verifies a re-leak with PARTIAL base
+// data does not clobber the stored entry's accounting/identity fields — only newly
+// discovered volume names are unioned in. Guards a future caller from under-counting the
+// reaping footprint by overwriting Items/Tenant/ProviderUUID (Copilot review). ENG-376.
+func TestPutReaping_ReLeakPreservesStoredAccounting(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	first := sampleEntry("lease-y") // Items [{sku-1, qty 2}], Tenant tenant-a, ProviderUUID provider-1
+	first.RetainedVolumeNames = []string{"vol-a", "vol-b"}
+	ok, err := s.PutReaping(first)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// A future caller re-leaks with PARTIAL data (empty Items/Tenant/ProviderUUID) plus
+	// a newly discovered volume name.
+	partial := RetentionEntry{
+		OriginalLeaseUUID:   "lease-y",
+		RetainedVolumeNames: []string{"vol-c"},
+	}
+	ok, err = s.PutReaping(partial)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	got, err := s.Get("lease-y")
+	require.NoError(t, err)
+	// Accounting/identity fields preserved from the first (full) write — NOT clobbered.
+	assert.Equal(t, first.Items, got.Items, "Items must survive a partial re-leak (else reaping footprint under-counts)")
+	assert.Equal(t, "tenant-a", got.Tenant, "Tenant preserved")
+	assert.Equal(t, "provider-1", got.ProviderUUID, "ProviderUUID preserved")
+	// The newly discovered volume name is unioned in.
+	assert.ElementsMatch(t, []string{"vol-a", "vol-b", "vol-c"}, got.RetainedVolumeNames)
+}
+
 // TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
 // absent key writes the base entry verbatim and returns ok=true.
 func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {

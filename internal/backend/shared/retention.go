@@ -164,8 +164,14 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 			case RetentionStatusActive, RetentionStatusRestoring:
 				return nil // already counted/owned — refuse, ok stays false
 			case RetentionStatusReaping:
-				base.ReapingSince = stored.ReapingSince // preserve aging
-				base.RetainedVolumeNames = dedupUnion(stored.RetainedVolumeNames, base.RetainedVolumeNames)
+				// Re-leak of a lease that already has a reaping tombstone: preserve the
+				// stored entry's accounting/identity fields (Items/Tenant/ProviderUUID/
+				// CreatedAt/ReapingSince) WHOLESALE and only union any newly discovered
+				// volume names, so a future caller passing partial `base` data can never
+				// clobber a still-counted footprint (mirrors PutActiveMerged's
+				// preserve-stored idiom; honors this method's "never clobbers" contract).
+				stored.RetainedVolumeNames = dedupUnion(stored.RetainedVolumeNames, base.RetainedVolumeNames)
+				base = stored
 			}
 		}
 		data, err := json.Marshal(base)
