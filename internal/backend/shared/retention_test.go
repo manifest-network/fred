@@ -737,6 +737,99 @@ func TestRetentionIndex_Apply(t *testing.T) {
 	assert.Empty(t, byStatus)
 }
 
+// assertIndexConsistent asserts the live index equals a freshly-derived rebuild (per-key, order-insensitive).
+func assertIndexConsistent(t *testing.T, s *RetentionStore) {
+	t.Helper()
+	liveT, liveS := s.indexSnapshot()
+	byTenant, byStatus, _, err := s.scanIndex()
+	require.NoError(t, err)
+	want := func(m map[string]map[string]struct{}) map[string][]string {
+		out := map[string][]string{}
+		for k, set := range m {
+			for u := range set {
+				out[k] = append(out[k], u)
+			}
+		}
+		return out
+	}
+	wantT, wantS := want(byTenant), want(byStatus)
+	require.Equal(t, len(wantT), len(liveT))
+	for k := range wantT {
+		assert.ElementsMatch(t, wantT[k], liveT[k], "byTenant[%q]", k)
+	}
+	require.Equal(t, len(wantS), len(liveS))
+	for k := range wantS {
+		assert.ElementsMatch(t, wantS[k], liveS[k], "byStatus[%q]", k)
+	}
+}
+
+func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	ok, err := s.PutActiveMerged(sampleEntry("u1"))
+	require.NoError(t, err)
+	require.True(t, ok)
+	assertIndexConsistent(t, s)
+
+	_, err = s.ClaimForRestore("u1", "newlease", time.Hour) // active -> restoring
+	require.NoError(t, err)
+	assertIndexConsistent(t, s)
+
+	swapped, err := s.RevertToActive("u1", 1) // restoring -> active (gen=1 after claim)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	assertIndexConsistent(t, s)
+
+	_, ok, err = s.MarkReapingIfActive("u1") // active -> reaping
+	require.NoError(t, err)
+	require.True(t, ok)
+	assertIndexConsistent(t, s)
+
+	okr, err := s.PutReaping(sampleEntry("u2")) // fresh-insert reaping
+	require.NoError(t, err)
+	require.True(t, okr)
+	assertIndexConsistent(t, s)
+
+	// Refused write must not change the index (PutReaping over an active record → ok=false).
+	// Seed the active record via PutActiveMerged (an index-maintaining mutator wired in this
+	// task) rather than blind Put — Put is not index-coupled until Task 4, so seeding with it
+	// here would leave u3 on disk but absent from the live index, failing assertIndexConsistent
+	// for a reason unrelated to PutReaping's refusal path.
+	okSeed, err := s.PutActiveMerged(sampleEntry("u3"))
+	require.NoError(t, err)
+	require.True(t, okSeed)
+	okr, err = s.PutReaping(sampleEntry("u3"))
+	require.NoError(t, err)
+	require.False(t, okr)
+	assertIndexConsistent(t, s) // sole equality oracle — do NOT compare two raw indexSnapshot maps with assert.Equal (order-randomized)
+
+	// DeleteIfActive on a non-active record is a no-op (u1 is reaping) → index unchanged.
+	_, deleted, err := s.DeleteIfActive("u1")
+	require.NoError(t, err)
+	require.False(t, deleted)
+	assertIndexConsistent(t, s)
+
+	// DeleteIfActive on a fresh active record removes it from both partitions.
+	okSeed, err = s.PutActiveMerged(sampleEntry("u4"))
+	require.NoError(t, err)
+	require.True(t, okSeed)
+	_, deleted, err = s.DeleteIfActive("u4")
+	require.NoError(t, err)
+	require.True(t, deleted)
+	assertIndexConsistent(t, s)
+
+	// MarkReapingIfExpired: active+expired → reaping.
+	expired := sampleEntry("u5")
+	expired.CreatedAt = time.Now().Add(-48 * time.Hour)
+	okSeed, err = s.PutActiveMerged(expired)
+	require.NoError(t, err)
+	require.True(t, okSeed)
+	_, okExp, err := s.MarkReapingIfExpired("u5", time.Hour)
+	require.NoError(t, err)
+	require.True(t, okExp)
+	assertIndexConsistent(t, s)
+}
+
 func TestRetentionIndex_ReIndexRebuildsAndFiresHook(t *testing.T) {
 	dir := t.TempDir()
 	var gotTrigger string

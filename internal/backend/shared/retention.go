@@ -217,7 +217,12 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 //
 // Returns (ok bool, err error): ok=false + nil err means "deferred, record is restoring".
 func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
-	var ok bool
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		ok   bool
+		oldE *RetentionEntry
+	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
 		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
@@ -225,6 +230,7 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 			if err := json.Unmarshal(raw, &stored); err != nil {
 				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
 			}
+			oldE = &stored
 			if stored.Status != RetentionStatusActive {
 				return nil // restoring (or otherwise non-active): refuse, ok stays false
 			}
@@ -250,7 +256,13 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 		ok = true
 		return bkt.Put([]byte(base.OriginalLeaseUUID), data)
 	})
-	return ok, err
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		s.indexApply(oldE, &base)
+	}
+	return ok, nil
 }
 
 // PutReaping writes a reaping tombstone for an ABANDONED on-disk footprint (a
@@ -265,7 +277,12 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 	base.Status = RetentionStatusReaping
 	base.ReapingSince = time.Now()
-	var ok bool
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		ok   bool
+		oldE *RetentionEntry
+	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
 		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
@@ -273,6 +290,10 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 			if err := json.Unmarshal(raw, &stored); err != nil {
 				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
 			}
+			// Capture the pre-image as a value copy BEFORE the reaping-branch
+			// `base = stored` assignment below aliases stored into base.
+			preImage := stored
+			oldE = &preImage
 			switch stored.Status {
 			case RetentionStatusActive, RetentionStatusRestoring:
 				return nil // already counted/owned — refuse, ok stays false
@@ -294,7 +315,13 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 		ok = true
 		return bkt.Put([]byte(base.OriginalLeaseUUID), data)
 	})
-	return ok, err
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		s.indexApply(oldE, &base)
+	}
+	return ok, nil
 }
 
 // dedupUnion returns the order-preserving deduplicated union of a and b
@@ -387,9 +414,12 @@ func (s *RetentionStore) ListReaping() ([]RetentionEntry, error) {
 // is never clobbered. The returned names are unused there: the volumes are already
 // gone, so there is nothing to destroy.
 func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var (
 		names   []string
 		deleted bool
+		oldE    RetentionEntry
 	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
@@ -404,11 +434,18 @@ func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
 		if e.Status != RetentionStatusActive {
 			return nil
 		}
+		oldE = e
 		names = e.RetainedVolumeNames
 		deleted = true
 		return bkt.Delete([]byte(orig))
 	})
-	return names, deleted, err
+	if err != nil {
+		return nil, false, err
+	}
+	if deleted {
+		s.indexApply(&oldE, nil)
+	}
+	return names, deleted, nil
 }
 
 // filter iterates all bucket entries and returns those for which keep returns true.
@@ -434,7 +471,12 @@ func (s *RetentionStore) filter(keep func(*RetentionEntry) bool) ([]RetentionEnt
 // restoring. Returns ErrNoRetention when absent or expired, ErrNotRestorable
 // when not in active state.
 func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Duration) (*RetentionEntry, error) {
-	var out *RetentionEntry
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		out  *RetentionEntry
+		oldE RetentionEntry
+	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
 		raw := bkt.Get([]byte(orig))
@@ -451,6 +493,7 @@ func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Dura
 		if maxAge > 0 && time.Since(e.CreatedAt) >= maxAge {
 			return ErrNoRetention // about to be reaped
 		}
+		oldE = e // value copy of the ACTIVE pre-image, before mutation
 		e.Status = RetentionStatusRestoring
 		e.NewLeaseUUID = newLease
 		e.RestoringSince = time.Now()
@@ -462,7 +505,13 @@ func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Dura
 		out = &e
 		return bkt.Put([]byte(orig), data)
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	if out != nil {
+		s.indexApply(&oldE, out)
+	}
+	return out, nil
 }
 
 // MarkReapingIfActive atomically transitions an ACTIVE record to reaping and
@@ -471,9 +520,13 @@ func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Dura
 // restore). The record is NOT deleted — it is the finalizer tombstone that keeps
 // the footprint counted until the volumes are confirmed gone. (ENG-376)
 func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var (
 		names []string
 		ok    bool
+		oldE  RetentionEntry
+		newE  RetentionEntry
 	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
@@ -481,38 +534,48 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 		if raw == nil {
 			return nil
 		}
-		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
+		if err := json.Unmarshal(raw, &oldE); err != nil {
 			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
 		}
-		if e.Status != RetentionStatusActive {
+		if oldE.Status != RetentionStatusActive {
 			return nil
 		}
-		e.Status = RetentionStatusReaping
-		e.ReapingSince = time.Now()
-		names = e.RetainedVolumeNames
-		data, err := json.Marshal(e)
+		newE = oldE
+		newE.Status = RetentionStatusReaping
+		newE.ReapingSince = time.Now()
+		names = newE.RetainedVolumeNames
+		data, err := json.Marshal(newE)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
 		}
 		ok = true
 		return bkt.Put([]byte(orig), data)
 	})
-	return names, ok, err
+	if err != nil {
+		return nil, false, err
+	}
+	if ok {
+		s.indexApply(&oldE, &newE)
+	}
+	return names, ok, nil
 }
 
 // MarkReapingIfExpired atomically transitions an ACTIVE, expired record to
-// reaping and returns its volume names for the
-// caller to destroy AFTER the txn commits. The record is NOT deleted — it stays a
+// reaping and returns its volume names for the caller to destroy AFTER the txn
+// commits. The record is NOT deleted — it stays a
 // counted tombstone until the volumes are confirmed gone. Returns ok=false when
 // absent, not active, or not yet expired, and a no-op when maxAge<=0. (ENG-376)
 func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration) ([]string, bool, error) {
 	if maxAge <= 0 {
 		return nil, false, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var (
 		names []string
 		ok    bool
+		oldE  RetentionEntry
+		newE  RetentionEntry
 	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
@@ -520,27 +583,33 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 		if raw == nil {
 			return nil
 		}
-		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
+		if err := json.Unmarshal(raw, &oldE); err != nil {
 			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
 		}
-		if e.Status != RetentionStatusActive {
+		if oldE.Status != RetentionStatusActive {
 			return nil
 		}
-		if time.Since(e.CreatedAt) < maxAge {
+		if time.Since(oldE.CreatedAt) < maxAge {
 			return nil
 		}
-		e.Status = RetentionStatusReaping
-		e.ReapingSince = time.Now()
-		names = e.RetainedVolumeNames
-		data, err := json.Marshal(e)
+		newE = oldE
+		newE.Status = RetentionStatusReaping
+		newE.ReapingSince = time.Now()
+		names = newE.RetainedVolumeNames
+		data, err := json.Marshal(newE)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
 		}
 		ok = true
 		return bkt.Put([]byte(orig), data)
 	})
-	return names, ok, err
+	if err != nil {
+		return nil, false, err
+	}
+	if ok {
+		s.indexApply(&oldE, &newE)
+	}
+	return names, ok, nil
 }
 
 // RevertToActive transitions a restoring record back to active, using a
@@ -549,33 +618,45 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 // match. On success the Generation is bumped and NewLeaseUUID/RestoringSince
 // are cleared.
 func (s *RetentionStore) RevertToActive(orig string, expectGen int) (bool, error) {
-	var swapped bool
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		swapped bool
+		oldE    RetentionEntry
+		newE    RetentionEntry
+	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
 		raw := bkt.Get([]byte(orig))
 		if raw == nil {
 			return nil
 		}
-		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
+		if err := json.Unmarshal(raw, &oldE); err != nil {
 			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
 		}
-		if e.Status != RetentionStatusRestoring {
+		if oldE.Status != RetentionStatusRestoring {
 			return nil
 		}
-		if e.Generation != expectGen {
+		if oldE.Generation != expectGen {
 			return nil
 		}
-		e.Status = RetentionStatusActive
-		e.Generation++
-		e.NewLeaseUUID = ""
-		e.RestoringSince = time.Time{}
-		data, err := json.Marshal(e)
+		newE = oldE
+		newE.Status = RetentionStatusActive
+		newE.Generation++
+		newE.NewLeaseUUID = ""
+		newE.RestoringSince = time.Time{}
+		data, err := json.Marshal(newE)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
 		}
 		swapped = true
 		return bkt.Put([]byte(orig), data)
 	})
-	return swapped, err
+	if err != nil {
+		return false, err
+	}
+	if swapped {
+		s.indexApply(&oldE, &newE)
+	}
+	return swapped, nil
 }
