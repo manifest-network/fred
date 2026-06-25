@@ -40,7 +40,7 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck or panicking | Logs + `fred_reconciler_runs_total{outcome="error"}` |
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
-| `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps (or `..._retention_leaked_total` rising) | A retained/leaked volume's destroy keeps failing — uncounted-then-tracked orphan the sweep can't reclaim | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
+| `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
 
 ---
 
@@ -149,10 +149,15 @@ pool (so it never silently over-admits) and the retention sweep **auto-retries**
 every interval. `cleanupOrphanedVolumes` deliberately never touches `fred-retained-*` names, so
 the sweep is the only automatic reclaimer.
 
-- **Signal.** `fred_docker_backend_retention_reaping_bytes` / `..._retention_reaping_leases` > 0.
-  A transient EBUSY clears within one sweep; a value sustained across several sweeps is a stuck
-  volume. `..._retention_leaked_total` increments on every failed-destroy / give-up / uncommitted
-  revert (DLQ-style: even one warrants a look).
+- **Signal.** `fred_docker_backend_retention_reaping_bytes` / `..._retention_reaping_leases` > 0
+  is the stuck-volume signal (these footprints **are** counted in the admission pool, so there is
+  no over-admit — they pin capacity until reclaimed). A transient EBUSY clears within one sweep;
+  a value sustained across several sweeps is a stuck volume. `..._retention_leaked_total` is a
+  broader event counter — it increments on a failed-destroy / give-up (which DO drive
+  `reaping_bytes`) **and** on a rollback uncommitted-revert (which keeps its footprint counted as
+  *live* and self-heals on the next `reconcileRestoring` sweep, NO stuck volume). So a rising
+  `leaked_total` with `reaping_bytes`/`reaping_leases` flat needs no action; only sustained
+  `reaping_bytes` is actionable here.
 - **Diagnose.** Find the volume(s): `ls <volume_data_path> | grep -E 'fred-retained-|fred-'`.
   Check why destroy fails — a container still bind-mounting it (`docker ps`, then stop it), or a
   filesystem error (`dmesg`).
