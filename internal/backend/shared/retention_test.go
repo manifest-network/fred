@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
@@ -870,4 +871,41 @@ func TestRetentionIndex_PutOverwriteAndDeleteStayConsistent(t *testing.T) {
 
 	require.NoError(t, s.Delete("nope")) // absent → no-op
 	assertIndexConsistent(t, s)
+}
+
+func TestRetentionIndex_ListByIndexEquivalence(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for i, st := range []string{RetentionStatusActive, RetentionStatusRestoring, RetentionStatusReaping, RetentionStatusActive} {
+		e := sampleEntry(fmt.Sprintf("u%d", i))
+		e.Status = st
+		if i == 3 {
+			e.Tenant = "tenant-b"
+		}
+		require.NoError(t, s.Put(e))
+	}
+	byT, err := s.ListByTenant("tenant-a")
+	require.NoError(t, err)
+	assert.Len(t, byT, 3)
+	for _, e := range byT {
+		assert.Equal(t, "tenant-a", e.Tenant)
+	}
+	restoring, err := s.ListRestoring()
+	require.NoError(t, err)
+	assert.Len(t, restoring, 1)
+	assert.Equal(t, RetentionStatusRestoring, restoring[0].Status)
+}
+
+func TestRetentionIndex_ReadDropsStaleIndexEntry(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("u1"))) // active
+
+	// Force a stale index entry: claim → revert leaves on-disk status=active, but seed
+	// byStatus[restoring] with u1 to simulate an index snapshot lagging a revert.
+	s.mu.Lock()
+	idxAdd(s.byStatus, RetentionStatusRestoring, "u1")
+	s.mu.Unlock()
+
+	got, err := s.ListRestoring()
+	require.NoError(t, err)
+	assert.Empty(t, got, "stale restoring index entry must be dropped: on-disk status is active")
 }

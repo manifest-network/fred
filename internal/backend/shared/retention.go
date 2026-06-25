@@ -416,18 +416,60 @@ func (s *RetentionStore) ListExpired(maxAge time.Duration) ([]RetentionEntry, er
 	})
 }
 
-// ListByTenant returns all entries for the given tenant.
-func (s *RetentionStore) ListByTenant(tenant string) ([]RetentionEntry, error) {
-	return s.filter(func(e *RetentionEntry) bool {
-		return e.Tenant == tenant
-	})
+// keysOf copies a set's keys (caller holds the lock).
+func keysOf(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for u := range set {
+		out = append(out, u)
+	}
+	return out
 }
 
-// ListRestoring returns all entries currently in the restoring state.
-func (s *RetentionStore) ListRestoring() ([]RetentionEntry, error) {
-	return s.filter(func(e *RetentionEntry) bool {
-		return e.Status == RetentionStatusRestoring
+// getAll Gets each UUID from the primary in ONE db.View (so the per-record reads share a
+// single MVCC snapshot and N txns collapse to 1), skipping nil (concurrently deleted) and
+// re-applying keep on the fetched entry (it may have left the partition since the index
+// snapshot). Eventually-consistent: the index snapshot and the View are separate
+// observations; callers re-validate via CAS before destructive action (see doc comments).
+func (s *RetentionStore) getAll(uuids []string, keep func(*RetentionEntry) bool) ([]RetentionEntry, error) {
+	out := make([]RetentionEntry, 0, len(uuids))
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		for _, u := range uuids {
+			raw := bkt.Get([]byte(u))
+			if raw == nil {
+				continue
+			}
+			var e RetentionEntry
+			if uerr := json.Unmarshal(raw, &e); uerr != nil {
+				return fmt.Errorf("failed to unmarshal retention entry: %w", uerr)
+			}
+			if keep(&e) {
+				out = append(out, e)
+			}
+		}
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListByTenant returns all entries for the given tenant (eventually-consistent; callers
+// must re-validate via CAS before mutating — see type doc). Served from the index.
+func (s *RetentionStore) ListByTenant(tenant string) ([]RetentionEntry, error) {
+	s.mu.RLock()
+	uuids := keysOf(s.byTenant[tenant])
+	s.mu.RUnlock()
+	return s.getAll(uuids, func(e *RetentionEntry) bool { return e.Tenant == tenant })
+}
+
+// ListRestoring returns all entries currently restoring (eventually-consistent). Served from the index.
+func (s *RetentionStore) ListRestoring() ([]RetentionEntry, error) {
+	s.mu.RLock()
+	uuids := keysOf(s.byStatus[RetentionStatusRestoring])
+	s.mu.RUnlock()
+	return s.getAll(uuids, func(e *RetentionEntry) bool { return e.Status == RetentionStatusRestoring })
 }
 
 // ListReaping returns all entries currently in the reaping (pending-destroy) state.
