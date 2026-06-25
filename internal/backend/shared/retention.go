@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -54,12 +55,24 @@ type RetentionEntry struct {
 // RetentionStoreConfig configures the retention store.
 type RetentionStoreConfig struct {
 	DBPath string
+	// OnReindex (nil-safe) fires after each index build with record count, duration, and
+	// trigger ("open"|"manual"). A callback (not a metrics import) so this package stays
+	// free of internal/metrics — mirrors boltStore.startCleanup's onPanic seam.
+	OnReindex func(count int, dur time.Duration, trigger string)
 }
 
-// RetentionStore persists soft-deleted lease data in bbolt so volumes and
-// manifests survive lease closure and are available for restore.
+// RetentionStore persists soft-deleted lease data in bbolt. The `retention` bucket is
+// the single source of truth; byTenant/byStatus are a DERIVED in-memory index rebuilt
+// from the bucket on open (never persisted, cannot drift across a restart). The bucket
+// is INDEX-COUPLED: it may be mutated ONLY through this type's wrapped methods (each
+// maintains the index under s.mu). Never wire boltStore.startCleanup / removeOlderThan
+// to this store — they cursor.Delete directly on the bucket and would bypass the index.
 type RetentionStore struct {
 	*boltStore
+	mu        sync.RWMutex
+	byTenant  map[string]map[string]struct{} // tenant -> set of OriginalLeaseUUID
+	byStatus  map[string]map[string]struct{} // status -> set of OriginalLeaseUUID
+	onReindex func(count int, dur time.Duration, trigger string)
 }
 
 // NewRetentionStore opens or creates a bbolt database for retention persistence.
@@ -76,7 +89,91 @@ func NewRetentionStore(cfg RetentionStoreConfig) (*RetentionStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RetentionStore{boltStore: base}, nil
+	s := &RetentionStore{boltStore: base, onReindex: cfg.OnReindex}
+	// Derived index: rebuilt from the primary bucket on open, before the store is
+	// published to any other goroutine (so no lock needed). Fail-closed on a malformed
+	// record — a corrupt retention record is a data-integrity event, not something to
+	// silently skip.
+	start := time.Now()
+	byTenant, byStatus, count, err := s.scanIndex()
+	if err != nil {
+		_ = base.Close()
+		return nil, fmt.Errorf("failed to build retention index: %w", err)
+	}
+	s.byTenant, s.byStatus = byTenant, byStatus
+	s.fireReindex(count, time.Since(start), "open")
+	return s, nil
+}
+
+func (s *RetentionStore) fireReindex(count int, dur time.Duration, trigger string) {
+	if s.onReindex != nil {
+		s.onReindex(count, dur, trigger)
+	}
+}
+
+// scanIndex builds fresh tenant/status index maps from one pass over the primary bucket,
+// decoding only the three indexed fields (skips the heavy Items/StackManifest allocation;
+// encoding/json still scans every byte). Returns the maps + record count. Fails on a
+// malformed record (fail-closed).
+func (s *RetentionStore) scanIndex() (byTenant, byStatus map[string]map[string]struct{}, count int, err error) {
+	byTenant = map[string]map[string]struct{}{}
+	byStatus = map[string]map[string]struct{}{}
+	err = s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).ForEach(func(k, v []byte) error {
+			var e struct {
+				OriginalLeaseUUID string `json:"original_lease_uuid"`
+				Tenant            string `json:"tenant"`
+				Status            string `json:"status"`
+			}
+			if uerr := json.Unmarshal(v, &e); uerr != nil {
+				// Use the bucket key (the OriginalLeaseUUID by convention) — a
+				// totally-malformed record has an empty e.OriginalLeaseUUID, so the
+				// operator-facing store-open failure must name the key to be lookup-able.
+				return fmt.Errorf("malformed retention record %q: %w", string(k), uerr)
+			}
+			idxAdd(byTenant, e.Tenant, e.OriginalLeaseUUID)
+			idxAdd(byStatus, e.Status, e.OriginalLeaseUUID)
+			count++
+			return nil
+		})
+	})
+	return byTenant, byStatus, count, err
+}
+
+// idxAdd / idxDel maintain a set-valued index map. Caller holds s.mu (or maps not yet
+// published). delete on a nil/absent map or missing key is a Go no-op.
+func idxAdd(m map[string]map[string]struct{}, key, uuid string) {
+	set := m[key]
+	if set == nil {
+		set = map[string]struct{}{}
+		m[key] = set
+	}
+	set[uuid] = struct{}{}
+}
+
+func idxDel(m map[string]map[string]struct{}, key, uuid string) {
+	set := m[key]
+	if set == nil {
+		return
+	}
+	delete(set, uuid)
+	if len(set) == 0 {
+		delete(m, key)
+	}
+}
+
+// indexApply reconciles the index for a record transition. Caller MUST hold s.mu.
+// oldE=nil → insert; newE=nil → delete; both set → move. Always removes oldE.Tenant and
+// adds newE.Tenant (tenant immutability is observed, not assumed/optimized).
+func (s *RetentionStore) indexApply(oldE, newE *RetentionEntry) {
+	if oldE != nil {
+		idxDel(s.byTenant, oldE.Tenant, oldE.OriginalLeaseUUID)
+		idxDel(s.byStatus, oldE.Status, oldE.OriginalLeaseUUID)
+	}
+	if newE != nil {
+		idxAdd(s.byTenant, newE.Tenant, newE.OriginalLeaseUUID)
+		idxAdd(s.byStatus, newE.Status, newE.OriginalLeaseUUID)
+	}
 }
 
 // Put persists a RetentionEntry, upserting by OriginalLeaseUUID.

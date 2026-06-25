@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -657,4 +658,81 @@ func TestStatusAudit_ListExpired_ExcludesReaping(t *testing.T) {
 	got, err := s.ListExpired(time.Hour)
 	require.NoError(t, err)
 	assert.Empty(t, got, "ListExpired returns active-only")
+}
+
+// indexSnapshot returns a deep, per-partition SORTED copy of the in-memory index
+// for white-box assertions (sorted so equality checks are order-deterministic).
+func (s *RetentionStore) indexSnapshot() (map[string][]string, map[string][]string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cp := func(m map[string]map[string]struct{}) map[string][]string {
+		out := map[string][]string{}
+		for k, set := range m {
+			for u := range set {
+				out[k] = append(out[k], u)
+			}
+			sort.Strings(out[k])
+		}
+		return out
+	}
+	return cp(s.byTenant), cp(s.byStatus)
+}
+
+func TestRetentionIndex_RebuildOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/retention.db"
+	s1, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.NoError(t, err)
+	a := sampleEntry("lease-a") // tenant-a, active
+	b := sampleEntry("lease-b")
+	b.Tenant = "tenant-b"
+	b.Status = RetentionStatusReaping
+	require.NoError(t, s1.Put(a))
+	require.NoError(t, s1.Put(b))
+	require.NoError(t, s1.Close())
+
+	s2, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s2.Close() })
+
+	byTenant, byStatus := s2.indexSnapshot()
+	assert.ElementsMatch(t, []string{"lease-a"}, byTenant["tenant-a"])
+	assert.ElementsMatch(t, []string{"lease-b"}, byTenant["tenant-b"])
+	assert.ElementsMatch(t, []string{"lease-a"}, byStatus[RetentionStatusActive])
+	assert.ElementsMatch(t, []string{"lease-b"}, byStatus[RetentionStatusReaping])
+}
+
+// A malformed record must fail the open (fail-closed) — a corrupt retention record is a
+// data-integrity event, and silently skipping it would drop the only restore handle from
+// the index while the bytes persist on disk.
+func TestRetentionIndex_RebuildFailsClosedOnMalformedRecord(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/retention.db"
+	s1, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.NoError(t, err)
+	require.NoError(t, s1.Put(sampleEntry("good")))
+	// Write garbage bytes directly under a key (white-box).
+	require.NoError(t, s1.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte("bad"), []byte("{not json"))
+	}))
+	require.NoError(t, s1.Close())
+
+	_, err = NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "retention index")
+}
+
+func TestRetentionIndex_Apply(t *testing.T) {
+	s := newTestRetentionStore(t)
+	s.mu.Lock()
+	a := sampleEntry("u1") // tenant-a / active
+	s.indexApply(nil, &a)
+	moved := a
+	moved.Status = RetentionStatusReaping
+	s.indexApply(&a, &moved)  // active -> reaping
+	s.indexApply(&moved, nil) // delete
+	s.mu.Unlock()
+	byTenant, byStatus := s.indexSnapshot()
+	assert.Empty(t, byTenant)
+	assert.Empty(t, byStatus)
 }
