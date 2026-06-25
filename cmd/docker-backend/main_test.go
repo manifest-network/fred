@@ -1744,3 +1744,60 @@ func TestHandleRestore(t *testing.T) {
 		assert.Equal(t, http.StatusInternalServerError, w.Code)
 	})
 }
+
+func TestHandleListProvisions_Paginates(t *testing.T) {
+	all := []backend.ProvisionInfo{
+		{LeaseUUID: "11111111-1111-1111-1111-111111111111"},
+		{LeaseUUID: "22222222-2222-2222-2222-222222222222"},
+		{LeaseUUID: "33333333-3333-3333-3333-333333333333"},
+	}
+	mb := &mockBackend{
+		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { return all, nil },
+	}
+
+	// First page (limit=2): two items + continue = last UUID.
+	w := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?limit=2"))
+	require.Equal(t, http.StatusOK, w.Code)
+	var p1 backend.ListProvisionsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &p1))
+	assert.Len(t, p1.Provisions, 2)
+	assert.Equal(t, "22222222-2222-2222-2222-222222222222", p1.Continue)
+
+	// Second page resumes from continue: one item, no continue.
+	w2 := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w2, signedGetRequest("/provisions?limit=2&continue="+p1.Continue))
+	require.Equal(t, http.StatusOK, w2.Code)
+	var p2 backend.ListProvisionsResponse
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &p2))
+	assert.Len(t, p2.Provisions, 1)
+	assert.Empty(t, p2.Continue)
+}
+
+func TestHandleListProvisions_MalformedContinueIs400(t *testing.T) {
+	called := false
+	mb := &mockBackend{
+		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { called = true; return nil, nil },
+	}
+	w := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?limit=2&continue=not-a-uuid"))
+	assert.Equal(t, http.StatusBadRequest, w.Code) // mirrors the lease_uuid bad-UUID 400 test
+	assert.False(t, called, "invalid pagination params must fail fast before the O(LEASES) ListProvisions fetch")
+}
+
+func TestHandleListProvisions_NoLimitReturnsFull(t *testing.T) {
+	all := []backend.ProvisionInfo{
+		{LeaseUUID: "11111111-1111-1111-1111-111111111111"},
+		{LeaseUUID: "22222222-2222-2222-2222-222222222222"},
+	}
+	mb := &mockBackend{
+		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { return all, nil },
+	}
+	w := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions"))
+	require.Equal(t, http.StatusOK, w.Code)
+	var p backend.ListProvisionsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &p))
+	assert.Len(t, p.Provisions, 2)
+	assert.Empty(t, p.Continue, "unpaginated path sets no continue")
+}

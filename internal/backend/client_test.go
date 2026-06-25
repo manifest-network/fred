@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2092,4 +2093,225 @@ func TestHTTPClient_ListRetentions_Empty(t *testing.T) {
 	got, err := client.ListRetentions(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+func TestNewHTTPClient_ProvisionsPageLimitDefault(t *testing.T) {
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com"})
+	assert.Equal(t, DefaultProvisionsPageLimit, c.provisionsPageLimit, "zero config falls back to default")
+
+	c2 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: 250})
+	assert.Equal(t, 250, c2.provisionsPageLimit, "explicit config is honored")
+
+	c3 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: -5})
+	assert.Equal(t, DefaultProvisionsPageLimit, c3.provisionsPageLimit, "negative config falls back to default (never sent as limit=-5)")
+}
+
+func TestHTTPClient_ListProvisions_EmptyIsNonNil(t *testing.T) {
+	server := pagingProvisionServer(t, nil) // empty backend
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+	assert.NotNil(t, got, "empty backend must yield a non-nil [] (preserves the pre-pagination contract)")
+	assert.Empty(t, got)
+}
+
+// pagingProvisionServer serves /provisions using the real PaginateProvisions
+// helper so the client loop is exercised against production paging semantics.
+func pagingProvisionServer(t *testing.T, all []ProvisionInfo) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/provisions" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		limit, cont, err := ParseProvisionsPageParams(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		page, next := PaginateProvisions(all, cont, limit)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: page, Continue: next})
+	}))
+}
+
+// provUUID renders i as a lexically-sortable valid UUID. The client loop sends
+// the last LeaseUUID back as the `continue` query param, which the producer's
+// ParseProvisionsPageParams validates as a UUID — so the IDs in these
+// end-to-end tests must be real UUIDs (zero-padded so lexical == numeric order).
+func provUUID(i int) string {
+	return fmt.Sprintf("%08d-0000-0000-0000-000000000000", i)
+}
+
+func manyProvisions(n int) []ProvisionInfo {
+	out := make([]ProvisionInfo, n)
+	for i := range out {
+		out[i] = ProvisionInfo{LeaseUUID: provUUID(i), Status: ProvisionStatusReady}
+	}
+	return out
+}
+
+func TestHTTPClient_ListProvisions_ReassemblesAllPages(t *testing.T) {
+	all := manyProvisions(2500) // > default page size of 1000 -> 3 pages
+	server := pagingProvisionServer(t, all)
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 2500)
+
+	seen := make(map[string]int)
+	for _, p := range got {
+		seen[p.LeaseUUID]++
+	}
+	assert.Len(t, seen, 2500, "no duplicates across pages")
+	assert.Equal(t, provUUID(0), got[0].LeaseUUID, "sorted order preserved")
+}
+
+func TestHTTPClient_ListProvisions_SmallPageLimit(t *testing.T) {
+	all := manyProvisions(25)
+	server := pagingProvisionServer(t, all)
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+	assert.Len(t, got, 25)
+}
+
+func TestHTTPClient_ListProvisions_NonAdvancingContinueErrors(t *testing.T) {
+	// Malicious/buggy server: always returns the same continue token.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{
+			Provisions: []ProvisionInfo{{LeaseUUID: "stuck"}},
+			Continue:   "stuck", // never advances
+		})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	_, err := c.ListProvisions(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-advancing")
+}
+
+func TestHTTPClient_ListProvisions_PerPageTooLargeErrors(t *testing.T) {
+	big := strings.Repeat("x", 1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ps := make([]ProvisionInfo, 0, 2000)
+		for i := 0; i < 2000; i++ {
+			ps = append(ps, ProvisionInfo{LeaseUUID: padID(i), LastError: big})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: ps, Continue: padID(1999)})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, MaxProvisionsBytes: 64 << 10}) // 64 KiB per page
+	_, err := c.ListProvisions(context.Background())
+	require.Error(t, err, "an oversized page errors (fail-closed), not silent truncation")
+}
+
+func TestHTTPClient_ListProvisions_BackCompatSinglePageNoContinue(t *testing.T) {
+	// Old server: ignores limit/continue, returns full list, no continue field.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"provisions": []ProvisionInfo{{LeaseUUID: "a"}, {LeaseUUID: "b"}},
+		})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "no continue field => stop after one page")
+}
+
+func TestHTTPClient_ListProvisions_ContinuesOnShortNonFinalPage(t *testing.T) {
+	// A server may return fewer than `limit` items but still set continue; the
+	// client must NOT stop on a short page — only an empty continue ends the walk.
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{{LeaseUUID: "a"}}, Continue: "a"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{{LeaseUUID: "b"}}, Continue: ""})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, []string{"a", "b"}, []string{got[0].LeaseUUID, got[1].LeaseUUID})
+}
+
+// Producer that errors on the 2nd page exercises complete-or-error end to end.
+func TestHTTPClient_ListProvisions_PageErrorAborts(t *testing.T) {
+	all := manyProvisions(25)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls >= 2 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		limit, cont, _ := ParseProvisionsPageParams(r.URL.Query())
+		page, next := PaginateProvisions(all, cont, limit)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: page, Continue: next})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	_, err := c.ListProvisions(context.Background())
+	require.Error(t, err, "a failed page aborts the whole fetch (complete-or-error)")
+}
+
+// Directional safety: a provision deleted between pages is simply absent from the
+// assembled set — never duplicated, never an error. (Orphan detection is
+// orphans = backend - chain, so an omitted entry can only SHRINK the
+// deprovision-candidate set; it is re-checked next tick.)
+func TestHTTPClient_ListProvisions_ToleratesMidFetchDeletion(t *testing.T) {
+	live := manyProvisions(25) // provUUID(0)..provUUID(24)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		set := live
+		if calls >= 2 {
+			// After page 1 (provUUID(0)..provUUID(9)), delete a not-yet-returned item.
+			set = make([]ProvisionInfo, 0, len(live))
+			for _, p := range live {
+				if p.LeaseUUID == provUUID(20) {
+					continue
+				}
+				set = append(set, p)
+			}
+		}
+		limit, cont, _ := ParseProvisionsPageParams(r.URL.Query())
+		page, next := PaginateProvisions(set, cont, limit)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: page, Continue: next})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+
+	seen := map[string]int{}
+	for _, p := range got {
+		seen[p.LeaseUUID]++
+		assert.Equal(t, 1, seen[p.LeaseUUID], "no duplicates across pages")
+	}
+	assert.NotContains(t, seen, provUUID(20), "deleted-mid-fetch item is simply absent")
+	assert.Len(t, got, 24)
 }
