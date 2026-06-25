@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -499,7 +500,7 @@ type HTTPClient struct {
 	// Response body size limits
 	maxInfoBytes             int64
 	maxProvisionBytes        int64
-	maxProvisionsBytes       int64
+	maxProvisionsBytes       int64 // bounds a single /provisions PAGE body (not the whole list) since pagination
 	maxLookupProvisionsBytes int64
 	maxLogsBytes             int64
 	maxReleasesBytes         int64
@@ -933,13 +934,51 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	return cbErr
 }
 
-// ListProvisions returns all provisioned resources from this backend.
+// ListProvisions returns all provisioned resources from this backend. It walks
+// the keyset-paginated /provisions endpoint, reassembling the complete set; it
+// returns an error rather than a partial set (complete-or-error) so the
+// reconciler never acts on incomplete data.
 func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
+	var acc []ProvisionInfo
+	cont := ""
+	for page := 0; ; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("list provisions: %w", err) // responsive inter-page cancellation
+		}
+		if page >= maxProvisionsPages {
+			return nil, fmt.Errorf("list provisions: exceeded %d pages (last continue=%q); backend not converging", maxProvisionsPages, cont)
+		}
+		resp, perr := c.fetchProvisionsPage(ctx, cont)
+		if perr != nil {
+			return nil, perr
+		}
+		acc = append(acc, resp.Provisions...)
+		if resp.Continue == "" {
+			break // exhausted — the complete set
+		}
+		if resp.Continue <= cont {
+			return nil, fmt.Errorf("list provisions: backend returned non-advancing continue token %q (sent %q)", resp.Continue, cont)
+		}
+		cont = resp.Continue
+	}
+	return acc, nil
+}
+
+// fetchProvisionsPage fetches one keyset page. continueToken == "" requests the
+// first page. The per-page body is bounded by maxProvisionsBytes (fail-closed).
+func (c *HTTPClient) fetchProvisionsPage(ctx context.Context, continueToken string) (ListProvisionsResponse, error) {
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(c.provisionsPageLimit))
+	if continueToken != "" {
+		q.Set("continue", continueToken)
+	}
+	target := c.baseURL + "/provisions?" + q.Encode()
+
 	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/provisions", nil)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
@@ -955,27 +994,24 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
 
-		var provResult struct {
-			Provisions []ProvisionInfo `json:"provisions"`
-		}
+		var provResult ListProvisionsResponse
 		if err := decodeJSONLimited(resp.Body, c.maxProvisionsBytes, &provResult); err != nil {
 			return nil, fmt.Errorf("decode provisions response: %w", err)
 		}
-
-		return provResult.Provisions, nil
+		return provResult, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
-		return nil, ErrCircuitOpen
+		return ListProvisionsResponse{}, ErrCircuitOpen
 	}
 	if cbErr != nil {
-		return nil, cbErr
+		return ListProvisionsResponse{}, cbErr
 	}
-	provisions, ok := result.([]ProvisionInfo)
+	pr, ok := result.(ListProvisionsResponse)
 	if !ok {
-		return nil, fmt.Errorf("list provisions: unexpected result type %T", result)
+		return ListProvisionsResponse{}, fmt.Errorf("list provisions: unexpected result type %T", result)
 	}
-	return provisions, nil
+	return pr, nil
 }
 
 // GetProvision retrieves status information for a single provision.
