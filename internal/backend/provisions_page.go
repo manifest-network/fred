@@ -32,11 +32,13 @@ const MaxPageLimit = 5000
 // is non-unique; if the sort key ever becomes composite, switch the cursor to an
 // encoded versioned tuple per design spec §4.
 func PaginateProvisions(all []ProvisionInfo, continueToken string, limit int) (page []ProvisionInfo, next string) {
-	// Clone before sorting: this sorts in place and callers pass the slice
-	// straight from Backend.ListProvisions, which may alias a locked/cached
-	// backing array (see the aliasing-can-be-load-bearing hazard). make+copy
-	// (not slices.Clone) also preserves the non-nil empty-slice guarantee that
-	// the []-not-null JSON contract relies on.
+	// Sort a copy, never the caller's slice. The current backends return a freshly
+	// built slice from ListProvisions, but the backend.Client interface does not
+	// guarantee an owned/mutable result, so sorting in place could corrupt shared
+	// state (the aliasing-can-be-load-bearing hazard). make+copy (not slices.Clone)
+	// also preserves the non-nil empty-slice guarantee the []-not-null JSON contract
+	// relies on. The O(N) copy is a constant factor on the O(N log N)-per-page sort;
+	// the asymptotic win (a per-tick sorted snapshot) is tracked as future work (ENG-381).
 	sorted := make([]ProvisionInfo, len(all))
 	copy(sorted, all)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].LeaseUUID < sorted[j].LeaseUUID })
@@ -71,7 +73,7 @@ func ParseProvisionsPageParams(q url.Values) (limit int, continueToken string, e
 	}
 	if v := q.Get("continue"); v != "" {
 		if _, perr := uuid.Parse(v); perr != nil {
-			return 0, "", fmt.Errorf("invalid continue token: must be a UUID")
+			return 0, "", fmt.Errorf("invalid continue token %q: must be a UUID", v)
 		}
 		continueToken = v
 	}
