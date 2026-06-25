@@ -402,6 +402,14 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 		if sanitized == "" {
 			return nil, fmt.Errorf("image declares unsupported VOLUME path %q", volPath)
 		}
+		// Reserve the _wp directory for writable-path scaffolding. A declared VOLUME
+		// that sanitizes to _wp (e.g. VOLUME /_wp) or nests under it would place
+		// STATEFUL data under the volume root's _wp subtree, which isWritablePathOnly
+		// (retention_writable_path.go) would then misclassify as ephemeral scaffolding
+		// and DESTROY at close — silent tenant data loss. Fail closed at provision.
+		if sanitized == writablePathSubdir || strings.HasPrefix(sanitized, writablePathSubdir+"/") {
+			return nil, fmt.Errorf("image declares VOLUME %q that collides with the reserved writable-path directory %q", volPath, writablePathSubdir)
+		}
 		subdir := filepath.Join(hostPath, sanitized)
 		if err := os.MkdirAll(subdir, 0o700); err != nil {
 			return nil, fmt.Errorf("volume subdir %q: %w", subdir, err)
@@ -416,6 +424,16 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 	return binds, nil
 }
 
+// writablePathSubdir is the single fixed subdirectory inside a managed volume
+// that holds writable-path scaffolding (image content seeded for auto-detected
+// writable paths under a read-only rootfs). It is the on-disk discriminator for
+// a writable-path-only volume: such a volume contains only this subtree and no
+// declared-VOLUME (stateful) subdirs. Its content is wiped+reseeded from the
+// image on every deploy including restore (ENG-367 contract), so it is ephemeral
+// by construction. See isWritablePathOnly (retention_writable_path.go) for the
+// close-time reclaim decision (ENG-406).
+const writablePathSubdir = "_wp"
+
 // setupWritablePathBinds extracts image content for writable paths into
 // a managed volume subdirectory and returns a bind map for container creation.
 // Extraction failures are logged but don't fail the overall operation;
@@ -425,7 +443,7 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 		return nil
 	}
 
-	wpDir := filepath.Join(hostVolumePath, "_wp")
+	wpDir := filepath.Join(hostVolumePath, writablePathSubdir)
 	// Remove stale content from prior extractions so files deleted
 	// in a newer image don't persist.
 	if err := os.RemoveAll(wpDir); err != nil {

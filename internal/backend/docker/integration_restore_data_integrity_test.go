@@ -389,27 +389,34 @@ func TestIntegration_Docker_RetainRestore_OwnershipBoundary(t *testing.T) {
 		"nested file keeps its prior owner (chown is non-recursive) — tenant responsibility on drift")
 }
 
-// TestIntegration_Docker_RetainRestore_WritablePathWipeContract pins the
-// writable-path (_wp) durability contract across restore (ENG-367). Unlike a
-// declared VOLUME, a "writable path" — a non-VOLUME directory the image chowns
-// to the container user (e.g. grafana's /var/lib/grafana) — is backed by a _wp
-// subdir that setupWritablePathBinds RemoveAll's and re-extracts fresh from the
-// image on EVERY deploy, including restore (doRestore → doReplaceContainers →
-// setupVolBinds → setupWritablePathBinds). So tenant data written under a
-// writable path does NOT survive a close→restore: it is wiped and reseeded,
-// even though the managed volume itself is retained and adopted back.
+// TestIntegration_Docker_Close_WritablePathOnly_Reclaimed pins the ENG-406
+// reclaim policy end-to-end on real btrfs: a lease whose only on-disk volume is
+// writable-path-only — backed solely by a _wp subtree, no declared VOLUME — is
+// DESTROYED (reclaimed) at close, NOT soft-deleted into the retained namespace.
 //
-// This is the deliberate, current contract: only declared VOLUMEs are
-// restore-durable (see TestIntegration_Docker_RetainRestore_DataIntegrity for
-// the surviving side). The assertion FAILS LOUDLY if writable-path data ever
-// starts surviving restore, forcing that to be a conscious change.
+// Such a volume is ephemeral by the ENG-367 wipe-contract: setupWritablePathBinds
+// RemoveAll's and re-extracts _wp fresh from the image on every deploy including
+// restore, so its content is image-derived and never restore-durable. Retaining
+// it would preserve nothing restorable while minting a retention record, a
+// per-tenant retained-lease slot, a fred-retained-* dir, and a retained-disk
+// budget charge — pure pollution. ENG-406 reclaims it instead.
+//
+// This SUPERSEDES the prior ENG-367 pin (RetainRestore_WritablePathWipeContract),
+// which retained + restored this same pure-writable-path-only grafana lease and
+// asserted the _wp data was wiped on restore. Under ENG-406 a pure-writable-path-
+// only lease is no longer retained — hence not restorable (a re-provision yields
+// identical reseeded content) — so the wipe-on-restore code path
+// (setupWritablePathBinds, unchanged) is now reachable only for MIXED leases (a
+// stateful VOLUME alongside a writable path), where the VOLUME data is restored
+// and the _wp data is reseeded. (No mixed-fixture integration test covers that
+// residual path today; the unchanged wipe behavior is otherwise unaffected.)
 //
 // Fixture: grafana/grafana:11.1.0 — non-root (uid 472), declares NO VOLUMEs,
 // and /var/lib/grafana is owned by 472, so fred detects it as a writable path
 // and backs it with _wp. Command is overridden to `sleep` so grafana-server
 // never starts (the writable path is detected at image-inspect time and bound
 // regardless of the command).
-func TestIntegration_Docker_RetainRestore_WritablePathWipeContract(t *testing.T) {
+func TestIntegration_Docker_Close_WritablePathOnly_Reclaimed(t *testing.T) {
 	mountPath := setupBtrfsLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := retainRestoreBackend(t, mountPath)
@@ -452,48 +459,31 @@ func TestIntegration_Docker_RetainRestore_WritablePathWipeContract(t *testing.T)
 	execInContainer(t, containerID, []string{"sh", "-c",
 		fmt.Sprintf("printf '%%s' '%s' > %s/%s", sentinelContent, wpPath, sentinelName)})
 
-	// It must exist on the host _wp subdir before close (sanity).
+	// It must exist on the host _wp subdir before close (fixture sanity).
 	canonical := canonicalVolumeName(origLease, manifest.DefaultServiceName, 0)
-	hostWPSentinel := filepath.Join(mountPath, canonical, "_wp", "var", "lib", "grafana", sentinelName)
-	_, err = os.Stat(hostWPSentinel)
-	require.NoError(t, err, "writable-path sentinel must exist on host _wp before deprovision")
+	hostVolDir := filepath.Join(mountPath, canonical)
+	_, err = os.Stat(filepath.Join(hostVolDir, writablePathSubdir, "var", "lib", "grafana", sentinelName))
+	require.NoError(t, err, "writable-path sentinel must exist on host _wp before close")
 
-	// Soft-delete (retain) — the managed volume (including its _wp subdir) is retained.
+	// Close with RetainOnClose=true. ENG-406: a writable-path-only volume must be
+	// RECLAIMED (destroyed), not soft-deleted into the retained namespace.
 	require.NoError(t, b.Deprovision(ctx, origLease))
 	cb = waitForCallback(t, callbackCh, origLease, 30*time.Second)
 	require.Equal(t, backend.CallbackStatusDeprovisioned, cb.Status)
-	require.True(t, cb.Retained, "real btrfs retain must set the ground-truth Retained flag (the _wp wipe assertion below is meaningful only if the volume was actually retained + adopted back)")
+	require.False(t, cb.Retained,
+		"a writable-path-only lease must NOT report retained — its volume is reclaimed, not soft-deleted")
 
-	// Restore into a new lease.
-	newLease := fmt.Sprintf("retain-wp-new-%d", time.Now().UnixNano())
-	require.NoError(t, b.Restore(ctx, backend.RestoreRequest{
-		LeaseUUID:     newLease,
-		FromLeaseUUID: origLease,
-		Tenant:        "test-tenant",
-		ProviderUUID:  "test-provider",
-		Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		CallbackURL:   callbackServer.URL,
-	}))
-	cb = waitForCallback(t, callbackCh, newLease, 3*time.Minute)
-	require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "restore must succeed; error: %s", cb.Error)
+	// No retention record was written: no per-tenant slot, nothing restorable.
+	rec, err := b.retentionStore.Get(origLease)
+	require.NoError(t, err)
+	assert.Nil(t, rec, "writable-path-only close must leave no retention record")
 
-	// ── Contract: writable-path tenant data is WIPED + reseeded on restore ──
-	newContainerID := getContainerID(t, newLease)
-	require.True(t, containerHasBindMount(t, newContainerID, wpPath),
-		"writable-path bind must still be wired after restore (proves a reseed, not a broken/absent mount)")
-	gone := strings.TrimSpace(execInContainer(t, newContainerID, []string{"sh", "-c",
-		fmt.Sprintf("test -f %s/%s && echo PRESENT || echo GONE", wpPath, sentinelName)}))
-	assert.Equal(t, "GONE", gone,
-		"tenant data under a writable path must NOT survive restore (it is reseeded from the image); "+
-			"only declared VOLUMEs are restore-durable")
-
-	// And gone from the restored host _wp too.
-	newCanonical := canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)
-	_, err = os.Stat(filepath.Join(mountPath, newCanonical, "_wp", "var", "lib", "grafana", sentinelName))
+	// The canonical volume directory is destroyed, and no fred-retained-* tombstone
+	// dir was created for it.
+	_, err = os.Stat(hostVolDir)
 	assert.True(t, errors.Is(err, fs.ErrNotExist),
-		"writable-path sentinel must be gone from the restored host _wp")
-
-	// Cleanup: hard-delete the restored lease (reaper is off in this test).
-	b.cfg.RetainOnClose = false
-	require.NoError(t, b.Deprovision(ctx, newLease))
+		"the writable-path-only volume directory must be destroyed on close")
+	_, err = os.Stat(filepath.Join(mountPath, retainedName(canonical)))
+	assert.True(t, errors.Is(err, fs.ErrNotExist),
+		"no fred-retained-* tombstone must be left for a reclaimed writable-path-only volume")
 }
