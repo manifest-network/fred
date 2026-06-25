@@ -716,8 +716,21 @@ func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	limit, cont, perr := backend.ParseProvisionsPageParams(r.URL.Query())
+	if perr != nil {
+		s.errorResponse(w, http.StatusBadRequest, perr.Error())
+		return
+	}
+	page, next := backend.PaginateProvisions(provisions, cont, limit)
+	// Serialize as [] not null even if empty. PaginateProvisions returns non-nil
+	// today; this mirrors the lease_uuid branch above and stays defensive.
+	if page == nil {
+		page = []backend.ProvisionInfo{}
+	}
+
 	s.writeJSON(w, http.StatusOK, backend.ListProvisionsResponse{
-		Provisions: provisions,
+		Provisions: page,
+		Continue:   next,
 	})
 }
 
