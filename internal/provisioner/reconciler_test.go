@@ -3967,3 +3967,36 @@ func TestRestoreAffinity_EndToEnd_MultiBackend(t *testing.T) {
 	assert.Equal(t, "b2", ps.Get("source"),
 		"restore affinity: source placement must resolve to the retaining backend, not the least-loaded one")
 }
+
+func TestReconciler_ReconcileAll_OmittedProvisionNotDeprovisioned(t *testing.T) {
+	// Directional safety (ENG-380): a provision present on chain but OMITTED from
+	// the backend list must never be deprovisioned. orphans = backend - chain, so
+	// an omitted entry can only shrink the deprovision set; it is re-checked next
+	// tick. (The reconciler instead treats it as not-provisioned and re-provisions.)
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "kept-lease", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{}, // kept-lease omitted from the fetched page
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.deprovisionCalls, "an omitted-from-list provision must never be deprovisioned")
+}
