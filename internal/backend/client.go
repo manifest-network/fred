@@ -286,6 +286,10 @@ type ProvisionInfo struct {
 // ListProvisionsResponse is the response from the /provisions endpoint.
 type ListProvisionsResponse struct {
 	Provisions []ProvisionInfo `json:"provisions"`
+	// Continue is the keyset cursor for the next page: the LeaseUUID of the last
+	// item in this page when more remain, or "" when the set is exhausted.
+	// Absent (omitempty) on the unpaginated path and from pre-pagination servers.
+	Continue string `json:"continue,omitempty"`
 }
 
 // RetainedLease identifies a lease whose data this backend currently retains
@@ -501,6 +505,7 @@ type HTTPClient struct {
 	maxReleasesBytes         int64
 	maxStatsBytes            int64
 	maxRetentionsBytes       int64
+	provisionsPageLimit      int
 
 	// Optional Prometheus metrics (nil = skip recording)
 	requestDuration *prometheus.HistogramVec
@@ -524,7 +529,18 @@ const (
 	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
 	DefaultMaxStatsBytes            int64 = 1 << 20  // 1 MiB — load stats snapshot (small JSON)
 	DefaultMaxRetentionsBytes       int64 = 1 << 20  // 1 MiB — retained-lease list (small, UUID-only JSON)
+
+	// DefaultProvisionsPageLimit is the page size the client requests on
+	// GET /provisions. The server coerces a larger value down to MaxPageLimit.
+	DefaultProvisionsPageLimit = 1000
 )
+
+// maxProvisionsPages caps the client's page loop as a fail-closed backstop
+// against a backend that returns an unbounded sequence of advancing continue
+// tokens. The strict-increase guard catches a stuck token immediately; this
+// only bounds a pathological always-advancing server. At DefaultProvisionsPageLimit
+// this is far beyond any real fleet.
+const maxProvisionsPages = 100_000
 
 // HTTPClientConfig configures an HTTP backend client.
 type HTTPClientConfig struct {
@@ -556,6 +572,7 @@ type HTTPClientConfig struct {
 	MaxReleasesBytes         int64 // GetReleases response limit (default: 8 MiB)
 	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
 	MaxRetentionsBytes       int64 // ListRetentions response limit (default: 1 MiB)
+	ProvisionsPageLimit      int   // /provisions page size requested by the client (default: 1000)
 
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
@@ -657,6 +674,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		maxReleasesBytes:         positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
 		maxStatsBytes:            positiveOr(cfg.MaxStatsBytes, DefaultMaxStatsBytes),
 		maxRetentionsBytes:       positiveOr(cfg.MaxRetentionsBytes, DefaultMaxRetentionsBytes),
+		provisionsPageLimit:      cmp.Or(cfg.ProvisionsPageLimit, DefaultProvisionsPageLimit),
 		requestDuration:          cfg.RequestDuration,
 		requestsTotal:            cfg.RequestsTotal,
 	}

@@ -2093,3 +2093,11 @@ func TestHTTPClient_ListRetentions_Empty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
+
+func TestNewHTTPClient_ProvisionsPageLimitDefault(t *testing.T) {
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com"})
+	assert.Equal(t, DefaultProvisionsPageLimit, c.provisionsPageLimit, "zero config falls back to default")
+
+	c2 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: 250})
+	assert.Equal(t, 250, c2.provisionsPageLimit, "explicit config is honored")
+}
