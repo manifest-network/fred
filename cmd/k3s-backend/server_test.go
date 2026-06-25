@@ -1502,3 +1502,39 @@ func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
 		"middleware must reject method-swapped signature; body=%q", w.Body.String())
 	assert.Contains(t, w.Body.String(), "invalid signature")
 }
+
+func TestK3sHandleListProvisions_Paginates(t *testing.T) {
+	all := []backend.ProvisionInfo{
+		{LeaseUUID: "11111111-1111-1111-1111-111111111111"},
+		{LeaseUUID: "22222222-2222-2222-2222-222222222222"},
+		{LeaseUUID: "33333333-3333-3333-3333-333333333333"},
+	}
+	mb := &mockBackend{
+		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { return all, nil },
+	}
+
+	w := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?limit=2"))
+	require.Equal(t, http.StatusOK, w.Code)
+	var p backend.ListProvisionsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &p))
+	assert.Len(t, p.Provisions, 2)
+	assert.Equal(t, "22222222-2222-2222-2222-222222222222", p.Continue)
+
+	w2 := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w2, signedGetRequest("/provisions?limit=2&continue="+p.Continue))
+	require.Equal(t, http.StatusOK, w2.Code)
+	var p2 backend.ListProvisionsResponse
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &p2))
+	assert.Len(t, p2.Provisions, 1)
+	assert.Empty(t, p2.Continue)
+}
+
+func TestK3sHandleListProvisions_MalformedContinueIs400(t *testing.T) {
+	mb := &mockBackend{
+		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { return nil, nil },
+	}
+	w := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?limit=2&continue=nope"))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
