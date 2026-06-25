@@ -918,3 +918,85 @@ func TestRetentionStore_Keys(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"u1", "u2"}, keys)
 }
+
+func TestRetentionIndex_ConcurrentReadersWriters(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, s.Put(sampleEntry(fmt.Sprintf("u%d", i))))
+	}
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 64)
+	fail := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			id := fmt.Sprintf("u%d", i%50)
+			if _, err := s.ClaimForRestore(id, "n", time.Hour); err == nil {
+				_, _ = s.RevertToActive(id, 1)
+			}
+			_, _, _ = s.MarkReapingIfActive(id)
+		}
+	}()
+
+	var readersWG sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		readersWG.Add(1)
+		go func() {
+			defer readersWG.Done()
+			for j := 0; j < 200; j++ {
+				rs, err := s.ListRestoring()
+				if err != nil {
+					fail(err)
+					return
+				}
+				for k := range rs {
+					if rs[k].Status != RetentionStatusRestoring {
+						fail(fmt.Errorf("ListRestoring returned status %q", rs[k].Status))
+						return
+					}
+				}
+				bt, err := s.ListByTenant("tenant-a")
+				if err != nil {
+					fail(err)
+					return
+				}
+				for k := range bt {
+					if bt[k].Tenant != "tenant-a" {
+						fail(fmt.Errorf("ListByTenant returned tenant %q", bt[k].Tenant))
+						return
+					}
+				}
+				if j%50 == 0 {
+					if err := s.ReIndex(); err != nil {
+						fail(err)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	readersWG.Wait() // readers run fixed loops
+	close(stop)      // then stop the writer
+	writerWG.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err) // assert on the test goroutine, after joins
+	}
+
+	assertIndexConsistent(t, s) // no permanent drift after churn
+}
