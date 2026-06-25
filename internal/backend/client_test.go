@@ -2239,3 +2239,65 @@ func TestHTTPClient_ListProvisions_ContinuesOnShortNonFinalPage(t *testing.T) {
 	require.Len(t, got, 2)
 	assert.Equal(t, []string{"a", "b"}, []string{got[0].LeaseUUID, got[1].LeaseUUID})
 }
+
+// Producer that errors on the 2nd page exercises complete-or-error end to end.
+func TestHTTPClient_ListProvisions_PageErrorAborts(t *testing.T) {
+	all := manyProvisions(25)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls >= 2 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		limit, cont, _ := ParseProvisionsPageParams(r.URL.Query())
+		page, next := PaginateProvisions(all, cont, limit)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: page, Continue: next})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	_, err := c.ListProvisions(context.Background())
+	require.Error(t, err, "a failed page aborts the whole fetch (complete-or-error)")
+}
+
+// Directional safety: a provision deleted between pages is simply absent from the
+// assembled set — never duplicated, never an error. (Orphan detection is
+// orphans = backend - chain, so an omitted entry can only SHRINK the
+// deprovision-candidate set; it is re-checked next tick.)
+func TestHTTPClient_ListProvisions_ToleratesMidFetchDeletion(t *testing.T) {
+	live := manyProvisions(25) // provUUID(0)..provUUID(24)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		set := live
+		if calls >= 2 {
+			// After page 1 (provUUID(0)..provUUID(9)), delete a not-yet-returned item.
+			set = make([]ProvisionInfo, 0, len(live))
+			for _, p := range live {
+				if p.LeaseUUID == provUUID(20) {
+					continue
+				}
+				set = append(set, p)
+			}
+		}
+		limit, cont, _ := ParseProvisionsPageParams(r.URL.Query())
+		page, next := PaginateProvisions(set, cont, limit)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: page, Continue: next})
+	}))
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+
+	seen := map[string]int{}
+	for _, p := range got {
+		seen[p.LeaseUUID]++
+		assert.Equal(t, 1, seen[p.LeaseUUID], "no duplicates across pages")
+	}
+	assert.NotContains(t, seen, provUUID(20), "deleted-mid-fetch item is simply absent")
+	assert.Len(t, got, 24)
+}
