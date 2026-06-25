@@ -791,11 +791,9 @@ func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
 	require.True(t, okr)
 	assertIndexConsistent(t, s)
 
-	// Refused write must not change the index (PutReaping over an active record → ok=false).
-	// Seed the active record via PutActiveMerged (an index-maintaining mutator wired in this
-	// task) rather than blind Put — Put is not index-coupled until Task 4, so seeding with it
-	// here would leave u3 on disk but absent from the live index, failing assertIndexConsistent
-	// for a reason unrelated to PutReaping's refusal path.
+	// Refused write must not change the index: PutReaping over an active record returns
+	// ok=false and writes nothing, so the index must be unchanged afterward. Seed the active
+	// record with PutActiveMerged (any index-maintaining mutator works here).
 	okSeed, err := s.PutActiveMerged(sampleEntry("u3"))
 	require.NoError(t, err)
 	require.True(t, okSeed)
