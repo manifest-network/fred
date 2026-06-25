@@ -909,3 +909,12 @@ func TestRetentionIndex_ReadDropsStaleIndexEntry(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, got, "stale restoring index entry must be dropped: on-disk status is active")
 }
+
+func TestRetentionStore_Keys(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("u1")))
+	require.NoError(t, s.Put(sampleEntry("u2")))
+	keys, err := s.Keys()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"u1", "u2"}, keys)
+}

@@ -408,6 +408,20 @@ func (s *RetentionStore) List() ([]RetentionEntry, error) {
 	return s.filter(func(_ *RetentionEntry) bool { return true })
 }
 
+// Keys returns every retained lease UUID (the bbolt key) without unmarshalling the heavy
+// record value (skips the dominant per-record json.Unmarshal). string(k) copies, so no
+// cursor bytes escape the transaction.
+func (s *RetentionStore) Keys() ([]string, error) {
+	var out []string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).ForEach(func(k, _ []byte) error {
+			out = append(out, string(k))
+			return nil
+		})
+	})
+	return out, err
+}
+
 // ListExpired returns active entries whose CreatedAt is older than maxAge.
 func (s *RetentionStore) ListExpired(maxAge time.Duration) ([]RetentionEntry, error) {
 	cutoff := time.Now().Add(-maxAge)
