@@ -63,8 +63,10 @@ type RetentionStore struct {
 }
 
 // NewRetentionStore opens or creates a bbolt database for retention persistence.
-// No background cleanup loop is started; the docker backend drives reaping
-// explicitly via MarkReapingIfExpired / ListExpired.
+// No background cleanup loop is started; the docker backend drives reaping and
+// eviction explicitly via the MarkReaping* / ListReaping / ListExpired methods
+// (reapExpiredRetentions, evictRetentionsToCap, and the retryReapingRecords sweep
+// in restore.go), plus PutReaping for deprovision give-up tombstones.
 func NewRetentionStore(cfg RetentionStoreConfig) (*RetentionStore, error) {
 	base, err := openBoltStore(boltStoreConfig{
 		DBPath:     cfg.DBPath,

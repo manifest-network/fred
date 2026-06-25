@@ -93,8 +93,11 @@ ledger — the existing record (with a new status) is the single source of truth
     double-counts). For site 3's no-record sub-cases. `RetainedVolumeNames` may hold canonical
     names here (documented; the field means "volume names this record is responsible for
     destroying").
-- **Remove** the now-unused `ReapIfExpired` / `DeleteIfActive` (single production caller each;
-  store-test assertions migrate to the mark-reaping methods).
+- **Remove** the now-unused `ReapIfExpired` (its single caller, the grace reaper, now uses
+  `MarkReapingIfExpired`; store-test assertions migrate to the mark-reaping methods).
+  **NOTE (post-merge with ENG-370):** `DeleteIfActive` is **retained** — ENG-370's
+  `reconcileOrphanedRetentions` uses it as the ACTIVE-only CAS delete for an orphaned record
+  whose volumes already vanished. Only its *eviction* use was replaced (by `MarkReapingIfActive`).
 
 ### B. Accounting + metrics
 

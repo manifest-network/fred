@@ -25,7 +25,7 @@ record + its status) — no separate ledger. Plus a `retention_leaked_total` cou
 
 | File | Responsibility | Change |
 | --- | --- | --- |
-| `internal/backend/shared/retention.go` | bbolt retention store + entry model | add `reaping` status + `ReapingSince`; add `MarkReapingIfActive`, `MarkReapingIfExpired`, `ListReaping`, `PutReaping`; remove `ReapIfExpired`, `DeleteIfActive` |
+| `internal/backend/shared/retention.go` | bbolt retention store + entry model | add `reaping` status + `ReapingSince`; add `MarkReapingIfActive`, `MarkReapingIfExpired`, `ListReaping`, `PutReaping`; remove `ReapIfExpired` (DeleteIfActive RETAINED — ENG-370's `reconcileOrphanedRetentions` uses it; only the eviction use is replaced) |
 | `internal/backend/shared/retention_test.go` | store unit tests | tests for new methods; remove old-method tests |
 | `internal/backend/docker/metrics.go` | metric vars + setters | add `retentionLeakedTotal`, `retentionReapingBytes`, `retentionReapingLeases`; extend `updateRetentionMetrics` |
 | `internal/backend/docker/retention_accounting.go` | projection compute + refresh | add `computeReapingDiskMB`; refresh sets pool to active+reaping |
@@ -1105,24 +1105,30 @@ git commit -m "fix(retention): evict marks reaping on destroy fail, never under-
 
 ---
 
-## Task 10: Remove the now-unused `ReapIfExpired` / `DeleteIfActive`
+## Task 10: Remove the now-unused `ReapIfExpired`
+
+> **Post-merge correction (ENG-370):** as originally written this task also removed `DeleteIfActive`,
+> which was correct for ENG-376 *in isolation* (only the eviction path used it, now replaced by
+> `MarkReapingIfActive`). After merging `origin/main`, ENG-370's `reconcileOrphanedRetentions`
+> (`internal/backend/docker/restore.go`) uses `DeleteIfActive` as its ACTIVE-only CAS delete, so
+> **`DeleteIfActive` MUST be retained** — removing it breaks the build. Only `ReapIfExpired` is removed.
 
 **Files:**
-- Modify: `internal/backend/shared/retention.go` (delete both methods + their doc comments)
-- Modify: `internal/backend/shared/retention_test.go` (delete `TestRetentionStore_ReapIfExpired_Guards`, `TestDeleteIfActive_*`)
+- Modify: `internal/backend/shared/retention.go` (delete `ReapIfExpired` + its doc comment; KEEP `DeleteIfActive`)
+- Modify: `internal/backend/shared/retention_test.go` (delete `TestRetentionStore_ReapIfExpired_Guards`; KEEP `TestDeleteIfActive_*`)
 
-- [ ] **Step 1: Confirm no remaining callers**
+- [ ] **Step 1: Confirm no remaining callers of `ReapIfExpired`**
 
-Run: `grep -rn "ReapIfExpired\|DeleteIfActive" internal --include="*.go"`
-Expected: only the definitions in `retention.go` and the three `*_test.go` tests listed below. If any production caller remains, STOP — an earlier task is incomplete.
+Run: `grep -rn "ReapIfExpired" internal --include="*.go"`
+Expected: only the definition in `retention.go` and its guard test. If any production caller remains, STOP — an earlier task is incomplete. (Do NOT grep-and-remove `DeleteIfActive`; `reconcileOrphanedRetentions` depends on it.)
 
-- [ ] **Step 2: Delete the methods**
+- [ ] **Step 2: Delete the method**
 
-In `internal/backend/shared/retention.go`, delete the `ReapIfExpired` method (and its doc comment) and the `DeleteIfActive` method (and its doc comment).
+In `internal/backend/shared/retention.go`, delete the `ReapIfExpired` method (and its doc comment). Leave `DeleteIfActive` in place.
 
-- [ ] **Step 3: Delete the obsolete store tests**
+- [ ] **Step 3: Delete the obsolete store test**
 
-In `internal/backend/shared/retention_test.go`, delete `TestRetentionStore_ReapIfExpired_Guards`, `TestDeleteIfActive_DeletesActive`, `TestDeleteIfActive_SkipsRestoring`, and `TestDeleteIfActive_AbsentNoOp` (their behavior is now covered by the `MarkReaping*` tests).
+In `internal/backend/shared/retention_test.go`, delete `TestRetentionStore_ReapIfExpired_Guards` (its behavior is now covered by the `MarkReaping*` tests). Keep the `TestDeleteIfActive_*` tests.
 
 - [ ] **Step 4: Verify build + package tests**
 
@@ -1133,7 +1139,7 @@ Expected: build exit 0; tests PASS; no reference to the deleted symbols.
 
 ```bash
 git add internal/backend/shared/retention.go internal/backend/shared/retention_test.go
-git commit -m "refactor(retention): remove ReapIfExpired/DeleteIfActive superseded by MarkReaping* (ENG-376)"
+git commit -m "refactor(retention): remove ReapIfExpired superseded by MarkReapingIfExpired (ENG-376)"
 ```
 
 ---
