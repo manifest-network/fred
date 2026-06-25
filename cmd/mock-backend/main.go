@@ -356,15 +356,15 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 		return
 	}
 
-	provisions, err := s.backend.ListProvisions(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	limit, cont, perr := backend.ParseProvisionsPageParams(r.URL.Query())
 	if perr != nil {
 		http.Error(w, perr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	provisions, err := s.backend.ListProvisions(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	page, next := backend.PaginateProvisions(provisions, cont, limit)

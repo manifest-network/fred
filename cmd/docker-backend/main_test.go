@@ -1775,12 +1775,14 @@ func TestHandleListProvisions_Paginates(t *testing.T) {
 }
 
 func TestHandleListProvisions_MalformedContinueIs400(t *testing.T) {
+	called := false
 	mb := &mockBackend{
-		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { return nil, nil },
+		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { called = true; return nil, nil },
 	}
 	w := httptest.NewRecorder()
 	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?limit=2&continue=not-a-uuid"))
 	assert.Equal(t, http.StatusBadRequest, w.Code) // mirrors the lease_uuid bad-UUID 400 test
+	assert.False(t, called, "invalid pagination params must fail fast before the O(LEASES) ListProvisions fetch")
 }
 
 func TestHandleListProvisions_NoLimitReturnsFull(t *testing.T) {

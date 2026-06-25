@@ -1531,10 +1531,12 @@ func TestK3sHandleListProvisions_Paginates(t *testing.T) {
 }
 
 func TestK3sHandleListProvisions_MalformedContinueIs400(t *testing.T) {
+	called := false
 	mb := &mockBackend{
-		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { return nil, nil },
+		ListProvisionsFunc: func(context.Context) ([]backend.ProvisionInfo, error) { called = true; return nil, nil },
 	}
 	w := httptest.NewRecorder()
 	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/provisions?limit=2&continue=nope"))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.False(t, called, "invalid pagination params must fail fast before the ListProvisions fetch")
 }

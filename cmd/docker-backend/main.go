@@ -710,15 +710,15 @@ func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	provisions, err := s.backend.ListProvisions(r.Context())
-	if err != nil {
-		s.errorResponse(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
 	limit, cont, perr := backend.ParseProvisionsPageParams(r.URL.Query())
 	if perr != nil {
 		s.errorResponse(w, http.StatusBadRequest, perr.Error())
+		return
+	}
+
+	provisions, err := s.backend.ListProvisions(r.Context())
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	page, next := backend.PaginateProvisions(provisions, cont, limit)
