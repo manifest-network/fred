@@ -70,8 +70,8 @@ type RetentionStoreConfig struct {
 type RetentionStore struct {
 	*boltStore
 	mu        sync.RWMutex
-	byTenant  map[string]map[string]struct{} // tenant -> set of OriginalLeaseUUID
-	byStatus  map[string]map[string]struct{} // status -> set of OriginalLeaseUUID
+	byTenant  map[string]map[string]struct{} // tenant -> set of bbolt bucket keys (the authoritative lease UUID; see scanIndex/indexApply)
+	byStatus  map[string]map[string]struct{} // status -> set of bbolt bucket keys (the authoritative lease UUID; see scanIndex/indexApply)
 	onReindex func(count int, dur time.Duration, trigger string)
 }
 
