@@ -479,7 +479,13 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to open release store: %w", err)
 	}
 
-	retentionStore, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: cfg.RetentionDBPath})
+	retentionStore, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: cfg.RetentionDBPath,
+		OnReindex: func(count int, dur time.Duration, trigger string) {
+			retentionIndexReindexTotal.WithLabelValues(trigger).Inc()
+			logger.Info("retention index rebuilt", "records", count, "duration", dur, "trigger", trigger)
+		},
+	})
 	if err != nil {
 		_ = cbStore.Close()
 		_ = diagStore.Close()

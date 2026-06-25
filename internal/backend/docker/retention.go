@@ -14,13 +14,13 @@ func (b *Backend) ListRetentions(_ context.Context) ([]backend.RetainedLease, er
 	if b.retentionStore == nil {
 		return []backend.RetainedLease{}, nil
 	}
-	entries, err := b.retentionStore.List()
+	keys, err := b.retentionStore.Keys()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]backend.RetainedLease, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, backend.RetainedLease{LeaseUUID: e.OriginalLeaseUUID})
+	out := make([]backend.RetainedLease, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, backend.RetainedLease{LeaseUUID: k})
 	}
 	return out, nil
 }

@@ -1,6 +1,8 @@
 package shared
 
 import (
+	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -657,4 +659,467 @@ func TestStatusAudit_ListExpired_ExcludesReaping(t *testing.T) {
 	got, err := s.ListExpired(time.Hour)
 	require.NoError(t, err)
 	assert.Empty(t, got, "ListExpired returns active-only")
+}
+
+// indexSnapshot returns a deep, per-partition SORTED copy of the in-memory index
+// for white-box assertions (sorted so equality checks are order-deterministic).
+func (s *RetentionStore) indexSnapshot() (map[string][]string, map[string][]string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cp := func(m map[string]map[string]struct{}) map[string][]string {
+		out := map[string][]string{}
+		for k, set := range m {
+			for u := range set {
+				out[k] = append(out[k], u)
+			}
+			sort.Strings(out[k])
+		}
+		return out
+	}
+	return cp(s.byTenant), cp(s.byStatus)
+}
+
+func TestRetentionIndex_RebuildOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/retention.db"
+	s1, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.NoError(t, err)
+	a := sampleEntry("lease-a") // tenant-a, active
+	b := sampleEntry("lease-b")
+	b.Tenant = "tenant-b"
+	b.Status = RetentionStatusReaping
+	require.NoError(t, s1.Put(a))
+	require.NoError(t, s1.Put(b))
+	require.NoError(t, s1.Close())
+
+	s2, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s2.Close() })
+
+	byTenant, byStatus := s2.indexSnapshot()
+	assert.ElementsMatch(t, []string{"lease-a"}, byTenant["tenant-a"])
+	assert.ElementsMatch(t, []string{"lease-b"}, byTenant["tenant-b"])
+	assert.ElementsMatch(t, []string{"lease-a"}, byStatus[RetentionStatusActive])
+	assert.ElementsMatch(t, []string{"lease-b"}, byStatus[RetentionStatusReaping])
+}
+
+// A malformed record must fail the open (fail-closed) — a corrupt retention record is a
+// data-integrity event, and silently skipping it would drop the only restore handle from
+// the index while the bytes persist on disk.
+func TestRetentionIndex_RebuildFailsClosedOnMalformedRecord(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/retention.db"
+	s1, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.NoError(t, err)
+	require.NoError(t, s1.Put(sampleEntry("good")))
+	// Write garbage bytes directly under a key (white-box).
+	require.NoError(t, s1.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte("bad"), []byte("{not json"))
+	}))
+	require.NoError(t, s1.Close())
+
+	_, err = NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "retention index")
+	// The malformed-record error must name the offending bucket key so an operator can find
+	// and remediate it (uniform across all unmarshal sites — see the per-method %q errors).
+	assert.Contains(t, err.Error(), `"bad"`)
+}
+
+func TestRetentionIndex_Apply(t *testing.T) {
+	s := newTestRetentionStore(t)
+	s.mu.Lock()
+	a := sampleEntry("u1") // tenant-a / active
+	s.indexApply("u1", nil, &a)
+	moved := a
+	moved.Status = RetentionStatusReaping
+	s.indexApply("u1", &a, &moved)  // active -> reaping
+	s.indexApply("u1", &moved, nil) // delete
+	s.mu.Unlock()
+	byTenant, byStatus := s.indexSnapshot()
+	assert.Empty(t, byTenant)
+	assert.Empty(t, byStatus)
+}
+
+// assertIndexConsistent asserts the live index equals a freshly-derived rebuild (per-key, order-insensitive).
+func assertIndexConsistent(t *testing.T, s *RetentionStore) {
+	t.Helper()
+	liveT, liveS := s.indexSnapshot()
+	byTenant, byStatus, _, err := s.scanIndex()
+	require.NoError(t, err)
+	want := func(m map[string]map[string]struct{}) map[string][]string {
+		out := map[string][]string{}
+		for k, set := range m {
+			for u := range set {
+				out[k] = append(out[k], u)
+			}
+		}
+		return out
+	}
+	wantT, wantS := want(byTenant), want(byStatus)
+	require.Equal(t, len(wantT), len(liveT))
+	for k := range wantT {
+		assert.ElementsMatch(t, wantT[k], liveT[k], "byTenant[%q]", k)
+	}
+	require.Equal(t, len(wantS), len(liveS))
+	for k := range wantS {
+		assert.ElementsMatch(t, wantS[k], liveS[k], "byStatus[%q]", k)
+	}
+}
+
+func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	ok, err := s.PutActiveMerged(sampleEntry("u1"))
+	require.NoError(t, err)
+	require.True(t, ok)
+	assertIndexConsistent(t, s)
+
+	_, err = s.ClaimForRestore("u1", "newlease", time.Hour) // active -> restoring
+	require.NoError(t, err)
+	assertIndexConsistent(t, s)
+
+	swapped, err := s.RevertToActive("u1", 1) // restoring -> active (gen=1 after claim)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	assertIndexConsistent(t, s)
+
+	_, ok, err = s.MarkReapingIfActive("u1") // active -> reaping
+	require.NoError(t, err)
+	require.True(t, ok)
+	assertIndexConsistent(t, s)
+
+	okr, err := s.PutReaping(sampleEntry("u2")) // fresh-insert reaping
+	require.NoError(t, err)
+	require.True(t, okr)
+	assertIndexConsistent(t, s)
+
+	// Refused write must not change the index: PutReaping over an active record returns
+	// ok=false and writes nothing, so the index must be unchanged afterward. Seed the active
+	// record with PutActiveMerged (any index-maintaining mutator works here).
+	okSeed, err := s.PutActiveMerged(sampleEntry("u3"))
+	require.NoError(t, err)
+	require.True(t, okSeed)
+	okr, err = s.PutReaping(sampleEntry("u3"))
+	require.NoError(t, err)
+	require.False(t, okr)
+	assertIndexConsistent(t, s) // sole equality oracle — do NOT compare two raw indexSnapshot maps with assert.Equal (order-randomized)
+
+	// DeleteIfActive on a non-active record is a no-op (u1 is reaping) → index unchanged.
+	_, deleted, err := s.DeleteIfActive("u1")
+	require.NoError(t, err)
+	require.False(t, deleted)
+	assertIndexConsistent(t, s)
+
+	// DeleteIfActive on a fresh active record removes it from both partitions.
+	okSeed, err = s.PutActiveMerged(sampleEntry("u4"))
+	require.NoError(t, err)
+	require.True(t, okSeed)
+	_, deleted, err = s.DeleteIfActive("u4")
+	require.NoError(t, err)
+	require.True(t, deleted)
+	assertIndexConsistent(t, s)
+
+	// MarkReapingIfExpired: active+expired → reaping.
+	expired := sampleEntry("u5")
+	expired.CreatedAt = time.Now().Add(-48 * time.Hour)
+	okSeed, err = s.PutActiveMerged(expired)
+	require.NoError(t, err)
+	require.True(t, okSeed)
+	_, okExp, err := s.MarkReapingIfExpired("u5", time.Hour)
+	require.NoError(t, err)
+	require.True(t, okExp)
+	assertIndexConsistent(t, s)
+}
+
+func TestRetentionIndex_ReIndexRebuildsAndFiresHook(t *testing.T) {
+	dir := t.TempDir()
+	var gotTrigger string
+	var gotCount int
+	s, err := NewRetentionStore(RetentionStoreConfig{
+		DBPath:    dir + "/retention.db",
+		OnReindex: func(count int, _ time.Duration, trigger string) { gotCount, gotTrigger = count, trigger },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	require.NoError(t, s.Put(sampleEntry("u1")))
+	require.NoError(t, s.ReIndex())
+	assert.Equal(t, "manual", gotTrigger)
+	assert.Equal(t, 1, gotCount)
+	byTenant, _ := s.indexSnapshot()
+	assert.ElementsMatch(t, []string{"u1"}, byTenant["tenant-a"])
+}
+
+func TestRetentionIndex_PutOverwriteAndDeleteStayConsistent(t *testing.T) {
+	s := newTestRetentionStore(t)
+	e := sampleEntry("u1")
+	require.NoError(t, s.Put(e))
+	assertIndexConsistent(t, s)
+
+	e2 := e
+	e2.Status = RetentionStatusReaping
+	require.NoError(t, s.Put(e2)) // overwrite same UUID, different status
+	_, byStatus := s.indexSnapshot()
+	assert.NotContains(t, byStatus[RetentionStatusActive], "u1")
+	assert.ElementsMatch(t, []string{"u1"}, byStatus[RetentionStatusReaping])
+	assertIndexConsistent(t, s)
+
+	require.NoError(t, s.Delete("u1"))
+	assertIndexConsistent(t, s)
+	byTenant, byStatus := s.indexSnapshot()
+	assert.Empty(t, byTenant)
+	assert.Empty(t, byStatus)
+
+	require.NoError(t, s.Delete("nope")) // absent → no-op
+	assertIndexConsistent(t, s)
+}
+
+func TestRetentionIndex_ListByIndexEquivalence(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for i, st := range []string{RetentionStatusActive, RetentionStatusRestoring, RetentionStatusReaping, RetentionStatusActive} {
+		e := sampleEntry(fmt.Sprintf("u%d", i))
+		e.Status = st
+		if i == 3 {
+			e.Tenant = "tenant-b"
+		}
+		require.NoError(t, s.Put(e))
+	}
+	byT, err := s.ListByTenant("tenant-a")
+	require.NoError(t, err)
+	assert.Len(t, byT, 3)
+	for _, e := range byT {
+		assert.Equal(t, "tenant-a", e.Tenant)
+	}
+	restoring, err := s.ListRestoring()
+	require.NoError(t, err)
+	assert.Len(t, restoring, 1)
+	assert.Equal(t, RetentionStatusRestoring, restoring[0].Status)
+}
+
+func TestRetentionIndex_ReadDropsStaleIndexEntry(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("u1"))) // active
+
+	// Force a stale index entry: claim → revert leaves on-disk status=active, but seed
+	// byStatus[restoring] with u1 to simulate an index snapshot lagging a revert.
+	s.mu.Lock()
+	idxAdd(s.byStatus, RetentionStatusRestoring, "u1")
+	s.mu.Unlock()
+
+	got, err := s.ListRestoring()
+	require.NoError(t, err)
+	assert.Empty(t, got, "stale restoring index entry must be dropped: on-disk status is active")
+}
+
+func TestRetentionStore_Keys(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("u1")))
+	require.NoError(t, s.Put(sampleEntry("u2")))
+	keys, err := s.Keys()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"u1", "u2"}, keys)
+}
+
+func TestRetentionIndex_ConcurrentReadersWriters(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, s.Put(sampleEntry(fmt.Sprintf("u%d", i))))
+	}
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 64)
+	fail := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			id := fmt.Sprintf("u%d", i%50)
+			if _, err := s.ClaimForRestore(id, "n", time.Hour); err == nil {
+				_, _ = s.RevertToActive(id, 1)
+			}
+			_, _, _ = s.MarkReapingIfActive(id)
+		}
+	}()
+
+	var readersWG sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		readersWG.Add(1)
+		go func() {
+			defer readersWG.Done()
+			for j := 0; j < 200; j++ {
+				rs, err := s.ListRestoring()
+				if err != nil {
+					fail(err)
+					return
+				}
+				for k := range rs {
+					if rs[k].Status != RetentionStatusRestoring {
+						fail(fmt.Errorf("ListRestoring returned status %q", rs[k].Status))
+						return
+					}
+				}
+				bt, err := s.ListByTenant("tenant-a")
+				if err != nil {
+					fail(err)
+					return
+				}
+				for k := range bt {
+					if bt[k].Tenant != "tenant-a" {
+						fail(fmt.Errorf("ListByTenant returned tenant %q", bt[k].Tenant))
+						return
+					}
+				}
+				if j%50 == 0 {
+					if err := s.ReIndex(); err != nil {
+						fail(err)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	readersWG.Wait() // readers run fixed loops
+	close(stop)      // then stop the writer
+	writerWG.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err) // assert on the test goroutine, after joins
+	}
+
+	assertIndexConsistent(t, s) // no permanent drift after churn
+}
+
+// TestRetentionIndex_RebuildKeysOnBucketKey pins that scanIndex keys the index on the bucket
+// KEY (the authoritative UUID getAll resolves via Get), not on the record's value
+// OriginalLeaseUUID. A record whose stored value UUID is empty/mismatched (partial corruption,
+// older format, manual edit) must still be found via ListByTenant. (Copilot comment 2 regression.)
+func TestRetentionIndex_RebuildKeysOnBucketKey(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	// White-box: write a record under key "K1" whose VALUE has an empty (mismatched) UUID.
+	val := `{"original_lease_uuid":"","tenant":"t-mismatch","status":"active","retained_volume_names":["v"]}`
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte("K1"), []byte(val))
+	}))
+	require.NoError(t, s.ReIndex())
+
+	// The index must key on "K1" so getAll's Get("K1") finds the record; keying on the empty
+	// value UUID would make ListByTenant silently miss it.
+	got, err := s.ListByTenant("t-mismatch")
+	require.NoError(t, err)
+	require.Len(t, got, 1, "record must be found via the bucket key, not the empty value UUID")
+}
+
+// TestRetentionIndex_MutatorKeysOnBucketKey pins that indexApply (the runtime maintenance path)
+// keys the index on the bucket KEY too, consistent with scanIndex. A record whose stored value UUID
+// is empty/mismatched must still be correctly re-indexed when a mutator transitions its status —
+// otherwise scanIndex (keyed on the bucket key) and indexApply (keyed on the value field) diverge and
+// the record drifts out of the index until the next ReIndex. (Copilot follow-up regression.)
+func TestRetentionIndex_MutatorKeysOnBucketKey(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	// White-box: an active record under key "K1" whose VALUE UUID is empty (mismatched).
+	val := `{"original_lease_uuid":"","tenant":"t","status":"active","retained_volume_names":["v"]}`
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte("K1"), []byte(val))
+	}))
+	require.NoError(t, s.ReIndex()) // index keyed on the bucket key "K1"
+
+	// Runtime status transition active -> restoring via a mutator (keyed on orig="K1").
+	// maxAge=0 disables the expiry check (the white-box record has a zero CreatedAt); this test
+	// is about index keying, not grace expiry.
+	_, err := s.ClaimForRestore("K1", "newlease", 0)
+	require.NoError(t, err)
+
+	// The record must move to the restoring partition under "K1" and be found via getAll(Get("K1")).
+	restoring, err := s.ListRestoring()
+	require.NoError(t, err)
+	require.Len(t, restoring, 1, "transitioned record must be found via the bucket key, not the empty value UUID")
+	// No stale entry left in the active partition: the index must match a fresh rebuild.
+	assertIndexConsistent(t, s)
+}
+
+// TestRetentionIndex_ReIndexConcurrentWithWriter pins that ReIndex serializes with mutators by
+// holding s.mu across the full scan+swap. A writer continuously Puts unique, KEPT records while a
+// second goroutine ReIndexes. If ReIndex scanned outside the lock, a Put committed during the
+// (long) scan would be lost when the pre-scan snapshot is swapped in — and since the record is
+// never deleted, that loss persists as a missing index entry the final assertIndexConsistent
+// catches. With the lock held across scan+swap the writer is serialized, so no Put is lost.
+// (Copilot comment 1 regression; verified to FAIL against the scan-outside-lock implementation.)
+func TestRetentionIndex_ReIndexConcurrentWithWriter(t *testing.T) {
+	s := newTestRetentionStore(t)
+	// A wide base set makes each ReIndex scan slow enough that a concurrent Put reliably commits
+	// inside the scan→swap window on the buggy (scan-outside-lock) path.
+	for i := 0; i < 1000; i++ {
+		require.NoError(t, s.Put(sampleEntry(fmt.Sprintf("base%d", i))))
+	}
+
+	errCh := make(chan error, 16)
+	fail := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+	stop := make(chan struct{})
+
+	// Writer (outlasts the reindexer): continuously ADD unique, KEPT records. A ReIndex that
+	// loses one during its scan can't be healed (the writer never re-adds it, and the bounded
+	// reindexer runs no further), so the loss persists as missing-entry drift.
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := s.Put(sampleEntry(fmt.Sprintf("w%d", i))); err != nil {
+				fail(err)
+				return
+			}
+		}
+	}()
+
+	// Bounded reindexer. With the fix (lock held across scan) the writer is serialized around each
+	// scan, so it adds only a handful of records and the store stays small/fast; the blow-up only
+	// happens on the buggy path during local verification.
+	var reidxWG sync.WaitGroup
+	reidxWG.Add(1)
+	go func() {
+		defer reidxWG.Done()
+		for i := 0; i < 30; i++ {
+			if err := s.ReIndex(); err != nil {
+				fail(err)
+				return
+			}
+		}
+	}()
+
+	reidxWG.Wait() // bounded reindexer finishes its loop
+	close(stop)    // then stop the writer
+	writerWG.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	// The live index must match a fresh rebuild — no record dropped by a ReIndex that raced a
+	// concurrent Put.
+	assertIndexConsistent(t, s)
 }

@@ -405,7 +405,30 @@ var (
 		Name:      "retention_reaping_leases",
 		Help:      "Number of retained records stuck in the reaping (pending-destroy) state",
 	})
+
+	// retentionIndexReindexTotal counts retention in-memory index (re)builds by
+	// trigger: "open" (one per store open / process start) and "manual" (an explicit
+	// ReIndex self-heal). A rising "manual" rate signals operator-driven rebuilds; a
+	// jump in "open" beyond restart cadence signals store churn (ENG-385).
+	retentionIndexReindexTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem, // => fred_docker_backend_retention_index_reindex_total
+		Name:      "retention_index_reindex_total",
+		Help:      "Count of retention in-memory index (re)builds, by trigger (open|manual).",
+	}, []string{"trigger"})
 )
+
+// reindexTriggers is the closed trigger set, used to pre-initialize the
+// retentionIndexReindexTotal series to 0 so absence/ratio alert queries return 0,
+// not no-data, before the first (re)build.
+var reindexTriggers = []string{"open", "manual"}
+
+func init() {
+	// Pre-init both reindex-trigger series to 0, mirroring the orphan-skip pre-init.
+	for _, tr := range reindexTriggers {
+		retentionIndexReindexTotal.WithLabelValues(tr).Add(0)
+	}
+}
 
 const bytesPerMiB = 1 << 20
 
