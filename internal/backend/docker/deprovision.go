@@ -203,19 +203,71 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// never drops already-retained volumes (which would leak them) or overwrites
 		// the prior record with a shorter list — and never clobbers a record that a
 		// concurrent restore claimed (active→restoring) mid-flight.
+
+		// ENG-406: reclaim writable-path-only volumes instead of retaining them.
+		// A canonical volume whose only content is the ephemeral _wp/ scaffolding
+		// (no declared-VOLUME data) preserves nothing restorable — restore reseeds
+		// _wp from the image regardless (ENG-367 contract) — so retaining it only
+		// pollutes a per-tenant slot, the retained-disk budget, and leaves a
+		// fred-retained-* dir. Destroy those now (isWritablePathOnly is conservative:
+		// it returns true only for PROVABLY _wp-only volumes, so a stateful volume is
+		// never destroyed) and retain the rest. Only the VOLUME NAMES are narrowed
+		// (retainCanonical → RetainedVolumeNames); the record's Items and
+		// StackManifest MUST stay the FULL set (see the record write below).
+		retainCanonical := make([]string, 0, len(canonical))
+		for _, c := range canonical {
+			if b.isWritablePathOnly(c) {
+				if err := b.volumes.Destroy(ctx, c); err != nil {
+					// Destroy failed → the volume is still canonical on disk. Record
+					// the error so the lease stays Failed and retries (re-detecting
+					// and re-destroying it); do NOT add it to retainCanonical — it
+					// must never be retained.
+					logger.Error("failed to reclaim writable-path-only volume", "volume", c, "error", err)
+					volumeErrs = append(volumeErrs, fmt.Errorf("reclaim writable-path-only volume %s: %w", c, err))
+				} else {
+					retentionWritablePathReclaimedTotal.Inc()
+					logger.Info("reclaimed writable-path-only volume on close", "volume", c)
+				}
+				continue
+			}
+			retainCanonical = append(retainCanonical, c)
+		}
+		// durableItems = items whose service still has a volume to retain. This is
+		// used ONLY for the cap check (shouldRefuseRetention), NOT for the record:
+		// the refuse action is DESTROY, so feeding it the smaller durable footprint
+		// can only refuse LESS often (never destroying a stateful volume the full
+		// set would have spared) — the safe direction. The persisted record keeps
+		// the FULL items (below); accounting over-counting a reclaimed wp-only
+		// service's declared DiskMB is the safe (deny-only) direction, whereas
+		// under-counting it on the record would over-admit (ENG-360/376).
+		retainSet := make(map[string]struct{}, len(retainCanonical))
+		for _, c := range retainCanonical {
+			retainSet[c] = struct{}{}
+		}
+		durableItems := make([]backend.LeaseItem, 0, len(items))
+		for _, item := range items {
+			for i := range item.Quantity {
+				if _, ok := retainSet[canonicalVolumeName(leaseUUID, item.ServiceName, i)]; ok {
+					durableItems = append(durableItems, item)
+					break
+				}
+			}
+		}
+
 		switch {
-		case len(canonical) == 0:
-			// No canonical volumes enumerated. If List SUCCEEDED, none remain under
-			// the live name (already renamed on a prior attempt, or a stateless
-			// lease) → safe to release live. If List ERRORED, volumes may still be
-			// on disk → keep live counted (flag stays false); volumeErrs already
-			// carries the List error so the lease retries.
-			if listErr == nil {
+		case len(retainCanonical) == 0:
+			// No durable (declared-VOLUME) data remains to retain: the lease was
+			// stateless, its volumes were already renamed on a prior attempt, or
+			// they were all writable-path-only and just reclaimed above. Release
+			// live only when nothing errored — a List error or a failed wp-only
+			// destroy leaves bytes on disk, so keep live counted (flag stays false)
+			// and let the retry re-attempt.
+			if len(volumeErrs) == 0 {
 				releaseLiveOnRetainPath = true
 			}
-		case b.shouldRefuseRetention(leaseUUID, items):
+		case b.shouldRefuseRetention(leaseUUID, durableItems):
 			prevErrCount := len(volumeErrs)
-			volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, canonical, leaseUUID, tenant, logger)...)
+			volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, logger)...)
 			if len(volumeErrs) == prevErrCount {
 				// All canonical volumes destroyed without error — bytes are gone,
 				// so it is safe to release the live allocation.
@@ -223,8 +275,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			}
 		default:
 			// existing retain logic — UNCHANGED, just moved under `default:`
-			retained := make([]string, 0, len(canonical))
-			for _, c := range canonical {
+			retained := make([]string, 0, len(retainCanonical))
+			for _, c := range retainCanonical {
 				retained = append(retained, retainedName(c))
 			}
 			// Best-effort cap room BEFORE the write. Dropping the standalone Get-guard
@@ -260,6 +312,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// the MERGED retained set) before any rename in ONE bbolt txn. CreatedAt
 			// (grace clock) and Generation (CAS) are preserved across retries by the
 			// store. ok=false means a restore claimed the record concurrently — defer.
+			// Items and StackManifest MUST be the FULL lease set, NOT narrowed to the
+			// retained (durable) subset. Restore validates the record against the
+			// chain's full item set (itemsShapeMatch, restore.go) — the chain never
+			// saw the wp-only reclaim — so a narrowed Items would make EVERY restore
+			// fail (shape mismatch), stranding the retained stateful volume until the
+			// reaper destroys it: unrecoverable tenant data loss. On restore the
+			// reclaimed wp-only services simply get a fresh volume (RetainedVolumeNames
+			// omits them), reseeded from the image — exactly the ENG-367 contract. Only
+			// RetainedVolumeNames is narrowed to the durable volumes actually retained.
 			base := shared.RetentionEntry{
 				OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
 				Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
@@ -282,7 +343,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			default:
 				// Only the STILL-canonical volumes need renaming; the already-retained
 				// ones (from a prior attempt) are done.
-				for _, c := range canonical {
+				for _, c := range retainCanonical {
 					if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
 						logger.Error("failed to retain volume", "volume", c, "error", err)
 						volumeErrs = append(volumeErrs, fmt.Errorf("retain volume %s: %w", c, err))

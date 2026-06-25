@@ -212,6 +212,21 @@ var (
 		Help:      "Orphan-reconcile skips by reason (sweep-level bailouts + per-record raced prune attempts)",
 	}, []string{"reason"})
 
+	// retentionWritablePathReclaimedTotal counts managed volumes that, on close,
+	// were destroyed (reclaimed) rather than soft-deleted because they held only
+	// ephemeral writable-path scaffolding (a _wp/ subtree, no declared-VOLUME
+	// data). Such volumes are non-durable by the ENG-367 wipe-contract, so
+	// retaining them would only pollute the retention record/slot/dir/budget
+	// (ENG-406). A rising rate quantifies how much retention pollution the
+	// per-class reclaim policy is avoiding; pairs with retention_refused_total
+	// and the retained-volume gauges on the ENG-405 dashboards.
+	retentionWritablePathReclaimedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_writable_path_reclaimed_total",
+		Help:      "Total writable-path-only volumes destroyed (reclaimed) at close instead of retained",
+	})
+
 	// containerRemovalWaitFailuresTotal counts RemoveContainer calls where
 	// the "removal in progress" wait did not confirm NotFound before the
 	// bound elapsed (timeout, context cancellation, or persistent inspect
