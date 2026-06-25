@@ -387,8 +387,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// now. Releasing only on success (not before the loop) keeps the footprint
 			// counted while a failed Destroy leaves bytes on disk and the lease is kept
 			// Failed for retry, preventing an over-admit/ENOSPC window. Symmetric with
-			// the refuse-to-retain arm (releaseLiveOnRetainPath set only when
-			// len(volumeErrs) == prevErrCount).
+			// the retain arms (releaseLiveOnRetainPath set only when
+			// len(volumeErrs) == 0).
 			releaseLive()
 		}
 	}
