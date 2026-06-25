@@ -111,16 +111,21 @@ func (s *RetentionStore) fireReindex(count int, dur time.Duration, trigger strin
 	}
 }
 
-// ReIndex rebuilds the in-memory index from the primary bucket and atomically swaps it in.
-// Safe on a live store: builds fresh maps, then assigns under s.mu so readers see either the
-// whole old or whole new index. The self-heal/recovery seam (the index is never the source of truth).
+// ReIndex rebuilds the in-memory index from the primary bucket and swaps it in.
+// Safe on a live store: it holds s.mu across the WHOLE scan+swap, which serializes it with
+// mutators (each holds s.mu across its {db.Update + indexApply}). Holding the lock only for the
+// swap would be unsafe — a mutator could commit a write and update the live index between the
+// scan returning and the swap, and the swap would then overwrite that write with a pre-scan
+// snapshot (lost update → drift until the next rebuild). fireReindex runs outside the lock.
+// The self-heal/recovery seam (the index is never the source of truth).
 func (s *RetentionStore) ReIndex() error {
 	start := time.Now()
+	s.mu.Lock()
 	byTenant, byStatus, count, err := s.scanIndex()
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
-	s.mu.Lock()
 	s.byTenant, s.byStatus = byTenant, byStatus
 	s.mu.Unlock()
 	s.fireReindex(count, time.Since(start), "manual")
@@ -147,8 +152,13 @@ func (s *RetentionStore) scanIndex() (byTenant, byStatus map[string]map[string]s
 				// operator-facing store-open failure must name the key to be lookup-able.
 				return fmt.Errorf("malformed retention record %q: %w", string(k), uerr)
 			}
-			idxAdd(byTenant, e.Tenant, e.OriginalLeaseUUID)
-			idxAdd(byStatus, e.Status, e.OriginalLeaseUUID)
+			// Index on the bucket KEY, not e.OriginalLeaseUUID: the key is the authoritative
+			// UUID that getAll resolves via Get(uuid), so keying on it keeps the index→Get
+			// round-trip correct even if a record's value UUID is empty/mismatched (partial
+			// corruption / older format / manual edit). For store-written records key == value.
+			uuid := string(k)
+			idxAdd(byTenant, e.Tenant, uuid)
+			idxAdd(byStatus, e.Status, uuid)
 			count++
 			return nil
 		})

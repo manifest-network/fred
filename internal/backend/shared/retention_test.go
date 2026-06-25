@@ -998,3 +998,96 @@ func TestRetentionIndex_ConcurrentReadersWriters(t *testing.T) {
 
 	assertIndexConsistent(t, s) // no permanent drift after churn
 }
+
+// TestRetentionIndex_RebuildKeysOnBucketKey pins that scanIndex keys the index on the bucket
+// KEY (the authoritative UUID getAll resolves via Get), not on the record's value
+// OriginalLeaseUUID. A record whose stored value UUID is empty/mismatched (partial corruption,
+// older format, manual edit) must still be found via ListByTenant. (Copilot comment 2 regression.)
+func TestRetentionIndex_RebuildKeysOnBucketKey(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	// White-box: write a record under key "K1" whose VALUE has an empty (mismatched) UUID.
+	val := `{"original_lease_uuid":"","tenant":"t-mismatch","status":"active","retained_volume_names":["v"]}`
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte("K1"), []byte(val))
+	}))
+	require.NoError(t, s.ReIndex())
+
+	// The index must key on "K1" so getAll's Get("K1") finds the record; keying on the empty
+	// value UUID would make ListByTenant silently miss it.
+	got, err := s.ListByTenant("t-mismatch")
+	require.NoError(t, err)
+	require.Len(t, got, 1, "record must be found via the bucket key, not the empty value UUID")
+}
+
+// TestRetentionIndex_ReIndexConcurrentWithWriter pins that ReIndex serializes with mutators by
+// holding s.mu across the full scan+swap. A writer continuously Puts unique, KEPT records while a
+// second goroutine ReIndexes. If ReIndex scanned outside the lock, a Put committed during the
+// (long) scan would be lost when the pre-scan snapshot is swapped in — and since the record is
+// never deleted, that loss persists as a missing index entry the final assertIndexConsistent
+// catches. With the lock held across scan+swap the writer is serialized, so no Put is lost.
+// (Copilot comment 1 regression; verified to FAIL against the scan-outside-lock implementation.)
+func TestRetentionIndex_ReIndexConcurrentWithWriter(t *testing.T) {
+	s := newTestRetentionStore(t)
+	// A wide base set makes each ReIndex scan slow enough that a concurrent Put reliably commits
+	// inside the scan→swap window on the buggy (scan-outside-lock) path.
+	for i := 0; i < 1000; i++ {
+		require.NoError(t, s.Put(sampleEntry(fmt.Sprintf("base%d", i))))
+	}
+
+	errCh := make(chan error, 16)
+	fail := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+	stop := make(chan struct{})
+
+	// Writer (outlasts the reindexer): continuously ADD unique, KEPT records. A ReIndex that
+	// loses one during its scan can't be healed (the writer never re-adds it, and the bounded
+	// reindexer runs no further), so the loss persists as missing-entry drift.
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := s.Put(sampleEntry(fmt.Sprintf("w%d", i))); err != nil {
+				fail(err)
+				return
+			}
+		}
+	}()
+
+	// Bounded reindexer. With the fix (lock held across scan) the writer is serialized around each
+	// scan, so it adds only a handful of records and the store stays small/fast; the blow-up only
+	// happens on the buggy path during local verification.
+	var reidxWG sync.WaitGroup
+	reidxWG.Add(1)
+	go func() {
+		defer reidxWG.Done()
+		for i := 0; i < 30; i++ {
+			if err := s.ReIndex(); err != nil {
+				fail(err)
+				return
+			}
+		}
+	}()
+
+	reidxWG.Wait() // bounded reindexer finishes its loop
+	close(stop)    // then stop the writer
+	writerWG.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	// The live index must match a fresh rebuild — no record dropped by a ReIndex that raced a
+	// concurrent Put.
+	assertIndexConsistent(t, s)
+}
