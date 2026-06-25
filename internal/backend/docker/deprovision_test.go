@@ -56,3 +56,44 @@ func TestDeprovisionGiveUp_WritesReapingTombstone(t *testing.T) {
 	assert.ElementsMatch(t, []string{"fred-u1-app-0"}, got.RetainedVolumeNames)
 	assert.Greater(t, testutil.ToFloat64(retentionLeakedTotal), leakBefore)
 }
+
+// TestDeprovisionGiveUp_ListFails_RecordsBothNamespaces verifies the recordGiveUpLeak
+// fallback (volumes.List error): the tombstone records BOTH the canonical name and the
+// fred-retained-* name per item. A retain-path partial rename may have moved a volume
+// into the retained namespace before failing, so recording only the canonical name would
+// let the sweep "succeed" against the (idempotent) non-existent canonical name, drop the
+// tombstone, and leave the fred-retained-* volume on disk and untracked. ENG-376.
+func TestDeprovisionGiveUp_ListFails_RecordsBothNamespaces(t *testing.T) {
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"u1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u1", Tenant: "t1", Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		}, VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1}, // next failure → give up
+	})
+	withMicroSKU(b, 1024)
+	rs := attachRetentionStore(t, b)
+
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return nil, errors.New("statfs EIO") }, // force the fallback
+		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
+	}
+
+	_ = b.Deprovision(context.Background(), "u1")
+
+	var got *shared.RetentionEntry
+	require.Eventually(t, func() bool {
+		g, e := rs.Get("u1")
+		if e != nil || g == nil {
+			return false
+		}
+		got = g
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "reaping tombstone for u1 must be written at give-up")
+
+	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
+	assert.ElementsMatch(t,
+		[]string{"fred-u1-app-0", "fred-retained-u1-app-0"},
+		got.RetainedVolumeNames,
+		"fallback must record BOTH the canonical and the fred-retained- name so whichever exists is destroyed before the tombstone is deleted")
+}

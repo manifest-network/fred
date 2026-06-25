@@ -472,10 +472,19 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 			}
 		}
 	} else {
-		logger.Warn("give-up leak: volume list failed; deriving canonical names from items", "error", err)
+		logger.Warn("give-up leak: volume list failed; deriving canonical + retained names from items", "error", err)
 		for _, item := range items {
 			for i := range item.Quantity {
-				leaked = append(leaked, canonicalVolumeName(leaseUUID, item.ServiceName, i))
+				canonical := canonicalVolumeName(leaseUUID, item.ServiceName, i)
+				// Record BOTH namespaces. A retain-path give-up may have already renamed
+				// some volumes into fred-retained-* before failing, so the on-disk name is
+				// unknown when List() is unavailable. destroyReapingVolumes treats a missing
+				// volume as an idempotent no-op, so recording both guarantees whichever
+				// exists is destroyed before the tombstone is deleted. Without the retained
+				// name, the sweep would "succeed" against the non-existent canonical name and
+				// drop the tombstone while the fred-retained-* volume persists untracked —
+				// reintroducing the exact under-count/leak this path fixes.
+				leaked = append(leaked, canonical, retainedName(canonical))
 			}
 		}
 	}
