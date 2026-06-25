@@ -106,7 +106,7 @@ func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 	// (no declared-VOLUME subdir) → writable-path-only.
 	volRoot := t.TempDir()
 	stageVolumeDirs(t, volRoot, map[string][]string{
-		canonical0: {filepath.Join("_wp", "var", "lib", "grafana")},
+		canonical0: {filepath.Join(writablePathSubdir, "var", "lib", "grafana")},
 	})
 
 	var destroyed []string
@@ -198,7 +198,7 @@ func TestDeprovision_StatefulVolume_RetainedNotDestroyed(t *testing.T) {
 	// The presence of stateful data must force RETAIN despite the _wp subtree.
 	volRoot := t.TempDir()
 	stageVolumeDirs(t, volRoot, map[string][]string{
-		canonical0: {"data", filepath.Join("_wp", "etc")},
+		canonical0: {"data", filepath.Join(writablePathSubdir, "etc")},
 	})
 
 	var destroyed []string
@@ -288,8 +288,8 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 
 	volRoot := t.TempDir()
 	stageVolumeDirs(t, volRoot, map[string][]string{
-		dbVol:   {"data"},                                        // stateful
-		dashVol: {filepath.Join("_wp", "var", "lib", "grafana")}, // writable-path-only
+		dbVol:   {"data"},                                                     // stateful
+		dashVol: {filepath.Join(writablePathSubdir, "var", "lib", "grafana")}, // writable-path-only
 	})
 
 	var destroyed []string
@@ -390,7 +390,7 @@ func TestDeprovision_WritablePathOnly_WithXFSMarker_StillReclaimed(t *testing.T)
 
 	volRoot := t.TempDir()
 	stageVolumeDirs(t, volRoot, map[string][]string{
-		canonical0: {filepath.Join("_wp", "var")},
+		canonical0: {filepath.Join(writablePathSubdir, "var")},
 	})
 	// Simulate the xfs in-volume quota marker beside _wp/.
 	require.NoError(t, os.WriteFile(filepath.Join(volRoot, canonical0, projectIDFile), []byte("p"), 0o600))
@@ -509,7 +509,7 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
 	hostVol := t.TempDir()
-	wpDir := filepath.Join(hostVol, "_wp")
+	wpDir := filepath.Join(hostVol, writablePathSubdir)
 
 	// Stale content from a prior extraction / tenant write under the writable path.
 	staleFile := filepath.Join(wpDir, "var", "lib", "grafana", "tenant-stale.txt")
@@ -658,4 +658,164 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 	assert.Equal(t, int64(0), s.AllocatedDiskMB, "live released after the retry completes")
 	assert.Equal(t, int64(1024), s.RetainedDiskMB,
 		"both retained volumes must be counted (the dangerous direction is UNDER-count → over-admit)")
+}
+
+// TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively guards the
+// detector hardening (Copilot): a top-level entry NAMED _wp but that is a file or
+// symlink (not a directory) is unexpected — setupWritablePathBinds always creates
+// _wp as a directory and the container cannot write the volume root — so it must
+// NOT count as writable-path scaffolding. Since the gate action is DESTROY, such a
+// volume is retained conservatively, never reclaimed.
+func TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively(t *testing.T) {
+	server, callbackDone := retainCloseServer(t)
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
+	canonical0 := canonicalVolumeName("lease-wpf", "web", 0)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-wpf": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-wpf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-wpf-web-0", "docker-micro", "tenant-a"))
+
+	// Stage a volume whose ONLY top-level entry named _wp is a FILE, not a directory.
+	volRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(volRoot, canonical0), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(volRoot, canonical0, writablePathSubdir), []byte("x"), 0o600))
+
+	var destroyed []string
+	var renamed [][2]string
+	b.volumes = &mockVolumeManager{
+		defaultDir: volRoot,
+		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			destroyed = append(destroyed, id)
+			return nil
+		},
+		RenameVolumeFn: func(old, newName string) error {
+			renamed = append(renamed, [2]string{old, newName})
+			return nil
+		},
+	}
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-wpf"))
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	assert.Empty(t, destroyed, "a non-directory _wp must NOT be treated as scaffolding → never destroyed")
+	assert.Equal(t, [][2]string{{canonical0, retainedName(canonical0)}}, renamed,
+		"volume with a non-directory _wp must be retained conservatively")
+	rec, err := rs.Get("lease-wpf")
+	require.NoError(t, err)
+	assert.NotNil(t, rec, "conservatively-retained volume must have a record")
+}
+
+// TestDeprovision_PartialInstanceRetain_CapCheckCountsOnlyRetained guards the
+// durableItems per-instance fix (Copilot): with per-volume classification a
+// Quantity>1 service can have a SUBSET of instances retained. The cap check
+// (shouldRefuseRetention, whose action is DESTROY) must count only the instances
+// actually retained, not the service's full Quantity — otherwise the over-count
+// could spuriously breach the cap and destroy the retained durable volume.
+//
+// Setup: one service, Quantity=2; instance 0 is writable-path-only (reclaimed),
+// instance 1 is stateful (retained). Cap = 600 MB. The accurate retained footprint
+// is 1×512 = 512 ≤ 600 (retain), but the buggy full-Quantity count would be
+// 2×512 = 1024 > 600 (refuse → destroy the retained instance).
+func TestDeprovision_PartialInstanceRetain_CapCheckCountsOnlyRetained(t *testing.T) {
+	server, callbackDone := retainCloseServer(t)
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "svc"}}
+	inst0 := canonicalVolumeName("lease-pi", "svc", 0) // writable-path-only → reclaimed
+	inst1 := canonicalVolumeName("lease-pi", "svc", 1) // stateful → retained
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-pi": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-pi", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"svc": {Image: "redis:7"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512)
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.cfg.MaxRetainedDiskMB = 600 // accurate 512 retains; over-counted 1024 would refuse+destroy
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-pi-svc-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("lease-pi-svc-1", "docker-micro", "tenant-a"))
+
+	volRoot := t.TempDir()
+	stageVolumeDirs(t, volRoot, map[string][]string{
+		inst0: {filepath.Join(writablePathSubdir, "var")}, // writable-path-only
+		inst1: {"data"},                                   // stateful
+	})
+
+	var destroyed []string
+	var renamed [][2]string
+	b.volumes = &mockVolumeManager{
+		defaultDir: volRoot,
+		ListFn:     func() ([]string, error) { return []string{inst0, inst1}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			destroyed = append(destroyed, id)
+			return nil
+		},
+		RenameVolumeFn: func(old, newName string) error {
+			renamed = append(renamed, [2]string{old, newName})
+			return nil
+		},
+	}
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-pi"))
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	// The retained stateful instance must NOT be destroyed by a spurious cap breach.
+	assert.Equal(t, []string{inst0}, destroyed, "only the writable-path-only instance must be reclaimed")
+	assert.Equal(t, [][2]string{{inst1, retainedName(inst1)}}, renamed,
+		"the retained stateful instance must survive (cap check must count only retained instances)")
+	rec, err := rs.Get("lease-pi")
+	require.NoError(t, err)
+	require.NotNil(t, rec, "the partially-retained lease must keep a record for its durable instance")
 }

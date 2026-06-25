@@ -462,7 +462,7 @@ func TestIntegration_Docker_Close_WritablePathOnly_Reclaimed(t *testing.T) {
 	// It must exist on the host _wp subdir before close (fixture sanity).
 	canonical := canonicalVolumeName(origLease, manifest.DefaultServiceName, 0)
 	hostVolDir := filepath.Join(mountPath, canonical)
-	_, err = os.Stat(filepath.Join(hostVolDir, "_wp", "var", "lib", "grafana", sentinelName))
+	_, err = os.Stat(filepath.Join(hostVolDir, writablePathSubdir, "var", "lib", "grafana", sentinelName))
 	require.NoError(t, err, "writable-path sentinel must exist on host _wp before close")
 
 	// Close with RetainOnClose=true. ENG-406: a writable-path-only volume must be

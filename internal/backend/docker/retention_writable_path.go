@@ -39,16 +39,20 @@ func (b *Backend) isWritablePathOnly(name string) bool {
 	}
 	sawWritablePathDir := false
 	for _, e := range entries {
-		switch e.Name() {
-		case writablePathSubdir:
-			// The ephemeral writable-path scaffolding subtree.
+		switch {
+		case e.Name() == writablePathSubdir && e.IsDir():
+			// The ephemeral writable-path scaffolding subtree. Require it to be a
+			// real directory: setupWritablePathBinds always creates _wp as one, and
+			// the container can't write the volume root, so a file/symlink named _wp
+			// is unexpected — fall through to retain rather than destroy.
 			sawWritablePathDir = true
-		case projectIDFile:
+		case e.Name() == projectIDFile:
 			// xfs writes this quota marker file inside every volume root; it is
 			// fred housekeeping, not tenant data. btrfs/zfs write nothing here.
 		default:
-			// Any other top-level entry is a declared-VOLUME data subdir
-			// (created by buildStatefulVolumeBinds) → stateful → retain.
+			// Any other top-level entry is a declared-VOLUME data subdir (created by
+			// buildStatefulVolumeBinds), or an unexpected/non-directory _wp → stateful
+			// or ambiguous → retain.
 			return false
 		}
 	}

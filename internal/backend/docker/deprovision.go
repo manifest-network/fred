@@ -232,25 +232,33 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			}
 			retainCanonical = append(retainCanonical, c)
 		}
-		// durableItems = items whose service still has a volume to retain. This is
-		// used ONLY for the cap check (shouldRefuseRetention), NOT for the record:
-		// the refuse action is DESTROY, so feeding it the smaller durable footprint
-		// can only refuse LESS often (never destroying a stateful volume the full
-		// set would have spared) — the safe direction. The persisted record keeps
-		// the FULL items (below); accounting over-counting a reclaimed wp-only
-		// service's declared DiskMB is the safe (deny-only) direction, whereas
-		// under-counting it on the record would over-admit (ENG-360/376).
+		// durableItems = the per-instance retained footprint, used ONLY for the cap
+		// check (shouldRefuseRetention), NOT for the record. Each item's Quantity is
+		// narrowed to the number of its instances actually retained: classification is
+		// per-volume, so a Quantity>1 service can have a SUBSET of instances retained
+		// (e.g. one instance's host path hits a transient ReadDir error → retained
+		// conservatively, others reclaimed). The cap-refuse action is DESTROY, so the
+		// cap input must NOT over-count — counting a service's full Quantity when only
+		// some instances are retained could spuriously breach the cap and destroy the
+		// retained durable volumes. The persisted record keeps the FULL items (below);
+		// over-counting THERE feeds an admission DENY gate (safe), whereas
+		// under-counting the record would over-admit (ENG-360/376).
 		retainSet := make(map[string]struct{}, len(retainCanonical))
 		for _, c := range retainCanonical {
 			retainSet[c] = struct{}{}
 		}
 		durableItems := make([]backend.LeaseItem, 0, len(items))
 		for _, item := range items {
+			retained := 0
 			for i := range item.Quantity {
 				if _, ok := retainSet[canonicalVolumeName(leaseUUID, item.ServiceName, i)]; ok {
-					durableItems = append(durableItems, item)
-					break
+					retained++
 				}
+			}
+			if retained > 0 {
+				durItem := item
+				durItem.Quantity = retained
+				durableItems = append(durableItems, durItem)
 			}
 		}
 
