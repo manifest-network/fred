@@ -140,13 +140,31 @@ func (b *Backend) computeReapingDiskMB() (mb int64, count int, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	unknown := make(map[string]struct{})
 	for _, e := range entries {
 		if e.Status != shared.RetentionStatusReaping {
 			continue
 		}
 		count++
-		emb, _ := b.leaseDiskMB(e.Items)
+		emb, eunres := b.leaseDiskMB(e.Items)
 		mb += emb
+		for _, s := range eunres {
+			unknown[s] = struct{}{}
+		}
+	}
+	if len(unknown) > 0 {
+		skus := make([]string, 0, len(unknown))
+		for s := range unknown {
+			skus = append(skus, s)
+		}
+		sort.Strings(skus)
+		// Same hazard as computeRetainedDiskMB: an unresolved SKU contributes 0, so a
+		// reaping record on a removed/renamed profile UNDERCOUNTS the admission pool
+		// (reaping is added to SetRetainedDisk) → over-admission/ENOSPC risk. Warn so an
+		// operator can restore the profile; the reaping footprint is transient, so this
+		// is rarer than the active case but the direction is identically dangerous.
+		b.logger.Warn("reaping record references unknown SKU profile(s); admission accounting UNDERCOUNTS the pending-destroy footprint (risk of over-admission/ENOSPC) until the profile is restored",
+			"unknown_skus", skus)
 	}
 	return mb, count, nil
 }

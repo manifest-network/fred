@@ -178,7 +178,8 @@ required handling:
 
 | Site | `reaping` handling |
 | --- | --- |
-| `computeRetainedDiskMB` | **count** (active + reaping) |
+| `computeRetainedDiskMB` | **active-only, unchanged** (its reader `breachRetentionCap` DESTROYS — over-counting is the dangerous direction; see §B) |
+| `computeReapingDiskMB` (new) | **reaping-only**; `refreshRetentionAccounting` adds it to the admission pool (`SetRetainedDisk(active+reaping)`) |
 | `retained_leases` gauge / cap count in `evictRetentionsToCap` | **exclude** (active-only) |
 | `ClaimForRestore`, `PutActiveMerged` | **reject** (already active-only — verify) |
 | `reconcileRetentions` (boot switch) | **new arm** → `retryReapingRecords` |

@@ -341,7 +341,7 @@ func TestMarkReapingIfExpired(t *testing.T) {
 // TestListReaping returns only reaping records.
 func TestListReaping(t *testing.T) {
 	s := newTestRetentionStore(t)
-	require.NoError(t, s.Put(sampleEntry("active-1")))             // active
+	require.NoError(t, s.Put(sampleEntry("active-1"))) // active
 	reaping := sampleEntry("reaping-1")
 	reaping.Status = RetentionStatusReaping
 	require.NoError(t, s.Put(reaping))

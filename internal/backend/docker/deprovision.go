@@ -356,7 +356,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			//
 			// Persist the abandoned footprint as a reaping tombstone BEFORE releasing
 			// live, so the bytes hand off live→reaping with no uncounted gap. (ENG-376)
-			b.recordGiveUpLeak(ctx, leaseUUID, tenant, providerUUID, items, logger)
+			b.recordGiveUpLeak(leaseUUID, tenant, providerUUID, items, logger)
 			// Release live UNCONDITIONALLY here: the provision is about to be
 			// deleted and `return nil`, so no retry can ever run to free it.
 			// On the retain path the flag is still false, so without this the
@@ -457,7 +457,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 // auto-retries the destroy — turning a permanent manual-only leak into a self-healing
 // one. PutReaping is idempotent and refuses to clobber an active/restoring record, so a
 // footprint an existing record already counts is left untouched. (ENG-376)
-func (b *Backend) recordGiveUpLeak(ctx context.Context, leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
+func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
 	retentionLeakedTotal.Inc()
 	if b.retentionStore == nil {
 		return // no projection to correct; metric + the give-up log are the record
