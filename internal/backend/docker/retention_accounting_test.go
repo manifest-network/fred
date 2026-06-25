@@ -1395,3 +1395,38 @@ func TestComputeRetainedDiskMB_UnknownSKUInActiveRecord(t *testing.T) {
 	assert.Equal(t, int64(2048), mb,
 		"unknown SKU must contribute 0 to the disk projection (resolvable part only)")
 }
+
+// TestRefreshCountsReapingInPoolNotCap verifies a reaping record's footprint is
+// included in the admission pool (SetRetainedDisk) and the reaping gauges, but is
+// EXCLUDED from computeRetainedDiskMB (the active-only cap-breach input — a destroy
+// gate that must never over-count). ENG-376.
+func TestRefreshCountsReapingInPoolNotCap(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+
+	active := retentionEntryFixture("lease-a", "t1", time.Now()) // qty 2 → 2048 MB
+	require.NoError(t, rs.Put(active))
+	reaping := retentionEntryFixture("lease-b", "t1", time.Now()) // qty 2 → 2048 MB
+	reaping.Status = shared.RetentionStatusReaping
+	require.NoError(t, rs.Put(reaping))
+
+	// Cap-breach input stays active-only (data-safe destroy direction).
+	activeMB, activeCount, err := b.computeRetainedDiskMB()
+	require.NoError(t, err)
+	assert.Equal(t, int64(2048), activeMB)
+	assert.Equal(t, 1, activeCount)
+
+	// Reaping subset.
+	reapMB, reapCount, err := b.computeReapingDiskMB()
+	require.NoError(t, err)
+	assert.Equal(t, int64(2048), reapMB)
+	assert.Equal(t, 1, reapCount)
+
+	// Admission pool = active + reaping (over-admit prevention).
+	b.refreshRetentionAccounting()
+	assert.Equal(t, int64(4096), b.pool.Stats().RetainedDiskMB)
+	assert.Equal(t, float64(4096)*bytesPerMiB, testutil.ToFloat64(retainedVolumeBytes))
+	assert.Equal(t, float64(1), testutil.ToFloat64(retainedLeases), "count gauge active-only")
+	assert.Equal(t, float64(2048)*bytesPerMiB, testutil.ToFloat64(retentionReapingBytes))
+	assert.Equal(t, float64(1), testutil.ToFloat64(retentionReapingLeases))
+}

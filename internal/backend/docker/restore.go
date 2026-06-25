@@ -103,6 +103,10 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 			}
 		case shared.RetentionStatusRestoring:
 			b.reconcileRestoring(ctx, e)
+		case shared.RetentionStatusReaping:
+			// Finalizer retry at boot: re-attempt destroy of any record stranded
+			// reaping by a prior crash/destroy-failure; delete it when confirmed gone.
+			b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, e.RetainedVolumeNames)
 		}
 	}
 	return nil
@@ -219,42 +223,50 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 		return nil
 	}
 	sort.Slice(active, func(i, j int) bool { return active[i].CreatedAt.Before(active[j].CreatedAt) })
-	// Evict oldest-first until maxPerTenant-1 remain (making room for one new entry).
-	// DeleteIfActive removes the record IN-TXN before we destroy its volumes, so a
-	// ClaimForRestore racing between the ListByTenant snapshot above and this loop
-	// can never have its record evicted out from under it (TOCTOU-safe): a now-
-	// restoring record returns deleted=false and is skipped.
 	for i := 0; i <= len(active)-maxPerTenant; i++ {
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap", "tenant", tenant, "lease_uuid", active[i].OriginalLeaseUUID)
-		names, deleted, err := b.retentionStore.DeleteIfActive(active[i].OriginalLeaseUUID)
-		if err != nil {
-			return err
+		// Atomic active→reaping (TOCTOU-safe: a record concurrently claimed for
+		// restore returns ok=false and is skipped). The record is the finalizer
+		// tombstone — it is removed from the active cap set immediately (making room)
+		// but stays counted in the admission pool until its volumes are confirmed gone.
+		names, ok, merr := b.retentionStore.MarkReapingIfActive(active[i].OriginalLeaseUUID)
+		if merr != nil {
+			return merr
 		}
-		if !deleted {
+		if !ok {
 			continue // concurrently claimed for restore (or already gone) — skip
 		}
-		destroyFailed := false
-		for _, name := range names {
-			if derr := b.volumes.Destroy(ctx, name); derr != nil {
-				b.logger.Error("evict: destroy retained volume failed", "volume", name, "error", derr)
-				destroyFailed = true
-			}
-		}
-		if destroyFailed {
-			// A Destroy failed AFTER DeleteIfActive atomically removed the record,
-			// which would otherwise leave the volume with NO record (never reaped/
-			// enumerable = permanent leak). Re-record the snapshot entry so the volume
-			// stays tracked and the next sweep/eviction retries (mirrors
-			// reapExpiredRetentions). Bounded, accepted re-claim possibility: the
-			// re-recorded active entry becomes restore-claimable again until reaped —
-			// same trade-off the reaper makes. (Idempotent: already-destroyed names no-op.)
-			if perr := b.retentionStore.Put(active[i]); perr != nil {
-				b.logger.Error("evict: re-record for retry failed; volume(s) leaked until manual cleanup", "lease_uuid", active[i].OriginalLeaseUUID, "error", perr)
-			}
-		}
+		b.destroyReapingVolumes(ctx, active[i].OriginalLeaseUUID, names)
 	}
 	b.refreshRetentionAccounting()
 	return nil
+}
+
+// destroyReapingVolumes destroys every volume of a reaping record and, ONLY if all
+// destroys succeed, Delete()s the record. Returns true iff the record was fully
+// reaped (deleted). On any destroy failure it LEAVES the record reaping (the
+// finalizer retry) and bumps retentionLeakedTotal — the footprint stays counted
+// and the next sweep retries. Idempotent: already-gone volume names no-op, and a
+// Delete failure leaves the record reaping for a later retry (no under-count). (ENG-376)
+func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names []string) bool {
+	destroyFailed := false
+	for _, name := range names {
+		if derr := b.volumes.Destroy(ctx, name); derr != nil {
+			b.logger.Error("reaping: destroy volume", "volume", name, "error", derr)
+			destroyFailed = true
+		}
+	}
+	if destroyFailed {
+		retentionLeakedTotal.Inc()
+		b.logger.Warn("reaping: volume(s) still on disk; record left reaping for retry (footprint stays counted)",
+			"lease_uuid", orig)
+		return false
+	}
+	if derr := b.retentionStore.Delete(orig); derr != nil {
+		b.logger.Warn("reaping: destroy ok but record delete failed; next sweep retries", "lease_uuid", orig, "error", derr)
+		return false
+	}
+	return true
 }
 
 // volumeRootUnverifiable reports whether a volume-root probe means the orphan
@@ -395,9 +407,9 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 
 // reapExpiredRetentions hard-deletes retained volumes past RetentionMaxAge.
 // Returns the count of records FULLY reaped (all volumes destroyed AND the
-// record removed). If a Destroy fails after ReapIfExpired atomically removed the
-// record, the (still-expired) entry is re-recorded so the next sweep retries the
-// destroy; that record is NOT counted as reaped.
+// record removed). Each expired active record is atomically transitioned to
+// reaping before its volumes are destroyed, so a destroy failure leaves the
+// record as a counted finalizer tombstone rather than creating an under-count.
 func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 	if b.retentionStore == nil || b.cfg.RetentionMaxAge <= 0 {
 		return 0, nil
@@ -408,50 +420,62 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 	}
 	var n int
 	for _, e := range candidates {
-		names, err := b.retentionStore.ReapIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
-		if err != nil {
-			b.logger.Error("reap: store error", "lease_uuid", e.OriginalLeaseUUID, "error", err)
+		// Atomic active→reaping (the record is NEVER deleted before its volumes are
+		// confirmed gone, so a destroy failure cannot drop a still-on-disk footprint).
+		names, ok, merr := b.retentionStore.MarkReapingIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
+		if merr != nil {
+			b.logger.Error("reap: store error", "lease_uuid", e.OriginalLeaseUUID, "error", merr)
 			continue
 		}
-		if names == nil {
+		if !ok {
 			continue // concurrently claimed/changed since the snapshot — skip
 		}
-		destroyFailed := false
-		for _, name := range names {
-			if derr := b.volumes.Destroy(ctx, name); derr != nil {
-				b.logger.Error("reap: destroy volume", "volume", name, "error", derr)
-				destroyFailed = true
-			}
+		if b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, names) {
+			n++
 		}
-		if destroyFailed {
-			// A Destroy failed AFTER ReapIfExpired atomically removed the record.
-			// Re-record the (still-expired) entry so the next sweep retries the
-			// destroy; ClaimForRestore rejects expired records, so it cannot be
-			// adopted in the meantime. (Idempotent: already-destroyed names no-op.)
-			if perr := b.retentionStore.Put(e); perr != nil {
-				b.logger.Error("reap: re-record for retry failed; volume(s) leaked until manual cleanup", "lease_uuid", e.OriginalLeaseUUID, "error", perr)
-			}
-			continue // not counted as reaped
-		}
-		n++
 	}
 	b.refreshRetentionAccounting()
 	return n, nil
 }
 
-// runRetentionSweep is the PERIODIC reaper body: reap expired, reconcile any
-// restoring records (a running-process backstop for restores that failed since
-// the last tick), and prune ACTIVE records whose volumes have been absent for
-// >= N consecutive sweeps (orphan reconcile, ENG-370). The BOOT path does NOT
-// call this: at startup reconcileRetentions
-// (before cleanup) handles restoring records and an eager reapExpiredRetentions
-// (after cleanup) handles expired ones, so restoring records aren't double-reconciled.
+// retryReapingRecords re-attempts destruction of every reaping record's volumes
+// (the finalizer retry) and deletes each record whose volumes are confirmed gone.
+// Runs on the periodic sweep AND at boot. Fail-closed: on a store List error the
+// records are kept (footprint keeps counting). It deliberately does NOT call
+// refreshRetentionAccounting itself — the CALLER owns the refresh (runRetentionSweep
+// refreshes at the end; the boot path refreshes via reapExpiredRetentions/recoverState).
+// A new caller MUST refresh after invoking this. (ENG-376)
+func (b *Backend) retryReapingRecords(ctx context.Context) error {
+	if b.retentionStore == nil {
+		return nil
+	}
+	recs, err := b.retentionStore.ListReaping()
+	if err != nil {
+		return err
+	}
+	for _, e := range recs {
+		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, e.RetainedVolumeNames)
+	}
+	return nil
+}
+
+// runRetentionSweep is the PERIODIC reaper body: reap expired + retry any reaping
+// records (the finalizer retry, ENG-376) + reconcile any restoring records (a
+// running-process backstop for restores that failed since the last tick) + prune
+// ACTIVE records whose volumes have been absent for >= N consecutive sweeps (orphan
+// reconcile, ENG-370). The BOOT path does NOT call this: at startup reconcileRetentions
+// (before cleanup) handles restoring and reaping records and an eager
+// reapExpiredRetentions (after cleanup) handles expired ones, so they aren't
+// double-reconciled.
 func (b *Backend) runRetentionSweep(ctx context.Context) error {
 	if _, err := b.reapExpiredRetentions(ctx); err != nil {
 		return err
 	}
 	if b.retentionStore == nil {
 		return nil
+	}
+	if err := b.retryReapingRecords(ctx); err != nil {
+		return err
 	}
 	recs, err := b.retentionStore.ListRestoring()
 	if err != nil {
@@ -835,8 +859,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // restore. N1: compose.Down the new project FIRST (stop containers on the
 // bind-mounted volumes) BEFORE renaming volumes back — otherwise a still-running
 // container holds the volume's bind mount open. It then re-quarantines each
-// adopted volume to the retained namespace, releases the pool allocations, and
-// CAS-reverts the record to active.
+// adopted volume to the retained namespace, and CAS-reverts the record to active.
 //
 // dropProvision controls the new-lease reservation:
 //   - true  (synchronous paths: adopt failure, route failure, ack abort): no
@@ -854,6 +877,13 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // provision's expected-set entry (cleanupOrphanedVolumes' restoring arm) protects
 // the canonical volume from the orphan reaper. Reverting here would make that
 // still-live data eligible for cleanup/reaping.
+//
+// Make-before-break (ENG-376 site 4): when RevertToActive returns a STORE ERROR
+// the revert did NOT commit. The live allocation is KEPT counted (no releaseAll)
+// so the footprint is never under-counted. reconcileRestoring's orphaned arm will
+// resume the revert (via removeProvision when dropProvision=true) and release the
+// same liveIDs. For the !ok (generation changed) and success arms the prior
+// release behavior is preserved.
 func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 	allocatedIDs []string, rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger) {
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
@@ -878,16 +908,30 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID)
 		return
 	}
-	// Re-quarantine succeeded: revert the record to active and re-count it as
-	// retained BEFORE releasing the live allocation, so the footprint is counted
-	// continuously (transient double-count = over-deny = safe), mirroring the
-	// deprovision retain hand-off.
-	if ok, err := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation); err != nil {
-		logger.Error("restore rollback: revert record failed", "error", err)
-	} else if !ok {
+	// Re-quarantine succeeded. Make-before-break: only release the live allocation
+	// AFTER the destination owner (the active record) durably commits. A store ERROR
+	// means the revert did NOT commit, so we KEEP live counted (F stays counted as
+	// live — no under-count) and let reconcileRestoring resume the revert and release
+	// the same liveIDs. We still removeProvision for dropProvision=true so reconcile's
+	// orphaned arm (live=false) runs — a lingering Provisioning provision would make
+	// reconcileRestoring defer forever.
+	ok, rerr := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation)
+	if rerr != nil {
+		retentionLeakedTotal.Inc()
+		logger.Error("restore rollback: revert record failed; keeping live allocation counted until reconcile resumes the revert",
+			"lease_uuid", rec.OriginalLeaseUUID, "error", rerr)
+		if dropProvision {
+			b.removeProvision(leaseUUID)
+		}
+		return
+	}
+	if !ok {
+		// Generation changed: the record was reverted/re-claimed elsewhere (now active
+		// or owned by a new restore). It is counted there, so RELEASE live to avoid a
+		// 2F double-count — matching the prior behavior for this benign case.
 		logger.Warn("restore rollback: record generation changed; reaper will reconcile", "lease_uuid", rec.OriginalLeaseUUID)
 	}
-	b.refreshRetentionAccounting() // retained += F (record now active)
+	b.refreshRetentionAccounting() // retained += F (record now active, if ok)
 	releaseAll(b.pool, allocatedIDs)
 	updateResourceMetrics(b.pool.Stats())
 	if dropProvision {

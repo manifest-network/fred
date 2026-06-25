@@ -20,6 +20,13 @@ const RetentionStatusActive = "active"
 // RetentionStatusRestoring is the status of an entry currently being restored.
 const RetentionStatusRestoring = "restoring"
 
+// RetentionStatusReaping marks a record whose volumes are pending physical
+// destruction: the bytes are still on disk (so the footprint must keep counting
+// in the admission projection) but the record is NOT restore-claimable. It is a
+// finalizer tombstone — kept until every volume is confirmed destroyed, then
+// Delete()d. See ENG-376.
+const RetentionStatusReaping = "reaping"
+
 var (
 	// ErrNoRetention is returned when no retained data exists for a given lease UUID.
 	ErrNoRetention = errors.New("no retained data for lease")
@@ -41,6 +48,7 @@ type RetentionEntry struct {
 	Generation          int                     `json:"generation"`
 	CreatedAt           time.Time               `json:"created_at"`
 	RestoringSince      time.Time               `json:"restoring_since,omitempty"`
+	ReapingSince        time.Time               `json:"reaping_since,omitempty"`
 }
 
 // RetentionStoreConfig configures the retention store.
@@ -55,8 +63,10 @@ type RetentionStore struct {
 }
 
 // NewRetentionStore opens or creates a bbolt database for retention persistence.
-// No background cleanup loop is started; the docker backend drives reaping
-// explicitly via ReapIfExpired / ListExpired.
+// No background cleanup loop is started; the docker backend drives reaping and
+// eviction explicitly via the MarkReaping* / ListReaping / ListExpired methods
+// (reapExpiredRetentions, evictRetentionsToCap, and the retryReapingRecords sweep
+// in restore.go), plus PutReaping for deprovision give-up tombstones.
 func NewRetentionStore(cfg RetentionStoreConfig) (*RetentionStore, error) {
 	base, err := openBoltStore(boltStoreConfig{
 		DBPath:     cfg.DBPath,
@@ -118,6 +128,50 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 			// needing this guard.
 			if base.StackManifest == nil {
 				base.StackManifest = stored.StackManifest
+			}
+		}
+		data, err := json.Marshal(base)
+		if err != nil {
+			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		ok = true
+		return bkt.Put([]byte(base.OriginalLeaseUUID), data)
+	})
+	return ok, err
+}
+
+// PutReaping writes a reaping tombstone for an ABANDONED on-disk footprint (a
+// deprovision give-up). It is idempotent and never clobbers a still-counted record:
+//   - absent: writes a fresh reaping record (stamps ReapingSince=now).
+//   - existing reaping: unions RetainedVolumeNames and PRESERVES ReapingSince (aging).
+//   - existing active/restoring: writes NOTHING, returns ok=false — that record
+//     already counts the footprint (or owns it for restore); a blind reaping write
+//     would corrupt accounting/CAS. Caller treats ok=false as "already tracked".
+//
+// Single txn, so it is safe against a concurrent ClaimForRestore. (ENG-376)
+func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
+	base.Status = RetentionStatusReaping
+	base.ReapingSince = time.Now()
+	var ok bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
+			var stored RetentionEntry
+			if err := json.Unmarshal(raw, &stored); err != nil {
+				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			}
+			switch stored.Status {
+			case RetentionStatusActive, RetentionStatusRestoring:
+				return nil // already counted/owned — refuse, ok stays false
+			case RetentionStatusReaping:
+				// Re-leak of a lease that already has a reaping tombstone: preserve the
+				// stored entry's accounting/identity fields (Items/Tenant/ProviderUUID/
+				// CreatedAt/ReapingSince) WHOLESALE and only union any newly discovered
+				// volume names, so a future caller passing partial `base` data can never
+				// clobber a still-counted footprint (mirrors PutActiveMerged's
+				// preserve-stored idiom; honors this method's "never clobbers" contract).
+				stored.RetainedVolumeNames = dedupUnion(stored.RetainedVolumeNames, base.RetainedVolumeNames)
+				base = stored
 			}
 		}
 		data, err := json.Marshal(base)
@@ -205,6 +259,45 @@ func (s *RetentionStore) ListRestoring() ([]RetentionEntry, error) {
 	})
 }
 
+// ListReaping returns all entries currently in the reaping (pending-destroy) state.
+func (s *RetentionStore) ListReaping() ([]RetentionEntry, error) {
+	return s.filter(func(e *RetentionEntry) bool {
+		return e.Status == RetentionStatusReaping
+	})
+}
+
+// DeleteIfActive atomically removes a record ONLY if it is still ACTIVE. Returns
+// (names, deleted, err); deleted=false (nil names) when absent or not active (e.g.
+// concurrently claimed for restore). Used by reconcileOrphanedRetentions (ENG-370)
+// to prune an orphaned active record whose backing volumes have already vanished
+// out-of-band — the ACTIVE-only CAS guarantees a concurrent restore (active→restoring)
+// is never clobbered. The returned names are unused there: the volumes are already
+// gone, so there is nothing to destroy.
+func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
+	var (
+		names   []string
+		deleted bool
+	)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		raw := bkt.Get([]byte(orig))
+		if raw == nil {
+			return nil
+		}
+		var e RetentionEntry
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+		}
+		if e.Status != RetentionStatusActive {
+			return nil
+		}
+		names = e.RetainedVolumeNames
+		deleted = true
+		return bkt.Delete([]byte(orig))
+	})
+	return names, deleted, err
+}
+
 // filter iterates all bucket entries and returns those for which keep returns true.
 func (s *RetentionStore) filter(keep func(*RetentionEntry) bool) ([]RetentionEntry, error) {
 	var results []RetentionEntry
@@ -259,15 +352,55 @@ func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Dura
 	return out, err
 }
 
-// ReapIfExpired deletes the record only if it is STILL active AND expired.
-// Returns the retained volume names for the caller to destroy AFTER the
-// transaction commits. Returns nil, nil when the record is absent, not active,
-// or not yet expired.
-func (s *RetentionStore) ReapIfExpired(orig string, maxAge time.Duration) ([]string, error) {
+// MarkReapingIfActive atomically transitions an ACTIVE record to reaping and
+// returns its volume names for the caller to destroy AFTER the txn commits.
+// ok=false (nil names) when absent or not active (e.g. concurrently claimed for
+// restore). The record is NOT deleted — it is the finalizer tombstone that keeps
+// the footprint counted until the volumes are confirmed gone. (ENG-376)
+func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error) {
+	var (
+		names []string
+		ok    bool
+	)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		raw := bkt.Get([]byte(orig))
+		if raw == nil {
+			return nil
+		}
+		var e RetentionEntry
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+		}
+		if e.Status != RetentionStatusActive {
+			return nil
+		}
+		e.Status = RetentionStatusReaping
+		e.ReapingSince = time.Now()
+		names = e.RetainedVolumeNames
+		data, err := json.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		ok = true
+		return bkt.Put([]byte(orig), data)
+	})
+	return names, ok, err
+}
+
+// MarkReapingIfExpired atomically transitions an ACTIVE, expired record to
+// reaping and returns its volume names for the
+// caller to destroy AFTER the txn commits. The record is NOT deleted — it stays a
+// counted tombstone until the volumes are confirmed gone. Returns ok=false when
+// absent, not active, or not yet expired, and a no-op when maxAge<=0. (ENG-376)
+func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration) ([]string, bool, error) {
 	if maxAge <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
-	var names []string
+	var (
+		names []string
+		ok    bool
+	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
 		raw := bkt.Get([]byte(orig))
@@ -284,39 +417,17 @@ func (s *RetentionStore) ReapIfExpired(orig string, maxAge time.Duration) ([]str
 		if time.Since(e.CreatedAt) < maxAge {
 			return nil
 		}
+		e.Status = RetentionStatusReaping
+		e.ReapingSince = time.Now()
 		names = e.RetainedVolumeNames
-		return bkt.Delete([]byte(orig))
+		data, err := json.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		ok = true
+		return bkt.Put([]byte(orig), data)
 	})
-	return names, err
-}
-
-// DeleteIfActive atomically removes a record ONLY if it is still ACTIVE,
-// returning its retained volume names for the caller to destroy AFTER the
-// txn commits. deleted=false (nil names) when absent or not active (e.g.
-// concurrently claimed for restore), so cap-eviction never races a restore.
-func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
-	var (
-		names   []string
-		deleted bool
-	)
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket(retentionBucketName)
-		raw := bkt.Get([]byte(orig))
-		if raw == nil {
-			return nil
-		}
-		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
-		}
-		if e.Status != RetentionStatusActive {
-			return nil
-		}
-		names = e.RetainedVolumeNames
-		deleted = true
-		return bkt.Delete([]byte(orig))
-	})
-	return names, deleted, err
+	return names, ok, err
 }
 
 // RevertToActive transitions a restoring record back to active, using a

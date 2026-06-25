@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -116,83 +117,6 @@ func TestRetentionStore_ClaimForRestore(t *testing.T) {
 	require.NoError(t, s.Put(old))
 	_, err = s.ClaimForRestore("lease-old", "new-lease-x", 90*24*time.Hour)
 	assert.ErrorIs(t, err, ErrNoRetention)
-}
-
-// TestRetentionStore_ReapIfExpired_Guards verifies the reap guards: expired
-// active records are reaped, reaping is idempotent, a record forced into the
-// restoring state is never reaped, and a live ClaimForRestore round-trip
-// protects a fresh record from reaping.
-func TestRetentionStore_ReapIfExpired_Guards(t *testing.T) {
-	s := newTestRetentionStore(t)
-
-	maxAge := 90 * 24 * time.Hour
-
-	// Insert an active entry that is "expired"
-	e := sampleEntry("lease-exp")
-	e.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, s.Put(e))
-
-	// Claim it first
-	_, err := s.ClaimForRestore("lease-exp", "new-lease-99", maxAge)
-	// It's expired so ClaimForRestore should return ErrNoRetention
-	assert.ErrorIs(t, err, ErrNoRetention)
-
-	// Since ClaimForRestore failed, the record is still active+expired.
-	// Now verify ReapIfExpired reaps it.
-	names, err := s.ReapIfExpired("lease-exp", maxAge)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"vol-a", "vol-b"}, names)
-
-	// Gone
-	got, err := s.Get("lease-exp")
-	require.NoError(t, err)
-	assert.Nil(t, got)
-
-	// A second call is idempotent
-	names, err = s.ReapIfExpired("lease-exp", maxAge)
-	require.NoError(t, err)
-	assert.Nil(t, names)
-
-	// Now test the non-reapable case: a restoring record should NOT be reaped.
-	e2 := sampleEntry("lease-restoring")
-	e2.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, s.Put(e2))
-	// Force it into restoring state directly via Put
-	e2.Status = RetentionStatusRestoring
-	require.NoError(t, s.Put(e2))
-
-	names, err = s.ReapIfExpired("lease-restoring", maxAge)
-	require.NoError(t, err)
-	assert.Nil(t, names, "restoring records must not be reaped")
-
-	// Still present
-	got, err = s.Get("lease-restoring")
-	require.NoError(t, err)
-	assert.NotNil(t, got)
-
-	// End-to-end atomicity: a FRESH (non-expired) active record that is
-	// successfully claimed via the real ClaimForRestore round-trip must not be
-	// reaped, even though the same maxAge is passed to ReapIfExpired. This
-	// proves the live active->restoring transition (not a Put-forced state)
-	// protects the record from concurrent reaping.
-	fresh := sampleEntry("lease-fresh")
-	fresh.CreatedAt = time.Now()
-	require.NoError(t, s.Put(fresh))
-
-	claimed, err := s.ClaimForRestore("lease-fresh", "new-lease-fresh", maxAge)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	assert.Equal(t, RetentionStatusRestoring, claimed.Status)
-
-	names, err = s.ReapIfExpired("lease-fresh", maxAge)
-	require.NoError(t, err)
-	assert.Nil(t, names, "a claimed (restoring) record must never be reaped")
-
-	// Still present and still restoring
-	got, err = s.Get("lease-fresh")
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, RetentionStatusRestoring, got.Status)
 }
 
 // TestRetentionStore_RevertToActive_CAS verifies generation-CAS transitions.
@@ -354,59 +278,152 @@ func TestRetentionStore_ListRestoring(t *testing.T) {
 	assert.Len(t, all, 3)
 }
 
-// TestDeleteIfActive_DeletesActive verifies the atomic cap-eviction primitive:
-// an ACTIVE record is removed in-txn and its retained volume names are returned
-// for the caller to destroy after commit.
-func TestDeleteIfActive_DeletesActive(t *testing.T) {
+// TestMarkReapingIfActive verifies active→reaping is atomic, returns the volume
+// names, stamps ReapingSince, and refuses non-active records (ok=false, untouched).
+func TestMarkReapingIfActive(t *testing.T) {
 	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("lease-a"))) // active, vols [vol-a vol-b]
 
-	e := sampleEntry("lease-active")
-	require.NoError(t, s.Put(e))
-
-	names, deleted, err := s.DeleteIfActive("lease-active")
+	names, ok, err := s.MarkReapingIfActive("lease-a")
 	require.NoError(t, err)
-	assert.True(t, deleted, "active record must be deleted")
-	assert.Equal(t, []string{"vol-a", "vol-b"}, names, "retained names returned for post-commit destroy")
+	assert.True(t, ok)
+	assert.ElementsMatch(t, []string{"vol-a", "vol-b"}, names)
 
-	got, err := s.Get("lease-active")
+	got, err := s.Get("lease-a")
 	require.NoError(t, err)
-	assert.Nil(t, got, "record must be gone after DeleteIfActive")
+	require.NotNil(t, got)
+	assert.Equal(t, RetentionStatusReaping, got.Status)
+	assert.False(t, got.ReapingSince.IsZero(), "ReapingSince must be stamped")
+
+	// Second call: already reaping → ok=false, no error.
+	_, ok, err = s.MarkReapingIfActive("lease-a")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	// Absent key → ok=false, no error.
+	_, ok, err = s.MarkReapingIfActive("nonexistent")
+	require.NoError(t, err)
+	assert.False(t, ok)
 }
 
-// TestDeleteIfActive_SkipsRestoring verifies the TOCTOU guard: a record that was
-// concurrently claimed for restore (Status=restoring) is NOT deleted, so cap
-// eviction can never race a restore that already owns the record.
-func TestDeleteIfActive_SkipsRestoring(t *testing.T) {
+// TestMarkReapingIfExpired verifies the reap mark only fires for active+expired
+// records, stamps ReapingSince, returns names, and guards fresh/non-active/zero-age.
+func TestMarkReapingIfExpired(t *testing.T) {
 	s := newTestRetentionStore(t)
+	maxAge := time.Hour
 
-	e := sampleEntry("lease-restoring")
-	e.Status = RetentionStatusRestoring
-	e.NewLeaseUUID = "new-lease"
-	e.Generation = 5
-	require.NoError(t, s.Put(e))
+	expired := sampleEntry("lease-exp")
+	expired.CreatedAt = time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.Put(expired))
 
-	names, deleted, err := s.DeleteIfActive("lease-restoring")
+	names, ok, err := s.MarkReapingIfExpired("lease-exp", maxAge)
 	require.NoError(t, err)
-	assert.False(t, deleted, "restoring record must NOT be deleted")
-	assert.Nil(t, names, "no names returned when not deleted")
-
-	got, err := s.Get("lease-restoring")
+	assert.True(t, ok)
+	assert.ElementsMatch(t, []string{"vol-a", "vol-b"}, names)
+	got, err := s.Get("lease-exp")
 	require.NoError(t, err)
-	require.NotNil(t, got, "restoring record must remain untouched")
-	assert.Equal(t, RetentionStatusRestoring, got.Status)
-	assert.Equal(t, "new-lease", got.NewLeaseUUID)
-	assert.Equal(t, 5, got.Generation)
+	assert.Equal(t, RetentionStatusReaping, got.Status)
+	assert.False(t, got.ReapingSince.IsZero())
+
+	// Fresh record → not reaped.
+	fresh := sampleEntry("lease-fresh") // CreatedAt = now
+	require.NoError(t, s.Put(fresh))
+	_, ok, err = s.MarkReapingIfExpired("lease-fresh", maxAge)
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	// maxAge<=0 → no-op.
+	_, ok, err = s.MarkReapingIfExpired("lease-exp", 0)
+	require.NoError(t, err)
+	assert.False(t, ok)
 }
 
-// TestDeleteIfActive_AbsentNoOp verifies DeleteIfActive on a missing key is a
-// no-op: deleted=false, nil names, no error.
-func TestDeleteIfActive_AbsentNoOp(t *testing.T) {
+// TestListReaping returns only reaping records.
+func TestListReaping(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("active-1"))) // active
+	reaping := sampleEntry("reaping-1")
+	reaping.Status = RetentionStatusReaping
+	require.NoError(t, s.Put(reaping))
+	restoring := sampleEntry("restoring-1")
+	restoring.Status = RetentionStatusRestoring
+	require.NoError(t, s.Put(restoring))
+
+	got, err := s.ListReaping()
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "reaping-1", got[0].OriginalLeaseUUID)
+}
+
+// TestPutReaping writes a fresh reaping tombstone, refuses to clobber an
+// active/restoring record (ok=false), and unions names + preserves ReapingSince
+// when an existing reaping record is present (idempotent re-leak).
+func TestPutReaping(t *testing.T) {
 	s := newTestRetentionStore(t)
 
-	names, deleted, err := s.DeleteIfActive("nonexistent")
+	base := sampleEntry("lease-x")
+	base.RetainedVolumeNames = []string{"fred-lease-x-app-0"}
+	ok, err := s.PutReaping(base)
 	require.NoError(t, err)
-	assert.False(t, deleted)
-	assert.Nil(t, names)
+	assert.True(t, ok)
+	got, err := s.Get("lease-x")
+	require.NoError(t, err)
+	assert.Equal(t, RetentionStatusReaping, got.Status)
+	assert.False(t, got.ReapingSince.IsZero())
+	first := got.ReapingSince
+
+	// Re-leak with an extra volume → union, ReapingSince preserved.
+	base2 := sampleEntry("lease-x")
+	base2.RetainedVolumeNames = []string{"fred-lease-x-app-0", "fred-lease-x-app-1"}
+	ok, err = s.PutReaping(base2)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	got, err = s.Get("lease-x")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"fred-lease-x-app-0", "fred-lease-x-app-1"}, got.RetainedVolumeNames)
+	assert.Equal(t, first, got.ReapingSince, "ReapingSince preserved across re-leak")
+
+	// Refuse to clobber an ACTIVE record.
+	require.NoError(t, s.Put(sampleEntry("lease-active")))
+	ok, err = s.PutReaping(sampleEntry("lease-active"))
+	require.NoError(t, err)
+	assert.False(t, ok)
+	got, err = s.Get("lease-active")
+	require.NoError(t, err)
+	assert.Equal(t, RetentionStatusActive, got.Status, "active record must be untouched")
+}
+
+// TestPutReaping_ReLeakPreservesStoredAccounting verifies a re-leak with PARTIAL base
+// data does not clobber the stored entry's accounting/identity fields — only newly
+// discovered volume names are unioned in. Guards a future caller from under-counting the
+// reaping footprint by overwriting Items/Tenant/ProviderUUID (Copilot review). ENG-376.
+func TestPutReaping_ReLeakPreservesStoredAccounting(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	first := sampleEntry("lease-y") // Items [{sku-1, qty 2}], Tenant tenant-a, ProviderUUID provider-1
+	first.RetainedVolumeNames = []string{"vol-a", "vol-b"}
+	ok, err := s.PutReaping(first)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// A future caller re-leaks with PARTIAL data (empty Items/Tenant/ProviderUUID) plus
+	// a newly discovered volume name.
+	partial := RetentionEntry{
+		OriginalLeaseUUID:   "lease-y",
+		RetainedVolumeNames: []string{"vol-c"},
+	}
+	ok, err = s.PutReaping(partial)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	got, err := s.Get("lease-y")
+	require.NoError(t, err)
+	// Accounting/identity fields preserved from the first (full) write — NOT clobbered.
+	assert.Equal(t, first.Items, got.Items, "Items must survive a partial re-leak (else reaping footprint under-counts)")
+	assert.Equal(t, "tenant-a", got.Tenant, "Tenant preserved")
+	assert.Equal(t, "provider-1", got.ProviderUUID, "ProviderUUID preserved")
+	// The newly discovered volume name is unioned in.
+	assert.ElementsMatch(t, []string{"vol-a", "vol-b", "vol-c"}, got.RetainedVolumeNames)
 }
 
 // TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
@@ -574,4 +591,70 @@ func TestPutActiveMerged_RestoringRefuses(t *testing.T) {
 	assert.Equal(t, RetentionStatusRestoring, got.Status)
 	assert.Equal(t, 5, got.Generation)
 	assert.Equal(t, "new-lease", got.NewLeaseUUID)
+}
+
+// TestMarkReaping_VsClaimForRestore_Concurrent races mark-reaping against a restore
+// claim on the SAME record many times and asserts the two atomic transitions never
+// both win: a record is never both reaping AND restoring, and exactly one wins each
+// round (whichever bbolt serializes first; the loser observes it and no-ops). ENG-376.
+func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for iter := 0; iter < 200; iter++ {
+		require.NoError(t, s.Put(sampleEntry("lease-c"))) // reset to active each round
+
+		var (
+			wg       sync.WaitGroup
+			reapOK   bool
+			reapErr  error
+			claimErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, reapOK, reapErr = s.MarkReapingIfActive("lease-c")
+		}()
+		go func() {
+			defer wg.Done()
+			_, claimErr = s.ClaimForRestore("lease-c", "new", time.Hour)
+		}()
+		wg.Wait()
+
+		require.NoError(t, reapErr)
+		claimOK := claimErr == nil
+		if !claimOK {
+			require.ErrorIs(t, claimErr, ErrNotRestorable, "claim loses only because the record is reaping")
+		}
+		assert.False(t, reapOK && claimOK, "mark-reaping and claim-for-restore must never both succeed")
+		assert.True(t, reapOK || claimOK, "exactly one transition must win each round")
+
+		got, err := s.Get("lease-c")
+		require.NoError(t, err)
+		if reapOK {
+			assert.Equal(t, RetentionStatusReaping, got.Status)
+		} else {
+			assert.Equal(t, RetentionStatusRestoring, got.Status)
+		}
+	}
+}
+
+// TestStatusAudit_ClaimForRestore_RejectsReaping ensures a reaping record cannot be restored.
+func TestStatusAudit_ClaimForRestore_RejectsReaping(t *testing.T) {
+	s := newTestRetentionStore(t)
+	r := sampleEntry("lease-r")
+	r.Status = RetentionStatusReaping
+	require.NoError(t, s.Put(r))
+	_, err := s.ClaimForRestore("lease-r", "new", time.Hour)
+	require.Error(t, err, "ClaimForRestore must reject a reaping record")
+}
+
+// TestStatusAudit_ListExpired_ExcludesReaping ensures the reaper never re-marks a reaping record.
+func TestStatusAudit_ListExpired_ExcludesReaping(t *testing.T) {
+	s := newTestRetentionStore(t)
+	r := sampleEntry("lease-r")
+	r.Status = RetentionStatusReaping
+	r.CreatedAt = time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.Put(r))
+	got, err := s.ListExpired(time.Hour)
+	require.NoError(t, err)
+	assert.Empty(t, got, "ListExpired returns active-only")
 }

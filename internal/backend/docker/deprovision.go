@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -353,6 +354,9 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// Too many failed attempts — give up and remove the provision.
 			// The leaked volumes require manual cleanup by the operator.
 			//
+			// Persist the abandoned footprint as a reaping tombstone BEFORE releasing
+			// live, so the bytes hand off live→reaping with no uncounted gap. (ENG-376)
+			b.recordGiveUpLeak(leaseUUID, tenant, providerUUID, items, logger)
 			// Release live UNCONDITIONALLY here: the provision is about to be
 			// deleted and `return nil`, so no retry can ever run to free it.
 			// On the retain path the flag is still false, so without this the
@@ -443,4 +447,65 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// volumes were soft-deleted into the retained namespace without error).
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
 	return nil
+}
+
+// recordGiveUpLeak handles a deprovision give-up's abandoned on-disk footprint. It
+// always increments retentionLeakedTotal (the observable backstop). When a retention
+// store is configured it also writes a reaping tombstone for the lease's still-on-disk
+// volumes (ground-truthed from disk; canonical names derived from items on List error)
+// so the footprint keeps counting in the admission projection and the retention sweep
+// auto-retries the destroy — turning a permanent manual-only leak into a self-healing
+// one. PutReaping is idempotent and refuses to clobber an active/restoring record, so a
+// footprint an existing record already counts is left untouched. (ENG-376)
+func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
+	retentionLeakedTotal.Inc()
+	if b.retentionStore == nil {
+		return // no projection to correct; metric + the give-up log are the record
+	}
+	var leaked []string
+	if all, err := b.volumes.List(); err == nil {
+		cprefix := leaseVolumePrefix(leaseUUID) // fred-{lease}-
+		rprefix := retainedName(cprefix)        // fred-retained-{lease}-
+		for _, id := range all {
+			if strings.HasPrefix(id, cprefix) || strings.HasPrefix(id, rprefix) {
+				leaked = append(leaked, id)
+			}
+		}
+	} else {
+		logger.Warn("give-up leak: volume list failed; deriving canonical + retained names from items", "error", err)
+		for _, item := range items {
+			for i := range item.Quantity {
+				canonical := canonicalVolumeName(leaseUUID, item.ServiceName, i)
+				// Record BOTH namespaces. A retain-path give-up may have already renamed
+				// some volumes into fred-retained-* before failing, so the on-disk name is
+				// unknown when List() is unavailable. destroyReapingVolumes treats a missing
+				// volume as an idempotent no-op, so recording both guarantees whichever
+				// exists is destroyed before the tombstone is deleted. Without the retained
+				// name, the sweep would "succeed" against the non-existent canonical name and
+				// drop the tombstone while the fred-retained-* volume persists untracked —
+				// reintroducing the exact under-count/leak this path fixes.
+				leaked = append(leaked, canonical, retainedName(canonical))
+			}
+		}
+	}
+	if len(leaked) == 0 {
+		return // nothing on disk to account for
+	}
+	rec := shared.RetentionEntry{
+		OriginalLeaseUUID:   leaseUUID,
+		Tenant:              tenant,
+		ProviderUUID:        providerUUID,
+		Items:               items,
+		RetainedVolumeNames: leaked,
+		Status:              shared.RetentionStatusReaping,
+		CreatedAt:           time.Now(),
+	}
+	if ok, err := b.retentionStore.PutReaping(rec); err != nil {
+		logger.Error("give-up leak: failed to record reaping tombstone; footprint UNTRACKED until manual cleanup", "lease_uuid", leaseUUID, "error", err)
+	} else if !ok {
+		logger.Info("give-up leak: an active/restoring record already counts this footprint; no tombstone written", "lease_uuid", leaseUUID)
+	}
+	// Reflect the new tombstone immediately (the deferred refresh only runs on the
+	// retain path; a non-retain give-up would otherwise wait for the next sweep).
+	b.refreshRetentionAccounting()
 }

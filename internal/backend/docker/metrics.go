@@ -376,15 +376,47 @@ var (
 		Name:      "retained_disk_cap_bytes",
 		Help:      "Per-provider retained-volume cap (max_retained_disk_mb) in bytes; 0 when unset",
 	})
+
+	// retentionLeakedTotal counts leak events: a reap/evict/sweep that left a volume
+	// on disk after a failed destroy, a deprovision give-up that abandoned a footprint,
+	// or a restore-rollback whose revert did not commit. Always incremented even when
+	// the store is too broken to take the tombstone write — the observable backstop.
+	retentionLeakedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_leaked_total",
+		Help:      "Retained-volume leak events (failed destroy / give-up / uncommitted revert) — see ENG-376",
+	})
+
+	// retentionReapingBytes is the reserved disk footprint (SKU quota) of records in
+	// the reaping (pending-destroy) state — bytes still on disk awaiting reclaim.
+	retentionReapingBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_reaping_bytes",
+		Help:      "Reserved disk footprint of reaping (pending-destroy) retained records, in bytes",
+	})
+
+	// retentionReapingLeases is the count of reaping records (DLQ-style depth). A
+	// sustained non-zero value means the sweep cannot reclaim a volume → operator action.
+	retentionReapingLeases = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_reaping_leases",
+		Help:      "Number of retained records stuck in the reaping (pending-destroy) state",
+	})
 )
 
 const bytesPerMiB = 1 << 20
 
-// updateRetentionMetrics sets the retained-volume gauges from the current
-// projection (MB) and active-lease count.
-func updateRetentionMetrics(retainedMB int64, count int) {
+// updateRetentionMetrics sets the retained-volume gauges. retainedMB is the
+// ADMISSION total (active + reaping); count is the ACTIVE-only lease count;
+// reapingMB/reapingCount are the reaping subset.
+func updateRetentionMetrics(retainedMB int64, count int, reapingMB int64, reapingCount int) {
 	retainedVolumeBytes.Set(float64(retainedMB) * bytesPerMiB)
 	retainedLeases.Set(float64(count))
+	retentionReapingBytes.Set(float64(reapingMB) * bytesPerMiB)
+	retentionReapingLeases.Set(float64(reapingCount))
 }
 
 // setStaticPoolMetrics sets the constant denominator gauges once at startup.

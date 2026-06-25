@@ -126,6 +126,46 @@ func (b *Backend) computeRetainedDiskMB() (mb int64, count int, err error) {
 	return mb, count, nil
 }
 
+// computeReapingDiskMB derives the reaping (pending-destroy) footprint from the
+// retention store: the sum of leaseDiskMB over REAPING records, plus their count.
+// These bytes are still physically on disk, so they count toward the admission
+// projection (refreshRetentionAccounting adds them to SetRetainedDisk) — but NOT
+// toward breachRetentionCap, whose true result DESTROYS data (over-counting a
+// destroy gate is the dangerous direction). (ENG-376)
+func (b *Backend) computeReapingDiskMB() (mb int64, count int, err error) {
+	if b.retentionStore == nil {
+		return 0, 0, nil
+	}
+	entries, err := b.retentionStore.ListReaping()
+	if err != nil {
+		return 0, 0, err
+	}
+	unknown := make(map[string]struct{})
+	for _, e := range entries {
+		count++
+		emb, eunres := b.leaseDiskMB(e.Items)
+		mb += emb
+		for _, s := range eunres {
+			unknown[s] = struct{}{}
+		}
+	}
+	if len(unknown) > 0 {
+		skus := make([]string, 0, len(unknown))
+		for s := range unknown {
+			skus = append(skus, s)
+		}
+		sort.Strings(skus)
+		// Same hazard as computeRetainedDiskMB: an unresolved SKU contributes 0, so a
+		// reaping record on a removed/renamed profile UNDERCOUNTS the admission pool
+		// (reaping is added to SetRetainedDisk) → over-admission/ENOSPC risk. Warn so an
+		// operator can restore the profile; the reaping footprint is transient, so this
+		// is rarer than the active case but the direction is identically dangerous.
+		b.logger.Warn("reaping record references unknown SKU profile(s); admission accounting UNDERCOUNTS the pending-destroy footprint (risk of over-admission/ENOSPC) until the profile is restored",
+			"unknown_skus", skus)
+	}
+	return mb, count, nil
+}
+
 // refreshRetentionAccounting recomputes the retained-disk projection and pushes
 // it to the admission pool and the gauges. Call at every retention transition
 // (close, reap, evict), on recover, and on the periodic sweep tick.
@@ -142,13 +182,21 @@ func (b *Backend) computeRetainedDiskMB() (mb int64, count int, err error) {
 func (b *Backend) refreshRetentionAccounting() {
 	b.retentionAccountingMu.Lock()
 	defer b.retentionAccountingMu.Unlock()
-	mb, count, err := b.computeRetainedDiskMB()
+	activeMB, activeCount, err := b.computeRetainedDiskMB()
 	if err != nil {
 		b.logger.Warn("failed to recompute retained disk accounting; keeping last value", "error", err)
 		return
 	}
-	b.pool.SetRetainedDisk(mb)
-	updateRetentionMetrics(mb, count)
+	reapingMB, reapingCount, err := b.computeReapingDiskMB()
+	if err != nil {
+		b.logger.Warn("failed to recompute reaping disk accounting; keeping last value", "error", err)
+		return
+	}
+	// Admission pool = active + reaping (reaping bytes are still on disk → counting
+	// them prevents over-admit/ENOSPC; this gate only DENIES provisions, so an
+	// over-count is safe). breachRetentionCap stays active-only (it DESTROYS).
+	b.pool.SetRetainedDisk(activeMB + reapingMB)
+	updateRetentionMetrics(activeMB+reapingMB, activeCount, reapingMB, reapingCount)
 }
 
 // breachRetentionCap reports whether retaining a lease of the given items would
