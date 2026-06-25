@@ -143,4 +143,12 @@ func TestParseProvisionsPageParams(t *testing.T) {
 		_, _, err := ParseProvisionsPageParams(url.Values{"continue": {"not-a-uuid"}})
 		require.Error(t, err)
 	})
+	t.Run("continue without limit is rejected", func(t *testing.T) {
+		_, _, err := ParseProvisionsPageParams(url.Values{"continue": {validUUID}})
+		require.Error(t, err, "a cursor with no positive limit must 400, not silently return the full list")
+	})
+	t.Run("continue with limit=0 is rejected", func(t *testing.T) {
+		_, _, err := ParseProvisionsPageParams(url.Values{"continue": {validUUID}, "limit": {"0"}})
+		require.Error(t, err)
+	})
 }

@@ -77,5 +77,12 @@ func ParseProvisionsPageParams(q url.Values) (limit int, continueToken string, e
 		}
 		continueToken = v
 	}
+	// A cursor without a positive page size is nonsensical: PaginateProvisions
+	// treats limit<=0 as an unpaginated passthrough and would silently ignore the
+	// cursor and return the full list. Reject it. (The back-compat "no params =>
+	// full list" path is unaffected — it carries no continue token.)
+	if continueToken != "" && limit <= 0 {
+		return 0, "", fmt.Errorf("continue requires a positive limit")
+	}
 	return limit, continueToken, nil
 }
