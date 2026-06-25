@@ -111,6 +111,22 @@ func (s *RetentionStore) fireReindex(count int, dur time.Duration, trigger strin
 	}
 }
 
+// ReIndex rebuilds the in-memory index from the primary bucket and atomically swaps it in.
+// Safe on a live store: builds fresh maps, then assigns under s.mu so readers see either the
+// whole old or whole new index. The self-heal/recovery seam (the index is never the source of truth).
+func (s *RetentionStore) ReIndex() error {
+	start := time.Now()
+	byTenant, byStatus, count, err := s.scanIndex()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.byTenant, s.byStatus = byTenant, byStatus
+	s.mu.Unlock()
+	s.fireReindex(count, time.Since(start), "manual")
+	return nil
+}
+
 // scanIndex builds fresh tenant/status index maps from one pass over the primary bucket,
 // decoding only the three indexed fields (skips the heavy Items/StackManifest allocation;
 // encoding/json still scans every byte). Returns the maps + record count. Fails on a

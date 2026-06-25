@@ -736,3 +736,21 @@ func TestRetentionIndex_Apply(t *testing.T) {
 	assert.Empty(t, byTenant)
 	assert.Empty(t, byStatus)
 }
+
+func TestRetentionIndex_ReIndexRebuildsAndFiresHook(t *testing.T) {
+	dir := t.TempDir()
+	var gotTrigger string
+	var gotCount int
+	s, err := NewRetentionStore(RetentionStoreConfig{
+		DBPath:    dir + "/retention.db",
+		OnReindex: func(count int, _ time.Duration, trigger string) { gotCount, gotTrigger = count, trigger },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	require.NoError(t, s.Put(sampleEntry("u1")))
+	require.NoError(t, s.ReIndex())
+	assert.Equal(t, "manual", gotTrigger)
+	assert.Equal(t, 1, gotCount)
+	byTenant, _ := s.indexSnapshot()
+	assert.ElementsMatch(t, []string{"u1"}, byTenant["tenant-a"])
+}
