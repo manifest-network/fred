@@ -136,15 +136,12 @@ func (b *Backend) computeReapingDiskMB() (mb int64, count int, err error) {
 	if b.retentionStore == nil {
 		return 0, 0, nil
 	}
-	entries, err := b.retentionStore.List()
+	entries, err := b.retentionStore.ListReaping()
 	if err != nil {
 		return 0, 0, err
 	}
 	unknown := make(map[string]struct{})
 	for _, e := range entries {
-		if e.Status != shared.RetentionStatusReaping {
-			continue
-		}
 		count++
 		emb, eunres := b.leaseDiskMB(e.Items)
 		mb += emb

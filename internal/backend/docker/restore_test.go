@@ -515,6 +515,7 @@ func TestEvict_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	old.RetainedVolumeNames = []string{"fred-retained-lease-old-app-0"}
 	require.NoError(t, rs.Put(old))
 	newer := retentionEntryFixture("lease-new", "t1", time.Now())
+	newer.RetainedVolumeNames = []string{"fred-retained-lease-new-app-0"} // UUID-derived; avoid the fixture's fixed default colliding with lease-old
 	require.NoError(t, rs.Put(newer))
 
 	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") }}
