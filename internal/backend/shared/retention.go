@@ -192,16 +192,32 @@ func (s *RetentionStore) indexApply(oldE, newE *RetentionEntry) {
 	}
 }
 
-// Put persists a RetentionEntry, upserting by OriginalLeaseUUID.
+// Put persists a RetentionEntry, upserting by OriginalLeaseUUID. It reads the
+// pre-image in-txn so the index can drop the stale partition membership of any
+// record being overwritten (a status/tenant change must not leave a phantom).
 func (s *RetentionStore) Put(e RetentionEntry) error {
 	data, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("failed to marshal retention entry: %w", err)
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var oldE *RetentionEntry
+	err = s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
+		if raw := bkt.Get([]byte(e.OriginalLeaseUUID)); raw != nil {
+			oldE = &RetentionEntry{}
+			if uerr := json.Unmarshal(raw, oldE); uerr != nil {
+				return fmt.Errorf("failed to unmarshal retention entry: %w", uerr)
+			}
+		}
 		return bkt.Put([]byte(e.OriginalLeaseUUID), data)
 	})
+	if err != nil {
+		return err
+	}
+	s.indexApply(oldE, &e)
+	return nil
 }
 
 // PutActiveMerged atomically upserts the soft-delete record for a closing lease,
@@ -364,12 +380,27 @@ func (s *RetentionStore) Get(orig string) (*RetentionEntry, error) {
 }
 
 // Delete removes a RetentionEntry by original lease UUID. It is idempotent:
-// no error is returned when the entry is absent.
+// no error is returned when the entry is absent. It reads the pre-image in-txn
+// so the index can drop the deleted record's partition membership.
 func (s *RetentionStore) Delete(orig string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var oldE *RetentionEntry
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
+		if raw := bkt.Get([]byte(orig)); raw != nil {
+			oldE = &RetentionEntry{}
+			if uerr := json.Unmarshal(raw, oldE); uerr != nil {
+				return fmt.Errorf("failed to unmarshal retention entry: %w", uerr)
+			}
+		}
 		return bkt.Delete([]byte(orig))
 	})
+	if err != nil {
+		return err
+	}
+	s.indexApply(oldE, nil) // oldE=nil when absent → no-op
+	return nil
 }
 
 // List returns all RetentionEntry records in the store.

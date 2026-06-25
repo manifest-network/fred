@@ -847,3 +847,27 @@ func TestRetentionIndex_ReIndexRebuildsAndFiresHook(t *testing.T) {
 	byTenant, _ := s.indexSnapshot()
 	assert.ElementsMatch(t, []string{"u1"}, byTenant["tenant-a"])
 }
+
+func TestRetentionIndex_PutOverwriteAndDeleteStayConsistent(t *testing.T) {
+	s := newTestRetentionStore(t)
+	e := sampleEntry("u1")
+	require.NoError(t, s.Put(e))
+	assertIndexConsistent(t, s)
+
+	e2 := e
+	e2.Status = RetentionStatusReaping
+	require.NoError(t, s.Put(e2)) // overwrite same UUID, different status
+	_, byStatus := s.indexSnapshot()
+	assert.NotContains(t, byStatus[RetentionStatusActive], "u1")
+	assert.ElementsMatch(t, []string{"u1"}, byStatus[RetentionStatusReaping])
+	assertIndexConsistent(t, s)
+
+	require.NoError(t, s.Delete("u1"))
+	assertIndexConsistent(t, s)
+	byTenant, byStatus := s.indexSnapshot()
+	assert.Empty(t, byTenant)
+	assert.Empty(t, byStatus)
+
+	require.NoError(t, s.Delete("nope")) // absent → no-op
+	assertIndexConsistent(t, s)
+}
