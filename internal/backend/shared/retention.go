@@ -222,7 +222,7 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 		if raw := bkt.Get([]byte(e.OriginalLeaseUUID)); raw != nil {
 			oldE = &RetentionEntry{}
 			if uerr := json.Unmarshal(raw, oldE); uerr != nil {
-				return fmt.Errorf("failed to unmarshal retention entry: %w", uerr)
+				return fmt.Errorf("malformed retention record %q: %w", e.OriginalLeaseUUID, uerr)
 			}
 		}
 		return bkt.Put([]byte(e.OriginalLeaseUUID), data)
@@ -258,7 +258,7 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
 			var stored RetentionEntry
 			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+				return fmt.Errorf("malformed retention record %q: %w", base.OriginalLeaseUUID, err)
 			}
 			oldE = &stored
 			if stored.Status != RetentionStatusActive {
@@ -318,7 +318,7 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
 			var stored RetentionEntry
 			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+				return fmt.Errorf("malformed retention record %q: %w", base.OriginalLeaseUUID, err)
 			}
 			// Capture the pre-image as a value copy BEFORE the reaping-branch
 			// `base = stored` assignment below aliases stored into base.
@@ -386,7 +386,7 @@ func (s *RetentionStore) Get(orig string) (*RetentionEntry, error) {
 		}
 		entry = &RetentionEntry{}
 		if err := json.Unmarshal(raw, entry); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		return nil
 	})
@@ -405,7 +405,7 @@ func (s *RetentionStore) Delete(orig string) error {
 		if raw := bkt.Get([]byte(orig)); raw != nil {
 			oldE = &RetentionEntry{}
 			if uerr := json.Unmarshal(raw, oldE); uerr != nil {
-				return fmt.Errorf("failed to unmarshal retention entry: %w", uerr)
+				return fmt.Errorf("malformed retention record %q: %w", orig, uerr)
 			}
 		}
 		return bkt.Delete([]byte(orig))
@@ -469,7 +469,7 @@ func (s *RetentionStore) getAll(uuids []string, keep func(*RetentionEntry) bool)
 			}
 			var e RetentionEntry
 			if uerr := json.Unmarshal(raw, &e); uerr != nil {
-				return fmt.Errorf("failed to unmarshal retention entry: %w", uerr)
+				return fmt.Errorf("malformed retention record %q: %w", u, uerr)
 			}
 			if keep(&e) {
 				out = append(out, e)
@@ -530,7 +530,7 @@ func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
 		}
 		var e RetentionEntry
 		if err := json.Unmarshal(raw, &e); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if e.Status != RetentionStatusActive {
 			return nil
@@ -554,10 +554,10 @@ func (s *RetentionStore) filter(keep func(*RetentionEntry) bool) ([]RetentionEnt
 	var results []RetentionEntry
 	err := s.db.View(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
-		return bkt.ForEach(func(_, v []byte) error {
+		return bkt.ForEach(func(k, v []byte) error {
 			var e RetentionEntry
 			if err := json.Unmarshal(v, &e); err != nil {
-				return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+				return fmt.Errorf("malformed retention record %q: %w", string(k), err)
 			}
 			if keep(&e) {
 				results = append(results, e)
@@ -586,7 +586,7 @@ func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Dura
 		}
 		var e RetentionEntry
 		if err := json.Unmarshal(raw, &e); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if e.Status != RetentionStatusActive {
 			return ErrNotRestorable
@@ -636,7 +636,7 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 			return nil
 		}
 		if err := json.Unmarshal(raw, &oldE); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if oldE.Status != RetentionStatusActive {
 			return nil
@@ -685,7 +685,7 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 			return nil
 		}
 		if err := json.Unmarshal(raw, &oldE); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if oldE.Status != RetentionStatusActive {
 			return nil
@@ -733,7 +733,7 @@ func (s *RetentionStore) RevertToActive(orig string, expectGen int) (bool, error
 			return nil
 		}
 		if err := json.Unmarshal(raw, &oldE); err != nil {
-			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if oldE.Status != RetentionStatusRestoring {
 			return nil

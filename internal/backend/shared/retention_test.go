@@ -721,6 +721,9 @@ func TestRetentionIndex_RebuildFailsClosedOnMalformedRecord(t *testing.T) {
 	_, err = NewRetentionStore(RetentionStoreConfig{DBPath: path})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "retention index")
+	// The malformed-record error must name the offending bucket key so an operator can find
+	// and remediate it (uniform across all unmarshal sites — see the per-method %q errors).
+	assert.Contains(t, err.Error(), `"bad"`)
 }
 
 func TestRetentionIndex_Apply(t *testing.T) {
