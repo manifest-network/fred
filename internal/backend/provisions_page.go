@@ -72,10 +72,15 @@ func ParseProvisionsPageParams(q url.Values) (limit int, continueToken string, e
 		limit = n
 	}
 	if v := q.Get("continue"); v != "" {
-		if _, perr := uuid.Parse(v); perr != nil {
+		u, perr := uuid.Parse(v)
+		if perr != nil {
 			return 0, "", fmt.Errorf("invalid continue token %q: must be a UUID", v)
 		}
-		continueToken = v
+		// Canonicalize: uuid.Parse accepts uppercase / {braces} / urn:uuid: /
+		// no-hyphen forms, but the cursor is compared lexically against the
+		// canonical-lowercase LeaseUUIDs in PaginateProvisions, so a non-canonical
+		// token would page incorrectly (duplicate/rewound). u.String() is canonical.
+		continueToken = u.String()
 	}
 	// A cursor without a positive page size is nonsensical: PaginateProvisions
 	// treats limit<=0 as an unpaginated passthrough and would silently ignore the

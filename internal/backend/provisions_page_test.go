@@ -151,4 +151,16 @@ func TestParseProvisionsPageParams(t *testing.T) {
 		_, _, err := ParseProvisionsPageParams(url.Values{"continue": {validUUID}, "limit": {"0"}})
 		require.Error(t, err)
 	})
+	t.Run("uppercase continue is canonicalized to lowercase", func(t *testing.T) {
+		// uuid.Parse accepts uppercase; the cursor must be canonical lowercase so
+		// lexical comparison matches the stored LeaseUUIDs (else duplicate/rewound pages).
+		_, cont, err := ParseProvisionsPageParams(url.Values{"limit": {"100"}, "continue": {"ABCDEF01-2345-6789-ABCD-EF0123456789"}})
+		require.NoError(t, err)
+		assert.Equal(t, "abcdef01-2345-6789-abcd-ef0123456789", cont)
+	})
+	t.Run("braced continue is canonicalized", func(t *testing.T) {
+		_, cont, err := ParseProvisionsPageParams(url.Values{"limit": {"100"}, "continue": {"{11111111-1111-1111-1111-111111111111}"}})
+		require.NoError(t, err)
+		assert.Equal(t, "11111111-1111-1111-1111-111111111111", cont)
+	})
 }
