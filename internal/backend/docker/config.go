@@ -220,6 +220,16 @@ type Config struct {
 	// tenant may have in the retention store at once. 0 means unlimited.
 	MaxRetainedLeasesPerTenant int `yaml:"max_retained_leases_per_tenant"`
 
+	// RetentionOrphanConfirmations is the number of consecutive retention sweeps a
+	// soft-deleted record must be observed with ALL its retained volumes missing
+	// before the record is pruned (ENG-370). It is a SWEEP COUNT, not a duration:
+	// the effective confirmation window is N × RetentionReapInterval (≈3h at the
+	// default 1h interval), so shortening RetentionReapInterval proportionally
+	// shrinks the window — re-tune N to keep a fixed grace. 0 is valid and
+	// disables orphan pruning entirely (kill-switch); negative values are rejected
+	// by Validate. Defaults to 3.
+	RetentionOrphanConfirmations int `yaml:"retention_orphan_confirmations"`
+
 	// MaxRetainedDiskMB caps the aggregate disk (MB) the provider will hold in
 	// the retained (soft-deleted) tier across ALL tenants. When retaining a
 	// closing lease would push the total over this cap, the lease is destroyed
@@ -333,33 +343,34 @@ func (c *Config) largestSKUDiskMB() int64 {
 // config; Validate enforces non-empty.
 func DefaultConfig() Config {
 	return Config{
-		Name:                    "docker",
-		ListenAddr:              ":9001",
-		DockerHost:              "unix:///var/run/docker.sock",
-		TotalCPUCores:           8.0,
-		TotalMemoryMB:           16384,
-		TotalDiskMB:             102400,
-		ImagePullTimeout:        5 * time.Minute,
-		ContainerCreateTimeout:  30 * time.Second,
-		ContainerStartTimeout:   30 * time.Second,
-		ContainerStopTimeout:    30 * time.Second,
-		ReconcileInterval:       5 * time.Minute,
-		ProvisionTimeout:        10 * time.Minute,
-		CallbackDBPath:          "callbacks.db",
-		NetworkIsolation:        ptrBool(true),
-		ContainerReadonlyRootfs: ptrBool(true),
-		ContainerPidsLimit:      ptrInt64(256),
-		ContainerTmpfsSizeMB:    64,
-		CallbackMaxAge:          24 * time.Hour,
-		DiagnosticsDBPath:       "diagnostics.db",
-		DiagnosticsMaxAge:       7 * 24 * time.Hour,
-		ReleasesDBPath:          "releases.db",
-		ReleasesMaxAge:          90 * 24 * time.Hour,
-		RetentionDBPath:         "retention.db",
-		RetentionMaxAge:         90 * 24 * time.Hour,
-		RetentionReapInterval:   time.Hour,
-		MigrationGracePeriod:    defaultMigrationGracePeriod,
-		MigrationReadyTimeout:   defaultMigrationReadyTimeout,
+		Name:                         "docker",
+		ListenAddr:                   ":9001",
+		DockerHost:                   "unix:///var/run/docker.sock",
+		TotalCPUCores:                8.0,
+		TotalMemoryMB:                16384,
+		TotalDiskMB:                  102400,
+		ImagePullTimeout:             5 * time.Minute,
+		ContainerCreateTimeout:       30 * time.Second,
+		ContainerStartTimeout:        30 * time.Second,
+		ContainerStopTimeout:         30 * time.Second,
+		ReconcileInterval:            5 * time.Minute,
+		ProvisionTimeout:             10 * time.Minute,
+		CallbackDBPath:               "callbacks.db",
+		NetworkIsolation:             ptrBool(true),
+		ContainerReadonlyRootfs:      ptrBool(true),
+		ContainerPidsLimit:           ptrInt64(256),
+		ContainerTmpfsSizeMB:         64,
+		CallbackMaxAge:               24 * time.Hour,
+		DiagnosticsDBPath:            "diagnostics.db",
+		DiagnosticsMaxAge:            7 * 24 * time.Hour,
+		ReleasesDBPath:               "releases.db",
+		ReleasesMaxAge:               90 * 24 * time.Hour,
+		RetentionDBPath:              "retention.db",
+		RetentionMaxAge:              90 * 24 * time.Hour,
+		RetentionReapInterval:        time.Hour,
+		RetentionOrphanConfirmations: 3,
+		MigrationGracePeriod:         defaultMigrationGracePeriod,
+		MigrationReadyTimeout:        defaultMigrationReadyTimeout,
 		AllowedRegistries: []string{
 			"docker.io",
 			"ghcr.io",
@@ -525,6 +536,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_retained_leases_per_tenant must be non-negative")
 	}
 
+	if c.RetentionOrphanConfirmations < 0 {
+		return fmt.Errorf("retention_orphan_confirmations must be non-negative")
+	}
 	if c.MaxRetainedDiskMB < 0 {
 		return fmt.Errorf("max_retained_disk_mb must be non-negative")
 	}

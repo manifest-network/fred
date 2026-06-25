@@ -258,6 +258,38 @@ func (s *RetentionStore) ListReaping() ([]RetentionEntry, error) {
 	})
 }
 
+// DeleteIfActive atomically removes a record ONLY if it is still ACTIVE. Returns
+// (names, deleted, err); deleted=false (nil names) when absent or not active (e.g.
+// concurrently claimed for restore). Used by reconcileOrphanedRetentions (ENG-370)
+// to prune an orphaned active record whose backing volumes have already vanished
+// out-of-band — the ACTIVE-only CAS guarantees a concurrent restore (active→restoring)
+// is never clobbered. The returned names are unused there: the volumes are already
+// gone, so there is nothing to destroy.
+func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
+	var (
+		names   []string
+		deleted bool
+	)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(retentionBucketName)
+		raw := bkt.Get([]byte(orig))
+		if raw == nil {
+			return nil
+		}
+		var e RetentionEntry
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("failed to unmarshal retention entry: %w", err)
+		}
+		if e.Status != RetentionStatusActive {
+			return nil
+		}
+		names = e.RetainedVolumeNames
+		deleted = true
+		return bkt.Delete([]byte(orig))
+	})
+	return names, deleted, err
+}
+
 // filter iterates all bucket entries and returns those for which keep returns true.
 func (s *RetentionStore) filter(keep func(*RetentionEntry) bool) ([]RetentionEntry, error) {
 	var results []RetentionEntry

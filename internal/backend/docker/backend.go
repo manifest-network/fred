@@ -115,6 +115,20 @@ type Backend struct {
 	// retentionStore persists soft-deleted leases awaiting restore or reaping
 	retentionStore *shared.RetentionStore
 
+	// orphanStreaks counts consecutive retention sweeps an ACTIVE record's volumes
+	// were all absent (ENG-370). Two invariants protect it:
+	//   1. Single-writer confinement: touched ONLY by reconcileOrphanedRetentions,
+	//      reachable only via runRetentionSweep on the single StartCleanupLoop
+	//      goroutine (boot-eager retention work runs before that goroutine starts
+	//      and never touches it) — so no mutex is needed. Do not add a second writer.
+	//   2. In-memory by design: a restart resets it so a cold boot can never prune
+	//      on its first sweep (the boot-before-mount fail-safe). Do not persist it.
+	// Separately, the prune itself relies on DeleteIfActive's in-txn CAS as the
+	// load-bearing guard against a concurrent restore (ClaimForRestore
+	// active→restoring on a request goroutine) — do not "simplify" it into an
+	// unconditional Delete.
+	orphanStreaks map[string]int
+
 	// callbackSender handles callback delivery with retry and HMAC
 	callbackSender *shared.CallbackSender
 
@@ -504,9 +518,17 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,
 		retentionStore:   retentionStore,
+		orphanStreaks:    make(map[string]int),
 		httpClient:       httpClient,
 		// tenantNetworkStripes is a fixed-size array embedded in Backend;
 		// the zero value is ready to use (N unlocked sync.Mutexes).
+	}
+
+	// Pre-initialize the orphan-skip counter series to 0 (ENG-370): the reason
+	// set is closed and known, so alert queries see 0 instead of no-data before
+	// the first skip event.
+	for _, r := range orphanSkipReasons {
+		retentionOrphanSkipsTotal.WithLabelValues(r).Add(0)
 	}
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())
