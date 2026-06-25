@@ -950,7 +950,9 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
-	var acc []ProvisionInfo
+	// Start non-nil so an empty backend returns [] (not nil), preserving the
+	// pre-pagination ListProvisions contract.
+	acc := []ProvisionInfo{}
 	cont := ""
 	for page := 0; ; page++ {
 		if err := ctx.Err(); err != nil {

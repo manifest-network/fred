@@ -2106,6 +2106,17 @@ func TestNewHTTPClient_ProvisionsPageLimitDefault(t *testing.T) {
 	assert.Equal(t, DefaultProvisionsPageLimit, c3.provisionsPageLimit, "negative config falls back to default (never sent as limit=-5)")
 }
 
+func TestHTTPClient_ListProvisions_EmptyIsNonNil(t *testing.T) {
+	server := pagingProvisionServer(t, nil) // empty backend
+	defer server.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	got, err := c.ListProvisions(context.Background())
+	require.NoError(t, err)
+	assert.NotNil(t, got, "empty backend must yield a non-nil [] (preserves the pre-pagination contract)")
+	assert.Empty(t, got)
+}
+
 // pagingProvisionServer serves /provisions using the real PaginateProvisions
 // helper so the client loop is exercised against production paging semantics.
 func pagingProvisionServer(t *testing.T, all []ProvisionInfo) *httptest.Server {
