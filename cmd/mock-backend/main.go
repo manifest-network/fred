@@ -362,9 +362,22 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 		return
 	}
 
+	limit, cont, perr := backend.ParseProvisionsPageParams(r.URL.Query())
+	if perr != nil {
+		http.Error(w, perr.Error(), http.StatusBadRequest)
+		return
+	}
+	page, next := backend.PaginateProvisions(provisions, cont, limit)
+	// Serialize as [] not null even if empty. PaginateProvisions returns non-nil
+	// today; this mirrors the lease_uuid branch above and stays defensive.
+	if page == nil {
+		page = []backend.ProvisionInfo{}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
-		Provisions: provisions,
+		Provisions: page,
+		Continue:   next,
 	}); err != nil {
 		slog.Error("failed to encode provisions response", "error", err)
 	}

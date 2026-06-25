@@ -99,6 +99,29 @@ func TestMockBackend_HandleListProvisions_Unfiltered_StillWorks(t *testing.T) {
 	assert.Len(t, resp.Provisions, 2)
 }
 
+func TestMockBackend_HandleListProvisions_Paginates(t *testing.T) {
+	srv := newTestServer(t, []string{testUUID1, testUUID2, testUUID3})
+
+	req := httptest.NewRequest("GET", "/provisions?limit=2", nil)
+	w := httptest.NewRecorder()
+	srv.handleListProvisions(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var p backend.ListProvisionsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &p))
+	require.Len(t, p.Provisions, 2)
+	assert.Equal(t, testUUID1, p.Provisions[0].LeaseUUID) // sorted: testUUID1 < testUUID3 < testUUID2
+	assert.Equal(t, testUUID3, p.Provisions[1].LeaseUUID)
+	assert.Equal(t, testUUID3, p.Continue)
+}
+
+func TestMockBackend_HandleListProvisions_MalformedContinueIs400(t *testing.T) {
+	srv := newTestServer(t, []string{testUUID1})
+	req := httptest.NewRequest("GET", "/provisions?limit=2&continue=not-a-uuid", nil)
+	w := httptest.NewRecorder()
+	srv.handleListProvisions(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 // TestComputeSignature_VerifiesAgainstHmacauth proves the standalone
 // reference implementation in computeSignature produces signatures that
 // the canonical internal/hmacauth.VerifyRequest accepts. Without this,
