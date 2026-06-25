@@ -189,16 +189,20 @@ func idxDel(m map[string]map[string]struct{}, key, uuid string) {
 }
 
 // indexApply reconciles the index for a record transition. Caller MUST hold s.mu.
-// oldE=nil → insert; newE=nil → delete; both set → move. Always removes oldE.Tenant and
-// adds newE.Tenant (tenant immutability is observed, not assumed/optimized).
-func (s *RetentionStore) indexApply(oldE, newE *RetentionEntry) {
+// oldE=nil → insert; newE=nil → delete; both set → move. The set member is the caller-supplied
+// uuid — the bbolt bucket KEY, which is authoritative and is what getAll resolves via Get; it
+// must NOT be derived from oldE/newE.OriginalLeaseUUID, so a record whose stored value UUID is
+// empty/mismatched (corruption / old format / manual edit) is still indexed under its real key,
+// consistent with scanIndex. Partitions come from the entries (tenant immutability is observed,
+// not assumed/optimized).
+func (s *RetentionStore) indexApply(uuid string, oldE, newE *RetentionEntry) {
 	if oldE != nil {
-		idxDel(s.byTenant, oldE.Tenant, oldE.OriginalLeaseUUID)
-		idxDel(s.byStatus, oldE.Status, oldE.OriginalLeaseUUID)
+		idxDel(s.byTenant, oldE.Tenant, uuid)
+		idxDel(s.byStatus, oldE.Status, uuid)
 	}
 	if newE != nil {
-		idxAdd(s.byTenant, newE.Tenant, newE.OriginalLeaseUUID)
-		idxAdd(s.byStatus, newE.Status, newE.OriginalLeaseUUID)
+		idxAdd(s.byTenant, newE.Tenant, uuid)
+		idxAdd(s.byStatus, newE.Status, uuid)
 	}
 }
 
@@ -226,7 +230,7 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 	if err != nil {
 		return err
 	}
-	s.indexApply(oldE, &e)
+	s.indexApply(e.OriginalLeaseUUID, oldE, &e)
 	return nil
 }
 
@@ -286,7 +290,7 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 		return false, err
 	}
 	if ok {
-		s.indexApply(oldE, &base)
+		s.indexApply(base.OriginalLeaseUUID, oldE, &base)
 	}
 	return ok, nil
 }
@@ -345,7 +349,7 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 		return false, err
 	}
 	if ok {
-		s.indexApply(oldE, &base)
+		s.indexApply(base.OriginalLeaseUUID, oldE, &base)
 	}
 	return ok, nil
 }
@@ -409,7 +413,7 @@ func (s *RetentionStore) Delete(orig string) error {
 	if err != nil {
 		return err
 	}
-	s.indexApply(oldE, nil) // oldE=nil when absent → no-op
+	s.indexApply(orig, oldE, nil) // oldE=nil when absent → no-op
 	return nil
 }
 
@@ -540,7 +544,7 @@ func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
 		return nil, false, err
 	}
 	if deleted {
-		s.indexApply(&oldE, nil)
+		s.indexApply(orig, &oldE, nil)
 	}
 	return names, deleted, nil
 }
@@ -606,7 +610,7 @@ func (s *RetentionStore) ClaimForRestore(orig, newLease string, maxAge time.Dura
 		return nil, err
 	}
 	if out != nil {
-		s.indexApply(&oldE, out)
+		s.indexApply(orig, &oldE, out)
 	}
 	return out, nil
 }
@@ -652,7 +656,7 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 		return nil, false, err
 	}
 	if ok {
-		s.indexApply(&oldE, &newE)
+		s.indexApply(orig, &oldE, &newE)
 	}
 	return names, ok, nil
 }
@@ -704,7 +708,7 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 		return nil, false, err
 	}
 	if ok {
-		s.indexApply(&oldE, &newE)
+		s.indexApply(orig, &oldE, &newE)
 	}
 	return names, ok, nil
 }
@@ -753,7 +757,7 @@ func (s *RetentionStore) RevertToActive(orig string, expectGen int) (bool, error
 		return false, err
 	}
 	if swapped {
-		s.indexApply(&oldE, &newE)
+		s.indexApply(orig, &oldE, &newE)
 	}
 	return swapped, nil
 }

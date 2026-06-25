@@ -727,11 +727,11 @@ func TestRetentionIndex_Apply(t *testing.T) {
 	s := newTestRetentionStore(t)
 	s.mu.Lock()
 	a := sampleEntry("u1") // tenant-a / active
-	s.indexApply(nil, &a)
+	s.indexApply("u1", nil, &a)
 	moved := a
 	moved.Status = RetentionStatusReaping
-	s.indexApply(&a, &moved)  // active -> reaping
-	s.indexApply(&moved, nil) // delete
+	s.indexApply("u1", &a, &moved)  // active -> reaping
+	s.indexApply("u1", &moved, nil) // delete
 	s.mu.Unlock()
 	byTenant, byStatus := s.indexSnapshot()
 	assert.Empty(t, byTenant)
@@ -1018,6 +1018,35 @@ func TestRetentionIndex_RebuildKeysOnBucketKey(t *testing.T) {
 	got, err := s.ListByTenant("t-mismatch")
 	require.NoError(t, err)
 	require.Len(t, got, 1, "record must be found via the bucket key, not the empty value UUID")
+}
+
+// TestRetentionIndex_MutatorKeysOnBucketKey pins that indexApply (the runtime maintenance path)
+// keys the index on the bucket KEY too, consistent with scanIndex. A record whose stored value UUID
+// is empty/mismatched must still be correctly re-indexed when a mutator transitions its status —
+// otherwise scanIndex (keyed on the bucket key) and indexApply (keyed on the value field) diverge and
+// the record drifts out of the index until the next ReIndex. (Copilot follow-up regression.)
+func TestRetentionIndex_MutatorKeysOnBucketKey(t *testing.T) {
+	s := newTestRetentionStore(t)
+
+	// White-box: an active record under key "K1" whose VALUE UUID is empty (mismatched).
+	val := `{"original_lease_uuid":"","tenant":"t","status":"active","retained_volume_names":["v"]}`
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte("K1"), []byte(val))
+	}))
+	require.NoError(t, s.ReIndex()) // index keyed on the bucket key "K1"
+
+	// Runtime status transition active -> restoring via a mutator (keyed on orig="K1").
+	// maxAge=0 disables the expiry check (the white-box record has a zero CreatedAt); this test
+	// is about index keying, not grace expiry.
+	_, err := s.ClaimForRestore("K1", "newlease", 0)
+	require.NoError(t, err)
+
+	// The record must move to the restoring partition under "K1" and be found via getAll(Get("K1")).
+	restoring, err := s.ListRestoring()
+	require.NoError(t, err)
+	require.Len(t, restoring, 1, "transitioned record must be found via the bucket key, not the empty value UUID")
+	// No stale entry left in the active partition: the index must match a fresh rebuild.
+	assertIndexConsistent(t, s)
 }
 
 // TestRetentionIndex_ReIndexConcurrentWithWriter pins that ReIndex serializes with mutators by
