@@ -2101,6 +2101,9 @@ func TestNewHTTPClient_ProvisionsPageLimitDefault(t *testing.T) {
 
 	c2 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: 250})
 	assert.Equal(t, 250, c2.provisionsPageLimit, "explicit config is honored")
+
+	c3 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: -5})
+	assert.Equal(t, DefaultProvisionsPageLimit, c3.provisionsPageLimit, "negative config falls back to default (never sent as limit=-5)")
 }
 
 // pagingProvisionServer serves /provisions using the real PaginateProvisions

@@ -658,6 +658,14 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		},
 	})
 
+	// Guard the page size: a zero OR negative ProvisionsPageLimit falls back to
+	// the default. cmp.Or (used above for the other defaults) only replaces zero,
+	// so a negative would be sent as limit=-N and rejected by the server each tick.
+	pageLimit := cfg.ProvisionsPageLimit
+	if pageLimit <= 0 {
+		pageLimit = DefaultProvisionsPageLimit
+	}
+
 	return &HTTPClient{
 		name:    cfg.Name,
 		baseURL: cfg.BaseURL,
@@ -675,7 +683,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		maxReleasesBytes:         positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
 		maxStatsBytes:            positiveOr(cfg.MaxStatsBytes, DefaultMaxStatsBytes),
 		maxRetentionsBytes:       positiveOr(cfg.MaxRetentionsBytes, DefaultMaxRetentionsBytes),
-		provisionsPageLimit:      cmp.Or(cfg.ProvisionsPageLimit, DefaultProvisionsPageLimit),
+		provisionsPageLimit:      pageLimit,
 		requestDuration:          cfg.RequestDuration,
 		requestsTotal:            cfg.RequestsTotal,
 	}
