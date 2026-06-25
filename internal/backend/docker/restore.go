@@ -252,18 +252,18 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names 
 	destroyFailed := false
 	for _, name := range names {
 		if derr := b.volumes.Destroy(ctx, name); derr != nil {
-			b.logger.Error("reap: destroy volume", "volume", name, "error", derr)
+			b.logger.Error("reaping: destroy volume", "volume", name, "error", derr)
 			destroyFailed = true
 		}
 	}
 	if destroyFailed {
 		retentionLeakedTotal.Inc()
-		b.logger.Warn("reap: volume(s) still on disk; record left reaping for retry (footprint stays counted)",
+		b.logger.Warn("reaping: volume(s) still on disk; record left reaping for retry (footprint stays counted)",
 			"lease_uuid", orig)
 		return false
 	}
 	if derr := b.retentionStore.Delete(orig); derr != nil {
-		b.logger.Warn("reap: destroy ok but record delete failed; next sweep retries", "lease_uuid", orig, "error", derr)
+		b.logger.Warn("reaping: destroy ok but record delete failed; next sweep retries", "lease_uuid", orig, "error", derr)
 		return false
 	}
 	return true
