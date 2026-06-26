@@ -17,8 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the first restore. (ENG-408)
 - **Per-tenant retention eviction metric.** New counter
   `fred_docker_backend_retention_evicted_total` increments each time a close-time
-  per-tenant cap eviction destroys one of a tenant's own oldest retained leases to
-  honor `max_retained_leases_per_tenant`. Distinct from the global
+  per-tenant cap eviction evicts one of a tenant's own oldest retained leases
+  (active→reaping) to honor `max_retained_leases_per_tenant`. Distinct from the global
   `fred_docker_backend_retention_refused_total` (`max_retained_disk_mb`); operators
   can now alert on per-tenant grace loss instead of grepping logs. (ENG-407)
 
