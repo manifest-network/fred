@@ -531,6 +531,39 @@ func TestEvict_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	assert.Equal(t, int64(2*2048), b.pool.Stats().RetainedDiskMB)
 }
 
+// TestEvict_IncrementsEvictedCounterPerRecord verifies cap eviction bumps
+// retentionEvictedTotal once per record actually evicted to honor the per-tenant
+// cap. This is the per-tenant max_retained_leases_per_tenant signal — distinct
+// from the GLOBAL retentionRefusedTotal (max_retained_disk_mb); the two must not
+// be conflated. With two active records for one tenant and cap=1, both are
+// evicted, so the counter must advance by exactly 2 (not once per call). ENG-407.
+func TestEvict_IncrementsEvictedCounterPerRecord(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedLeasesPerTenant = 1
+	rs := attachRetentionStore(t, b)
+
+	// Two active records for the same tenant; cap=1 evicts BOTH (down to 0,
+	// making room for the closing lease). Distinct volume names so the successful
+	// destroys don't collide.
+	a := retentionEntryFixture("lease-a", "t1", time.Now().Add(-2*time.Hour))
+	a.RetainedVolumeNames = []string{"fred-retained-lease-a-app-0"}
+	require.NoError(t, rs.Put(a))
+	c := retentionEntryFixture("lease-c", "t1", time.Now().Add(-time.Hour))
+	c.RetainedVolumeNames = []string{"fred-retained-lease-c-app-0"}
+	require.NoError(t, rs.Put(c))
+
+	// Destroys succeed → each evicted record is fully reaped, but the counter
+	// fires on the active→reaping eviction regardless of destroy outcome.
+	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return nil }}
+
+	before := testutil.ToFloat64(retentionEvictedTotal)
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", 1, "lease-new"))
+	assert.Equal(t, before+2, testutil.ToFloat64(retentionEvictedTotal),
+		"one increment per record evicted to honor the per-tenant cap")
+}
+
 // TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError verifies the
 // fail-safe: when the retention store cannot be read (so the protected-canonical
 // set cannot be built), orphan destruction is skipped entirely — nothing is

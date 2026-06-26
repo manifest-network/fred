@@ -396,6 +396,19 @@ var (
 		Help:      "Close-time refuse-to-retain events due to the max_retained_disk_mb cap",
 	})
 
+	// retentionEvictedTotal counts close-time per-tenant cap evictions: each time
+	// evictRetentionsToCap hard-deletes one of a CLOSING tenant's OWN oldest active
+	// retained leases to honor max_retained_leases_per_tenant. Incremented once per
+	// record actually evicted (active→reaping). DISTINCT from retentionRefusedTotal,
+	// which is the GLOBAL max_retained_disk_mb refuse-to-retain path — do not
+	// conflate the two. ENG-407.
+	retentionEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_evicted_total",
+		Help:      "Close-time per-tenant cap evictions (max_retained_leases_per_tenant); a tenant's own oldest retained lease destroyed to make room",
+	})
+
 	// diskPoolBytes is the admission ceiling (total_disk_mb in bytes). A
 	// denominator so dashboards don't hardcode the pool size.
 	diskPoolBytes = promauto.NewGauge(prometheus.GaugeOpts{
