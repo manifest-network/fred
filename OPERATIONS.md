@@ -135,8 +135,8 @@ exhaust physical disk (tenant ENOSPC).
 **Per-tenant fairness.** `max_retained_leases_per_tenant` is a **count** cap: it
 limits how many retained leases one tenant may hold, but not how much **disk** they
 occupy. Each close-time eviction it forces (a tenant's own oldest retained lease
-evicted from the active set — marked reaping, then reclaimed — to make room)
-increments `fred_docker_backend_retention_evicted_total`
+evicted from the active set (marked reaping) to make room) increments
+`fred_docker_backend_retention_evicted_total`
 — distinct from `..._retention_refused_total`, which is the global
 `max_retained_disk_mb` refuse-to-retain path; a rising evicted counter is the signal
 that tenants are silently losing restore grace to the count cap. Under
