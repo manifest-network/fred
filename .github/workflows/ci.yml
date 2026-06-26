@@ -73,7 +73,10 @@ jobs:
         # upstream fix, or a fix blocked by docker/compose v2 compatibility) are
         # tolerated. Replaces the previous blanket exit-3 suppression. See ENG-415.
         run: |
-          set -uo pipefail
+          # GitHub Actions runs this step with `bash -eo pipefail`; disable
+          # errexit so the expected govulncheck exit-3 (vulnerabilities found)
+          # is handled by the comparison below instead of aborting the step.
+          set +e
           allowlist=".github/govulncheck-allowlist.txt"
           report="$(mktemp)"
 
