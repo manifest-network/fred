@@ -16,6 +16,16 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 | HostAddress | `host_address` | string | *(required)* | External IP/hostname for port mappings. Must be a valid IP or hostname, not a URL |
 | HostBindIP | `host_bind_ip` | string | `"0.0.0.0"` | IP address to bind container ports to |
 | LogLevel | `log_level` | string | `"info"` | Log verbosity: `debug`, `info`, `warn`, `error`. Not set in `DefaultConfig()`; defaults to `"info"` at startup via `cmp.Or` |
+| ProductionMode | `production_mode` | bool | `false` | Tightens startup checks beyond basic validation. When true, `Validate` rejects dev-only insecure toggles — currently `callback_insecure_skip_verify`. Mirrors providerd's `production_mode` |
+
+### TLS & mTLS (ENG-103)
+
+| Field | YAML Key | Type | Default | Description |
+|---|---|---|---|---|
+| TLSCertFile | `tls_cert_file` | string | *(empty)* | Server certificate. When set together with `tls_key_file`, the listener serves HTTPS; otherwise plaintext HTTP (default). Loaded once at startup — rotation requires a restart (ENG-294) |
+| TLSKeyFile | `tls_key_file` | string | *(empty)* | Server private key. Must be set together with `tls_cert_file` |
+| TLSClientCAFile | `tls_client_ca_file` | string | *(empty)* | Enables mutual TLS: the listener requires and verifies a client certificate signed by this CA. Requires `tls_cert_file` + `tls_key_file` |
+| TLSClientAllowedNames | `tls_client_allowed_names` | []string | *(empty)* | Optionally pins the mTLS client identity — the presented cert's CommonName or a DNS SAN must be in this list. Empty accepts any cert signed by `tls_client_ca_file`. Requires `tls_client_ca_file` |
 
 ### Resources
 
@@ -90,6 +100,8 @@ When a provision fails (during provisioning, state recovery, or partial deprovis
 | RetentionOrphanConfirmations | `retention_orphan_confirmations` | int | `3` | Number of consecutive retention sweeps a soft-deleted record must be observed with **all** its retained volumes missing before the record is pruned (ENG-370). Catches records orphaned when their backing volumes vanish out-of-band (host/docker churn, `docker volume prune`, data-root reset) so they don't linger for the full grace window. Fail-safe: a sweep that cannot enumerate volumes, or finds the volume root absent/unreadable, skips rather than pruning. This is a **sweep count**, not a duration — the effective confirmation window is `N × retention_reap_interval` (≈3h at the 1h default). `0` disables orphan pruning entirely (kill-switch). |
 | MaxRetainedDiskMB | `max_retained_disk_mb` | int64 | `0` (unlimited) | Per-provider cap on the aggregate retained-volume disk footprint (MB) across all tenants. When retaining a closing lease would exceed this cap, the lease is destroyed immediately instead of retained (existing in-grace data is never evicted). `0` means no cap. Must be ≤ `total_disk_mb` when set. |
 
+> **Writable-path-only reclaim (ENG-406):** even with `retain_on_close: true`, a closing lease's volumes that hold only ephemeral `_wp/` writable-path scaffolding (no declared-`VOLUME` durable data) are **destroyed (reclaimed)** at close instead of retained — restore reseeds `_wp` from the image regardless, so retaining them preserves nothing restorable. The detector is conservative toward RETAIN (it never destroys a stateful volume). Counted by `fred_docker_backend_retention_writable_path_reclaimed_total`.
+
 > **Duration syntax:** `retention_max_age` and `retention_reap_interval` use Go duration syntax — valid units are `h`, `m`, `s` (e.g. `2160h` for 90 days, `336h` for 14 days). The units `d` (days) and `w` (weeks) are **not** valid and will fail config validation.
 
 ### Tenant Quotas
@@ -114,6 +126,8 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | ReconcileInterval | `reconcile_interval` | duration | `5m` | How often to reconcile state with Docker |
 | StartupVerifyDuration | `startup_verify_duration` | duration | `5s` | Grace period after start before verifying containers are still running |
 | ContainerStopTimeout | `container_stop_timeout` | duration | `30s` | Grace period before SIGKILL when stopping containers |
+| MigrationReadyTimeout | `migration_ready_timeout` | duration | `90s` | Caps how long a recover-time migration waits for the new stack-form container to reach `healthy` (or `running` when no health check is declared) before declaring the migration failed for that lease |
+| MigrationGracePeriod | `migration_grace_period` | duration | `1m` | How long the renamed `-prev` legacy container lingers after a successful recover-time migration before forced removal (preserves rollback potential) |
 
 ### Container Hardening
 
@@ -206,11 +220,12 @@ See [Manifest Guide](../../../docs/manifest-guide.md) for the full tenant-facing
 
 When `retain_on_close: true` is set, the backend performs a **soft-delete** instead of a hard destroy at lease close or auto-expire time:
 
-1. All managed volumes for the lease are **renamed** from `fred-<lease_uuid>-…` into a `fred-retained-<lease_uuid>-…` namespace and kept on disk.
-2. The original containers and resource-pool allocations are still released (the running workload is stopped; resources are freed for new leases).
-3. Fred publishes a `retained` status event to any connected tenant WebSocket so the tenant knows their data may be recoverable.
-4. Retained volumes are held for up to `retention_max_age` (default 90 days). The grace reaper runs every `retention_reap_interval` (default 1h) and destroys expired retained volumes.
-5. If a retained lease's backing volumes disappear **out-of-band** (host/docker churn, `docker volume prune`, a data-root reset on redeploy) while its record survives, the periodic sweep prunes the now-orphaned record after it is observed fully volume-less for `retention_orphan_confirmations` consecutive sweeps (default 3). This keeps dead records from accumulating for the full grace window. The prune is fail-safe — a sweep that errors listing volumes, or finds the volume root absent/unreadable, skips entirely rather than risk pruning a record whose volumes are merely transiently unavailable. Observable via `fred_docker_backend_retention_orphans_pruned_total` and `fred_docker_backend_retention_orphan_skips_total{reason}`.
+1. Canonical volumes that are **writable-path-only** — they hold only the ephemeral `_wp/` scaffolding (a read-only-rootfs writable-path mount) and no declared-`VOLUME` durable data — are **destroyed (reclaimed)**, not retained. Restore reseeds `_wp` from the image anyway (the ENG-367 wipe-contract), so retaining such a volume preserves nothing restorable and only pollutes the retention record, a per-tenant slot, the retained-disk budget, and the volume root. The detector (`isWritablePathOnly`) is conservative toward RETAIN — it destroys only *provably* `_wp`-only volumes, never a stateful one (ENG-406). Observable via `fred_docker_backend_retention_writable_path_reclaimed_total`.
+2. The remaining managed volumes for the lease are **renamed** from `fred-<lease_uuid>-…` into a `fred-retained-<lease_uuid>-…` namespace and kept on disk.
+3. The original containers and resource-pool allocations are still released (the running workload is stopped; resources are freed for new leases).
+4. Fred publishes a `retained` status event to any connected tenant WebSocket so the tenant knows their data may be recoverable.
+5. Retained volumes are held for up to `retention_max_age` (default 90 days). The grace reaper runs every `retention_reap_interval` (default 1h) and destroys expired retained volumes.
+6. If a retained lease's backing volumes disappear **out-of-band** (host/docker churn, `docker volume prune`, a data-root reset on redeploy) while its record survives, the periodic sweep prunes the now-orphaned record after it is observed fully volume-less for `retention_orphan_confirmations` consecutive sweeps (default 3). This keeps dead records from accumulating for the full grace window. The prune is fail-safe — a sweep that errors listing volumes, or finds the volume root absent/unreadable, skips entirely rather than risk pruning a record whose volumes are merely transiently unavailable. Observable via `fred_docker_backend_retention_orphans_pruned_total` and `fred_docker_backend_retention_orphan_skips_total{reason}`.
 
 ### Restore flow
 
@@ -234,7 +249,9 @@ Restore-specific re-deploy behavior worth knowing:
 
 ### Failure handling & crash recovery
 
-Restore is crash-safe and self-healing. A retention record carries one of two persisted statuses — `active` (awaiting restore or reap) and `restoring` (a restore is in flight) — and the adopt rename is the only on-disk mutation:
+Restore is crash-safe and self-healing. A retention record carries one of three persisted statuses — `active` (awaiting restore or reap), `restoring` (a restore is in flight), and `reaping` (volumes are pending physical destruction) — and the adopt rename is the only on-disk mutation:
+
+The `reaping` status is a finalizer tombstone (ENG-376): when a retained record is reaped (grace-expired, cap-evicted, or abandoned by a deprovision give-up) the record is **not** deleted at the active→reaping transition — it outlives its volumes and is `Delete`d only once every volume is confirmed destroyed. The bytes still sit on disk, so a reaping record keeps counting against the retained footprint while it is no longer restore-claimable. A record that cannot be reclaimed sticks in `reaping` (observable via the `fred_docker_backend_retention_reaping_leases` / `fred_docker_backend_retention_reaping_bytes` gauges); a failed destroy / give-up / uncommitted revert also bumps `fred_docker_backend_retention_leaked_total`.
 
 - **Restore failure (or worker panic)**: the new lease's compose project is torn down, the adopted volumes are **re-quarantined** back into the `fred-retained-` namespace, pool allocations are released, and the record is reverted `restoring → active`. The original data is preserved and the lease can be restored again. The new lease settles as a `Failed` lease (a failure callback is still emitted), exactly like a failed restart/update.
 - **Crash mid-restore**: on the next startup (and on every periodic sweep) the backend reconciles dangling `restoring` records — finalizing those that completed and rolling back (re-quarantining) those that did not, before the orphan-volume reaper runs. A record is written before the rename, so a crash in the narrow window between the two is repaired by re-quarantine rather than data loss.
@@ -636,7 +653,7 @@ Returns a single provision record. This is the primary endpoint for retrieving f
 
 ### `GET /provisions` (authenticated)
 
-Returns all provision records.
+Returns provision records. `GET /provisions` is keyset-paginated. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. An invalid `limit` or a non-UUID `continue` returns 400, as does a `continue` cursor supplied without a positive `limit`. A `limit` above the server maximum (5000) is coerced down to it rather than rejected. With no params it returns the full list unpaginated (back-compat). One or more `lease_uuid` query params return just those records. (ENG-380)
 
 **Response (`200`):**
 
@@ -658,9 +675,38 @@ Returns all provision records.
       "fail_count": 3,
       "last_error": "container exited unexpectedly: exit_code=137, oom_killed=true; logs:\nKilled"
     }
-  ]
+  ],
+  "continue": "def-456"
 }
 ```
+
+The `continue` field is present only on a full page with more records remaining; it is omitted once the list is exhausted.
+
+### `POST /restart` (authenticated)
+
+Restarts a lease's containers in place (same image, same configuration). Async — the result is delivered via callback. Returns `202` (`{"status": "restarting"}`), `404` if not provisioned, `409` for an invalid state.
+
+### `POST /update` (authenticated)
+
+Re-deploys a lease with a new manifest (image/config change). The `payload` field carries the new base64-encoded manifest. Async — result via callback. On failure the previous manifest is rolled back. Returns `202` (`{"status": "updating"}`), `400` (validation), `404`, `409`.
+
+### `POST /restore` (authenticated)
+
+Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease) and `callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`); `422` when no retained data exists, `409` for invalid state / already provisioned, `400` (validation), `503` (insufficient resources). See [Soft-delete & Restore](#soft-delete--restore).
+
+### `GET /retentions` (authenticated)
+
+Lists this backend's retained (soft-deleted) leases. Used by the reconciler to route restores to the node physically holding each lease's retained volumes (ENG-333).
+
+**Response (`200`):** `{"retentions": [ ... ]}` (serialized as `[]` when empty).
+
+### `GET /releases/{lease_uuid}` (authenticated)
+
+Returns the persisted release (deployment) history for a lease, retained for `releases_max_age` (default 90 days).
+
+### `POST /reconcile_custom_domain` (authenticated)
+
+Reconciles a lease's custom-domain ingress labels to match the supplied items. Body carries `lease_uuid` and `items`. Returns `204 No Content`; `404` if not provisioned, `409` for an invalid state.
 
 ### `GET /health` (unauthenticated)
 

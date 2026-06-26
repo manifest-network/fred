@@ -169,7 +169,8 @@ callback_secret: ""
 callback_db_path: "callbacks.db"
 
 # Maximum age of persisted callback entries. Entries older than this are
-# removed during startup replay. Default: 24h.
+# removed by background cleanup (an initial sweep runs at startup, then
+# periodically). Default: 24h.
 callback_max_age: 24h
 
 # =============================================================================
@@ -231,6 +232,14 @@ releases_max_age: 2160h
 # How often the grace reaper runs to destroy expired retained volumes.
 # Default: 1h.
 # retention_reap_interval: 1h
+
+# Number of consecutive retention sweeps a soft-deleted record must be observed
+# with ALL its retained volumes missing before the record is pruned (ENG-370).
+# This is a sweep COUNT, not a duration: the effective confirmation window is
+# N × retention_reap_interval (~3h at the default 1h interval), so shortening
+# retention_reap_interval proportionally shrinks the window. 0 disables orphan
+# pruning entirely (kill-switch); negative values are rejected. Default: 3.
+# retention_orphan_confirmations: 3
 
 # Maximum number of retained leases kept per tenant. When the cap is reached,
 # the tenant's oldest retained lease is eagerly reaped to make room.

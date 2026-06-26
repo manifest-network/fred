@@ -23,7 +23,7 @@ In this deployment topology, the fred ↔ backend channel is **plain HTTP (no TL
 
 ## 3. ENG-191's role on the call leg
 
-ENG-191 binds HTTP method and request URI into the canonical string to prevent **cross-endpoint replay**: a captured `POST /provision` signature must not verify when replayed against `POST /deprovision`, `POST /restart`, `POST /update`, or any other endpoint. Nine endpoints share one HMAC secret (`callback_secret`). Without method/URI binding, an in-zone observer can flip lease state by replaying a captured legitimate signature against a different endpoint — exploitable, given the plain-HTTP posture in (2).
+ENG-191 binds HTTP method and request URI into the canonical string to prevent **cross-endpoint replay**: a captured `POST /provision` signature must not verify when replayed against `POST /deprovision`, `POST /restart`, `POST /update`, or any other endpoint. All of the backend's contract endpoints share one HMAC secret (`callback_secret`). Without method/URI binding, an in-zone observer can flip lease state by replaying a captured legitimate signature against a different endpoint — exploitable, given the plain-HTTP posture in (2).
 
 ENG-191 is doing real work. Do not propose reverting it as a "simpler" fix for the ENG-198 symptom; the cost of reverting is reopening a materially exploitable cross-endpoint replay.
 

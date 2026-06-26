@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/manifest-network/fred/docs/manifest-schema.json",
+  "$id": "https://raw.githubusercontent.com/manifest-network/fred/main/docs/manifest-schema.json",
   "title": "Fred Deployment Manifest",
   "description": "Schema for Fred deployment manifests. Supports two formats: a single-service DockerManifest (DEPRECATED — auto-wrapped at the wire boundary into a 1-service stack named \"app\") or a multi-service StackManifest (PREFERRED). For POST /v1/leases/{uuid}/data the raw HTTP body is the manifest JSON. For POST /v1/leases/{uuid}/update the manifest is base64-encoded inside a JSON wrapper ({\"payload\": \"<base64>\"}); this schema describes the decoded manifest, not the wrapper.",
   "oneOf": [
@@ -136,6 +136,7 @@
     },
     "DockerManifestSingle": {
       "description": "DEPRECATED — single-service manifest. Identical to DockerManifestBase but non-empty depends_on is forbidden (Go: len(m.DependsOn) > 0 is rejected when inStack=false; empty map is allowed). Auto-wrapped at the wire boundary into a 1-service StackManifest under the synthetic service name \"app\"; tenants are encouraged to migrate to StackManifest directly. Will be removed in a future major release.",
+      "$comment": "This schema cannot validate manifest-service ↔ lease-item matching. Pick the format from your lease shape (see docs/manifest-guide.md → 'Pick the format from your lease shape'): a flat single-service manifest is always wrapped under the synthetic name \"app\", so it only matches a lease whose single item is named \"app\" or is unnamed (service_name: \"\"). For any other named lease item, send a StackManifest whose services keys match the item names.",
       "$ref": "#/$defs/DockerManifestBase",
       "not": {
         "properties": {
@@ -271,6 +272,7 @@
     },
     "StopGracePeriod": {
       "description": "Duration bounded to 1s–120s. Integer nanoseconds are range-checked exactly. For strings, integer seconds (1s–120s), milliseconds (1000ms–120000ms), and minutes (1m–2m) are enforced by the schema. Fractional and compound forms (e.g., \"1.5s\", \"1m30s\") pass the schema and are range-validated at runtime.",
+      "$comment": "When stop_grace_period is omitted from the manifest, the backend applies Docker's default of 10s (see docs/manifest-guide.md → stop_grace_period).",
       "oneOf": [
         {
           "type": "string",

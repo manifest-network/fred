@@ -227,7 +227,7 @@ The full transition matrix lives in [internal/backend/docker/README.md](internal
 4. Event Bridge publishes to Watermill topic
 5. HandleLeaseCreated:
    a. Check if lease already in-flight (idempotency)
-   b. Route to backend by SKU (round-robin if multiple backends match)
+   b. Route to backend by SKU (least-loaded matching backend if several match)
    c. Call backend POST /provision with callback URL
    d. Track as in-flight, record placement (lease→backend)
 6. Backend provisions resource asynchronously
@@ -371,7 +371,7 @@ The startup order is critical to avoid race conditions:
 
 ### Router Design
 
-The backend router matches leases to backends by exact SKU UUID. When multiple backends share the same SKU list, `RouteRoundRobin` distributes new provisions across them using an atomic counter. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
+The backend router matches leases to backends by exact SKU UUID. When multiple backends share the same SKU list, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
 
 ```go
 type Router struct {
@@ -381,17 +381,19 @@ type Router struct {
     counter        atomic.Uint64  // round-robin counter
 }
 
-func (r *Router) Route(sku string) Backend       // first match (deterministic)
-func (r *Router) RouteAll(sku string) []Backend   // all matching backends
-func (r *Router) RouteRoundRobin(sku string) Backend // round-robin across matches
+func (r *Router) Route(sku string) Backend                 // first match (deterministic)
+func (r *Router) RouteAll(sku string) []Backend             // all matching backends
+func (r *Router) RouteForProvision(ctx, sku, inFlight) Backend // least-loaded across matches
+func (r *Router) RouteRoundRobin(sku string) Backend       // round-robin across matches
 ```
 
 **Routing strategies:**
 - `Route` — returns the first matching backend (used for deprovision fallback and read-path when no placement exists)
-- `RouteRoundRobin` — distributes across all matching backends (used for new provisions)
+- `RouteForProvision` — routes a new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats
+- `RouteRoundRobin` — distributes across all matching backends via an atomic counter (the tie-break and no-stats fallback for `RouteForProvision`)
 - **Placement lookup** — maps `lease_uuid → backend_name` for read-path routing (connection, logs, diagnostics)
 
-When a single backend matches a SKU, all three strategies behave identically.
+When a single backend matches a SKU, all strategies behave identically.
 
 ### Circuit Breaker
 
@@ -525,9 +527,9 @@ The SM/actor machinery (`internal/backend/shared/leasesm`) is **shared across ba
 ### Placement Store
 
 Tracks which backend serves each lease (bbolt + in-memory cache):
-- Written when provisioning starts (after `RouteRoundRobin` picks a backend)
+- Written when provisioning starts (after `RouteForProvision` picks a backend)
 - Read on every tenant API call (connection, logs, diagnostics) to route to the correct backend
-- Deleted on deprovision or lease closure
+- Deleted only by the reconciler (`cleanupOrphanedPlacements`, ENG-333); survives lease close so a later restore can route to the source node. Deleted eagerly only when a never-provisioned `PENDING` lease is rejected (no retention to protect)
 - Rebuilt on startup: the reconciler calls `SetBatch` with placements from all backends' `ListProvisions`
 - Optional — only needed when multiple backends share the same SKU list
 
@@ -596,6 +598,8 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_backend_circuit_breaker_state` | gauge | `backend` | Circuit breaker state (0=closed, 1=half-open, 2=open) |
 | `fred_backend_healthy` | gauge | `backend` | Backend health (1=healthy, 0=unhealthy) |
 | `fred_backend_insufficient_resources_total` | counter | `backend` | Capacity 503s |
+| `fred_backend_allocated_cpu_ratio` | gauge | `backend` | Allocated-CPU ratio observed by the router at provision time (allocated/total). Per-backend router-decision signal, event-sampled on multi-candidate routing; not intended for cross-backend aggregation — use the backends' own `/stats` component gauges for fleet views (ENG-318) |
+| `fred_backend_routing_fallback_total` | counter | — | Provision-routing decisions that fell back to round-robin (no usable backend load stats) |
 
 **Chain:**
 
@@ -652,7 +656,6 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_active_provisions` | gauge | — | Active provisions |
 | `fred_docker_backend_provision_duration_seconds` | histogram | — | End-to-end provision time |
 | `fred_docker_backend_image_pull_duration_seconds` | histogram | — | Image pull duration |
-| `fred_docker_backend_container_create_duration_seconds` | histogram | — | Container create duration |
 | `fred_docker_backend_restore_duration_seconds` | histogram | — | Restore re-deploy worker duration (success only); measures the async re-deploy and excludes the synchronous adopt prelude (tracked separately under `replace_phase_duration_seconds{phase=adopt}`). Buckets mirror `provision_duration_seconds` for an indicative restore-vs-fresh-provision overlay (provision is success+failure, restore success-only) |
 | `fred_docker_backend_restore_total` | counter | `outcome` | Restore re-deploy worker attempts by `outcome` ∈ `success`/`failure`. Unlike the success-only `restore_duration_seconds`, it also counts the failure path (`rollbackRestoreAdoption`, panics included), so a docker-backend restore success rate is computable. Worker-scoped like `restore_duration_seconds` and `provisions_total`: a restore that fails in the synchronous adopt prelude (claim/rename/route/ack) before the worker spawns surfaces as the synchronous `Restore()` error and is counted by neither outcome here |
 | `fred_docker_backend_replace_phase_duration_seconds` | histogram | `operation, phase` | Per-phase duration of the shared replace machinery. `operation` ∈ `restart`/`update`/`restore`; `phase` ∈ `adopt` (restore-only volume rename), `image_setup`, `volume_setup` (incl. VOLUME-subdir chown), `compose_up`, `verify_startup` |
@@ -670,6 +673,13 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_retention_evicted_total` | counter | — | Close-time per-tenant cap evictions (max_retained_leases_per_tenant); a tenant's oldest retained lease evicted from the active set (marked reaping) to make room |
 | `fred_docker_backend_disk_pool_bytes` | gauge | — | Total disk admission pool (total_disk_mb) in bytes |
 | `fred_docker_backend_retained_disk_cap_bytes` | gauge | — | Per-provider retained-volume cap (max_retained_disk_mb) in bytes; 0 when unset |
+| `fred_docker_backend_retention_reaping_bytes` | gauge | — | Reserved disk footprint of reaping (pending-destroy) retained records, in bytes |
+| `fred_docker_backend_retention_reaping_leases` | gauge | — | Number of retained records stuck in the reaping (pending-destroy) state |
+| `fred_docker_backend_retention_leaked_total` | counter | — | Retained-volume leak events (failed destroy / give-up / uncommitted revert) — see ENG-376 |
+| `fred_docker_backend_retention_orphans_pruned_total` | counter | — | Total retention records pruned due to confirmed-absent backing volumes |
+| `fred_docker_backend_retention_orphan_skips_total` | counter | `reason` | Orphan-reconcile skips by reason (sweep-level bailouts + per-record raced prune attempts). `reason` ∈ `list_error`, `root_unverifiable`, `raced`, `disabled`, `store_error` |
+| `fred_docker_backend_retention_writable_path_reclaimed_total` | counter | — | Total writable-path-only volumes destroyed (reclaimed) at close instead of retained |
+| `fred_docker_backend_retention_index_reindex_total` | counter | `trigger` | Count of retention in-memory index (re)builds, by trigger (`open`\|`manual`) |
 
 **Callbacks:**
 
@@ -698,7 +708,6 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_lease_actor_panics_total` | counter | — | Panics recovered in actor handlers — any non-zero is a bug |
 | `fred_docker_backend_lease_terminal_event_dropped_total` | counter | `event` | Terminal SM events `sendTerminal` refused to deliver (actor exited, mid-exit, or inbox wedged). Sustained non-zero under clean shutdown indicates a real data-loss pattern |
 | `fred_docker_backend_die_event_dropped_total` | counter | `source` | Container-death signals `routeToLease` could not deliver (`event_loop`, `reconcile`). Reconciler re-detects on next cycle, so this is not data loss but flags a wedged actor or chronic burst |
-| `fred_docker_backend_lease_failing_race_skipped_total` | counter | — | `onEnterFailing` bails due to concurrent Restart/Update |
 | `fred_docker_backend_lease_worker_panics_total` | counter | `worker_type` | Panics in lease worker goroutines (provision/replace/diag) — any non-zero is a latent bug |
 
 ### Logging (slog)

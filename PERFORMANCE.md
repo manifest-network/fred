@@ -158,7 +158,7 @@ go test -bench=BenchmarkWatermill ./internal/provisioner/
 
 ```bash
 # Benchmark payload storage (bbolt)
-go test -bench=. ./internal/provisioner/payload/ -run=^$ -bench=PayloadStore
+go test -bench=BenchmarkStore ./internal/provisioner/payload/ -run=^$
 ```
 
 ## Benchmark Files

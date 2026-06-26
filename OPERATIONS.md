@@ -94,7 +94,7 @@ When SKU resource pools are full, provision requests get HTTP 503 with `insuffic
 - Active leases stay in `provisioning` state
 
 **Options:**
-1. **Add capacity**: spin up another docker-backend on a different host with the same `skus`. Fred round-robins new provisions across them automatically (requires `placement_store_db_path`).
+1. **Add capacity**: spin up another docker-backend on a different host with the same `skus`. Fred routes each new provision to the least-loaded matching backend — the one reporting the lowest allocated-CPU ratio from its `/stats` endpoint — so a fresh, empty host preferentially absorbs new provisions (requires `placement_store_db_path`).
 2. **Tighten SKU profiles**: smaller CPU/memory/disk per SKU lets more leases fit.
 3. **Tenant quotas**: if one tenant is hogging resources, set `tenant_quota` in `docker-backend.yaml` to cap them.
 4. **Force reconciliation**: orphan provisions (lease closed but containers still running) consume budget. The reconciler removes them on its cycle, but you can restart the backend to force an immediate cleanup.
@@ -201,7 +201,7 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 |---|---|---|
 | `token_tracker_db_path` | Replay protection for tenant tokens | Brief replay window after restart; tokens are 30s anyway |
 | `payload_store_db_path` | Tenant deployment payloads awaiting provisioning | Tenants must re-upload pending payloads |
-| `placement_store_db_path` | lease→backend mapping for round-robin reads | Read-path misroutes until reconciler rebuilds (next cycle) |
+| `placement_store_db_path` | lease→backend mapping for multi-backend read routing | Read-path misroutes until reconciler rebuilds (next cycle) |
 | `<docker>/callbacks.db` | Pending callbacks (delivery retry) | Some callbacks may not be redelivered after restart |
 | `<docker>/diagnostics.db` | Failure diagnostics (last_error, logs) | Older `failed` leases lose diagnostics; new failures still recorded |
 | `<docker>/releases.db` | Per-lease deployment history | Release history lost; provisioning still works |
@@ -230,6 +230,16 @@ Never run two `providerd` or `docker-backend` instances against the same bbolt f
 **To diagnose a failed update:**
 1. `GET /v1/leases/{uuid}/releases` — the failed release will have `status: "failed"` and an `error` field.
 2. `GET /v1/leases/{uuid}/logs` — old containers' logs are gone after rollback; the diagnostics store retains the failure logs for 7 days.
+
+### Restore operations
+
+`POST /v1/leases/{lease_uuid}/restore` (on providerd; `POST /restore` on the docker-backend) re-deploys a lease onto its **retained** (soft-deleted) volumes — the v0.5.0 headline feature. It runs through the same replace machinery as restart/update, so the rollback semantics above apply, with one extra synchronous *adopt prelude* up front that renames the `fred-retained-*` volumes back to their canonical names before the worker spawns.
+
+**Success-rate signal.** `fred_docker_backend_restore_total{outcome}` (`outcome ∈ {success, failure}`) is the docker-backend's own restore success rate, mirroring `provisions_total`. Both outcome series are pre-initialized to 0, so a failure ratio reads 0 (not no-data) before the first restore. **Worker-scoped caveat:** a restore that fails in the synchronous adopt prelude (claim/rename/route/ack) before the worker spawns returns a synchronous error to the caller and is counted by **neither** outcome bucket — exactly as `provisions_total` omits synchronous provision failures. Such failures surface to the tenant as the restore HTTP status; providerd's `fred_provisioner_provisioning_total{operation="restore"}` counts the async callback/timeout outcomes, not these synchronous backend errors, so it does not backfill the gap.
+
+**Latency.** `fred_docker_backend_restore_duration_seconds` measures the async re-deploy worker span (compose up + verify startup, success only) and **excludes** the synchronous adopt prelude. Its buckets mirror `provision_duration_seconds` so the two can be overlaid for the restore-vs-fresh-provision question — but the overlay is approximate: `provision_duration_seconds` is observed on both success and failure and carries no outcome label, so the comparison is robust at the median but tail-biased. Read it as indicative.
+
+**Slow-phase diagnosis.** `fred_docker_backend_replace_phase_duration_seconds{operation="restore",phase}` breaks the re-deploy into per-phase timings (`adopt`, `image_setup`, `volume_setup`, `compose_up`, `verify_startup`). When a restore is slow, query this to see which phase dominates — `adopt` (volume rename), `compose_up`, or `verify_startup` are the usual suspects.
 
 ---
 

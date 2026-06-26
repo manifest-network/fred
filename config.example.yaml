@@ -559,7 +559,10 @@ gas_adjustment: 1.2
 # max_gas_limit: 5000000
 
 # Gas price in micro-units of the fee denomination per gas unit.
-# Total fee = ceil(gas_limit * gas_price / 1_000_000). Higher prices = faster inclusion.
+# Total fee = ceil(signed_gas * gas_price / 1_000_000) where signed_gas =
+# floor(gas_limit * gas_adjustment) (see gas_limit/gas_adjustment above). With
+# the default gas_adjustment of 1.2 the fee is ~20% above the unadjusted
+# gas_limit. Higher prices = faster inclusion.
 gas_price: 25
 
 # Fee denomination for transaction fees.

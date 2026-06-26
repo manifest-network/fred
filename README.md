@@ -5,7 +5,7 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 ## Features
 
 - **Lease Lifecycle Management**: Watches chain events and orchestrates provisioning through backends
-- **Multi-Backend Support**: Route leases to different backends based on exact SKU UUID list, with round-robin distribution across backends sharing the same match criteria
+- **Multi-Backend Support**: Route leases to different backends based on exact SKU UUID list, distributing new provisions to the least-loaded matching backend (lowest allocated-CPU ratio)
 - **Event-Driven Architecture**: Uses Watermill for internal event routing with retries and middleware
 - **Tenant Authentication API**: HTTP/HTTPS API with ADR-036 signature verification for tenant access
 - **Periodic Withdrawals**: Configurable scheduled withdrawal of accumulated fees from active leases
@@ -47,7 +47,7 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 |                           +------------------+                    |
 |                           | Backend Router   |                    |
 |                           | (SKU routing +   |                    |
-|                           |  round-robin)    |                    |
+|                           |  least-loaded)   |                    |
 |                           +------------------+                    |
 |                                   |                               |
 +------------------------------------------------------------------+
@@ -167,7 +167,7 @@ All required fields are validated at startup. The daemon will fail to start with
 | `provider_address` | Provider management address |
 | `keyring_dir` | Directory containing keyring |
 | `key_name` | Key name for signing transactions |
-| `backends` | At least one backend must be configured (multiple backends may share `skus` for round-robin) |
+| `backends` | At least one backend must be configured (multiple backends may share `skus` for load-based routing) |
 | `callback_base_url` | URL where backends send callbacks (must be absolute http/https URL) |
 | `callback_secret` | Shared secret for HMAC callback authentication (minimum 32 characters) |
 
@@ -175,12 +175,12 @@ All required fields are validated at startup. The daemon will fail to start with
 
 Backends are services that handle the actual resource provisioning. Each backend URL must be an absolute URL with `http://` or `https://` scheme.
 
-Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, provisions are distributed across them using round-robin.
+Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
 
 ```yaml
 backends:
   # Give every backend the same skus list so they all match,
-  # then round-robin distributes evenly across them.
+  # then Fred routes each provision to the least-loaded one.
   - name: docker-1
     url: "http://10.0.0.1:9000"
     skus:
@@ -197,7 +197,7 @@ backends:
 callback_base_url: "http://fred.provider.example.com:8080"
 callback_secret: "your-32-character-or-longer-secret-here"
 
-# Required for round-robin setups (multiple backends sharing match criteria).
+# Required for multi-backend setups (multiple backends sharing match criteria).
 # Records which backend serves each lease so reads hit the right machine.
 # placement_store_db_path: "/var/lib/fred/placements.db"
 ```
@@ -254,7 +254,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
-| `placement_store_db_path` | Path to bbolt database for lease→backend placement tracking (required for round-robin) | (optional) |
+| `placement_store_db_path` | Path to bbolt database for lease→backend placement tracking (required for multi-backend routing) | (optional) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 > **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
@@ -915,6 +915,8 @@ Get container logs for a specific lease.
 
 List all provisions (for reconciliation).
 
+`GET /provisions` is keyset-paginated. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. An invalid `limit` or a non-UUID `continue` returns 400, as does a `continue` cursor supplied without a positive `limit`. A `limit` above the server maximum (5000) is coerced down to it rather than rejected. With no params it returns the full list unpaginated (back-compat). One or more `lease_uuid` query params return just those records. (ENG-380)
+
 **Response:**
 ```json
 {
@@ -924,7 +926,8 @@ List all provisions (for reconciliation).
       "status": "ready",
       "created_at": "2024-01-15T10:30:00Z"
     }
-  ]
+  ],
+  "continue": "..."
 }
 ```
 
@@ -1205,6 +1208,8 @@ cmd/
 ├── providerd/          # Main daemon entry point
 ├── mock-backend/       # Mock backend for testing
 ├── docker-backend/     # Docker container backend
+├── k3s-backend/        # K3s container backend
+├── lease-token/        # Mints ADR-036 tenant bearer tokens for lease endpoints
 └── loadtest/           # Load testing tool (not built by `make all`; `go build ./cmd/loadtest`)
 
 internal/
@@ -1217,7 +1222,8 @@ internal/
 │   ├── router.go       # SKU-based routing
 │   ├── mock.go         # In-memory mock for unit tests
 │   ├── shared/         # Cross-backend primitives (callback sender, bbolt store, registry, diagnostics)
-│   └── docker/         # Docker container backend implementation (actor-per-lease)
+│   ├── docker/         # Docker container backend implementation (actor-per-lease)
+│   └── k3s/            # K3s container backend implementation
 ├── chain/              # gRPC client, WebSocket subscriber, signer
 │   └── chaintest/      # Test-only mock chain client (not imported by providerd)
 ├── config/             # Configuration loading and validation
@@ -1240,6 +1246,7 @@ internal/
 │   └── interfaces.go   # BackendRouter, LeaseRejecter, PlacementStore interfaces
 ├── scheduler/          # Periodic withdrawal and credit monitoring
 ├── testutil/           # Test fixtures and helpers
+├── tlsconfig/          # TLS config builders for the providerd<->backend hop (mTLS, identity pinning)
 ├── util/               # Shared utility functions
 └── watcher/            # Cross-provider event detection
 ```

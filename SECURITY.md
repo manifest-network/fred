@@ -80,7 +80,7 @@ Go backends in this repository can import `internal/hmacauth` and call `hmacauth
 
 ### Backend Authentication (HMAC-SHA256)
 
-Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all contract endpoints: `POST /provision`, `POST /deprovision`, `POST /restart`, `POST /update`, `POST /reconcile_custom_domain`, `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated.
+Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all contract endpoints: `POST /provision`, `POST /deprovision`, `POST /restart`, `POST /update`, `POST /restore`, `POST /reconcile_custom_domain`, `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /retentions`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated.
 
 **Implementation:** `cmd/docker-backend/main.go` (auth middleware), `internal/hmacauth/`
 
@@ -108,6 +108,7 @@ Used tokens are tracked in a persistent bbolt database keyed by the normalized s
 | `GET /connection` | Yes | Returns sensitive connection details |
 | `POST /restart` | Yes | Mutating — replaying would restart containers |
 | `POST /update` | Yes | Mutating — replaying would redeploy |
+| `POST /restore` | Yes | Mutating — replaying would re-trigger a restore |
 | `GET /status` | No | Idempotent read |
 | `GET /provision` | No | Idempotent read |
 | `GET /logs` | No | Idempotent read |
