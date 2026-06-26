@@ -320,7 +320,7 @@ A minimal Traefik setup is outside this doc's scope; the `manifest-deploy` repo 
 
 ---
 
-## Multi-host setup with round-robin
+## Multi-host setup with load-based routing
 
 To distribute new provisions across multiple Docker hosts:
 
@@ -342,7 +342,7 @@ backends:
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
-Identical `skus` lists on `docker-1` and `docker-2` make them a round-robin pool. `placement_store_db_path` is **required** so that read operations (connection details, logs) hit the backend that actually holds each lease.
+Identical `skus` lists on `docker-1` and `docker-2` make them a matching pool for those SKUs. Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. `placement_store_db_path` is **required** so that read operations (connection details, logs) hit the backend that actually holds each lease.
 
 To add a host: spin up another `docker-backend` with the same `skus` list, add it to `config.yaml`, and reload `providerd`. New provisions immediately distribute across the new host. To drain: remove its entry from `skus` (so it no longer receives new provisions) and let existing leases close naturally, or migrate them by deprovisioning + reprovisioning on the chain side.
 
@@ -370,7 +370,7 @@ Backups must be taken with the daemon stopped (bbolt's file lock will refuse con
 
 Fred releases are tagged on GitHub with binaries via `goreleaser`. The release process is:
 
-1. Tag a release on GitHub. CI builds binaries and Docker images.
+1. Tag a release on GitHub. `goreleaser` publishes the `providerd` and `docker-backend` binary archives plus a single Docker image — `ghcr.io/manifest-network/fred` — which contains **only** `providerd`. There is no published `docker-backend` (or `k3s-backend`) image; run the `docker-backend` binary from its archive, or build its image locally (see [Docker images](#docker-images)).
 2. Pull the new binary or image to your hosts.
 3. Restart `providerd` and each `docker-backend`. Order does not matter — the HMAC handshake is symmetric.
 
@@ -381,6 +381,8 @@ Schema migrations: the bbolt files carry no explicit schema version, and Fred do
 ---
 
 ## Docker images
+
+`goreleaser` publishes only the `providerd` image (`ghcr.io/manifest-network/fred`, built from `Dockerfile.goreleaser`). The `docker-backend` and `k3s-backend` images are **not** published — build them locally from the multi-stage `Dockerfile` below, or run `docker-backend` directly from its released binary archive.
 
 The repo ships a multi-stage `Dockerfile` with three named targets:
 

@@ -175,7 +175,7 @@ Port map keys must be in `"port/protocol"` format:
 
 > **Note:** The Go runtime normalizes protocol case (e.g., `"80/TCP"` is accepted), but the canonical form is lowercase. Always use lowercase `tcp` or `udp` in manifests.
 
-Host port (`host_port`) must be 0–65535. A value of 0 (or omitted) means Docker auto-assigns. Use `GET /info/{lease_uuid}` after provisioning to discover assigned host ports.
+Host port (`host_port`) must be 0–65535. A value of 0 (or omitted) means Docker auto-assigns. Use `GET /v1/leases/{lease_uuid}/connection` after provisioning to discover assigned host ports.
 
 ### Environment Variables
 

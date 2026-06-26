@@ -30,7 +30,8 @@ For an end-to-end local environment against a running chain:
 
 ```bash
 bash scripts/dev-init.sh    # registers a provider + SKUs, generates configs, writes a callback secret
-./build/providerd --config config.yaml
+./build/docker-backend --config docker-backend.yaml
+./build/providerd --config config.docker.yaml
 ```
 
 `scripts/dev-init.sh` is parameterized via environment variables (see the script header). All defaults assume a local chain at `http://localhost:26657` with the `acc0` test key.

@@ -73,8 +73,8 @@ restored into a fresh lease, instead of being destroyed on close.
   disables reaping), `retention_reap_interval` (reaper cadence, default `1h`),
   and `max_retained_leases_per_tenant` (per-tenant cap, default `0` = unlimited).
   (ENG-325, #114)
-- **Queryable retention status.** `GET /v1/leases/{uuid}` and the status
-  endpoint now report `provision_status: retained` for soft-deleted leases, with
+- **Queryable retention status.** `GET /v1/leases/{uuid}/status` now reports
+  `provision_status: retained` for soft-deleted leases, with
   `retained_until` (RFC3339 grace deadline), `items` (the restore shape: service
   name / SKU / quantity), and a `restore_hint`. The status is served from the
   durable retention record even after the chain prunes the closed lease, under

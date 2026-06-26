@@ -54,20 +54,20 @@ backends:
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
     default: true
 
-  # Round-robin: same skus as docker-1, provisions distributed 50/50
+  # Same skus as docker-1 — new provisions are load-balanced across both
   - name: docker-2
     url: "http://docker-backend-2:9001"
     skus:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
-# Required for round-robin — tracks which backend serves each lease
+# Required when multiple backends share SKUs — tracks which backend serves each lease
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
 Fred does NOT interpret the SKU — it only uses exact UUID matching to decide which backend receives the request.
 
-**Round-robin:** Multiple backends can share the same `skus` list. When this happens, Fred distributes new provisions across them using round-robin and records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. This requires `placement_store_db_path` to be configured.
+**Load-balanced placement:** Multiple backends can share the same `skus` list. When this happens, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. Fred records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. This requires `placement_store_db_path` to be configured.
 
 ### Level 2: Backend Interprets Full SKU
 
@@ -219,7 +219,7 @@ Release resources for a lease. **Must be idempotent** - calling multiple times s
 
 ### GET /provisions
 
-List all currently provisioned resources. Used by Fred for reconciliation.
+List currently provisioned resources. Used by Fred for reconciliation. Keyset-paginated (see **Pagination** below).
 
 **Response:** `200 OK`
 ```json
@@ -240,9 +240,12 @@ List all currently provisioned resources. Used by Fred for reconciliation.
       ],
       "service_images": {"web": "nginx:latest"}
     }
-  ]
+  ],
+  "continue": "5a1e8400-e29b-41d4-a716-446655440000"
 }
 ```
+
+**Pagination:** `GET /provisions` is keyset-paginated. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. An invalid `limit` or a non-UUID `continue` returns 400. With no params it returns the full list unpaginated (back-compat). One or more `lease_uuid` query params return just those records. (ENG-380)
 
 **Fields:**
 - `fail_count` - Number of provision failures for this lease
@@ -745,9 +748,9 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 ## Reference Implementation
 
-**For a full-contract reference, read the Docker backend at `internal/backend/docker` (with `cmd/docker-backend`).** It implements all 10 contract routes plus `/health`, verifies inbound HMAC signatures, supports TLS/mTLS, and exercises the complete lifecycle (provision, info, logs, restart, update, releases, custom-domain reconciliation, deprovision, reconciliation).
+**For a full-contract reference, read the Docker backend at `internal/backend/docker` (with `cmd/docker-backend`).** It implements all 12 contract routes plus `/health`, verifies inbound HMAC signatures, supports TLS/mTLS, and exercises the complete lifecycle (provision, info, logs, restart, update, restore, retentions, releases, custom-domain reconciliation, deprovision, reconciliation).
 
-`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 6 of the 10 contract routes (provision, info, deprovision, provisions, provisions/{lease_uuid}, logs) plus `/health` — it lacks restart, update, reconcile_custom_domain, and releases — **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
+`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 6 of the 12 contract routes (provision, info, deprovision, provisions, provisions/{lease_uuid}, logs) plus `/health` — it lacks restart, update, restore, retentions, reconcile_custom_domain, and releases — **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
 
 | Function | Description |
 |----------|-------------|
@@ -844,7 +847,7 @@ curl -X POST http://localhost:9001/deprovision \
 
 Before deploying your backend:
 
-- [ ] All 10 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{lease_uuid}`, `/logs/{lease_uuid}`, `/provisions/{lease_uuid}`, `/provisions`, `/restart`, `/update`, `/reconcile_custom_domain`, `/releases/{lease_uuid}`) plus `/health`
+- [ ] All 12 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{lease_uuid}`, `/logs/{lease_uuid}`, `/provisions/{lease_uuid}`, `/provisions`, `/restart`, `/update`, `/restore`, `/retentions`, `/reconcile_custom_domain`, `/releases/{lease_uuid}`) plus `/health`
 - [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
 - [ ] Callbacks signed with HMAC-SHA256 with timestamp

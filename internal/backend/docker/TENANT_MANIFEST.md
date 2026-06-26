@@ -1,5 +1,7 @@
 # Docker Backend — Tenant Manifest Reference
 
-This document has moved to [docs/manifest-guide.md](../../../docs/manifest-guide.md).
+This stub is intentionally not the source of truth. The canonical tenant manifest
+documentation lives at the repo root:
 
-A formal JSON Schema is available at [docs/manifest-schema.json](../../../docs/manifest-schema.json).
+- **Guide:** [docs/manifest-guide.md](../../../docs/manifest-guide.md) — formats, fields, validation rules, and examples.
+- **JSON Schema:** [docs/manifest-schema.json](../../../docs/manifest-schema.json) — the formal schema for tooling/validation.
