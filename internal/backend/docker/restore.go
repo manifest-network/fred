@@ -236,6 +236,11 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 		if !ok {
 			continue // concurrently claimed for restore (or already gone) — skip
 		}
+		// The record is now genuinely evicted (active→reaping): the tenant has lost
+		// restore grace to the per-tenant cap. Count it here, after the ok guard, so
+		// a concurrently restore-claimed record (ok=false, skipped above) is NOT
+		// counted, and independent of the destroy outcome below. (ENG-407)
+		retentionEvictedTotal.Inc()
 		b.destroyReapingVolumes(ctx, active[i].OriginalLeaseUUID, names)
 	}
 	b.refreshRetentionAccounting()
