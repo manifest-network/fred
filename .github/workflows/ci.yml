@@ -78,7 +78,12 @@ jobs:
           # is handled by the comparison below instead of aborting the step.
           set +e
           allowlist=".github/govulncheck-allowlist.txt"
+          if [ ! -f "$allowlist" ]; then
+            echo "::error::govulncheck allowlist not found: $allowlist"
+            exit 1
+          fi
           report="$(mktemp)"
+          trap 'rm -f "$report"' EXIT
 
           govulncheck ./... | tee "$report"
           status=${PIPESTATUS[0]}
@@ -101,7 +106,7 @@ jobs:
 
           if [ -n "$unexpected" ]; then
             echo "::error::govulncheck found vulnerabilities not in $allowlist:"
-            printf '  %s\n' $unexpected
+            printf '%s\n' "$unexpected" | sed 's/^/  /'
             echo "Bump the dependency to a fixed version, or — if no fix is reachable —"
             echo "add the ID to $allowlist with a justification."
             exit 1
