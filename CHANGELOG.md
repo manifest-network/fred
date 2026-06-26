@@ -8,23 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `max_retained_disk_mb` docker-backend config key: per-provider cap on the
-  retained-volume tier, with refuse-to-retain on breach (ENG-360).
-- Retained-volume metrics: `fred_docker_backend_retained_volume_bytes`,
-  `fred_docker_backend_retained_leases`, `fred_docker_backend_retention_refused_total`,
-  and `fred_docker_backend_disk_pool_bytes` / `..._retained_disk_cap_bytes`
-  denominator gauges (ENG-360).
-- `fred_docker_backend_retention_index_reindex_total{trigger}` metric: retention
-  in-memory index (re)build count, by trigger (`open`|`manual`) (ENG-385).
-
 ### Changed
-
-- **Behavior change:** Retained (soft-deleted) volumes now count against the
-  disk admission pool until they are reaped, closing a disk over-commit / ENOSPC
-  risk. **Operators:** if `retain_on_close` is enabled, re-check `total_disk_mb`
-  headroom — effective live capacity now decreases by the retained footprint. See
-  the OPERATIONS.md "Reclaiming retained volumes under disk pressure" runbook.
-  (ENG-360)
 
 ### Deprecated
 
@@ -33,6 +17,147 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 ### Security
+
+## [0.5.0] - 2026-06-26
+
+This release ships **lease-close soft-delete + restore**: a closed or
+credit-expired lease's stateful volumes can be held for a grace window and
+restored into a fresh lease, instead of being destroyed on close.
+
+> **Upgrade notes (v0.4.0 → v0.5.0)**
+>
+> - **Restore is opt-in.** The retention/restore data path is gated behind the
+>   docker-backend `retain_on_close` key, which defaults to `false`. On a stock
+>   deployment nothing is retained and every restore returns `404` — set
+>   `retain_on_close: true` (and review `retention_max_age` / `max_retained_disk_mb`)
+>   to activate the headline feature.
+> - **Disk accounting.** When `retain_on_close` is enabled, retained (soft-deleted)
+>   volumes now count against the disk admission pool until reaped — re-check
+>   `total_disk_mb` headroom. See the OPERATIONS.md "Reclaiming retained volumes
+>   under disk pressure" runbook. (ENG-360)
+> - **Writable-path-only volumes are reclaimed at close**, not retained (ENG-406);
+>   mixed leases keep their stateful volumes restorable.
+> - **Provision placement is now least-loaded (CPU)** with round-robin fallback,
+>   using a new optional backend `GET /stats` endpoint (ENG-318). Mixed-version
+>   fleets degrade gracefully — a backend without `/stats` is simply excluded.
+> - **No new deploy-ordering constraint vs v0.4.0** — the ENG-191 HMAC / ENG-103
+>   mTLS wire changes already shipped in 0.4.0 and are not repeated here.
+
+### Added
+
+- **Lease-close soft-delete + restore (headline).** When the docker-backend
+  `retain_on_close` key is enabled, a closed lease's managed volumes are
+  soft-deleted (renamed into the `fred-retained-` namespace and recorded in a
+  bbolt retention store) and held for a grace window instead of being destroyed.
+  They can then be restored into a fresh `PENDING` lease via
+  `POST /v1/leases/{new_lease_uuid}/restore` with `from_lease_uuid` naming the
+  source lease. Restore is same-tenant only (the caller must own both leases),
+  pinned to the backend that holds the source data, and must shape-match the
+  original service names/quantities. New docker-backend config keys:
+  `retain_on_close` (default `false`), `retention_db_path` (default
+  `retention.db`), `retention_max_age` (grace window, default 90 days; `0`
+  disables reaping), `retention_reap_interval` (reaper cadence, default `1h`),
+  and `max_retained_leases_per_tenant` (per-tenant cap, default `0` = unlimited).
+  (ENG-325, #114)
+- **Queryable retention status.** `GET /v1/leases/{uuid}` and the status
+  endpoint now report `provision_status: retained` for soft-deleted leases, with
+  `retained_until` (RFC3339 grace deadline), `items` (the restore shape: service
+  name / SKU / quantity), and a `restore_hint`. The status is served from the
+  durable retention record even after the chain prunes the closed lease, under
+  strict per-tenant authorization (a cross-tenant query returns `404`). The
+  deprovision callback now carries a ground-truth `Retained` flag so `providerd`
+  reports `retained` only when volumes were actually held. (ENG-329, #118)
+- **Restore latency instrumentation.** New
+  `fred_docker_backend_restore_duration_seconds` histogram and
+  `fred_docker_backend_replace_phase_duration_seconds{operation,phase}` for the
+  shared replace machinery (restart/update/restore). The provisioner's
+  `fred_provisioner_provisioning_total` and
+  `fred_provisioner_provisioning_duration_seconds` gain an `operation` label
+  (`provision`|`restore`) so restore latency stays separable from fresh-provision
+  latency. (ENG-357 #123, ENG-358 #124)
+- `max_retained_disk_mb` docker-backend config key: per-provider cap on the
+  retained-volume tier, with refuse-to-retain on breach (ENG-360, #131).
+- Retained-volume metrics: `fred_docker_backend_retained_volume_bytes`,
+  `fred_docker_backend_retained_leases`, `fred_docker_backend_retention_refused_total`,
+  and `fred_docker_backend_disk_pool_bytes` / `..._retained_disk_cap_bytes`
+  denominator gauges (ENG-360, #131).
+- `fred_docker_backend_retention_index_reindex_total{trigger}` metric: retention
+  in-memory index (re)build count, by trigger (`open`|`manual`) (ENG-385, #137).
+
+### Changed
+
+- **Backend selection is now least-loaded (lowest allocated-CPU ratio) instead
+  of round-robin.** When several backends match an SKU, a provision goes to the
+  one with the lowest allocated-CPU ratio, queried live from each backend's new
+  `GET /stats` endpoint; backends without usable stats are excluded and routing
+  falls back to round-robin. Restore requests bypass this and are pinned to the
+  backend holding the source lease's retained data (restore backend affinity).
+  (ENG-318 #117, ENG-333 #120)
+- **Restored leases are acknowledged on-chain inline**, like fresh provisions,
+  instead of waiting for the next reconciler pass — cutting restore-to-`ACTIVE`
+  time. (ENG-358, #124)
+- **Retention list paths use an in-memory tenant/status index** (rebuilt on
+  open) for O(subset) lookups instead of full-store scans. (ENG-385, #137)
+- **`GET /provisions` (backend) is now paginated** via keyset pagination,
+  removing the ~8 MiB response cliff that aborted reconcile on providers with
+  many leases; reconciler consumers page through the results. (ENG-380, #136)
+- **Writable-path-only volumes are reclaimed (destroyed) at close** instead of
+  retained. A volume created solely from writable-path auto-detection (no
+  declared `VOLUME`) is unrestorable by construction — its contents are wiped and
+  reseeded on every restore — so close now destroys it, leaving no retention
+  record, per-tenant slot, `fred-retained-` directory, or retained-disk charge.
+  Mixed leases (stateful + writable-path-only) keep their stateful volumes
+  restorable. Counted by the new
+  `fred_docker_backend_retention_writable_path_reclaimed_total` metric.
+  (ENG-406, #138)
+- **Behavior change:** Retained (soft-deleted) volumes now count against the
+  disk admission pool until they are reaped, closing a disk over-commit / ENOSPC
+  risk. **Operators:** if `retain_on_close` is enabled, re-check `total_disk_mb`
+  headroom — effective live capacity now decreases by the retained footprint. See
+  the OPERATIONS.md "Reclaiming retained volumes under disk pressure" runbook.
+  (ENG-360, #131)
+
+### Fixed
+
+- **Retained-disk under-count on broken-store abandon.** A reaping-tombstone
+  finalizer (the retention record now outlives the volume until its destruction
+  is confirmed) plus make-before-break rollback close the disk-accounting
+  under-count across the reap / evict / deprovision-give-up / rollback paths;
+  give-up leaks now self-heal. New `fred_docker_backend_retention_leaked_total`
+  counter and `fred_docker_backend_retention_reaping_bytes` /
+  `fred_docker_backend_retention_reaping_leases` gauges for the reaping tier.
+  (ENG-376, #135)
+- **Orphaned retention records are pruned** when their volumes vanish
+  out-of-band, via a periodic fail-closed reconcile that requires N consecutive
+  confirming sweeps before pruning. New `retention_orphan_confirmations`
+  docker-backend config key (sweep count, default `3`; `0` is a kill-switch) and
+  `fred_docker_backend_retention_orphans_pruned_total` /
+  `fred_docker_backend_retention_orphan_skips_total{reason}` metrics.
+  (ENG-370, #133)
+- **Anonymous Docker volumes are reaped on every teardown** (compose-down and
+  container / image-introspection cleanup), stopping a leak that taxed
+  compose-up under load. Safe by construction — fred data lives in bind mounts /
+  managed directories. (ENG-372, #132)
+- **Reconciler placement-prune grace window + deprovision fail-safe.** Replaces
+  the SKU-route deprovision fallback (which could deprovision a phantom default
+  backend and strand retained volumes) with positive single-backend resolution
+  or an all-backends idempotent fallback, and adds a grace window to the
+  placement pruner so leases that provisioned during a slow sweep are not pruned.
+  (ENG-335, #121)
+- **`TimeoutChecker` untracks non-pending leases** instead of retrying a reject
+  forever. A lost re-provision callback for an already-`ACTIVE` lease used to
+  wedge the lease in-flight (the chain rejects `RejectLeases` for non-`PENDING`
+  leases), permanently inflating in-flight counts and skewing capacity/routing;
+  terminal reject errors now untrack and hand back to the reconciler.
+  (ENG-337, #122)
+
+### Security
+
+- **`callback_insecure_skip_verify` is now gated behind `production_mode`** on
+  the docker and k3s backends: when `production_mode: true`, the insecure
+  TLS-skip toggle is rejected at startup, closing the backend → Fred callback
+  MITM exposure (mirrors the existing `providerd`-side gate). New
+  `production_mode` config key (default `false`). (ENG-321, #113)
 
 ## [0.4.0] - 2026-06-10
 
