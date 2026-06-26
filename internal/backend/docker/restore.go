@@ -815,6 +815,10 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 		// delete the record while the lease is not Ready. Convert panic -> Failed.
 		if r := recover(); r != nil {
 			logger.Error("restore worker panicked", "recover", r)
+			// Count the outcome BEFORE the fallible rollback so a panic inside
+			// rollbackRestoreAdoption can't bypass the increment (the success branch
+			// likewise counts before its fallible Delete).
+			restoresTotal.WithLabelValues("failure").Inc()
 			b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
 			// Mirror spawnReplaceWorker's own panic recovery (lease_actor.go) and the
 			// normal doReplace* failure shape: populate top-level CallbackErr AND
@@ -840,12 +844,15 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			// phase ran before this worker; restore_duration_seconds covers the
 			// async re-deploy worker span, which is the ~3-4x cost ENG-357 targets.
 			restoreDurationSeconds.Observe(time.Since(restoreStart).Seconds())
+			restoresTotal.WithLabelValues("success").Inc()
 			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
 				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
 			}
 			b.refreshRetentionAccounting()
 			return
 		}
+		// Count the outcome before the fallible rollback (see the panic branch).
+		restoresTotal.WithLabelValues("failure").Inc()
 		b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
 	}()
 	return b.doReplaceContainers(ctx, replaceContainersOp{
