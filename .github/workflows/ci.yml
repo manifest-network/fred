@@ -67,23 +67,42 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 
       - name: Run govulncheck
-        # Advisory: docker/docker (GO-2026-4887, GO-2026-4883) has no patched
-        # release and moby/buildkit + docker/cli fixes are blocked by
-        # docker/compose v2 compatibility.  Treat exit-code 3 (vulns found)
-        # as a warning until upstream ships fixes; other failures still break CI.
+        # Fail on any CALLED vulnerability whose ID is not in the allowlist
+        # (.github/govulncheck-allowlist.txt). This keeps a real signal: new or
+        # unexpected vulns break CI, while documented, accepted exceptions (no
+        # upstream fix, or a fix blocked by docker/compose v2 compatibility) are
+        # tolerated. Replaces the previous blanket exit-3 suppression. See ENG-415.
         run: |
-          set +e
-          govulncheck ./...
-          status=$?
-          set -e
+          set -uo pipefail
+          allowlist=".github/govulncheck-allowlist.txt"
+          report="$(mktemp)"
+
+          govulncheck ./... | tee "$report"
+          status=${PIPESTATUS[0]}
 
           if [ "$status" -eq 0 ]; then
+            echo "govulncheck: no vulnerabilities found."
             exit 0
           fi
-
-          if [ "$status" -eq 3 ]; then
-            echo "::warning::govulncheck found known vulnerabilities; see report above."
-            exit 0
+          if [ "$status" -ne 3 ]; then
+            echo "::error::govulncheck failed to run (exit $status)."
+            exit "$status"
           fi
 
-          exit "$status"
+          # exit 3 => called vulnerabilities found. Compare the called set
+          # (the numbered "Vulnerability #N:" headers — informational, non-called
+          # findings are intentionally excluded) against the allowlist.
+          called="$(grep -oE '^Vulnerability #[0-9]+: GO-[0-9]+-[0-9]+' "$report" | grep -oE 'GO-[0-9]+-[0-9]+' | sort -u)"
+          allowed="$(grep -oE 'GO-[0-9]+-[0-9]+' "$allowlist" | sort -u)"
+          unexpected="$(comm -23 <(printf '%s\n' "$called") <(printf '%s\n' "$allowed") | grep -E 'GO-' || true)"
+
+          if [ -n "$unexpected" ]; then
+            echo "::error::govulncheck found vulnerabilities not in $allowlist:"
+            printf '  %s\n' $unexpected
+            echo "Bump the dependency to a fixed version, or — if no fix is reachable —"
+            echo "add the ID to $allowlist with a justification."
+            exit 1
+          fi
+
+          echo "::notice::All called vulnerabilities are allowlisted (see $allowlist)."
+          exit 0
