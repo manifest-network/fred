@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_docker_backend_restore_total{outcome}` metric: restore re-deploy worker
+  outcome counter (`success`/`failure`), incremented on both the success and the
+  rollback (`rollbackRestoreAdoption`, panics included) paths so a
+  docker-backend-side restore success rate is computable —
+  `fred_docker_backend_restore_duration_seconds` is success-only. Both series are
+  pre-initialized to `0` so the success-rate query reads `0`, not no-data, before
+  the first restore. (ENG-408)
+
 ### Changed
 
 ### Deprecated

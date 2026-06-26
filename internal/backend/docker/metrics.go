@@ -159,6 +159,29 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(0.05, 2, 16), // 50ms to ~27min
 	}, []string{"operation", "phase"})
 
+	// restoresTotal counts restore re-deploy WORKER outcomes by result. Unlike
+	// restoreDurationSeconds (success-only), it increments on BOTH the success and
+	// failure branches of doRestore's terminal defer (the rollbackRestoreAdoption
+	// path, panics included), so a docker-backend-side restore success rate is
+	// computable from the worker's own metrics — mirroring provisionsTotal, which
+	// likewise counts only doProvision's worker outcome (ENG-408).
+	//
+	// Worker-scoped like restore_duration_seconds: a restore that fails in the
+	// SYNCHRONOUS adopt prelude (claim/rename/route/ack) before the worker spawns
+	// returns a synchronous error to the caller and is counted by NEITHER outcome
+	// here — exactly as provisionsTotal omits synchronous provision failures. Such
+	// failures surface to the tenant as the Restore() error / HTTP status. Note
+	// providerd's fred_provisioner_provisioning_total{operation=restore} does NOT
+	// backfill this gap: it counts the async callback/timeout outcomes, not the
+	// backend's synchronous errors (see internal/api/handlers.go restore handler).
+	// outcome ∈ restoreOutcomes ("success"/"failure", matching provisionsTotal).
+	restoresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "restore_total",
+		Help:      "Total number of restore re-deploy worker attempts by outcome",
+	}, []string{"outcome"})
+
 	// reconciliationTotal tracks reconciliation runs by outcome.
 	reconciliationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
@@ -438,10 +461,20 @@ var (
 // not no-data, before the first (re)build.
 var reindexTriggers = []string{"open", "manual"}
 
+// restoreOutcomes is the closed outcome set for restoresTotal, pre-initialized to 0
+// so a restore success-rate / failure-ratio query returns 0, not no-data, before the
+// first restore completes (ENG-408). Values mirror provisionsTotal.
+var restoreOutcomes = []string{"success", "failure"}
+
 func init() {
 	// Pre-init both reindex-trigger series to 0, mirroring the orphan-skip pre-init.
 	for _, tr := range reindexTriggers {
 		retentionIndexReindexTotal.WithLabelValues(tr).Add(0)
+	}
+	// Pre-init both restore-outcome series to 0 (ENG-408) so the docker-backend restore
+	// success rate reads 0, not no-data, before the first restore.
+	for _, oc := range restoreOutcomes {
+		restoresTotal.WithLabelValues(oc).Add(0)
 	}
 }
 
