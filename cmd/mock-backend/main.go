@@ -111,7 +111,7 @@ func main() {
 		)
 		httpClient.Transport = &http.Transport{
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // G402: opt-in via operator env MOCK_BACKEND_TLS_SKIP_VERIFY (off by default) in the dev/test mock backend; not the production daemon, not tenant-controlled
+				InsecureSkipVerify: true,
 			},
 		}
 	}

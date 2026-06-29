@@ -84,6 +84,16 @@ linters:
         linters:
           - gosec
         text: "G204|G304"
+      # mock-backend is a dev/test harness (not the production daemon); its
+      # opt-in InsecureSkipVerify (off by default, MOCK_BACKEND_TLS_SKIP_VERIFY-
+      # gated) is intentional for local self-signed-cert testing. Suppress G402
+      # via config rather than an inline nolint: that line also carries a CodeQL
+      # go/disabled-certificate-check alert, and editing it would make CodeQL
+      # re-attribute the pre-existing alert as "new in this PR".
+      - path: ^cmd/mock-backend/
+        linters:
+          - gosec
+        text: "G402"
       # Exclude deprecated API warnings from dependencies we can't control
       - linters:
           - staticcheck
