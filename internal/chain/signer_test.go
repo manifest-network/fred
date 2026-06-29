@@ -1,7 +1,12 @@
 package chain
 
 import (
+	"bytes"
+	"context"
+	"flag"
 	stdmath "math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -628,6 +633,51 @@ func newTestSignerForGas(t *testing.T, gasLimit, maxGasLimit uint64, gasAdjustme
 		adj = d
 	}
 	return &Signer{gasLimit: gasLimit, maxGasLimit: maxGasLimit, gasAdjustment: adj}
+}
+
+var update = flag.Bool("update", false, "update golden files")
+
+// goldenBytes is the idiomatic -update-flag golden helper.
+// With -update it writes testdata/<name> and returns got.
+// Without -update it reads testdata/<name> and fatals with a hint if missing.
+// A deleted golden always causes a test failure (not silent regeneration), so
+// the guard stays meaningful when buildUnsignedTx is extracted in Task 3.
+func goldenBytes(t *testing.T, name string, got []byte) []byte {
+	t.Helper()
+	path := filepath.Join("testdata", name)
+	if *update {
+		if err := os.MkdirAll("testdata", 0o755); err != nil {
+			t.Fatalf("mkdir testdata: %v", err)
+		}
+		if err := os.WriteFile(path, got, 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		return got
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden %s (run `go test -run %s -update` to create): %v", path, t.Name(), err)
+	}
+	return want
+}
+
+func TestSigner_signTxInternal_GoldenBytes(t *testing.T) {
+	s := newDeterministicTestSigner(t) // Task 0: fixed mnemonic → stable secp256k1 signature
+	addr, err := sdk.AccAddressFromBech32(s.Address())
+	if err != nil {
+		t.Fatalf("addr: %v", err)
+	}
+	acct := newTestAccountAny(t, addr, 3 /*accNum*/, 7 /*seq*/)
+	msg := newTestMsg(s.Address())
+
+	got, err := s.signTxInternal(context.Background(), []sdk.Msg{msg}, acct, nil, nil)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	golden := goldenBytes(t, "signTxInternal_ack_seq7.bin", got)
+	if !bytes.Equal(got, golden) {
+		t.Fatalf("signed bytes drifted from golden (len got=%d golden=%d)", len(got), len(golden))
+	}
 }
 
 func TestSigner_adjustGas_and_adjustAndCapGas(t *testing.T) {
