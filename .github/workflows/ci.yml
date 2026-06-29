@@ -67,23 +67,67 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 
       - name: Run govulncheck
-        # Advisory: docker/docker (GO-2026-4887, GO-2026-4883) has no patched
-        # release and moby/buildkit + docker/cli fixes are blocked by
-        # docker/compose v2 compatibility.  Treat exit-code 3 (vulns found)
-        # as a warning until upstream ships fixes; other failures still break CI.
+        # Fail on any CALLED vulnerability whose ID is not in the allowlist
+        # (.github/govulncheck-allowlist.txt). This keeps a real signal: new or
+        # unexpected vulns break CI, while documented, accepted exceptions (no
+        # upstream fix, or a fix blocked by docker/compose v2 compatibility) are
+        # tolerated. Replaces the previous blanket exit-3 suppression. See ENG-415.
         run: |
+          # GitHub Actions runs this step with `bash -eo pipefail`; disable
+          # errexit so the expected govulncheck exit-3 (vulnerabilities found)
+          # is handled by the comparison below instead of aborting the step.
           set +e
-          govulncheck ./...
-          status=$?
-          set -e
+          allowlist=".github/govulncheck-allowlist.txt"
+          if [ ! -f "$allowlist" ]; then
+            echo "::error::govulncheck allowlist not found: $allowlist"
+            exit 1
+          fi
+          report="$(mktemp)"
+          trap 'rm -f "$report"' EXIT
+
+          govulncheck ./... | tee "$report"
+          pipestatus=("${PIPESTATUS[@]}")
+          status=${pipestatus[0]}
+          # Fail closed if tee could not record the report: the comparison below
+          # reads $report, and gating on a truncated/empty report would bias
+          # toward a false PASS (the unsafe direction for a deny gate).
+          if [ "${pipestatus[1]}" -ne 0 ]; then
+            echo "::error::failed to write govulncheck report (tee exit ${pipestatus[1]}); refusing to gate on an incomplete report."
+            exit 1
+          fi
 
           if [ "$status" -eq 0 ]; then
+            echo "govulncheck: no vulnerabilities found."
             exit 0
           fi
-
-          if [ "$status" -eq 3 ]; then
-            echo "::warning::govulncheck found known vulnerabilities; see report above."
-            exit 0
+          if [ "$status" -ne 3 ]; then
+            echo "::error::govulncheck failed to run (exit $status)."
+            exit "$status"
           fi
 
-          exit "$status"
+          # exit 3 => called vulnerabilities found. Compare the called set
+          # (the numbered "Vulnerability #N:" headers — informational, non-called
+          # findings are intentionally excluded) against the allowlist.
+          called="$(grep -oE '^Vulnerability #[0-9]+: GO-[0-9]+-[0-9]+' "$report" | grep -oE 'GO-[0-9]+-[0-9]+' | sort -u)"
+          # Fail closed if exit 3 parsed zero headers. exit 3 guarantees >=1
+          # CALLED vuln, so an empty $called means the report format changed and
+          # the parse silently missed everything — which would otherwise sail
+          # through to a false PASS (empty $called => empty $unexpected). Treat a
+          # parse that contradicts the exit code as a gate failure.
+          if [ -z "$called" ]; then
+            echo "::error::govulncheck exited 3 but no 'Vulnerability #N: GO-...' headers were parsed; the report format may have changed. Failing closed."
+            exit 1
+          fi
+          allowed="$(grep -oE 'GO-[0-9]+-[0-9]+' "$allowlist" | sort -u)"
+          unexpected="$(comm -23 <(printf '%s\n' "$called") <(printf '%s\n' "$allowed") | grep -E 'GO-' || true)"
+
+          if [ -n "$unexpected" ]; then
+            echo "::error::govulncheck found vulnerabilities not in $allowlist:"
+            printf '%s\n' "$unexpected" | sed 's/^/  /'
+            echo "Bump the dependency to a fixed version, or — if no fix is reachable —"
+            echo "add the ID to $allowlist with a justification."
+            exit 1
+          fi
+
+          echo "::notice::All called vulnerabilities are allowlisted (see $allowlist)."
+          exit 0

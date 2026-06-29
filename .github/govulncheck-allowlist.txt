@@ -1,0 +1,36 @@
+# govulncheck allowlist — OSV IDs the CI vuln gate tolerates.
+#
+# The CI job (.github/workflows/ci.yml :: vulncheck) FAILS on any *called*
+# vulnerability whose ID is not listed here. New or unexpected vulnerabilities
+# therefore break the build; the entries below are the known, accepted
+# exceptions. One ID per line; any text after the ID is a free-form note
+# (do NOT put other GO-IDs in a note — the parser greps every GO-ID on a line).
+#
+# Keep this list MINIMAL. Re-evaluate on every dependency bump and delete
+# entries as fixes land. Tracking: ENG-415.
+#
+# ── Category A: no upstream fix available (govulncheck "Fixed in: N/A") ──────
+# github.com/docker/docker @ v28.5.2+incompatible has no patched release, and
+# the docker/cli + moby/buildkit fixes are themselves gated on docker/compose
+# v2 compatibility. Nothing we can bump resolves these today.
+GO-2026-5746   docker/docker — no patched release
+GO-2026-5668   docker/docker — no patched release
+GO-2026-5617   docker/docker — no patched release
+GO-2026-4887   docker/docker — no patched release
+GO-2026-4883   docker/docker — no patched release
+GO-2026-4610   no fix on the binding path — reachable via docker/compose v2 (Fixed in: N/A); the separate docker/cli v29.2.0 fix does not resolve the compose-reachable instance
+#
+# ── Category B: fix exists upstream, but bumping cascades through the
+#    docker/compose v2 toolchain (containerd, buildkit, in-toto are
+#    transitively pinned by docker/compose v2.40.3; bumping them drags
+#    k8s.io 0.32→0.34, otel, prometheus, cobra). Deferred to a dedicated,
+#    separately-tested dependency-upgrade PR. Remove these once that lands.
+GO-2026-5758   containerd/v2 fixed in v2.1.9 (deferred — compose-coupled)
+GO-2026-5622   containerd/v2 fixed in v2.1.9 (deferred — compose-coupled)
+GO-2026-5475   containerd/v2 fixed in v2.1.9 (deferred — compose-coupled)
+GO-2026-5338   containerd/v2 fixed in v2.1.9 (deferred — compose-coupled)
+GO-2026-5064   containerd/v2 fixed in v2.1.9 (deferred — compose-coupled)
+GO-2026-5378   containerd/v2 fixed in v2.2.4 (deferred — compose-coupled)
+GO-2026-4859   moby/buildkit fixed in v0.28.1 (deferred — compose-coupled)
+GO-2026-4858   moby/buildkit fixed in v0.28.1 (deferred — compose-coupled)
+GO-2026-5547   in-toto/in-toto-golang fixed in v0.11.0 (deferred — pulled via buildkit/cli)
