@@ -169,11 +169,6 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 		seq = *seqOverride
 	}
 
-	txBuilder := s.txConfig.NewTxBuilder()
-	if err := txBuilder.SetMsgs(msgs...); err != nil {
-		return nil, fmt.Errorf("failed to set messages: %w", err)
-	}
-
 	gasLimit := s.gasLimit
 	if gasLimitOverride != nil {
 		// OOG-retry / pre-seeded path: the value is already adjusted+capped; do
@@ -186,20 +181,11 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 			return nil, err
 		}
 	}
-	if gasLimit > uint64(stdmath.MaxInt64) {
-		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
+
+	txBuilder, err := s.buildUnsignedTx(msgs, gasLimit, false /*zeroFee*/)
+	if err != nil {
+		return nil, err
 	}
-	txBuilder.SetGasLimit(gasLimit)
-	// Use math.Int to avoid int64 overflow for large gasLimit * gasPrice products.
-	// Ceiling division: the chain validates fee against ceil(gasLimit * gasPrice / 1e6);
-	// integer floor would under-pay by one base unit of fee_denom whenever the product
-	// isn't an exact multiple of gasPriceDivisor.
-	divisor := math.NewInt(gasPriceDivisor)
-	feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Add(divisor).Sub(math.OneInt()).Quo(divisor)
-	if feeInt.LT(math.NewInt(minFeeAmount)) {
-		feeInt = math.NewInt(minFeeAmount)
-	}
-	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, feeInt)))
 
 	keyInfo, err := s.keyring.Key(s.keyName)
 	if err != nil {
@@ -255,6 +241,35 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 	}
 
 	return txBytes, nil
+}
+
+// buildUnsignedTx creates a TxBuilder with msgs, the given (already-derived)
+// gasLimit, and the fee. When zeroFee is true the fee is omitted entirely
+// (no SetFeeAmount, no minFeeAmount floor) — required for Simulate, whose ante
+// skips fee deduction only when the fee is zero. gasLimit must already be
+// adjusted/capped; this helper does NOT derive gas.
+func (s *Signer) buildUnsignedTx(msgs []sdk.Msg, gasLimit uint64, zeroFee bool) (client.TxBuilder, error) {
+	txBuilder := s.txConfig.NewTxBuilder()
+	if err := txBuilder.SetMsgs(msgs...); err != nil {
+		return nil, fmt.Errorf("failed to set messages: %w", err)
+	}
+	if gasLimit > uint64(stdmath.MaxInt64) {
+		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
+	}
+	txBuilder.SetGasLimit(gasLimit)
+	if !zeroFee {
+		// Use math.Int to avoid int64 overflow for large gasLimit * gasPrice products.
+		// Ceiling division: the chain validates fee against ceil(gasLimit * gasPrice / 1e6);
+		// integer floor would under-pay by one base unit of fee_denom whenever the product
+		// isn't an exact multiple of gasPriceDivisor.
+		divisor := math.NewInt(gasPriceDivisor)
+		feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Add(divisor).Sub(math.OneInt()).Quo(divisor)
+		if feeInt.LT(math.NewInt(minFeeAmount)) {
+			feeInt = math.NewInt(minFeeAmount)
+		}
+		txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, feeInt)))
+	}
+	return txBuilder, nil
 }
 
 // adjustGas applies the configured gas_adjustment multiplier to raw gas.
