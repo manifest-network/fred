@@ -176,24 +176,15 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 
 	gasLimit := s.gasLimit
 	if gasLimitOverride != nil {
+		// OOG-retry / pre-seeded path: the value is already adjusted+capped; do
+		// not re-apply the multiplier (would double-adjust).
 		gasLimit = *gasLimitOverride
-	} else if !s.gasAdjustment.IsNil() && s.gasAdjustment.GT(math.LegacyOneDec()) {
-		// Apply multiplier only on the normal path. OOG retries set
-		// gasLimitOverride to a bumped value; we must not compound the
-		// multiplier on top or we'd double-adjust. maxGasLimit cap is still
-		// enforced so operators retain an upper bound.
-		// Big-int/decimal arithmetic via cosmossdk.io/math avoids the
-		// platform-dependent float→uint64 conversion semantics of a naive
-		// implementation (amd64 returns MinInt64, arm64 saturates at MaxUint64).
-		adjustedInt := s.gasAdjustment.MulInt(math.NewIntFromUint64(gasLimit)).TruncateInt()
-		if !adjustedInt.IsUint64() {
-			return nil, fmt.Errorf("gas adjustment overflow: gasLimit=%d * %s = %s exceeds uint64", gasLimit, s.gasAdjustment, adjustedInt)
+	} else {
+		var err error
+		gasLimit, err = s.adjustAndCapGas(s.gasLimit)
+		if err != nil {
+			return nil, err
 		}
-		adjusted := adjustedInt.Uint64()
-		if s.maxGasLimit > 0 && adjusted > s.maxGasLimit {
-			adjusted = s.maxGasLimit
-		}
-		gasLimit = adjusted
 	}
 	if gasLimit > uint64(stdmath.MaxInt64) {
 		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
@@ -264,6 +255,34 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 	}
 
 	return txBytes, nil
+}
+
+// adjustGas applies the configured gas_adjustment multiplier to raw gas.
+// It does NOT apply the maxGasLimit cap. Returns an error only on uint64
+// overflow of the multiplication (deterministic big-int math).
+func (s *Signer) adjustGas(raw uint64) (uint64, error) {
+	if s.gasAdjustment.IsNil() || !s.gasAdjustment.GT(math.LegacyOneDec()) {
+		return raw, nil
+	}
+	adjustedInt := s.gasAdjustment.MulInt(math.NewIntFromUint64(raw)).TruncateInt()
+	if !adjustedInt.IsUint64() {
+		return 0, fmt.Errorf("gas adjustment overflow: gasLimit=%d * %s = %s exceeds uint64", raw, s.gasAdjustment, adjustedInt)
+	}
+	return adjustedInt.Uint64(), nil
+}
+
+// adjustAndCapGas applies gas_adjustment then clamps to maxGasLimit (if set).
+// This preserves the legacy normal-path semantics used by signTxInternal,
+// FallbackGas, and the OOG ladder.
+func (s *Signer) adjustAndCapGas(raw uint64) (uint64, error) {
+	adjusted, err := s.adjustGas(raw)
+	if err != nil {
+		return 0, err
+	}
+	if s.maxGasLimit > 0 && adjusted > s.maxGasLimit {
+		adjusted = s.maxGasLimit
+	}
+	return adjusted, nil
 }
 
 // SignWithPrivKey signs using the keyring.

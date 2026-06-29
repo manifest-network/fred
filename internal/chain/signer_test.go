@@ -1,6 +1,8 @@
 package chain
 
 import (
+	stdmath "math"
+	"strconv"
 	"testing"
 
 	"cosmossdk.io/math"
@@ -613,4 +615,57 @@ func TestSigner_SignTx_InvalidAccount(t *testing.T) {
 
 	_, err := s.SignTx(t.Context(), newTestMsg(s.address), wrongAny)
 	assert.Error(t, err)
+}
+
+func newTestSignerForGas(t *testing.T, gasLimit, maxGasLimit uint64, gasAdjustment float64) *Signer {
+	t.Helper()
+	var adj math.LegacyDec
+	if gasAdjustment > 0 {
+		d, err := math.LegacyNewDecFromStr(strconv.FormatFloat(gasAdjustment, 'f', -1, 64))
+		if err != nil {
+			t.Fatalf("parse adjustment: %v", err)
+		}
+		adj = d
+	}
+	return &Signer{gasLimit: gasLimit, maxGasLimit: maxGasLimit, gasAdjustment: adj}
+}
+
+func TestSigner_adjustGas_and_adjustAndCapGas(t *testing.T) {
+	tests := []struct {
+		name                      string
+		gasLimit, maxGasLimit     uint64
+		adjustment                float64
+		raw                       uint64
+		wantAdjust, wantAdjustCap uint64
+		wantErr                   bool
+	}{
+		{name: "adjustment applied", adjustment: 1.2, raw: 200000, wantAdjust: 240000, wantAdjustCap: 240000},
+		{name: "cap binds", adjustment: 1.2, maxGasLimit: 300000, raw: 300000, wantAdjust: 360000, wantAdjustCap: 300000},
+		{name: "adjustment 1.0 is no-op", adjustment: 1.0, raw: 200000, wantAdjust: 200000, wantAdjustCap: 200000},
+		{name: "adjustment 1.0, cap not binding", adjustment: 1.0, maxGasLimit: 500000, raw: 200000, wantAdjust: 200000, wantAdjustCap: 200000},
+		{name: "no cap when maxGasLimit 0", adjustment: 1.5, raw: 1000000, wantAdjust: 1500000, wantAdjustCap: 1500000},
+		{name: "overflow errors", adjustment: 3.0, raw: stdmath.MaxInt64, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSignerForGas(t, tc.gasLimit, tc.maxGasLimit, tc.adjustment)
+			gotAdjust, errA := s.adjustGas(tc.raw)
+			gotCap, errC := s.adjustAndCapGas(tc.raw)
+			if tc.wantErr {
+				if errA == nil || errC == nil {
+					t.Fatalf("want error, got adjustGas err=%v adjustAndCapGas err=%v", errA, errC)
+				}
+				return
+			}
+			if errA != nil || errC != nil {
+				t.Fatalf("unexpected error: adjustGas=%v adjustAndCapGas=%v", errA, errC)
+			}
+			if gotAdjust != tc.wantAdjust {
+				t.Errorf("adjustGas = %d, want %d", gotAdjust, tc.wantAdjust)
+			}
+			if gotCap != tc.wantAdjustCap {
+				t.Errorf("adjustAndCapGas = %d, want %d", gotCap, tc.wantAdjustCap)
+			}
+		})
+	}
 }
