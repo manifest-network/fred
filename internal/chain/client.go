@@ -64,6 +64,13 @@ const (
 	defaultTxTimeout = 60 * time.Second
 )
 
+// broadcastOpts carries per-call broadcast tuning.
+type broadcastOpts struct {
+	maxRetries uint64 // total attempts for the OOG/sequence ladder (default txMaxRetries)
+}
+
+func defaultBroadcastOpts() broadcastOpts { return broadcastOpts{maxRetries: txMaxRetries} }
+
 // Client provides methods to query and submit transactions to the chain.
 type Client struct {
 	conn            *grpc.ClientConn
@@ -428,7 +435,7 @@ func (c *Client) broadcastBatchedMsgs(
 			msg = innerMsg
 		}
 
-		txHash, err := c.broadcastTxWithSigner(ctx, signer, msg)
+		txHash, err := c.broadcastTxWithSigner(ctx, signer, []sdktypes.Msg{msg}, defaultBroadcastOpts())
 		recordTxMetrics(metricType, err)
 		if err != nil {
 			return totalProcessed, txHashes, fmt.Errorf("failed to %s leases: %w", metricType, err)
@@ -483,15 +490,40 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (s
 // broadcastTx signs and broadcasts a transaction using the primary signer.
 // Used for operations that must use the provider key (withdrawals, grants, funding).
 func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
-	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), msg)
+	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), []sdktypes.Msg{msg}, defaultBroadcastOpts())
 }
 
 // broadcastTxWithSigner signs and broadcasts a transaction using the given signer.
-// The signer is fixed for the entire retry cycle (signer affinity).
-func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg) (string, error) {
+// The signer is fixed for the entire retry cycle (signer affinity). A single
+// Simulate call pre-seeds the gas before the backoff loop; the OOG ladder then
+// climbs from that value if execution fails.
+func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msgs []sdktypes.Msg, opts broadcastOpts) (string, error) {
 	var txHash string
-	var seqOverride *uint64      // sequence override from a previous sequence-mismatch error
-	var gasLimitOverride *uint64 // gas limit override from a previous out-of-gas error
+	var seqOverride *uint64 // sequence override from a previous sequence-mismatch error
+
+	// Pre-seed: simulate gas once before the backoff loop. Terminal refusal is
+	// returned immediately; transient failure degrades to FallbackGas.
+	simGas, preAccount, simErr := c.simulateGas(ctx, signer, msgs)
+	switch {
+	case errors.Is(simErr, errGasExceedsCap):
+		return "", simErr // terminal: already counted "refused" in simulateGas
+	case simErr != nil:
+		fb, fbErr := signer.FallbackGas()
+		if fbErr != nil {
+			fb = signer.gasLimit // overflow: degrade to raw gas_limit, never 0
+			slog.Error("FallbackGas overflow; using raw gas_limit", "error", fbErr, "gas_limit", fb)
+		}
+		simGas = fb
+		metrics.GasSimulationTotal.WithLabelValues("fallback").Inc()
+		slog.Warn("gas simulation failed; using fallback ceiling", "error", simErr, "fallback_gas", simGas)
+	default:
+		metrics.GasSimulationTotal.WithLabelValues("simulated").Inc()
+	}
+	metrics.GasSimulated.Observe(float64(simGas))
+	// SOLE declaration of gasLimitOverride at function scope. The OOG closure
+	// below reassigns this variable (gasLimitOverride = &increased), not a new
+	// inner one, so the ladder climbs from simGas.
+	gasLimitOverride := &simGas
 
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = txInitialBackoff
@@ -499,13 +531,15 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 	bo.MaxElapsedTime = 0
 
 	boCtx := backoff.WithContext(
-		backoff.WithMaxRetries(bo, txMaxRetries-1),
+		backoff.WithMaxRetries(bo, opts.maxRetries-1),
 		ctx,
 	)
 
+	firstAccount := preAccount
 	operation := func() error {
 		var err error
-		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msg, seqOverride, gasLimitOverride)
+		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msgs, seqOverride, gasLimitOverride, firstAccount)
+		firstAccount = nil // retries re-query for a fresh sequence
 		if err == nil {
 			return nil
 		}
@@ -642,19 +676,29 @@ func (c *Client) isRetryableGRPCCode(code codes.Code) bool {
 // broadcast, or the mempool already holds a tx at the queried sequence).
 // If gasLimitOverride is non-nil, its value is used instead of the configured gas limit
 // (e.g. after an out-of-gas error triggered a retry with increased gas).
-func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg, seqOverride *uint64, gasLimitOverride *uint64) (string, error) {
-	// Get account info for the signer's sequence/account number
-	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
-		Address: signer.Address(),
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to query account: %w", err)
+// If preAccount is non-nil, it is used directly (reusing the account queried by
+// simulateGas on the first attempt, avoiding a duplicate query).
+func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msgs []sdktypes.Msg, seqOverride *uint64, gasLimitOverride *uint64, preAccount *codectypes.Any) (string, error) {
+	// Get account info for the signer's sequence/account number. Reuse the
+	// account from simulateGas when preAccount is set (first attempt only);
+	// retries pass nil and re-query for a fresh sequence.
+	var accountAny *codectypes.Any
+	if preAccount != nil {
+		accountAny = preAccount
+	} else {
+		accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
+			Address: signer.Address(),
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to query account: %w", err)
+		}
+		accountAny = accResp.Account
 	}
 
 	// Build, sign, and broadcast the transaction.
 	// When seqOverride is set (from a previous sequence-mismatch error),
 	// use it instead of the potentially stale on-chain sequence.
-	txBytes, err := signer.signTxInternal(ctx, []sdktypes.Msg{msg}, accResp.Account, seqOverride, gasLimitOverride)
+	txBytes, err := signer.signTxInternal(ctx, msgs, accountAny, seqOverride, gasLimitOverride)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %w", err)
 	}
