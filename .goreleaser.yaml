@@ -63,7 +63,7 @@ sboms:
 # the checksums validates all archives/SBOMs. Produces a self-contained
 # .sigstore.json bundle; verify with:
 #   cosign verify-blob --bundle checksums.txt.sigstore.json \
-#     --certificate-identity-regexp '^https://github.com/manifest-network/fred' \
+#     --certificate-identity-regexp '^https://github\.com/manifest-network/fred/\.github/workflows/release\.yml@refs/tags/' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
 #     checksums.txt
 signs:
@@ -79,7 +79,7 @@ signs:
 
 # Keyless cosign signature over the published container image, by digest.
 # Verify with: cosign verify ghcr.io/manifest-network/fred:<tag> \
-#   --certificate-identity-regexp '^https://github.com/manifest-network/fred' \
+#   --certificate-identity-regexp '^https://github\.com/manifest-network/fred/\.github/workflows/release\.yml@refs/tags/' \
 #   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 docker_signs:
   - cmd: cosign

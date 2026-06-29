@@ -27,7 +27,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.8.0
+          version: v2.9.0 # keep in sync with .github/workflows/ci.yml
 
   release:
     needs: verify
