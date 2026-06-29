@@ -59,8 +59,9 @@ sboms:
 
 # Keyless cosign signature over the checksums file (Sigstore: Fulcio cert +
 # Rekor transparency log, via the workflow's OIDC token — no long-lived keys).
-# The checksums file covers every artifact, so verifying this one signature +
-# the checksums validates all archives/SBOMs. Produces a self-contained
+# Because the checksums file lists every artifact's digest, verifying this one
+# signature — then each artifact against the signed checksums — validates all
+# archives and SBOMs. Produces a self-contained
 # .sigstore.json bundle; verify with:
 #   cosign verify-blob --bundle checksums.txt.sigstore.json \
 #     --certificate-identity-regexp '^https://github\.com/manifest-network/fred/\.github/workflows/release\.yml@refs/tags/' \
