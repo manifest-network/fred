@@ -551,10 +551,11 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 // destDir by following a symlink — including one created by an earlier entry in
 // the same archive — so containment is structural rather than coupled to the tar
 // source's walk order. It rejects absolute paths, path traversal via "..", and
-// device nodes. Setuid/setgid bits are stripped. Total bytes written are tracked
-// and an error is returned if maxBytes is exceeded. File ownership from tar
-// headers is preserved when running as root; EPERM errors from chown are
-// silently ignored.
+// device nodes, and skips entries that refer to the destination root itself
+// (".", "./", or empty) so a tar cannot mkdir or chown destDir. Setuid/setgid
+// bits are stripped. Total bytes written are tracked and an error is returned if
+// maxBytes is exceeded. File ownership from tar headers is preserved when running
+// as root; EPERM errors from chown are silently ignored.
 //
 // Symlinks whose targets point outside destDir (absolute paths, ".." traversal)
 // are still created — os.Root.Symlink does not validate the link target, and
