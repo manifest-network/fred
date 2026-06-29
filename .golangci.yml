@@ -70,10 +70,10 @@ linters:
       # The remaining G110 is the per-entry io.Copy, bounded by the maxBytes cap
       # (verified non-exploitable). Suppressed via config (not an inline comment)
       # so the line isn't pulled into the PR diff and re-flagged by CodeQL.
-      - path: internal/backend/docker/lifecycle\.go
+      - path: ^internal/backend/docker/lifecycle\.go$
         linters:
           - gosec
-        text: "G110"
+        text: "G110:"
       # Volume drivers shell out to btrfs/xfs/zfs and read per-volume metadata
       # files by design. Every exec uses a constant binary with discrete argv
       # (no shell -> no command injection), and every path is rooted at the
