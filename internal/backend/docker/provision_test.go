@@ -3768,6 +3768,113 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		assert.Equal(t, uint32(1000), stat.Uid)
 		assert.Equal(t, uint32(1000), stat.Gid)
 	})
+
+	t.Run("refuses to write a file through a symlinked ancestor", func(t *testing.T) {
+		destDir := t.TempDir()
+		// A directory OUTSIDE destDir that a malicious symlink will point at.
+		escapeDir := t.TempDir()
+		canary := filepath.Join(escapeDir, "pwned")
+
+		// Entry 1 creates an escaping symlink "evil" -> <escapeDir> (absolute,
+		// outside destDir). Entry 2 then tries to write "evil/pwned"; a naive
+		// extractor follows the symlink and lands at <escapeDir>/pwned. The lexical
+		// boundary check cannot catch this because it does not resolve on-disk links.
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "evil", Typeflag: tar.TypeSymlink, Linkname: escapeDir},
+			{Name: "evil/pwned", Typeflag: tar.TypeReg, Mode: 0o644, Content: "owned"},
+		})
+
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+
+		require.Error(t, err)
+		assert.NoFileExists(t, canary, "must not write through a symlinked ancestor")
+	})
+
+	t.Run("does not follow a same-name symlink when writing a file", func(t *testing.T) {
+		destDir := t.TempDir()
+		escapeDir := t.TempDir()
+		secret := filepath.Join(escapeDir, "secret")
+		require.NoError(t, os.WriteFile(secret, []byte("original"), 0o600))
+
+		// Entry 1 creates symlink "secret" -> <escapeDir>/secret. Entry 2 writes a
+		// regular file at the same name; a naive O_TRUNC open follows the symlink
+		// and clobbers the out-of-tree target.
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "secret", Typeflag: tar.TypeSymlink, Linkname: secret},
+			{Name: "secret", Typeflag: tar.TypeReg, Mode: 0o644, Content: "overwritten"},
+		})
+
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+
+		require.Error(t, err)
+		content, readErr := os.ReadFile(secret)
+		require.NoError(t, readErr)
+		assert.Equal(t, "original", string(content), "must not follow a same-name symlink and clobber the target")
+	})
+
+	t.Run("refuses a directory entry that collides with an existing symlink", func(t *testing.T) {
+		destDir := t.TempDir()
+		escapeDir := t.TempDir()
+
+		// Entry 1 creates symlink "d" -> <escapeDir>. Entry 2 is a directory at the
+		// same name: a naive extractor's MkdirAll no-ops on the symlinked dir and
+		// then os.Chown FOLLOWS the link, chowning <escapeDir> (an out-of-tree path,
+		// destructive when running as root). The entry must be refused instead.
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "d", Typeflag: tar.TypeSymlink, Linkname: escapeDir},
+			{Name: "d", Typeflag: tar.TypeDir, Mode: 0o755},
+		})
+
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+
+		require.Error(t, err)
+	})
+
+	t.Run("accepts a dotdot-prefixed filename that is not traversal", func(t *testing.T) {
+		destDir := t.TempDir()
+		// "..data" is a real filename (e.g. Kubernetes atomic-writer), not a "..".
+		// path-traversal component, so it must be extracted, not rejected.
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "..data", Typeflag: tar.TypeReg, Mode: 0o644, Content: "payload"},
+		})
+
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+
+		require.NoError(t, err)
+		content, readErr := os.ReadFile(filepath.Join(destDir, "..data"))
+		require.NoError(t, readErr)
+		assert.Equal(t, "payload", string(content))
+	})
+
+	t.Run("does not chown the destination root via a '.' entry", func(t *testing.T) {
+		if os.Getuid() != 0 {
+			t.Skip("chown requires root")
+		}
+		destDir := t.TempDir()
+		beforeUID := mustStatUID(t, destDir)
+
+		// A "." (root) entry with an attacker-chosen owner must not chown destDir,
+		// which fred created and owns; the entry is skipped. Sibling entries still
+		// extract.
+		buf := createTestTar(t, []testTarEntry{
+			{Name: ".", Typeflag: tar.TypeDir, Mode: 0o755, Uid: 12345, Gid: 12345},
+			{Name: "f.txt", Typeflag: tar.TypeReg, Mode: 0o644, Content: "ok"},
+		})
+
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+
+		require.NoError(t, err)
+		assert.Equal(t, beforeUID, mustStatUID(t, destDir), "'.' entry must not chown destDir")
+		assert.FileExists(t, filepath.Join(destDir, "f.txt"))
+	})
+}
+
+// mustStatUID returns the owning uid of path.
+func mustStatUID(t *testing.T, path string) uint32 {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	return info.Sys().(*syscall.Stat_t).Uid
 }
 
 // testTarEntry describes a single tar entry for test helpers.

@@ -546,18 +546,34 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 	return failures
 }
 
-// sanitizeAndExtractTar reads a tar stream and extracts entries into destDir
-// with security checks. It rejects absolute paths, path traversal via "..",
-// and device nodes. Setuid/setgid bits are stripped. Total bytes written are
-// tracked and an error is returned if maxBytes is exceeded. File ownership
-// from tar headers is preserved when running as root; EPERM errors from chown
-// are silently ignored.
+// sanitizeAndExtractTar reads a tar stream and extracts entries into destDir,
+// confining every operation to destDir via os.Root: no operation can escape
+// destDir by following a symlink — including one created by an earlier entry in
+// the same archive — so containment is structural rather than coupled to the tar
+// source's walk order. It rejects absolute paths, path traversal via "..", and
+// device nodes, and skips entries that refer to the destination root itself
+// (".", "./", or empty) so a tar cannot mkdir or chown destDir. Setuid/setgid
+// bits are stripped. Total bytes written are tracked and an error is returned if
+// maxBytes is exceeded. File ownership from tar headers is preserved when running
+// as root; EPERM errors from chown are silently ignored.
 //
 // Symlinks whose targets point outside destDir (absolute paths, ".." traversal)
-// are still created — they resolve correctly inside the container once
-// bind-mounted. The returned slice contains descriptions of such out-of-scope
-// symlinks (e.g., "name -> target") for caller-side debug logging.
+// are still created — os.Root.Symlink does not validate the link target, and
+// they resolve correctly inside the container once bind-mounted (e.g. neo4j:
+// data -> /data). They are harmless on the host because os.Root refuses to
+// extract any later entry *through* them. The returned slice contains
+// descriptions of such out-of-scope symlinks (e.g., "name -> target") for
+// caller-side debug logging. See ENG-430.
 func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64, []string, error) {
+	// destDir must already exist — the caller (ExtractImageContent) creates it
+	// before calling. os.OpenRoot opens it as a confinement root for every
+	// extraction op below; it returns a clear error if destDir is missing.
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		return 0, nil, fmt.Errorf("open destination root %s: %w", destDir, err)
+	}
+	defer func() { _ = root.Close() }()
+
 	tr := tar.NewReader(src)
 	var totalBytes int64
 	var outOfScope []string
@@ -571,16 +587,20 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 			return totalBytes, outOfScope, fmt.Errorf("reading tar header: %w", err)
 		}
 
-		// Reject absolute paths and path traversal.
-		clean := filepath.Clean(hdr.Name)
-		if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+		// name is the entry path relative to destDir (the os.Root). Reject absolute
+		// paths and ".." that climbs above the root (a bare ".." or a leading
+		// "../"); a name that merely starts with ".." but is a real filename (e.g.
+		// "..data" from a Kubernetes atomic writer) is not traversal and is allowed.
+		// os.Root would reject true traversal anyway — this yields a clear,
+		// entry-named error.
+		name := filepath.Clean(hdr.Name)
+		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
 			return totalBytes, outOfScope, fmt.Errorf("tar entry has unsafe path: %q", hdr.Name)
 		}
-
-		target := filepath.Join(destDir, clean)
-		// Verify resolved path stays within destDir.
-		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(filepath.Separator)) && target != filepath.Clean(destDir) {
-			return totalBytes, outOfScope, fmt.Errorf("tar entry escapes destination: %q", hdr.Name)
+		// "." / "./" / "" entries refer to the extraction root itself, which fred
+		// already created and owns; skip them so a tar cannot mkdir/chown destDir.
+		if name == "." {
+			continue
 		}
 
 		// Strip setuid/setgid bits.
@@ -588,67 +608,62 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if mkErr := os.MkdirAll(target, os.FileMode(hdr.Mode)&os.ModePerm|0o700); mkErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("mkdir %s: %w", clean, mkErr)
+			if mkErr := root.MkdirAll(name, os.FileMode(hdr.Mode)&os.ModePerm|0o700); mkErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("mkdir %s: %w", name, mkErr)
 			}
-			if chErr := os.Chown(target, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
-				return totalBytes, outOfScope, fmt.Errorf("chown dir %s: %w", clean, chErr)
+			if chErr := root.Lchown(name, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
+				return totalBytes, outOfScope, fmt.Errorf("chown dir %s: %w", name, chErr)
 			}
 
 		case tar.TypeReg:
-			// Note: OpenFile could follow a symlink created earlier in the archive,
-			// writing outside destDir despite the prefix check. This is not exploitable
-			// here because the tar source is always Docker's CopyFromContainer API,
-			// which walks the filesystem without following symlinks — so a symlink entry
-			// is never followed by regular file entries "inside" it.
 			if totalBytes+hdr.Size > maxBytes {
 				return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d byte limit", maxBytes)
 			}
-			if mkErr := os.MkdirAll(filepath.Dir(target), 0o700); mkErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("mkdir for %s: %w", clean, mkErr)
+			if dir := filepath.Dir(name); dir != "." {
+				if mkErr := root.MkdirAll(dir, 0o700); mkErr != nil {
+					return totalBytes, outOfScope, fmt.Errorf("mkdir for %s: %w", name, mkErr)
+				}
 			}
-			f, fErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&os.ModePerm)
+			// root.OpenFile will not follow a symlink that escapes the root, so a
+			// same-name or ancestor symlink left by an earlier entry cannot redirect
+			// this write outside destDir.
+			f, fErr := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&os.ModePerm)
 			if fErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("create %s: %w", clean, fErr)
+				return totalBytes, outOfScope, fmt.Errorf("create %s: %w", name, fErr)
 			}
 			n, copyErr := io.Copy(f, tr)
 			closeErr := f.Close()
 			if copyErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("write %s: %w", clean, copyErr)
+				return totalBytes, outOfScope, fmt.Errorf("write %s: %w", name, copyErr)
 			}
 			if closeErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("close %s: %w", clean, closeErr)
+				return totalBytes, outOfScope, fmt.Errorf("close %s: %w", name, closeErr)
 			}
 			totalBytes += n
-			if chErr := os.Chown(target, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
-				return totalBytes, outOfScope, fmt.Errorf("chown %s: %w", clean, chErr)
+			if chErr := root.Lchown(name, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
+				return totalBytes, outOfScope, fmt.Errorf("chown %s: %w", name, chErr)
 			}
 
 		case tar.TypeSymlink:
-			// Symlinks with out-of-scope targets (absolute or ..-prefixed) are
-			// created as-is. They'll be dangling on the host but resolve correctly
-			// inside the container once bind-mounted (e.g., neo4j: data -> /data).
-			// Docker's CopyFromContainer doesn't follow symlinks when building the
-			// tar, so subsequent entries won't traverse through them on the host.
-			escaped := filepath.IsAbs(hdr.Linkname) || strings.HasPrefix(filepath.Clean(hdr.Linkname), "..")
-			if !escaped {
-				// For relative symlinks, verify the resolved target stays within destDir.
-				resolved := filepath.Join(filepath.Dir(target), hdr.Linkname)
-				if !strings.HasPrefix(resolved, filepath.Clean(destDir)+string(filepath.Separator)) && resolved != filepath.Clean(destDir) {
-					escaped = true
-				}
-			}
-			if escaped {
+			// Out-of-scope (absolute or ..-escaping) targets are recorded for
+			// caller-side debug logging. The link is still created verbatim —
+			// os.Root.Symlink does not validate the target, and it resolves correctly
+			// inside the container once bind-mounted (e.g. neo4j: data -> /data). It
+			// is harmless on the host because every op here goes through the root, so
+			// no later entry can be extracted *through* it.
+			if symlinkTargetEscapes(name, hdr.Linkname) {
 				outOfScope = append(outOfScope, fmt.Sprintf("%s -> %s", hdr.Name, hdr.Linkname))
 			}
-			if mkErr := os.MkdirAll(filepath.Dir(target), 0o700); mkErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("mkdir for symlink %s: %w", clean, mkErr)
+			if dir := filepath.Dir(name); dir != "." {
+				if mkErr := root.MkdirAll(dir, 0o700); mkErr != nil {
+					return totalBytes, outOfScope, fmt.Errorf("mkdir for symlink %s: %w", name, mkErr)
+				}
 			}
-			if symlinkErr := os.Symlink(hdr.Linkname, target); symlinkErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("symlink %s -> %s: %w", clean, hdr.Linkname, symlinkErr)
+			if symlinkErr := root.Symlink(hdr.Linkname, name); symlinkErr != nil {
+				return totalBytes, outOfScope, fmt.Errorf("symlink %s -> %s: %w", name, hdr.Linkname, symlinkErr)
 			}
-			if chErr := os.Lchown(target, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
-				return totalBytes, outOfScope, fmt.Errorf("lchown symlink %s: %w", clean, chErr)
+			if chErr := root.Lchown(name, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
+				return totalBytes, outOfScope, fmt.Errorf("lchown symlink %s: %w", name, chErr)
 			}
 
 		default:
@@ -657,6 +672,19 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 		}
 	}
 	return totalBytes, outOfScope, nil
+}
+
+// symlinkTargetEscapes reports whether a symlink at name (relative to the
+// extraction root) pointing at linkname resolves outside the root — an absolute
+// target, or a relative target with enough ".." to climb above the root. Such
+// links are still created (os.Root.Symlink permits an unvalidated target); this
+// only flags them for caller-side debug logging.
+func symlinkTargetEscapes(name, linkname string) bool {
+	if filepath.IsAbs(linkname) {
+		return true
+	}
+	resolved := filepath.Join(filepath.Dir(name), linkname)
+	return resolved == ".." || strings.HasPrefix(resolved, ".."+string(filepath.Separator))
 }
 
 // readFileFromContainer extracts a single file from a container using
