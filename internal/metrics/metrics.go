@@ -130,6 +130,26 @@ var (
 		Name:      "signer_oog_retries_total",
 		Help:      "Total out-of-gas retry decisions by outcome (retried, exhausted)",
 	}, []string{"result"})
+
+	// GasSimulationTotal counts per-tx gas-simulation outcomes.
+	// result ∈ {simulated, fallback, refused}.
+	GasSimulationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "chain",
+		Name:      "gas_simulation_total",
+		Help:      "Per-tx gas simulation outcomes (simulated, fallback, refused).",
+	}, []string{"result"})
+
+	// GasSimulated records the gas magnitude (simulated or fallback) chosen for
+	// a broadcast, so over-pay magnitude is observable at the default unbounded
+	// max_gas_limit. Label-free (cardinality discipline).
+	GasSimulated = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "chain",
+		Name:      "gas_simulated",
+		Help:      "Gas magnitude (simulated or fallback) declared for a broadcast.",
+		Buckets:   []float64{100_000, 200_000, 300_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000},
+	})
 )
 
 // Reconciliation metrics
