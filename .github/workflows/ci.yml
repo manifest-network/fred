@@ -109,6 +109,15 @@ jobs:
           # (the numbered "Vulnerability #N:" headers — informational, non-called
           # findings are intentionally excluded) against the allowlist.
           called="$(grep -oE '^Vulnerability #[0-9]+: GO-[0-9]+-[0-9]+' "$report" | grep -oE 'GO-[0-9]+-[0-9]+' | sort -u)"
+          # Fail closed if exit 3 parsed zero headers. exit 3 guarantees >=1
+          # CALLED vuln, so an empty $called means the report format changed and
+          # the parse silently missed everything — which would otherwise sail
+          # through to a false PASS (empty $called => empty $unexpected). Treat a
+          # parse that contradicts the exit code as a gate failure.
+          if [ -z "$called" ]; then
+            echo "::error::govulncheck exited 3 but no 'Vulnerability #N: GO-...' headers were parsed; the report format may have changed. Failing closed."
+            exit 1
+          fi
           allowed="$(grep -oE 'GO-[0-9]+-[0-9]+' "$allowlist" | sort -u)"
           unexpected="$(comm -23 <(printf '%s\n' "$called") <(printf '%s\n' "$allowed") | grep -E 'GO-' || true)"
 

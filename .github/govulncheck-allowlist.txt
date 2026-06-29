@@ -18,7 +18,7 @@ GO-2026-5668   docker/docker — no patched release
 GO-2026-5617   docker/docker — no patched release
 GO-2026-4887   docker/docker — no patched release
 GO-2026-4883   docker/docker — no patched release
-GO-2026-4610   docker/cli fix exists (v29.2.0) but also reachable via docker/compose v2 with no fix
+GO-2026-4610   no fix on the binding path — reachable via docker/compose v2 (Fixed in: N/A); the separate docker/cli v29.2.0 fix does not resolve the compose-reachable instance
 #
 # ── Category B: fix exists upstream, but bumping cascades through the
 #    docker/compose v2 toolchain (containerd, buildkit, in-toto are
