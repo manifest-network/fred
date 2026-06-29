@@ -1,6 +1,6 @@
 module github.com/manifest-network/fred
 
-go 1.25.11
+go 1.26.4
 
 require (
 	cosmossdk.io/errors v1.0.2
