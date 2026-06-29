@@ -86,7 +86,15 @@ jobs:
           trap 'rm -f "$report"' EXIT
 
           govulncheck ./... | tee "$report"
-          status=${PIPESTATUS[0]}
+          pipestatus=("${PIPESTATUS[@]}")
+          status=${pipestatus[0]}
+          # Fail closed if tee could not record the report: the comparison below
+          # reads $report, and gating on a truncated/empty report would bias
+          # toward a false PASS (the unsafe direction for a deny gate).
+          if [ "${pipestatus[1]}" -ne 0 ]; then
+            echo "::error::failed to write govulncheck report (tee exit ${pipestatus[1]}); refusing to gate on an incomplete report."
+            exit 1
+          fi
 
           if [ "$status" -eq 0 ]; then
             echo "govulncheck: no vulnerabilities found."
