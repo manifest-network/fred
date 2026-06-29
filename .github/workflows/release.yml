@@ -4,21 +4,50 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege by default; the release job elevates only what it needs.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
-  release:
+  # Green-CI gate: re-run the core checks against the exact tagged commit so we
+  # never publish (and sign) artifacts from code that doesn't build/test/lint
+  # clean. The integration + govulncheck gates already ran when the commit
+  # merged to main; this is the fast, release-blocking subset.
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          fetch-depth: 0 # GoReleaser needs full history for changelog
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test -short ./...
+      - name: Lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.9.0 # keep in sync with .github/workflows/ci.yml
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release + upload artifacts
+      packages: write # push the container image to ghcr.io
+      id-token: write # cosign keyless signing (Sigstore Fulcio/Rekor OIDC)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # GoReleaser needs full history for the changelog
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      # Tools GoReleaser shells out to: cosign (keyless signing) and syft (SBOMs).
+      - uses: sigstore/cosign-installer@v3
+      - uses: anchore/sbom-action/download-syft@v0
 
       - uses: docker/setup-buildx-action@v3
 

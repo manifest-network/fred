@@ -52,6 +52,45 @@ dockers:
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
 
+# Software Bill of Materials (syft) per release archive.
+sboms:
+  - id: archives
+    artifacts: archive
+
+# Keyless cosign signature over the checksums file (Sigstore: Fulcio cert +
+# Rekor transparency log, via the workflow's OIDC token — no long-lived keys).
+# Because the checksums file lists every artifact's digest, verifying this one
+# signature — then each artifact against the signed checksums — validates all
+# archives and SBOMs. Produces a self-contained
+# .sigstore.json bundle; verify with:
+#   cosign verify-blob --bundle checksums.txt.sigstore.json \
+#     --certificate-identity-regexp '^https://github\.com/manifest-network/fred/\.github/workflows/release\.yml@refs/tags/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     checksums.txt
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+# Keyless cosign signature over the published container image, by digest.
+# Verify with: cosign verify ghcr.io/manifest-network/fred:<tag> \
+#   --certificate-identity-regexp '^https://github\.com/manifest-network/fred/\.github/workflows/release\.yml@refs/tags/' \
+#   --certificate-oidc-issuer https://token.actions.githubusercontent.com
+docker_signs:
+  - cmd: cosign
+    artifacts: images
+    args:
+      - sign
+      - "${artifact}@${digest}"
+      - "--yes"
+    output: true
+
 changelog:
   sort: asc
   groups:
