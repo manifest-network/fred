@@ -2395,7 +2395,7 @@ func TestClient_simulateGas_happyPath(t *testing.T) {
 }
 
 func TestClient_simulateGas_rejectsOverCap(t *testing.T) {
-	c, signer := newTestClientWithGas(t, 1_500_000 /*maxGasLimit*/, 2_000_000, 1.2)
+	c, signer := newTestClientWithGas(t, 1_500_000 /*gasLimit*/, 2_000_000 /*maxGasLimit*/, 1.2)
 	c.txService = &mockTxService{SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
 		return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 3_400_000}}, nil // adjusted ≈ 4.08M > 2M cap
 	}}

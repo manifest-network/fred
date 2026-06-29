@@ -282,7 +282,7 @@ func (c *Client) simulateGas(ctx context.Context, signer *Signer, msgs []sdktype
 	}
 	adjusted, err := signer.adjustGas(simRes.GasInfo.GasUsed) // read GasUsed; adjustment only (no clamp)
 	if err != nil {
-		return 0, accResp.Account, err
+		return 0, accResp.Account, fmt.Errorf("simulate: %w", err)
 	}
 	if signer.maxGasLimit > 0 && adjusted > signer.maxGasLimit {
 		metrics.GasSimulationTotal.WithLabelValues("refused").Inc()
@@ -555,6 +555,10 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msgs
 	// below reassigns this variable (gasLimitOverride = &increased), not a new
 	// inner one, so the ladder climbs from simGas.
 	gasLimitOverride := &simGas
+
+	if opts.maxRetries == 0 {
+		opts.maxRetries = 1
+	}
 
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = txInitialBackoff

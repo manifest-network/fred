@@ -271,14 +271,16 @@ func (s *Signer) adjustGas(raw uint64) (uint64, error) {
 	}
 	adjustedInt := s.gasAdjustment.MulInt(math.NewIntFromUint64(raw)).TruncateInt()
 	if !adjustedInt.IsUint64() {
-		return 0, fmt.Errorf("gas adjustment overflow: gasLimit=%d * %s = %s exceeds uint64", raw, s.gasAdjustment, adjustedInt)
+		return 0, fmt.Errorf("gas adjustment overflow: gas=%d * %s = %s exceeds uint64", raw, s.gasAdjustment, adjustedInt)
 	}
 	return adjustedInt.Uint64(), nil
 }
 
 // adjustAndCapGas applies gas_adjustment then clamps to maxGasLimit (if set).
-// This preserves the legacy normal-path semantics used by signTxInternal,
-// FallbackGas, and the OOG ladder.
+// It applies the maxGasLimit cap on all paths (including when the adjustment
+// is a no-op). This is safe because config validation enforces
+// max_gas_limit >= gas_limit, so capping a no-op adjustment never truncates
+// a value that was already within range.
 func (s *Signer) adjustAndCapGas(raw uint64) (uint64, error) {
 	adjusted, err := s.adjustGas(raw)
 	if err != nil {

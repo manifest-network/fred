@@ -16,6 +16,7 @@ import (
 	cryptocodec "github.com/cosmos/cosmos-sdk/crypto/codec"
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/tx/signing"
 	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
 	authtx "github.com/cosmos/cosmos-sdk/x/auth/tx"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
@@ -75,7 +76,7 @@ func newTestSigner(t *testing.T) *Signer {
 	}
 }
 
-// newTestAccountAny packs a BaseAccount into *codectypes.Any for SignTx.
+// newTestAccountAny packs a BaseAccount into *codectypes.Any for signing transactions.
 func newTestAccountAny(t *testing.T, addr sdk.AccAddress, accNum, seq uint64) *codectypes.Any {
 	t.Helper()
 
@@ -104,7 +105,10 @@ func newDeterministicTestSigner(t *testing.T) *Signer {
 	if err != nil {
 		t.Fatalf("fixed-key account: %v", err)
 	}
-	addr, _ := rec.GetAddress()
+	addr, err := rec.GetAddress()
+	if err != nil {
+		t.Fatalf("get address: %v", err)
+	}
 	s.address = addr.String()
 	return s
 }
@@ -717,12 +721,26 @@ func TestSigner_BuildSimTx(t *testing.T) {
 		t.Fatalf("declared gas = %d, want %d (simDeclaredGas)", feeTx.GetGas(), simDeclaredGas)
 	}
 	sigTx := decoded.(authsigning.SigVerifiableTx)
-	sigs, _ := sigTx.GetSignaturesV2()
+	sigs, err := sigTx.GetSignaturesV2()
+	if err != nil {
+		t.Fatalf("GetSignaturesV2: %v", err)
+	}
 	if len(sigs) != 1 {
 		t.Fatalf("want exactly one (empty) signature, got %d", len(sigs))
 	}
 	if sigs[0].Sequence != 9 {
 		t.Fatalf("sim tx must use the on-chain sequence 9, got %d", sigs[0].Sequence)
+	}
+	if sigs[0].PubKey == nil {
+		t.Fatalf("sim tx must carry the real pubkey (non-nil)")
+	}
+	sigData, ok := sigs[0].Data.(*signing.SingleSignatureData)
+	if !ok {
+		t.Fatalf("sig data must be *signing.SingleSignatureData, got %T", sigs[0].Data)
+	}
+	// After protobuf encode+decode, nil becomes []byte{} — check length, not pointer identity.
+	if len(sigData.Signature) != 0 {
+		t.Fatalf("sim tx signature must be empty (nil before encode), got %x", sigData.Signature)
 	}
 }
 
