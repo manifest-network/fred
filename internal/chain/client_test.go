@@ -2541,6 +2541,34 @@ func TestClient_simBreaker_halfOpenRecovers(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Task 10: broadcastMultiMsgTx fold + preAccount single-query
+// ---------------------------------------------------------------------------
+
+func TestClient_broadcastMultiMsgTx_simulatesGas(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var signedGas uint64
+	c.txService = &mockTxService{SimulateFn: okSimulate(180000), BroadcastTxFn: captureGas(t, &signedGas, c, signer), GetTxFn: okGetTx()}
+	_, err := c.broadcastMultiMsgTx(context.Background(), []sdktypes.Msg{newTestMsg(signer.Address()), newTestMsg(signer.Address())})
+	if err != nil {
+		t.Fatalf("broadcastMultiMsgTx: %v", err)
+	}
+	if signedGas != 216000 { // floor(1.2 * 180000) — simulated, not the static gas_limit
+		t.Fatalf("multi-msg declared gas = %d, want 216000 (simulated)", signedGas)
+	}
+}
+
+func TestClient_broadcast_singleAccountQueryOnFirstAttempt(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var accountQueries int
+	c.authQuery = countingAuthQuery(c.authQuery, &accountQueries)
+	c.txService = &mockTxService{SimulateFn: okSimulate(200000), BroadcastTxFn: okBroadcast(), GetTxFn: okGetTx()}
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if accountQueries != 1 {
+		t.Fatalf("attempt 1 must reuse the sim account; want 1 Account query, got %d", accountQueries)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

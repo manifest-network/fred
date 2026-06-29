@@ -247,58 +247,14 @@ func (c *Client) Conn() *grpc.ClientConn {
 
 // broadcastMultiMsgTx broadcasts multiple messages in a single transaction
 // using the primary signer. Returns error on failure; callers handle fallback.
+// Fail-fast (single attempt): callers are startup EnsureGrants/EnsureFunding,
+// which fall back to per-msg broadcasts and must fit the 60s boot budget.
+// Simulation still applies — the pre-seed runs once before the single attempt.
 func (c *Client) broadcastMultiMsgTx(ctx context.Context, msgs []sdktypes.Msg) (string, error) {
 	if len(msgs) == 0 {
 		return "", nil
 	}
-	if len(msgs) == 1 {
-		return c.broadcastTx(ctx, msgs[0])
-	}
-
-	signer := c.signerPool.Primary()
-	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
-		Address: signer.Address(),
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to query account: %w", err)
-	}
-
-	txBytes, err := signer.SignTxMulti(ctx, msgs, accResp.Account)
-	if err != nil {
-		return "", fmt.Errorf("failed to sign multi-msg transaction: %w", err)
-	}
-
-	resp, err := c.txService.BroadcastTx(ctx, &tx.BroadcastTxRequest{
-		TxBytes: txBytes,
-		Mode:    tx.BroadcastMode_BROADCAST_MODE_SYNC,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to broadcast transaction: %w", err)
-	}
-
-	if resp.TxResponse.Code != 0 {
-		return "", &ChainTxError{
-			Code:      resp.TxResponse.Code,
-			Codespace: resp.TxResponse.Codespace,
-			RawLog:    resp.TxResponse.RawLog,
-		}
-	}
-
-	txHash := resp.TxResponse.TxHash
-	execResp, err := c.waitForTx(ctx, txHash)
-	if err != nil {
-		return "", fmt.Errorf("failed waiting for tx %s: %w", txHash, err)
-	}
-
-	if execResp.TxResponse.Code != 0 {
-		return "", &ChainTxError{
-			Code:      execResp.TxResponse.Code,
-			Codespace: execResp.TxResponse.Codespace,
-			RawLog:    execResp.TxResponse.RawLog,
-		}
-	}
-
-	return txHash, nil
+	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), msgs, broadcastOpts{maxRetries: 1})
 }
 
 // simulateGas estimates gas for msgs via the Simulate RPC, applies
