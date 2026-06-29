@@ -80,6 +80,28 @@ func newTestAccountAny(t *testing.T, addr sdk.AccAddress, accNum, seq uint64) *c
 	return accountAny
 }
 
+const testMnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+// newDeterministicTestSigner creates a Signer with a fixed mnemonic so that
+// secp256k1 (RFC-6979-deterministic) signatures are reproducible across runs.
+// Use this for byte-level / golden-file assertions; use newTestSigner for
+// gas-value assertions where reproducibility of the key is not required.
+func newDeterministicTestSigner(t *testing.T) *Signer {
+	t.Helper()
+	s := newTestSigner(t)
+	supported, _ := s.keyring.SupportedAlgorithms()
+	if err := s.keyring.Delete("testkey"); err != nil {
+		t.Fatalf("delete random key: %v", err)
+	}
+	rec, err := s.keyring.NewAccount("testkey", testMnemonic, keyring.DefaultBIP39Passphrase, sdk.FullFundraiserPath, supported[0])
+	if err != nil {
+		t.Fatalf("fixed-key account: %v", err)
+	}
+	addr, _ := rec.GetAddress()
+	s.address = addr.String()
+	return s
+}
+
 func TestPassphraseReader_RepeatedReads(t *testing.T) {
 	r := newPassphraseReader("mypassword")
 	expected := []byte("mypassword\n")

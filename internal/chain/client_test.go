@@ -13,11 +13,13 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"cosmossdk.io/math"
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	"github.com/cosmos/cosmos-sdk/types/tx"
@@ -101,6 +103,7 @@ type mockTxService struct {
 	tx.ServiceClient
 	BroadcastTxFn func(ctx context.Context, req *tx.BroadcastTxRequest, opts ...grpc.CallOption) (*tx.BroadcastTxResponse, error)
 	GetTxFn       func(ctx context.Context, req *tx.GetTxRequest, opts ...grpc.CallOption) (*tx.GetTxResponse, error)
+	SimulateFn    func(ctx context.Context, req *tx.SimulateRequest, opts ...grpc.CallOption) (*tx.SimulateResponse, error)
 }
 
 func (m *mockTxService) BroadcastTx(ctx context.Context, req *tx.BroadcastTxRequest, opts ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
@@ -115,6 +118,13 @@ func (m *mockTxService) GetTx(ctx context.Context, req *tx.GetTxRequest, opts ..
 		return m.GetTxFn(ctx, req, opts...)
 	}
 	panic("mockTxService.GetTx not implemented")
+}
+
+func (m *mockTxService) Simulate(ctx context.Context, req *tx.SimulateRequest, opts ...grpc.CallOption) (*tx.SimulateResponse, error) {
+	if m.SimulateFn != nil {
+		return m.SimulateFn(ctx, req, opts...)
+	}
+	panic("mockTxService.Simulate not implemented")
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +154,106 @@ func newMockClient(opts ...func(*Client)) *Client {
 		c.providerAddress = c.signerPool.ProviderAddress()
 	}
 	return c
+}
+
+// ---------------------------------------------------------------------------
+// Task-0 gas-test helpers
+// ---------------------------------------------------------------------------
+
+// newTestClientWithGas returns a *Client (single-signer pool, authQuery returning
+// a fixed account for the signer) plus the *Signer it uses, with the given gas
+// params. Random-key signer — fine for gas-VALUE assertions; use
+// newDeterministicTestSigner for byte-level assertions.
+func newTestClientWithGas(t *testing.T, gasLimit, maxGasLimit uint64, adj float64) (*Client, *Signer) {
+	t.Helper()
+	s := newTestSigner(t)
+	s.gasLimit, s.maxGasLimit = gasLimit, maxGasLimit
+	if adj > 0 {
+		d, err := math.LegacyNewDecFromStr(strconv.FormatFloat(adj, 'f', -1, 64))
+		if err != nil {
+			t.Fatalf("adjustment: %v", err)
+		}
+		s.gasAdjustment = d
+	}
+	addr, err := sdktypes.AccAddressFromBech32(s.Address())
+	if err != nil {
+		t.Fatalf("addr: %v", err)
+	}
+	acct := newTestAccountAny(t, addr, 1, 1)
+	c := newMockClient(func(c *Client) {
+		c.signerPool = newTestSignerPoolFromSigner(s)
+		c.authQuery = &mockAuthQuery{AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: acct}, nil
+		}}
+	})
+	return c, s
+}
+
+func okSimulate(gasUsed uint64) func(context.Context, *tx.SimulateRequest, ...grpc.CallOption) (*tx.SimulateResponse, error) {
+	return func(context.Context, *tx.SimulateRequest, ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: gasUsed}}, nil
+	}
+}
+func okBroadcast() func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+	return func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+		return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "ABCD"}}, nil
+	}
+}
+func okGetTx() func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+	return func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+		return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "ABCD"}}, nil
+	}
+}
+
+// captureGas returns a BroadcastTxFn that decodes the broadcast tx, records its
+// declared gas into *out, and returns success.
+func captureGas(t *testing.T, out *uint64, _ *Client, signer *Signer) func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+	return func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+		decoded, err := signer.txConfig.TxDecoder()(req.TxBytes)
+		if err != nil {
+			t.Fatalf("decode broadcast tx: %v", err)
+		}
+		*out = decoded.(sdktypes.FeeTx).GetGas()
+		return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "ABCD"}}, nil
+	}
+}
+
+// countingAuthQuery wraps an authQuery, incrementing *n on each Account call.
+func countingAuthQuery(inner authtypes.QueryClient, n *int) authtypes.QueryClient {
+	return &mockAuthQuery{AccountFn: func(ctx context.Context, req *authtypes.QueryAccountRequest, opts ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+		*n++
+		return inner.Account(ctx, req, opts...)
+	}}
+}
+
+// outOfGasGetTxOnce returns a GetTxFn yielding an out-of-gas (code 11) execution
+// result on the first call and success thereafter — drives exactly one OOG ladder
+// bump. (OOG is an execution result surfaced by GetTx, not the BroadcastTx ack;
+// mirrors the existing retry tests' code 11.)
+func outOfGasGetTxOnce() func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+	var n int
+	return func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+		n++
+		code := uint32(0)
+		if n == 1 {
+			code = 11
+		}
+		return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: code, Codespace: "sdk", RawLog: "out of gas", TxHash: req.Hash}}, nil
+	}
+}
+
+// seqMismatchBroadcastOnce returns a BroadcastTxFn yielding a sequence-mismatch
+// (code 32) ack on the first call and success thereafter (mirrors the existing
+// retry tests' code 32 at client_test.go:1410).
+func seqMismatchBroadcastOnce() func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+	var n int
+	return func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+		n++
+		if n == 1 {
+			return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 32, Codespace: "sdk", RawLog: "account sequence mismatch, expected 5, got 4"}}, nil
+		}
+		return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "OK"}}, nil
+	}
 }
 
 // ---------------------------------------------------------------------------
