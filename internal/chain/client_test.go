@@ -145,6 +145,7 @@ func newMockClient(opts ...func(*Client)) *Client {
 		txPollInterval: 10 * time.Millisecond,
 		txTimeout:      500 * time.Millisecond,
 		queryPageLimit: 100,
+		now:            time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -2480,6 +2481,62 @@ func TestClient_broadcast_fallbackOnTransientSim(t *testing.T) {
 	}
 	if signedGas != 1_800_000 { // FallbackGas() = floor(1.2 * 1.5M), NOT raw 1.5M
 		t.Fatalf("fallback declared gas = %d, want 1800000", signedGas)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task-9: circuit-breaker tests
+// ---------------------------------------------------------------------------
+
+func TestClient_simBreaker_opensAfterConsecutiveFailures(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var simCalls int
+	c.txService = &mockTxService{
+		SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			simCalls++
+			return nil, status.Error(codes.Unavailable, "down")
+		},
+		BroadcastTxFn: okBroadcast(), GetTxFn: okGetTx(),
+	}
+	for i := 0; i < simBreakerThreshold+2; i++ {
+		_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	}
+	if simCalls > simBreakerThreshold {
+		t.Fatalf("breaker open: Simulate should be skipped after %d failures, got %d calls", simBreakerThreshold, simCalls)
+	}
+}
+
+// §8.17 — half-open recovery: advancing the injected clock past the cooldown
+// re-attempts Simulate (this is the whole reason `now` is a seam).
+func TestClient_simBreaker_halfOpenRecovers(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	clock := time.Unix(1_000_000, 0)
+	c.now = func() time.Time { return clock } // controllable clock (overrides newMockClient's time.Now)
+	failing := true
+	var simCalls int
+	c.txService = &mockTxService{
+		SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			simCalls++
+			if failing {
+				return nil, status.Error(codes.Unavailable, "down")
+			}
+			return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 200000}}, nil
+		},
+		BroadcastTxFn: okBroadcast(), GetTxFn: okGetTx(),
+	}
+	for i := 0; i < simBreakerThreshold; i++ { // open the breaker
+		_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	}
+	openCalls := simCalls
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if simCalls != openCalls {
+		t.Fatalf("breaker should be open (Simulate skipped); got an extra call")
+	}
+	failing = false
+	clock = clock.Add(simBreakerCooldown + time.Second) // advance past cooldown → half-open
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if simCalls != openCalls+1 {
+		t.Fatalf("after cooldown, Simulate must be re-attempted (half-open); got %d, want %d", simCalls, openCalls+1)
 	}
 }
 

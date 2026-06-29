@@ -11,6 +11,7 @@ import (
 	stdmath "math"
 	"os"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -62,7 +63,66 @@ const (
 
 	// defaultTxTimeout is the default timeout for waiting for tx inclusion.
 	defaultTxTimeout = 60 * time.Second
+
+	// simBreakerThreshold is the number of consecutive Simulate failures before
+	// the circuit-breaker opens and Simulate is skipped for simBreakerCooldown.
+	simBreakerThreshold = 5
+
+	// simBreakerCooldown is the duration the breaker stays open (skipping
+	// Simulate) after simBreakerThreshold consecutive failures.
+	simBreakerCooldown = 30 * time.Second
+
+	// simTimeout is the per-Simulate RPC deadline, decoupled from the broadcast
+	// deadline so a slow node doesn't exhaust the whole broadcast budget.
+	simTimeout = 5 * time.Second
 )
+
+// simBreaker is a consecutive-failure circuit-breaker for the Simulate RPC.
+// Zero value is ready to use (breaker starts closed). All methods are safe for
+// concurrent use.
+type simBreaker struct {
+	mu           sync.Mutex
+	consecutive  int
+	openUntilUTC time.Time
+}
+
+// allow reports whether Simulate should be attempted at time now.
+// Returns true when the breaker is closed or the cooldown has expired.
+func (b *simBreaker) allow(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !now.Before(b.openUntilUTC)
+}
+
+// recordSuccess resets the consecutive-failure counter and closes the breaker.
+func (b *simBreaker) recordSuccess() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.consecutive = 0
+	b.openUntilUTC = time.Time{}
+}
+
+// recordFailure increments the consecutive counter and opens the breaker when
+// the threshold is reached.
+func (b *simBreaker) recordFailure(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.consecutive++
+	if b.consecutive >= simBreakerThreshold {
+		b.openUntilUTC = now.Add(simBreakerCooldown)
+	}
+}
+
+// fallbackGasOrRaw returns the FallbackGas for the signer, degrading to the
+// raw gas_limit on overflow (never returns 0).
+func fallbackGasOrRaw(signer *Signer) uint64 {
+	fb, err := signer.FallbackGas()
+	if err != nil {
+		slog.Error("FallbackGas overflow; using raw gas_limit", "error", err, "gas_limit", signer.gasLimit)
+		return signer.gasLimit
+	}
+	return fb
+}
 
 // broadcastOpts carries per-call broadcast tuning.
 type broadcastOpts struct {
@@ -83,6 +143,8 @@ type Client struct {
 	txPollInterval  time.Duration
 	txTimeout       time.Duration
 	queryPageLimit  uint64
+	simBreaker      simBreaker       // consecutive-failure circuit-breaker for Simulate
+	now             func() time.Time // injectable clock (time.Now in production; overridable in tests)
 }
 
 // ClientConfig holds configuration for the chain client.
@@ -145,6 +207,7 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 		txPollInterval:  txPollInterval,
 		txTimeout:       txTimeout,
 		queryPageLimit:  uint64(queryPageLimit),
+		now:             time.Now,
 	}, nil
 }
 
@@ -252,7 +315,9 @@ func (c *Client) simulateGas(ctx context.Context, signer *Signer, msgs []sdktype
 	if err != nil {
 		return 0, accResp.Account, fmt.Errorf("simulate: build: %w", err)
 	}
-	simRes, err := c.txService.Simulate(ctx, &tx.SimulateRequest{TxBytes: simBytes})
+	simCtx, cancel := context.WithTimeout(ctx, simTimeout)
+	defer cancel()
+	simRes, err := c.txService.Simulate(simCtx, &tx.SimulateRequest{TxBytes: simBytes})
 	if err != nil {
 		return 0, accResp.Account, fmt.Errorf("simulate: %w", err)
 	}
@@ -501,23 +566,33 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msgs
 	var txHash string
 	var seqOverride *uint64 // sequence override from a previous sequence-mismatch error
 
-	// Pre-seed: simulate gas once before the backoff loop. Terminal refusal is
-	// returned immediately; transient failure degrades to FallbackGas.
-	simGas, preAccount, simErr := c.simulateGas(ctx, signer, msgs)
-	switch {
-	case errors.Is(simErr, errGasExceedsCap):
-		return "", simErr // terminal: already counted "refused" in simulateGas
-	case simErr != nil:
-		fb, fbErr := signer.FallbackGas()
-		if fbErr != nil {
-			fb = signer.gasLimit // overflow: degrade to raw gas_limit, never 0
-			slog.Error("FallbackGas overflow; using raw gas_limit", "error", fbErr, "gas_limit", fb)
+	// Pre-seed: simulate gas once before the backoff loop. The circuit-breaker
+	// skips Simulate while open (after simBreakerThreshold consecutive failures)
+	// and re-attempts after simBreakerCooldown. Terminal refusal is returned
+	// immediately; transient failure degrades to FallbackGas.
+	var simGas uint64
+	var preAccount *codectypes.Any
+	if c.simBreaker.allow(c.now()) {
+		var simErr error
+		simGas, preAccount, simErr = c.simulateGas(ctx, signer, msgs)
+		switch {
+		case errors.Is(simErr, errGasExceedsCap):
+			// Simulate itself succeeded — the result merely exceeded the cap.
+			// Count it as a success so a cap-reject doesn't trip the breaker.
+			c.simBreaker.recordSuccess()
+			return "", simErr
+		case simErr != nil:
+			c.simBreaker.recordFailure(c.now())
+			simGas = fallbackGasOrRaw(signer)
+			metrics.GasSimulationTotal.WithLabelValues("fallback").Inc()
+			slog.Warn("gas simulation failed; using fallback ceiling", "error", simErr, "fallback_gas", simGas)
+		default:
+			c.simBreaker.recordSuccess()
+			metrics.GasSimulationTotal.WithLabelValues("simulated").Inc()
 		}
-		simGas = fb
+	} else {
+		simGas = fallbackGasOrRaw(signer) // breaker open: skip Simulate (no RPC round-trip)
 		metrics.GasSimulationTotal.WithLabelValues("fallback").Inc()
-		slog.Warn("gas simulation failed; using fallback ceiling", "error", simErr, "fallback_gas", simGas)
-	default:
-		metrics.GasSimulationTotal.WithLabelValues("simulated").Inc()
 	}
 	metrics.GasSimulated.Observe(float64(simGas))
 	// SOLE declaration of gasLimitOverride at function scope. The OOG closure
