@@ -300,6 +300,14 @@ func (s *Signer) adjustAndCapGas(raw uint64) (uint64, error) {
 	return adjusted, nil
 }
 
+// FallbackGas returns the Simulate-failure fallback gas: the configured
+// gas_limit run through the same adjustment+cap as the success path. This is
+// the single source of truth for the degraded path (byte-for-byte the legacy
+// effective default), used by the broadcast pre-seed when Simulate is down.
+func (s *Signer) FallbackGas() (uint64, error) {
+	return s.adjustAndCapGas(s.gasLimit)
+}
+
 // SignWithPrivKey signs using the keyring.
 func SignWithPrivKey(
 	ctx context.Context,

@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -57,6 +58,13 @@ func (e *ChainTxError) IsOutOfGas() bool {
 func (e *ChainTxError) IsInsufficientFee() bool {
 	return e.Codespace == "sdk" && e.Code == 13
 }
+
+// errGasExceedsCap is returned when a successful gas simulation's adjusted
+// estimate exceeds the configured max_gas_limit. It is TERMINAL — the caller
+// must NOT fall back and submit (that would defeat the operator's reject-cap;
+// clamp-and-submit is the Hermes post-multiplier OOG anti-pattern). Distinct
+// from a transient simulate failure, which DOES fall back.
+var errGasExceedsCap = errors.New("estimated gas exceeds max_gas_limit")
 
 // reExpectedSeq extracts "expected N, got M" from Cosmos SDK sequence mismatch errors.
 // False positives are prevented by the IsSequenceMismatch() guard in ExpectedSequence(),

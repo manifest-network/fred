@@ -680,6 +680,17 @@ func TestSigner_signTxInternal_GoldenBytes(t *testing.T) {
 	}
 }
 
+func TestSigner_FallbackGas(t *testing.T) {
+	s := newTestSignerForGas(t, 1_500_000 /*gasLimit*/, 0, 1.2)
+	got, err := s.FallbackGas()
+	if err != nil {
+		t.Fatalf("FallbackGas: %v", err)
+	}
+	if got != 1_800_000 { // floor(1.2 * 1.5M)
+		t.Fatalf("FallbackGas = %d, want 1800000", got)
+	}
+}
+
 func TestSigner_adjustGas_and_adjustAndCapGas(t *testing.T) {
 	tests := []struct {
 		name                      string
