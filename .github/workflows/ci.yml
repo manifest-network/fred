@@ -18,7 +18,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       - name: Build
         run: go build -v ./...
@@ -31,12 +31,15 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       - name: Test
-        # Note: -race flag omitted due to memory constraints on GitHub runners.
-        # Run `go test -race ./...` locally before pushing critical changes.
-        run: go test -v ./...
+        # -short skips the load/stress and benchmark-style tests (guarded by
+        # testing.Short()): the 100K-event stress test is timing-flaky in CI and
+        # the race-stress tests OOM the runner. They still run locally / on demand.
+        # -race is also omitted here due to runner memory; run
+        # `go test -race -short ./...` locally before pushing concurrency changes.
+        run: go test -short -v ./...
 
   lint:
     runs-on: ubuntu-latest
@@ -46,7 +49,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
