@@ -142,16 +142,6 @@ func (s *Signer) Address() string {
 	return s.address
 }
 
-// SignTx builds, signs, and encodes a single-message transaction.
-func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
-	return s.SignTxMulti(ctx, []sdk.Msg{msg}, accountAny)
-}
-
-// SignTxMulti builds, signs, and encodes a transaction with one or more messages.
-func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
-	return s.signTxInternal(ctx, msgs, accountAny, nil, nil)
-}
-
 // signTxInternal is the shared implementation for signing transactions.
 // If seqOverride is non-nil, its value is used instead of the account's on-chain
 // sequence. A pointer is used because sequence 0 is a valid Cosmos SDK value

@@ -226,7 +226,7 @@ func TestSigner_SignTx(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 42, 7)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, txBytes)
 
@@ -253,7 +253,7 @@ func TestSigner_SignTx_MinimumFee(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 
 	tx, err := s.txConfig.TxDecoder()(txBytes)
@@ -280,7 +280,7 @@ func TestSigner_SignTx_LargeGasFeeNoOverflow(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 
 	tx, err := s.txConfig.TxDecoder()(txBytes)
@@ -303,7 +303,7 @@ func signTxAndDecodeFee(t *testing.T, s *Signer) sdk.Coins {
 	addr, err := sdk.AccAddressFromBech32(s.address)
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -365,7 +365,7 @@ func TestSigner_SignTx_CeilingFee_UnderDivisorHitsMin(t *testing.T) {
 		"fee below minFeeAmount must clamp to 1; got %s", fee)
 }
 
-func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
+func TestSigner_signTxInternal_MultipleMessages(t *testing.T) {
 	s := newTestSigner(t)
 
 	addr, err := sdk.AccAddressFromBech32(s.address)
@@ -379,7 +379,7 @@ func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
 		newTestMsg(s.address),
 	}
 
-	txBytes, err := s.SignTxMulti(t.Context(), msgs, accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), msgs, accountAny, nil, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, txBytes)
 
@@ -474,7 +474,7 @@ func TestSigner_SignTx_GasAdjustment_Applied(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -522,7 +522,7 @@ func TestSigner_SignTx_GasAdjustment_RespectsMaxCap(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -561,7 +561,7 @@ func TestSigner_SignTx_GasAdjustment_OverflowReturnsError(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	_, err = s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	_, err = s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.Error(t, err, "overflow must be detected and surface as an error")
 	assert.Contains(t, err.Error(), "gas adjustment overflow",
 		"error message must identify the overflow root cause")
@@ -580,7 +580,7 @@ func TestSigner_SignTx_GasAdjustment_ExactlyOneIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -618,7 +618,7 @@ func TestSigner_SignTx_InvalidAccount(t *testing.T) {
 		Value:   []byte("garbage"),
 	}
 
-	_, err := s.SignTx(t.Context(), newTestMsg(s.address), wrongAny)
+	_, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, wrongAny, nil, nil)
 	assert.Error(t, err)
 }
 
