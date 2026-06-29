@@ -2354,6 +2354,52 @@ func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Task 7: simulateGas tests
+// ---------------------------------------------------------------------------
+
+func TestClient_simulateGas_happyPath(t *testing.T) {
+	c, signer := newTestClientWithGas(t /*gasLimit*/, 1_500_000 /*maxGasLimit*/, 0 /*adj*/, 1.2)
+	c.txService = &mockTxService{SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 200000}}, nil
+	}}
+	gas, acct, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if err != nil {
+		t.Fatalf("simulateGas: %v", err)
+	}
+	if gas != 240000 { // floor(1.2 * 200000)
+		t.Fatalf("gas = %d, want 240000", gas)
+	}
+	if acct == nil {
+		t.Fatalf("expected preAccount returned for reuse")
+	}
+}
+
+func TestClient_simulateGas_rejectsOverCap(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000 /*maxGasLimit*/, 2_000_000, 1.2)
+	c.txService = &mockTxService{SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 3_400_000}}, nil // adjusted ≈ 4.08M > 2M cap
+	}}
+	_, _, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if !errors.Is(err, errGasExceedsCap) {
+		t.Fatalf("want errGasExceedsCap, got %v", err)
+	}
+}
+
+func TestClient_simulateGas_transientError(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	c.txService = &mockTxService{SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return nil, status.Error(codes.Unavailable, "rpc down")
+	}}
+	_, acct, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if err == nil || errors.Is(err, errGasExceedsCap) {
+		t.Fatalf("want transient (non-cap) error, got %v", err)
+	}
+	if acct == nil {
+		t.Fatalf("transient error must still return the account for attempt-1 reuse")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

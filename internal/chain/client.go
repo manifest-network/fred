@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	"github.com/cosmos/cosmos-sdk/types/tx"
@@ -228,6 +229,38 @@ func (c *Client) broadcastMultiMsgTx(ctx context.Context, msgs []sdktypes.Msg) (
 	}
 
 	return txHash, nil
+}
+
+// simulateGas estimates gas for msgs via the Simulate RPC, applies
+// gas_adjustment, and enforces the max_gas_limit reject-cap. It returns the
+// adjusted gas, the account it queried (so the caller can reuse it for the
+// first broadcast attempt — same committed sequence, no duplicate query), and
+// an error. A returned errGasExceedsCap is TERMINAL (do not fall back).
+func (c *Client) simulateGas(ctx context.Context, signer *Signer, msgs []sdktypes.Msg) (uint64, *codectypes.Any, error) {
+	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{Address: signer.Address()})
+	if err != nil {
+		return 0, nil, fmt.Errorf("simulate: query account: %w", err)
+	}
+	simBytes, err := signer.BuildSimTx(msgs, accResp.Account, simDeclaredGas) // small fixed declared gas (NOT gasLimit/maxGasLimit)
+	if err != nil {
+		return 0, accResp.Account, fmt.Errorf("simulate: build: %w", err)
+	}
+	simRes, err := c.txService.Simulate(ctx, &tx.SimulateRequest{TxBytes: simBytes})
+	if err != nil {
+		return 0, accResp.Account, fmt.Errorf("simulate: %w", err)
+	}
+	if simRes.GasInfo == nil { // malformed/empty response from a buggy RPC — classify transient (→ fallback), don't nil-panic
+		return 0, accResp.Account, fmt.Errorf("simulate: nil gas_info")
+	}
+	adjusted, err := signer.adjustGas(simRes.GasInfo.GasUsed) // read GasUsed; adjustment only (no clamp)
+	if err != nil {
+		return 0, accResp.Account, err
+	}
+	if signer.maxGasLimit > 0 && adjusted > signer.maxGasLimit {
+		metrics.GasSimulationTotal.WithLabelValues("refused").Inc()
+		return 0, accResp.Account, fmt.Errorf("%w: estimated gas %d exceeds max_gas_limit %d", errGasExceedsCap, adjusted, signer.maxGasLimit)
+	}
+	return adjusted, accResp.Account, nil
 }
 
 // recordQueryMetrics records duration for a chain query.
