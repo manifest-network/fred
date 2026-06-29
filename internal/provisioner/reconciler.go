@@ -1240,7 +1240,7 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 func (r *Reconciler) Start(ctx context.Context) error {
 	// Add jitter (0-25% of interval) to prevent thundering herd when
 	// multiple fred instances start simultaneously.
-	jitter := time.Duration(rand.Int64N(int64(r.interval / 4)))
+	jitter := time.Duration(rand.Int64N(int64(r.interval / 4))) //nolint:gosec // G404: non-crypto jitter for thundering-herd avoidance; only offsets a startup timer, never security-sensitive
 	slog.Info("starting periodic reconciliation",
 		"interval", r.interval,
 		"initial_jitter", jitter,

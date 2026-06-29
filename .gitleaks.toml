@@ -1,0 +1,19 @@
+# gitleaks config for fred.
+#
+# Extends the upstream default ruleset and allowlists the paths that
+# legitimately contain high-entropy NON-secret strings: test fixtures
+# (synthetic lease UUIDs, mock callback tokens, example payload hashes) and
+# planning docs (example values). PRODUCTION code is still fully scanned, so a
+# real credential committed under internal/ or cmd/ still fails the gate.
+#
+# This runs in addition to GitHub's native secret scanning + push protection.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and planning docs: synthetic/example high-entropy strings, not real secrets"
+paths = [
+  '''_test\.go$''',
+  '''^docs/''',
+]

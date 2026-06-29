@@ -18,6 +18,7 @@ linters:
     - nilerr
     - errorlint
     - exhaustruct
+    - gosec
   settings:
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
@@ -33,6 +34,16 @@ linters:
         - diagnostic
     misspell:
       locale: US
+    gosec:
+      # G115 (integer-overflow on conversion) has a very high false-positive
+      # rate; every site flagged in this repo is bounded/validated (manifest
+      # port specs 1-65535, file modes masked with ModePerm, clamped page
+      # limits, chain-derived SKU counts, lossless int64<->uint64 time
+      # round-trips). G104 (unhandled errors) duplicates errcheck, which is
+      # enabled above and already tuned for this repo. Exclude both rule-wide.
+      excludes:
+        - G115
+        - G104
   exclusions:
     rules:
       # Exclude test files from strict linters
@@ -44,6 +55,7 @@ linters:
           - gocritic
           - errorlint
           - misspell
+          - gosec
       # Exclude cmd tools from strict linters
       - path: ^cmd/
         linters:
@@ -53,6 +65,25 @@ linters:
       - path: ^internal/testutil/
         linters:
           - errcheck
+      # gosec tar-extraction findings in lifecycle.go's sanitizeAndExtractTar:
+      # verified non-exploitable (lexical destDir containment + maxBytes cap +
+      # Docker CopyFromContainer does not follow symlinks). Structural O_NOFOLLOW
+      # hardening is tracked in ENG-430, which is actively reworking this code;
+      # scoped here to avoid churning that file. Remove when ENG-430 lands.
+      - path: internal/backend/docker/lifecycle\.go
+        linters:
+          - gosec
+        text: "G304|G305|G110"
+      # Volume drivers shell out to btrfs/xfs/zfs and read per-volume metadata
+      # files by design. Every exec uses a constant binary with discrete argv
+      # (no shell -> no command injection), and every path is rooted at the
+      # trusted provider-config dataPath; the only tenant-influenced segment
+      # (service name) is regex-validated (serviceNameRe, a DNS label), so no
+      # traversal or flag-injection is possible. Verified non-exploitable.
+      - path: internal/backend/docker/volume_.*\.go
+        linters:
+          - gosec
+        text: "G204|G304"
       # Exclude deprecated API warnings from dependencies we can't control
       - linters:
           - staticcheck

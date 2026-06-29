@@ -114,7 +114,7 @@ func clientNamePinner(allowed []string) func(tls.ConnectionState) error {
 
 // loadCertPool reads a PEM bundle and returns a pool containing its certs.
 func loadCertPool(file string) (*x509.CertPool, error) {
-	pem, err := os.ReadFile(file)
+	pem, err := os.ReadFile(file) //nolint:gosec // G304: file is an operator-configured TLS cert/CA path, read at startup — not tenant-reachable
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", file, err)
 	}
