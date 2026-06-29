@@ -2569,6 +2569,29 @@ func TestClient_broadcast_singleAccountQueryOnFirstAttempt(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Task 11: Startup batch fail-fast budget lock
+// ---------------------------------------------------------------------------
+
+func TestClient_broadcastMultiMsgTx_failsFast(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var broadcastCalls int
+	c.txService = &mockTxService{
+		SimulateFn: okSimulate(180000),
+		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			broadcastCalls++
+			return nil, status.Error(codes.Unavailable, "batch down") // retryable
+		},
+	}
+	_, err := c.broadcastMultiMsgTx(context.Background(), []sdktypes.Msg{newTestMsg(signer.Address()), newTestMsg(signer.Address())})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if broadcastCalls != 1 {
+		t.Fatalf("broadcastMultiMsgTx must fail fast: want 1 broadcast attempt, got %d (ladder would retry)", broadcastCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

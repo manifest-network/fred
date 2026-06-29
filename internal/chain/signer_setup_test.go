@@ -8,6 +8,7 @@ import (
 
 	"cosmossdk.io/math"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	"github.com/cosmos/cosmos-sdk/x/authz"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	"github.com/stretchr/testify/assert"
@@ -324,4 +325,40 @@ func TestEnsureFunding_BalanceQueryFailure_SkipsSubSigner(t *testing.T) {
 	err := EnsureFunding(t.Context(), bankQ, broadcaster, pool, minBalance, topUp)
 	require.NoError(t, err)
 	assert.Equal(t, int32(1), broadcastCount.Load(), "should fund only the sub-signer whose balance was queryable")
+}
+
+// ---------------------------------------------------------------------------
+// Task 11: Grant/funding sim-coverage assertion (AC#9 / §8.16)
+// ---------------------------------------------------------------------------
+
+func TestEnsureGrants_batchCarriesSimulatedGas(t *testing.T) {
+	// EnsureGrants no-ops on a zero-sub-signer pool (signer_setup.go:47), so use a
+	// pool WITH a sub-signer; then it actually broadcasts a MsgGrant batch whose
+	// declared gas we capture. Assert it == 216000 (floor(1.2*180000)), not static.
+	pool := newTestSignerPool(t, 1) // 1 sub-signer so EnsureGrants doesn't early-return
+	primary := pool.Primary()
+	primary.gasAdjustment, _ = math.LegacyNewDecFromStr("1.2") // 180000 sim → 216000 declared
+	addr, err := sdk.AccAddressFromBech32(primary.Address())
+	if err != nil {
+		t.Fatalf("addr: %v", err)
+	}
+	acct := newTestAccountAny(t, addr, 1, 1)
+	var declaredGas uint64
+	c := newMockClient(func(c *Client) {
+		c.signerPool = pool
+		c.authQuery = &mockAuthQuery{AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: acct}, nil
+		}}
+	})
+	c.txService = &mockTxService{SimulateFn: okSimulate(180000), BroadcastTxFn: captureGas(t, &declaredGas, c, primary), GetTxFn: okGetTx()}
+	// mockAuthzQuerier reporting no existing grants → EnsureGrants broadcasts a MsgGrant batch.
+	authzQ := &mockAuthzQuerier{grantsFn: func(context.Context, *authz.QueryGrantsRequest, ...grpc.CallOption) (*authz.QueryGrantsResponse, error) {
+		return &authz.QueryGrantsResponse{}, nil // empty → all grants missing
+	}}
+	if err := EnsureGrants(context.Background(), authzQ, c, pool); err != nil {
+		t.Fatalf("EnsureGrants: %v", err)
+	}
+	if declaredGas != 216000 {
+		t.Fatalf("grant batch declared gas = %d, want 216000 (simulated, not static gas_limit)", declaredGas)
+	}
 }
