@@ -2592,6 +2592,81 @@ func TestClient_broadcastMultiMsgTx_failsFast(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Task 11b: §8 invariant regression tests
+// ---------------------------------------------------------------------------
+
+// §8.8 — OOG ladder climbs FROM the simulated value (not from the configured gas_limit).
+func TestClient_ladderClimbsFromSimulated(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var declared []uint64
+	c.txService = &mockTxService{
+		SimulateFn: okSimulate(200000), // → 240000 seed (gasAdjustment 1.2)
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			decoded, _ := signer.txConfig.TxDecoder()(req.TxBytes)
+			declared = append(declared, decoded.(sdktypes.FeeTx).GetGas())
+			return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX"}}, nil
+		},
+		GetTxFn: outOfGasGetTxOnce(), // first execution OOGs (code 11) → exactly one ladder bump
+	}
+	if _, err := c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts()); err != nil {
+		t.Fatalf("broadcast: %v", err)
+	}
+	if len(declared) < 2 || declared[0] != 240000 || declared[1] != 360000 { // 240000 then ×1.5
+		t.Fatalf("ladder must climb from simulated 240000→360000, got %v", declared)
+	}
+}
+
+// §8.11 — Simulate runs exactly once per call; a seq-mismatch retry must NOT re-simulate.
+func TestClient_simulateOncePerCall(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var simCalls int
+	c.txService = &mockTxService{
+		SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			simCalls++
+			return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 200000}}, nil
+		},
+		BroadcastTxFn: seqMismatchBroadcastOnce(), // 1st ack: code-32 seq-mismatch → retry; 2nd: ok
+		GetTxFn:       okGetTx(),
+	}
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if simCalls != 1 {
+		t.Fatalf("Simulate must run once per call (gas is seq-independent), even across a seq-mismatch retry; got %d", simCalls)
+	}
+}
+
+// §8.15 — FallbackGas overflow degrades to the raw gas_limit, NEVER to 0.
+func TestClient_fallbackOverflowDegradesToRaw(t *testing.T) {
+	const big = uint64(1)<<63 - 1 // MaxInt64; ×3.0 overflows uint64 in adjustGas
+	c, signer := newTestClientWithGas(t, big, 0, 3.0)
+	var declared uint64
+	c.txService = &mockTxService{
+		SimulateFn: func(context.Context, *tx.SimulateRequest, ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			return nil, status.Error(codes.Unavailable, "down")
+		},
+		BroadcastTxFn: captureGas(t, &declared, c, signer),
+		GetTxFn:       okGetTx(),
+	}
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if declared != big { // degrades to raw gas_limit, NEVER 0
+		t.Fatalf("FallbackGas overflow must degrade to raw gas_limit %d, got %d", big, declared)
+	}
+}
+
+// §8.6 — max_gas_limit==0 means unbounded: a large simulated GasUsed must NOT be refused or capped.
+func TestClient_noCapWhenMaxGasLimitZero(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0 /*maxGasLimit*/, 1.2)
+	// Set SimulateFn BEFORE calling simulateGas — the default mockTxService panics when SimulateFn is nil.
+	c.txService = &mockTxService{SimulateFn: okSimulate(10_000_000)}
+	got, _, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if err != nil {
+		t.Fatalf("must not refuse when max_gas_limit==0: %v", err)
+	}
+	if got != 12_000_000 {
+		t.Fatalf("uncapped gas = %d, want 12000000", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
