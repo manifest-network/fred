@@ -308,6 +308,56 @@ func (s *Signer) FallbackGas() (uint64, error) {
 	return s.adjustAndCapGas(s.gasLimit)
 }
 
+// simDeclaredGas is the gas declared on the sim tx. It is a small fixed value
+// (mirrors the SDK's flags.DefaultGasLimit). It must NEVER be gasLimit or
+// maxGasLimit: those are operator-tunable (morpheus runs gasLimit=4M) and at/
+// above block MaxGas every simulation ante-rejects — manifestd runs
+// LimitSimulationGasDecorator under simulate (meter = block MaxGas) and
+// SetUpContextDecorator rejects declared > block MaxGas even under simulate. The
+// measured GasUsed is unaffected (the meter is block-bounded regardless).
+const simDeclaredGas = 200000
+
+// BuildSimTx builds an encoded, zero-fee, dummy-signed tx suitable for the
+// Simulate RPC. The signature is empty (Simulate skips sig verification) but
+// uses the real pubkey + the account's on-chain sequence (Simulate DOES check
+// the sequence). Callers pass simDeclaredGas as declaredGas (see the const).
+//
+// We deliberately do NOT reuse the SDK's clienttx.CalculateGas /
+// Factory.BuildSimTx: they require a tx.Factory + client.Context that fred's
+// custom Signer/keyring never constructs, and CalculateGas applies the
+// adjustment via uint64(adj*float64(GasUsed)) — the float→uint64 truncation
+// fred deliberately replaced with deterministic cosmossdk.io/math (see adjustGas).
+func (s *Signer) BuildSimTx(msgs []sdk.Msg, accountAny *codectypes.Any, declaredGas uint64) ([]byte, error) {
+	var account authtypes.AccountI
+	if err := s.cdc.UnpackAny(accountAny, &account); err != nil {
+		return nil, fmt.Errorf("failed to unpack account: %w", err)
+	}
+	txBuilder, err := s.buildUnsignedTx(msgs, declaredGas, true /*zeroFee*/)
+	if err != nil {
+		return nil, err
+	}
+	keyInfo, err := s.keyring.Key(s.keyName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get key: %w", err)
+	}
+	pubKey, err := keyInfo.GetPubKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public key: %w", err)
+	}
+	sig := signing.SignatureV2{
+		PubKey: pubKey,
+		Data: &signing.SingleSignatureData{
+			SignMode:  signing.SignMode_SIGN_MODE_DIRECT,
+			Signature: nil,
+		},
+		Sequence: account.GetSequence(),
+	}
+	if err := txBuilder.SetSignatures(sig); err != nil {
+		return nil, fmt.Errorf("failed to set sim signature: %w", err)
+	}
+	return s.txConfig.TxEncoder()(txBuilder.GetTx())
+}
+
 // SignWithPrivKey signs using the keyring.
 func SignWithPrivKey(
 	ctx context.Context,

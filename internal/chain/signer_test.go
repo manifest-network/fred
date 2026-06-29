@@ -691,6 +691,41 @@ func TestSigner_FallbackGas(t *testing.T) {
 	}
 }
 
+func TestSigner_BuildSimTx(t *testing.T) {
+	s := newDeterministicTestSigner(t)
+	s.gasLimit, s.maxGasLimit = 1_500_000, 8_000_000 // maxGasLimit large on purpose
+	addr, err := sdk.AccAddressFromBech32(s.Address())
+	if err != nil {
+		t.Fatalf("addr: %v", err)
+	}
+	acct := newTestAccountAny(t, addr, 3 /*accNum*/, 9 /*seq*/)
+	msg := newTestMsg(s.Address())
+
+	raw, err := s.BuildSimTx([]sdk.Msg{msg}, acct, simDeclaredGas)
+	if err != nil {
+		t.Fatalf("BuildSimTx: %v", err)
+	}
+	decoded, err := s.txConfig.TxDecoder()(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	feeTx := decoded.(sdk.FeeTx)
+	if !feeTx.GetFee().IsZero() {
+		t.Fatalf("sim tx fee must be zero, got %s", feeTx.GetFee())
+	}
+	if feeTx.GetGas() != simDeclaredGas { // small fixed const, NEVER gasLimit(1.5M) or maxGasLimit(8M)
+		t.Fatalf("declared gas = %d, want %d (simDeclaredGas)", feeTx.GetGas(), simDeclaredGas)
+	}
+	sigTx := decoded.(authsigning.SigVerifiableTx)
+	sigs, _ := sigTx.GetSignaturesV2()
+	if len(sigs) != 1 {
+		t.Fatalf("want exactly one (empty) signature, got %d", len(sigs))
+	}
+	if sigs[0].Sequence != 9 {
+		t.Fatalf("sim tx must use the on-chain sequence 9, got %d", sigs[0].Sequence)
+	}
+}
+
 func TestSigner_adjustGas_and_adjustAndCapGas(t *testing.T) {
 	tests := []struct {
 		name                      string
