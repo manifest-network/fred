@@ -198,7 +198,7 @@ func parseFlags(args []string, out io.Writer) (configPath string, showVersion bo
 func loadConfig(path string) (k3s.Config, error) {
 	cfg := k3s.DefaultConfig()
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is the -config CLI flag (operator argv, default config.k3s.yaml), read once at startup before the listener binds — not tenant-reachable
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return cfg, fmt.Errorf("config file not found: %s", path)

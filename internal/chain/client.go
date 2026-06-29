@@ -143,12 +143,12 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 // buildTLSConfig creates a TLS configuration for gRPC.
 func buildTLSConfig(caFile string, skipVerify bool) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: skipVerify,
+		InsecureSkipVerify: skipVerify, //nolint:gosec // G402: opt-in operator config grpc_tls_skip_verify (rejected under production_mode, see config.Validate); not tenant-controlled. Matches tlsconfig.go's annotation.
 	}
 
 	// If a CA file is specified, load it
 	if caFile != "" {
-		caCert, err := os.ReadFile(caFile)
+		caCert, err := os.ReadFile(caFile) //nolint:gosec // G304: caFile is the operator-configured gRPC TLS CA path, read at startup — not tenant-reachable
 		if err != nil {
 			return nil, fmt.Errorf("failed to read CA file: %w", err)
 		}

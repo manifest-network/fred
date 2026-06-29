@@ -1,0 +1,23 @@
+# gitleaks config for fred.
+#
+# Extends the upstream default ruleset. The only allowlist scopes the noisy
+# `generic-api-key` rule (high-entropy heuristic) out of test fixtures and
+# planning docs, which legitimately contain synthetic high-entropy strings
+# (test lease UUIDs, mock callback tokens, example payload hashes).
+#
+# Crucially this is scoped via `targetRules` to ONLY generic-api-key — every
+# other (provider-specific) rule (AWS, GCP, private keys, tokens, ...) still
+# scans test files and docs, so a real credential committed anywhere still
+# fails the gate. Production code is fully scanned by every rule. This runs in
+# addition to GitHub's native secret scanning + push protection.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "generic-api-key false positives in test fixtures + planning docs (synthetic high-entropy strings, not real secrets)"
+targetRules = ["generic-api-key"]
+paths = [
+  '''_test\.go$''',
+  '''^docs/''',
+]
