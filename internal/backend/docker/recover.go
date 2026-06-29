@@ -329,6 +329,20 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// (no off-actor field mutation).
 	for uuid, existing := range b.provisions {
 		if _, hasContainers := building[uuid]; hasContainers {
+			// By-design (ENG-414): only the in-flight statuses below are preserved
+			// here. Ready and Failing/Failed deliberately fall through to the
+			// container-derived (materialized) value, so a crashed-then-running lease
+			// recovers to Ready (locked by TestRecoverState_FailCountAntiRegression).
+			// recoverState cannot distinguish that legitimate recovery from the narrow
+			// race where the actor set Failing/Failed (via an event-loop die) AFTER our
+			// pre-merge ListManagedContainers snapshot still showed the container
+			// running — so an actor-set Failing/Failed can be momentarily overwritten
+			// with Ready. This is accepted: it self-heals (the in-flight diag goroutine
+			// completes → evDiagGathered → Failed and rewrites Status; or, once the dead
+			// container is GC'd, the no-containers branch below drops the phantom-Ready
+			// entry) and emits NO duplicate failure callback — Failing and Failed both
+			// Ignore(evContainerDied) (lease_sm.go) and the SM's internal state
+			// (NewStateMachine, not external storage) is unaffected by this map swap.
 			switch existing.Status {
 			case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
 				// In-flight re-provision: the rebuilt containers belong to the
