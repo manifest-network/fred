@@ -16,6 +16,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend: the `releases.db` age reaper (`RemoveOlderThan`,
+  `releases_max_age` default 90d) no longer deletes a live long-lived lease's
+  only manifest-rehydration source. It now retains each lease's most-recent
+  active release and its newest entry, pruning only older history, so a lease
+  running stably for ≥90d survives a backend restart and stays Restartable
+  (previously its record was reaped → `recoverState` left `StackManifest` nil →
+  `Restart`/custom-domain reconcile hard-failed). `Append` now derives the next
+  release version from `max(existing)+1` so within-key pruning cannot reuse a
+  version. (ENG-440)
+
 ### Security
 
 ## [0.6.0] - 2026-06-30
