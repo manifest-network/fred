@@ -77,7 +77,13 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		stackManifest = p.StackManifest
 	})
 	if !exists {
-		// Already deprovisioned — idempotent success.
+		// Already deprovisioned (no live container / in-flight op for this lease).
+		// Still purge any stranded releases.db history before returning: a lease whose
+		// container was already gone at on-chain close reaches doDeprovision via the
+		// lease_closed event but short-circuits here ~400 lines before the terminal
+		// releaseStore.Delete, leaving a stale "active" record that audit-lease-status
+		// flags until the 90-day RemoveOlderThan TTL. (ENG-410)
+		b.purgeReleaseHistory(leaseUUID, logger)
 		return nil
 	}
 	// Decrement activeProvisions on the Ready→Deprovisioning transition so the
@@ -455,11 +461,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			b.persistDiagnostics(diagSnap, nil)
 
 			// Perform the same cleanup as the normal success path.
-			if b.releaseStore != nil {
-				if err := b.releaseStore.Delete(leaseUUID); err != nil {
-					logger.Warn("failed to delete release history", "error", err)
-				}
-			}
+			b.purgeReleaseHistory(leaseUUID, logger)
 			if b.cfg.IsNetworkIsolation() {
 				if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 					logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
@@ -491,11 +493,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	}
 
 	// Clean up release history
-	if b.releaseStore != nil {
-		if err := b.releaseStore.Delete(leaseUUID); err != nil {
-			logger.Warn("failed to delete release history", "error", err)
-		}
-	}
+	b.purgeReleaseHistory(leaseUUID, logger)
 
 	// All containers and volumes removed — delete via the store seam. The map
 	// entry is the *provision wrapper, so GC drops the docker-private
@@ -520,6 +518,22 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// volumes were soft-deleted into the retained namespace without error).
 	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
 	return nil
+}
+
+// purgeReleaseHistory best-effort deletes a lease's releases.db history. It is a
+// no-op when no release store is configured or the key is already absent. Shared by
+// doDeprovision's terminal-success, give-up, and already-deprovisioned (!exists) paths
+// so "delete this lease's release history" has one implementation. The !exists path is
+// what lets a deprovision RPC for an already-containerless lease (e.g. a lease_closed
+// event delivered after the container was gone) still purge its stale "active" record
+// instead of stranding it until the 90-day RemoveOlderThan TTL. (ENG-410)
+func (b *Backend) purgeReleaseHistory(leaseUUID string, logger *slog.Logger) {
+	if b.releaseStore == nil {
+		return
+	}
+	if err := b.releaseStore.Delete(leaseUUID); err != nil {
+		logger.Warn("failed to delete release history", "error", err)
+	}
 }
 
 // recordGiveUpLeak handles a deprovision give-up's abandoned on-disk footprint. It
