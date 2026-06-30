@@ -59,6 +59,19 @@ func TestCheckDemoteFit_PromoteSkipsMeasurement(t *testing.T) {
 	}
 }
 
+func TestCheckDemoteFit_UnresolvableOldSKUFallsThroughToMeasurement(t *testing.T) {
+	// Old SKU "docker-retired" is not in the config → GetSKUProfile returns error
+	// → promote-skip is suppressed → gate falls through to measurement.
+	b := gateBackend(2048*bytesPerMiB+1, nil) // exceeds docker-medium cap
+	rec := gRec("orig1",
+		[]backend.LeaseItem{gItem("docker-retired", "app", 1)},
+		[]string{gRetVol("orig1", "app", 0)})
+	newItems := []backend.LeaseItem{gItem("docker-medium", "app", 1)}
+	if !errors.Is(b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-medium"), b.logger), backend.ErrDemoteDataExceedsTier) {
+		t.Fatalf("unresolvable old SKU must fall through to measurement and refuse when usage exceeds cap")
+	}
+}
+
 func TestCheckDemoteFit_DemoteFitsAtBoundary(t *testing.T) {
 	b := gateBackend(2048*bytesPerMiB, nil) // usage == docker-medium cap exactly
 	rec := gRec("orig1", []backend.LeaseItem{gItem("docker-large", "app", 1)}, []string{gRetVol("orig1", "app", 0)})
@@ -88,7 +101,7 @@ func TestCheckDemoteFit_UnmeasurableRefuses(t *testing.T) {
 }
 
 func TestCheckDemoteFit_MixedLeaseAtomicRefuse(t *testing.T) {
-	// app demotes (4096→2048) and overflows; web promotes (512→2048, skipped). Whole restore refuses.
+	// app (first item) demotes and overflows → refuses before web is even examined.
 	b := gateBackend(2048*bytesPerMiB+1, nil)
 	rec := gRec("orig1",
 		[]backend.LeaseItem{gItem("docker-large", "app", 1), gItem("docker-micro", "web", 1)},
