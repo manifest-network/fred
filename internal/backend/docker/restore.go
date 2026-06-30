@@ -573,6 +573,77 @@ func itemsShapeMatch(a, b []backend.LeaseItem) error {
 	return nil
 }
 
+// checkDemoteFit refuses a restore whose new SKU shrinks a service's disk
+// cap below the retained volume's measured footprint. It is READ-ONLY and
+// runs in the synchronous prelude BEFORE any side effect (reserve / pool /
+// claim / adopt), so a refusal leaves the retained record and volumes
+// untouched — no rollback. The retained volumes are from a closed lease with
+// no running container, so the footprint is static (no TOCTOU on size); a
+// concurrent reaper flipping the record active→reaping is handled by the
+// later atomic ClaimForRestore (loser → ErrNotRestorable). Do NOT cache the
+// Usage result or move this gate after the claim.
+//
+// For each service: a clear promote/same-tier (new ≥ old, both resolvable)
+// skips measurement (the cap only grows). Otherwise every retained stateful
+// volume of that service must satisfy usage ≤ newDiskMB×MiB (equality OK).
+// Over-measuring is the SAFE direction here (refuse = preserve data); see
+// the design spec §5.6. An unmeasurable volume or a demote to an ephemeral
+// (DiskMB=0) tier with retained data is refused.
+func (b *Backend) checkDemoteFit(ctx context.Context, rec *shared.RetentionEntry,
+	newItems []backend.LeaseItem, newProfiles map[string]SKUProfile, logger *slog.Logger) error {
+	retained := make(map[string]struct{}, len(rec.RetainedVolumeNames))
+	for _, n := range rec.RetainedVolumeNames {
+		retained[n] = struct{}{}
+	}
+	oldSKU := make(map[string]string, len(rec.Items))
+	for _, it := range rec.Items {
+		oldSKU[it.ServiceName] = it.SKU
+	}
+	backendKind := b.volumes.Kind()
+	for _, it := range newItems {
+		np, ok := newProfiles[it.SKU]
+		if !ok {
+			return fmt.Errorf("%w: unknown SKU %q", backend.ErrValidation, it.SKU)
+		}
+		newDiskMB := np.DiskMB
+		// Promote/same-tier optimization: skip measurement when the new cap is
+		// not smaller than the (resolvable) old cap.
+		if op, oerr := b.cfg.GetSKUProfile(oldSKU[it.ServiceName]); oerr == nil && newDiskMB >= op.DiskMB {
+			continue
+		}
+		for i := range it.Quantity {
+			name := retainedName(canonicalVolumeName(rec.OriginalLeaseUUID, it.ServiceName, i))
+			if _, isStateful := retained[name]; !isStateful {
+				continue // stateless instance: no retained volume to check
+			}
+			if newDiskMB <= 0 {
+				restoreDemoteRefusedTotal.WithLabelValues(backendKind, "ephemeral_tier").Inc()
+				return fmt.Errorf("%w: service %q: cannot restore stateful data into an ephemeral (disk_mb=0) tier",
+					backend.ErrDemoteDataExceedsTier, it.ServiceName)
+			}
+			usage, uerr := b.volumes.Usage(ctx, name)
+			if uerr != nil {
+				reason := "unmeasurable_read_error"
+				if errors.Is(uerr, errors.ErrUnsupported) {
+					reason = "unmeasurable_backend"
+				}
+				restoreDemoteRefusedTotal.WithLabelValues(backendKind, reason).Inc()
+				return fmt.Errorf("%w: service %q volume %q: cannot measure usage: %w",
+					backend.ErrDemoteDataExceedsTier, it.ServiceName, name, uerr)
+			}
+			capBytes := newDiskMB * bytesPerMiB
+			if usage > capBytes {
+				restoreDemoteRefusedTotal.WithLabelValues(backendKind, "measured_exceeds").Inc()
+				logger.Warn("restore demote refused: retained data exceeds smaller tier",
+					"service", it.ServiceName, "volume", name, "used_bytes", usage, "tier_disk_mb", newDiskMB, "cap_bytes", capBytes)
+				return fmt.Errorf("%w: service %q: %d bytes used exceeds disk_mb=%d cap (%d bytes)",
+					backend.ErrDemoteDataExceedsTier, it.ServiceName, usage, newDiskMB, capBytes)
+			}
+		}
+	}
+	return nil
+}
+
 // releaseAll releases every pool allocation id (best-effort, idempotent).
 func releaseAll(pool *shared.ResourcePool, ids []string) {
 	for _, id := range ids {
