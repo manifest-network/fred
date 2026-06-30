@@ -844,6 +844,20 @@ func setupZFSPool(t *testing.T) (mountPath, poolName string) {
 	return mountPath, poolName
 }
 
+// writeIncompressibleMiB writes mib MiB of incompressible data to path and
+// syncs. ZFS defaults to compression=on, and with any compression setting it
+// stores all-zero blocks as holes — so zero-filled test data (dd if=/dev/zero
+// / make([]byte,N)) would be elided and never consume space, leaving
+// `referenced` at the empty baseline and the refquota unfilled. /dev/urandom is
+// incompressible so the bytes are actually allocated; the sync flushes the txg
+// so `referenced` reflects the write immediately (it updates at txg commit).
+func writeIncompressibleMiB(t *testing.T, path string, mib int) {
+	t.Helper()
+	out, err := exec.Command("dd", "if=/dev/urandom", "of="+path, "bs=1M", fmt.Sprintf("count=%d", mib)).CombinedOutput()
+	require.NoError(t, err, "dd urandom -> %s: %s", path, out)
+	_ = exec.Command("sync").Run()
+}
+
 // TestIntegration_Usage_Btrfs verifies that btrfsVolumeManager.Usage returns
 // the subvolume's referenced bytes within a generous metadata-overhead bound.
 func TestIntegration_Usage_Btrfs(t *testing.T) {
@@ -921,7 +935,7 @@ func TestIntegration_Usage_ZFS(t *testing.T) {
 	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
 
 	const writeMiB = 10
-	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
+	writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), writeMiB)
 
 	got, err := mgr.Usage(ctx, volName)
 	require.NoError(t, err)
@@ -1184,7 +1198,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
 		require.NoError(t, err)
 
-		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
+		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 5)
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
 		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
@@ -1212,9 +1226,11 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		require.NoError(t, err,
 			"zfs set refquota at 20 MiB must succeed when referenced is only ~5 MiB")
 
-		// refquota is now 20 MiB; a write beyond it must fail.
+		// refquota is now 20 MiB; a write beyond it must fail. Use /dev/urandom:
+		// zero-filled data would be stored as holes (ZFS compression=on default)
+		// and never reach the refquota, so dd would spuriously succeed.
 		newHostPath := mgr.HostPath(newCanon)
-		out, werr := exec.Command("dd", "if=/dev/zero",
+		out, werr := exec.Command("dd", "if=/dev/urandom",
 			"of="+filepath.Join(newHostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
 		require.Error(t, werr,
 			"writing 25 MiB beyond the 20 MiB ZFS refquota must fail; dd output: %s", out)
@@ -1272,9 +1288,9 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
 
-		out, werr := exec.Command("dd", "if=/dev/zero",
-			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
-		require.NoError(t, werr, "25 MiB must fit 100 MiB ZFS refquota; dd output: %s", out)
+		// 25 MiB of incompressible data so `referenced` actually reflects it
+		// (ZFS compression=on default would elide zero-filled data as holes).
+		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 25)
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
 		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
