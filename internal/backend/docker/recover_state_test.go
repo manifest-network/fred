@@ -660,11 +660,18 @@ func TestRecoverState_ColdStartFailed_EnrichmentSkippedWhenInstanceReplaced(t *t
 }
 
 // TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest is the ENG-440
-// functional regression: a lease running stably >=90d has one old "active" release;
-// after the age reaper runs (e.g. at the next backend restart) recoverState must STILL
-// rehydrate prov.StackManifest from it. Before the keep-latest fix, RemoveOlderThan
-// whole-key-deleted the record, leaving StackManifest nil -> routeReplaceRestart
-// hard-fails ErrInvalidState "no stored manifest" and the custom-domain reconcile loops.
+// functional regression at the recover layer: a lease running stably >=90d has one old
+// "active" release; after the age reaper runs (e.g. at the next backend restart)
+// recoverState must STILL rehydrate prov.StackManifest from it. Before the keep-latest
+// fix, RemoveOlderThan whole-key-deleted the record, leaving StackManifest nil ->
+// routeReplaceRestart hard-fails ErrInvalidState "no stored manifest" and the
+// custom-domain reconcile loops.
+//
+// This asserts the two NECESSARY conditions for the restart gate (restart_update.go:108-116):
+// the recovered provision is Ready AND its StackManifest is non-nil. That a real Restart
+// then SUCCEEDS end-to-end (the sufficient condition, through the actual constructor
+// reaper-before-recover ordering) is proven by the integration e2e
+// TestIntegration_Docker_AgeReapedReleaseStillRestartable.
 func TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "recover_releases.db")
 	relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
@@ -699,5 +706,7 @@ func TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest(t *testing.
 	b.provisionsMu.RUnlock()
 	require.NotNil(t, p)
 	require.NotNil(t, p.StackManifest,
-		"after the keep-latest fix, an age-reaped lease still rehydrates its manifest and stays Restartable")
+		"after the keep-latest fix, an age-reaped lease still rehydrates its manifest (restart gate's StackManifest!=nil condition)")
+	assert.Equal(t, backend.ProvisionStatusReady, p.Status,
+		"the recovered lease is Ready (the restart gate's other condition)")
 }
