@@ -44,7 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Close-time purge of a containerless lease's release history.** When a deprovision
   reaches `doDeprovision` for a lease with no live container / in-flight op (the
   idempotent no-provision short-circuit), it now still deletes the lease's `releases.db`
-  history before returning, instead of short-circuiting ~before the terminal
+  history before returning, instead of short-circuiting before the terminal
   `releaseStore.Delete`. This stops a `lease_closed` event delivered after the container
   was already gone from stranding a stale `status=active` record (an `audit-lease-status`
   false positive) until the 90-day `RemoveOlderThan` TTL. Best-effort and chain-driven;

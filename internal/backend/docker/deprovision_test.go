@@ -18,7 +18,7 @@ import (
 // TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory proves ENG-410's
 // close-time fix: a lease whose container was already gone at on-chain close has release
 // history but no provision entry (recoverState rebuilds b.provisions from live containers
-// only), so a deprovision RPC hits the !exists short-circuit ~before the terminal
+// only), so a deprovision RPC hits the !exists short-circuit before the terminal
 // releaseStore.Delete and leaves a stale "active" record that audit-lease-status flags
 // until the 90-day RemoveOlderThan TTL. The short-circuit must still purge that history.
 func TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory(t *testing.T) {
