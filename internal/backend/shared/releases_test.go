@@ -339,7 +339,9 @@ func TestReleaseStore_RemoveOlderThan(t *testing.T) {
 
 	removed, err := store.RemoveOlderThan(24 * time.Hour)
 	require.NoError(t, err)
-	assert.Equal(t, 1, removed)
+	// ENG-440: the old lease's lone "active" release is load-bearing (recoverState
+	// rehydrates the manifest from it), so it is now RETAINED, not reaped.
+	assert.Equal(t, 0, removed, "no prunable non-protected entries")
 
 	releases, err := store.List("fresh-lease")
 	require.NoError(t, err)
@@ -347,7 +349,7 @@ func TestReleaseStore_RemoveOlderThan(t *testing.T) {
 
 	releases, err = store.List("old-lease")
 	require.NoError(t, err)
-	assert.Nil(t, releases)
+	assert.Len(t, releases, 1, "the lone old active release is protected and retained")
 }
 
 func TestReleaseStore_AppendCorruptedData(t *testing.T) {
@@ -386,6 +388,11 @@ func TestReleaseStore_InitialCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, store1.Append("old-lease", Release{
+		Image:     "nginx:superseded",
+		Status:    "superseded",
+		CreatedAt: time.Now().Add(-48 * time.Hour),
+	}))
+	require.NoError(t, store1.Append("old-lease", Release{
 		Image:     "nginx:old",
 		Status:    "active",
 		CreatedAt: time.Now().Add(-48 * time.Hour),
@@ -404,9 +411,14 @@ func TestReleaseStore_InitialCleanup(t *testing.T) {
 	require.NoError(t, err)
 	defer store2.Close()
 
+	// ENG-440: the startup cleanup prunes the old superseded entry but RETAINS the
+	// load-bearing active one (keep-latest guard) — proving the initial sweep still
+	// runs and prunes, without destroying the manifest source.
 	old, err := store2.List("old-lease")
 	require.NoError(t, err)
-	assert.Nil(t, old)
+	require.Len(t, old, 1, "old superseded entry pruned, active retained")
+	assert.Equal(t, "nginx:old", old[0].Image)
+	assert.Equal(t, "active", old[0].Status)
 
 	fresh, err := store2.List("fresh-lease")
 	require.NoError(t, err)
@@ -440,4 +452,178 @@ func TestReleaseStore_Append_VersionDerivedFromMax(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 6, latest.Version,
 		"next version must be max(existing)+1 (6), never the len-derived 2")
+}
+
+// TestReleaseStore_RemoveOlderThan_KeepsLoneOldActive is the core ENG-440 guard:
+// a lease running stably >=90d has a single provision-time "active" release, now
+// older than the cutoff. The reaper must NOT delete it — recoverState rehydrates
+// the StackManifest from this record, so reaping it makes the live lease
+// un-Restartable.
+func TestReleaseStore_RemoveOlderThan_KeepsLoneOldActive(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "keep_lone_active.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.Append("lease-1", Release{
+		Manifest:  []byte(`{"image":"nginx:1.25"}`),
+		Image:     "nginx:1.25",
+		Status:    "active",
+		CreatedAt: time.Now().Add(-100 * 24 * time.Hour),
+	}))
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 0, removed, "the lone active release is load-bearing and must be retained")
+
+	active, err := store.LatestActive("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, active, "RemoveOlderThan must not destroy the manifest-rehydration source")
+	assert.Equal(t, "nginx:1.25", active.Image)
+}
+
+// TestReleaseStore_RemoveOlderThan_PrunesOldSupersededTail confirms the reaper still
+// does useful work: it prunes old superseded history while retaining the latest-active
+// and index-latest entries.
+func TestReleaseStore_RemoveOlderThan_PrunesOldSupersededTail(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "prune_tail.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	old := time.Now().Add(-100 * 24 * time.Hour)
+	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.Append("lease-1", Release{Image: "v3", Status: "active", CreatedAt: old}))
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 2, removed, "the two old superseded entries are pruned")
+
+	releases, err := store.List("lease-1")
+	require.NoError(t, err)
+	require.Len(t, releases, 1, "only the protected active/index-latest entry remains")
+	assert.Equal(t, "v3", releases[0].Image)
+	assert.Equal(t, 3, releases[0].Version, "surviving entry keeps its original version")
+}
+
+// TestReleaseStore_RemoveOlderThan_KeepsOldActiveWhenNewestIsFailed locks the
+// version-monotonicity coupling: when the newest entry is a FAILED release appended
+// after the active one, latest-active and index-latest differ. Both are protected, so
+// the global-max version (on the failed index-latest) is never pruned, keeping Append's
+// max+1 collision-free.
+func TestReleaseStore_RemoveOlderThan_KeepsOldActiveWhenNewestIsFailed(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "active_then_failed.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	old := time.Now().Add(-100 * 24 * time.Hour)
+	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "active", CreatedAt: old}))
+	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "failed", CreatedAt: old}))
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 0, removed, "latest-active (v1) and index-latest (v2) are both protected")
+
+	active, err := store.LatestActive("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, "v1", active.Image, "the older active release is the rehydration source and must survive")
+
+	// And a subsequent Append must not reuse v2 (the retained global max).
+	require.NoError(t, store.Append("lease-1", Release{Image: "v3", Status: "deploying", CreatedAt: time.Now()}))
+	latest, err := store.Latest("lease-1")
+	require.NoError(t, err)
+	assert.Equal(t, 3, latest.Version, "next version is max(2)+1=3, never a reused 2")
+}
+
+// TestReleaseStore_RemoveOlderThan_AppendAfterPruneNoVersionReuse is the end-to-end
+// coupling capstone: prune actually removes entries, then Append must still issue a
+// fresh version (proves Change 1 + Change 2 together).
+func TestReleaseStore_RemoveOlderThan_AppendAfterPruneNoVersionReuse(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "prune_then_append.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	old := time.Now().Add(-100 * 24 * time.Hour)
+	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.Append("lease-1", Release{Image: "v3", Status: "active", CreatedAt: old}))
+
+	_, err = store.RemoveOlderThan(90 * 24 * time.Hour) // prunes v1, v2 -> [v3]
+	require.NoError(t, err)
+
+	require.NoError(t, store.Append("lease-1", Release{Image: "v4", Status: "deploying", CreatedAt: time.Now()}))
+	latest, err := store.Latest("lease-1")
+	require.NoError(t, err)
+	assert.Equal(t, 4, latest.Version, "after pruning to [v3], next version is max(3)+1=4, not len-derived 2")
+}
+
+// TestReleaseStore_RemoveOlderThan_EmptyValueRemoved guards the len(releases)==0 path:
+// a null/[] value must be removed like a corrupt key, never panic the sweep.
+func TestReleaseStore_RemoveOlderThan_EmptyValueRemoved(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "empty_value.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(releasesBucketName).Put([]byte("empty-lease"), []byte("[]"))
+	}))
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed, "an empty value is removed like a corrupt key")
+
+	releases, err := store.List("empty-lease")
+	require.NoError(t, err)
+	assert.Nil(t, releases)
+}
+
+// TestReleaseStore_RemoveOlderThan_PrunesOldTailKeepsFreshActive exercises the age
+// predicate on a MIXED-age key: an old superseded entry plus a FRESH active entry.
+// Only the old non-protected entry is pruned; the fresh protected one is kept. (Today
+// the all-or-nothing reaper keeps the whole key because not every entry is old, so this
+// is a genuine RED->GREEN test of the new within-key pruning.)
+func TestReleaseStore_RemoveOlderThan_PrunesOldTailKeepsFreshActive(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mixed_age.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: time.Now().Add(-100 * 24 * time.Hour)}))
+	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "active", CreatedAt: time.Now()})) // fresh
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed, "only the old superseded entry is pruned")
+
+	releases, err := store.List("lease-1")
+	require.NoError(t, err)
+	require.Len(t, releases, 1)
+	assert.Equal(t, "v2", releases[0].Image)
+}
+
+// TestReleaseStore_RemoveOlderThan_CorruptValueRemoved is a regression-lock (green
+// before and after the fix) for the unparseable-value branch: a corrupt value is
+// removed whole-key.
+func TestReleaseStore_RemoveOlderThan_CorruptValueRemoved(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "corrupt_reap.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(releasesBucketName).Put([]byte("corrupt-lease"), []byte("not valid json"))
+	}))
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed, "an unparseable value is removed whole-key")
+
+	releases, err := store.List("corrupt-lease")
+	require.NoError(t, err)
+	assert.Nil(t, releases)
 }
