@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -410,4 +411,33 @@ func TestReleaseStore_InitialCleanup(t *testing.T) {
 	fresh, err := store2.List("fresh-lease")
 	require.NoError(t, err)
 	assert.Len(t, fresh, 1)
+}
+
+// TestReleaseStore_Append_VersionDerivedFromMax verifies Append assigns the next
+// version from max(existing.Version)+1, not len(releases)+1. This matters once
+// RemoveOlderThan's keep-latest guard prunes entries from within a key, leaving a
+// shorter slice whose surviving entry carries a higher version than its length
+// (ENG-440). Seed such a slice directly so len(1) < maxVersion(5).
+func TestReleaseStore_Append_VersionDerivedFromMax(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "version_max.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	seeded, err := json.Marshal([]Release{
+		{Version: 5, Image: "nginx:5", Status: "active", CreatedAt: time.Now()},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(releasesBucketName).Put([]byte("lease-1"), seeded)
+	}))
+
+	require.NoError(t, store.Append("lease-1", Release{
+		Image: "nginx:6", Status: "deploying", CreatedAt: time.Now(),
+	}))
+
+	latest, err := store.Latest("lease-1")
+	require.NoError(t, err)
+	assert.Equal(t, 6, latest.Version,
+		"next version must be max(existing)+1 (6), never the len-derived 2")
 }

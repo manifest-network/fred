@@ -58,6 +58,21 @@ func NewReleaseStore(cfg ReleaseStoreConfig) (*ReleaseStore, error) {
 	return s, nil
 }
 
+// maxVersion returns the highest Version among releases, or 0 for an empty slice.
+// Append derives the next version from this (not len) so that within-key pruning by
+// RemoveOlderThan's keep-latest guard can never cause a version to be reused: the
+// pruning always retains the index-latest entry, which holds the maximum version, so
+// maxVersion(remaining)+1 stays strictly greater than every version ever issued for
+// the lease (ENG-440). Uses the Go 1.21 max builtin (do not name the accumulator
+// `max`, which would shadow it).
+func maxVersion(releases []Release) int {
+	highest := 0
+	for _, r := range releases {
+		highest = max(highest, r.Version)
+	}
+	return highest
+}
+
 // Append adds a new release for a lease, auto-assigning Version.
 func (s *ReleaseStore) Append(leaseUUID string, r Release) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
@@ -71,7 +86,7 @@ func (s *ReleaseStore) Append(leaseUUID string, r Release) error {
 			}
 		}
 
-		r.Version = len(releases) + 1
+		r.Version = maxVersion(releases) + 1
 		releases = append(releases, r)
 
 		encoded, err := json.Marshal(releases)
