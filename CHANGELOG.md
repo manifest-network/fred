@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
@@ -26,9 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Signed releases + SBOMs.** Release artifacts are now signed with keyless
   cosign (Sigstore Fulcio/Rekor — no long-lived keys) and ship a syft SPDX SBOM
   per archive. The signature covers `checksums.txt` (which lists every archive and
-  SBOM digest) and the published container image is signed by digest. Verify with
-  `cosign verify-blob --bundle …` / `cosign verify …` (commands in
-  `.goreleaser.yaml`). (ENG-415)
+  SBOM digest) and the published container image is signed by digest. Verify
+  published artifacts with `cosign verify-blob` / `cosign verify` (full commands
+  in `.goreleaser.yaml`). (ENG-415)
 
 ### Changed
 
