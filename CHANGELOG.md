@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-30
+
 ### Added
 
 - `fred_docker_backend_restore_total{outcome}` metric: restore re-deploy worker
@@ -21,8 +23,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (active→reaping) to honor `max_retained_leases_per_tenant`. Distinct from the global
   `fred_docker_backend_retention_refused_total` (`max_retained_disk_mb`); operators
   can now alert on per-tenant grace loss instead of grepping logs. (ENG-407)
+- **Signed releases + SBOMs.** Release artifacts are now signed with keyless
+  cosign (Sigstore Fulcio/Rekor — no long-lived keys) and ship a syft SPDX SBOM
+  per archive. The signature covers `checksums.txt` (which lists every archive and
+  SBOM digest) and the published container image is signed by digest. Verify with
+  `cosign verify-blob --bundle …` / `cosign verify …` (commands in
+  `.goreleaser.yaml`). (ENG-415)
 
 ### Changed
+
+- **Per-transaction gas simulation.** Chain transactions now estimate gas by
+  simulating each tx (`gas_adjustment` × simulated `GasUsed`) instead of a fixed
+  per-operation value. `gas_limit` is now only the fallback ceiling used when
+  `Simulate` is unavailable, and a new `max_gas_limit` (`0` = uncapped) rejects any
+  tx whose simulated estimate exceeds it. New config knobs: `gas_adjustment` and
+  `max_gas_limit`. (ENG-431)
+- Build: Go toolchain bumped to **1.26.4**; building from source now requires
+  Go ≥ 1.26.4. (#148)
 
 ### Deprecated
 
@@ -43,6 +60,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the already-succeeded restore. (ENG-433)
 
 ### Security
+
+- **Tar extraction hardened against symlink-follow TOCTOU.** Tenant image-content
+  extraction now uses `os.Root` so path resolution is structurally confined to the
+  destination directory, eliminating the symlink-then-write traversal class instead
+  of relying on lexical path checks. (ENG-430)
+- **Supply-chain / CI hardening.** The `govulncheck` gate no longer blanket-
+  suppresses findings: fixable CVEs (`x/crypto`, `x/net`, `spdystream`, and Go
+  stdlib via the 1.26.4 bump) were cleared, with only documented unfixable IDs
+  allowlisted. Added `gosec` static analysis and `gitleaks` secret scanning to CI,
+  and signed releases with SBOMs (see Added). (ENG-415)
 
 ## [0.5.0] - 2026-06-26
 
