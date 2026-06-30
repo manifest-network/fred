@@ -2036,6 +2036,48 @@ func TestHTTPClientRestore_422DoesNotTripBreaker(t *testing.T) {
 	assert.Equal(t, n, requestCount, "all %d requests should have reached the server", n)
 }
 
+// TestHTTPClientRestore_DemoteExceedsTier_DoesNotTripBreaker verifies that a
+// 422 with code="demote_exceeds_tier" (ErrDemoteDataExceedsTier) is treated as
+// a permanent client error and does NOT trip the circuit breaker. This test
+// fails before the ErrDemoteDataExceedsTier allowlist entry is added.
+func TestHTTPClientRestore_DemoteExceedsTier_DoesNotTripBreaker(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"retained data exceeds the requested smaller tier","code":"demote_exceeds_tier"}`))
+	}))
+	defer server.Close()
+
+	// Set a low threshold to make any tripping obvious.
+	const threshold = 3
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-restore-demote-cb",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: threshold,
+	})
+
+	req := RestoreRequest{
+		LeaseUUID:     "new-lease-1",
+		FromLeaseUUID: "old-lease-1",
+		Tenant:        "t",
+		CallbackURL:   "http://fred/callback",
+	}
+
+	// Make more requests than the threshold — circuit must stay closed.
+	const n = threshold * 4
+	for i := range n {
+		err := client.Restore(context.Background(), req)
+		assert.ErrorIs(t, err, ErrDemoteDataExceedsTier, "call %d should return ErrDemoteDataExceedsTier", i+1)
+		assert.NotErrorIs(t, err, ErrCircuitOpen, "circuit must not open on ErrDemoteDataExceedsTier (call %d)", i+1)
+	}
+
+	// All requests should have reached the server (none short-circuited).
+	assert.Equal(t, n, requestCount, "all %d requests should have reached the server", n)
+}
+
 func TestHTTPClientRestore_WithHMAC(t *testing.T) {
 	const secret = "test-secret-for-hmac-restore-abcde"
 

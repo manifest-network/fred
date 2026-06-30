@@ -644,13 +644,15 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrAlreadyProvisioned: 409 from Provision (idempotent duplicate)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
+			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
 			return err == nil ||
 				errors.Is(err, ErrNotProvisioned) ||
 				errors.Is(err, ErrValidation) ||
 				errors.Is(err, ErrInsufficientResources) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
-				errors.Is(err, ErrNotRetained)
+				errors.Is(err, ErrNotRetained) ||
+				errors.Is(err, ErrDemoteDataExceedsTier)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
