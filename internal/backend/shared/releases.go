@@ -58,6 +58,21 @@ func NewReleaseStore(cfg ReleaseStoreConfig) (*ReleaseStore, error) {
 	return s, nil
 }
 
+// maxVersion returns the highest Version among releases, or 0 for an empty slice.
+// Append derives the next version from this (not len) so that within-key pruning by
+// RemoveOlderThan's keep-latest guard can never cause a version to be reused: the
+// pruning always retains the index-latest entry, which holds the maximum version, so
+// maxVersion(remaining)+1 stays strictly greater than every version ever issued for
+// the lease (ENG-440). Uses the Go 1.21 max builtin (do not name the accumulator
+// `max`, which would shadow it).
+func maxVersion(releases []Release) int {
+	highest := 0
+	for _, r := range releases {
+		highest = max(highest, r.Version)
+	}
+	return highest
+}
+
 // Append adds a new release for a lease, auto-assigning Version.
 func (s *ReleaseStore) Append(leaseUUID string, r Release) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
@@ -71,7 +86,7 @@ func (s *ReleaseStore) Append(leaseUUID string, r Release) error {
 			}
 		}
 
-		r.Version = len(releases) + 1
+		r.Version = maxVersion(releases) + 1
 		releases = append(releases, r)
 
 		encoded, err := json.Marshal(releases)
@@ -213,42 +228,94 @@ func (s *ReleaseStore) Delete(leaseUUID string) error {
 	})
 }
 
-// RemoveOlderThan deletes release entries where all releases are older than maxAge.
+// RemoveOlderThan prunes release history older than maxAge while preserving each
+// lease's load-bearing records. For every lease it ALWAYS retains its index-latest
+// entry — the entry the runtime mutators append to / activate, and (because Append
+// assigns the next version to the tail) the holder of the lease's maximum version,
+// which keeps Append's max+1 derivation collision-free — AND, when a distinct one
+// exists, the most-recent "active" release that recoverState rehydrates the
+// StackManifest from (see LatestActive). So it protects one entry when the newest
+// entry is itself the active release or no active release exists, two otherwise. Only
+// entries that are BOTH older than the cutoff AND not protected are pruned, so a
+// lease's record is never emptied and its live manifest is never removed (ENG-440).
+// Corrupt or empty values are removed whole-key. Returns the number of release ENTRIES
+// removed (corrupt/empty keys count as one).
 func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 	removed := 0
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(releasesBucketName)
+
+		// Decide all changes during a read-only cursor pass, then apply them after the
+		// loop. Mutating the bucket (Put/Delete) while the cursor is live can split/
+		// rebalance pages and invalidate the cursor. Cursor keys alias tx-lifetime
+		// pages reused across iterations, so any retained key must be copied.
+		type change struct {
+			key     []byte
+			value   []byte // nil => delete the whole key
+			removed int
+		}
+		var changes []change
+
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var releases []Release
 			if err := json.Unmarshal(v, &releases); err != nil {
 				slog.Warn("deleting corrupted release entry during cleanup",
-					"lease_uuid", string(k),
-					"error", err,
-				)
-				if delErr := c.Delete(); delErr != nil {
-					return delErr
-				}
-				removed++
+					"lease_uuid", string(k), "error", err)
+				changes = append(changes, change{key: append([]byte(nil), k...), removed: 1})
+				continue
+			}
+			if len(releases) == 0 {
+				// Empty/null value: nothing to protect; treat like a corrupt key.
+				changes = append(changes, change{key: append([]byte(nil), k...), removed: 1})
 				continue
 			}
 
-			// Remove entry if all releases are older than cutoff
-			allOld := true
-			for _, r := range releases {
-				if !r.CreatedAt.Before(cutoff) {
-					allOld = false
+			// Protected indices (never pruned): the index-latest entry (holds the max
+			// version) and the most-recent "active" entry (the manifest-rehydration
+			// source). At most two, so plain ints — no per-key map allocation.
+			keepLatest := len(releases) - 1
+			keepActive := -1
+			for i := len(releases) - 1; i >= 0; i-- {
+				if releases[i].Status == "active" {
+					keepActive = i
 					break
 				}
 			}
-			if allOld {
-				if delErr := c.Delete(); delErr != nil {
-					return delErr
+
+			kept := make([]Release, 0, len(releases))
+			prunedHere := 0
+			for i, r := range releases {
+				if i != keepLatest && i != keepActive && r.CreatedAt.Before(cutoff) {
+					prunedHere++
+					continue
 				}
-				removed++
+				kept = append(kept, r)
 			}
+			if prunedHere == 0 {
+				continue // unchanged: don't rewrite an untouched key
+			}
+
+			encoded, err := json.Marshal(kept)
+			if err != nil {
+				return fmt.Errorf("failed to marshal pruned releases for %s: %w", string(k), err)
+			}
+			changes = append(changes, change{key: append([]byte(nil), k...), value: encoded, removed: prunedHere})
+		}
+
+		for _, ch := range changes {
+			if ch.value == nil {
+				if err := b.Delete(ch.key); err != nil {
+					return err
+				}
+			} else {
+				if err := b.Put(ch.key, ch.value); err != nil {
+					return err
+				}
+			}
+			removed += ch.removed
 		}
 		return nil
 	})

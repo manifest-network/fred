@@ -658,3 +658,55 @@ func TestRecoverState_ColdStartFailed_EnrichmentSkippedWhenInstanceReplaced(t *t
 	assert.Equal(t, "fresh-owner-error", p.LastError,
 		"CreatedAt guard must skip the stale enriched write onto a replacement instance; got %q", p.LastError)
 }
+
+// TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest is the ENG-440
+// functional regression at the recover layer: a lease running stably >=90d has one old
+// "active" release; after the age reaper runs (e.g. at the next backend restart)
+// recoverState must STILL rehydrate prov.StackManifest from it. Before the keep-latest
+// fix, RemoveOlderThan whole-key-deleted the record, leaving StackManifest nil ->
+// routeReplaceRestart hard-fails ErrInvalidState "no stored manifest" and the
+// custom-domain reconcile loops.
+//
+// This asserts the two NECESSARY conditions for the restart gate (restart_update.go:108-116):
+// the recovered provision is Ready AND its StackManifest is non-nil. That a real Restart
+// then SUCCEEDS end-to-end (the sufficient condition, through the actual constructor
+// reaper-before-recover ordering) is proven by the integration e2e
+// TestIntegration_Docker_AgeReapedReleaseStillRestartable.
+func TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "recover_releases.db")
+	relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer relStore.Close()
+
+	// One provision-time active release, older than the 90d cutoff.
+	require.NoError(t, relStore.Append("L1", shared.Release{
+		Manifest:  []byte(`{"image":"nginx:1.25"}`),
+		Image:     "stack",
+		Status:    "active",
+		CreatedAt: time.Now().Add(-100 * 24 * time.Hour),
+	}))
+
+	// Simulate the startup/periodic age reap.
+	_, err = relStore.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running", CallbackURL: "http://cb"},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	b.releaseStore = relStore
+	require.NoError(t, b.recoverState(context.Background()))
+
+	b.provisionsMu.RLock()
+	p := b.provisions["L1"]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, p)
+	require.NotNil(t, p.StackManifest,
+		"after the keep-latest fix, an age-reaped lease still rehydrates its manifest (restart gate's StackManifest!=nil condition)")
+	assert.Equal(t, backend.ProvisionStatusReady, p.Status,
+		"the recovered lease is Ready (the restart gate's other condition)")
+}
