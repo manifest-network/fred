@@ -52,6 +52,17 @@ type volumeManager interface {
 	// zfs if mountpoint properties were overridden, but production code
 	// expects default inheritance.
 	HostPath(name string) string
+
+	// Usage returns the volume's current data footprint in BYTES. Backends
+	// without a usage primitive (noop) return an error wrapping
+	// errors.ErrUnsupported (Go 1.21+); callers detect it with
+	// errors.Is(err, errors.ErrUnsupported). Used by the restore demote
+	// fit-gate (checkDemoteFit) to refuse a tier-down that would not fit.
+	Usage(ctx context.Context, id string) (int64, error)
+
+	// Kind returns the backend filesystem name ("btrfs", "xfs", "zfs",
+	// "noop") for metric labeling and logging.
+	Kind() string
 }
 
 // noopVolumeManager is used when no SKUs have disk_mb > 0.
@@ -89,6 +100,17 @@ func (n *noopVolumeManager) RenameVolume(_, _ string) error {
 func (n *noopVolumeManager) HostPath(_ string) string {
 	return ""
 }
+
+// Usage on the noop manager is unsupported — it manages no quota-enforced
+// volumes. Returns a wrapped errors.ErrUnsupported so the demote gate's
+// "unmeasurable" branch detects it via errors.Is. Unreachable in practice:
+// a noop backend never holds a retained stateful volume.
+func (n *noopVolumeManager) Usage(_ context.Context, _ string) (int64, error) {
+	return 0, fmt.Errorf("noop volume manager cannot measure usage: %w", errors.ErrUnsupported)
+}
+
+// Kind identifies the noop backend.
+func (n *noopVolumeManager) Kind() string { return "noop" }
 
 // Filesystem magic numbers from statfs(2).
 const (

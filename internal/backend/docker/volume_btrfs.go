@@ -104,6 +104,14 @@ func (b *btrfsVolumeManager) HostPath(name string) string {
 	return filepath.Join(b.dataPath, name)
 }
 
+// Kind identifies the btrfs backend.
+func (b *btrfsVolumeManager) Kind() string { return "btrfs" }
+
+// Usage is implemented in Task 2.
+func (b *btrfsVolumeManager) Usage(_ context.Context, _ string) (int64, error) {
+	return 0, fmt.Errorf("btrfs usage not implemented: %w", errors.ErrUnsupported)
+}
+
 func (b *btrfsVolumeManager) Validate() error {
 	// Check btrfs binary exists
 	if _, err := exec.LookPath("btrfs"); err != nil {

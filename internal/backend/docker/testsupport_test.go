@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -130,6 +131,12 @@ func (f *fakeVolumeBackend) renamed(oldName, newName string) bool {
 func (f *fakeVolumeBackend) HostPath(name string) string {
 	return filepath.Join("/var/lib/fred/volumes", name)
 }
+
+func (f *fakeVolumeBackend) Usage(_ context.Context, _ string) (int64, error) {
+	return 0, errors.ErrUnsupported
+}
+
+func (f *fakeVolumeBackend) Kind() string { return "fake" }
 
 // fakeReleaseStore wraps a real *shared.ReleaseStore with the test-side
 // helpers expected by the migration tests. The wrapped store is real so the

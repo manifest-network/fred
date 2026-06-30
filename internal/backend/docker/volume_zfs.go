@@ -177,6 +177,14 @@ func (z *zfsVolumeManager) HostPath(name string) string {
 	return filepath.Join(z.dataPath, name)
 }
 
+// Kind identifies the zfs backend.
+func (z *zfsVolumeManager) Kind() string { return "zfs" }
+
+// Usage is implemented in Task 4.
+func (z *zfsVolumeManager) Usage(_ context.Context, _ string) (int64, error) {
+	return 0, fmt.Errorf("zfs usage not implemented: %w", errors.ErrUnsupported)
+}
+
 func (z *zfsVolumeManager) Validate() error {
 	// Check zfs binary exists
 	if _, err := exec.LookPath("zfs"); err != nil {

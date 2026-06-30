@@ -247,6 +247,14 @@ func (x *xfsVolumeManager) HostPath(name string) string {
 	return filepath.Join(x.dataPath, name)
 }
 
+// Kind identifies the xfs backend.
+func (x *xfsVolumeManager) Kind() string { return "xfs" }
+
+// Usage is implemented in Task 3.
+func (x *xfsVolumeManager) Usage(_ context.Context, _ string) (int64, error) {
+	return 0, fmt.Errorf("xfs usage not implemented: %w", errors.ErrUnsupported)
+}
+
 func (x *xfsVolumeManager) Validate() error {
 	// Check xfs_quota binary exists.
 	if _, err := exec.LookPath("xfs_quota"); err != nil {
