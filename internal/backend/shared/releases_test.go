@@ -627,3 +627,30 @@ func TestReleaseStore_RemoveOlderThan_CorruptValueRemoved(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, releases)
 }
+
+// TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive covers the keepActive == -1
+// branch: a lease that only ever failed to deploy (no "active" release) and whose sole
+// entry is older than the cutoff. The index-latest guard alone must retain it — the
+// reaper never empties a non-corrupt key — so the record is preserved (cosmetic-only,
+// but a regression anchor for the no-active path).
+func TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "lone_failed.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.Append("lease-1", Release{
+		Image:     "nginx:failed",
+		Status:    "failed",
+		CreatedAt: time.Now().Add(-100 * 24 * time.Hour),
+	}))
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 0, removed, "the index-latest entry is protected even with no active release")
+
+	releases, err := store.List("lease-1")
+	require.NoError(t, err)
+	require.Len(t, releases, 1, "a non-corrupt key is never emptied")
+	assert.Equal(t, "failed", releases[0].Status)
+}
