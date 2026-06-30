@@ -182,6 +182,20 @@ var (
 		Help:      "Total number of restore re-deploy worker attempts by outcome",
 	}, []string{"outcome"})
 
+	// restoreDemoteRefusedTotal counts restores refused by the demote
+	// fit-gate (checkDemoteFit) because the retained data does not fit the
+	// requested smaller tier, by backend and reason. Fixed-cardinality
+	// labels: backend ∈ {btrfs,xfs,zfs,noop,mock}; reason ∈
+	// {measured_exceeds, unmeasurable_read_error, unmeasurable_backend,
+	// ephemeral_tier}. These are synchronous-prelude refusals NOT counted by
+	// restoresTotal (which is worker-scoped). (ENG-438)
+	restoreDemoteRefusedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "restore_demote_refused_total",
+		Help:      "Restores refused because retained data exceeds the requested smaller tier, by backend and reason",
+	}, []string{"backend", "reason"})
+
 	// reconciliationTotal tracks reconciliation runs by outcome.
 	reconciliationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
