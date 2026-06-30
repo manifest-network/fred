@@ -733,7 +733,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		return fmt.Errorf("%w: corrupt retained record", backend.ErrValidation)
 	}
 	profiles := map[string]SKUProfile{}
-	for _, item := range rec.Items {
+	for _, item := range req.Items {
 		if _, ok := profiles[item.SKU]; ok {
 			continue
 		}
@@ -742,6 +742,11 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			return fmt.Errorf("%w: %w", backend.ErrValidation, perr)
 		}
 		profiles[item.SKU] = p
+	}
+	// Demote fit-gate (read-only; BEFORE any side effect — reserve/pool/claim/
+	// adopt). A refusal leaves the retained record and volumes untouched.
+	if err := b.checkDemoteFit(ctx, rec, req.Items, profiles, logger); err != nil {
+		return err
 	}
 	for svc, m := range rec.StackManifest.Services {
 		// A nil service entry is corruption (provision/recovery validate manifests);
@@ -767,14 +772,14 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			LeaseUUID:         req.LeaseUUID,
 			Tenant:            rec.Tenant,
 			ProviderUUID:      rec.ProviderUUID,
-			SKU:               rec.Items[0].SKU,
+			SKU:               req.Items[0].SKU,
 			Status:            backend.ProvisionStatusProvisioning,
-			Quantity:          totalQuantity(rec.Items),
+			Quantity:          totalQuantity(req.Items),
 			CreatedAt:         time.Now(),
 			FailCount:         0,
 			LastError:         "",
 			CallbackURL:       req.CallbackURL,
-			Items:             slices.Clone(rec.Items),
+			Items:             slices.Clone(req.Items),
 			ContainerIDs:      make([]string, 0),
 			StackManifest:     rec.StackManifest,
 			ServiceContainers: nil,
@@ -785,7 +790,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 
 	// (c) Allocate pool slots.
 	var allocatedIDs []string
-	for _, item := range rec.Items {
+	for _, item := range req.Items {
 		for i := range item.Quantity {
 			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
 			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
@@ -841,7 +846,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// success/failure/panic.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
-		return b.doRestore(opCtx, req.LeaseUUID, claimed, profiles, allocatedIDs, logger)
+		return b.doRestore(opCtx, req.LeaseUUID, claimed, req.Items, profiles, allocatedIDs, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestoreRequestedMsg{
@@ -885,7 +890,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 // restart/update. (Dropping it here would race that transition and silently lose
 // the callback; the periodic reaper / a subsequent op reconciles the entry.)
 func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.RetentionEntry,
-	profiles map[string]SKUProfile, allocatedIDs []string, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
+	newItems []backend.LeaseItem, profiles map[string]SKUProfile, allocatedIDs []string, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
 	restoreStart := time.Now()
 	defer func() {
 		// N2: a panic leaves resultRet.Err==nil; force the failure path so we never
@@ -965,7 +970,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 		b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
 	}()
 	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: rec.Items, Profiles: profiles,
+		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: newItems, Profiles: profiles,
 		OldContainerIDs: nil, ServiceContainers: nil, Operation: "restore", NoComposeRollback: true, Logger: logger,
 		OnSuccess: func(p *leasesm.ProvisionState) { p.StackManifest = rec.StackManifest },
 	})
