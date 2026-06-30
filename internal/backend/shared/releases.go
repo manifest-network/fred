@@ -229,15 +229,17 @@ func (s *ReleaseStore) Delete(leaseUUID string) error {
 }
 
 // RemoveOlderThan prunes release history older than maxAge while preserving each
-// lease's load-bearing records. For every lease it ALWAYS retains two entries: the
-// most-recent "active" release (recoverState rehydrates the StackManifest from it —
-// see LatestActive) and the index-latest release (the entry the runtime mutators
-// append to / activate, and — because Append assigns the next version to the tail —
-// the holder of the lease's maximum version, which keeps Append's max+1 derivation
-// collision-free). Only entries that are BOTH older than the cutoff AND not protected
-// are pruned, so a lease's record is never emptied and its live manifest is never
-// removed (ENG-440). Corrupt or empty values are removed whole-key. Returns the number
-// of release ENTRIES removed (corrupt/empty keys count as one).
+// lease's load-bearing records. For every lease it ALWAYS retains its index-latest
+// entry — the entry the runtime mutators append to / activate, and (because Append
+// assigns the next version to the tail) the holder of the lease's maximum version,
+// which keeps Append's max+1 derivation collision-free — AND, when a distinct one
+// exists, the most-recent "active" release that recoverState rehydrates the
+// StackManifest from (see LatestActive). So it protects one entry when the newest
+// entry is itself the active release or no active release exists, two otherwise. Only
+// entries that are BOTH older than the cutoff AND not protected are pruned, so a
+// lease's record is never emptied and its live manifest is never removed (ENG-440).
+// Corrupt or empty values are removed whole-key. Returns the number of release ENTRIES
+// removed (corrupt/empty keys count as one).
 func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 	removed := 0
