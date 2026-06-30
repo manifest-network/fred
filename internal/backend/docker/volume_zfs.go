@@ -42,8 +42,14 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	// Idempotent: if dataset already exists (mountpoint present), update quota and return.
 	_, statErr := os.Stat(mountpoint)
 	if statErr == nil {
-		if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, dataset).CombinedOutput(); err != nil {
-			return "", false, fmt.Errorf("zfs set refquota on existing %s: %w: %s", dataset, err, out)
+		// Set refquota= and clear any legacy quota= in one atomic call.
+		// Before ENG-438, Create used `zfs set quota=` instead of refquota=, so
+		// datasets created on an older binary carry a stale quota= property.
+		// ZFS enforces the tighter of quota and refquota simultaneously; a stale
+		// smaller quota= would silently bind on a promote (newCap > oldCap).
+		// Setting quota=none removes the legacy limit so refquota is the sole cap.
+		if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, "quota=none", dataset).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("zfs set refquota and clear legacy quota on existing %s: %w: %s", dataset, err, out)
 		}
 		z.logger.Debug("reusing existing zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
 		return mountpoint, false, nil
@@ -59,8 +65,9 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		if out, err := exec.CommandContext(ctx, "zfs", "mount", dataset).CombinedOutput(); err != nil {
 			return "", false, fmt.Errorf("zfs mount existing unmounted dataset %s: %w: %s", dataset, err, out)
 		}
-		if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, dataset).CombinedOutput(); err != nil {
-			return "", false, fmt.Errorf("zfs set refquota on remounted %s: %w: %s", dataset, err, out)
+		// Clear legacy quota= alongside refquota= (see idempotent-reuse path above for rationale).
+		if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, "quota=none", dataset).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("zfs set refquota and clear legacy quota on remounted %s: %w: %s", dataset, err, out)
 		}
 		z.logger.Info("remounted existing zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
 		return mountpoint, false, nil

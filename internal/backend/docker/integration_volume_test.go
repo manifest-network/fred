@@ -1217,7 +1217,47 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 			"writing 25 MiB beyond the 20 MiB ZFS refquota must fail; dd output: %s", out)
 	})
 
-	// (b) 25 MiB data exceeds 20 MiB medium: gate refuses, preventing the
+	// (b) promote: Create at large cap on an existing medium-capped dataset must
+	//     clear any stale quota= so refquota is the sole enforcer. Simulates the
+	//     pre-ENG-438 state by explicitly setting quota= before the promote call,
+	//     then asserts quota is none (0 in parsable output) afterwards. A stale
+	//     smaller quota= would otherwise silently bind on promote and cap the lease
+	//     at the old size even after `zfs set refquota=<larger>` succeeds.
+	t.Run("promote_clears_legacy_quota", func(t *testing.T) {
+		const lease = "int-zfs-promote"
+		canon := canonicalVolumeName(lease, "app", 0)
+
+		// Create at medium cap — hits the fresh-create path (no legacy quota).
+		_, _, err := mgr.Create(ctx, canon, mediumMiB)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+
+		// Resolve the ZFS dataset name so we can inspect and set properties directly.
+		dsOut, dsErr := exec.Command("zfs", "list", "-H", "-o", "name", filepath.Join(mountPath, canon)).CombinedOutput()
+		require.NoError(t, dsErr, "resolve dataset name: %s", dsOut)
+		dataset := strings.TrimSpace(string(dsOut))
+
+		// Simulate a pre-ENG-438 dataset that had quota= set by the old code.
+		// ZFS enforces the tighter of quota and refquota simultaneously; without
+		// the fix, a promote would leave this stale smaller quota= in place.
+		out, setErr := exec.Command("zfs", "set", "quota="+fmt.Sprintf("%dM", mediumMiB), dataset).CombinedOutput()
+		require.NoError(t, setErr, "zfs set legacy quota: %s", out)
+
+		// Promote: Create at large cap hits the idempotent-reuse path and must
+		// issue `zfs set refquota=100M quota=none <dataset>` so the stale quota is cleared.
+		_, _, err = mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err, "promote Create at large cap must succeed")
+
+		// Assert that quota= is now none. With -Hp, quota=none is reported as "0".
+		// A non-zero value here means the stale quota= was not cleared and would
+		// silently cap writes at mediumMiB despite the refquota promotion.
+		quotaOut, quotaErr := exec.Command("zfs", "get", "-Hp", "-o", "value", "quota", dataset).CombinedOutput()
+		require.NoError(t, quotaErr, "zfs get quota: %s", quotaOut)
+		require.Equal(t, "0", strings.TrimSpace(string(quotaOut)),
+			"legacy quota= must be none (0) after promote so refquota is the sole cap")
+	})
+
+	// (c) 25 MiB data exceeds 20 MiB medium: gate refuses, preventing the
 	//     `zfs set refquota < referenced` error that ZFS would return if we
 	//     proceeded directly to Create at medium cap.
 	t.Run("exceeds_medium_gate_refuses", func(t *testing.T) {
