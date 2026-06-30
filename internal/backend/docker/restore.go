@@ -3,6 +3,7 @@ package docker
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -850,6 +851,38 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			// async re-deploy worker span, which is the ~3-4x cost ENG-357 targets.
 			restoreDurationSeconds.Observe(time.Since(restoreStart).Seconds())
 			restoresTotal.WithLabelValues("success").Inc()
+			// Persist an "active" release for the NEW lease so its manifest survives a
+			// docker-backend restart. recoverState rehydrates prov.StackManifest ONLY
+			// from releaseStore.LatestActive (recover.go), and Restart hard-fails on a
+			// nil manifest (restart_update.go), so without this a restored lease becomes
+			// un-Restartable after the next backend restart. The lease is already Ready
+			// here, so the release is written directly as active (mirrors provision.go's
+			// on-success Append, not restart's deploying+ActivateLatest two-step). The
+			// payload bytes are the marshaled retained StackManifest — the same
+			// json.Marshal(stack) round-trip ParsePayload consumes (restart_update.go).
+			//
+			// Best-effort (Warn, not abort) by necessity: unlike restart_update.go — which
+			// records the release BEFORE doing any work and so can hard-abort on a write
+			// failure — the restore has already brought the stack up and adopted the volumes,
+			// so there is nothing to abort. Nor can the retention Delete below be gated on
+			// this Append succeeding: withholding the Delete would leave a retained record
+			// pointing at volumes already renamed into the live lease, and reconcileRestoring
+			// would then re-quarantine them out from under the running lease. So a (rare)
+			// Append failure degrades to the pre-fix state — no worse than before, and
+			// self-corrected by the next Update/re-provision (both re-source the manifest
+			// from the chain). (ENG-433)
+			if b.releaseStore != nil {
+				if manifestBytes, marshalErr := json.Marshal(rec.StackManifest); marshalErr != nil {
+					logger.Warn("restore ok but failed to marshal manifest for release record", "lease_uuid", leaseUUID, "error", marshalErr)
+				} else if relErr := b.releaseStore.Append(leaseUUID, shared.Release{
+					Manifest:  manifestBytes,
+					Image:     "stack",
+					Status:    "active",
+					CreatedAt: time.Now(),
+				}); relErr != nil {
+					logger.Warn("restore ok but failed to record release history", "lease_uuid", leaseUUID, "error", relErr)
+				}
+			}
 			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
 				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
 			}

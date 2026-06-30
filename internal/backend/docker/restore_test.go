@@ -2107,6 +2107,114 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	b.wg.Wait()
 }
 
+// TestRestore_PersistsReleaseSoLeaseStaysRestartableAfterRestart is ENG-433's
+// regression test, end to end. A successful restore must persist an "active" release
+// record for the new lease; without it a docker-backend restart leaves the lease's
+// manifest unrecoverable — recoverState rehydrates prov.StackManifest ONLY from
+// releaseStore.LatestActive (recover.go), so the rebuilt provision has a nil manifest and
+// Restart hard-fails with ErrInvalidState ("no stored manifest", restart_update.go).
+//
+// The test walks the full chain: drive a restore to Ready, assert the release record was
+// written (the mechanism), simulate a backend restart by dropping the in-memory map and
+// rebuilding from the live container + the release store (exercising the real
+// json.Marshal → ParsePayload round-trip), then Restart the rehydrated lease to confirm
+// the hard-fail is actually gone (the outcome ENG-433 promises, not just the precondition).
+func TestRestore_PersistsReleaseSoLeaseStaysRestartableAfterRestart(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	rel := attachReleaseStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "u1")
+
+	var mu sync.Mutex
+	var downProjects []string
+	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
+
+	callbackReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer server.Close()
+
+	require.NoError(t, b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL)))
+	<-callbackReceived
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p, ok := b.provisions["u2"]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+
+	// (1) Mechanism: the restore must have persisted an active release (with manifest
+	// bytes) for the NEW lease — the exact record recoverState reads (recover.go's
+	// LatestActive). This is the isolated, fast signal if the Append regresses.
+	require.Eventually(t, func() bool {
+		r, gerr := rel.LatestActive("u2")
+		return gerr == nil && r != nil && len(r.Manifest) > 0
+	}, 5*time.Second, 20*time.Millisecond,
+		"restore must persist an active release record (with manifest) for the new lease u2")
+
+	// (2) Simulate a docker-backend restart: the live container survives (live-restore),
+	// so recoverState rebuilds u2 from it — but the in-memory StackManifest set by
+	// doRestore's OnSuccess is gone, forcing rehydration from the release store.
+	mock.ListManagedContainersFn = func(_ context.Context) ([]ContainerInfo, error) {
+		return []ContainerInfo{{
+			ContainerID:   "c-u2-app-0",
+			LeaseUUID:     "u2",
+			Tenant:        "tenant-a",
+			ProviderUUID:  "prov-1",
+			SKU:           "docker-small",
+			ServiceName:   manifest.DefaultServiceName,
+			InstanceIndex: 0,
+			Status:        "running",
+			Name:          "fred-u2-app-0",
+			CreatedAt:     time.Now(),
+		}}, nil
+	}
+	b.provisionsMu.Lock()
+	b.provisions = map[string]*provision{}
+	b.provisionsMu.Unlock()
+	require.NoError(t, b.recoverState(context.Background()))
+
+	// (3) Precondition restored: the manifest is rehydrated from the release record via
+	// the real json.Marshal → ParsePayload round-trip (the retained image must survive).
+	b.provisionsMu.RLock()
+	p, ok := b.provisions["u2"]
+	var stack *manifest.StackManifest
+	if ok {
+		stack = p.StackManifest
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, ok, "u2 must be rebuilt from its live container after the restart")
+	require.NotNil(t, stack, "recoverState must rehydrate the restored lease's manifest from the release record")
+	svc, ok := stack.Services[manifest.DefaultServiceName]
+	require.True(t, ok, "rehydrated manifest must contain the app service")
+	assert.Equal(t, "nginx:latest", svc.Image, "rehydrated manifest must round-trip the retained image")
+
+	// (4) Outcome: Restart now clears the synchronous nil-manifest gate instead of
+	// hard-failing with ErrInvalidState "no stored manifest" (routeReplaceRestart returns
+	// that error synchronously to the caller), so a non-error return proves the restored
+	// lease is Restartable again — the exact harm ENG-433 fixes.
+	require.NoError(t,
+		b.Restart(context.Background(), backend.RestartRequest{LeaseUUID: "u2", CallbackURL: server.URL}),
+		"restored lease must be Restartable after a cold start (no ErrInvalidState)")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
 // TestRestore_NormalizesLegacyUnnamedItem_Succeeds: a legacy single-service lease
 // arrives from the chain with ServiceName="" while the retained record was
 // normalized to "app" at Provision time. Restore must normalize the request
