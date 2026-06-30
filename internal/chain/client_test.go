@@ -13,11 +13,13 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"cosmossdk.io/math"
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	"github.com/cosmos/cosmos-sdk/types/tx"
@@ -101,6 +103,7 @@ type mockTxService struct {
 	tx.ServiceClient
 	BroadcastTxFn func(ctx context.Context, req *tx.BroadcastTxRequest, opts ...grpc.CallOption) (*tx.BroadcastTxResponse, error)
 	GetTxFn       func(ctx context.Context, req *tx.GetTxRequest, opts ...grpc.CallOption) (*tx.GetTxResponse, error)
+	SimulateFn    func(ctx context.Context, req *tx.SimulateRequest, opts ...grpc.CallOption) (*tx.SimulateResponse, error)
 }
 
 func (m *mockTxService) BroadcastTx(ctx context.Context, req *tx.BroadcastTxRequest, opts ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
@@ -115,6 +118,13 @@ func (m *mockTxService) GetTx(ctx context.Context, req *tx.GetTxRequest, opts ..
 		return m.GetTxFn(ctx, req, opts...)
 	}
 	panic("mockTxService.GetTx not implemented")
+}
+
+func (m *mockTxService) Simulate(ctx context.Context, req *tx.SimulateRequest, opts ...grpc.CallOption) (*tx.SimulateResponse, error) {
+	if m.SimulateFn != nil {
+		return m.SimulateFn(ctx, req, opts...)
+	}
+	panic("mockTxService.Simulate not implemented")
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +145,7 @@ func newMockClient(opts ...func(*Client)) *Client {
 		txPollInterval: 10 * time.Millisecond,
 		txTimeout:      500 * time.Millisecond,
 		queryPageLimit: 100,
+		now:            time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -144,6 +155,106 @@ func newMockClient(opts ...func(*Client)) *Client {
 		c.providerAddress = c.signerPool.ProviderAddress()
 	}
 	return c
+}
+
+// ---------------------------------------------------------------------------
+// Task-0 gas-test helpers
+// ---------------------------------------------------------------------------
+
+// newTestClientWithGas returns a *Client (single-signer pool, authQuery returning
+// a fixed account for the signer) plus the *Signer it uses, with the given gas
+// params. Random-key signer — fine for gas-VALUE assertions; use
+// newDeterministicTestSigner for byte-level assertions.
+func newTestClientWithGas(t *testing.T, gasLimit, maxGasLimit uint64, adj float64) (*Client, *Signer) {
+	t.Helper()
+	s := newTestSigner(t)
+	s.gasLimit, s.maxGasLimit = gasLimit, maxGasLimit
+	if adj > 0 {
+		d, err := math.LegacyNewDecFromStr(strconv.FormatFloat(adj, 'f', -1, 64))
+		if err != nil {
+			t.Fatalf("adjustment: %v", err)
+		}
+		s.gasAdjustment = d
+	}
+	addr, err := sdktypes.AccAddressFromBech32(s.Address())
+	if err != nil {
+		t.Fatalf("addr: %v", err)
+	}
+	acct := newTestAccountAny(t, addr, 1, 1)
+	c := newMockClient(func(c *Client) {
+		c.signerPool = newTestSignerPoolFromSigner(s)
+		c.authQuery = &mockAuthQuery{AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+			return &authtypes.QueryAccountResponse{Account: acct}, nil
+		}}
+	})
+	return c, s
+}
+
+func okSimulate(gasUsed uint64) func(context.Context, *tx.SimulateRequest, ...grpc.CallOption) (*tx.SimulateResponse, error) {
+	return func(context.Context, *tx.SimulateRequest, ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: gasUsed}}, nil
+	}
+}
+func okBroadcast() func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+	return func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+		return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "ABCD"}}, nil
+	}
+}
+func okGetTx() func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+	return func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+		return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "ABCD"}}, nil
+	}
+}
+
+// captureGas returns a BroadcastTxFn that decodes the broadcast tx, records its
+// declared gas into *out, and returns success.
+func captureGas(t *testing.T, out *uint64, _ *Client, signer *Signer) func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+	return func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+		decoded, err := signer.txConfig.TxDecoder()(req.TxBytes)
+		if err != nil {
+			t.Fatalf("decode broadcast tx: %v", err)
+		}
+		*out = decoded.(sdktypes.FeeTx).GetGas()
+		return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "ABCD"}}, nil
+	}
+}
+
+// countingAuthQuery wraps an authQuery, incrementing *n on each Account call.
+func countingAuthQuery(inner authtypes.QueryClient, n *int) authtypes.QueryClient {
+	return &mockAuthQuery{AccountFn: func(ctx context.Context, req *authtypes.QueryAccountRequest, opts ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+		*n++
+		return inner.Account(ctx, req, opts...)
+	}}
+}
+
+// outOfGasGetTxOnce returns a GetTxFn yielding an out-of-gas (code 11) execution
+// result on the first call and success thereafter — drives exactly one OOG ladder
+// bump. (OOG is an execution result surfaced by GetTx, not the BroadcastTx ack;
+// mirrors the existing retry tests' code 11.)
+func outOfGasGetTxOnce() func(context.Context, *tx.GetTxRequest, ...grpc.CallOption) (*tx.GetTxResponse, error) {
+	var n int
+	return func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+		n++
+		code := uint32(0)
+		if n == 1 {
+			code = 11
+		}
+		return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: code, Codespace: "sdk", RawLog: "out of gas", TxHash: req.Hash}}, nil
+	}
+}
+
+// seqMismatchBroadcastOnce returns a BroadcastTxFn yielding a sequence-mismatch
+// (code 32) ack on the first call and success thereafter (mirrors the existing
+// retry tests' code 32 at client_test.go:1410).
+func seqMismatchBroadcastOnce() func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+	var n int
+	return func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+		n++
+		if n == 1 {
+			return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 32, Codespace: "sdk", RawLog: "account sequence mismatch, expected 5, got 4"}}, nil
+		}
+		return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "OK"}}, nil
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -749,6 +860,7 @@ func setupTxMocks(t *testing.T) (*Client, *atomic.Int32) {
 	}
 
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			broadcastCount.Add(1)
 			return &tx.BroadcastTxResponse{
@@ -777,7 +889,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		c, _ := setupTxMocks(t)
 
 		msg := newTestMsg(c.providerAddress)
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), c.signerPool.Primary(), msg, nil, nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), c.signerPool.Primary(), []sdktypes.Msg{msg}, nil, nil, nil)
 		require.NoError(t, err)
 		assert.NotEmpty(t, hash)
 	})
@@ -792,7 +904,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, nil, nil, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to query account")
 	})
@@ -815,7 +927,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, nil, nil, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to broadcast transaction")
 	})
@@ -840,7 +952,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, nil, nil, nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -877,7 +989,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, nil, nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "MEMPOOL_TX", hash)
 	})
@@ -917,7 +1029,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, nil, nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "MEMPOOL_DELAYED", hash)
 		assert.GreaterOrEqual(t, int(getTxCalls.Load()), 3)
@@ -953,7 +1065,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, nil, nil, nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -986,7 +1098,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), nil, nil)
+		_, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, nil, nil, nil)
 		require.Error(t, err)
 		var chainErr *ChainTxError
 		require.ErrorAs(t, err, &chainErr)
@@ -1021,7 +1133,7 @@ func TestClient_DoBroadcastTx(t *testing.T) {
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
 		overrideSeq := uint64(10)
-		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()), &overrideSeq, nil)
+		hash, err := c.doBroadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, &overrideSeq, nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "TXSEQOVERRIDE", hash)
 	})
@@ -1146,6 +1258,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 			},
 		}
 		ts := &mockTxService{
+			SimulateFn: okSimulate(200000),
 			BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 				n := calls.Add(1)
 				if n > 1 {
@@ -1234,6 +1347,7 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 			},
 		}
 		ts := &mockTxService{
+			SimulateFn: okSimulate(200000),
 			BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 				return nil, status.Error(codes.Internal, "node down")
 			},
@@ -1290,6 +1404,7 @@ func TestClient_BroadcastBatchedMsgs_MsgExecWrapping(t *testing.T) {
 
 	var broadcastedBytes [][]byte
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			mu.Lock()
 			broadcastedBytes = append(broadcastedBytes, req.TxBytes)
@@ -1360,6 +1475,7 @@ func TestClient_BroadcastBatchedMsgs_NoWrapping_AfterDemotion(t *testing.T) {
 	}
 	broadcastCount := &atomic.Int32{}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			broadcastCount.Add(1)
 			return &tx.BroadcastTxResponse{
@@ -1402,6 +1518,7 @@ func TestClient_BroadcastTxWithSigner_SequenceMismatchRetry(t *testing.T) {
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			if n == 1 {
@@ -1427,7 +1544,7 @@ func TestClient_BroadcastTxWithSigner_SequenceMismatchRetry(t *testing.T) {
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_RETRY", hash)
 	assert.GreaterOrEqual(t, int(attempts.Load()), 2, "should have retried after sequence mismatch")
@@ -1452,6 +1569,7 @@ func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
 	}
 
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			if n == 1 {
@@ -1482,7 +1600,7 @@ func TestClient_BroadcastTxWithSigner_SequenceHintUsed(t *testing.T) {
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_SEQHINT", hash)
 	assert.Equal(t, int32(2), attempts.Load(), "should have retried exactly once")
@@ -1506,6 +1624,7 @@ func TestClient_BroadcastTxWithSigner_ConsecutiveMismatches(t *testing.T) {
 	}
 
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			switch n {
@@ -1546,7 +1665,7 @@ func TestClient_BroadcastTxWithSigner_ConsecutiveMismatches(t *testing.T) {
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_DOUBLE", hash)
 	assert.Equal(t, int32(3), attempts.Load())
@@ -1581,6 +1700,7 @@ func TestClient_BroadcastTxWithSigner_OverrideClearedOnNonSequenceError(t *testi
 	}
 
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			switch n {
@@ -1618,7 +1738,7 @@ func TestClient_BroadcastTxWithSigner_OverrideClearedOnNonSequenceError(t *testi
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_CLEARED", hash)
 	assert.Equal(t, int32(3), attempts.Load())
@@ -1641,6 +1761,7 @@ func TestClient_BroadcastTxWithSigner_Code19WaitForTxTimeoutIsNotRetried(t *test
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			broadcastCount.Add(1)
 			return &tx.BroadcastTxResponse{
@@ -1663,7 +1784,7 @@ func TestClient_BroadcastTxWithSigner_Code19WaitForTxTimeoutIsNotRetried(t *test
 		c.txTimeout = 100 * time.Millisecond
 	})
 
-	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.Error(t, err)
 	assert.Equal(t, int32(1), broadcastCount.Load(), "should not retry after code 19 timeout")
 
@@ -1689,6 +1810,7 @@ func TestClient_BroadcastTxWithSigner_FirstTimeoutThenCode19Recovery(t *testing.
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := broadcastCount.Add(1)
 			if n == 1 {
@@ -1729,7 +1851,7 @@ func TestClient_BroadcastTxWithSigner_FirstTimeoutThenCode19Recovery(t *testing.
 		c.txTimeout = 200 * time.Millisecond
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_GHOST", hash)
 	assert.Equal(t, int32(2), broadcastCount.Load(), "should broadcast exactly twice")
@@ -1785,6 +1907,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasRetry(t *testing.T) {
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			if n == 2 {
@@ -1820,7 +1943,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasRetry(t *testing.T) {
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_2", hash)
 	assert.Equal(t, int32(2), attempts.Load(), "should have retried exactly once")
@@ -1842,6 +1965,7 @@ func TestClient_BroadcastTxWithSigner_ConsecutiveOutOfGas(t *testing.T) {
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			switch n {
@@ -1879,7 +2003,7 @@ func TestClient_BroadcastTxWithSigner_ConsecutiveOutOfGas(t *testing.T) {
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_3", hash)
 	assert.Equal(t, int32(3), attempts.Load())
@@ -1906,6 +2030,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasRetryCappedByMaxGasLimit(t *testin
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			if n == 2 {
@@ -1935,7 +2060,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasRetryCappedByMaxGasLimit(t *testin
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_2", hash)
 	assert.Equal(t, uint64(250000), retryGasLimit, "retry gas must be capped at maxGasLimit")
@@ -1957,6 +2082,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasOverridePersistsThroughTransientEr
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			switch n {
@@ -1998,7 +2124,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasOverridePersistsThroughTransientEr
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_3", hash)
 	assert.Equal(t, int32(3), attempts.Load())
@@ -2023,6 +2149,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasThenSequenceMismatch(t *testing.T)
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			switch n {
@@ -2069,7 +2196,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasThenSequenceMismatch(t *testing.T)
 		c.txService = ts
 	})
 
-	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	hash, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.NoError(t, err)
 	assert.Equal(t, "TX_3", hash)
 	assert.Equal(t, int32(3), attempts.Load())
@@ -2093,6 +2220,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasRetriesExhausted(t *testing.T) {
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			return &tx.BroadcastTxResponse{
@@ -2113,7 +2241,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasRetriesExhausted(t *testing.T) {
 		c.txService = ts
 	})
 
-	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.Error(t, err)
 	assert.Equal(t, int32(3), attempts.Load(), "should exhaust all 3 attempts")
 
@@ -2140,6 +2268,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasFutileRetryAtCap(t *testing.T) {
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			n := attempts.Add(1)
 			return &tx.BroadcastTxResponse{
@@ -2160,7 +2289,7 @@ func TestClient_BroadcastTxWithSigner_OutOfGasFutileRetryAtCap(t *testing.T) {
 		c.txService = ts
 	})
 
-	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), newTestMsg(s.Address()))
+	_, err := c.broadcastTxWithSigner(t.Context(), pool.Primary(), []sdktypes.Msg{newTestMsg(s.Address())}, defaultBroadcastOpts())
 	require.Error(t, err)
 	assert.Equal(t, int32(1), attempts.Load(),
 		"must stop after 1 attempt — retrying at the same gas is futile")
@@ -2204,6 +2333,7 @@ func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {
 		},
 	}
 	ts := &mockTxService{
+		SimulateFn: okSimulate(200000),
 		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
 			return &tx.BroadcastTxResponse{
 				TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX1"},
@@ -2240,6 +2370,299 @@ func TestClient_BroadcastBatchedMsgs_SignerAcquiredOnce(t *testing.T) {
 	require.GreaterOrEqual(t, len(queriedAddrs), 2, "should have at least 2 account queries (one per sub-batch)")
 	for _, addr := range queriedAddrs[1:] {
 		assert.Equal(t, queriedAddrs[0], addr, "all sub-batches should query the same signer address")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: simulateGas tests
+// ---------------------------------------------------------------------------
+
+func TestClient_simulateGas_happyPath(t *testing.T) {
+	c, signer := newTestClientWithGas(t /*gasLimit*/, 1_500_000 /*maxGasLimit*/, 0 /*adj*/, 1.2)
+	c.txService = &mockTxService{SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 200000}}, nil
+	}}
+	gas, acct, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if err != nil {
+		t.Fatalf("simulateGas: %v", err)
+	}
+	if gas != 240000 { // floor(1.2 * 200000)
+		t.Fatalf("gas = %d, want 240000", gas)
+	}
+	if acct == nil {
+		t.Fatalf("expected preAccount returned for reuse")
+	}
+}
+
+func TestClient_simulateGas_rejectsOverCap(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000 /*gasLimit*/, 2_000_000 /*maxGasLimit*/, 1.2)
+	c.txService = &mockTxService{SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 3_400_000}}, nil // adjusted ≈ 4.08M > 2M cap
+	}}
+	_, _, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if !errors.Is(err, errGasExceedsCap) {
+		t.Fatalf("want errGasExceedsCap, got %v", err)
+	}
+}
+
+func TestClient_simulateGas_transientError(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	c.txService = &mockTxService{SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+		return nil, status.Error(codes.Unavailable, "rpc down")
+	}}
+	_, acct, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if err == nil || errors.Is(err, errGasExceedsCap) {
+		t.Fatalf("want transient (non-cap) error, got %v", err)
+	}
+	if acct == nil {
+		t.Fatalf("transient error must still return the account for attempt-1 reuse")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pre-seed behavior tests (Task 8)
+// ---------------------------------------------------------------------------
+
+func TestClient_broadcast_preSeedsSimulatedGas(t *testing.T) {
+	// simulateGas returns 200000 gas used; with adj=1.2, adjustGas(200000)=240000.
+	// broadcastTxWithSigner must seed gasLimitOverride=240000 so the tx is signed at that limit.
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var signedGas uint64
+	c.txService = &mockTxService{
+		SimulateFn:    okSimulate(200000),
+		BroadcastTxFn: captureGas(t, &signedGas, c, signer),
+		GetTxFn:       okGetTx(),
+	}
+	_, err := c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if err != nil {
+		t.Fatalf("broadcast: %v", err)
+	}
+	if signedGas != 240000 {
+		t.Fatalf("broadcast declared gas = %d, want 240000 (simulated×1.2)", signedGas)
+	}
+}
+
+func TestClient_broadcast_refusedIsTerminal(t *testing.T) {
+	// simulateGas returns gasUsed=3_400_000; with adj=1.2, adjusted≈4.08M > 2M cap →
+	// errGasExceedsCap is returned; the tx must NOT be broadcast.
+	c, signer := newTestClientWithGas(t, 1_500_000, 2_000_000, 1.2)
+	broadcastCalled := false
+	c.txService = &mockTxService{
+		SimulateFn: okSimulate(3_400_000),
+		BroadcastTxFn: func(_ context.Context, _ *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			broadcastCalled = true
+			return nil, nil
+		},
+	}
+	_, err := c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if !errors.Is(err, errGasExceedsCap) {
+		t.Fatalf("want errGasExceedsCap, got %v", err)
+	}
+	if broadcastCalled {
+		t.Fatalf("refused tx must NOT be broadcast")
+	}
+}
+
+func TestClient_broadcast_fallbackOnTransientSim(t *testing.T) {
+	// simulateGas fails with a transient RPC error; broadcast must proceed using
+	// FallbackGas() = floor(1.2 * 1_500_000) = 1_800_000 (not raw gasLimit).
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var signedGas uint64
+	c.txService = &mockTxService{
+		SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			return nil, status.Error(codes.Unavailable, "down")
+		},
+		BroadcastTxFn: captureGas(t, &signedGas, c, signer),
+		GetTxFn:       okGetTx(),
+	}
+	_, err := c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if err != nil {
+		t.Fatalf("broadcast: %v", err)
+	}
+	if signedGas != 1_800_000 { // FallbackGas() = floor(1.2 * 1.5M), NOT raw 1.5M
+		t.Fatalf("fallback declared gas = %d, want 1800000", signedGas)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task-9: circuit-breaker tests
+// ---------------------------------------------------------------------------
+
+func TestClient_simBreaker_opensAfterConsecutiveFailures(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var simCalls int
+	c.txService = &mockTxService{
+		SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			simCalls++
+			return nil, status.Error(codes.Unavailable, "down")
+		},
+		BroadcastTxFn: okBroadcast(), GetTxFn: okGetTx(),
+	}
+	for i := 0; i < simBreakerThreshold+2; i++ {
+		_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	}
+	if simCalls > simBreakerThreshold {
+		t.Fatalf("breaker open: Simulate should be skipped after %d failures, got %d calls", simBreakerThreshold, simCalls)
+	}
+}
+
+// §8.17 — half-open recovery: advancing the injected clock past the cooldown
+// re-attempts Simulate (this is the whole reason `now` is a seam).
+func TestClient_simBreaker_halfOpenRecovers(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	clock := time.Unix(1_000_000, 0)
+	c.now = func() time.Time { return clock } // controllable clock (overrides newMockClient's time.Now)
+	failing := true
+	var simCalls int
+	c.txService = &mockTxService{
+		SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			simCalls++
+			if failing {
+				return nil, status.Error(codes.Unavailable, "down")
+			}
+			return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 200000}}, nil
+		},
+		BroadcastTxFn: okBroadcast(), GetTxFn: okGetTx(),
+	}
+	for i := 0; i < simBreakerThreshold; i++ { // open the breaker
+		_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	}
+	openCalls := simCalls
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if simCalls != openCalls {
+		t.Fatalf("breaker should be open (Simulate skipped); got an extra call")
+	}
+	failing = false
+	clock = clock.Add(simBreakerCooldown + time.Second) // advance past cooldown → half-open
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if simCalls != openCalls+1 {
+		t.Fatalf("after cooldown, Simulate must be re-attempted (half-open); got %d, want %d", simCalls, openCalls+1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 10: broadcastMultiMsgTx fold + preAccount single-query
+// ---------------------------------------------------------------------------
+
+func TestClient_broadcastMultiMsgTx_simulatesGas(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var signedGas uint64
+	c.txService = &mockTxService{SimulateFn: okSimulate(180000), BroadcastTxFn: captureGas(t, &signedGas, c, signer), GetTxFn: okGetTx()}
+	_, err := c.broadcastMultiMsgTx(context.Background(), []sdktypes.Msg{newTestMsg(signer.Address()), newTestMsg(signer.Address())})
+	if err != nil {
+		t.Fatalf("broadcastMultiMsgTx: %v", err)
+	}
+	if signedGas != 216000 { // floor(1.2 * 180000) — simulated, not the static gas_limit
+		t.Fatalf("multi-msg declared gas = %d, want 216000 (simulated)", signedGas)
+	}
+}
+
+func TestClient_broadcast_singleAccountQueryOnFirstAttempt(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var accountQueries int
+	c.authQuery = countingAuthQuery(c.authQuery, &accountQueries)
+	c.txService = &mockTxService{SimulateFn: okSimulate(200000), BroadcastTxFn: okBroadcast(), GetTxFn: okGetTx()}
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if accountQueries != 1 {
+		t.Fatalf("attempt 1 must reuse the sim account; want 1 Account query, got %d", accountQueries)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 11: Startup batch fail-fast budget lock
+// ---------------------------------------------------------------------------
+
+func TestClient_broadcastMultiMsgTx_failsFast(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var broadcastCalls int
+	c.txService = &mockTxService{
+		SimulateFn: okSimulate(180000),
+		BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			broadcastCalls++
+			return nil, status.Error(codes.Unavailable, "batch down") // retryable
+		},
+	}
+	_, err := c.broadcastMultiMsgTx(context.Background(), []sdktypes.Msg{newTestMsg(signer.Address()), newTestMsg(signer.Address())})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if broadcastCalls != 1 {
+		t.Fatalf("broadcastMultiMsgTx must fail fast: want 1 broadcast attempt, got %d (ladder would retry)", broadcastCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 11b: §8 invariant regression tests
+// ---------------------------------------------------------------------------
+
+// §8.8 — OOG ladder climbs FROM the simulated value (not from the configured gas_limit).
+func TestClient_ladderClimbsFromSimulated(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var declared []uint64
+	c.txService = &mockTxService{
+		SimulateFn: okSimulate(200000), // → 240000 seed (gasAdjustment 1.2)
+		BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+			decoded, _ := signer.txConfig.TxDecoder()(req.TxBytes)
+			declared = append(declared, decoded.(sdktypes.FeeTx).GetGas())
+			return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TX"}}, nil
+		},
+		GetTxFn: outOfGasGetTxOnce(), // first execution OOGs (code 11) → exactly one ladder bump
+	}
+	if _, err := c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts()); err != nil {
+		t.Fatalf("broadcast: %v", err)
+	}
+	if len(declared) < 2 || declared[0] != 240000 || declared[1] != 360000 { // 240000 then ×1.5
+		t.Fatalf("ladder must climb from simulated 240000→360000, got %v", declared)
+	}
+}
+
+// §8.11 — Simulate runs exactly once per call; a seq-mismatch retry must NOT re-simulate.
+func TestClient_simulateOncePerCall(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0, 1.2)
+	var simCalls int
+	c.txService = &mockTxService{
+		SimulateFn: func(_ context.Context, _ *tx.SimulateRequest, _ ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			simCalls++
+			return &tx.SimulateResponse{GasInfo: &sdktypes.GasInfo{GasUsed: 200000}}, nil
+		},
+		BroadcastTxFn: seqMismatchBroadcastOnce(), // 1st ack: code-32 seq-mismatch → retry; 2nd: ok
+		GetTxFn:       okGetTx(),
+	}
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if simCalls != 1 {
+		t.Fatalf("Simulate must run once per call (gas is seq-independent), even across a seq-mismatch retry; got %d", simCalls)
+	}
+}
+
+// §8.15 — FallbackGas overflow degrades to the raw gas_limit, NEVER to 0.
+func TestClient_fallbackOverflowDegradesToRaw(t *testing.T) {
+	const big = uint64(1)<<63 - 1 // MaxInt64; ×3.0 overflows uint64 in adjustGas
+	c, signer := newTestClientWithGas(t, big, 0, 3.0)
+	var declared uint64
+	c.txService = &mockTxService{
+		SimulateFn: func(context.Context, *tx.SimulateRequest, ...grpc.CallOption) (*tx.SimulateResponse, error) {
+			return nil, status.Error(codes.Unavailable, "down")
+		},
+		BroadcastTxFn: captureGas(t, &declared, c, signer),
+		GetTxFn:       okGetTx(),
+	}
+	_, _ = c.broadcastTxWithSigner(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())}, defaultBroadcastOpts())
+	if declared != big { // degrades to raw gas_limit, NEVER 0
+		t.Fatalf("FallbackGas overflow must degrade to raw gas_limit %d, got %d", big, declared)
+	}
+}
+
+// §8.6 — max_gas_limit==0 means unbounded: a large simulated GasUsed must NOT be refused or capped.
+func TestClient_noCapWhenMaxGasLimitZero(t *testing.T) {
+	c, signer := newTestClientWithGas(t, 1_500_000, 0 /*maxGasLimit*/, 1.2)
+	// Set SimulateFn BEFORE calling simulateGas — the default mockTxService panics when SimulateFn is nil.
+	c.txService = &mockTxService{SimulateFn: okSimulate(10_000_000)}
+	got, _, err := c.simulateGas(context.Background(), signer, []sdktypes.Msg{newTestMsg(signer.Address())})
+	if err != nil {
+		t.Fatalf("must not refuse when max_gas_limit==0: %v", err)
+	}
+	if got != 12_000_000 {
+		t.Fatalf("uncapped gas = %d, want 12000000", got)
 	}
 }
 

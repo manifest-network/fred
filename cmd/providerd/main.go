@@ -154,6 +154,18 @@ func run(cmd *cobra.Command, args []string) error {
 	metrics.SignerPoolSize.Set(float64(signerPool.Size()))
 	metrics.SignerPoolLaneCount.Set(float64(signerPool.LaneCount()))
 
+	slog.Info("per-tx gas simulation active",
+		"fallback_gas_limit", cfg.GasLimit, "max_gas_limit", cfg.MaxGasLimit, "gas_adjustment", cfg.GasAdjustment)
+	if cfg.GasAdjustment <= 1.0 {
+		slog.Warn("gas_adjustment <= 1.0 gives no simulation headroom; zero-fee simulation structurally under-counts real gas, expect first-attempt OOG retries",
+			"gas_adjustment", cfg.GasAdjustment)
+	}
+	const maxGasLimitBatchFloor = 5_000_000 // ~worst-case adjusted batch op (50-lease withdraw / 100-lease MsgExec)
+	if cfg.MaxGasLimit > 0 && cfg.MaxGasLimit < maxGasLimitBatchFloor {
+		slog.Warn("max_gas_limit is below the worst-case batch-op floor; large withdrawals/batches may be permanently refused while small acks pass",
+			"max_gas_limit", cfg.MaxGasLimit, "recommended_min", maxGasLimitBatchFloor)
+	}
+
 	// Initialize chain client
 	chainClient, err := chain.NewClient(chain.ClientConfig{
 		Endpoint:       cfg.GRPCEndpoint,

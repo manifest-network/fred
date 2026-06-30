@@ -1,6 +1,13 @@
 package chain
 
 import (
+	"bytes"
+	"context"
+	"flag"
+	stdmath "math"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"cosmossdk.io/math"
@@ -9,6 +16,7 @@ import (
 	cryptocodec "github.com/cosmos/cosmos-sdk/crypto/codec"
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/tx/signing"
 	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
 	authtx "github.com/cosmos/cosmos-sdk/x/auth/tx"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
@@ -68,7 +76,7 @@ func newTestSigner(t *testing.T) *Signer {
 	}
 }
 
-// newTestAccountAny packs a BaseAccount into *codectypes.Any for SignTx.
+// newTestAccountAny packs a BaseAccount into *codectypes.Any for signing transactions.
 func newTestAccountAny(t *testing.T, addr sdk.AccAddress, accNum, seq uint64) *codectypes.Any {
 	t.Helper()
 
@@ -78,6 +86,31 @@ func newTestAccountAny(t *testing.T, addr sdk.AccAddress, accNum, seq uint64) *c
 		t.Fatalf("failed to create account Any: %v", err)
 	}
 	return accountAny
+}
+
+const testMnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+// newDeterministicTestSigner creates a Signer with a fixed mnemonic so that
+// secp256k1 (RFC-6979-deterministic) signatures are reproducible across runs.
+// Use this for byte-level / golden-file assertions; use newTestSigner for
+// gas-value assertions where reproducibility of the key is not required.
+func newDeterministicTestSigner(t *testing.T) *Signer {
+	t.Helper()
+	s := newTestSigner(t)
+	supported, _ := s.keyring.SupportedAlgorithms()
+	if err := s.keyring.Delete("testkey"); err != nil {
+		t.Fatalf("delete random key: %v", err)
+	}
+	rec, err := s.keyring.NewAccount("testkey", testMnemonic, keyring.DefaultBIP39Passphrase, sdk.FullFundraiserPath, supported[0])
+	if err != nil {
+		t.Fatalf("fixed-key account: %v", err)
+	}
+	addr, err := rec.GetAddress()
+	if err != nil {
+		t.Fatalf("get address: %v", err)
+	}
+	s.address = addr.String()
+	return s
 }
 
 func TestPassphraseReader_RepeatedReads(t *testing.T) {
@@ -197,7 +230,7 @@ func TestSigner_SignTx(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 42, 7)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, txBytes)
 
@@ -224,7 +257,7 @@ func TestSigner_SignTx_MinimumFee(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 
 	tx, err := s.txConfig.TxDecoder()(txBytes)
@@ -251,7 +284,7 @@ func TestSigner_SignTx_LargeGasFeeNoOverflow(t *testing.T) {
 
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 
 	tx, err := s.txConfig.TxDecoder()(txBytes)
@@ -274,7 +307,7 @@ func signTxAndDecodeFee(t *testing.T, s *Signer) sdk.Coins {
 	addr, err := sdk.AccAddressFromBech32(s.address)
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -336,7 +369,7 @@ func TestSigner_SignTx_CeilingFee_UnderDivisorHitsMin(t *testing.T) {
 		"fee below minFeeAmount must clamp to 1; got %s", fee)
 }
 
-func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
+func TestSigner_signTxInternal_MultipleMessages(t *testing.T) {
 	s := newTestSigner(t)
 
 	addr, err := sdk.AccAddressFromBech32(s.address)
@@ -350,7 +383,7 @@ func TestSigner_SignTxMulti_MultipleMessages(t *testing.T) {
 		newTestMsg(s.address),
 	}
 
-	txBytes, err := s.SignTxMulti(t.Context(), msgs, accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), msgs, accountAny, nil, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, txBytes)
 
@@ -445,7 +478,7 @@ func TestSigner_SignTx_GasAdjustment_Applied(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -493,7 +526,7 @@ func TestSigner_SignTx_GasAdjustment_RespectsMaxCap(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -532,7 +565,7 @@ func TestSigner_SignTx_GasAdjustment_OverflowReturnsError(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	_, err = s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	_, err = s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.Error(t, err, "overflow must be detected and surface as an error")
 	assert.Contains(t, err.Error(), "gas adjustment overflow",
 		"error message must identify the overflow root cause")
@@ -551,7 +584,7 @@ func TestSigner_SignTx_GasAdjustment_ExactlyOneIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	accountAny := newTestAccountAny(t, addr, 0, 0)
 
-	txBytes, err := s.SignTx(t.Context(), newTestMsg(s.address), accountAny)
+	txBytes, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, accountAny, nil, nil)
 	require.NoError(t, err)
 	tx, err := s.txConfig.TxDecoder()(txBytes)
 	require.NoError(t, err)
@@ -589,6 +622,164 @@ func TestSigner_SignTx_InvalidAccount(t *testing.T) {
 		Value:   []byte("garbage"),
 	}
 
-	_, err := s.SignTx(t.Context(), newTestMsg(s.address), wrongAny)
+	_, err := s.signTxInternal(t.Context(), []sdk.Msg{newTestMsg(s.address)}, wrongAny, nil, nil)
 	assert.Error(t, err)
+}
+
+func newTestSignerForGas(t *testing.T, gasLimit, maxGasLimit uint64, gasAdjustment float64) *Signer {
+	t.Helper()
+	var adj math.LegacyDec
+	if gasAdjustment > 0 {
+		d, err := math.LegacyNewDecFromStr(strconv.FormatFloat(gasAdjustment, 'f', -1, 64))
+		if err != nil {
+			t.Fatalf("parse adjustment: %v", err)
+		}
+		adj = d
+	}
+	return &Signer{gasLimit: gasLimit, maxGasLimit: maxGasLimit, gasAdjustment: adj}
+}
+
+var update = flag.Bool("update", false, "update golden files")
+
+// goldenBytes is the idiomatic -update-flag golden helper.
+// With -update it writes testdata/<name> and returns got.
+// Without -update it reads testdata/<name> and fatals with a hint if missing.
+// A deleted golden always causes a test failure (not silent regeneration), so
+// the guard stays meaningful when buildUnsignedTx is extracted in Task 3.
+func goldenBytes(t *testing.T, name string, got []byte) []byte {
+	t.Helper()
+	path := filepath.Join("testdata", name)
+	if *update {
+		if err := os.MkdirAll("testdata", 0o755); err != nil {
+			t.Fatalf("mkdir testdata: %v", err)
+		}
+		if err := os.WriteFile(path, got, 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		return got
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden %s (run `go test -run %s -update` to create): %v", path, t.Name(), err)
+	}
+	return want
+}
+
+func TestSigner_signTxInternal_GoldenBytes(t *testing.T) {
+	s := newDeterministicTestSigner(t) // Task 0: fixed mnemonic → stable secp256k1 signature
+	addr, err := sdk.AccAddressFromBech32(s.Address())
+	if err != nil {
+		t.Fatalf("addr: %v", err)
+	}
+	acct := newTestAccountAny(t, addr, 3 /*accNum*/, 7 /*seq*/)
+	msg := newTestMsg(s.Address())
+
+	got, err := s.signTxInternal(context.Background(), []sdk.Msg{msg}, acct, nil, nil)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	golden := goldenBytes(t, "signTxInternal_ack_seq7.bin", got)
+	if !bytes.Equal(got, golden) {
+		t.Fatalf("signed bytes drifted from golden (len got=%d golden=%d)", len(got), len(golden))
+	}
+}
+
+func TestSigner_FallbackGas(t *testing.T) {
+	s := newTestSignerForGas(t, 1_500_000 /*gasLimit*/, 0, 1.2)
+	got, err := s.FallbackGas()
+	if err != nil {
+		t.Fatalf("FallbackGas: %v", err)
+	}
+	if got != 1_800_000 { // floor(1.2 * 1.5M)
+		t.Fatalf("FallbackGas = %d, want 1800000", got)
+	}
+}
+
+func TestSigner_BuildSimTx(t *testing.T) {
+	s := newDeterministicTestSigner(t)
+	s.gasLimit, s.maxGasLimit = 1_500_000, 8_000_000 // maxGasLimit large on purpose
+	addr, err := sdk.AccAddressFromBech32(s.Address())
+	if err != nil {
+		t.Fatalf("addr: %v", err)
+	}
+	acct := newTestAccountAny(t, addr, 3 /*accNum*/, 9 /*seq*/)
+	msg := newTestMsg(s.Address())
+
+	raw, err := s.BuildSimTx([]sdk.Msg{msg}, acct, simDeclaredGas)
+	if err != nil {
+		t.Fatalf("BuildSimTx: %v", err)
+	}
+	decoded, err := s.txConfig.TxDecoder()(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	feeTx := decoded.(sdk.FeeTx)
+	if !feeTx.GetFee().IsZero() {
+		t.Fatalf("sim tx fee must be zero, got %s", feeTx.GetFee())
+	}
+	if feeTx.GetGas() != simDeclaredGas { // small fixed const, NEVER gasLimit(1.5M) or maxGasLimit(8M)
+		t.Fatalf("declared gas = %d, want %d (simDeclaredGas)", feeTx.GetGas(), simDeclaredGas)
+	}
+	sigTx := decoded.(authsigning.SigVerifiableTx)
+	sigs, err := sigTx.GetSignaturesV2()
+	if err != nil {
+		t.Fatalf("GetSignaturesV2: %v", err)
+	}
+	if len(sigs) != 1 {
+		t.Fatalf("want exactly one (empty) signature, got %d", len(sigs))
+	}
+	if sigs[0].Sequence != 9 {
+		t.Fatalf("sim tx must use the on-chain sequence 9, got %d", sigs[0].Sequence)
+	}
+	if sigs[0].PubKey == nil {
+		t.Fatalf("sim tx must carry the real pubkey (non-nil)")
+	}
+	sigData, ok := sigs[0].Data.(*signing.SingleSignatureData)
+	if !ok {
+		t.Fatalf("sig data must be *signing.SingleSignatureData, got %T", sigs[0].Data)
+	}
+	// After protobuf encode+decode, nil becomes []byte{} — check length, not pointer identity.
+	if len(sigData.Signature) != 0 {
+		t.Fatalf("sim tx signature must be empty (nil before encode), got %x", sigData.Signature)
+	}
+}
+
+func TestSigner_adjustGas_and_adjustAndCapGas(t *testing.T) {
+	tests := []struct {
+		name                      string
+		gasLimit, maxGasLimit     uint64
+		adjustment                float64
+		raw                       uint64
+		wantAdjust, wantAdjustCap uint64
+		wantErr                   bool
+	}{
+		{name: "adjustment applied", adjustment: 1.2, raw: 200000, wantAdjust: 240000, wantAdjustCap: 240000},
+		{name: "cap binds", adjustment: 1.2, maxGasLimit: 300000, raw: 300000, wantAdjust: 360000, wantAdjustCap: 300000},
+		{name: "adjustment 1.0 is no-op", adjustment: 1.0, raw: 200000, wantAdjust: 200000, wantAdjustCap: 200000},
+		{name: "adjustment 1.0, cap not binding", adjustment: 1.0, maxGasLimit: 500000, raw: 200000, wantAdjust: 200000, wantAdjustCap: 200000},
+		{name: "no cap when maxGasLimit 0", adjustment: 1.5, raw: 1000000, wantAdjust: 1500000, wantAdjustCap: 1500000},
+		{name: "overflow errors", adjustment: 3.0, raw: stdmath.MaxInt64, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSignerForGas(t, tc.gasLimit, tc.maxGasLimit, tc.adjustment)
+			gotAdjust, errA := s.adjustGas(tc.raw)
+			gotCap, errC := s.adjustAndCapGas(tc.raw)
+			if tc.wantErr {
+				if errA == nil || errC == nil {
+					t.Fatalf("want error, got adjustGas err=%v adjustAndCapGas err=%v", errA, errC)
+				}
+				return
+			}
+			if errA != nil || errC != nil {
+				t.Fatalf("unexpected error: adjustGas=%v adjustAndCapGas=%v", errA, errC)
+			}
+			if gotAdjust != tc.wantAdjust {
+				t.Errorf("adjustGas = %d, want %d", gotAdjust, tc.wantAdjust)
+			}
+			if gotCap != tc.wantAdjustCap {
+				t.Errorf("adjustAndCapGas = %d, want %d", gotCap, tc.wantAdjustCap)
+			}
+		})
+	}
 }

@@ -142,16 +142,6 @@ func (s *Signer) Address() string {
 	return s.address
 }
 
-// SignTx builds, signs, and encodes a single-message transaction.
-func (s *Signer) SignTx(ctx context.Context, msg sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
-	return s.SignTxMulti(ctx, []sdk.Msg{msg}, accountAny)
-}
-
-// SignTxMulti builds, signs, and encodes a transaction with one or more messages.
-func (s *Signer) SignTxMulti(ctx context.Context, msgs []sdk.Msg, accountAny *codectypes.Any) ([]byte, error) {
-	return s.signTxInternal(ctx, msgs, accountAny, nil, nil)
-}
-
 // signTxInternal is the shared implementation for signing transactions.
 // If seqOverride is non-nil, its value is used instead of the account's on-chain
 // sequence. A pointer is used because sequence 0 is a valid Cosmos SDK value
@@ -169,46 +159,23 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 		seq = *seqOverride
 	}
 
-	txBuilder := s.txConfig.NewTxBuilder()
-	if err := txBuilder.SetMsgs(msgs...); err != nil {
-		return nil, fmt.Errorf("failed to set messages: %w", err)
+	var gasLimit uint64
+	if gasLimitOverride != nil {
+		// OOG-retry / pre-seeded path: the value is already adjusted+capped; do
+		// not re-apply the multiplier (would double-adjust).
+		gasLimit = *gasLimitOverride
+	} else {
+		var err error
+		gasLimit, err = s.adjustAndCapGas(s.gasLimit)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	gasLimit := s.gasLimit
-	if gasLimitOverride != nil {
-		gasLimit = *gasLimitOverride
-	} else if !s.gasAdjustment.IsNil() && s.gasAdjustment.GT(math.LegacyOneDec()) {
-		// Apply multiplier only on the normal path. OOG retries set
-		// gasLimitOverride to a bumped value; we must not compound the
-		// multiplier on top or we'd double-adjust. maxGasLimit cap is still
-		// enforced so operators retain an upper bound.
-		// Big-int/decimal arithmetic via cosmossdk.io/math avoids the
-		// platform-dependent float→uint64 conversion semantics of a naive
-		// implementation (amd64 returns MinInt64, arm64 saturates at MaxUint64).
-		adjustedInt := s.gasAdjustment.MulInt(math.NewIntFromUint64(gasLimit)).TruncateInt()
-		if !adjustedInt.IsUint64() {
-			return nil, fmt.Errorf("gas adjustment overflow: gasLimit=%d * %s = %s exceeds uint64", gasLimit, s.gasAdjustment, adjustedInt)
-		}
-		adjusted := adjustedInt.Uint64()
-		if s.maxGasLimit > 0 && adjusted > s.maxGasLimit {
-			adjusted = s.maxGasLimit
-		}
-		gasLimit = adjusted
+	txBuilder, err := s.buildUnsignedTx(msgs, gasLimit, false /*zeroFee*/)
+	if err != nil {
+		return nil, err
 	}
-	if gasLimit > uint64(stdmath.MaxInt64) {
-		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
-	}
-	txBuilder.SetGasLimit(gasLimit)
-	// Use math.Int to avoid int64 overflow for large gasLimit * gasPrice products.
-	// Ceiling division: the chain validates fee against ceil(gasLimit * gasPrice / 1e6);
-	// integer floor would under-pay by one base unit of fee_denom whenever the product
-	// isn't an exact multiple of gasPriceDivisor.
-	divisor := math.NewInt(gasPriceDivisor)
-	feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Add(divisor).Sub(math.OneInt()).Quo(divisor)
-	if feeInt.LT(math.NewInt(minFeeAmount)) {
-		feeInt = math.NewInt(minFeeAmount)
-	}
-	txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, feeInt)))
 
 	keyInfo, err := s.keyring.Key(s.keyName)
 	if err != nil {
@@ -264,6 +231,123 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 	}
 
 	return txBytes, nil
+}
+
+// buildUnsignedTx creates a TxBuilder with msgs, the given (already-derived)
+// gasLimit, and the fee. When zeroFee is true the fee is omitted entirely
+// (no SetFeeAmount, no minFeeAmount floor) — required for Simulate, whose ante
+// skips fee deduction only when the fee is zero. gasLimit must already be
+// adjusted/capped; this helper does NOT derive gas.
+func (s *Signer) buildUnsignedTx(msgs []sdk.Msg, gasLimit uint64, zeroFee bool) (client.TxBuilder, error) {
+	txBuilder := s.txConfig.NewTxBuilder()
+	if err := txBuilder.SetMsgs(msgs...); err != nil {
+		return nil, fmt.Errorf("failed to set messages: %w", err)
+	}
+	if gasLimit > uint64(stdmath.MaxInt64) {
+		return nil, fmt.Errorf("gas limit %d overflows int64", gasLimit)
+	}
+	txBuilder.SetGasLimit(gasLimit)
+	if !zeroFee {
+		// Use math.Int to avoid int64 overflow for large gasLimit * gasPrice products.
+		// Ceiling division: the chain validates fee against ceil(gasLimit * gasPrice / 1e6);
+		// integer floor would under-pay by one base unit of fee_denom whenever the product
+		// isn't an exact multiple of gasPriceDivisor.
+		divisor := math.NewInt(gasPriceDivisor)
+		feeInt := math.NewInt(int64(gasLimit)).Mul(math.NewInt(s.gasPrice)).Add(divisor).Sub(math.OneInt()).Quo(divisor)
+		if feeInt.LT(math.NewInt(minFeeAmount)) {
+			feeInt = math.NewInt(minFeeAmount)
+		}
+		txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewCoin(s.feeDenom, feeInt)))
+	}
+	return txBuilder, nil
+}
+
+// adjustGas applies the configured gas_adjustment multiplier to raw gas.
+// It does NOT apply the maxGasLimit cap. Returns an error only on uint64
+// overflow of the multiplication (deterministic big-int math).
+func (s *Signer) adjustGas(raw uint64) (uint64, error) {
+	if s.gasAdjustment.IsNil() || !s.gasAdjustment.GT(math.LegacyOneDec()) {
+		return raw, nil
+	}
+	adjustedInt := s.gasAdjustment.MulInt(math.NewIntFromUint64(raw)).TruncateInt()
+	if !adjustedInt.IsUint64() {
+		return 0, fmt.Errorf("gas adjustment overflow: gas=%d * %s = %s exceeds uint64", raw, s.gasAdjustment, adjustedInt)
+	}
+	return adjustedInt.Uint64(), nil
+}
+
+// adjustAndCapGas applies gas_adjustment then clamps to maxGasLimit (if set).
+// It applies the maxGasLimit cap on all paths (including when the adjustment
+// is a no-op). This is safe because config validation enforces
+// max_gas_limit >= gas_limit, so capping a no-op adjustment never truncates
+// a value that was already within range.
+func (s *Signer) adjustAndCapGas(raw uint64) (uint64, error) {
+	adjusted, err := s.adjustGas(raw)
+	if err != nil {
+		return 0, err
+	}
+	if s.maxGasLimit > 0 && adjusted > s.maxGasLimit {
+		adjusted = s.maxGasLimit
+	}
+	return adjusted, nil
+}
+
+// FallbackGas returns the Simulate-failure fallback gas: the configured
+// gas_limit run through the same adjustment+cap as the success path. This is
+// the single source of truth for the degraded path (byte-for-byte the legacy
+// effective default), used by the broadcast pre-seed when Simulate is down.
+func (s *Signer) FallbackGas() (uint64, error) {
+	return s.adjustAndCapGas(s.gasLimit)
+}
+
+// simDeclaredGas is the gas declared on the sim tx. It is a small fixed value
+// (mirrors the SDK's flags.DefaultGasLimit). It must NEVER be gasLimit or
+// maxGasLimit: those are operator-tunable (morpheus runs gasLimit=4M) and at/
+// above block MaxGas every simulation ante-rejects — manifestd runs
+// LimitSimulationGasDecorator under simulate (meter = block MaxGas) and
+// SetUpContextDecorator rejects declared > block MaxGas even under simulate. The
+// measured GasUsed is unaffected (the meter is block-bounded regardless).
+const simDeclaredGas = 200000
+
+// BuildSimTx builds an encoded, zero-fee, dummy-signed tx suitable for the
+// Simulate RPC. The signature is empty (Simulate skips sig verification) but
+// uses the real pubkey + the account's on-chain sequence (Simulate DOES check
+// the sequence). Callers pass simDeclaredGas as declaredGas (see the const).
+//
+// We deliberately do NOT reuse the SDK's clienttx.CalculateGas /
+// Factory.BuildSimTx: they require a tx.Factory + client.Context that fred's
+// custom Signer/keyring never constructs, and CalculateGas applies the
+// adjustment via uint64(adj*float64(GasUsed)) — the float→uint64 truncation
+// fred deliberately replaced with deterministic cosmossdk.io/math (see adjustGas).
+func (s *Signer) BuildSimTx(msgs []sdk.Msg, accountAny *codectypes.Any, declaredGas uint64) ([]byte, error) {
+	var account authtypes.AccountI
+	if err := s.cdc.UnpackAny(accountAny, &account); err != nil {
+		return nil, fmt.Errorf("failed to unpack account: %w", err)
+	}
+	txBuilder, err := s.buildUnsignedTx(msgs, declaredGas, true /*zeroFee*/)
+	if err != nil {
+		return nil, err
+	}
+	keyInfo, err := s.keyring.Key(s.keyName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get key: %w", err)
+	}
+	pubKey, err := keyInfo.GetPubKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public key: %w", err)
+	}
+	sig := signing.SignatureV2{
+		PubKey: pubKey,
+		Data: &signing.SingleSignatureData{
+			SignMode:  signing.SignMode_SIGN_MODE_DIRECT,
+			Signature: nil,
+		},
+		Sequence: account.GetSequence(),
+	}
+	if err := txBuilder.SetSignatures(sig); err != nil {
+		return nil, fmt.Errorf("failed to set sim signature: %w", err)
+	}
+	return s.txConfig.TxEncoder()(txBuilder.GetTx())
 }
 
 // SignWithPrivKey signs using the keyring.

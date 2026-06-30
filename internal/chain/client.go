@@ -11,6 +11,7 @@ import (
 	stdmath "math"
 	"os"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -21,6 +22,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	"github.com/cosmos/cosmos-sdk/types/tx"
@@ -61,7 +63,73 @@ const (
 
 	// defaultTxTimeout is the default timeout for waiting for tx inclusion.
 	defaultTxTimeout = 60 * time.Second
+
+	// simBreakerThreshold is the number of consecutive Simulate failures before
+	// the circuit-breaker opens and Simulate is skipped for simBreakerCooldown.
+	simBreakerThreshold = 5
+
+	// simBreakerCooldown is the duration the breaker stays open (skipping
+	// Simulate) after simBreakerThreshold consecutive failures.
+	simBreakerCooldown = 30 * time.Second
+
+	// simTimeout is the per-Simulate RPC deadline, decoupled from the broadcast
+	// deadline so a slow node doesn't exhaust the whole broadcast budget.
+	simTimeout = 5 * time.Second
 )
+
+// simBreaker is a consecutive-failure circuit-breaker for the Simulate RPC.
+// Zero value is ready to use (breaker starts closed). All methods are safe for
+// concurrent use.
+type simBreaker struct {
+	mu           sync.Mutex
+	consecutive  int
+	openUntilUTC time.Time
+}
+
+// allow reports whether Simulate should be attempted at time now.
+// Returns true when the breaker is closed or the cooldown has expired.
+func (b *simBreaker) allow(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !now.Before(b.openUntilUTC)
+}
+
+// recordSuccess resets the consecutive-failure counter and closes the breaker.
+func (b *simBreaker) recordSuccess() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.consecutive = 0
+	b.openUntilUTC = time.Time{}
+}
+
+// recordFailure increments the consecutive counter and opens the breaker when
+// the threshold is reached.
+func (b *simBreaker) recordFailure(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.consecutive++
+	if b.consecutive >= simBreakerThreshold {
+		b.openUntilUTC = now.Add(simBreakerCooldown)
+	}
+}
+
+// fallbackGasOrRaw returns the FallbackGas for the signer, degrading to the
+// raw gas_limit on overflow (never returns 0).
+func fallbackGasOrRaw(signer *Signer) uint64 {
+	fb, err := signer.FallbackGas()
+	if err != nil {
+		slog.Error("FallbackGas overflow; using raw gas_limit", "error", err, "gas_limit", signer.gasLimit)
+		return signer.gasLimit
+	}
+	return fb
+}
+
+// broadcastOpts carries per-call broadcast tuning.
+type broadcastOpts struct {
+	maxRetries uint64 // total attempts for the OOG/sequence ladder (default txMaxRetries)
+}
+
+func defaultBroadcastOpts() broadcastOpts { return broadcastOpts{maxRetries: txMaxRetries} }
 
 // Client provides methods to query and submit transactions to the chain.
 type Client struct {
@@ -75,6 +143,8 @@ type Client struct {
 	txPollInterval  time.Duration
 	txTimeout       time.Duration
 	queryPageLimit  uint64
+	simBreaker      simBreaker       // consecutive-failure circuit-breaker for Simulate
+	now             func() time.Time // injectable clock (time.Now in production; overridable in tests)
 }
 
 // ClientConfig holds configuration for the chain client.
@@ -137,6 +207,7 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 		txPollInterval:  txPollInterval,
 		txTimeout:       txTimeout,
 		queryPageLimit:  uint64(queryPageLimit),
+		now:             time.Now,
 	}, nil
 }
 
@@ -176,58 +247,48 @@ func (c *Client) Conn() *grpc.ClientConn {
 
 // broadcastMultiMsgTx broadcasts multiple messages in a single transaction
 // using the primary signer. Returns error on failure; callers handle fallback.
+// Fail-fast (single attempt): callers are startup EnsureGrants/EnsureFunding,
+// which fall back to per-msg broadcasts and must fit the 60s boot budget.
+// Simulation still applies — the pre-seed runs once before the single attempt.
 func (c *Client) broadcastMultiMsgTx(ctx context.Context, msgs []sdktypes.Msg) (string, error) {
 	if len(msgs) == 0 {
 		return "", nil
 	}
-	if len(msgs) == 1 {
-		return c.broadcastTx(ctx, msgs[0])
-	}
+	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), msgs, broadcastOpts{maxRetries: 1})
+}
 
-	signer := c.signerPool.Primary()
-	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
-		Address: signer.Address(),
-	})
+// simulateGas estimates gas for msgs via the Simulate RPC, applies
+// gas_adjustment, and enforces the max_gas_limit reject-cap. It returns the
+// adjusted gas, the account it queried (so the caller can reuse it for the
+// first broadcast attempt — same committed sequence, no duplicate query), and
+// an error. A returned errGasExceedsCap is TERMINAL (do not fall back).
+func (c *Client) simulateGas(ctx context.Context, signer *Signer, msgs []sdktypes.Msg) (uint64, *codectypes.Any, error) {
+	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{Address: signer.Address()})
 	if err != nil {
-		return "", fmt.Errorf("failed to query account: %w", err)
+		return 0, nil, fmt.Errorf("simulate: query account: %w", err)
 	}
-
-	txBytes, err := signer.SignTxMulti(ctx, msgs, accResp.Account)
+	simBytes, err := signer.BuildSimTx(msgs, accResp.Account, simDeclaredGas) // small fixed declared gas (NOT gasLimit/maxGasLimit)
 	if err != nil {
-		return "", fmt.Errorf("failed to sign multi-msg transaction: %w", err)
+		return 0, accResp.Account, fmt.Errorf("simulate: build: %w", err)
 	}
-
-	resp, err := c.txService.BroadcastTx(ctx, &tx.BroadcastTxRequest{
-		TxBytes: txBytes,
-		Mode:    tx.BroadcastMode_BROADCAST_MODE_SYNC,
-	})
+	simCtx, cancel := context.WithTimeout(ctx, simTimeout)
+	defer cancel()
+	simRes, err := c.txService.Simulate(simCtx, &tx.SimulateRequest{TxBytes: simBytes})
 	if err != nil {
-		return "", fmt.Errorf("failed to broadcast transaction: %w", err)
+		return 0, accResp.Account, fmt.Errorf("simulate: %w", err)
 	}
-
-	if resp.TxResponse.Code != 0 {
-		return "", &ChainTxError{
-			Code:      resp.TxResponse.Code,
-			Codespace: resp.TxResponse.Codespace,
-			RawLog:    resp.TxResponse.RawLog,
-		}
+	if simRes.GasInfo == nil { // malformed/empty response from a buggy RPC — classify transient (→ fallback), don't nil-panic
+		return 0, accResp.Account, fmt.Errorf("simulate: nil gas_info")
 	}
-
-	txHash := resp.TxResponse.TxHash
-	execResp, err := c.waitForTx(ctx, txHash)
+	adjusted, err := signer.adjustGas(simRes.GasInfo.GasUsed) // read GasUsed; adjustment only (no clamp)
 	if err != nil {
-		return "", fmt.Errorf("failed waiting for tx %s: %w", txHash, err)
+		return 0, accResp.Account, fmt.Errorf("simulate: %w", err)
 	}
-
-	if execResp.TxResponse.Code != 0 {
-		return "", &ChainTxError{
-			Code:      execResp.TxResponse.Code,
-			Codespace: execResp.TxResponse.Codespace,
-			RawLog:    execResp.TxResponse.RawLog,
-		}
+	if signer.maxGasLimit > 0 && adjusted > signer.maxGasLimit {
+		metrics.GasSimulationTotal.WithLabelValues("refused").Inc()
+		return 0, accResp.Account, fmt.Errorf("%w: estimated gas %d exceeds max_gas_limit %d", errGasExceedsCap, adjusted, signer.maxGasLimit)
 	}
-
-	return txHash, nil
+	return adjusted, accResp.Account, nil
 }
 
 // recordQueryMetrics records duration for a chain query.
@@ -395,7 +456,7 @@ func (c *Client) broadcastBatchedMsgs(
 			msg = innerMsg
 		}
 
-		txHash, err := c.broadcastTxWithSigner(ctx, signer, msg)
+		txHash, err := c.broadcastTxWithSigner(ctx, signer, []sdktypes.Msg{msg}, defaultBroadcastOpts())
 		recordTxMetrics(metricType, err)
 		if err != nil {
 			return totalProcessed, txHashes, fmt.Errorf("failed to %s leases: %w", metricType, err)
@@ -450,15 +511,54 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (s
 // broadcastTx signs and broadcasts a transaction using the primary signer.
 // Used for operations that must use the provider key (withdrawals, grants, funding).
 func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
-	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), msg)
+	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), []sdktypes.Msg{msg}, defaultBroadcastOpts())
 }
 
 // broadcastTxWithSigner signs and broadcasts a transaction using the given signer.
-// The signer is fixed for the entire retry cycle (signer affinity).
-func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg) (string, error) {
+// The signer is fixed for the entire retry cycle (signer affinity). A single
+// Simulate call pre-seeds the gas before the backoff loop; the OOG ladder then
+// climbs from that value if execution fails.
+func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msgs []sdktypes.Msg, opts broadcastOpts) (string, error) {
 	var txHash string
-	var seqOverride *uint64      // sequence override from a previous sequence-mismatch error
-	var gasLimitOverride *uint64 // gas limit override from a previous out-of-gas error
+	var seqOverride *uint64 // sequence override from a previous sequence-mismatch error
+
+	// Pre-seed: simulate gas once before the backoff loop. The circuit-breaker
+	// skips Simulate while open (after simBreakerThreshold consecutive failures)
+	// and re-attempts after simBreakerCooldown. Terminal refusal is returned
+	// immediately; transient failure degrades to FallbackGas.
+	var simGas uint64
+	var preAccount *codectypes.Any
+	if c.simBreaker.allow(c.now()) {
+		var simErr error
+		simGas, preAccount, simErr = c.simulateGas(ctx, signer, msgs)
+		switch {
+		case errors.Is(simErr, errGasExceedsCap):
+			// Simulate itself succeeded — the result merely exceeded the cap.
+			// Count it as a success so a cap-reject doesn't trip the breaker.
+			c.simBreaker.recordSuccess()
+			return "", simErr
+		case simErr != nil:
+			c.simBreaker.recordFailure(c.now())
+			simGas = fallbackGasOrRaw(signer)
+			metrics.GasSimulationTotal.WithLabelValues("fallback").Inc()
+			slog.Warn("gas simulation failed; using fallback ceiling", "error", simErr, "fallback_gas", simGas)
+		default:
+			c.simBreaker.recordSuccess()
+			metrics.GasSimulationTotal.WithLabelValues("simulated").Inc()
+		}
+	} else {
+		simGas = fallbackGasOrRaw(signer) // breaker open: skip Simulate (no RPC round-trip)
+		metrics.GasSimulationTotal.WithLabelValues("fallback").Inc()
+	}
+	metrics.GasSimulated.Observe(float64(simGas))
+	// SOLE declaration of gasLimitOverride at function scope. The OOG closure
+	// below reassigns this variable (gasLimitOverride = &increased), not a new
+	// inner one, so the ladder climbs from simGas.
+	gasLimitOverride := &simGas
+
+	if opts.maxRetries == 0 {
+		opts.maxRetries = 1
+	}
 
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = txInitialBackoff
@@ -466,13 +566,15 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msg 
 	bo.MaxElapsedTime = 0
 
 	boCtx := backoff.WithContext(
-		backoff.WithMaxRetries(bo, txMaxRetries-1),
+		backoff.WithMaxRetries(bo, opts.maxRetries-1),
 		ctx,
 	)
 
+	firstAccount := preAccount
 	operation := func() error {
 		var err error
-		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msg, seqOverride, gasLimitOverride)
+		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msgs, seqOverride, gasLimitOverride, firstAccount)
+		firstAccount = nil // retries re-query for a fresh sequence
 		if err == nil {
 			return nil
 		}
@@ -609,19 +711,29 @@ func (c *Client) isRetryableGRPCCode(code codes.Code) bool {
 // broadcast, or the mempool already holds a tx at the queried sequence).
 // If gasLimitOverride is non-nil, its value is used instead of the configured gas limit
 // (e.g. after an out-of-gas error triggered a retry with increased gas).
-func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msg sdktypes.Msg, seqOverride *uint64, gasLimitOverride *uint64) (string, error) {
-	// Get account info for the signer's sequence/account number
-	accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
-		Address: signer.Address(),
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to query account: %w", err)
+// If preAccount is non-nil, it is used directly (reusing the account queried by
+// simulateGas on the first attempt, avoiding a duplicate query).
+func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msgs []sdktypes.Msg, seqOverride *uint64, gasLimitOverride *uint64, preAccount *codectypes.Any) (string, error) {
+	// Get account info for the signer's sequence/account number. Reuse the
+	// account from simulateGas when preAccount is set (first attempt only);
+	// retries pass nil and re-query for a fresh sequence.
+	var accountAny *codectypes.Any
+	if preAccount != nil {
+		accountAny = preAccount
+	} else {
+		accResp, err := c.authQuery.Account(ctx, &authtypes.QueryAccountRequest{
+			Address: signer.Address(),
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to query account: %w", err)
+		}
+		accountAny = accResp.Account
 	}
 
 	// Build, sign, and broadcast the transaction.
 	// When seqOverride is set (from a previous sequence-mismatch error),
 	// use it instead of the potentially stale on-chain sequence.
-	txBytes, err := signer.signTxInternal(ctx, []sdktypes.Msg{msg}, accResp.Account, seqOverride, gasLimitOverride)
+	txBytes, err := signer.signTxInternal(ctx, msgs, accountAny, seqOverride, gasLimitOverride)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %w", err)
 	}

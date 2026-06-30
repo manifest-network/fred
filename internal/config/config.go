@@ -58,11 +58,17 @@ type Config struct {
 	GRPCTLSEnabled       bool          `mapstructure:"grpc_tls_enabled"`
 	GRPCTLSCAFile        string        `mapstructure:"grpc_tls_ca_file"`
 	GRPCTLSSkipVerify    bool          `mapstructure:"grpc_tls_skip_verify"`
-	GasLimit             uint64        `mapstructure:"gas_limit"`
-	MaxGasLimit          uint64        `mapstructure:"max_gas_limit"` // 0 = no cap; if set, caps the gas limit during out-of-gas retries
-	GasPrice             int64         `mapstructure:"gas_price"`
-	// GasAdjustment is a multiplier applied to gas_limit when signing a tx,
-	// providing headroom above the static estimate and reducing OOG retries.
+	// GasLimit is the Simulate-failure fallback gas ceiling. Steady-state gas is
+	// simulated per tx; this value is used only when Simulate is unavailable.
+	GasLimit uint64 `mapstructure:"gas_limit"`
+	// MaxGasLimit (0 = no cap) is an absolute reject-cap: a per-tx simulated
+	// estimate (gas_adjustment * GasUsed) exceeding it is refused, not submitted.
+	// It also caps the gas on the OOG-retry / Simulate-failure fallback paths.
+	MaxGasLimit uint64 `mapstructure:"max_gas_limit"`
+	GasPrice    int64  `mapstructure:"gas_price"`
+	// GasAdjustment is the multiplier applied to the simulated GasUsed (and, on
+	// the Simulate-failure fallback path, to gas_limit) when signing a tx,
+	// providing headroom above the estimate and reducing OOG retries.
 	// Matches the Cosmos SDK CLI flag of the same name. Default: 1.2.
 	// Must satisfy 1.0 <= GasAdjustment <= 3.0 (see Validate).
 	GasAdjustment float64 `mapstructure:"gas_adjustment"`
