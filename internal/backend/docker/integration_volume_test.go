@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -746,4 +747,506 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	// Cleanup
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
+}
+
+// setupXFSLoopback creates an XFS filesystem on a loopback file, mounted with
+// the pquota option required for project-quota enforcement. Returns the mount
+// path. Cleanup (umount) is registered via t.Cleanup.
+// Skips if root, mkfs.xfs, xfs_quota, or a usable loop device are absent.
+func setupXFSLoopback(t *testing.T) string {
+	t.Helper()
+
+	if os.Getuid() != 0 {
+		t.Skip("xfs loopback requires root")
+	}
+	if _, err := exec.LookPath("mkfs.xfs"); err != nil {
+		t.Skip("mkfs.xfs not found:", err)
+	}
+	if _, err := exec.LookPath("xfs_quota"); err != nil {
+		t.Skip("xfs_quota not found:", err)
+	}
+
+	tmpDir := t.TempDir()
+	imgFile := filepath.Join(tmpDir, "xfs.img")
+	mountDir := filepath.Join(tmpDir, "mnt")
+	require.NoError(t, os.MkdirAll(mountDir, 0755))
+
+	out, err := exec.Command("truncate", "-s", "256M", imgFile).CombinedOutput()
+	require.NoError(t, err, "truncate: %s", out)
+
+	out, err = exec.Command("mkfs.xfs", "-f", imgFile).CombinedOutput()
+	require.NoError(t, err, "mkfs.xfs: %s", out)
+
+	// pquota enables project-quota enforcement. Same loop-skip guard as btrfs.
+	out, err = exec.Command("mount", "-o", "loop,pquota", imgFile, mountDir).CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "set up loop device") {
+			t.Skipf("xfs loopback unavailable (loop device setup failed): %s", out)
+		}
+		require.NoError(t, err, "mount: %s", out)
+	}
+
+	t.Cleanup(func() {
+		_ = exec.Command("umount", "-l", mountDir).Run()
+	})
+
+	return mountDir
+}
+
+// setupZFSPool creates a ZFS pool backed by a sparse loopback image and
+// mounts it at a dedicated directory. Returns the mountpoint and pool name.
+// Cleanup (zpool destroy) is registered via t.Cleanup.
+// Skips if root, zfs, or zpool are absent, or if pool creation fails with a
+// device-unavailable error (common in containers without ZFS kernel modules).
+func setupZFSPool(t *testing.T) (mountPath, poolName string) {
+	t.Helper()
+
+	if os.Getuid() != 0 {
+		t.Skip("zfs pool requires root")
+	}
+	if _, err := exec.LookPath("zfs"); err != nil {
+		t.Skip("zfs not found:", err)
+	}
+	if _, err := exec.LookPath("zpool"); err != nil {
+		t.Skip("zpool not found:", err)
+	}
+
+	tmpDir := t.TempDir()
+	imgFile := filepath.Join(tmpDir, "zfs.img")
+	// Pool names must be unique to avoid collisions when tests run in parallel.
+	poolName = fmt.Sprintf("fredtest%d", time.Now().UnixNano())
+	mountPath = filepath.Join(tmpDir, "mnt")
+	require.NoError(t, os.MkdirAll(mountPath, 0755))
+
+	// 512 MiB: ZFS needs more headroom than btrfs/xfs due to metadata.
+	out, err := exec.Command("truncate", "-s", "512M", imgFile).CombinedOutput()
+	require.NoError(t, err, "truncate: %s", out)
+
+	out, err = exec.Command("zpool", "create", "-m", mountPath, poolName, imgFile).CombinedOutput()
+	if err != nil {
+		s := string(out)
+		if strings.Contains(s, "Unable to open") ||
+			strings.Contains(s, "no such device") ||
+			strings.Contains(s, "not a block device") ||
+			strings.Contains(s, "permission denied") {
+			t.Skipf("zfs pool creation unavailable: %s", s)
+		}
+		require.NoError(t, err, "zpool create: %s", out)
+	}
+
+	t.Cleanup(func() {
+		_ = exec.Command("zpool", "destroy", "-f", poolName).Run()
+	})
+
+	return mountPath, poolName
+}
+
+// TestIntegration_Usage_Btrfs verifies that btrfsVolumeManager.Usage returns
+// the subvolume's referenced bytes within a generous metadata-overhead bound.
+func TestIntegration_Usage_Btrfs(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	ctx := context.Background()
+
+	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
+
+	const volName = "fred-int-usage-btrfs-app-0"
+	const capMiB = int64(100)
+
+	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+
+	const writeMiB = 10
+	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
+
+	got, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err)
+
+	// rfer includes filesystem metadata; allow a 6 MiB overhead ceiling.
+	const wantMin = int64(writeMiB * 1024 * 1024)
+	const wantMax = int64((writeMiB + 6) * 1024 * 1024)
+	assert.GreaterOrEqual(t, got, wantMin, "Usage too low: got %d, want >= %d", got, wantMin)
+	assert.LessOrEqual(t, got, wantMax, "Usage too high: got %d, want <= %d", got, wantMax)
+}
+
+// TestIntegration_Usage_XFS verifies that xfsVolumeManager.Usage returns the
+// project's used bytes (1 KiB block granularity) within a metadata-overhead bound.
+func TestIntegration_Usage_XFS(t *testing.T) {
+	mountDir := setupXFSLoopback(t)
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(mountDir, "xfs", slog.Default())
+	require.NoError(t, err)
+
+	const volName = "fred-int-usage-xfs-app-0"
+	const capMiB = int64(100)
+
+	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+
+	const writeMiB = 10
+	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
+
+	got, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err)
+
+	const wantMin = int64(writeMiB * 1024 * 1024)
+	const wantMax = int64((writeMiB + 6) * 1024 * 1024)
+	assert.GreaterOrEqual(t, got, wantMin, "Usage too low: got %d, want >= %d", got, wantMin)
+	assert.LessOrEqual(t, got, wantMax, "Usage too high: got %d, want <= %d", got, wantMax)
+}
+
+// TestIntegration_Usage_ZFS verifies that zfsVolumeManager.Usage returns the
+// dataset's referenced bytes within a metadata-overhead bound.
+func TestIntegration_Usage_ZFS(t *testing.T) {
+	mountPath, _ := setupZFSPool(t)
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(mountPath, "zfs", slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+
+	const volName = "fred-int-usage-zfs-app-0"
+	const capMiB = int64(100)
+
+	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+
+	const writeMiB = 10
+	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
+
+	got, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err)
+
+	const wantMin = int64(writeMiB * 1024 * 1024)
+	const wantMax = int64((writeMiB + 6) * 1024 * 1024)
+	assert.GreaterOrEqual(t, got, wantMin, "Usage too low: got %d, want >= %d", got, wantMin)
+	assert.LessOrEqual(t, got, wantMax, "Usage too high: got %d, want <= %d", got, wantMax)
+}
+
+// TestIntegration_DemotePromote_Btrfs is the end-to-end demote/promote quota
+// test on a real btrfs loopback. It verifies all three plan assertions:
+//
+//	(a) data fits medium → checkDemoteFit passes, Create at medium lowers the
+//	    enforced quota, and a write beyond medium fails with EDQUOT/ENOSPC.
+//	(b) data exceeds medium → checkDemoteFit returns ErrDemoteDataExceedsTier.
+//	(c) promote Create at large raises the cap so writes beyond medium succeed.
+//
+// Uses custom 100 MiB / 20 MiB "large"/"medium" tiers to stay within the
+// 256 MiB loopback image.
+func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	ctx := context.Background()
+
+	const largeMiB, mediumMiB = int64(100), int64(20)
+
+	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
+
+	// Wire a Backend with real btrfs volumes and the custom small-SKU profiles.
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.volumes = mgr
+	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
+	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
+	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}
+
+	// (a) 5 MiB data fits 20 MiB medium: gate passes, quota lowered, write beyond fails.
+	t.Run("fits_medium", func(t *testing.T) {
+		const origLease = "int-btrfs-fits"
+		canon := canonicalVolumeName(origLease, "app", 0)
+		retained := retainedName(canon)
+
+		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err)
+
+		// 5 MiB — fits 20 MiB medium
+		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
+
+		require.NoError(t, mgr.RenameVolume(canon, retained))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+
+		rec := &shared.RetentionEntry{
+			OriginalLeaseUUID:   origLease,
+			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			RetainedVolumeNames: []string{retained},
+		}
+		err = b.checkDemoteFit(ctx, rec,
+			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
+			mediumProfiles, b.logger)
+		require.NoError(t, err, "5 MiB data fits 20 MiB medium: checkDemoteFit must pass")
+
+		// Simulate adoptRetainedVolumes: rename to a new lease's canonical name.
+		const newLease = "int-btrfs-fits-new"
+		newCanon := canonicalVolumeName(newLease, "app", 0)
+		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, newCanon) })
+
+		// Create at medium cap lowers the btrfs qgroup limit to 20 MiB.
+		newHostPath, _, err := mgr.Create(ctx, newCanon, mediumMiB)
+		require.NoError(t, err, "Create at medium cap must succeed")
+
+		// Writing 25 MiB beyond the 20 MiB quota must fail (total ~30 MiB > 20 MiB).
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(newHostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.Error(t, werr,
+			"writing 25 MiB to a 20 MiB-quota btrfs volume must fail (EDQUOT/ENOSPC); dd output: %s", out)
+	})
+
+	// (b) 25 MiB data exceeds 20 MiB medium: gate returns ErrDemoteDataExceedsTier.
+	t.Run("exceeds_medium", func(t *testing.T) {
+		const origLease = "int-btrfs-exceeds"
+		canon := canonicalVolumeName(origLease, "app", 0)
+		retained := retainedName(canon)
+
+		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+
+		// 25 MiB — exceeds 20 MiB medium cap; write must succeed under 100 MiB large cap.
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.NoError(t, werr, "writing 25 MiB to 100 MiB-quota volume must succeed; dd output: %s", out)
+
+		require.NoError(t, mgr.RenameVolume(canon, retained))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+
+		rec := &shared.RetentionEntry{
+			OriginalLeaseUUID:   origLease,
+			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			RetainedVolumeNames: []string{retained},
+		}
+		err = b.checkDemoteFit(ctx, rec,
+			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
+			mediumProfiles, b.logger)
+		require.ErrorIs(t, err, backend.ErrDemoteDataExceedsTier,
+			"25 MiB data exceeds 20 MiB medium: gate must refuse with ErrDemoteDataExceedsTier")
+	})
+
+	// (c) promote: Create at large from a medium-capped volume raises the cap so
+	//     writes beyond medium now succeed.
+	t.Run("promote_raises_cap", func(t *testing.T) {
+		const origLease = "int-btrfs-promote"
+		canon := canonicalVolumeName(origLease, "app", 0)
+
+		// Start at medium cap (20 MiB).
+		hostPath, _, err := mgr.Create(ctx, canon, mediumMiB)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+
+		// Write 5 MiB so the subvolume has some data.
+		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
+
+		// Confirm 25 MiB does NOT fit under medium cap (partial write fails).
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(hostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.Error(t, werr,
+			"25 MiB must not fit the 20 MiB cap before promote; dd output: %s", out)
+		// Remove any partial file so rfer drops back toward the initial 5 MiB.
+		_ = os.Remove(filepath.Join(hostPath, "big.bin"))
+
+		// Promote: Create (idempotent) at large cap raises qgroup limit to 100 MiB.
+		_, _, err = mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err, "Create at large cap must succeed (quota update)")
+
+		// Writing 25 MiB must now succeed (cap is 100 MiB; total at most ~30 MiB).
+		out, werr = exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(hostPath, "big2.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.NoError(t, werr,
+			"25 MiB must fit the promoted 100 MiB cap; dd output: %s", out)
+	})
+}
+
+// TestIntegration_DemotePromote_XFS exercises the demote/promote quota flow on
+// a real XFS loopback with project quotas (pquota). Covers the same gate
+// assertions as the btrfs variant: (a) gate passes + quota lowered, (b) gate
+// refuses when data exceeds the smaller tier.
+func TestIntegration_DemotePromote_XFS(t *testing.T) {
+	mountDir := setupXFSLoopback(t)
+	ctx := context.Background()
+
+	const largeMiB, mediumMiB = int64(100), int64(20)
+
+	mgr, err := newVolumeManager(mountDir, "xfs", slog.Default())
+	require.NoError(t, err)
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.volumes = mgr
+	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
+	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
+	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}
+
+	// (a) fits: gate passes, XFS bhard lowered, write beyond medium fails.
+	t.Run("fits_medium", func(t *testing.T) {
+		const origLease = "int-xfs-fits"
+		canon := canonicalVolumeName(origLease, "app", 0)
+		retained := retainedName(canon)
+
+		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err)
+
+		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
+
+		require.NoError(t, mgr.RenameVolume(canon, retained))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+
+		rec := &shared.RetentionEntry{
+			OriginalLeaseUUID:   origLease,
+			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			RetainedVolumeNames: []string{retained},
+		}
+		err = b.checkDemoteFit(ctx, rec,
+			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
+			mediumProfiles, b.logger)
+		require.NoError(t, err, "5 MiB data fits 20 MiB medium: checkDemoteFit must pass")
+
+		const newLease = "int-xfs-fits-new"
+		newCanon := canonicalVolumeName(newLease, "app", 0)
+		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, newCanon) })
+
+		// Create at medium cap updates the XFS project bhard limit to 20 MiB.
+		newHostPath, _, err := mgr.Create(ctx, newCanon, mediumMiB)
+		require.NoError(t, err, "Create at medium cap must succeed")
+
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(newHostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.Error(t, werr,
+			"writing 25 MiB to a 20 MiB-quota XFS volume must fail (EDQUOT); dd output: %s", out)
+	})
+
+	// (b) exceeds: gate refuses.
+	t.Run("exceeds_medium", func(t *testing.T) {
+		const origLease = "int-xfs-exceeds"
+		canon := canonicalVolumeName(origLease, "app", 0)
+		retained := retainedName(canon)
+
+		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.NoError(t, werr, "25 MiB must fit 100 MiB XFS quota; dd output: %s", out)
+
+		require.NoError(t, mgr.RenameVolume(canon, retained))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+
+		rec := &shared.RetentionEntry{
+			OriginalLeaseUUID:   origLease,
+			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			RetainedVolumeNames: []string{retained},
+		}
+		err = b.checkDemoteFit(ctx, rec,
+			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
+			mediumProfiles, b.logger)
+		require.ErrorIs(t, err, backend.ErrDemoteDataExceedsTier,
+			"25 MiB data exceeds 20 MiB medium: gate must refuse")
+	})
+}
+
+// TestIntegration_DemotePromote_ZFS exercises the demote/promote quota flow on
+// a real ZFS pool. The key ZFS-specific assertion is that the gate's precondition
+// (usage ≤ new cap) prevents `zfs set refquota` from being called with a value
+// below the dataset's `referenced`, which ZFS would reject with "cannot set
+// refquota below referenced value".
+func TestIntegration_DemotePromote_ZFS(t *testing.T) {
+	mountPath, _ := setupZFSPool(t)
+	ctx := context.Background()
+
+	const largeMiB, mediumMiB = int64(100), int64(20)
+
+	mgr, err := newVolumeManager(mountPath, "zfs", slog.Default())
+	require.NoError(t, err)
+	// Validate resolves and caches the parent dataset name required by all ZFS ops.
+	require.NoError(t, mgr.Validate())
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.volumes = mgr
+	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
+	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
+	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}
+
+	// (a) 5 MiB data fits 20 MiB medium: gate passes, `zfs set refquota` at
+	//     medium succeeds because referenced (~5 MiB) < refquota (20 MiB).
+	//     Write beyond medium then fails — confirming refquota is the enforcer.
+	t.Run("fits_medium_refquota_succeeds", func(t *testing.T) {
+		const origLease = "int-zfs-fits"
+		canon := canonicalVolumeName(origLease, "app", 0)
+		retained := retainedName(canon)
+
+		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err)
+
+		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
+
+		require.NoError(t, mgr.RenameVolume(canon, retained))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+
+		rec := &shared.RetentionEntry{
+			OriginalLeaseUUID:   origLease,
+			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			RetainedVolumeNames: []string{retained},
+		}
+		err = b.checkDemoteFit(ctx, rec,
+			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
+			mediumProfiles, b.logger)
+		require.NoError(t, err, "5 MiB fits 20 MiB medium: gate must pass")
+
+		const newLease = "int-zfs-fits-new"
+		newCanon := canonicalVolumeName(newLease, "app", 0)
+		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, newCanon) })
+
+		// Create at medium cap issues `zfs set refquota=20M <dataset>`.
+		// Since referenced (~5 MiB) < refquota (20 MiB) the set must NOT fail with
+		// "cannot set refquota below referenced value" — that ZFS error only arises
+		// when the gate is bypassed and data > new cap reaches this call.
+		_, _, err = mgr.Create(ctx, newCanon, mediumMiB)
+		require.NoError(t, err,
+			"zfs set refquota at 20 MiB must succeed when referenced is only ~5 MiB")
+
+		// refquota is now 20 MiB; a write beyond it must fail.
+		newHostPath := mgr.HostPath(newCanon)
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(newHostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.Error(t, werr,
+			"writing 25 MiB beyond the 20 MiB ZFS refquota must fail; dd output: %s", out)
+	})
+
+	// (b) 25 MiB data exceeds 20 MiB medium: gate refuses, preventing the
+	//     `zfs set refquota < referenced` error that ZFS would return if we
+	//     proceeded directly to Create at medium cap.
+	t.Run("exceeds_medium_gate_refuses", func(t *testing.T) {
+		const origLease = "int-zfs-exceeds"
+		canon := canonicalVolumeName(origLease, "app", 0)
+		retained := retainedName(canon)
+
+		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.NoError(t, werr, "25 MiB must fit 100 MiB ZFS refquota; dd output: %s", out)
+
+		require.NoError(t, mgr.RenameVolume(canon, retained))
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+
+		rec := &shared.RetentionEntry{
+			OriginalLeaseUUID:   origLease,
+			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			RetainedVolumeNames: []string{retained},
+		}
+		err = b.checkDemoteFit(ctx, rec,
+			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
+			mediumProfiles, b.logger)
+		// Gate refuses — prevents `zfs set refquota=20M` on a ~25 MiB dataset,
+		// which would fail: "cannot set refquota below referenced value."
+		require.ErrorIs(t, err, backend.ErrDemoteDataExceedsTier,
+			"gate must refuse 25 MiB data for 20 MiB medium, preventing ZFS refquota-below-referenced error")
+	})
 }
