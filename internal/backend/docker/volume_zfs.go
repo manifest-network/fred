@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,8 +42,8 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	// Idempotent: if dataset already exists (mountpoint present), update quota and return.
 	_, statErr := os.Stat(mountpoint)
 	if statErr == nil {
-		if out, err := exec.CommandContext(ctx, "zfs", "set", "quota="+quota, dataset).CombinedOutput(); err != nil {
-			return "", false, fmt.Errorf("zfs set quota on existing %s: %w: %s", dataset, err, out)
+		if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, dataset).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("zfs set refquota on existing %s: %w: %s", dataset, err, out)
 		}
 		z.logger.Debug("reusing existing zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
 		return mountpoint, false, nil
@@ -58,21 +59,21 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		if out, err := exec.CommandContext(ctx, "zfs", "mount", dataset).CombinedOutput(); err != nil {
 			return "", false, fmt.Errorf("zfs mount existing unmounted dataset %s: %w: %s", dataset, err, out)
 		}
-		if out, err := exec.CommandContext(ctx, "zfs", "set", "quota="+quota, dataset).CombinedOutput(); err != nil {
-			return "", false, fmt.Errorf("zfs set quota on remounted %s: %w: %s", dataset, err, out)
+		if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, dataset).CombinedOutput(); err != nil {
+			return "", false, fmt.Errorf("zfs set refquota on remounted %s: %w: %s", dataset, err, out)
 		}
 		z.logger.Info("remounted existing zfs dataset", "dataset", dataset, "mountpoint", mountpoint, "quota_mb", sizeMB)
 		return mountpoint, false, nil
 	}
 
-	if out, err := exec.CommandContext(ctx, "zfs", "create", "-o", "quota="+quota, dataset).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "zfs", "create", "-o", "refquota="+quota, dataset).CombinedOutput(); err != nil {
 		// Cleanup partially created dataset (zfs create is not atomic with quota).
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "zfs", "destroy", "-f", dataset).CombinedOutput(); cleanupErr != nil {
 			z.logger.Warn("failed to cleanup zfs dataset after create failure", "dataset", dataset, "error", cleanupErr, "output", string(cleanupOut))
 		}
-		return "", false, fmt.Errorf("zfs create %s (quota=%s): %w: %s", dataset, quota, err, out)
+		return "", false, fmt.Errorf("zfs create %s (refquota=%s): %w: %s", dataset, quota, err, out)
 	}
 
 	// The dataset mountpoint is the child of the parent mountpoint.
@@ -180,9 +181,26 @@ func (z *zfsVolumeManager) HostPath(name string) string {
 // Kind identifies the zfs backend.
 func (z *zfsVolumeManager) Kind() string { return "zfs" }
 
-// Usage is implemented in Task 4.
-func (z *zfsVolumeManager) Usage(_ context.Context, _ string) (int64, error) {
-	return 0, fmt.Errorf("zfs usage not implemented: %w", errors.ErrUnsupported)
+// Usage returns the dataset's referenced bytes — its own data footprint,
+// excluding snapshots and descendant datasets. refquota is enforced against
+// exactly this value. `-Hp` yields tab-stripped exact bytes.
+func (z *zfsVolumeManager) Usage(ctx context.Context, id string) (int64, error) {
+	dataset := z.parentDataset + "/" + id
+	out, err := exec.CommandContext(ctx, "zfs", "get", "-Hp", "-o", "value", "referenced", dataset).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("zfs get referenced %s: %w: %s", dataset, err, out)
+	}
+	return parseZfsReferenced(string(out))
+}
+
+// parseZfsReferenced parses the exact-byte `referenced` value from
+// `zfs get -Hp -o value referenced`.
+func parseZfsReferenced(out string) (int64, error) {
+	v, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse zfs referenced %q: %w", strings.TrimSpace(out), err)
+	}
+	return v, nil
 }
 
 func (z *zfsVolumeManager) Validate() error {
