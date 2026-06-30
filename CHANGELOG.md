@@ -30,6 +30,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Restore now persists a release record for the new lease.** A successful restore
+  brought the adopted stack up but never wrote a `releases.db` record (it set the
+  manifest in memory only and deleted the retained record). After a docker-backend
+  restart, `recoverState` rehydrates a lease's manifest solely from
+  `releaseStore.LatestActive`, so a restored lease came back with a nil manifest and
+  `Restart` hard-failed with `ErrInvalidState` ("no stored manifest"). The restore
+  success path now appends an `active` release (the retained `StackManifest`
+  re-serialized via the same `json.Marshal` → `ParsePayload` round-trip used by
+  restart/update), so restored leases survive a restart and stay restartable. The
+  fix is best-effort like the provision path — a release-write failure cannot undo
+  the already-succeeded restore. (ENG-433)
+
 ### Security
 
 ## [0.5.0] - 2026-06-26
