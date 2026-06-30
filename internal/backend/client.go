@@ -430,6 +430,12 @@ const (
 // (e.g., unknown SKU, invalid manifest, disallowed image registry).
 var ErrValidation = errors.New("validation error")
 
+// ErrDemoteDataExceedsTier is returned when a restore requests a smaller
+// disk tier (demote) than the retained volume's measured data footprint, so
+// the data would not fit the new cap. A dedicated sentinel (NOT wrapping
+// ErrValidation) so the API can map it to 422 distinctly. (ENG-438)
+var ErrDemoteDataExceedsTier = errors.New("retained data exceeds the requested smaller tier")
+
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
 var (

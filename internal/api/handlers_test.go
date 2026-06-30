@@ -4993,6 +4993,73 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 	assert.Equal(t, "insufficient resources to restore", errResp.Error)
 }
 
+// TestRestoreLease_DemoteExceedsTier_422 verifies that a backend Restore returning
+// ErrDemoteDataExceedsTier is surfaced to the tenant as HTTP 422 Unprocessable
+// Entity — distinct from the ErrValidation→400 mapping and the ErrNotRetained→404
+// mapping. Uses a MockBackend (not an HTTP server) so the error is injected at the
+// Go interface level without needing an HTTP status-code mapping for the sentinel.
+// (ENG-438)
+func TestRestoreLease_DemoteExceedsTier_422(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	// MockBackend with RestoreFn configured to return ErrDemoteDataExceedsTier
+	// wrapped in an additional message, exactly as checkDemoteFit would return it.
+	mockB := backend.NewMockBackend(backend.MockBackendConfig{Name: "test-backend"})
+	mockB.RestoreFn = func(_ context.Context, _ backend.RestoreRequest) error {
+		return fmt.Errorf("%w: service %q: 3000 bytes used exceeds disk_mb=2 cap (2097152 bytes)",
+			backend.ErrDemoteDataExceedsTier, "app")
+	}
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockB, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string {
+			if uuid == fromLeaseUUID {
+				return "test-backend"
+			}
+			return ""
+		},
+	}
+
+	h := &Handlers{
+		client:          chainClient,
+		backendRouter:   router,
+		placementLookup: placement,
+		providerUUID:    providerUUID,
+		bech32Prefix:    "manifest",
+	}
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.RestoreLease(rec, req)
+
+	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code, "body: %s", rec.Body.String())
+}
+
 // TestRestoreLease_PendingLeaseAuthenticates verifies that requireActive=false
 // allows a PENDING lease to authenticate successfully (i.e. the handler reaches
 // the backend call rather than 404-ing on auth).

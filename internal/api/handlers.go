@@ -1003,6 +1003,8 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 			// 503, matching how Provision/StartProvisioning surface capacity to
 			// tenants: the provider is full, not a permanent client error.
 			writeError(w, "insufficient resources to restore", http.StatusServiceUnavailable)
+		case errors.Is(err, backend.ErrDemoteDataExceedsTier):
+			writeError(w, err.Error(), http.StatusUnprocessableEntity)
 		case errors.Is(err, backend.ErrValidation):
 			writeError(w, err.Error(), http.StatusBadRequest)
 		default:

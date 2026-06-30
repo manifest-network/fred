@@ -30,6 +30,11 @@ type MockBackend struct {
 
 	// retentions is returned by ListRetentions. nil/empty = no retained leases.
 	retentions []RetainedLease
+
+	// RestoreFn, when non-nil, overrides the default Restore behavior. Allows
+	// callers to inject specific errors (e.g. ErrDemoteDataExceedsTier) without
+	// standing up an HTTP test server.
+	RestoreFn func(ctx context.Context, req RestoreRequest) error
 }
 
 type mockProvision struct {
@@ -321,7 +326,11 @@ func (m *MockBackend) Update(ctx context.Context, req UpdateRequest) error {
 
 // Restore is a no-op for mock backend — returns ErrNotRetained unless the
 // source lease exists in the provisions map (simulating "has retained data").
+// If RestoreFn is set, it is called instead of the default behavior.
 func (m *MockBackend) Restore(ctx context.Context, req RestoreRequest) error {
+	if m.RestoreFn != nil {
+		return m.RestoreFn(ctx, req)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
