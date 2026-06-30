@@ -159,7 +159,7 @@ func (s *Signer) signTxInternal(ctx context.Context, msgs []sdk.Msg, accountAny 
 		seq = *seqOverride
 	}
 
-	gasLimit := s.gasLimit
+	var gasLimit uint64
 	if gasLimitOverride != nil {
 		// OOG-retry / pre-seeded path: the value is already adjusted+capped; do
 		// not re-apply the multiplier (would double-adjust).
