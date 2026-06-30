@@ -15,6 +15,25 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
+// TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory proves ENG-410's
+// close-time fix: a lease whose container was already gone at on-chain close has release
+// history but no provision entry (recoverState rebuilds b.provisions from live containers
+// only), so a deprovision RPC hits the !exists short-circuit ~before the terminal
+// releaseStore.Delete and leaves a stale "active" record that audit-lease-status flags
+// until the 90-day RemoveOlderThan TTL. The short-circuit must still purge that history.
+func TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+	rel := attachReleaseStore(t, b)
+	require.NoError(t, rel.Append("u1", shared.Release{Image: "stack", Status: "active", CreatedAt: time.Now()}))
+
+	// No provision entry for u1 → doDeprovision takes the !exists path.
+	require.NoError(t, b.doDeprovision(context.Background(), "u1"))
+
+	releases, err := rel.List("u1")
+	require.NoError(t, err)
+	assert.Empty(t, releases, "containerless deprovision must purge stranded release history (ENG-410)")
+}
+
 // TestDeprovisionGiveUp_WritesReapingTombstone verifies a give-up (max volume
 // cleanup attempts) writes a reaping tombstone for the leaked canonical volumes so
 // the footprint keeps counting + the sweep auto-retries, instead of a silent
