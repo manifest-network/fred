@@ -43,3 +43,20 @@ func TestParseBtrfsQgroupRfer_NotFound(t *testing.T) {
 		t.Fatalf("expected error for missing qgroup id")
 	}
 }
+
+func TestParseXfsReportUsedBlocks(t *testing.T) {
+	// `xfs_quota -x -c "report -p -b -N" <mnt>` rows: <projid> <used> <soft> <hard> <warn/grace>
+	// Used is in 1KiB blocks.
+	out := "#0            0          0          0     00 [--------]\n" +
+		"#1048576   1024          0    2097152     00 [--------]\n"
+	blocks, err := parseXfsReportUsedBlocks(out, 1048576)
+	if err != nil || blocks != 1024 {
+		t.Fatalf("parseXfsReportUsedBlocks = %d, %v; want 1024, nil", blocks, err)
+	}
+}
+
+func TestParseXfsReportUsedBlocks_NotFound(t *testing.T) {
+	if _, err := parseXfsReportUsedBlocks("#0 0 0 0 00 [---]\n", 42); err == nil {
+		t.Fatalf("expected error for missing project id")
+	}
+}

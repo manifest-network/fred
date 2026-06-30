@@ -250,9 +250,54 @@ func (x *xfsVolumeManager) HostPath(name string) string {
 // Kind identifies the xfs backend.
 func (x *xfsVolumeManager) Kind() string { return "xfs" }
 
-// Usage is implemented in Task 3.
-func (x *xfsVolumeManager) Usage(_ context.Context, _ string) (int64, error) {
-	return 0, fmt.Errorf("xfs usage not implemented: %w", errors.ErrUnsupported)
+// xfsBlockBytes is the XFS quota report block unit (1 KiB blocks).
+const xfsBlockBytes = 1024
+
+// Usage returns the project's used bytes from the XFS project-quota report.
+// The "Used" column is in 1 KiB blocks; multiply by xfsBlockBytes. XFS quota
+// accounting is kernel-maintained and real-time (no rescan). Must use
+// `xfs_quota -x`; generic quota/repquota do not work with XFS project quotas.
+func (x *xfsVolumeManager) Usage(ctx context.Context, id string) (int64, error) {
+	dirPath := filepath.Join(x.dataPath, id)
+	projID, err := readProjectIDFile(dirPath)
+	if err != nil {
+		return 0, fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
+	}
+	out, err := exec.CommandContext(ctx, "xfs_quota", "-x", "-c", "report -p -b -N", x.dataPath).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("xfs_quota report for %s (proj %d): %w: %s", dirPath, projID, err, out)
+	}
+	blocks, err := parseXfsReportUsedBlocks(string(out), projID)
+	if err != nil {
+		return 0, fmt.Errorf("read used blocks for proj %d under %s: %w", projID, dirPath, err)
+	}
+	return blocks * xfsBlockBytes, nil
+}
+
+// parseXfsReportUsedBlocks finds the report row for projID and returns its
+// "Used" value in 1 KiB blocks. Rows look like:
+//
+//	#<projid>   <used>   <soft>   <hard>   <warn/grace>
+//
+// The first token may be the bare id or "#<id>".
+func parseXfsReportUsedBlocks(out string, projID uint32) (int64, error) {
+	want := strconv.FormatUint(uint64(projID), 10)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		first := strings.TrimPrefix(fields[0], "#")
+		if first != want {
+			continue
+		}
+		used, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse used blocks %q: %w", fields[1], err)
+		}
+		return used, nil
+	}
+	return 0, fmt.Errorf("project id %d not found in xfs_quota report output", projID)
 }
 
 func (x *xfsVolumeManager) Validate() error {
