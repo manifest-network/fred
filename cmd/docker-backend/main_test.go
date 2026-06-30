@@ -1732,6 +1732,23 @@ func TestHandleRestore(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "insufficient resources")
 	})
 
+	t.Run("ErrDemoteDataExceedsTier returns 422 with demote_exceeds_tier code", func(t *testing.T) {
+		mb := &mockBackend{
+			RestoreFunc: func(context.Context, backend.RestoreRequest) error {
+				return fmt.Errorf("%w: service %q: 3000 bytes used exceeds disk_mb=2 cap",
+					backend.ErrDemoteDataExceedsTier, "app")
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restore", validBody))
+
+		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "demote_exceeds_tier", resp.Code,
+			"demote-exceeds-tier 422 must set code=demote_exceeds_tier")
+	})
+
 	t.Run("generic error returns 500", func(t *testing.T) {
 		mb := &mockBackend{
 			RestoreFunc: func(context.Context, backend.RestoreRequest) error {

@@ -494,6 +494,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusUnprocessableEntity, "no retained data for lease")
 			return
 		}
+		if errors.Is(err, backend.ErrDemoteDataExceedsTier) {
+			// 422 with code="demote_exceeds_tier" → client reconstructs
+			// ErrDemoteDataExceedsTier (422 is overloaded: bare 422 = ErrNotRetained).
+			s.errorResponseWithCode(w, http.StatusUnprocessableEntity, err.Error(), "demote_exceeds_tier")
+			return
+		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			// 409 with no code → client maps to ErrInvalidState.
 			s.errorResponse(w, http.StatusConflict, "invalid state for restore")

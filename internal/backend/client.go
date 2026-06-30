@@ -1193,6 +1193,12 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 		case http.StatusAccepted:
 			return nil, nil
 		case http.StatusUnprocessableEntity:
+			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
+			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
+			code, msg := parseErrorCode(readErrorBodyBytes(resp))
+			if code == "demote_exceeds_tier" {
+				return nil, fmt.Errorf("%w: %s", ErrDemoteDataExceedsTier, msg)
+			}
 			return nil, ErrNotRetained
 		case http.StatusConflict:
 			// Restore overloads 409 for two sentinels: the backend tags the

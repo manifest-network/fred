@@ -1823,9 +1823,15 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 			wantNil:    true,
 		},
 		{
-			name:       "422 Unprocessable Entity returns ErrNotRetained",
+			name:       "422 Unprocessable Entity (no code) returns ErrNotRetained",
 			statusCode: http.StatusUnprocessableEntity,
 			wantErr:    ErrNotRetained,
+		},
+		{
+			name:       "422 Unprocessable Entity with demote_exceeds_tier code returns ErrDemoteDataExceedsTier",
+			statusCode: http.StatusUnprocessableEntity,
+			body:       `{"error":"retained data exceeds the requested smaller tier: service \"app\": 3000 bytes used exceeds disk_mb=2 cap","code":"demote_exceeds_tier"}`,
+			wantErr:    ErrDemoteDataExceedsTier,
 		},
 		{
 			name:       "409 Conflict (no code) returns ErrInvalidState",
