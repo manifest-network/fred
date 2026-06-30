@@ -771,7 +771,10 @@ func setupXFSLoopback(t *testing.T) string {
 	mountDir := filepath.Join(tmpDir, "mnt")
 	require.NoError(t, os.MkdirAll(mountDir, 0755))
 
-	out, err := exec.Command("truncate", "-s", "256M", imgFile).CombinedOutput()
+	// 512M: modern xfsprogs refuses to mkfs an XFS filesystem smaller than
+	// 300MB ("Filesystem must be larger than 300MB"). The per-volume project
+	// quotas (tens of MiB) are independent of this backing-image size.
+	out, err := exec.Command("truncate", "-s", "512M", imgFile).CombinedOutput()
 	require.NoError(t, err, "truncate: %s", out)
 
 	out, err = exec.Command("mkfs.xfs", "-f", imgFile).CombinedOutput()
