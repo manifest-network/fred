@@ -2174,7 +2174,7 @@ func pagingProvisionServer(t *testing.T, all []ProvisionInfo) *httptest.Server {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		limit, cont, err := ParseProvisionsPageParams(r.URL.Query())
+		limit, cont, err := ParsePageParams(r.URL.Query())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -2187,7 +2187,7 @@ func pagingProvisionServer(t *testing.T, all []ProvisionInfo) *httptest.Server {
 
 // provUUID renders i as a lexically-sortable valid UUID. The client loop sends
 // the last LeaseUUID back as the `continue` query param, which the producer's
-// ParseProvisionsPageParams validates as a UUID — so the IDs in these
+// ParsePageParams validates as a UUID — so the IDs in these
 // end-to-end tests must be real UUIDs (zero-padded so lexical == numeric order).
 func provUUID(i int) string {
 	return fmt.Sprintf("%08d-0000-0000-0000-000000000000", i)
@@ -2312,7 +2312,7 @@ func TestHTTPClient_ListProvisions_PageErrorAborts(t *testing.T) {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
-		limit, cont, _ := ParseProvisionsPageParams(r.URL.Query())
+		limit, cont, _ := ParsePageParams(r.URL.Query())
 		page, next := PaginateProvisions(all, cont, limit)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: page, Continue: next})
@@ -2344,7 +2344,7 @@ func TestHTTPClient_ListProvisions_ToleratesMidFetchDeletion(t *testing.T) {
 				set = append(set, p)
 			}
 		}
-		limit, cont, _ := ParseProvisionsPageParams(r.URL.Query())
+		limit, cont, _ := ParsePageParams(r.URL.Query())
 		page, next := PaginateProvisions(set, cont, limit)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: page, Continue: next})

@@ -116,50 +116,50 @@ func padID(i int) string {
 	return fmt.Sprintf("%08d", i)
 }
 
-func TestParseProvisionsPageParams(t *testing.T) {
+func TestParsePageParams(t *testing.T) {
 	validUUID := "11111111-1111-1111-1111-111111111111"
 
 	t.Run("absent params", func(t *testing.T) {
-		limit, cont, err := ParseProvisionsPageParams(url.Values{})
+		limit, cont, err := ParsePageParams(url.Values{})
 		require.NoError(t, err)
 		assert.Equal(t, 0, limit)
 		assert.Empty(t, cont)
 	})
 	t.Run("valid limit and continue", func(t *testing.T) {
-		limit, cont, err := ParseProvisionsPageParams(url.Values{"limit": {"500"}, "continue": {validUUID}})
+		limit, cont, err := ParsePageParams(url.Values{"limit": {"500"}, "continue": {validUUID}})
 		require.NoError(t, err)
 		assert.Equal(t, 500, limit)
 		assert.Equal(t, validUUID, cont)
 	})
 	t.Run("non-integer limit is rejected", func(t *testing.T) {
-		_, _, err := ParseProvisionsPageParams(url.Values{"limit": {"abc"}})
+		_, _, err := ParsePageParams(url.Values{"limit": {"abc"}})
 		require.Error(t, err)
 	})
 	t.Run("negative limit is rejected", func(t *testing.T) {
-		_, _, err := ParseProvisionsPageParams(url.Values{"limit": {"-1"}})
+		_, _, err := ParsePageParams(url.Values{"limit": {"-1"}})
 		require.Error(t, err)
 	})
 	t.Run("non-UUID continue is rejected", func(t *testing.T) {
-		_, _, err := ParseProvisionsPageParams(url.Values{"continue": {"not-a-uuid"}})
+		_, _, err := ParsePageParams(url.Values{"continue": {"not-a-uuid"}})
 		require.Error(t, err)
 	})
 	t.Run("continue without limit is rejected", func(t *testing.T) {
-		_, _, err := ParseProvisionsPageParams(url.Values{"continue": {validUUID}})
+		_, _, err := ParsePageParams(url.Values{"continue": {validUUID}})
 		require.Error(t, err, "a cursor with no positive limit must 400, not silently return the full list")
 	})
 	t.Run("continue with limit=0 is rejected", func(t *testing.T) {
-		_, _, err := ParseProvisionsPageParams(url.Values{"continue": {validUUID}, "limit": {"0"}})
+		_, _, err := ParsePageParams(url.Values{"continue": {validUUID}, "limit": {"0"}})
 		require.Error(t, err)
 	})
 	t.Run("uppercase continue is canonicalized to lowercase", func(t *testing.T) {
 		// uuid.Parse accepts uppercase; the cursor must be canonical lowercase so
 		// lexical comparison matches the stored LeaseUUIDs (else duplicate/rewound pages).
-		_, cont, err := ParseProvisionsPageParams(url.Values{"limit": {"100"}, "continue": {"ABCDEF01-2345-6789-ABCD-EF0123456789"}})
+		_, cont, err := ParsePageParams(url.Values{"limit": {"100"}, "continue": {"ABCDEF01-2345-6789-ABCD-EF0123456789"}})
 		require.NoError(t, err)
 		assert.Equal(t, "abcdef01-2345-6789-abcd-ef0123456789", cont)
 	})
 	t.Run("braced continue is canonicalized", func(t *testing.T) {
-		_, cont, err := ParseProvisionsPageParams(url.Values{"limit": {"100"}, "continue": {"{11111111-1111-1111-1111-111111111111}"}})
+		_, cont, err := ParsePageParams(url.Values{"limit": {"100"}, "continue": {"{11111111-1111-1111-1111-111111111111}"}})
 		require.NoError(t, err)
 		assert.Equal(t, "11111111-1111-1111-1111-111111111111", cont)
 	})

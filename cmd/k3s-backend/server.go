@@ -42,10 +42,12 @@ type backendService interface {
 	GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
 	GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
 	ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error)
+	ListProvisionsPage(ctx context.Context, after string, limit int) ([]backend.ProvisionInfo, string, error)
 	LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	Restart(ctx context.Context, req backend.RestartRequest) error
 	Update(ctx context.Context, req backend.UpdateRequest) error
 	ListRetentions(ctx context.Context) ([]backend.RetainedLease, error)
+	ListRetentionsPage(ctx context.Context, after string, limit int) ([]backend.RetainedLease, string, error)
 	ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	Health(ctx context.Context) error
@@ -265,16 +267,25 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListRetentions(w http.ResponseWriter, r *http.Request) {
-	retentions, err := s.backend.ListRetentions(r.Context())
+	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
+	if perr != nil {
+		s.errorResponse(w, http.StatusBadRequest, perr.Error())
+		return
+	}
+
+	page, next, err := s.backend.ListRetentionsPage(r.Context(), cont, limit)
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Serialize as `[]` not `null` even if the backend returned a nil slice.
-	if retentions == nil {
-		retentions = []backend.RetainedLease{}
+	// Serialize as `[]` not `null` even if empty (defensive; impls return non-nil).
+	if page == nil {
+		page = []backend.RetainedLease{}
 	}
-	s.writeJSON(w, http.StatusOK, backend.ListRetentionsResponse{Retentions: retentions})
+	s.writeJSON(w, http.StatusOK, backend.ListRetentionsResponse{
+		Retentions: page,
+		Continue:   next,
+	})
 }
 
 func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Request) {
@@ -451,20 +462,18 @@ func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit, cont, perr := backend.ParseProvisionsPageParams(r.URL.Query())
+	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
 	if perr != nil {
 		s.errorResponse(w, http.StatusBadRequest, perr.Error())
 		return
 	}
 
-	provisions, err := s.backend.ListProvisions(r.Context())
+	page, next, err := s.backend.ListProvisionsPage(r.Context(), cont, limit)
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	page, next := backend.PaginateProvisions(provisions, cont, limit)
-	// Serialize as [] not null even if empty. PaginateProvisions returns non-nil
-	// today; this mirrors the lease_uuid branch above and stays defensive.
+	// Serialize as [] not null even if empty (defensive; impls return non-nil).
 	if page == nil {
 		page = []backend.ProvisionInfo{}
 	}
