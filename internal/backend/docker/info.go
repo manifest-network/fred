@@ -213,12 +213,14 @@ func (b *Backend) ListProvisions(_ context.Context) ([]backend.ProvisionInfo, er
 }
 
 // ListProvisionsPage returns one keyset page of provisions for the /provisions
-// handler, the paged sibling of ListProvisions. The docker provision store is an
-// in-memory map with no ordered index, so this snapshots it via ListProvisions
-// and paginates in memory (O(N log N) per page, no disk I/O) — symmetric with
-// ListRetentionsPage. A true store-level O(limit) provision read is tracked as
-// ENG-455 (it needs the ENG-381 ordered snapshot, since recoverState rebuilds
-// the whole map each tick).
+// handler — the same paged-handler role ListRetentionsPage plays for
+// /retentions, but NOT the same performance profile. The docker provision store
+// is an in-memory map with no ordered index, so this snapshots it via
+// ListProvisions and paginates in memory (O(N log N) per page, no disk I/O),
+// whereas ListRetentionsPage serves O(limit) pages directly from the ordered
+// bbolt index via a cursor seek. A true store-level O(limit) provision read is
+// tracked as ENG-455 (it needs the ENG-381 ordered snapshot, since recoverState
+// rebuilds the whole map each tick).
 func (b *Backend) ListProvisionsPage(ctx context.Context, after string, limit int) ([]backend.ProvisionInfo, string, error) {
 	all, err := b.ListProvisions(ctx)
 	if err != nil {
