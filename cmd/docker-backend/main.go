@@ -542,16 +542,27 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListRetentions(w http.ResponseWriter, r *http.Request) {
+	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
+	if perr != nil {
+		s.errorResponse(w, http.StatusBadRequest, perr.Error())
+		return
+	}
+
 	retentions, err := s.backend.ListRetentions(r.Context())
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Serialize as `[]` not `null` even if the backend returned a nil slice.
-	if retentions == nil {
-		retentions = []backend.RetainedLease{}
+	page, next := backend.PaginateRetentions(retentions, cont, limit)
+	// Serialize as `[]` not `null` even if empty. PaginateRetentions returns
+	// non-nil today; this mirrors handleListProvisions and stays defensive.
+	if page == nil {
+		page = []backend.RetainedLease{}
 	}
-	s.writeJSON(w, http.StatusOK, backend.ListRetentionsResponse{Retentions: retentions})
+	s.writeJSON(w, http.StatusOK, backend.ListRetentionsResponse{
+		Retentions: page,
+		Continue:   next,
+	})
 }
 
 func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Request) {
@@ -728,7 +739,7 @@ func (s *Server) handleListProvisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit, cont, perr := backend.ParseProvisionsPageParams(r.URL.Query())
+	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
 	if perr != nil {
 		s.errorResponse(w, http.StatusBadRequest, perr.Error())
 		return

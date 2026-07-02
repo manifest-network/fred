@@ -21,6 +21,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend and k3s-backend: the `GET /retentions` list is now keyset-
+  paginated end to end, closing the second un-paginated O(N) cliff left by
+  ENG-380. Previously the whole retained-lease list was returned in one response
+  capped at 1 MiB (~19.4k records/backend); on overflow the reconciler silently
+  marked retentions incomplete, which disabled placement-orphan pruning and
+  degraded restore backend-affinity (ENG-333) with no operator-visible error.
+  The client now walks pages (complete-or-error) with each page bounded, so a
+  large retained inventory is fetched without `ErrResponseTooLarge`. Page size is
+  configurable via `RetentionsPageLimit` (default 1000). (ENG-451)
+
 - docker-backend: `/health` now probes the persistence stores (callback,
   diagnostics, release, retention bbolt) in addition to pinging the Docker
   daemon. Previously a locked/corrupt/read-only store left the backend reporting
