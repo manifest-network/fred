@@ -1163,6 +1163,39 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 		require.ErrorIs(t, err, backend.ErrDemoteDataExceedsTier,
 			"25 MiB data exceeds 20 MiB medium: gate must refuse")
 	})
+
+	// (c) promote: Create at large from a medium-capped project raises the XFS
+	//     project bhard so writes beyond the medium cap now succeed.
+	t.Run("promote_raises_cap", func(t *testing.T) {
+		const origLease = "int-xfs-promote"
+		canon := canonicalVolumeName(origLease, "app", 0)
+
+		// Start at medium cap (20 MiB).
+		hostPath, _, err := mgr.Create(ctx, canon, mediumMiB)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+
+		// Write 5 MiB so the project has some data.
+		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
+
+		// Confirm 25 MiB does NOT fit under the medium bhard (partial write fails).
+		out, werr := exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(hostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.Error(t, werr,
+			"25 MiB must not fit the 20 MiB bhard before promote; dd output: %s", out)
+		// Remove any partial file so usage drops back toward the initial 5 MiB.
+		_ = os.Remove(filepath.Join(hostPath, "big.bin"))
+
+		// Promote: Create (idempotent) at large cap raises the project bhard to 100 MiB.
+		_, _, err = mgr.Create(ctx, canon, largeMiB)
+		require.NoError(t, err, "Create at large cap must succeed (bhard update)")
+
+		// Writing 25 MiB must now succeed (bhard is 100 MiB; total at most ~30 MiB).
+		out, werr = exec.Command("dd", "if=/dev/zero",
+			"of="+filepath.Join(hostPath, "big2.bin"), "bs=1M", "count=25").CombinedOutput()
+		require.NoError(t, werr,
+			"25 MiB must fit the promoted 100 MiB bhard; dd output: %s", out)
+	})
 }
 
 // TestIntegration_DemotePromote_ZFS exercises the demote/promote quota flow on

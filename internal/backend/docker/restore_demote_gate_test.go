@@ -3,11 +3,28 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
+
+// assertDemoteRefused runs fn and asserts the demote-refusal counter for the
+// given {backend, reason} label pair incremented by exactly 1. It measures a
+// before/after delta on the specific child so it stays correct despite other
+// tests sharing the package-level restoreDemoteRefusedTotal CounterVec.
+func assertDemoteRefused(t *testing.T, backendKind, reason string, fn func()) {
+	t.Helper()
+	c := restoreDemoteRefusedTotal.WithLabelValues(backendKind, reason)
+	before := testutil.ToFloat64(c)
+	fn()
+	if got := testutil.ToFloat64(c) - before; got != 1 {
+		t.Fatalf("restore_demote_refused_total{backend=%q,reason=%q} delta = %v; want 1", backendKind, reason, got)
+	}
+}
 
 // gateBackend builds a Backend whose volumes mock returns a fixed usage.
 func gateBackend(usage int64, usageErr error) *Backend {
@@ -85,18 +102,43 @@ func TestCheckDemoteFit_DemoteExceedsByOneByte(t *testing.T) {
 	b := gateBackend(2048*bytesPerMiB+1, nil)
 	rec := gRec("orig1", []backend.LeaseItem{gItem("docker-large", "app", 1)}, []string{gRetVol("orig1", "app", 0)})
 	newItems := []backend.LeaseItem{gItem("docker-medium", "app", 1)}
-	err := b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-medium"), b.logger)
+	var err error
+	assertDemoteRefused(t, "mock", "measured_exceeds", func() {
+		err = b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-medium"), b.logger)
+	})
 	if !errors.Is(err, backend.ErrDemoteDataExceedsTier) {
 		t.Fatalf("err = %v; want ErrDemoteDataExceedsTier", err)
 	}
 }
 
 func TestCheckDemoteFit_UnmeasurableRefuses(t *testing.T) {
+	// A non-ErrUnsupported read failure (e.g. the qgroup command errored) →
+	// reason label "unmeasurable_read_error".
 	b := gateBackend(0, errors.New("qgroup show failed"))
 	rec := gRec("orig1", []backend.LeaseItem{gItem("docker-large", "app", 1)}, []string{gRetVol("orig1", "app", 0)})
 	newItems := []backend.LeaseItem{gItem("docker-medium", "app", 1)}
-	if !errors.Is(b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-medium"), b.logger), backend.ErrDemoteDataExceedsTier) {
+	var err error
+	assertDemoteRefused(t, "mock", "unmeasurable_read_error", func() {
+		err = b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-medium"), b.logger)
+	})
+	if !errors.Is(err, backend.ErrDemoteDataExceedsTier) {
 		t.Fatalf("unmeasurable demote must refuse")
+	}
+}
+
+func TestCheckDemoteFit_UnmeasurableBackendRefuses(t *testing.T) {
+	// Usage returns a wrapped errors.ErrUnsupported (noop-style backend that
+	// cannot measure at all) → reason label "unmeasurable_backend", distinct
+	// from a transient read error.
+	b := gateBackend(0, fmt.Errorf("cannot measure usage: %w", errors.ErrUnsupported))
+	rec := gRec("orig1", []backend.LeaseItem{gItem("docker-large", "app", 1)}, []string{gRetVol("orig1", "app", 0)})
+	newItems := []backend.LeaseItem{gItem("docker-medium", "app", 1)}
+	var err error
+	assertDemoteRefused(t, "mock", "unmeasurable_backend", func() {
+		err = b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-medium"), b.logger)
+	})
+	if !errors.Is(err, backend.ErrDemoteDataExceedsTier) {
+		t.Fatalf("unsupported-usage demote must refuse")
 	}
 }
 
@@ -117,7 +159,11 @@ func TestCheckDemoteFit_EphemeralTierWithDataRefuses(t *testing.T) {
 	b.cfg.SKUProfiles["docker-ephemeral"] = SKUProfile{CPUCores: 0.25, MemoryMB: 256, DiskMB: 0}
 	rec := gRec("orig1", []backend.LeaseItem{gItem("docker-large", "app", 1)}, []string{gRetVol("orig1", "app", 0)})
 	newItems := []backend.LeaseItem{gItem("docker-ephemeral", "app", 1)}
-	if !errors.Is(b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-ephemeral"), b.logger), backend.ErrDemoteDataExceedsTier) {
+	var err error
+	assertDemoteRefused(t, "mock", "ephemeral_tier", func() {
+		err = b.checkDemoteFit(context.Background(), rec, newItems, gProfiles(b, "docker-ephemeral"), b.logger)
+	})
+	if !errors.Is(err, backend.ErrDemoteDataExceedsTier) {
 		t.Fatalf("demote to DiskMB=0 with retained data must refuse")
 	}
 }

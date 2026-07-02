@@ -436,6 +436,14 @@ var ErrValidation = errors.New("validation error")
 // ErrValidation) so the API can map it to 422 distinctly. (ENG-438)
 var ErrDemoteDataExceedsTier = errors.New("retained data exceeds the requested smaller tier")
 
+// CodeDemoteExceedsTier is the machine-readable error code the docker-backend
+// emits (HTTP 422) and the HTTPClient parses to reconstruct
+// ErrDemoteDataExceedsTier across the HTTP boundary. 422 is overloaded (a bare
+// 422 with no code means ErrNotRetained), so producer and consumer must agree
+// on this exact string; defining it once here makes drift a compile error
+// rather than a silent misclassification. (ENG-438)
+const CodeDemoteExceedsTier = "demote_exceeds_tier"
+
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
 var (
@@ -1198,7 +1206,7 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
 			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
 			code, msg := parseErrorCode(readErrorBodyBytes(resp))
-			if code == "demote_exceeds_tier" {
+			if code == CodeDemoteExceedsTier {
 				return nil, fmt.Errorf("%w: %s", ErrDemoteDataExceedsTier, msg)
 			}
 			return nil, ErrNotRetained
