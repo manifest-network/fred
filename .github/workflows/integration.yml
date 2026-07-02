@@ -121,7 +121,11 @@ jobs:
           lsmod | grep -q '^zfs ' || sudo modprobe zfs || { echo "::error::zfs kernel module not loadable"; fail=1; }
           if truncate -s 512M "$work/zfs.img"; then
             zpool_name="fredpreflight$$"
-            if sudo zpool create "$zpool_name" "$work/zfs.img"; then
+            mkdir -p "$work/zmnt"
+            # -m "$work/zmnt": mirror setupZFSPool's `zpool create -m mountPath`
+            # (exercise the exact code path) AND keep the mount inside $work so a
+            # suppressed `zpool destroy` failure can't leak a root-level /$pool mount.
+            if sudo zpool create -m "$work/zmnt" "$zpool_name" "$work/zfs.img"; then
               sudo zpool destroy "$zpool_name" || true
             else
               echo "::error::file-backed zpool create failed — the ZFS Usage/quota tests would t.Skip (ENG-330 gap). Failing."
