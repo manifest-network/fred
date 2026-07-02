@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -26,7 +27,12 @@ const projectIDFile = ".fred-project-id"
 // xfsVolumeManager creates directories with XFS project quotas.
 type xfsVolumeManager struct {
 	dataPath string
-	logger   *slog.Logger
+	// mountPoint is the XFS mount that contains dataPath, resolved once at
+	// construction. xfs_quota requires the mount point (not a subdirectory of
+	// it) as its trailing filesystem argument; dataPath is typically a subdir
+	// of this mount. See resolveMountpoint and ENG-449.
+	mountPoint string
+	logger     *slog.Logger
 
 	mu         sync.Mutex
 	activeIDs  map[uint32]string // projectID → volumeID
@@ -118,6 +124,81 @@ func readProjectIDFile(dirPath string) (uint32, error) {
 	return uint32(v), nil
 }
 
+// resolveMountpoint returns the mount point of the filesystem that contains
+// path, by walking up parent directories until the device number (st_dev)
+// changes — the classic mountpoint(1) test.
+//
+// xfs_quota requires a real mount point as its trailing filesystem argument;
+// the configured volume_data_path is typically a *subdirectory* of the XFS
+// mount (e.g. /data/fred/volumes under the /data/fred mount), which xfs_quota
+// rejects with "cannot setup path for mount ...: No such device or address".
+// The `project -s`/`limit -p`/`report -p` commands take the subdirectory in
+// their -p argument and the mount point as the filesystem argument.
+//
+// The subdirectory need not exist yet (Create makes per-volume directories
+// lazily), so resolution starts from the nearest existing ancestor — the mount
+// that ancestor lives on is the same mount the subdirectory will inherit.
+func resolveMountpoint(path string) (string, error) {
+	// Resolve to an absolute path first. A relative volume_data_path is allowed
+	// by config validation, and would otherwise walk up to "." (not a real mount
+	// point) because filepath.Dir(".") == ".".
+	p, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute path for %s: %w", path, err)
+	}
+
+	// Walk up to the nearest existing ancestor.
+	var st syscall.Stat_t
+	for {
+		if err := syscall.Stat(p, &st); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("stat %s: %w", p, err)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return "", fmt.Errorf("no existing ancestor for %s", path)
+		}
+		p = parent
+	}
+
+	// Walk up until the device number changes; that boundary is the mount root.
+	dev := st.Dev
+	for {
+		parent := filepath.Dir(p)
+		if parent == p {
+			return p, nil // reached the filesystem root
+		}
+		var pst syscall.Stat_t
+		if err := syscall.Stat(parent, &pst); err != nil {
+			return "", fmt.Errorf("stat %s: %w", parent, err)
+		}
+		if pst.Dev != dev {
+			return p, nil // p's parent is a different filesystem: p is the mount root
+		}
+		p = parent
+	}
+}
+
+// xfsQuotaArgs builds the argument vector for an `xfs_quota -x -c <cmd>
+// <mountPoint>` invocation. The mount point is ALWAYS the trailing filesystem
+// argument (never a subdirectory of it); per-directory commands reference the
+// subdirectory inside cmd's -p option instead. See resolveMountpoint / ENG-449.
+func xfsQuotaArgs(cmd, mountPoint string) []string {
+	return []string{"-x", "-c", cmd, mountPoint}
+}
+
+// xfsProjectSetupCmd is the `project -s` command that tags dirPath's inode (and
+// its existing children) with projID. dirPath is the volume subdirectory.
+func xfsProjectSetupCmd(dirPath string, projID uint32) string {
+	return fmt.Sprintf("project -s -p %s %d", dirPath, projID)
+}
+
+// xfsLimitCmd is the `limit -p` command that sets the block hard limit for projID.
+func xfsLimitCmd(projID uint32, quota string) string {
+	return fmt.Sprintf("limit -p bhard=%s %d", quota, projID)
+}
+
 func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
 	dirPath := filepath.Join(x.dataPath, id)
 	quota := fmt.Sprintf("%dm", sizeMB)
@@ -136,8 +217,8 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		x.trackProjectID(id, projID)
 		x.mu.Unlock()
 
-		cmd := fmt.Sprintf("limit -p bhard=%s %d", quota, projID)
-		if out, err := exec.CommandContext(ctx, "xfs_quota", "-x", "-c", cmd, x.dataPath).CombinedOutput(); err != nil {
+		cmd := xfsLimitCmd(projID, quota)
+		if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
 			return "", false, fmt.Errorf("xfs_quota limit on existing %s (id=%d, quota=%s): %w: %s", dirPath, projID, quota, err, out)
 		}
 		x.logger.Debug("reusing existing xfs quota directory", "path", dirPath, "project_id", projID, "quota_mb", sizeMB)
@@ -168,9 +249,10 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		return "", false, fmt.Errorf("write project ID marker for %s: %w", dirPath, err)
 	}
 
-	// Assign project ID to directory.
-	cmd := fmt.Sprintf("project -s -p %s %d", dirPath, projID)
-	if out, err := exec.CommandContext(ctx, "xfs_quota", "-x", "-c", cmd, x.dataPath).CombinedOutput(); err != nil {
+	// Assign project ID to directory. The subdirectory is named in -p; the XFS
+	// mount point is the xfs_quota filesystem argument (ENG-449).
+	cmd := xfsProjectSetupCmd(dirPath, projID)
+	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
 		if cleanupErr := os.RemoveAll(dirPath); cleanupErr != nil {
 			x.logger.Warn("failed to cleanup directory after xfs project setup failure", "path", dirPath, "error", cleanupErr)
 		}
@@ -179,8 +261,8 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	}
 
 	// Set quota limit.
-	cmd = fmt.Sprintf("limit -p bhard=%s %d", quota, projID)
-	if out, err := exec.CommandContext(ctx, "xfs_quota", "-x", "-c", cmd, x.dataPath).CombinedOutput(); err != nil {
+	cmd = xfsLimitCmd(projID, quota)
+	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
 		if cleanupErr := os.RemoveAll(dirPath); cleanupErr != nil {
 			x.logger.Warn("failed to cleanup directory after xfs quota limit failure", "path", dirPath, "error", cleanupErr)
 		}
@@ -263,7 +345,7 @@ func (x *xfsVolumeManager) Usage(ctx context.Context, id string) (int64, error) 
 	if err != nil {
 		return 0, fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
 	}
-	out, err := exec.CommandContext(ctx, "xfs_quota", "-x", "-c", "report -p -b -N", x.dataPath).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs("report -p -b -N", x.mountPoint)...).CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("xfs_quota report for %s (proj %d): %w: %s", dirPath, projID, err, out)
 	}
@@ -309,10 +391,10 @@ func (x *xfsVolumeManager) Validate() error {
 	// Check pquota mount option by attempting a quota report.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "xfs_quota", "-x", "-c", "report -p", x.dataPath).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs("report -p", x.mountPoint)...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("xfs project quotas not available at %s (mount with pquota option): %w: %s",
-			x.dataPath, err, out)
+			x.mountPoint, err, out)
 	}
 
 	// Populate activeIDs from existing volume marker files.

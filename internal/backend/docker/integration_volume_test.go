@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -914,6 +915,80 @@ func TestIntegration_Usage_XFS(t *testing.T) {
 	const wantMax = int64((writeMiB + 6) * 1024 * 1024)
 	assert.GreaterOrEqual(t, got, wantMin, "Usage too low: got %d, want >= %d", got, wantMin)
 	assert.LessOrEqual(t, got, wantMax, "Usage too high: got %d, want <= %d", got, wantMax)
+}
+
+// TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces is the ENG-449
+// regression. It runs the xfs manager over a volume_data_path that is a
+// *subdirectory* of the XFS mount — the production layout (e.g.
+// /data/fred/volumes under the /data/fred mount) — instead of the mount root
+// that the other XFS tests use (which accidentally hid the bug: when
+// dataPath == mountpoint the wrong argument still resolved).
+//
+// Under the pre-fix code, xfs_quota was run against the subdir, so:
+//   - `project -s` silently no-op'd → the volume inode was never project-tagged
+//     → Usage()'s `report -p` could not find the projid ("project id N not found");
+//   - `limit -p` silently no-op'd → the disk_mb cap was never enforced.
+func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	dataPath := filepath.Join(mount, "volumes") // subdir of the XFS mount
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+
+	ctx := context.Background()
+	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+
+	const volName = "fred-int-xfs-subdir-app-0"
+	const capMiB = int64(20)
+	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+
+	// (1) Measurement: a 10 MiB write is accounted, proving the inode is
+	// project-tagged and `report -p` runs against the mount, not the subdir.
+	const writeMiB = 10
+	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
+	got, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err, "Usage must succeed for a subdirectory volume_data_path (ENG-449)")
+	assert.GreaterOrEqual(t, got, int64(writeMiB*1024*1024), "Usage under-reports: %d", got)
+	assert.LessOrEqual(t, got, int64((writeMiB+6)*1024*1024), "Usage over-reports: %d", got)
+
+	// (2) Enforcement: a write past the 20 MiB cap is rejected with EDQUOT/ENOSPC.
+	err = os.WriteFile(filepath.Join(hostPath, "big.bin"), make([]byte, 25*1024*1024), 0600)
+	require.Error(t, err, "writing past the disk_mb cap must be quota-enforced (ENG-449)")
+	assert.True(t,
+		errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.ENOSPC) ||
+			strings.Contains(err.Error(), "disk quota exceeded") ||
+			strings.Contains(err.Error(), "no space left"),
+		"expected a quota/space error, got: %v", err)
+}
+
+// TestIntegration_Btrfs_SubdirDataPath_Measures guards that the btrfs backend
+// still measures correctly when volume_data_path is a subdirectory of the mount
+// (ENG-449 "validate other fs too"). btrfs tools operate on any path within the
+// filesystem, so — unlike XFS — a subdir needs no mountpoint resolution; this
+// pins that so the shared refactor did not regress it.
+func TestIntegration_Btrfs_SubdirDataPath_Measures(t *testing.T) {
+	mount := setupBtrfsLoopback(t)
+	dataPath := filepath.Join(mount, "volumes") // subdir of the btrfs mount
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+
+	ctx := context.Background()
+	mgr := &btrfsVolumeManager{dataPath: dataPath, logger: slog.Default()}
+
+	const volName = "fred-int-btrfs-subdir-app-0"
+	hostPath, created, err := mgr.Create(ctx, volName, 100)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+
+	const writeMiB = 10
+	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
+	got, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, got, int64(writeMiB*1024*1024), "Usage under-reports: %d", got)
+	assert.LessOrEqual(t, got, int64((writeMiB+6)*1024*1024), "Usage over-reports: %d", got)
 }
 
 // TestIntegration_Usage_ZFS verifies that zfsVolumeManager.Usage returns the
