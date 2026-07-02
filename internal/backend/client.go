@@ -430,6 +430,20 @@ const (
 // (e.g., unknown SKU, invalid manifest, disallowed image registry).
 var ErrValidation = errors.New("validation error")
 
+// ErrDemoteDataExceedsTier is returned when a restore requests a smaller
+// disk tier (demote) than the retained volume's measured data footprint, so
+// the data would not fit the new cap. A dedicated sentinel (NOT wrapping
+// ErrValidation) so the API can map it to 422 distinctly. (ENG-438)
+var ErrDemoteDataExceedsTier = errors.New("retained data exceeds the requested smaller tier")
+
+// CodeDemoteExceedsTier is the machine-readable error code the docker-backend
+// emits (HTTP 422) and the HTTPClient parses to reconstruct
+// ErrDemoteDataExceedsTier across the HTTP boundary. 422 is overloaded (a bare
+// 422 with no code means ErrNotRetained), so producer and consumer must agree
+// on this exact string; defining it once here makes drift a compile error
+// rather than a silent misclassification. (ENG-438)
+const CodeDemoteExceedsTier = "demote_exceeds_tier"
+
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
 var (
@@ -638,13 +652,15 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrAlreadyProvisioned: 409 from Provision (idempotent duplicate)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
+			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
 			return err == nil ||
 				errors.Is(err, ErrNotProvisioned) ||
 				errors.Is(err, ErrValidation) ||
 				errors.Is(err, ErrInsufficientResources) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
-				errors.Is(err, ErrNotRetained)
+				errors.Is(err, ErrNotRetained) ||
+				errors.Is(err, ErrDemoteDataExceedsTier)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -1187,6 +1203,12 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 		case http.StatusAccepted:
 			return nil, nil
 		case http.StatusUnprocessableEntity:
+			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
+			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
+			code, msg := parseErrorCode(readErrorBodyBytes(resp))
+			if code == CodeDemoteExceedsTier {
+				return nil, fmt.Errorf("%w: %s", ErrDemoteDataExceedsTier, msg)
+			}
 			return nil, ErrNotRetained
 		case http.StatusConflict:
 			// Restore overloads 409 for two sentinels: the backend tags the

@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Restore can now target a different SKU tier (promote/demote). A demote is
+  refused (HTTP 422) when the retained volume's measured data does not fit the
+  new tier's disk cap. New metric `restore_demote_refused_total{backend,reason}`.
+  (ENG-438)
+
 ### Changed
 
 ### Deprecated

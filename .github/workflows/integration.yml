@@ -76,6 +76,17 @@ jobs:
           sudo apt-get install -y btrfs-progs
           sudo modprobe btrfs || true
 
+      - name: Install ZFS
+        # zfsutils-linux provides the zpool/zfs userland; the zfs kernel module
+        # ships with the ubuntu-latest runner kernel and is loaded via modprobe.
+        # The ZFS Usage/quota tests (volume_zfs.go) build their own file-backed
+        # zpool. A modprobe/setup failure is caught by the preflight below — the
+        # point is to fail loudly, never silently t.Skip (ENG-330). xfsprogs
+        # (mkfs.xfs / xfs_quota) is already preinstalled on ubuntu-latest.
+        run: |
+          sudo apt-get install -y zfsutils-linux
+          sudo modprobe zfs || true
+
       - name: Preflight — fail loudly if the privileged env is missing
         # setupBtrfsLoopback (and the Docker-ping helpers) call t.Skip when root,
         # btrfs-progs, loop devices, or Docker are absent — which would make this
@@ -99,8 +110,32 @@ jobs:
             echo "::error::loopback btrfs mount failed — the volume/restore tests would t.Skip (ENG-330 silent-rot gap). Failing."
             fail=1
           fi
+          # XFS: tooling is preinstalled; the XFS tests build their own >300MB
+          # loopback (xfsprogs refuses <300MB). Presence check only.
+          command -v mkfs.xfs >/dev/null 2>&1 || { echo "::error::mkfs.xfs not installed"; fail=1; }
+          command -v xfs_quota >/dev/null 2>&1 || { echo "::error::xfs_quota not installed"; fail=1; }
+          # ZFS: userland + a loadable module + a file-backed pool round-trip, so a
+          # missing/unloadable ZFS env fails loudly here instead of t.Skip in-suite.
+          command -v zpool >/dev/null 2>&1 || { echo "::error::zpool not installed"; fail=1; }
+          command -v zfs >/dev/null 2>&1 || { echo "::error::zfs CLI not installed"; fail=1; }
+          lsmod | grep -q '^zfs ' || sudo modprobe zfs || { echo "::error::zfs kernel module not loadable"; fail=1; }
+          if truncate -s 512M "$work/zfs.img"; then
+            zpool_name="fredpreflight$$"
+            mkdir -p "$work/zmnt"
+            # -m "$work/zmnt": mirror setupZFSPool's `zpool create -m mountPath`
+            # (exercise the exact code path) AND keep the mount inside $work so a
+            # suppressed `zpool destroy` failure can't leak a root-level /$pool mount.
+            if sudo zpool create -m "$work/zmnt" "$zpool_name" "$work/zfs.img"; then
+              sudo zpool destroy "$zpool_name" || true
+            else
+              echo "::error::file-backed zpool create failed — the ZFS Usage/quota tests would t.Skip (ENG-330 gap). Failing."
+              fail=1
+            fi
+          else
+            echo "::error::zfs truncate failed"; fail=1
+          fi
           rm -rf "$work" || true
-          [ "$fail" -eq 0 ] && echo "Preflight OK: docker + root + btrfs-progs + loopback + quota all available."
+          [ "$fail" -eq 0 ] && echo "Preflight OK: docker + root + btrfs/xfs/zfs tooling + loopback + quota all available."
           exit "$fail"
 
       - name: Docker Hub login (optional)

@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -30,6 +31,7 @@ type mockVolumeManager struct {
 	ListFn         func() ([]string, error)
 	ValidateFn     func() error
 	RenameVolumeFn func(oldName, newName string) error
+	UsageFn        func(ctx context.Context, id string) (int64, error)
 
 	// defaultDir is returned by Create when CreateFn is nil.
 	// Set this to t.TempDir() in tests that need real paths.
@@ -77,6 +79,15 @@ func (m *mockVolumeManager) RenameVolume(oldName, newName string) error {
 func (m *mockVolumeManager) HostPath(name string) string {
 	return filepath.Join(m.defaultDir, name)
 }
+
+func (m *mockVolumeManager) Usage(ctx context.Context, id string) (int64, error) {
+	if m.UsageFn != nil {
+		return m.UsageFn(ctx, id)
+	}
+	return 0, errors.New("mockVolumeManager.Usage not configured")
+}
+
+func (m *mockVolumeManager) Kind() string { return "mock" }
 
 // mockDockerClient implements dockerClient for testing. Each method delegates to
 // the corresponding Fn field; an unexpected call (nil Fn) panics so tests fail

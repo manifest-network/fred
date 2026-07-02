@@ -5991,3 +5991,78 @@ func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
 	assert.Equal(t, kp.Address, backendReq["tenant"], "handler must forward the ADR-036 signer's tenant to the backend")
 	assert.Equal(t, fromLeaseUUID, backendReq["from_lease_uuid"], "handler must forward the requested source lease")
 }
+
+// TestRestoreLease_DemoteExceedsTier422 verifies that a backend 422 with
+// code="demote_exceeds_tier" (ErrDemoteDataExceedsTier) surfaces as a 422 to
+// the fred-api caller — the third layer of the three-layer 422 propagation
+// (docker-backend → HTTPClient → fred-api handler).
+func TestRestoreLease_DemoteExceedsTier422(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/restore" && r.Method == "POST" {
+			// 422 with code="demote_exceeds_tier" — retained data is too large for
+			// the requested smaller tier (ENG-438).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"error":"retained data exceeds the requested smaller tier","code":"demote_exceeds_tier"}`))
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend-demote",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string {
+			if uuid == fromLeaseUUID {
+				return "test-backend-demote"
+			}
+			return ""
+		},
+	}
+
+	h := &Handlers{
+		client:          chainClient,
+		backendRouter:   router,
+		placementLookup: placement,
+		providerUUID:    providerUUID,
+		bech32Prefix:    "manifest",
+	}
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.RestoreLease(rec, req)
+
+	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code, "body: %s", rec.Body.String())
+}

@@ -2107,6 +2107,182 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	b.wg.Wait()
 }
 
+// TestRestore_HonorsNewSKU_Promote drives a full restore whose request targets a
+// LARGER-disk SKU (docker-medium, DiskMB 2048) than the retained record
+// (docker-small, DiskMB 1024). It proves the new SKU is honored end-to-end: the
+// volume Create that applies the disk cap is called with the NEW tier's DiskMB
+// (2048), not the retained 1024, and the reserved ProvisionState carries the new
+// SKU. A clear promote must skip the demote gate's measurement entirely, so the
+// volume mock's Usage is intentionally left unset — any stray call would error and
+// fail the restore. (ENG-438, Task 8 sinks: profiles + ProvisionState + doRestore op.)
+func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		// A non-empty VOLUME makes setupVolBinds create a stateful volume, so the
+		// new SKU's DiskMB flows into the (capacity-setting) Create call we observe.
+		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
+			return &ImageInfo{ID: "img-1", Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "u1") // retained at docker-small (DiskMB 1024)
+
+	var mu sync.Mutex
+	var downProjects []string
+	var createSizes []int64
+	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.volumes = &mockVolumeManager{
+		defaultDir: t.TempDir(),
+		CreateFn: func(_ context.Context, _ string, sizeMB int64) (string, bool, error) {
+			mu.Lock()
+			createSizes = append(createSizes, sizeMB)
+			mu.Unlock()
+			return t.TempDir(), true, nil
+		},
+		RenameVolumeFn: func(_, _ string) error { return nil },
+		// UsageFn deliberately unset: a clear promote must NOT measure.
+	}
+
+	callbackReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer server.Close()
+
+	// Promote: request docker-medium (2048) over the retained docker-small (1024).
+	req := restoreRequest("u2", "u1", server.URL)
+	req.Items = []backend.LeaseItem{{SKU: "docker-medium", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
+
+	require.NoError(t, b.Restore(context.Background(), req))
+	<-callbackReceived
+
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p, ok := b.provisions["u2"]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+
+	// The NEW SKU's disk cap (docker-medium = 2048 MiB) reached the volume Create —
+	// not the retained docker-small's 1024. This is the load-bearing "honor the new
+	// SKU" assertion: the disk quota applied is the new tier's.
+	mu.Lock()
+	gotSizes := append([]int64(nil), createSizes...)
+	mu.Unlock()
+	require.NotEmpty(t, gotSizes, "setupVolBinds must have created the stateful volume")
+	for _, s := range gotSizes {
+		assert.Equal(t, int64(2048), s,
+			"volume Create must use the NEW SKU's DiskMB (docker-medium=2048), not the retained docker-small=1024")
+	}
+
+	// The reserved provision reflects the new SKU end-to-end (ProvisionState sink).
+	b.provisionsMu.RLock()
+	p := b.provisions["u2"]
+	gotSKU := p.SKU
+	gotItems := append([]backend.LeaseItem(nil), p.Items...)
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, "docker-medium", gotSKU, "ProvisionState.SKU must be the new SKU")
+	require.Len(t, gotItems, 1)
+	assert.Equal(t, "docker-medium", gotItems[0].SKU, "ProvisionState.Items must carry the new SKU")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+// TestRestore_DemoteOverflow_RefusesNoMutation drives the real Restore entry point
+// with a request that DEMOTES (docker-large→docker-medium) while the retained
+// volume measures one byte over the new tier's cap. The synchronous demote gate
+// must refuse with ErrDemoteDataExceedsTier and perform NO side effect: the
+// retained record stays active (not claimed/restoring), no volume is renamed, no
+// new-lease provision is reserved, and pool allocation is unchanged. This is the
+// must-have refusal + no-mutation guarantee for Task 8. (ENG-438.)
+func TestRestore_DemoteOverflow_RefusesNoMutation(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+
+	// Retained at docker-large (DiskMB 4096); request docker-medium (2048) = demote.
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		Tenant:              "tenant-a",
+		ProviderUUID:        "prov-1",
+		Items:               []backend.LeaseItem{{SKU: "docker-large", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		StackManifest:       restoreStackManifest(),
+		CallbackURL:         "http://localhost/callback",
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
+		Status:              shared.RetentionStatusActive,
+		Generation:          1,
+		CreatedAt:           time.Now(),
+	}))
+
+	var mu sync.Mutex
+	var renames []restoreRenameCall
+	usageCalled := false
+	b.volumes = &mockVolumeManager{
+		UsageFn: func(_ context.Context, _ string) (int64, error) {
+			mu.Lock()
+			usageCalled = true
+			mu.Unlock()
+			return 2048*bytesPerMiB + 1, nil // one byte over the docker-medium cap
+		},
+		RenameVolumeFn: func(old, new string) error {
+			mu.Lock()
+			renames = append(renames, restoreRenameCall{old, new})
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	beforeAlloc := b.pool.Stats().AllocatedDiskMB
+
+	req := restoreRequest("u2", "u1", "http://localhost/cb")
+	req.Items = []backend.LeaseItem{{SKU: "docker-medium", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
+
+	err := b.Restore(context.Background(), req)
+
+	// Refusal: the dedicated sentinel (maps to 422 across the boundary).
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, backend.ErrDemoteDataExceedsTier),
+		"a demote that does not fit must return ErrDemoteDataExceedsTier; got %v", err)
+
+	mu.Lock()
+	assert.True(t, usageCalled, "the demote gate must measure the retained volume")
+	gotRenames := append([]restoreRenameCall(nil), renames...)
+	mu.Unlock()
+
+	// NO MUTATION — the gate runs in the read-only prelude BEFORE reserve/pool/claim/adopt.
+	// (1) retained record untouched: still active, generation unchanged, not bound to a new lease.
+	got, gerr := rs.Get("u1")
+	require.NoError(t, gerr)
+	require.NotNil(t, got)
+	assert.Equal(t, shared.RetentionStatusActive, got.Status, "record must stay active (not claimed→restoring)")
+	assert.Equal(t, 1, got.Generation, "record generation must be unchanged (no ClaimForRestore)")
+	assert.Empty(t, got.NewLeaseUUID, "record must not be bound to a new lease")
+
+	// (2) no adopt rename.
+	assert.Empty(t, gotRenames, "no volume may be renamed on a refused demote")
+
+	// (3) no new-lease provision reserved.
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, hasU2, "no provision may be reserved on a refused demote")
+
+	// (4) pool allocation unchanged.
+	assert.Equal(t, beforeAlloc, b.pool.Stats().AllocatedDiskMB,
+		"pool allocation must be unchanged on a refused demote")
+}
+
 // TestRestore_PersistsReleaseSoLeaseStaysRestartableAfterRestart is ENG-433's
 // regression test, end to end. A successful restore must persist an "active" release
 // record for the new lease; without it a docker-backend restart leaves the lease's

@@ -494,6 +494,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusUnprocessableEntity, "no retained data for lease")
 			return
 		}
+		if errors.Is(err, backend.ErrDemoteDataExceedsTier) {
+			// 422 with code=demote_exceeds_tier → client reconstructs
+			// ErrDemoteDataExceedsTier (422 is overloaded: bare 422 = ErrNotRetained).
+			s.errorResponseWithCode(w, http.StatusUnprocessableEntity, err.Error(), backend.CodeDemoteExceedsTier)
+			return
+		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			// 409 with no code → client maps to ErrInvalidState.
 			s.errorResponse(w, http.StatusConflict, "invalid state for restore")
@@ -769,6 +775,8 @@ type ErrorResponse struct {
 	// client maps a bare 409 to ErrInvalidState, so the already-provisioned
 	// case sets Code="already_provisioned" to let the client reconstruct the
 	// correct sentinel. (Mirrors the validation_code body-discriminator pattern.)
+	// Similarly, Restore returns 422 for BOTH ErrNotRetained (bare 422) and
+	// ErrDemoteDataExceedsTier (422 + Code="demote_exceeds_tier").
 	Code string `json:"code,omitempty"`
 }
 
@@ -794,7 +802,8 @@ func (s *Server) errorResponse(w http.ResponseWriter, status int, message string
 
 // errorResponseWithCode writes an error response carrying a machine-readable
 // discriminator code so the client can disambiguate an overloaded status code
-// (e.g. Restore's 409, which is shared by ErrInvalidState and ErrAlreadyProvisioned).
+// (e.g. Restore's 409, which is shared by ErrInvalidState and ErrAlreadyProvisioned;
+// and Restore's 422, which is shared by ErrNotRetained and ErrDemoteDataExceedsTier).
 func (s *Server) errorResponseWithCode(w http.ResponseWriter, status int, message, code string) {
 	s.writeJSON(w, status, ErrorResponse{Error: message, Code: code})
 }

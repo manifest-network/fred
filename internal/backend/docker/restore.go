@@ -573,6 +573,83 @@ func itemsShapeMatch(a, b []backend.LeaseItem) error {
 	return nil
 }
 
+// checkDemoteFit refuses a restore whose new SKU shrinks a service's disk
+// cap below the retained volume's measured footprint. It is READ-ONLY and
+// runs in the synchronous prelude BEFORE any side effect (reserve / pool /
+// claim / adopt), so a refusal leaves the retained record and volumes
+// untouched — no rollback. The retained volumes are from a closed lease with
+// no running container, so the footprint is static (no TOCTOU on size); a
+// concurrent reaper flipping the record active→reaping is handled by the
+// later atomic ClaimForRestore (loser → ErrNotRestorable). Do NOT cache the
+// Usage result or move this gate after the claim.
+//
+// For each service: a clear promote/same-tier (new ≥ old, both resolvable)
+// skips measurement (the cap only grows). Otherwise every retained stateful
+// volume of that service must satisfy usage ≤ newDiskMB×MiB (equality OK).
+// Over-measuring is the SAFE direction here (refuse = preserve data); see
+// the design spec §5.6. An unmeasurable volume or a demote to an ephemeral
+// (DiskMB=0) tier with retained data is refused.
+func (b *Backend) checkDemoteFit(ctx context.Context, rec *shared.RetentionEntry,
+	newItems []backend.LeaseItem, newProfiles map[string]SKUProfile, logger *slog.Logger) error {
+	retained := make(map[string]struct{}, len(rec.RetainedVolumeNames))
+	for _, n := range rec.RetainedVolumeNames {
+		retained[n] = struct{}{}
+	}
+	oldSKU := make(map[string]string, len(rec.Items))
+	for _, it := range rec.Items {
+		oldSKU[it.ServiceName] = it.SKU
+	}
+	backendKind := b.volumes.Kind()
+	for _, it := range newItems {
+		np, ok := newProfiles[it.SKU]
+		if !ok {
+			return fmt.Errorf("%w: unknown SKU %q", backend.ErrValidation, it.SKU)
+		}
+		newDiskMB := np.DiskMB
+		// Promote/same-tier optimization: skip measurement when the new cap is
+		// not smaller than the (resolvable) old cap.
+		if op, oerr := b.cfg.GetSKUProfile(oldSKU[it.ServiceName]); oerr == nil && newDiskMB >= op.DiskMB {
+			continue
+		}
+		for i := range it.Quantity {
+			name := retainedName(canonicalVolumeName(rec.OriginalLeaseUUID, it.ServiceName, i))
+			if _, isStateful := retained[name]; !isStateful {
+				continue // stateless instance: no retained volume to check
+			}
+			if newDiskMB <= 0 {
+				restoreDemoteRefusedTotal.WithLabelValues(backendKind, "ephemeral_tier").Inc()
+				return fmt.Errorf("%w: service %q: cannot restore stateful data into an ephemeral (disk_mb=0) tier",
+					backend.ErrDemoteDataExceedsTier, it.ServiceName)
+			}
+			usage, uerr := b.volumes.Usage(ctx, name)
+			if uerr != nil {
+				reason := "unmeasurable_read_error"
+				if errors.Is(uerr, errors.ErrUnsupported) {
+					reason = "unmeasurable_backend"
+				}
+				restoreDemoteRefusedTotal.WithLabelValues(backendKind, reason).Inc()
+				// uerr can embed host paths and raw command output (e.g. btrfs
+				// qgroup show against b.dataPath); log it for operators but keep
+				// it OUT of the returned error, which docker-backend/fred-api
+				// forward verbatim to the (untrusted) tenant in the 422 body.
+				logger.Warn("restore demote refused: cannot measure retained volume usage",
+					"service", it.ServiceName, "volume", name, "reason", reason, "error", uerr)
+				return fmt.Errorf("%w: service %q: unable to verify retained data fits the requested tier",
+					backend.ErrDemoteDataExceedsTier, it.ServiceName)
+			}
+			capBytes := newDiskMB * bytesPerMiB
+			if usage > capBytes {
+				restoreDemoteRefusedTotal.WithLabelValues(backendKind, "measured_exceeds").Inc()
+				logger.Warn("restore demote refused: retained data exceeds smaller tier",
+					"service", it.ServiceName, "volume", name, "used_bytes", usage, "tier_disk_mb", newDiskMB, "cap_bytes", capBytes)
+				return fmt.Errorf("%w: service %q: %d bytes used exceeds disk_mb=%d cap (%d bytes)",
+					backend.ErrDemoteDataExceedsTier, it.ServiceName, usage, newDiskMB, capBytes)
+			}
+		}
+	}
+	return nil
+}
+
 // releaseAll releases every pool allocation id (best-effort, idempotent).
 func releaseAll(pool *shared.ResourcePool, ids []string) {
 	for _, id := range ids {
@@ -662,7 +739,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		return fmt.Errorf("%w: corrupt retained record", backend.ErrValidation)
 	}
 	profiles := map[string]SKUProfile{}
-	for _, item := range rec.Items {
+	for _, item := range req.Items {
 		if _, ok := profiles[item.SKU]; ok {
 			continue
 		}
@@ -671,6 +748,11 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			return fmt.Errorf("%w: %w", backend.ErrValidation, perr)
 		}
 		profiles[item.SKU] = p
+	}
+	// Demote fit-gate (read-only; BEFORE any side effect — reserve/pool/claim/
+	// adopt). A refusal leaves the retained record and volumes untouched.
+	if err := b.checkDemoteFit(ctx, rec, req.Items, profiles, logger); err != nil {
+		return err
 	}
 	for svc, m := range rec.StackManifest.Services {
 		// A nil service entry is corruption (provision/recovery validate manifests);
@@ -696,14 +778,14 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			LeaseUUID:         req.LeaseUUID,
 			Tenant:            rec.Tenant,
 			ProviderUUID:      rec.ProviderUUID,
-			SKU:               rec.Items[0].SKU,
+			SKU:               req.Items[0].SKU,
 			Status:            backend.ProvisionStatusProvisioning,
-			Quantity:          totalQuantity(rec.Items),
+			Quantity:          totalQuantity(req.Items),
 			CreatedAt:         time.Now(),
 			FailCount:         0,
 			LastError:         "",
 			CallbackURL:       req.CallbackURL,
-			Items:             slices.Clone(rec.Items),
+			Items:             slices.Clone(req.Items),
 			ContainerIDs:      make([]string, 0),
 			StackManifest:     rec.StackManifest,
 			ServiceContainers: nil,
@@ -714,7 +796,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 
 	// (c) Allocate pool slots.
 	var allocatedIDs []string
-	for _, item := range rec.Items {
+	for _, item := range req.Items {
 		for i := range item.Quantity {
 			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
 			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
@@ -770,7 +852,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// success/failure/panic.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
-		return b.doRestore(opCtx, req.LeaseUUID, claimed, profiles, allocatedIDs, logger)
+		return b.doRestore(opCtx, req.LeaseUUID, claimed, req.Items, profiles, allocatedIDs, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestoreRequestedMsg{
@@ -814,7 +896,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 // restart/update. (Dropping it here would race that transition and silently lose
 // the callback; the periodic reaper / a subsequent op reconciles the entry.)
 func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.RetentionEntry,
-	profiles map[string]SKUProfile, allocatedIDs []string, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
+	newItems []backend.LeaseItem, profiles map[string]SKUProfile, allocatedIDs []string, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
 	restoreStart := time.Now()
 	defer func() {
 		// N2: a panic leaves resultRet.Err==nil; force the failure path so we never
@@ -894,7 +976,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 		b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
 	}()
 	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: rec.Items, Profiles: profiles,
+		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: newItems, Profiles: profiles,
 		OldContainerIDs: nil, ServiceContainers: nil, Operation: "restore", NoComposeRollback: true, Logger: logger,
 		OnSuccess: func(p *leasesm.ProvisionState) { p.StackManifest = rec.StackManifest },
 	})

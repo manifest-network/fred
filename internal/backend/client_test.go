@@ -1823,9 +1823,15 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 			wantNil:    true,
 		},
 		{
-			name:       "422 Unprocessable Entity returns ErrNotRetained",
+			name:       "422 Unprocessable Entity (no code) returns ErrNotRetained",
 			statusCode: http.StatusUnprocessableEntity,
 			wantErr:    ErrNotRetained,
+		},
+		{
+			name:       "422 Unprocessable Entity with demote_exceeds_tier code returns ErrDemoteDataExceedsTier",
+			statusCode: http.StatusUnprocessableEntity,
+			body:       `{"error":"retained data exceeds the requested smaller tier: service \"app\": 3000 bytes used exceeds disk_mb=2 cap","code":"demote_exceeds_tier"}`,
+			wantErr:    ErrDemoteDataExceedsTier,
 		},
 		{
 			name:       "409 Conflict (no code) returns ErrInvalidState",
@@ -2024,6 +2030,48 @@ func TestHTTPClientRestore_422DoesNotTripBreaker(t *testing.T) {
 		err := client.Restore(context.Background(), req)
 		assert.ErrorIs(t, err, ErrNotRetained, "call %d should return ErrNotRetained", i+1)
 		assert.NotErrorIs(t, err, ErrCircuitOpen, "circuit must not open on ErrNotRetained (call %d)", i+1)
+	}
+
+	// All requests should have reached the server (none short-circuited).
+	assert.Equal(t, n, requestCount, "all %d requests should have reached the server", n)
+}
+
+// TestHTTPClientRestore_DemoteExceedsTier_DoesNotTripBreaker verifies that a
+// 422 with code="demote_exceeds_tier" (ErrDemoteDataExceedsTier) is treated as
+// a permanent client error and does NOT trip the circuit breaker. This test
+// fails before the ErrDemoteDataExceedsTier allowlist entry is added.
+func TestHTTPClientRestore_DemoteExceedsTier_DoesNotTripBreaker(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"retained data exceeds the requested smaller tier","code":"demote_exceeds_tier"}`))
+	}))
+	defer server.Close()
+
+	// Set a low threshold to make any tripping obvious.
+	const threshold = 3
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:            "test-restore-demote-cb",
+		BaseURL:         server.URL,
+		Timeout:         5 * time.Second,
+		CBFailureThresh: threshold,
+	})
+
+	req := RestoreRequest{
+		LeaseUUID:     "new-lease-1",
+		FromLeaseUUID: "old-lease-1",
+		Tenant:        "t",
+		CallbackURL:   "http://fred/callback",
+	}
+
+	// Make more requests than the threshold — circuit must stay closed.
+	const n = threshold * 4
+	for i := range n {
+		err := client.Restore(context.Background(), req)
+		assert.ErrorIs(t, err, ErrDemoteDataExceedsTier, "call %d should return ErrDemoteDataExceedsTier", i+1)
+		assert.NotErrorIs(t, err, ErrCircuitOpen, "circuit must not open on ErrDemoteDataExceedsTier (call %d)", i+1)
 	}
 
 	// All requests should have reached the server (none short-circuited).
