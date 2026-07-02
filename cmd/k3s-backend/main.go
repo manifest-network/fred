@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -106,7 +107,7 @@ func main() {
 	cancel()
 
 	// Create server
-	server := NewServer(b, string(cfg.CallbackSecret), logger)
+	server := NewServer(b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize)
 
 	// Setup HTTP server. ReadHeaderTimeout closes the slow-loris attack
 	// surface (a client that trickles request headers to hold a goroutine
@@ -222,6 +223,11 @@ func applyEnvOverrides(cfg *k3s.Config) {
 	}
 	if host := os.Getenv("K3S_BACKEND_HOST_ADDRESS"); host != "" {
 		cfg.HostAddress = host
+	}
+	if v := os.Getenv("K3S_BACKEND_MAX_REQUEST_BODY_SIZE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			cfg.MaxRequestBodySize = n
+		}
 	}
 	// KUBECONFIG is the standard K8s convention for pointing at a
 	// kubeconfig file (kubectl reads it; client-go's default loader

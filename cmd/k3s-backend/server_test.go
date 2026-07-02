@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/k3s"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
@@ -66,14 +67,14 @@ func TestVerifySignature(t *testing.T) {
 // handler hits nil and panics, which proves the middleware accepted the
 // request. Mirrors cmd/docker-backend/main_test.go:69–72.
 func newTestHandler() http.Handler {
-	s := NewServer(nil, testSecret, slog.Default())
+	s := NewServer(nil, testSecret, slog.Default(), k3s.DefaultMaxRequestBodySize)
 	return s.Handler()
 }
 
 // newMockHandler creates a Handler backed by the given mockBackend so handler
 // logic tests can assert behavior reaching the backend layer.
 func newMockHandler(mb *mockBackend) http.Handler {
-	s := NewServer(mb, testSecret, slog.Default())
+	s := NewServer(mb, testSecret, slog.Default(), k3s.DefaultMaxRequestBodySize)
 	return s.Handler()
 }
 
@@ -1482,7 +1483,7 @@ func TestHMACMiddleware_RejectsCrossPathReplay(t *testing.T) {
 // 405 for unknown methods *before* the middleware runs — the routing
 // short-circuit would mask the auth check.
 func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
-	mw := hmacAuthMiddleware(testSecret, slog.Default())
+	mw := hmacAuthMiddleware(testSecret, slog.Default(), k3s.DefaultMaxRequestBodySize)
 	authed := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))

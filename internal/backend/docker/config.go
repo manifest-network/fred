@@ -29,6 +29,15 @@ const (
 	defaultMigrationGracePeriod  = time.Minute
 )
 
+// DefaultMaxRequestBodySize caps inbound HTTP request bodies for the docker
+// backend. It is deliberately larger than providerd's
+// config.DefaultMaxRequestBodySize (1 MiB): providerd caps the raw tenant body,
+// then re-serializes and wraps it (JSON envelope + base64) before forwarding, so
+// a manifest that just cleared providerd can exceed 1 MiB on the backend hop and
+// would otherwise be rejected with an opaque 400. Configurable via
+// max_request_body_size / DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE. (ENG-448 / F42)
+const DefaultMaxRequestBodySize int64 = 2 << 20 // 2 MiB
+
 // Config holds the configuration for the Docker backend.
 type Config struct {
 	// LogLevel controls the log verbosity (debug, info, warn, error).
@@ -40,6 +49,11 @@ type Config struct {
 
 	// ListenAddr is the address the HTTP server listens on.
 	ListenAddr string `yaml:"listen_addr"`
+
+	// MaxRequestBodySize caps inbound HTTP request bodies (bytes). It must
+	// exceed providerd's request cap plus forward-wrapping overhead; defaults to
+	// DefaultMaxRequestBodySize when unset or non-positive. (ENG-448 / F42)
+	MaxRequestBodySize int64 `yaml:"max_request_body_size"`
 
 	// ProductionMode tightens startup checks beyond basic validation. When true,
 	// Validate rejects dev-only insecure toggles — currently
@@ -345,6 +359,7 @@ func DefaultConfig() Config {
 	return Config{
 		Name:                         "docker",
 		ListenAddr:                   ":9001",
+		MaxRequestBodySize:           DefaultMaxRequestBodySize,
 		DockerHost:                   "unix:///var/run/docker.sock",
 		TotalCPUCores:                8.0,
 		TotalMemoryMB:                16384,
@@ -382,6 +397,12 @@ func DefaultConfig() Config {
 func (c *Config) Validate() error {
 	if c.Name == "" {
 		return fmt.Errorf("name is required")
+	}
+
+	// A non-positive cap (unset in YAML, or 0) falls back to the default rather
+	// than disabling the body limit entirely. (ENG-448 / F42)
+	if c.MaxRequestBodySize <= 0 {
+		c.MaxRequestBodySize = DefaultMaxRequestBodySize
 	}
 
 	if c.ListenAddr == "" {

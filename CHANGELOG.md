@@ -26,6 +26,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   daemon. Previously a locked/corrupt/read-only store left the backend reporting
   healthy while soft-delete/restore silently failed against it. (ENG-448 / F31)
 
+- docker-backend and k3s-backend: the inbound request-body cap is now
+  configurable (`max_request_body_size` /
+  `{DOCKER,K3S}_BACKEND_MAX_REQUEST_BODY_SIZE`) and defaults to 2 MiB — larger
+  than providerd's 1 MiB cap. Previously both backends hardcoded a 1 MiB cap
+  equal to providerd's, so a tenant manifest that just cleared providerd could
+  be rejected with an opaque 400 at the backend once providerd re-serialized and
+  wrapped it for forwarding. (ENG-448 / F42)
+
 - docker-backend: the `releases.db` age reaper (`RemoveOlderThan`,
   `releases_max_age` default 90d) no longer deletes a live long-lived lease's
   only manifest-rehydration source. It now retains each lease's most-recent
