@@ -7,9 +7,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 func TestHandleListRetentions_Paginates(t *testing.T) {
