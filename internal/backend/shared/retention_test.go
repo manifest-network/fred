@@ -932,6 +932,14 @@ func TestRetentionStore_KeysPage(t *testing.T) {
 		assert.Equal(t, []string{"a", "b", "c", "d", "e"}, keys)
 		assert.Empty(t, next)
 	})
+	t.Run("passthrough (limit<=0) ignores a non-empty cursor and returns all", func(t *testing.T) {
+		// Matches PaginateRetentions/keysetPage: limit<=0 is "give me everything",
+		// so the cursor is ignored rather than seeked from.
+		keys, next, err := s.KeysPage("c", 0)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a", "b", "c", "d", "e"}, keys)
+		assert.Empty(t, next)
+	})
 	t.Run("first page yields continue = last key", func(t *testing.T) {
 		keys, next, err := s.KeysPage("", 2)
 		require.NoError(t, err)

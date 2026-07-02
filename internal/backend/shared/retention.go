@@ -441,9 +441,11 @@ func (s *RetentionStore) Keys() ([]string, error) {
 // uses a bbolt cursor Seek so the read is O(limit), not a full-bucket scan, and
 // (like Keys) skips the heavy per-record value unmarshal.
 //
-//   - limit <= 0 -> returns all keys (unpaginated passthrough), next "".
-//   - limit  > 0 -> returns up to limit keys; next is the last returned key iff a
-//     full page was returned AND more keys remain, otherwise "".
+//   - limit <= 0 -> returns ALL keys, next "" — the unpaginated passthrough. The
+//     cursor is ignored in this mode, matching PaginateRetentions/keysetPage.
+//   - limit  > 0 -> returns up to limit keys strictly greater than `after`; next
+//     is the last returned key iff a full page was returned AND more keys remain,
+//     otherwise "".
 //
 // The returned slice is always non-nil so callers serialize it as [] not null.
 // Precondition: keys are canonical lease UUIDs — bbolt stores keys byte-sorted,
@@ -458,7 +460,11 @@ func (s *RetentionStore) KeysPage(after string, limit int) (keys []string, next 
 		c := b.Cursor()
 
 		var k []byte
-		if after == "" {
+		// limit <= 0 is the unpaginated passthrough: return every key and ignore
+		// the cursor, matching PaginateRetentions/keysetPage. (ParsePageParams
+		// never pairs a non-empty cursor with limit<=0, so a cursor with limit<=0
+		// only reaches a direct store caller — keep the two consistent anyway.)
+		if after == "" || limit <= 0 {
 			k, _ = c.First()
 		} else {
 			// Seek lands on the first key >= after; advance past an exact match so
