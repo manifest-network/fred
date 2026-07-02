@@ -974,6 +974,40 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	return cbErr
 }
 
+// walkKeysetPages drives a complete-or-error keyset walk over a paginated
+// backend list endpoint, reassembling every page into one slice. fetchPage
+// returns one page's items and the next continue token ("" once the set is
+// exhausted). Shared by ListProvisions and ListRetentions so their fail-closed
+// defenses — the maxListPages backstop, the strict-increase continue-token
+// guard, inter-page ctx cancellation, and the non-nil accumulator — live in one
+// place and cannot drift between the two endpoints. op names the operation for
+// error messages (e.g. "list provisions").
+func walkKeysetPages[T any](ctx context.Context, op string, fetchPage func(ctx context.Context, continueToken string) (items []T, next string, err error)) ([]T, error) {
+	acc := []T{} // non-nil so an empty backend returns [] (not nil)
+	cont := ""
+	for page := 0; ; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%s: %w", op, err) // responsive inter-page cancellation
+		}
+		if page >= maxListPages {
+			return nil, fmt.Errorf("%s: exceeded %d pages (last continue=%q); backend not converging", op, maxListPages, cont)
+		}
+		items, next, err := fetchPage(ctx, cont)
+		if err != nil {
+			return nil, err
+		}
+		acc = append(acc, items...)
+		if next == "" {
+			break // exhausted — the complete set
+		}
+		if next <= cont {
+			return nil, fmt.Errorf("%s: backend returned non-advancing continue token %q (sent %q)", op, next, cont)
+		}
+		cont = next
+	}
+	return acc, nil
+}
+
 // ListProvisions returns all provisioned resources from this backend. It walks
 // the keyset-paginated /provisions endpoint, reassembling the complete set; it
 // returns an error rather than a partial set (complete-or-error) so the
@@ -982,31 +1016,13 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
-	// Start non-nil so an empty backend returns [] (not nil), preserving the
-	// pre-pagination ListProvisions contract.
-	acc := []ProvisionInfo{}
-	cont := ""
-	for page := 0; ; page++ {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("list provisions: %w", err) // responsive inter-page cancellation
+	return walkKeysetPages(ctx, "list provisions", func(ctx context.Context, cont string) ([]ProvisionInfo, string, error) {
+		resp, ferr := c.fetchProvisionsPage(ctx, cont)
+		if ferr != nil {
+			return nil, "", ferr
 		}
-		if page >= maxListPages {
-			return nil, fmt.Errorf("list provisions: exceeded %d pages (last continue=%q); backend not converging", maxListPages, cont)
-		}
-		resp, perr := c.fetchProvisionsPage(ctx, cont)
-		if perr != nil {
-			return nil, perr
-		}
-		acc = append(acc, resp.Provisions...)
-		if resp.Continue == "" {
-			break // exhausted — the complete set
-		}
-		if resp.Continue <= cont {
-			return nil, fmt.Errorf("list provisions: backend returned non-advancing continue token %q (sent %q)", resp.Continue, cont)
-		}
-		cont = resp.Continue
-	}
-	return acc, nil
+		return resp.Provisions, resp.Continue, nil
+	})
 }
 
 // fetchProvisionsPage fetches one keyset page. continueToken == "" requests the
@@ -1337,31 +1353,13 @@ func (c *HTTPClient) ListRetentions(ctx context.Context) (_ []RetainedLease, err
 	start := time.Now()
 	defer func() { c.recordMetrics("list_retentions", start, err) }()
 
-	// Start non-nil so an empty backend returns [] (not nil), preserving the
-	// pre-pagination ListRetentions contract.
-	acc := []RetainedLease{}
-	cont := ""
-	for page := 0; ; page++ {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("list retentions: %w", err) // responsive inter-page cancellation
+	return walkKeysetPages(ctx, "list retentions", func(ctx context.Context, cont string) ([]RetainedLease, string, error) {
+		resp, ferr := c.fetchRetentionsPage(ctx, cont)
+		if ferr != nil {
+			return nil, "", ferr
 		}
-		if page >= maxListPages {
-			return nil, fmt.Errorf("list retentions: exceeded %d pages (last continue=%q); backend not converging", maxListPages, cont)
-		}
-		resp, perr := c.fetchRetentionsPage(ctx, cont)
-		if perr != nil {
-			return nil, perr
-		}
-		acc = append(acc, resp.Retentions...)
-		if resp.Continue == "" {
-			break // exhausted — the complete set
-		}
-		if resp.Continue <= cont {
-			return nil, fmt.Errorf("list retentions: backend returned non-advancing continue token %q (sent %q)", resp.Continue, cont)
-		}
-		cont = resp.Continue
-	}
-	return acc, nil
+		return resp.Retentions, resp.Continue, nil
+	})
 }
 
 // fetchRetentionsPage fetches one keyset page. continueToken == "" requests the
