@@ -5,7 +5,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/metrics"
@@ -39,15 +41,43 @@ func TestLoggingMiddleware_BoundsMetricPathLabel(t *testing.T) {
 
 	matched := metrics.APIRequestsTotal.WithLabelValues("GET", "/v1/test-f28/{id}", "200")
 	unmatched := metrics.APIRequestsTotal.WithLabelValues("GET", "unmatched", "404")
-	perScan := metrics.APIRequestsTotal.WithLabelValues("GET", "/scan-f28-should-not-exist", "404")
-	m0, u0, s0 := testutil.ToFloat64(matched), testutil.ToFloat64(unmatched), testutil.ToFloat64(perScan)
+	m0, u0 := testutil.ToFloat64(matched), testutil.ToFloat64(unmatched)
 
 	// One matched request + two DISTINCT junk 404 scan paths.
+	const scanA, scanB = "/scan-f28-should-not-exist", "/scan-f28-another-random"
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/test-f28/550e8400-e29b-41d4-a716-446655440000", nil))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/scan-f28-should-not-exist", nil))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/scan-f28-another-random", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", scanA, nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", scanB, nil))
 
 	require.Equal(t, 1.0, testutil.ToFloat64(matched)-m0, "matched route labeled with its template")
 	require.Equal(t, 2.0, testutil.ToFloat64(unmatched)-u0, "both junk paths collapse into the single unmatched series")
-	require.Equal(t, 0.0, testutil.ToFloat64(perScan)-s0, "no per-scan-path series is created")
+
+	// Assert NO series exists keyed by a raw scan path. Collect the vec's actual
+	// series rather than reading a pre-referenced child with ToFloat64 — the
+	// latter would itself instantiate the series and mask a regression.
+	present := collectPathLabels(t, metrics.APIRequestsTotal)
+	require.NotContains(t, present, scanA, "middleware must not mint a per-path series for junk scan paths")
+	require.NotContains(t, present, scanB, "middleware must not mint a per-path series for junk scan paths")
+}
+
+// collectPathLabels returns the set of "path" label values across every series
+// currently registered in the collector.
+func collectPathLabels(t *testing.T, c prometheus.Collector) []string {
+	t.Helper()
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.Collect(ch)
+		close(ch)
+	}()
+	var paths []string
+	for m := range ch {
+		var d dto.Metric
+		require.NoError(t, m.Write(&d))
+		for _, lp := range d.Label {
+			if lp.GetName() == "path" {
+				paths = append(paths, lp.GetValue())
+			}
+		}
+	}
+	return paths
 }
