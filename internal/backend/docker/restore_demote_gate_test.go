@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -124,6 +125,11 @@ func TestCheckDemoteFit_UnmeasurableRefuses(t *testing.T) {
 	if !errors.Is(err, backend.ErrDemoteDataExceedsTier) {
 		t.Fatalf("unmeasurable demote must refuse")
 	}
+	// The tenant-facing error must NOT leak the underlying Usage error (which
+	// can carry host paths / command output); that detail is logged, not returned.
+	if strings.Contains(err.Error(), "qgroup show failed") {
+		t.Fatalf("tenant-facing error must not leak the underlying Usage error: %v", err)
+	}
 }
 
 func TestCheckDemoteFit_UnmeasurableBackendRefuses(t *testing.T) {
@@ -139,6 +145,9 @@ func TestCheckDemoteFit_UnmeasurableBackendRefuses(t *testing.T) {
 	})
 	if !errors.Is(err, backend.ErrDemoteDataExceedsTier) {
 		t.Fatalf("unsupported-usage demote must refuse")
+	}
+	if strings.Contains(err.Error(), "cannot measure usage") {
+		t.Fatalf("tenant-facing error must not leak the underlying Usage error: %v", err)
 	}
 }
 

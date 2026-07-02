@@ -74,7 +74,8 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	}
 
 	if out, err := exec.CommandContext(ctx, "zfs", "create", "-o", "refquota="+quota, dataset).CombinedOutput(); err != nil {
-		// Cleanup partially created dataset (zfs create is not atomic with quota).
+		// Best-effort cleanup in case the failed create still left a dataset
+		// behind (zfs create -o refquota is atomic, so this is defensive).
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "zfs", "destroy", "-f", dataset).CombinedOutput(); cleanupErr != nil {

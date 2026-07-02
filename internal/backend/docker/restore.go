@@ -628,8 +628,14 @@ func (b *Backend) checkDemoteFit(ctx context.Context, rec *shared.RetentionEntry
 					reason = "unmeasurable_backend"
 				}
 				restoreDemoteRefusedTotal.WithLabelValues(backendKind, reason).Inc()
-				return fmt.Errorf("%w: service %q volume %q: cannot measure usage: %w",
-					backend.ErrDemoteDataExceedsTier, it.ServiceName, name, uerr)
+				// uerr can embed host paths and raw command output (e.g. btrfs
+				// qgroup show against b.dataPath); log it for operators but keep
+				// it OUT of the returned error, which docker-backend/fred-api
+				// forward verbatim to the (untrusted) tenant in the 422 body.
+				logger.Warn("restore demote refused: cannot measure retained volume usage",
+					"service", it.ServiceName, "volume", name, "reason", reason, "error", uerr)
+				return fmt.Errorf("%w: service %q: unable to verify retained data fits the requested tier",
+					backend.ErrDemoteDataExceedsTier, it.ServiceName)
 			}
 			capBytes := newDiskMB * bytesPerMiB
 			if usage > capBytes {
