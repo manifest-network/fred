@@ -43,10 +43,14 @@ func PaginateProvisions(all []ProvisionInfo, continueToken string, limit int) (p
 // relies on. The O(N) copy is a constant factor on the O(N log N)-per-page sort;
 // the asymptotic win (a per-tick sorted snapshot) is tracked as future work (ENG-381).
 //
-// Precondition: keyOf yields a unique total order (lease identity is a UUIDv7).
-// Keyset paging silently skips or duplicates at page boundaries if the sort key
-// is non-unique; if the key ever becomes composite, switch the cursor to an
-// encoded versioned tuple per design spec §4.
+// Precondition: keyOf yields a unique key with a canonical, consistent string
+// order — the same order the client's cursor and any store-level seek use (e.g.
+// the retention store's bbolt byte-order cursor). Chain lease UUIDs satisfy this
+// (canonical-lowercase UUIDv7 from GenerateUUIDv7), but the version is incidental
+// — uniqueness plus canonical ordering is what matters. Keyset paging silently
+// skips or duplicates at page boundaries if the sort key is non-unique; if it
+// ever becomes composite, switch the cursor to an encoded versioned tuple per
+// design spec §4.
 func keysetPage[T any](all []T, keyOf func(T) string, continueToken string, limit int) (page []T, next string) {
 	sorted := make([]T, len(all))
 	copy(sorted, all)
