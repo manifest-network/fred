@@ -21,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend: `/health` now probes the persistence stores (callback,
+  diagnostics, release, retention bbolt) in addition to pinging the Docker
+  daemon. Previously a locked/corrupt/read-only store left the backend reporting
+  healthy while soft-delete/restore silently failed against it. (ENG-448 / F31)
+
 - docker-backend: the `releases.db` age reaper (`RemoveOlderThan`,
   `releases_max_age` default 90d) no longer deletes a live long-lived lease's
   only manifest-rehydration source. It now retains each lease's most-recent
