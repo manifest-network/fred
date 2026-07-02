@@ -28,16 +28,20 @@ func requireCapSysAdmin(backendKind string, logger *slog.Logger) error {
 //   - !canSet (authoritative): fatal, actionable error;
 //   - canSet: nil.
 func capGuardResult(backendKind string, canSet bool, probeErr error, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if probeErr != nil {
 		logger.Warn("could not determine quota-set privilege; proceeding without the startup capability guard",
 			"backend", backendKind, "error", probeErr)
 		return nil
 	}
 	if !canSet {
-		return fmt.Errorf("docker-backend cannot set %s volume quotas: it is not running as root and lacks "+
-			"CAP_SYS_ADMIN in its ambient set; grant it via systemd AmbientCapabilities=CAP_SYS_ADMIN "+
-			"(a plain `setcap cap_sys_admin+ep` on the binary does NOT propagate to the exec'd quota tools) "+
-			"— refusing to start so per-volume disk_mb limits are enforced, not silently skipped", backendKind)
+		return fmt.Errorf("docker-backend cannot set %s volume quotas: CAP_SYS_ADMIN is not available to the "+
+			"exec'd quota tools — grant AmbientCapabilities=CAP_SYS_ADMIN for a non-root daemon, or include "+
+			"CAP_SYS_ADMIN in CapabilityBoundingSet when running as root (a plain `setcap cap_sys_admin+ep` on "+
+			"the binary does NOT propagate to the child) — refusing to start so per-volume disk_mb limits are "+
+			"enforced, not silently skipped", backendKind)
 	}
 	return nil
 }
