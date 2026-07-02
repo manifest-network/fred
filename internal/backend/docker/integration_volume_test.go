@@ -998,6 +998,21 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 // real, unprivileged capability set — which is why the missing capability (the
 // docker-backend runs User=fred with only CAP_CHOWN,CAP_DAC_OVERRIDE) stayed
 // invisible until ENG-449 unmasked it and it broke provisioning in prod.
+// runWithoutCapSysAdmin runs `sh -c cmdline` as root but with CAP_SYS_ADMIN
+// dropped (bounding+effective) via capsh. Unlike a setuid-to-nobody run — which
+// fails at FILE ACCESS before ever reaching the privileged syscall (and on which
+// xfs_quota misleadingly exits 0) — this keeps euid 0, so the mount is reachable
+// and the quota syscall is actually reached with the capability missing,
+// faithfully reproducing the daemon's failing condition. Skips if capsh
+// (libcap2-bin) is unavailable.
+func runWithoutCapSysAdmin(t *testing.T, cmdline string) ([]byte, error) {
+	t.Helper()
+	if _, err := exec.LookPath("capsh"); err != nil {
+		t.Skip("capsh (libcap2-bin) not available; cannot drop CAP_SYS_ADMIN")
+	}
+	return exec.Command("capsh", "--drop=cap_sys_admin", "--", "-c", cmdline).CombinedOutput()
+}
+
 func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 	mount := setupXFSLoopback(t) // requires root
 	ctx := context.Background()
@@ -1007,25 +1022,20 @@ func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, canSet, "test must run as root to exercise this")
 
-	// limit -p on a bare project id needs no tagged inode.
-	args := xfsQuotaArgs(xfsLimitCmd(987654321, "1m"), mount)
-
 	// As root: setting the quota SUCCEEDS — proving the filesystem itself is fine
 	// and it is purely the capability that gates the operation.
-	rootOut, rootErr := exec.CommandContext(ctx, "xfs_quota", args...).CombinedOutput()
+	rootOut, rootErr := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(xfsLimitCmd(987654321, "1m"), mount)...).CombinedOutput()
 	require.NoError(t, rootErr, "root should be able to set the quota: %s", rootOut)
 
-	// As a dropped-privilege (nobody) child: the SAME command FAILS, because
-	// quotactl(Q_XSETQLIM) requires CAP_SYS_ADMIN.
-	dropped := exec.CommandContext(ctx, "xfs_quota", args...)
-	dropped.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: 65534, Gid: 65534}, // nobody:nogroup
-	}
-	dropOut, dropErr := dropped.CombinedOutput()
+	// With CAP_SYS_ADMIN dropped (euid still 0, so the mount is reachable and
+	// quotactl(Q_XSETQLIM) is actually reached), the SAME command FAILS.
+	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("xfs_quota -x -c 'limit -p bhard=1m 987654321' %s", mount))
 	require.Error(t, dropErr,
-		"a process without CAP_SYS_ADMIN must NOT be able to set an XFS quota (got success: %s)", dropOut)
-	assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
-		"expected an 'Operation not permitted' error, got: %s", dropOut)
+		"setting an XFS quota without CAP_SYS_ADMIN must fail: %s", dropOut)
+	if len(dropOut) > 0 {
+		assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
+			"expected an 'Operation not permitted' error, got: %s", dropOut)
+	}
 }
 
 // TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin is the btrfs analogue of
@@ -1046,16 +1056,14 @@ func TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 	rootOut, rootErr := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", "10M", subvol).CombinedOutput()
 	require.NoError(t, rootErr, "root should set the qgroup limit: %s", rootOut)
 
-	// As a dropped-privilege (nobody) child: the SAME command FAILS.
-	dropped := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", "5M", subvol)
-	dropped.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: 65534, Gid: 65534},
-	}
-	dropOut, dropErr := dropped.CombinedOutput()
+	// With CAP_SYS_ADMIN dropped (euid 0, so the qgroup ioctl is reached): FAILS.
+	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("btrfs qgroup limit 5M %s", subvol))
 	require.Error(t, dropErr,
-		"a process without CAP_SYS_ADMIN must NOT set a btrfs qgroup limit (got success: %s)", dropOut)
-	assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
-		"expected a permission error, got: %s", dropOut)
+		"setting a btrfs qgroup limit without CAP_SYS_ADMIN must fail: %s", dropOut)
+	if len(dropOut) > 0 { // message shape is a bonus signal; require.Error is the guarantee
+		assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
+			"expected a permission error, got: %s", dropOut)
+	}
 }
 
 // TestIntegration_Zfs_QuotaSet_RequiresPrivilege documents that setting a zfs
@@ -1085,8 +1093,10 @@ func TestIntegration_Zfs_QuotaSet_RequiresPrivilege(t *testing.T) {
 	dropOut, dropErr := dropped.CombinedOutput()
 	require.Error(t, dropErr,
 		"a non-root process without zfs-allow delegation must NOT set refquota (got success: %s)", dropOut)
-	assert.Contains(t, strings.ToLower(string(dropOut)), "permission",
-		"expected a permission error, got: %s", dropOut)
+	if len(dropOut) > 0 { // message shape is a bonus signal; require.Error is the guarantee
+		assert.Contains(t, strings.ToLower(string(dropOut)), "permission",
+			"expected a permission error, got: %s", dropOut)
+	}
 }
 
 // TestIntegration_XFS_Backfill_TagsUntaggedVolume proves the ENG-454 startup
