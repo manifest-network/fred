@@ -27,9 +27,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   capped at 1 MiB (~19.4k records/backend); on overflow the reconciler silently
   marked retentions incomplete, which disabled placement-orphan pruning and
   degraded restore backend-affinity (ENG-333) with no operator-visible error.
-  The client now walks pages (complete-or-error) with each page bounded, so a
-  large retained inventory is fetched without `ErrResponseTooLarge`. Page size is
-  configurable via `RetentionsPageLimit` (default 1000). (ENG-451)
+  The client now walks pages (complete-or-error, each page bounded), and the
+  docker retention store serves each page directly from its ordered bbolt index
+  via a cursor seek — O(limit) per request, not a full-bucket scan per page. The
+  `/provisions` and `/retentions` handlers now paginate symmetrically at the
+  backend. Page size is configurable via `RetentionsPageLimit` (default 1000).
+  (ENG-451)
 
 - docker-backend: `/health` now probes the persistence stores (callback,
   diagnostics, release, retention bbolt) in addition to pinging the Docker

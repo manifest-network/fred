@@ -42,6 +42,32 @@ func TestHandleListRetentions_Paginates(t *testing.T) {
 	assert.Empty(t, p2.Continue)
 }
 
+// Proves the handler routes /retentions through the O(limit) paged store method
+// (ListRetentionsPage) with the parsed cursor+limit, not the full-scan ListRetentions.
+func TestHandleListRetentions_RoutesToPagedBackend(t *testing.T) {
+	var gotAfter string
+	var gotLimit int
+	mb := &mockBackend{
+		ListRetentionsPageFunc: func(_ context.Context, after string, limit int) ([]backend.RetainedLease, string, error) {
+			gotAfter, gotLimit = after, limit
+			return []backend.RetainedLease{{LeaseUUID: "x"}}, "x", nil
+		},
+		ListRetentionsFunc: func(context.Context) ([]backend.RetainedLease, error) {
+			t.Fatal("handler must use the paged ListRetentionsPage, not the full-scan ListRetentions")
+			return nil, nil
+		},
+	}
+	w := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w, signedGetRequest("/retentions?limit=5&continue=11111111-1111-1111-1111-111111111111"))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "11111111-1111-1111-1111-111111111111", gotAfter)
+	assert.Equal(t, 5, gotLimit)
+
+	var resp backend.ListRetentionsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "x", resp.Continue)
+}
+
 func TestHandleListRetentions_MalformedContinueIs400(t *testing.T) {
 	called := false
 	mb := &mockBackend{

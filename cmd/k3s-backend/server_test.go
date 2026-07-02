@@ -107,10 +107,12 @@ type mockBackend struct {
 	GetLogsFunc               func(ctx context.Context, leaseUUID string, tail int) (map[string]string, error)
 	GetProvisionFunc          func(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
 	ListProvisionsFunc        func(ctx context.Context) ([]backend.ProvisionInfo, error)
+	ListProvisionsPageFunc    func(ctx context.Context, after string, limit int) ([]backend.ProvisionInfo, string, error)
 	LookupProvisionsFunc      func(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error)
 	RestartFunc               func(ctx context.Context, req backend.RestartRequest) error
 	UpdateFunc                func(ctx context.Context, req backend.UpdateRequest) error
 	ListRetentionsFunc        func(ctx context.Context) ([]backend.RetainedLease, error)
+	ListRetentionsPageFunc    func(ctx context.Context, after string, limit int) ([]backend.RetainedLease, string, error)
 	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
 	GetReleasesFunc           func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	HealthFunc                func(ctx context.Context) error
@@ -157,6 +159,34 @@ func (m *mockBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionIn
 		panic("mockBackend.ListProvisions called but not configured")
 	}
 	return m.ListProvisionsFunc(ctx)
+}
+
+// ListProvisionsPage defaults to ListProvisions + PaginateProvisions so tests
+// that only set ListProvisionsFunc exercise the paged handler path unchanged.
+func (m *mockBackend) ListProvisionsPage(ctx context.Context, after string, limit int) ([]backend.ProvisionInfo, string, error) {
+	if m.ListProvisionsPageFunc != nil {
+		return m.ListProvisionsPageFunc(ctx, after, limit)
+	}
+	all, err := m.ListProvisions(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	page, next := backend.PaginateProvisions(all, after, limit)
+	return page, next, nil
+}
+
+// ListRetentionsPage defaults to ListRetentions + PaginateRetentions so tests
+// that only set ListRetentionsFunc exercise the paged handler path unchanged.
+func (m *mockBackend) ListRetentionsPage(ctx context.Context, after string, limit int) ([]backend.RetainedLease, string, error) {
+	if m.ListRetentionsPageFunc != nil {
+		return m.ListRetentionsPageFunc(ctx, after, limit)
+	}
+	all, err := m.ListRetentions(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	page, next := backend.PaginateRetentions(all, after, limit)
+	return page, next, nil
 }
 
 func (m *mockBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {

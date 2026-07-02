@@ -436,6 +436,51 @@ func (s *RetentionStore) Keys() ([]string, error) {
 	return out, err
 }
 
+// KeysPage returns one keyset page of retained lease UUIDs (the bbolt keys) in
+// ascending key order, containing the keys strictly greater than `after`. It
+// uses a bbolt cursor Seek so the read is O(limit), not a full-bucket scan, and
+// (like Keys) skips the heavy per-record value unmarshal.
+//
+//   - limit <= 0 -> returns all keys (unpaginated passthrough), next "".
+//   - limit  > 0 -> returns up to limit keys; next is the last returned key iff a
+//     full page was returned AND more keys remain, otherwise "".
+//
+// The returned slice is always non-nil so callers serialize it as [] not null.
+// Precondition: keys are canonical lease UUIDs — bbolt stores keys byte-sorted,
+// which matches the client's keyset cursor order (canonical-lowercase UUID).
+func (s *RetentionStore) KeysPage(after string, limit int) (keys []string, next string, err error) {
+	keys = []string{}
+	err = s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(retentionBucketName)
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+
+		var k []byte
+		if after == "" {
+			k, _ = c.First()
+		} else {
+			// Seek lands on the first key >= after; advance past an exact match so
+			// the page starts strictly after the cursor (keyset semantics).
+			k, _ = c.Seek([]byte(after))
+			if k != nil && string(k) == after {
+				k, _ = c.Next()
+			}
+		}
+
+		for ; k != nil; k, _ = c.Next() {
+			if limit > 0 && len(keys) == limit {
+				next = keys[len(keys)-1] // full page + at least one more key remains
+				return nil
+			}
+			keys = append(keys, string(k)) // string(k) copies; no cursor bytes escape the txn
+		}
+		return nil
+	})
+	return keys, next, err
+}
+
 // ListExpired returns active entries whose CreatedAt is older than maxAge.
 func (s *RetentionStore) ListExpired(maxAge time.Duration) ([]RetentionEntry, error) {
 	cutoff := time.Now().Add(-maxAge)
