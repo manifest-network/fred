@@ -159,8 +159,15 @@ func newVolumeManager(dataPath, filesystem string, logger *slog.Logger) (volumeM
 	case "btrfs":
 		return &btrfsVolumeManager{dataPath: dataPath, logger: logger}, nil
 	case "xfs":
+		// xfs_quota requires the XFS mount point as its filesystem argument;
+		// dataPath is typically a subdirectory of that mount (ENG-449).
+		mountPoint, err := resolveMountpoint(dataPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
+		}
 		return &xfsVolumeManager{
 			dataPath:   dataPath,
+			mountPoint: mountPoint,
 			logger:     logger,
 			activeIDs:  make(map[uint32]string),
 			volumeToID: make(map[string]uint32),

@@ -34,6 +34,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   be rejected with an opaque 400 at the backend once providerd re-serialized and
   wrapped it for forwarding. (ENG-448 / F42)
 
+- docker-backend (xfs): per-volume XFS project quotas are now actually applied
+  and measurable when `volume_data_path` is a subdirectory of the XFS mount (the
+  normal deployment layout, e.g. `/data/fred/volumes` under a `/data/fred`
+  mount). `xfs_quota` requires the mount point as its trailing filesystem
+  argument, but the manager passed the `volume_data_path` subdirectory, so
+  `project -s`/`limit -p` silently no-op'd (the `disk_mb` cap was never
+  enforced) and `report -p` failed — `Usage()` returned "project id not found",
+  which made the ENG-438 restore demote-fit gate refuse every demote as
+  `unmeasurable_read_error`. The containing mount point is now resolved once at
+  construction (`resolveMountpoint`) and used for all `xfs_quota` invocations;
+  the volume subdirectory is named only in `project -s -p`. btrfs and zfs were
+  unaffected. Note: volumes provisioned before this fix stay untagged until
+  re-provisioned or re-tagged out of band. (ENG-449)
 - docker-backend: the `releases.db` age reaper (`RemoveOlderThan`,
   `releases_max_age` default 90d) no longer deletes a live long-lived lease's
   only manifest-rehydration source. It now retains each lease's most-recent
