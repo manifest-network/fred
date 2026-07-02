@@ -17,7 +17,7 @@ func devOf(t *testing.T, path string) uint64 {
 	t.Helper()
 	var st syscall.Stat_t
 	require.NoError(t, syscall.Stat(path, &st))
-	return uint64(st.Dev)
+	return st.Dev
 }
 
 // TestResolveMountpoint_ReturnsMountBoundary verifies that resolveMountpoint
@@ -30,11 +30,15 @@ func TestResolveMountpoint_ReturnsMountBoundary(t *testing.T) {
 	mp, err := resolveMountpoint(dir)
 	require.NoError(t, err)
 
-	// Result must exist and be an ancestor (prefix) of the input.
+	// Result must exist and be a genuine path ancestor of the input (or the
+	// input itself). filepath.Rel is directory-boundary aware, unlike a raw
+	// string prefix which would accept "/tmp" as a "prefix" of "/tmp2/x".
 	_, statErr := os.Stat(mp)
 	require.NoError(t, statErr, "mountpoint %q does not exist", mp)
-	assert.True(t, strings.HasPrefix(dir, mp),
-		"mountpoint %q is not an ancestor of %q", mp, dir)
+	rel, relErr := filepath.Rel(mp, dir)
+	require.NoError(t, relErr)
+	assert.False(t, strings.HasPrefix(rel, ".."),
+		"mountpoint %q is not an ancestor of %q (rel=%q)", mp, dir, rel)
 
 	// Mount-boundary invariant: root, or parent is on a different device.
 	if mp != string(os.PathSeparator) {

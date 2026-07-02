@@ -139,8 +139,15 @@ func readProjectIDFile(dirPath string) (uint32, error) {
 // lazily), so resolution starts from the nearest existing ancestor — the mount
 // that ancestor lives on is the same mount the subdirectory will inherit.
 func resolveMountpoint(path string) (string, error) {
+	// Resolve to an absolute path first. A relative volume_data_path is allowed
+	// by config validation, and would otherwise walk up to "." (not a real mount
+	// point) because filepath.Dir(".") == ".".
+	p, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute path for %s: %w", path, err)
+	}
+
 	// Walk up to the nearest existing ancestor.
-	p := filepath.Clean(path)
 	var st syscall.Stat_t
 	for {
 		if err := syscall.Stat(p, &st); err == nil {
