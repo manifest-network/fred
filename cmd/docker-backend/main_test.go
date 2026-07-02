@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
@@ -69,7 +70,7 @@ func TestVerifySignature(t *testing.T) {
 // that don't need it. If a handler change causes unexpected panics, it means
 // the change touched the backend in a path that previously didn't.
 func newTestHandler() http.Handler {
-	s := NewServer(nil, testSecret, slog.Default())
+	s := NewServer(nil, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize)
 	return s.Handler()
 }
 
@@ -661,7 +662,7 @@ func (m *mockBackend) Stats() shared.ResourceStats {
 
 // newMockHandler creates a Handler backed by the given mockBackend.
 func newMockHandler(mb *mockBackend) http.Handler {
-	s := NewServer(mb, testSecret, slog.Default())
+	s := NewServer(mb, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize)
 	return s.Handler()
 }
 
@@ -1497,7 +1498,7 @@ func TestHMACMiddleware_RejectsCrossPathReplay(t *testing.T) {
 // check. Wrapping the middleware around a permissive next-handler
 // proves the property the test cares about.
 func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
-	mw := hmacAuthMiddleware(testSecret, slog.Default())
+	mw := hmacAuthMiddleware(testSecret, slog.Default(), docker.DefaultMaxRequestBodySize)
 	authed := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))

@@ -731,9 +731,37 @@ func (b *Backend) Name() string {
 	return b.cfg.Name
 }
 
-// Health checks if the Docker daemon is reachable.
+// Health checks that the Docker daemon is reachable AND the persistence stores
+// are readable. Probing the bbolt stores (not just docker.Ping) means a
+// locked/corrupt/read-only retention or release store surfaces as unhealthy
+// instead of the backend reporting healthy while soft-delete/restore silently
+// fail — the most data-loss-sensitive subsystem must not be the unmonitored
+// one. (ENG-448 / F31)
 func (b *Backend) Health(ctx context.Context) error {
-	return b.docker.Ping(ctx)
+	if err := b.docker.Ping(ctx); err != nil {
+		return err
+	}
+	if b.callbackStore != nil {
+		if err := b.callbackStore.Healthy(); err != nil {
+			return fmt.Errorf("callback store unhealthy: %w", err)
+		}
+	}
+	if b.diagnosticsStore != nil {
+		if err := b.diagnosticsStore.Healthy(); err != nil {
+			return fmt.Errorf("diagnostics store unhealthy: %w", err)
+		}
+	}
+	if b.releaseStore != nil {
+		if err := b.releaseStore.Healthy(); err != nil {
+			return fmt.Errorf("release store unhealthy: %w", err)
+		}
+	}
+	if b.retentionStore != nil {
+		if err := b.retentionStore.Healthy(); err != nil {
+			return fmt.Errorf("retention store unhealthy: %w", err)
+		}
+	}
+	return nil
 }
 
 // sendCallback resolves the callback URL from the provisions map and delegates

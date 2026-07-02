@@ -100,7 +100,7 @@ func main() {
 	cancel()
 
 	// Create server
-	server := NewServer(b, string(cfg.CallbackSecret), logger)
+	server := NewServer(b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize)
 
 	// Build the listener TLS config up front so a bad cert fails fast before we
 	// announce readiness. Config.Validate (run in docker.New) already enforces
@@ -236,6 +236,11 @@ func applyEnvOverrides(cfg *docker.Config) {
 	if dockerHost := os.Getenv("DOCKER_HOST"); dockerHost != "" {
 		cfg.DockerHost = dockerHost
 	}
+	if v := os.Getenv("DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			cfg.MaxRequestBodySize = n
+		}
+	}
 }
 
 // backendService defines the methods that handlers call on the backend.
@@ -260,17 +265,24 @@ type backendService interface {
 
 // Server handles HTTP requests for the Docker backend.
 type Server struct {
-	backend        backendService
-	callbackSecret string
-	logger         *slog.Logger
+	backend            backendService
+	callbackSecret     string
+	logger             *slog.Logger
+	maxRequestBodySize int64
 }
 
-// NewServer creates a new HTTP server for the Docker backend.
-func NewServer(b backendService, callbackSecret string, logger *slog.Logger) *Server {
+// NewServer creates a new HTTP server for the Docker backend. maxRequestBodySize
+// caps inbound request bodies; a non-positive value falls back to
+// docker.DefaultMaxRequestBodySize. (ENG-448 / F42)
+func NewServer(b backendService, callbackSecret string, logger *slog.Logger, maxRequestBodySize int64) *Server {
+	if maxRequestBodySize <= 0 {
+		maxRequestBodySize = docker.DefaultMaxRequestBodySize
+	}
 	return &Server{
-		backend:        b,
-		callbackSecret: callbackSecret,
-		logger:         logger,
+		backend:            b,
+		callbackSecret:     callbackSecret,
+		logger:             logger,
+		maxRequestBodySize: maxRequestBodySize,
 	}
 }
 
@@ -278,7 +290,7 @@ func NewServer(b backendService, callbackSecret string, logger *slog.Logger) *Se
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger)
+	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger, s.maxRequestBodySize)
 	mux.Handle("POST /provision", authMw(http.HandlerFunc(s.handleProvision)))
 	mux.Handle("POST /deprovision", authMw(http.HandlerFunc(s.handleDeprovision)))
 	mux.Handle("GET /info/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetInfo)))
@@ -826,8 +838,7 @@ func jsonError(w http.ResponseWriter, status int, message string) {
 	_, _ = w.Write(encoded)
 }
 
-const maxRequestBodySize = 1 << 20 // 1 MiB
-const maxTailLines = 10000         // Upper bound for log tail requests
+const maxTailLines = 10000 // Upper bound for log tail requests
 
 // validateCallbackURL validates that a callback URL is safe to use.
 // It rejects non-HTTP(S) schemes and dangerous IP addresses to prevent SSRF.
@@ -867,7 +878,7 @@ func validateCallbackURL(rawURL string) error {
 }
 
 // hmacAuthMiddleware returns middleware that verifies HMAC-SHA256 signatures on requests.
-func hmacAuthMiddleware(secret string, logger *slog.Logger) func(http.Handler) http.Handler {
+func hmacAuthMiddleware(secret string, logger *slog.Logger, maxRequestBodySize int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Limit request body size

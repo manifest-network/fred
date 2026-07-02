@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/k3s"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
@@ -53,17 +54,24 @@ type backendService interface {
 
 // Server handles HTTP requests for the K3s backend.
 type Server struct {
-	backend        backendService
-	callbackSecret string
-	logger         *slog.Logger
+	backend            backendService
+	callbackSecret     string
+	logger             *slog.Logger
+	maxRequestBodySize int64
 }
 
-// NewServer creates a new HTTP server for the K3s backend.
-func NewServer(b backendService, callbackSecret string, logger *slog.Logger) *Server {
+// NewServer creates a new HTTP server for the K3s backend. maxRequestBodySize
+// caps inbound request bodies; a non-positive value falls back to
+// k3s.DefaultMaxRequestBodySize. (ENG-448 / F42)
+func NewServer(b backendService, callbackSecret string, logger *slog.Logger, maxRequestBodySize int64) *Server {
+	if maxRequestBodySize <= 0 {
+		maxRequestBodySize = k3s.DefaultMaxRequestBodySize
+	}
 	return &Server{
-		backend:        b,
-		callbackSecret: callbackSecret,
-		logger:         logger,
+		backend:            b,
+		callbackSecret:     callbackSecret,
+		logger:             logger,
+		maxRequestBodySize: maxRequestBodySize,
 	}
 }
 
@@ -71,7 +79,7 @@ func NewServer(b backendService, callbackSecret string, logger *slog.Logger) *Se
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger)
+	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger, s.maxRequestBodySize)
 	mux.Handle("POST /provision", authMw(http.HandlerFunc(s.handleProvision)))
 	mux.Handle("POST /deprovision", authMw(http.HandlerFunc(s.handleDeprovision)))
 	mux.Handle("GET /info/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetInfo)))
@@ -537,8 +545,7 @@ func jsonError(w http.ResponseWriter, status int, message string) {
 	_, _ = w.Write(encoded)
 }
 
-const maxRequestBodySize = 1 << 20 // 1 MiB
-const maxTailLines = 10000         // Upper bound for log tail requests
+const maxTailLines = 10000 // Upper bound for log tail requests
 
 // validateCallbackURL validates that a callback URL is safe to use.
 // It rejects non-HTTP(S) schemes and dangerous IP addresses to prevent SSRF.
@@ -599,7 +606,7 @@ func validateCallbackURL(rawURL string) error {
 }
 
 // hmacAuthMiddleware returns middleware that verifies HMAC-SHA256 signatures on requests.
-func hmacAuthMiddleware(secret string, logger *slog.Logger) func(http.Handler) http.Handler {
+func hmacAuthMiddleware(secret string, logger *slog.Logger, maxRequestBodySize int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Limit request body size

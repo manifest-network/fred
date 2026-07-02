@@ -67,6 +67,11 @@ type Config struct {
 	// ListenAddr is the address the HTTP server listens on.
 	ListenAddr string `yaml:"listen_addr"`
 
+	// MaxRequestBodySize caps inbound HTTP request bodies (bytes). It must
+	// exceed providerd's request cap plus forward-wrapping overhead; defaults to
+	// DefaultMaxRequestBodySize when unset or non-positive. (ENG-448 / F42)
+	MaxRequestBodySize int64 `yaml:"max_request_body_size"`
+
 	// KubeconfigPath is the explicit path to a kubeconfig file used by
 	// client-go to talk to the K3s API server. When empty, the resolver
 	// (kubeclient.go, T3) falls back in order: KubeconfigPathList → in-cluster
@@ -187,20 +192,29 @@ type Config struct {
 // backends can run side-by-side on the same host without colliding. The
 // default SKU profile names are k3s-* to make it obvious in logs which
 // backend a request was routed to.
+// DefaultMaxRequestBodySize caps inbound HTTP request bodies for the k3s
+// backend. Like the docker backend it is deliberately larger than providerd's
+// config.DefaultMaxRequestBodySize (1 MiB) to leave headroom for providerd's
+// re-serialized/wrapped forward body, so a manifest that cleared providerd is
+// not rejected with an opaque 400 on the backend hop. Configurable via
+// max_request_body_size / K3S_BACKEND_MAX_REQUEST_BODY_SIZE. (ENG-448 / F42)
+const DefaultMaxRequestBodySize int64 = 2 << 20 // 2 MiB
+
 func DefaultConfig() Config {
 	return Config{
-		Name:              "k3s",
-		ListenAddr:        ":9002",
-		TotalCPUCores:     8.0,
-		TotalMemoryMB:     16384,
-		TotalDiskMB:       102400,
-		CallbackDBPath:    "k3s-callbacks.db",
-		CallbackMaxAge:    24 * time.Hour,
-		DiagnosticsDBPath: "k3s-diagnostics.db",
-		DiagnosticsMaxAge: 7 * 24 * time.Hour,
-		ReleasesDBPath:    "k3s-releases.db",
-		ReleasesMaxAge:    90 * 24 * time.Hour,
-		ReconcileInterval: 5 * time.Minute,
+		Name:               "k3s",
+		ListenAddr:         ":9002",
+		MaxRequestBodySize: DefaultMaxRequestBodySize,
+		TotalCPUCores:      8.0,
+		TotalMemoryMB:      16384,
+		TotalDiskMB:        102400,
+		CallbackDBPath:     "k3s-callbacks.db",
+		CallbackMaxAge:     24 * time.Hour,
+		DiagnosticsDBPath:  "k3s-diagnostics.db",
+		DiagnosticsMaxAge:  7 * 24 * time.Hour,
+		ReleasesDBPath:     "k3s-releases.db",
+		ReleasesMaxAge:     90 * 24 * time.Hour,
+		ReconcileInterval:  5 * time.Minute,
 		SKUProfiles: map[string]SKUProfile{
 			"k3s-micro": {
 				CPUCores: 0.25,
@@ -239,6 +253,12 @@ func DefaultConfig() Config {
 func (c *Config) Validate() error {
 	if c.Name == "" {
 		return fmt.Errorf("name is required")
+	}
+
+	// A non-positive cap (unset in YAML, or 0) falls back to the default rather
+	// than disabling the body limit entirely. (ENG-448 / F42)
+	if c.MaxRequestBodySize <= 0 {
+		c.MaxRequestBodySize = DefaultMaxRequestBodySize
 	}
 
 	if c.ListenAddr == "" {
