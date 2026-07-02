@@ -356,7 +356,7 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 		return
 	}
 
-	limit, cont, perr := backend.ParseProvisionsPageParams(r.URL.Query())
+	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
 	if perr != nil {
 		http.Error(w, perr.Error(), http.StatusBadRequest)
 		return

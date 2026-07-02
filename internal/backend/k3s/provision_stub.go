@@ -364,6 +364,18 @@ func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, 
 	return out, nil
 }
 
+// ListProvisionsPage is the paged sibling of ListProvisions for the /provisions
+// handler. The provision store is an in-memory map, so this snapshots it and
+// paginates in memory (symmetric with the docker backend).
+func (b *Backend) ListProvisionsPage(ctx context.Context, after string, limit int) ([]backend.ProvisionInfo, string, error) {
+	all, err := b.ListProvisions(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	page, next := backend.PaginateProvisions(all, after, limit)
+	return page, next, nil
+}
+
 // LookupProvisions returns the subset of in-memory records whose UUIDs
 // appear in the input slice. Missing UUIDs are silently omitted (the
 // HTTP handler distinguishes "no matches" from "endpoint missing" by
@@ -458,6 +470,18 @@ func (b *Backend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
 // backend satisfies the backend.Backend interface (ENG-333).
 func (b *Backend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
 	return []backend.RetainedLease{}, nil
+}
+
+// ListRetentionsPage is the paged sibling of ListRetentions for the /retentions
+// handler. The k3s scaffold has no retention store yet, so this paginates the
+// (currently empty) in-memory result; ENG-134+ replaces the stub.
+func (b *Backend) ListRetentionsPage(ctx context.Context, after string, limit int) ([]backend.RetainedLease, string, error) {
+	all, err := b.ListRetentions(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	page, next := backend.PaginateRetentions(all, after, limit)
+	return page, next, nil
 }
 
 // Stats returns the resource pool's current snapshot. The k3s scaffold

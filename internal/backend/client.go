@@ -304,6 +304,10 @@ type RetainedLease struct {
 // ListRetentionsResponse is the response from the GET /retentions endpoint.
 type ListRetentionsResponse struct {
 	Retentions []RetainedLease `json:"retentions"`
+	// Continue is the keyset cursor for the next page: the LeaseUUID of the last
+	// item in this page when more remain, or "" when the set is exhausted.
+	// Absent (omitempty) on the unpaginated path and from pre-pagination servers.
+	Continue string `json:"continue,omitempty"`
 }
 
 // CallbackPayload is sent by backends to fred's callback endpoint.
@@ -519,8 +523,9 @@ type HTTPClient struct {
 	maxLogsBytes             int64
 	maxReleasesBytes         int64
 	maxStatsBytes            int64
-	maxRetentionsBytes       int64
+	maxRetentionsBytes       int64 // bounds a single /retentions PAGE body (not the whole list) since pagination
 	provisionsPageLimit      int
+	retentionsPageLimit      int
 
 	// Optional Prometheus metrics (nil = skip recording)
 	requestDuration *prometheus.HistogramVec
@@ -543,19 +548,24 @@ const (
 	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
 	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
 	DefaultMaxStatsBytes            int64 = 1 << 20  // 1 MiB — load stats snapshot (small JSON)
-	DefaultMaxRetentionsBytes       int64 = 1 << 20  // 1 MiB — retained-lease list (small, UUID-only JSON)
+	DefaultMaxRetentionsBytes       int64 = 1 << 20  // 1 MiB — bounds a single /retentions PAGE (not the whole list) since pagination
 
 	// DefaultProvisionsPageLimit is the page size the client requests on
 	// GET /provisions. The server coerces a larger value down to MaxPageLimit.
 	DefaultProvisionsPageLimit = 1000
+
+	// DefaultRetentionsPageLimit is the page size the client requests on
+	// GET /retentions. The server coerces a larger value down to MaxPageLimit.
+	DefaultRetentionsPageLimit = 1000
 )
 
-// maxProvisionsPages caps the client's page loop as a fail-closed backstop
-// against a backend that returns an unbounded sequence of advancing continue
-// tokens. The strict-increase guard catches a stuck token immediately; this
-// only bounds a pathological always-advancing server. At DefaultProvisionsPageLimit
-// this is far beyond any real fleet.
-const maxProvisionsPages = 100_000
+// maxListPages caps a client keyset-pagination loop (ListProvisions,
+// ListRetentions) as a fail-closed backstop against a backend that returns an
+// unbounded sequence of advancing continue tokens. The strict-increase guard
+// catches a stuck token immediately; this only bounds a pathological
+// always-advancing server. At the default page sizes this is far beyond any
+// real fleet.
+const maxListPages = 100_000
 
 // HTTPClientConfig configures an HTTP backend client.
 type HTTPClientConfig struct {
@@ -586,8 +596,9 @@ type HTTPClientConfig struct {
 	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
 	MaxReleasesBytes         int64 // GetReleases response limit (default: 8 MiB)
 	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
-	MaxRetentionsBytes       int64 // ListRetentions response limit (default: 1 MiB)
+	MaxRetentionsBytes       int64 // /retentions per-page response limit (default: 1 MiB)
 	ProvisionsPageLimit      int   // /provisions page size requested by the client (default: 1000)
+	RetentionsPageLimit      int   // /retentions page size requested by the client (default: 1000)
 
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
@@ -674,12 +685,16 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		},
 	})
 
-	// Guard the page size: a zero OR negative ProvisionsPageLimit falls back to
-	// the default. cmp.Or (used above for the other defaults) only replaces zero,
-	// so a negative would be sent as limit=-N and rejected by the server each tick.
+	// Guard the page size: a zero OR negative page limit falls back to the
+	// default. cmp.Or (used above for the other defaults) only replaces zero, so a
+	// negative would be sent as limit=-N and rejected by the server each tick.
 	pageLimit := cfg.ProvisionsPageLimit
 	if pageLimit <= 0 {
 		pageLimit = DefaultProvisionsPageLimit
+	}
+	retentionsPageLimit := cfg.RetentionsPageLimit
+	if retentionsPageLimit <= 0 {
+		retentionsPageLimit = DefaultRetentionsPageLimit
 	}
 
 	return &HTTPClient{
@@ -700,6 +715,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		maxStatsBytes:            positiveOr(cfg.MaxStatsBytes, DefaultMaxStatsBytes),
 		maxRetentionsBytes:       positiveOr(cfg.MaxRetentionsBytes, DefaultMaxRetentionsBytes),
 		provisionsPageLimit:      pageLimit,
+		retentionsPageLimit:      retentionsPageLimit,
 		requestDuration:          cfg.RequestDuration,
 		requestsTotal:            cfg.RequestsTotal,
 	}
@@ -958,6 +974,40 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	return cbErr
 }
 
+// walkKeysetPages drives a complete-or-error keyset walk over a paginated
+// backend list endpoint, reassembling every page into one slice. fetchPage
+// returns one page's items and the next continue token ("" once the set is
+// exhausted). Shared by ListProvisions and ListRetentions so their fail-closed
+// defenses — the maxListPages backstop, the strict-increase continue-token
+// guard, inter-page ctx cancellation, and the non-nil accumulator — live in one
+// place and cannot drift between the two endpoints. op names the operation for
+// error messages (e.g. "list provisions").
+func walkKeysetPages[T any](ctx context.Context, op string, fetchPage func(ctx context.Context, continueToken string) (items []T, next string, err error)) ([]T, error) {
+	acc := []T{} // non-nil so an empty backend returns [] (not nil)
+	cont := ""
+	for page := 0; ; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%s: %w", op, err) // responsive inter-page cancellation
+		}
+		if page >= maxListPages {
+			return nil, fmt.Errorf("%s: exceeded %d pages (last continue=%q); backend not converging", op, maxListPages, cont)
+		}
+		items, next, err := fetchPage(ctx, cont)
+		if err != nil {
+			return nil, err
+		}
+		acc = append(acc, items...)
+		if next == "" {
+			break // exhausted — the complete set
+		}
+		if next <= cont {
+			return nil, fmt.Errorf("%s: backend returned non-advancing continue token %q (sent %q)", op, next, cont)
+		}
+		cont = next
+	}
+	return acc, nil
+}
+
 // ListProvisions returns all provisioned resources from this backend. It walks
 // the keyset-paginated /provisions endpoint, reassembling the complete set; it
 // returns an error rather than a partial set (complete-or-error) so the
@@ -966,31 +1016,13 @@ func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
-	// Start non-nil so an empty backend returns [] (not nil), preserving the
-	// pre-pagination ListProvisions contract.
-	acc := []ProvisionInfo{}
-	cont := ""
-	for page := 0; ; page++ {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("list provisions: %w", err) // responsive inter-page cancellation
+	return walkKeysetPages(ctx, "list provisions", func(ctx context.Context, cont string) ([]ProvisionInfo, string, error) {
+		resp, ferr := c.fetchProvisionsPage(ctx, cont)
+		if ferr != nil {
+			return nil, "", ferr
 		}
-		if page >= maxProvisionsPages {
-			return nil, fmt.Errorf("list provisions: exceeded %d pages (last continue=%q); backend not converging", maxProvisionsPages, cont)
-		}
-		resp, perr := c.fetchProvisionsPage(ctx, cont)
-		if perr != nil {
-			return nil, perr
-		}
-		acc = append(acc, resp.Provisions...)
-		if resp.Continue == "" {
-			break // exhausted — the complete set
-		}
-		if resp.Continue <= cont {
-			return nil, fmt.Errorf("list provisions: backend returned non-advancing continue token %q (sent %q)", resp.Continue, cont)
-		}
-		cont = resp.Continue
-	}
-	return acc, nil
+		return resp.Provisions, resp.Continue, nil
+	})
 }
 
 // fetchProvisionsPage fetches one keyset page. continueToken == "" requests the
@@ -1313,13 +1345,68 @@ func (c *HTTPClient) GetLoadStats(ctx context.Context) (*LoadStats, error) {
 }
 
 // ListRetentions retrieves the leases whose data this backend currently retains
-// (GET /retentions). Used by the reconciler for restore backend affinity.
-func (c *HTTPClient) ListRetentions(ctx context.Context) ([]RetainedLease, error) {
-	result, err := doGet[ListRetentionsResponse](c, ctx, "list_retentions", c.baseURL+"/retentions", c.maxRetentionsBytes)
-	if err != nil {
-		return nil, err
+// (GET /retentions). Used by the reconciler for restore backend affinity. It
+// walks the keyset-paginated endpoint, reassembling the complete set; it returns
+// an error rather than a partial set (complete-or-error) so the reconciler never
+// acts on incomplete retention data.
+func (c *HTTPClient) ListRetentions(ctx context.Context) (_ []RetainedLease, err error) {
+	start := time.Now()
+	defer func() { c.recordMetrics("list_retentions", start, err) }()
+
+	return walkKeysetPages(ctx, "list retentions", func(ctx context.Context, cont string) ([]RetainedLease, string, error) {
+		resp, ferr := c.fetchRetentionsPage(ctx, cont)
+		if ferr != nil {
+			return nil, "", ferr
+		}
+		return resp.Retentions, resp.Continue, nil
+	})
+}
+
+// fetchRetentionsPage fetches one keyset page. continueToken == "" requests the
+// first page. The per-page body is bounded by maxRetentionsBytes (fail-closed).
+func (c *HTTPClient) fetchRetentionsPage(ctx context.Context, continueToken string) (ListRetentionsResponse, error) {
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(c.retentionsPageLimit))
+	if continueToken != "" {
+		q.Set("continue", continueToken)
 	}
-	return result.Retentions, nil
+	target := c.baseURL + "/retentions?" + q.Encode()
+
+	result, cbErr := c.cb.Execute(func() (any, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		c.signRequest(httpReq, nil)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("list retentions request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("list retentions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+		}
+
+		var retResult ListRetentionsResponse
+		if err := decodeJSONLimited(resp.Body, c.maxRetentionsBytes, &retResult); err != nil {
+			return nil, fmt.Errorf("decode retentions response: %w", err)
+		}
+		return retResult, nil
+	})
+
+	if isCircuitBreakerError(cbErr) {
+		return ListRetentionsResponse{}, ErrCircuitOpen
+	}
+	if cbErr != nil {
+		return ListRetentionsResponse{}, cbErr
+	}
+	rr, ok := result.(ListRetentionsResponse)
+	if !ok {
+		return ListRetentionsResponse{}, fmt.Errorf("list retentions: unexpected result type %T", result)
+	}
+	return rr, nil
 }
 
 // Health checks if the backend is reachable and healthy.

@@ -920,6 +920,65 @@ func TestRetentionStore_Keys(t *testing.T) {
 	assert.ElementsMatch(t, []string{"u1", "u2"}, keys)
 }
 
+func TestRetentionStore_KeysPage(t *testing.T) {
+	s := newTestRetentionStore(t)
+	for _, k := range []string{"c", "a", "e", "b", "d"} { // inserted out of order
+		require.NoError(t, s.Put(sampleEntry(k)))
+	}
+
+	t.Run("passthrough when limit<=0 returns all in key order", func(t *testing.T) {
+		keys, next, err := s.KeysPage("", 0)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a", "b", "c", "d", "e"}, keys)
+		assert.Empty(t, next)
+	})
+	t.Run("passthrough (limit<=0) ignores a non-empty cursor and returns all", func(t *testing.T) {
+		// Matches PaginateRetentions/keysetPage: limit<=0 is "give me everything",
+		// so the cursor is ignored rather than seeked from.
+		keys, next, err := s.KeysPage("c", 0)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a", "b", "c", "d", "e"}, keys)
+		assert.Empty(t, next)
+	})
+	t.Run("first page yields continue = last key", func(t *testing.T) {
+		keys, next, err := s.KeysPage("", 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a", "b"}, keys)
+		assert.Equal(t, "b", next)
+	})
+	t.Run("resume strictly after continue", func(t *testing.T) {
+		keys, next, err := s.KeysPage("b", 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"c", "d"}, keys)
+		assert.Equal(t, "d", next)
+	})
+	t.Run("partial last page exhausts", func(t *testing.T) {
+		keys, next, err := s.KeysPage("d", 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"e"}, keys)
+		assert.Empty(t, next)
+	})
+	t.Run("full page that consumes the remainder exhausts", func(t *testing.T) {
+		keys, next, err := s.KeysPage("c", 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"d", "e"}, keys)
+		assert.Empty(t, next)
+	})
+	t.Run("stale cursor seeks to next greater", func(t *testing.T) {
+		keys, next, err := s.KeysPage("bb", 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"c", "d", "e"}, keys)
+		assert.Empty(t, next)
+	})
+	t.Run("cursor past end yields non-nil empty, exhausted", func(t *testing.T) {
+		keys, next, err := s.KeysPage("z", 10)
+		require.NoError(t, err)
+		assert.NotNil(t, keys)
+		assert.Empty(t, keys)
+		assert.Empty(t, next)
+	})
+}
+
 func TestRetentionIndex_ConcurrentReadersWriters(t *testing.T) {
 	s := newTestRetentionStore(t)
 	for i := 0; i < 50; i++ {
