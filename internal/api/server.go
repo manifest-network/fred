@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/cors"
 
@@ -503,9 +502,9 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start)
 		statusStr := strconv.Itoa(wrapped.statusCode)
 
-		// Normalize path for metrics to avoid high cardinality
-		// Replace UUIDs with placeholder
-		path := normalizePath(r.URL.Path)
+		// Use the matched route template (bounded cardinality) for the metric
+		// path label; the raw URL path still goes to the structured log below.
+		path := metricPath(r)
 
 		// Record metrics
 		metrics.APIRequestDuration.WithLabelValues(r.Method, path, statusStr).Observe(duration.Seconds())
@@ -521,16 +520,21 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// normalizePath replaces dynamic path segments (UUIDs) with placeholders
-// to prevent high cardinality in metrics labels.
-func normalizePath(path string) string {
-	segments := strings.Split(path, "/")
-	for i, segment := range segments {
-		if _, err := uuid.Parse(segment); err == nil {
-			segments[i] = "{uuid}"
-		}
+// metricPath returns a bounded-cardinality label for the request: the matched
+// ServeMux route template with its leading method/host stripped (e.g.
+// "/v1/leases/{lease_uuid}/status"), or "unmatched" for a request that matched
+// no route (e.g. an unauthenticated 404 path scan). Labeling metrics with the
+// template rather than r.URL.Path bounds the {path} label to the finite set of
+// registered routes + 1, closing an unauthenticated cardinality-DoS vector. (F28)
+func metricPath(r *http.Request) string {
+	if r.Pattern == "" {
+		return "unmatched"
 	}
-	return strings.Join(segments, "/")
+	// Pattern is "[METHOD ][HOST]/path"; the path starts at the first '/'.
+	if i := strings.IndexByte(r.Pattern, '/'); i >= 0 {
+		return r.Pattern[i:]
+	}
+	return r.Pattern
 }
 
 // responseWriter wraps http.ResponseWriter to capture the status code.

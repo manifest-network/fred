@@ -33,6 +33,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- fred-api: the request metric `path` label is now the matched route template
+  (e.g. `/v1/leases/{lease_uuid}/status`) rather than the raw URL path, with an
+  `unmatched` bucket for unrouted requests. Previously an unauthenticated 404
+  path scan minted a new Prometheus series per path (cardinality DoS); the label
+  is now bounded to the finite registered-route set. (ENG-448 / F28)
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
