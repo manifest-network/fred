@@ -34,6 +34,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   backend. Page size is configurable via `RetentionsPageLimit` (default 1000).
   (ENG-451)
 
+- docker-backend: the daemon now **fails fast at startup** when it lacks
+  `CAP_SYS_ADMIN` on a backend that requires it to set quotas (xfs, btrfs),
+  instead of rejecting every stateful provision at runtime with an opaque
+  `xfs_quota: cannot set limits: Operation not permitted`. The privileged
+  quota-set (`quotactl`) needs `CAP_SYS_ADMIN`, but the read-only `report` probe
+  in `Validate()` did not — so an under-privileged daemon silently failed to
+  enforce per-volume `disk_mb` caps (invisible until the ENG-449 mountpoint fix
+  made the code actually reach the privileged call). zfs is exempt (it supports
+  `zfs allow` delegation); the noop backend (no stateful SKUs) is unaffected.
+  Grant it via `AmbientCapabilities=CAP_SYS_ADMIN` on the docker-backend systemd
+  unit (see DEPLOYMENT.md). (ENG-454)
+- docker-backend: added a startup **quota backfill** — existing volumes (active
+  leases and active retained volumes) have their project quota re-applied
+  (re-tag + limit) via the new `EnsureQuota` primitive, so leases provisioned
+  before the daemon held `CAP_SYS_ADMIN` get their `disk_mb` enforced without a
+  re-provision or data move. Best-effort and idempotent; it never creates a
+  volume (a concurrent deprovision cannot be resurrected). New metric
+  `volume_quota_backfill_total{outcome}`. (ENG-454)
 - docker-backend: `/health` now probes the persistence stores (callback,
   diagnostics, release, retention bbolt) in addition to pinging the Docker
   daemon. Previously a locked/corrupt/read-only store left the backend reporting

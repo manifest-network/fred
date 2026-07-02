@@ -182,6 +182,18 @@ var (
 		Help:      "Total number of restore re-deploy worker attempts by outcome",
 	}, []string{"outcome"})
 
+	// volumeQuotaBackfillTotal counts per-volume quota re-application attempts by
+	// the startup reconcile (reconcileVolumeQuotas), which re-tags + re-limits
+	// existing volumes so leases provisioned before the daemon held CAP_SYS_ADMIN
+	// get their disk_mb enforced without a re-provision. outcome ∈ {applied,failed}.
+	// (ENG-454)
+	volumeQuotaBackfillTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_quota_backfill_total",
+		Help:      "Startup quota-backfill per-volume re-application attempts by outcome",
+	}, []string{"outcome"})
+
 	// restoreDemoteRefusedTotal counts restores refused by the demote
 	// fit-gate (checkDemoteFit) because the retained data does not fit the
 	// requested smaller tier, by backend and reason. Fixed-cardinality
@@ -496,6 +508,11 @@ var reindexTriggers = []string{"open", "manual"}
 // first restore completes (ENG-408). Values mirror provisionsTotal.
 var restoreOutcomes = []string{"success", "failure"}
 
+// quotaBackfillOutcomes is the closed outcome set for volumeQuotaBackfillTotal,
+// pre-initialized to 0 so a backfill failure-ratio query returns 0, not no-data,
+// before the first startup reconcile (ENG-454).
+var quotaBackfillOutcomes = []string{"applied", "failed"}
+
 func init() {
 	// Pre-init both reindex-trigger series to 0, mirroring the orphan-skip pre-init.
 	for _, tr := range reindexTriggers {
@@ -505,6 +522,10 @@ func init() {
 	// success rate reads 0, not no-data, before the first restore.
 	for _, oc := range restoreOutcomes {
 		restoresTotal.WithLabelValues(oc).Add(0)
+	}
+	// Pre-init the quota-backfill outcomes to 0 (ENG-454).
+	for _, oc := range quotaBackfillOutcomes {
+		volumeQuotaBackfillTotal.WithLabelValues(oc).Add(0)
 	}
 }
 

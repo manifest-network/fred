@@ -101,6 +101,25 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	return mountpoint, true, nil
 }
 
+// EnsureQuota re-applies refquota (and clears any legacy quota=) to an existing
+// dataset. No-op if the dataset is absent (never creates). ZFS quota is inherent
+// to the dataset, so there is no separate "tag" step. See ENG-454.
+func (z *zfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+	dataset := z.parentDataset + "/" + id
+	exists, err := z.datasetExists(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	quota := fmt.Sprintf("%dM", sizeMB)
+	if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, "quota=none", dataset).CombinedOutput(); err != nil {
+		return fmt.Errorf("zfs set refquota on %s: %w: %s", dataset, err, out)
+	}
+	return nil
+}
+
 func (z *zfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	dataset := z.parentDataset + "/" + id
 
@@ -227,5 +246,10 @@ func (z *zfsVolumeManager) Validate() error {
 	}
 	z.parentDataset = parent
 
+	// NOTE: deliberately NO CAP_SYS_ADMIN check here (unlike xfs/btrfs, see
+	// requireCapSysAdmin). ZFS create/set can be delegated to a non-root user via
+	// `zfs allow`, so the daemon may legitimately set quotas without the
+	// capability. A cap check would false-positive on a properly-delegated host.
+	// zfs privilege failures surface as a create/set error at provision time.
 	return nil
 }

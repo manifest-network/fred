@@ -20,6 +20,14 @@ type volumeManager interface {
 	// created (vs reused), and any error. sizeMB is the quota in megabytes.
 	Create(ctx context.Context, id string, sizeMB int64) (hostPath string, created bool, err error)
 
+	// EnsureQuota re-applies the quota (for xfs: project-tag + bhard limit) to an
+	// EXISTING volume, so a volume created before the daemon could set quotas
+	// (ENG-454) gets its disk_mb cap enforced without a re-provision or data
+	// move. Unlike Create it NEVER creates: if the volume is absent it is a no-op
+	// (returns nil), so a concurrently-deprovisioning volume cannot be
+	// resurrected. Idempotent. Used by the startup backfill (reconcileVolumeQuotas).
+	EnsureQuota(ctx context.Context, id string, sizeMB int64) error
+
 	// Destroy removes the directory and quota. Idempotent.
 	Destroy(ctx context.Context, id string) error
 
@@ -75,6 +83,12 @@ func (n *noopVolumeManager) Create(_ context.Context, _ string, _ int64) (string
 }
 
 func (n *noopVolumeManager) Destroy(_ context.Context, _ string) error {
+	return nil
+}
+
+// EnsureQuota on the noop manager is a no-op: it manages no quota-enforced
+// volumes, so there is nothing to re-apply.
+func (n *noopVolumeManager) EnsureQuota(_ context.Context, _ string, _ int64) error {
 	return nil
 }
 
