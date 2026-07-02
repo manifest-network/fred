@@ -9,22 +9,36 @@ import (
 )
 
 // daemonCanSetQuotas reports whether an exec'd quota tool (xfs_quota / btrfs /
-// zfs) launched by this daemon will run with CAP_SYS_ADMIN. That holds iff the
-// daemon runs as root (euid 0) OR carries CAP_SYS_ADMIN in its AMBIENT set.
+// zfs) launched by this daemon will run with CAP_SYS_ADMIN.
 //
-// It deliberately does NOT test the effective set. The privileged work is done
-// by exec'd children, and across execve a child with no file capabilities gains
-// a capability only via the parent's ambient set (or the root-euid rule) — never
-// via the parent's effective set. So an effective-only grant (`setcap
-// cap_sys_admin+ep` on the daemon binary, which clears the ambient set) would
-// pass an effective-set check yet leave the exec'd tools unprivileged, silently
-// re-introducing the exact unenforced-quota bug this guard exists to prevent.
-// Pure Go / CGO-free. See ENG-454.
+// An exec'd child gets the capability only if it lands in the child's permitted
+// set. Across execve, for a child with no file capabilities:
+//   - a ROOT (euid 0) parent's child gets permitted = (all caps) & BOUNDING set,
+//     so the child has CAP_SYS_ADMIN iff it is in the parent's bounding set — a
+//     hardened root unit whose CapabilityBoundingSet omits it would still spawn
+//     unprivileged quota tools;
+//   - a NON-ROOT parent's child gets permitted = the parent's AMBIENT set.
+//
+// So: root needs the cap in its bounding set; non-root needs it in its ambient
+// set. Testing the EFFECTIVE set would be wrong — it does not propagate to such a
+// child, so an effective-only grant (`setcap cap_sys_admin+ep` on the binary,
+// which clears ambient) would false-pass. Pure Go / CGO-free. See ENG-454.
 func daemonCanSetQuotas() (bool, error) {
 	if unix.Geteuid() == 0 {
-		return true, nil
+		return boundingHasCap(unix.CAP_SYS_ADMIN)
 	}
 	return ambientHasCap(unix.CAP_SYS_ADMIN)
+}
+
+// boundingHasCap reports whether `capability` is in the calling thread's
+// capability bounding set, via prctl(PR_CAPBSET_READ, cap).
+func boundingHasCap(capability uintptr) (bool, error) {
+	r, _, errno := unix.Syscall6(unix.SYS_PRCTL,
+		uintptr(unix.PR_CAPBSET_READ), capability, 0, 0, 0, 0)
+	if errno != 0 {
+		return false, fmt.Errorf("prctl(PR_CAPBSET_READ, %d): %w", capability, errno)
+	}
+	return r == 1, nil
 }
 
 // ambientHasCap reports whether `capability` is in the calling thread's ambient
