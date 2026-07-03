@@ -361,13 +361,14 @@ func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	// the removal succeeds.
 	projID, hasProjID := x.resolveProjectID(id)
 
-	x.removeProjectID(id)
-
 	if err := os.RemoveAll(dirPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		// The volume is still on disk. Leave its quota limit intact (still enforced)
-		// and return the error so the caller retries — a later Destroy re-resolves
-		// the projID from the still-present marker and clears it once removal
-		// succeeds. (Clearing before removal would leave a surviving volume uncapped.)
+		// The volume is still (at least partly) on disk. Leave the on-disk quota
+		// limit intact (still enforced) AND keep the in-memory projID mapping (see
+		// removeProjectID below), then return the error so the caller retries — a
+		// later Destroy re-resolves the projID (from the marker if it survives, else
+		// the still-present map entry) and finishes removal + clear. (Clearing before
+		// removal would leave a surviving volume uncapped; freeing the map entry here
+		// would let the projID be reallocated while these inodes are still tagged.)
 		return fmt.Errorf("remove directory %s: %w", dirPath, err)
 	}
 
@@ -399,6 +400,12 @@ func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 				"path", dirPath, "project_id", projID, "error", err, "output", string(out))
 		}
 	}
+
+	// Drop the in-memory projID mapping only now, once the on-disk volume is gone.
+	// Keeping it until here means a failed/partial removal above stays retryable
+	// (the map is the resolve fallback when the marker was already unlinked) and the
+	// projID is never reallocated to a new volume while its inodes still exist.
+	x.removeProjectID(id)
 
 	x.logger.Debug("destroyed xfs quota directory", "path", dirPath)
 	return nil

@@ -286,10 +286,15 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	mgr := newXfsManagerForTest(dataPath)
 
 	const id = "fred-vol-app-0"
+	const projID = uint32(4242)
 	dir := filepath.Join(dataPath, id)
 	require.NoError(t, os.MkdirAll(dir, 0700))
-	require.NoError(t, writeProjectIDFile(dir, 4242))
+	require.NoError(t, writeProjectIDFile(dir, projID))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), []byte("x"), 0600))
+	// Track the projID in-memory too, so we can assert the mapping survives a failed
+	// removal (a retry must still resolve it; the projID must not be reallocated).
+	mgr.activeIDs[projID] = id
+	mgr.volumeToID[id] = projID
 	// Make the volume dir non-writable so its contents cannot be unlinked -> RemoveAll fails.
 	require.NoError(t, os.Chmod(dir, 0500))
 	t.Cleanup(func() { _ = os.Chmod(dir, 0700) }) // let t.TempDir cleanup remove the tree
@@ -302,4 +307,14 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	assert.DirExists(t, dir, "the volume must remain on disk when removal fails")
 	assert.Equal(t, before, testutil.ToFloat64(volumeQuotaClearFailedTotal),
 		"the quota limit must be left intact (clear not attempted) while the volume survives")
+
+	// The in-memory mapping must survive the failed removal: a retry must still
+	// resolve the projID, and it must not be reallocated while the inodes exist.
+	mgr.mu.Lock()
+	mappedID, stillMapped := mgr.volumeToID[id]
+	_, stillReserved := mgr.activeIDs[projID]
+	mgr.mu.Unlock()
+	assert.True(t, stillMapped, "the volumeToID entry must survive a failed removal (retry-resolvable)")
+	assert.Equal(t, projID, mappedID)
+	assert.True(t, stillReserved, "the projID must stay reserved in activeIDs (no premature reallocation)")
 }
