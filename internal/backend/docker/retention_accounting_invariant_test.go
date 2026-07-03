@@ -3,6 +3,9 @@ package docker
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,6 +14,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // ENG-456: the cached admission projection (pool.retainedDisk, read via
@@ -73,13 +78,17 @@ func TestRetentionAccountingInvariant_TeethDetectsSkippedRefresh(t *testing.T) {
 	require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
 }
 
-// TestRetentionAccountingInvariant_HoldsAfterTransition drives each real,
-// self-refreshing retention transition entry point and asserts the invariant
-// holds afterward. Each case leaves a NON-ZERO retained footprint so the
-// assertion is non-trivial (not a vacuous 0 == 0). Methods that deliberately
-// delegate the refresh to their caller (retryReapingRecords,
-// reconcileOrphanedRetentions) are intentionally NOT asserted in isolation —
-// they are exercised via runRetentionSweep, which owns the trailing refresh.
+// TestRetentionAccountingInvariant_HoldsAfterTransition drives the
+// unit-drivable self-refreshing retention transition entry points and asserts
+// the invariant holds afterward. Each case leaves a NON-ZERO retained footprint
+// so the assertion is non-trivial (not a vacuous 0 == 0). The close path
+// (Deprovision with RetainOnClose=true) is the primary refresh site but needs
+// the httptest/callback wiring the table intentionally avoids, so it is a
+// standalone case: TestRetentionAccountingInvariant_AfterDeprovisionRetainClose.
+// Methods that deliberately delegate the refresh to their caller
+// (retryReapingRecords, reconcileOrphanedRetentions) are intentionally NOT
+// asserted in isolation — they are exercised via runRetentionSweep, which owns
+// the trailing refresh.
 func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 	// A fake volume backend whose Destroy/Rename/List all succeed, so reap/evict
 	// fully reap (delete) their records and restore rollbacks re-quarantine.
@@ -220,4 +229,75 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				"case must leave a non-trivial retained footprint (not a vacuous 0 == 0 check)")
 		})
 	}
+}
+
+// TestRetentionAccountingInvariant_AfterDeprovisionRetainClose drives the real
+// close path — Deprovision with RetainOnClose=true — end to end and asserts the
+// retained-disk accounting invariant holds after the live→retained hand-off.
+// Close is the primary refresh site (deprovision.go:166,597; the first entry in
+// refreshRetentionAccounting's "close, reap, evict" doc list) and needs the full
+// httptest/callback wiring the table above avoids, so it is a standalone case.
+func TestRetentionAccountingInvariant_AfterDeprovisionRetainClose(t *testing.T) {
+	callbackDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case callbackDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "retention.db"),
+	})
+	require.NoError(t, err)
+	defer rs.Close()
+
+	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+	canonical0 := canonicalVolumeName("lease-close", "web", 0)
+	canonical1 := canonicalVolumeName("lease-close", "web", 1)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"lease-close": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "lease-close", Tenant: "tenant-a", ProviderUUID: "prov-1",
+			Status:        backend.ProvisionStatusReady,
+			ContainerIDs:  []string{"c1"},
+			CallbackURL:   server.URL,
+			Items:         items,
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
+		}},
+	})
+
+	withMicroSKU(b, 512) // align the pool resolver (defaultTestSKUProfiles: 512) and computeRetainedDiskMB
+	b.retentionStore = rs
+	b.cfg.RetainOnClose = true
+	b.httpClient = server.Client()
+	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	rebuildCallbackSender(b)
+
+	require.NoError(t, b.pool.TryAllocate("lease-close-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("lease-close-web-1", "docker-micro", "tenant-a"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre: live F=1024 MB")
+
+	b.volumes = &mockVolumeManager{
+		ListFn:         func() ([]string, error) { return []string{canonical0, canonical1}, nil },
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	require.NoError(t, b.Deprovision(context.Background(), "lease-close"))
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deprovisioned callback")
+	}
+
+	// After a successful retain-close hand-off: live released, F counted as
+	// retained, and the invariant holds (cache == recompute-from-store).
+	s := b.pool.Stats()
+	assert.Equal(t, int64(0), s.AllocatedDiskMB, "live released after retain close")
+	assert.Equal(t, int64(1024), s.RetainedDiskMB, "F counted as retained after close")
+	assertRetentionAccountingConsistent(t, b, "invariant must hold after Deprovision retain-close")
 }
