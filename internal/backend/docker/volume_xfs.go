@@ -380,7 +380,7 @@ func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	// the whole table — so provisioning latency degrades cumulatively as leases
 	// churn (ENG-459).
 	if hasProjID {
-		// Detach from the caller's ctx: a deprovision that was cancelled or whose
+		// Detach from the caller's ctx: a deprovision that was canceled or whose
 		// deadline elapsed must not skip this cleanup (mirrors the provision-failure
 		// teardown, which uses a fresh context). Skipping it would leave the entry
 		// leaked with the directory already gone — unrecoverable on retry.
