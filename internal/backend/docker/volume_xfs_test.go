@@ -203,6 +203,41 @@ func TestResolveProjectID_NotFoundWhenNeitherKnows(t *testing.T) {
 	assert.False(t, ok, "an already-cleared / never-created volume resolves to no projID")
 }
 
+// TestResolveProjectID_RejectsZeroMarker guards project ID 0 (XFS's reserved
+// default project): a corrupt/hostile marker reading "0" must NOT resolve, so
+// Destroy can never reset the default project's limits.
+func TestResolveProjectID_RejectsZeroMarker(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 0))
+
+	_, ok := mgr.resolveProjectID(id)
+	assert.False(t, ok, "project ID 0 (reserved default project) must never resolve")
+}
+
+// TestResolveProjectID_SkipsOnUnreadableMarker verifies that a marker that EXISTS
+// but is unreadable/corrupt (not ErrNotExist) makes resolveProjectID skip rather
+// than fall back to the in-memory map — the marker is authoritative, so guessing a
+// possibly-wrong project when it is present-but-corrupt could clear a foreign one.
+func TestResolveProjectID_SkipsOnUnreadableMarker(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	// A present-but-corrupt marker (unparseable content); the map even knows a projID.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, projectIDFile), []byte("not-a-number"), 0600))
+	mgr.volumeToID[id] = 555
+
+	_, ok := mgr.resolveProjectID(id)
+	assert.False(t, ok, "a present-but-corrupt marker must skip the clear, not fall back to the map")
+}
+
 // TestDestroy_QuotaClearFailure_StillRemovesDirAndCounts pins the ENG-459
 // best-effort contract on the failure branch (per fred's "test the error branch"
 // discipline): if the xfs_quota clear fails, Destroy must still remove the
@@ -233,4 +268,38 @@ func TestDestroy_QuotaClearFailure_StillRemovesDirAndCounts(t *testing.T) {
 	assert.NoDirExists(t, dir, "the directory must still be removed despite the clear failure")
 	assert.Equal(t, before+1, testutil.ToFloat64(volumeQuotaClearFailedTotal),
 		"a clear failure must be recorded on the leak counter")
+}
+
+// TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError pins the ordering
+// invariant: the quota limit is cleared only AFTER the directory is successfully
+// removed. If os.RemoveAll fails, Destroy must return an error (the caller reads
+// that as "bytes still on disk" and retries) and must NOT clear the limit — the
+// surviving volume stays enforced. Proven by forcing RemoveAll to fail (a
+// non-writable volume dir whose file cannot be unlinked) while an empty PATH would
+// make any attempted clear fail-and-count: the counter staying flat proves the
+// clear was never reached.
+func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions, so os.RemoveAll would not fail")
+	}
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 4242))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), []byte("x"), 0600))
+	// Make the volume dir non-writable so its contents cannot be unlinked -> RemoveAll fails.
+	require.NoError(t, os.Chmod(dir, 0500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) }) // let t.TempDir cleanup remove the tree
+
+	t.Setenv("PATH", t.TempDir()) // any attempted clear would fail (xfs_quota not found) and bump the counter
+	before := testutil.ToFloat64(volumeQuotaClearFailedTotal)
+
+	err := mgr.Destroy(context.Background(), id)
+	require.Error(t, err, "a RemoveAll failure must surface (bytes still on disk -> caller retries)")
+	assert.DirExists(t, dir, "the volume must remain on disk when removal fails")
+	assert.Equal(t, before, testutil.ToFloat64(volumeQuotaClearFailedTotal),
+		"the quota limit must be left intact (clear not attempted) while the volume survives")
 }
