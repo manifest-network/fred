@@ -66,10 +66,11 @@ func TestRetentionAccountingInvariant_TeethDetectsSkippedRefresh(t *testing.T) {
 	require.Equal(t, int64(1024), activeMB+reapingMB, "store reflects the new active record")
 	require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "cache is stale — refresh was skipped")
 
-	// The equality the invariant helper asserts (assert.Equal → ObjectsAreEqual)
-	// must report drift here. If it did NOT, the helper would be a tautology.
-	require.False(t,
-		assert.ObjectsAreEqual(activeMB+reapingMB, b.pool.Stats().RetainedDiskMB),
+	// The two values must differ here — require.NotEqual is the exact public
+	// inverse of the assert.Equal the invariant helper uses, so this proves a
+	// skipped-refresh drift is detectable. Without it, the positive cases pass
+	// against already-correct code and prove nothing.
+	require.NotEqual(t, activeMB+reapingMB, b.pool.Stats().RetainedDiskMB,
 		"invariant check must detect a skipped-refresh drift (else it has no teeth)")
 
 	// After the refresh, the invariant is restored.
