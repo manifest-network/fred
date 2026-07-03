@@ -12,6 +12,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   refused (HTTP 422) when the retained volume's measured data does not fit the
   new tier's disk cap. New metric `restore_demote_refused_total{backend,reason}`.
   (ENG-438)
+- docker-backend: added a regression guard for the retained-disk admission
+  accounting invariant — the cached pool projection (`SetRetainedDisk`) must
+  equal the value recomputed from the retention store (active + reaping) after
+  every self-refreshing retention transition (close, reap, evict, sweep,
+  reconcile-restoring, restore rollback, recover). A future transition that
+  mutates the retention store but skips `refreshRetentionAccounting` — drifting
+  the projection stale-low → over-admit → tenant ENOSPC — now fails a test.
+  (ENG-456)
 
 ### Changed
 
