@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -988,6 +989,78 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 			strings.Contains(err.Error(), "disk quota exceeded") ||
 			strings.Contains(err.Error(), "no space left"),
 		"expected a quota/space error, got: %v", err)
+}
+
+// xfsReportListsProject reports whether projID currently appears in
+// `xfs_quota report -p` for mount — i.e. its dquot still carries a nonzero limit or
+// usage (a modern GETNEXTQUOTA kernel skips fully-uninitialized dquots). This is the
+// precise per-project signal ENG-459 asserts on, robust to any other (baseline or
+// foreign) entries in the filesystem-global quota table. `-N` suppresses headers.
+func xfsReportListsProject(t *testing.T, mount string, projID uint32) bool {
+	t.Helper()
+	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -N", mount)...).CombinedOutput()
+	require.NoError(t, err, "xfs_quota report -p: %s", out)
+	want := strconv.FormatUint(uint64(projID), 10)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 1 && strings.TrimPrefix(fields[0], "#") == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestIntegration_XFS_Destroy_ClearsQuotaEntry is the ENG-459 regression. Since
+// ENG-449/454 made per-volume project quotas actually apply, Create sets a projid +
+// bhard limit on every volume; the pre-fix Destroy removed the directory but left
+// the on-disk limit set, so every closed lease leaked one project-quota entry and
+// each entry taxed every subsequent xfs_quota scan (report -p in Usage/Validate),
+// degrading provisioning latency cumulatively. This asserts the acceptance
+// criterion per project: each created volume's projid appears in report -p, and
+// after Destroy it is gone. Checking specific projids (read from each volume's
+// marker) rather than a global row count keeps the assertion robust to any other
+// entries in the filesystem-global quota table, and empirically pins the "bhard=0 +
+// dir removed hides the entry" kernel behavior on the CI kernel — the one claim the
+// mechanism research could confirm by semantics but not by primary documentation.
+func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	dataPath := filepath.Join(mount, "volumes") // subdir of the mount (production layout)
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+
+	const n = 8
+	const capMiB = int64(20)
+	names := make([]string, n)
+	projIDs := make([]uint32, n)
+	for i := range n {
+		name := fmt.Sprintf("fred-int-eng459-app-%d", i)
+		names[i] = name
+		_, created, err := mgr.Create(ctx, name, capMiB)
+		require.NoError(t, err)
+		require.True(t, created)
+
+		projID, err := readProjectIDFile(filepath.Join(dataPath, name))
+		require.NoError(t, err)
+		projIDs[i] = projID
+		require.True(t, xfsReportListsProject(t, mount, projID),
+			"a freshly-created volume's project (%d) must appear in report -p", projID)
+	}
+
+	for _, name := range names {
+		require.NoError(t, mgr.Destroy(ctx, name))
+	}
+
+	// The fix: Destroy zeroes each project's limit after removing its dir, so every
+	// dquot returns to uninitialized and GETNEXTQUOTA stops reporting it. Pre-fix the
+	// limit was left set, so each projid persisted — the leak.
+	for i, projID := range projIDs {
+		assert.False(t, xfsReportListsProject(t, mount, projID),
+			"ENG-459: after Destroy, volume %s's project-quota entry (%d) must be gone", names[i], projID)
+	}
 }
 
 // TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin is the ENG-454 regression.

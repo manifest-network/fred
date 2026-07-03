@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -140,4 +141,180 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 
 	report := xfsQuotaArgs("report -p -b -N", mount)
 	assert.Equal(t, mount, report[len(report)-1], "report: trailing fs arg must be the mount point")
+}
+
+// newXfsManagerForTest builds a bare xfsVolumeManager over dataPath with empty
+// maps — enough to exercise the marker/map logic (resolveProjectID) and the
+// Destroy teardown path without any live XFS mount or xfs_quota tooling.
+func newXfsManagerForTest(dataPath string) *xfsVolumeManager {
+	return &xfsVolumeManager{
+		dataPath:   dataPath,
+		mountPoint: dataPath,
+		logger:     slog.Default(),
+		activeIDs:  make(map[uint32]string),
+		volumeToID: make(map[string]uint32),
+	}
+}
+
+// TestResolveProjectID_PrefersMarkerFile pins the ENG-459 resolution rule: the
+// on-disk .fred-project-id marker (the authoritative record of the projID that was
+// actually tagged + limited, and the only source that survives a restart) wins over
+// the in-memory map. Resolving via the marker — never by recomputing crc32(id) — is
+// required because assignProjectID's collision-probe can make the derived candidate
+// differ from the assigned id, so a recompute-based clear could zero the wrong project.
+func TestResolveProjectID_PrefersMarkerFile(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 4242))
+	mgr.volumeToID[id] = 9999 // map disagrees; the on-disk marker must win
+
+	got, ok := mgr.resolveProjectID(id)
+	require.True(t, ok)
+	assert.Equal(t, uint32(4242), got, "the on-disk marker is authoritative over the in-memory map")
+}
+
+// TestResolveProjectID_FallsBackToMapWhenNoMarker covers a volume whose directory
+// (and marker) is already gone but which the live process still tracks in-memory —
+// the projID is still resolvable so its quota can be cleared.
+func TestResolveProjectID_FallsBackToMapWhenNoMarker(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0" // no directory / marker on disk
+	mgr.volumeToID[id] = 777
+
+	got, ok := mgr.resolveProjectID(id)
+	require.True(t, ok)
+	assert.Equal(t, uint32(777), got)
+}
+
+// TestResolveProjectID_NotFoundWhenNeitherKnows covers the idempotent re-Destroy /
+// never-created case: neither the marker nor the map knows the id, so there is no
+// projID to clear (the caller skips the clear).
+func TestResolveProjectID_NotFoundWhenNeitherKnows(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	_, ok := mgr.resolveProjectID("fred-unknown-app-0")
+	assert.False(t, ok, "an already-cleared / never-created volume resolves to no projID")
+}
+
+// TestResolveProjectID_RejectsZeroMarker guards project ID 0 (XFS's reserved
+// default project): a corrupt/hostile marker reading "0" must NOT resolve, so
+// Destroy can never reset the default project's limits.
+func TestResolveProjectID_RejectsZeroMarker(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 0))
+
+	_, ok := mgr.resolveProjectID(id)
+	assert.False(t, ok, "project ID 0 (reserved default project) must never resolve")
+}
+
+// TestResolveProjectID_SkipsOnUnreadableMarker verifies that a marker that EXISTS
+// but is unreadable/corrupt (not ErrNotExist) makes resolveProjectID skip rather
+// than fall back to the in-memory map — the marker is authoritative, so guessing a
+// possibly-wrong project when it is present-but-corrupt could clear a foreign one.
+func TestResolveProjectID_SkipsOnUnreadableMarker(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	// A present-but-corrupt marker (unparseable content); the map even knows a projID.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, projectIDFile), []byte("not-a-number"), 0600))
+	mgr.volumeToID[id] = 555
+
+	_, ok := mgr.resolveProjectID(id)
+	assert.False(t, ok, "a present-but-corrupt marker must skip the clear, not fall back to the map")
+}
+
+// TestDestroy_QuotaClearFailure_StillRemovesDirAndCounts pins the ENG-459
+// best-effort contract on the failure branch (per fred's "test the error branch"
+// discipline): if the xfs_quota clear fails, Destroy must still remove the
+// directory, still return nil, and record the leak on the observable counter.
+// Returning an error would break the caller invariant (a Destroy error means
+// "bytes still on disk" → the lease is kept Failed and its footprint counted), and
+// a zero-byte quota-clear failure must not strand the lease. The clear is forced to
+// fail hermetically by pointing PATH at an empty dir so xfs_quota is not found —
+// exercising the exact err!=nil branch a real EPERM (missing CAP_SYS_ADMIN) hits,
+// with no root or live XFS mount required.
+func TestDestroy_QuotaClearFailure_StillRemovesDirAndCounts(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 4242))
+
+	// Force the clear's xfs_quota exec to fail (binary not found) — a stand-in for
+	// any real clear failure. t.Setenv forbids t.Parallel, which is fine here.
+	t.Setenv("PATH", t.TempDir())
+
+	before := testutil.ToFloat64(volumeQuotaClearFailedTotal)
+	err := mgr.Destroy(context.Background(), id)
+	require.NoError(t, err, "a quota-clear failure must not fail Destroy (would strand the lease)")
+
+	assert.NoDirExists(t, dir, "the directory must still be removed despite the clear failure")
+	assert.Equal(t, before+1, testutil.ToFloat64(volumeQuotaClearFailedTotal),
+		"a clear failure must be recorded on the leak counter")
+}
+
+// TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError pins the ordering
+// invariant: the quota limit is cleared only AFTER the directory is successfully
+// removed. If os.RemoveAll fails, Destroy must return an error (the caller reads
+// that as "bytes still on disk" and retries) and must NOT clear the limit — the
+// surviving volume stays enforced. Proven by forcing RemoveAll to fail (a
+// non-writable volume dir whose file cannot be unlinked) while an empty PATH would
+// make any attempted clear fail-and-count: the counter staying flat proves the
+// clear was never reached.
+func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions, so os.RemoveAll would not fail")
+	}
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+
+	const id = "fred-vol-app-0"
+	const projID = uint32(4242)
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, projID))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), []byte("x"), 0600))
+	// Track the projID in-memory too, so we can assert the mapping survives a failed
+	// removal (a retry must still resolve it; the projID must not be reallocated).
+	mgr.activeIDs[projID] = id
+	mgr.volumeToID[id] = projID
+	// Make the volume dir non-writable so its contents cannot be unlinked -> RemoveAll fails.
+	require.NoError(t, os.Chmod(dir, 0500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) }) // let t.TempDir cleanup remove the tree
+
+	t.Setenv("PATH", t.TempDir()) // any attempted clear would fail (xfs_quota not found) and bump the counter
+	before := testutil.ToFloat64(volumeQuotaClearFailedTotal)
+
+	err := mgr.Destroy(context.Background(), id)
+	require.Error(t, err, "a RemoveAll failure must surface (bytes still on disk -> caller retries)")
+	assert.DirExists(t, dir, "the volume must remain on disk when removal fails")
+	assert.Equal(t, before, testutil.ToFloat64(volumeQuotaClearFailedTotal),
+		"the quota limit must be left intact (clear not attempted) while the volume survives")
+
+	// The in-memory mapping must survive the failed removal: a retry must still
+	// resolve the projID, and it must not be reallocated while the inodes exist.
+	mgr.mu.Lock()
+	mappedID, stillMapped := mgr.volumeToID[id]
+	_, stillReserved := mgr.activeIDs[projID]
+	mgr.mu.Unlock()
+	assert.True(t, stillMapped, "the volumeToID entry must survive a failed removal (retry-resolvable)")
+	assert.Equal(t, projID, mappedID)
+	assert.True(t, stillReserved, "the projID must stay reserved in activeIDs (no premature reallocation)")
 }

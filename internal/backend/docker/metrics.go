@@ -194,6 +194,20 @@ var (
 		Help:      "Startup quota-backfill per-volume re-application attempts by outcome",
 	}, []string{"outcome"})
 
+	// volumeQuotaClearFailedTotal counts XFS project-quota clear failures during
+	// volume Destroy (ENG-459). Destroy resets a project's bhard limit to 0 so its
+	// quota-table entry drops out of xfs_quota's scans once the directory is gone;
+	// the clear is best-effort (it must not wedge teardown — a leaked limit entry
+	// holds no disk), so a failure is logged and counted here rather than propagated.
+	// The observable backstop, mirroring retentionLeakedTotal: a rising rate means
+	// the project-quota table is regrowing and needs operator cleanup.
+	volumeQuotaClearFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_quota_clear_failed_total",
+		Help:      "XFS project-quota clear failures on volume destroy (leaked table entry needs operator cleanup) — see ENG-459",
+	})
+
 	// restoreDemoteRefusedTotal counts restores refused by the demote
 	// fit-gate (checkDemoteFit) because the retained data does not fit the
 	// requested smaller tier, by backend and reason. Fixed-cardinality
