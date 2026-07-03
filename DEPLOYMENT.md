@@ -121,9 +121,10 @@ Each container gets a directory with an xfs project quota.
 > `xfs_quota: cannot set limits: Operation not permitted`. The backend now
 > **fails fast at startup** if it lacks the capability rather than running with
 > silently-unenforced per-volume disk caps. See the systemd section below for how
-> to grant it. Also prefer mounting the XFS filesystem **at** `volume_data_path`
-> (as above) rather than at a parent directory — `xfs_quota` requires a real
-> mount point.
+> to grant it. (`xfs_quota` requires a real mount point, but the backend resolves
+> the XFS mount that *contains* `volume_data_path` automatically — so
+> `volume_data_path` may be the mount itself, as above, or a subdirectory of it,
+> e.g. `/data/fred/volumes` under a `/data` mount.)
 
 #### zfs (best for snapshots/backups)
 
