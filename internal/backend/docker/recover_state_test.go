@@ -27,6 +27,7 @@ import (
 // about volumes. Tests that need to observe volume calls set the Fn fields.
 type mockVolumeManager struct {
 	CreateFn       func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
+	EnsureQuotaFn  func(ctx context.Context, id string, sizeMB int64) error
 	DestroyFn      func(ctx context.Context, id string) error
 	ListFn         func() ([]string, error)
 	ValidateFn     func() error
@@ -43,6 +44,13 @@ func (m *mockVolumeManager) Create(ctx context.Context, id string, sizeMB int64)
 		return m.CreateFn(ctx, id, sizeMB)
 	}
 	return m.defaultDir, true, nil
+}
+
+func (m *mockVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+	if m.EnsureQuotaFn != nil {
+		return m.EnsureQuotaFn(ctx, id, sizeMB)
+	}
+	return nil
 }
 
 func (m *mockVolumeManager) Destroy(ctx context.Context, id string) error {

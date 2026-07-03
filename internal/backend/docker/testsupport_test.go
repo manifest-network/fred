@@ -100,6 +100,8 @@ func (f *fakeVolumeBackend) Create(_ context.Context, id string, _ int64) (strin
 	return filepath.Join("/var/lib/fred/volumes", id), true, nil
 }
 
+func (f *fakeVolumeBackend) EnsureQuota(_ context.Context, _ string, _ int64) error { return nil }
+
 func (f *fakeVolumeBackend) Destroy(_ context.Context, id string) error {
 	f.destroyed = append(f.destroyed, id)
 	return nil

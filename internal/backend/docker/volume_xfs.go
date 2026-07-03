@@ -274,6 +274,40 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	return dirPath, true, nil
 }
 
+// EnsureQuota re-applies the project tag + bhard limit to an existing volume,
+// recovering the projID from its .fred-project-id marker. It re-tags the inode
+// (project -s) — which heals a volume left untagged by a pre-CAP_SYS_ADMIN
+// daemon (ENG-454) — then re-applies the limit. No-op if the directory is absent
+// (never creates), so a concurrent deprovision is never resurrected.
+func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+	dirPath := filepath.Join(x.dataPath, id)
+	if _, err := os.Stat(dirPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // vanished (e.g. concurrent deprovision): nothing to enforce
+		}
+		return fmt.Errorf("stat volume dir %s: %w", dirPath, err)
+	}
+	projID, err := readProjectIDFile(dirPath)
+	if err != nil {
+		return fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
+	}
+
+	x.mu.Lock()
+	x.trackProjectID(id, projID)
+	x.mu.Unlock()
+
+	tagCmd := xfsProjectSetupCmd(dirPath, projID)
+	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(tagCmd, x.mountPoint)...).CombinedOutput(); err != nil {
+		return fmt.Errorf("xfs_quota project re-tag for %s (id=%d): %w: %s", dirPath, projID, err, out)
+	}
+	limitCmd := xfsLimitCmd(projID, fmt.Sprintf("%dm", sizeMB))
+	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(limitCmd, x.mountPoint)...).CombinedOutput(); err != nil {
+		return fmt.Errorf("xfs_quota limit for %s (id=%d): %w: %s", dirPath, projID, err, out)
+	}
+	x.logger.Debug("re-applied xfs project quota", "path", dirPath, "project_id", projID, "quota_mb", sizeMB)
+	return nil
+}
+
 func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	dirPath := filepath.Join(x.dataPath, id)
 
@@ -395,6 +429,15 @@ func (x *xfsVolumeManager) Validate() error {
 	if err != nil {
 		return fmt.Errorf("xfs project quotas not available at %s (mount with pquota option): %w: %s",
 			x.mountPoint, err, out)
+	}
+
+	// Setting an XFS project quota (project -s / limit -p → quotactl
+	// Q_XSETQLIM) requires CAP_SYS_ADMIN. The report probe above is a READ and
+	// succeeds without it, so it cannot detect a missing capability — which is
+	// exactly how an under-privileged daemon silently failed to enforce quotas
+	// (ENG-454). Fail fast at startup rather than rejecting every provision.
+	if err := requireCapSysAdmin(x.Kind(), x.logger); err != nil {
+		return err
 	}
 
 	// Populate activeIDs from existing volume marker files.

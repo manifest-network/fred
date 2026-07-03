@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -70,6 +71,28 @@ func TestResolveMountpoint_Root(t *testing.T) {
 	got, err := resolveMountpoint("/")
 	require.NoError(t, err)
 	assert.Equal(t, "/", got)
+}
+
+// TestXfsEnsureQuota_MissingVolumeIsNoop verifies the non-resurrecting property:
+// EnsureQuota on a volume that does not exist on disk returns nil WITHOUT running
+// any xfs_quota command (so it needs no privilege and can't recreate a volume a
+// concurrent deprovision just removed). Runs unprivileged — the missing-path
+// branch returns before any exec.
+func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := newVolumeManager(dir, "xfs", slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-does-not-exist-app-0", 100),
+		"EnsureQuota on a missing volume must be a no-op")
+}
+
+// TestBtrfsEnsureQuota_MissingVolumeIsNoop is the btrfs analogue: EnsureQuota on
+// a subvolume that does not exist returns nil without running any btrfs command
+// (root-free — the missing-path branch returns before any exec).
+func TestBtrfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
+	mgr := &btrfsVolumeManager{dataPath: t.TempDir(), logger: slog.Default()}
+	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-does-not-exist-app-0", 100),
+		"btrfs EnsureQuota on a missing subvolume must be a no-op")
 }
 
 // TestNewVolumeManager_XFS_ResolvesMountpoint verifies that constructing the

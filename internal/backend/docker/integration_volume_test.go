@@ -24,6 +24,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -859,6 +860,31 @@ func writeIncompressibleMiB(t *testing.T, path string, mib int) {
 	_ = exec.Command("sync").Run()
 }
 
+// writeIncompressibleExpectFail writes mib MiB of incompressible data and asserts
+// the write is REJECTED (quota/space exceeded) — used to prove an enforced cap.
+func writeIncompressibleExpectFail(t *testing.T, path string, mib int) {
+	t.Helper()
+	out, err := exec.Command("dd", "if=/dev/urandom", "of="+path, "bs=1M", fmt.Sprintf("count=%d", mib)).CombinedOutput()
+	require.Error(t, err, "writing %d MiB should have been quota-rejected: %s", mib, out)
+}
+
+// backendForReconcileTest builds a Backend with one active stateful lease whose
+// single instance of service svc uses sku (DiskMB=diskMB), wired to mgr — the
+// minimal wiring reconcileVolumeQuotas needs to re-apply a real quota.
+func backendForReconcileTest(t *testing.T, mgr volumeManager, dataPath, lease, svc, sku string, diskMB int64) *Backend {
+	t.Helper()
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease,
+			Items:     []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: svc}},
+		}},
+	})
+	b.volumes = mgr
+	b.cfg.VolumeDataPath = dataPath
+	b.cfg.SKUProfiles[sku] = SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: diskMB}
+	return b
+}
+
 // TestIntegration_Usage_Btrfs verifies that btrfsVolumeManager.Usage returns
 // the subvolume's referenced bytes within a generous metadata-overhead bound.
 func TestIntegration_Usage_Btrfs(t *testing.T) {
@@ -962,6 +988,305 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 			strings.Contains(err.Error(), "disk quota exceeded") ||
 			strings.Contains(err.Error(), "no space left"),
 		"expected a quota/space error, got: %v", err)
+}
+
+// TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin is the ENG-454 regression.
+// It proves that SETTING an XFS project quota requires CAP_SYS_ADMIN, by running
+// the exact privileged xfs_quota command both as root and as a dropped-privilege
+// (non-root) subprocess. The pre-existing XFS integration tests all run as root
+// (mounting a loopback fs requires it), so they never exercised the daemon's
+// real, unprivileged capability set — which is why the missing capability (the
+// docker-backend runs User=fred with only CAP_CHOWN,CAP_DAC_OVERRIDE) stayed
+// invisible until ENG-449 unmasked it and it broke provisioning in prod.
+// runWithoutCapSysAdmin runs `sh -c cmdline` as root but with CAP_SYS_ADMIN
+// dropped (bounding+effective) via capsh. Unlike a setuid-to-nobody run — which
+// fails at FILE ACCESS before ever reaching the privileged syscall (and on which
+// xfs_quota misleadingly exits 0) — this keeps euid 0, so the mount is reachable
+// and the quota syscall is actually reached with the capability missing,
+// faithfully reproducing the daemon's failing condition. Skips if capsh
+// (libcap2-bin) is unavailable.
+func runWithoutCapSysAdmin(t *testing.T, cmdline string) ([]byte, error) {
+	t.Helper()
+	if _, err := exec.LookPath("capsh"); err != nil {
+		t.Skip("capsh (libcap2-bin) not available; cannot drop CAP_SYS_ADMIN")
+	}
+	return exec.Command("capsh", "--drop=cap_sys_admin", "--", "-c", cmdline).CombinedOutput()
+}
+
+func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
+	mount := setupXFSLoopback(t) // requires root
+	ctx := context.Background()
+
+	// Sanity: our own detector agrees the (root) test process can set quotas.
+	canSet, err := daemonCanSetQuotas()
+	require.NoError(t, err)
+	require.True(t, canSet, "test must run as root to exercise this")
+
+	// As root: setting the quota SUCCEEDS — proving the filesystem itself is fine
+	// and it is purely the capability that gates the operation.
+	rootOut, rootErr := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(xfsLimitCmd(987654321, "1m"), mount)...).CombinedOutput()
+	require.NoError(t, rootErr, "root should be able to set the quota: %s", rootOut)
+
+	// With CAP_SYS_ADMIN dropped (euid still 0, so the mount is reachable and
+	// quotactl(Q_XSETQLIM) is actually reached), the SAME command FAILS.
+	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("xfs_quota -x -c 'limit -p bhard=1m 987654321' %s", mount))
+	require.Error(t, dropErr,
+		"setting an XFS quota without CAP_SYS_ADMIN must fail: %s", dropOut)
+	if len(dropOut) > 0 {
+		assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
+			"expected an 'Operation not permitted' error, got: %s", dropOut)
+	}
+}
+
+// TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin is the btrfs analogue of
+// the ENG-454 regression: btrfs `qgroup limit` is a privileged ioctl requiring
+// CAP_SYS_ADMIN, and (unlike zfs) has no delegation alternative — so the daemon
+// must hold the capability. Proven by running it as root (succeeds) vs a
+// dropped-privilege subprocess (fails). Guards against the same "tests run as
+// root, prod runs unprivileged" fidelity gap on btrfs hosts.
+func TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
+	mount := setupBtrfsLoopback(t) // requires root; quota enabled
+	ctx := context.Background()
+
+	subvol := filepath.Join(mount, "fred-cap-probe-app-0")
+	out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", subvol).CombinedOutput()
+	require.NoError(t, err, "root subvolume create: %s", out)
+
+	// As root: setting the qgroup limit SUCCEEDS.
+	rootOut, rootErr := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", "10M", subvol).CombinedOutput()
+	require.NoError(t, rootErr, "root should set the qgroup limit: %s", rootOut)
+
+	// With CAP_SYS_ADMIN dropped (euid 0, so the qgroup ioctl is reached): FAILS.
+	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("btrfs qgroup limit 5M %s", subvol))
+	require.Error(t, dropErr,
+		"setting a btrfs qgroup limit without CAP_SYS_ADMIN must fail: %s", dropOut)
+	if len(dropOut) > 0 { // message shape is a bonus signal; require.Error is the guarantee
+		assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
+			"expected a permission error, got: %s", dropOut)
+	}
+}
+
+// TestIntegration_Zfs_QuotaSet_RequiresPrivilege documents that setting a zfs
+// refquota requires privilege for a plain (non-delegated) non-root process —
+// proven by root (succeeds) vs a dropped-privilege subprocess (fails). ZFS is
+// the deliberate exception to the startup CAP_SYS_ADMIN guard: `zfs allow` can
+// delegate create/quota to a non-root user WITHOUT the capability, which is why
+// requireCapSysAdmin is not called for zfs. This test pins the underlying
+// privilege requirement (absent delegation) so the exemption stays intentional.
+func TestIntegration_Zfs_QuotaSet_RequiresPrivilege(t *testing.T) {
+	_, pool := setupZFSPool(t) // requires root
+	ctx := context.Background()
+
+	dataset := pool + "/fred-cap-probe"
+	out, err := exec.CommandContext(ctx, "zfs", "create", dataset).CombinedOutput()
+	require.NoError(t, err, "root zfs create: %s", out)
+
+	// As root: setting refquota SUCCEEDS.
+	rootOut, rootErr := exec.CommandContext(ctx, "zfs", "set", "refquota=10M", dataset).CombinedOutput()
+	require.NoError(t, rootErr, "root should set refquota: %s", rootOut)
+
+	// As a dropped-privilege (nobody) child with no `zfs allow` delegation: FAILS.
+	dropped := exec.CommandContext(ctx, "zfs", "set", "refquota=5M", dataset)
+	dropped.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: 65534, Gid: 65534},
+	}
+	dropOut, dropErr := dropped.CombinedOutput()
+	require.Error(t, dropErr,
+		"a non-root process without zfs-allow delegation must NOT set refquota (got success: %s)", dropOut)
+	if len(dropOut) > 0 { // message shape is a bonus signal; require.Error is the guarantee
+		assert.Contains(t, strings.ToLower(string(dropOut)), "permission",
+			"expected a permission error, got: %s", dropOut)
+	}
+}
+
+// TestIntegration_XFS_Backfill_TagsUntaggedVolume proves the ENG-454 startup
+// backfill mechanism: EnsureQuota (what reconcileVolumeQuotas invokes) re-tags +
+// limits a volume that a pre-CAP_SYS_ADMIN daemon left untagged and unenforced —
+// restoring measurement + enforcement with no re-provision or data move.
+func TestIntegration_XFS_Backfill_TagsUntaggedVolume(t *testing.T) {
+	mount := setupXFSLoopback(t) // requires root
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+
+	const volName = "fred-int-backfill-app-0"
+	const capMiB = int64(20)
+
+	// Simulate a volume created by a pre-ENG-454 daemon: the directory and the
+	// .fred-project-id marker exist, but the inode was never project-tagged and
+	// no limit was set (the privileged xfs_quota calls silently no-op'd).
+	dir := filepath.Join(dataPath, volName)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 424242))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 10*1024*1024), 0600))
+
+	// Pre-backfill: untagged → Usage cannot find its projid in the quota report.
+	_, uerr := mgr.Usage(ctx, volName)
+	require.Error(t, uerr, "an untagged volume must not be measurable before backfill")
+
+	// Backfill via EnsureQuota (what reconcileVolumeQuotas invokes).
+	require.NoError(t, mgr.EnsureQuota(ctx, volName, capMiB))
+
+	// Post-backfill: measurable...
+	used, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err, "after backfill the volume must be measurable")
+	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "Usage under-reports: %d", used)
+
+	// ...and enforced: a write past the cap is EDQUOT'd.
+	werr := os.WriteFile(filepath.Join(dir, "big.bin"), make([]byte, 20*1024*1024), 0600)
+	require.Error(t, werr, "a write past the backfilled cap must be quota-enforced")
+	assert.True(t,
+		errors.Is(werr, syscall.EDQUOT) || errors.Is(werr, syscall.ENOSPC) ||
+			strings.Contains(werr.Error(), "disk quota exceeded") ||
+			strings.Contains(werr.Error(), "no space left"),
+		"expected a quota/space error, got: %v", werr)
+}
+
+// TestIntegration_XFS_ReconcileBackfill_EndToEnd exercises the FULL startup
+// backfill wired to a real xfs manager: an active lease whose on-disk volume was
+// left untagged by a pre-CAP_SYS_ADMIN daemon is healed by reconcileVolumeQuotas
+// — becoming measurable and enforced — with no re-provision. This composes the
+// enumeration (name derivation + existence gate + SKU sizing) with the real
+// EnsureQuota, catching wiring bugs the mock-based unit test cannot.
+func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
+	mount := setupXFSLoopback(t) // requires root
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	require.NoError(t, err)
+
+	const lease = "l-e2e-backfill"
+	volName := canonicalVolumeName(lease, "app", 0)
+	dir := filepath.Join(dataPath, volName)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 555001))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 10*1024*1024), 0600))
+
+	b := backendForReconcileTest(t, mgr, dataPath, lease, "app", "e2e-stateful", 20)
+
+	_, uerr := mgr.Usage(ctx, volName)
+	require.Error(t, uerr, "untagged volume must not be measurable before backfill")
+
+	b.reconcileVolumeQuotas(ctx)
+
+	used, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err, "reconcile backfill must make the volume measurable")
+	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "Usage under-reports: %d", used)
+
+	werr := os.WriteFile(filepath.Join(dir, "big.bin"), make([]byte, 20*1024*1024), 0600)
+	require.Error(t, werr, "a write past the backfilled cap must be quota-enforced")
+	assert.True(t,
+		errors.Is(werr, syscall.EDQUOT) || errors.Is(werr, syscall.ENOSPC) ||
+			strings.Contains(werr.Error(), "disk quota exceeded") ||
+			strings.Contains(werr.Error(), "no space left"),
+		"expected a quota/space error, got: %v", werr)
+}
+
+// TestIntegration_XFS_ReconcileBackfill_RetainedVolume covers the retained-volume
+// arm of the backfill end-to-end: a soft-deleted (fred-retained-) volume left
+// untagged by a pre-CAP_SYS_ADMIN daemon is healed by reconcileVolumeQuotas via
+// its active retention record — the population that dominated the prod backlog.
+func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
+	mount := setupXFSLoopback(t) // requires root
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	require.NoError(t, err)
+
+	const origLease = "l-ret"
+	retName := retainedName(canonicalVolumeName(origLease, "db", 0)) // fred-retained-l-ret-db-0
+	dir := filepath.Join(dataPath, retName)
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, writeProjectIDFile(dir, 556001))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 10*1024*1024), 0600))
+
+	b, rs := newBackendWithRetention(t)
+	b.volumes = mgr
+	b.cfg.VolumeDataPath = dataPath
+	b.cfg.SKUProfiles["ret-sku"] = SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 20}
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   origLease,
+		Tenant:              "t1",
+		ProviderUUID:        "p1",
+		Items:               []backend.LeaseItem{{SKU: "ret-sku", Quantity: 1, ServiceName: "db"}},
+		RetainedVolumeNames: []string{retName},
+		Status:              shared.RetentionStatusActive,
+		CreatedAt:           time.Now(),
+	}))
+
+	_, uerr := mgr.Usage(ctx, retName)
+	require.Error(t, uerr, "untagged retained volume must not be measurable before backfill")
+
+	b.reconcileVolumeQuotas(ctx)
+
+	used, err := mgr.Usage(ctx, retName)
+	require.NoError(t, err, "reconcile must backfill the retained volume")
+	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "Usage under-reports: %d", used)
+
+	werr := os.WriteFile(filepath.Join(dir, "big.bin"), make([]byte, 20*1024*1024), 0600)
+	require.Error(t, werr, "retained volume cap must be enforced after backfill")
+	assert.True(t,
+		errors.Is(werr, syscall.EDQUOT) || errors.Is(werr, syscall.ENOSPC) ||
+			strings.Contains(werr.Error(), "disk quota exceeded") ||
+			strings.Contains(werr.Error(), "no space left"),
+		"expected a quota/space error, got: %v", werr)
+}
+
+// TestIntegration_Btrfs_ReconcileBackfill_EndToEnd exercises the full startup
+// backfill wired to a real btrfs manager. btrfs has no "untagged" state (the
+// qgroup limit is applied at create), so this proves the reconcile RE-APPLIES
+// the current SKU cap: a volume created with a large cap is tightened by the
+// reconcile to the lease's smaller disk_mb, and a write past it is rejected.
+func TestIntegration_Btrfs_ReconcileBackfill_EndToEnd(t *testing.T) {
+	mount := setupBtrfsLoopback(t) // requires root
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+	ctx := context.Background()
+	mgr := &btrfsVolumeManager{dataPath: dataPath, logger: slog.Default()}
+
+	const lease = "l-btrfs-e2e"
+	volName := canonicalVolumeName(lease, "app", 0)
+	hostPath, _, err := mgr.Create(ctx, volName, 100) // large initial cap
+	require.NoError(t, err)
+	writeIncompressibleMiB(t, filepath.Join(hostPath, "seed.bin"), 5) // under both caps
+
+	b := backendForReconcileTest(t, mgr, dataPath, lease, "app", "btrfs-small", 20)
+	b.reconcileVolumeQuotas(ctx)
+
+	// The reconcile tightened the qgroup limit to 20 MiB → 30 MiB more is rejected.
+	writeIncompressibleExpectFail(t, filepath.Join(hostPath, "big.bin"), 30)
+}
+
+// TestIntegration_Zfs_ReconcileBackfill_EndToEnd is the zfs analogue: the
+// reconcile re-applies refquota to the lease's smaller disk_mb via the real
+// manager, and a write past it is rejected. (refquota cannot be lowered below
+// current usage, so the seed write stays under the smaller cap.)
+func TestIntegration_Zfs_ReconcileBackfill_EndToEnd(t *testing.T) {
+	mount, _ := setupZFSPool(t) // requires root
+	ctx := context.Background()
+	mgr, err := newVolumeManager(mount, "zfs", slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate()) // resolves parentDataset
+
+	const lease = "l-zfs-e2e"
+	volName := canonicalVolumeName(lease, "app", 0)
+	hostPath, _, err := mgr.Create(ctx, volName, 100) // large initial refquota
+	require.NoError(t, err)
+	writeIncompressibleMiB(t, filepath.Join(hostPath, "seed.bin"), 5) // under both caps
+
+	b := backendForReconcileTest(t, mgr, mount, lease, "app", "zfs-small", 20)
+	b.reconcileVolumeQuotas(ctx)
+
+	// The reconcile tightened refquota to 20 MiB → 30 MiB more is rejected.
+	writeIncompressibleExpectFail(t, filepath.Join(hostPath, "big.bin"), 30)
 }
 
 // TestIntegration_Btrfs_SubdirDataPath_Measures guards that the btrfs backend

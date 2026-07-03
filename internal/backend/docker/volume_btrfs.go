@@ -60,6 +60,24 @@ func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64
 	return subvolPath, true, nil
 }
 
+// EnsureQuota re-applies the qgroup limit to an existing subvolume (a btrfs
+// subvolume's quota is inherent to it, so there is no separate "tag" step).
+// No-op if the subvolume is absent (never creates). See ENG-454.
+func (b *btrfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+	subvolPath := filepath.Join(b.dataPath, id)
+	if _, err := os.Stat(subvolPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat subvolume %s: %w", subvolPath, err)
+	}
+	quota := fmt.Sprintf("%dm", sizeMB)
+	if out, err := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", quota, subvolPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("btrfs qgroup limit %s on %s: %w: %s", quota, subvolPath, err, out)
+	}
+	return nil
+}
+
 func (b *btrfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	subvolPath := filepath.Join(b.dataPath, id)
 
@@ -192,6 +210,14 @@ func (b *btrfsVolumeManager) Validate() error {
 	if err != nil {
 		return fmt.Errorf("btrfs quotas not enabled at %s (run 'btrfs quota enable %s'): %w: %s",
 			b.dataPath, b.dataPath, err, out)
+	}
+
+	// `btrfs subvolume create` and `btrfs qgroup limit` are privileged ioctls
+	// requiring CAP_SYS_ADMIN (no delegation alternative, unlike zfs). The
+	// qgroup show read above succeeds without it, so fail fast at startup rather
+	// than rejecting every provision at runtime (ENG-454).
+	if err := requireCapSysAdmin(b.Kind(), b.logger); err != nil {
+		return err
 	}
 
 	return nil

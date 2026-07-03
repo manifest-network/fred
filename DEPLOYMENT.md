@@ -114,6 +114,18 @@ dnf install -y xfsprogs        # Fedora/RHEL
 
 Each container gets a directory with an xfs project quota.
 
+> **The docker-backend must run with `CAP_SYS_ADMIN` to _set_ XFS project
+> quotas.** `quotactl(Q_XSETQLIM)` (what `xfs_quota limit`/`project -s` invoke) is
+> privileged; the `report` read is not, so a missing capability is invisible
+> until the first stateful provision fails with
+> `xfs_quota: cannot set limits: Operation not permitted`. The backend now
+> **fails fast at startup** if it lacks the capability rather than running with
+> silently-unenforced per-volume disk caps. See the systemd section below for how
+> to grant it. (`xfs_quota` requires a real mount point, but the backend resolves
+> the XFS mount that *contains* `volume_data_path` automatically — so
+> `volume_data_path` may be the mount itself, as above, or a subdirectory of it,
+> e.g. `/data/fred/volumes` under a `/data` mount.)
+
 #### zfs (best for snapshots/backups)
 
 ```bash
@@ -222,8 +234,9 @@ ReadWritePaths=/var/lib/fred
 WantedBy=multi-user.target
 ```
 
-`docker-backend.service` is the same shape with two differences:
-- It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root.
+`docker-backend.service` is the same shape with three differences:
+- It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root. Note this makes the docker-backend effectively host-root-equivalent regardless of `User=` (access to a rootful Docker socket can launch a privileged container) — so unlike `providerd`, its minimal-capability hardening is partly cosmetic. The real lever for de-privileging it is rootless Docker.
+- **On XFS hosts it needs `CAP_SYS_ADMIN`** to set per-volume project quotas (see the xfs section above). Add `AmbientCapabilities=CAP_SYS_ADMIN` and include `CAP_SYS_ADMIN` in `CapabilityBoundingSet` — ambient capabilities are compatible with `NoNewPrivileges=true`. Scope this to `docker-backend` only; `providerd` does not need it. (btrfs `subvolume`/`qgroup` and zfs `create`/`set` are likewise privileged; zfs alternatively supports `zfs allow` delegation.) Note: a plain `setcap cap_sys_admin+ep` on the binary is **not** sufficient — the daemon shells out to `xfs_quota`/`btrfs`, and a file-capability grant does not propagate to those child processes (it clears the ambient set). Use `AmbientCapabilities` (or run as root); the daemon refuses to start otherwise.
 - `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `volume_data_path`, and — when retention is enabled — `retention_db_path`.
 
 `TimeoutStopSec` should comfortably exceed the graceful-drain window so systemd doesn't SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your config (default 30s); the `docker-backend` uses a fixed 30s drain (not configurable).

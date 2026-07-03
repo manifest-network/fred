@@ -618,6 +618,13 @@ func (b *Backend) Start(ctx context.Context) error {
 		b.logger.Warn("retention reconciliation failed", "error", err)
 	}
 
+	// Backfill per-volume quotas onto existing volumes. Volumes provisioned
+	// before the daemon held CAP_SYS_ADMIN were created untagged/un-limited;
+	// once the capability is granted, this re-applies enforcement without a
+	// re-provision. Best-effort (never fatal). Runs after reconcileRetentions so
+	// the fred-retained- namespace matches the retention records (ENG-454).
+	b.reconcileVolumeQuotas(ctx)
+
 	// Clean up orphaned volumes (created but no matching provision).
 	// Must run after recoverState so the provision map is populated.
 	if err := b.cleanupOrphanedVolumes(ctx); err != nil {
