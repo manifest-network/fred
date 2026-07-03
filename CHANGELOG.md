@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.7.0] - 2026-07-03
+
+### Added
+
 - Restore can now target a different SKU tier (promote/demote). A demote is
   refused (HTTP 422) when the retained volume's measured data does not fit the
   new tier's disk cap. New metric `restore_demote_refused_total{backend,reason}`.
@@ -108,6 +122,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `Restart`/custom-domain reconcile hard-failed). `Append` now derives the next
   release version from `max(existing)+1` so within-key pruning cannot reuse a
   version. (ENG-440)
+- **Close-time purge of a containerless lease's release history.** When a deprovision
+  reaches `doDeprovision` for a lease with no live container / in-flight op (the
+  idempotent no-provision short-circuit), it now still deletes the lease's `releases.db`
+  history before returning, instead of short-circuiting before the terminal
+  `releaseStore.Delete`. This stops a `lease_closed` event delivered after the container
+  was already gone from stranding a stale `status=active` record (an `audit-lease-status`
+  false positive) until the 90-day `RemoveOlderThan` TTL. Best-effort and chain-driven;
+  the three release-history deletes in `doDeprovision` are consolidated behind one helper.
+  Purely cosmetic (no pool/admission/routing impact). (ENG-410)
 
 ### Security
 
@@ -169,15 +192,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   restart/update), so restored leases survive a restart and stay restartable. The
   fix is best-effort like the provision path — a release-write failure cannot undo
   the already-succeeded restore. (ENG-433)
-- **Close-time purge of a containerless lease's release history.** When a deprovision
-  reaches `doDeprovision` for a lease with no live container / in-flight op (the
-  idempotent no-provision short-circuit), it now still deletes the lease's `releases.db`
-  history before returning, instead of short-circuiting before the terminal
-  `releaseStore.Delete`. This stops a `lease_closed` event delivered after the container
-  was already gone from stranding a stale `status=active` record (an `audit-lease-status`
-  false positive) until the 90-day `RemoveOlderThan` TTL. Best-effort and chain-driven;
-  the three release-history deletes in `doDeprovision` are consolidated behind one helper.
-  Purely cosmetic (no pool/admission/routing impact). (ENG-410)
 
 ### Security
 
