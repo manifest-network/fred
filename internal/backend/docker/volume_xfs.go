@@ -93,6 +93,30 @@ func (x *xfsVolumeManager) trackProjectID(volumeID string, projID uint32) {
 	x.volumeToID[volumeID] = projID
 }
 
+// resolveProjectID returns the XFS project ID assigned to volumeID, for teardown.
+// It prefers the on-disk .fred-project-id marker — the authoritative record of the
+// projID that was actually project-tagged and limited, and the only source that
+// survives a restart — and falls back to the in-memory reverse map. Returns
+// ok=false when neither knows the id (an already-cleared or never-created volume:
+// nothing to clear).
+//
+// Resolution goes through the marker/map, NEVER a recomputed crc32(volumeID):
+// assignProjectID's collision-probe means the derived candidate can differ from
+// the id actually assigned, so a recompute-based clear could zero the wrong
+// project. The caller must NOT hold x.mu.
+func (x *xfsVolumeManager) resolveProjectID(volumeID string) (uint32, bool) {
+	dirPath := filepath.Join(x.dataPath, volumeID)
+	if projID, err := readProjectIDFile(dirPath); err == nil {
+		return projID, true
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if projID, ok := x.volumeToID[volumeID]; ok {
+		return projID, true
+	}
+	return 0, false
+}
+
 // removeProjectID removes the volumeID's entry from the active maps.
 func (x *xfsVolumeManager) removeProjectID(volumeID string) {
 	x.mu.Lock()
@@ -197,6 +221,15 @@ func xfsProjectSetupCmd(dirPath string, projID uint32) string {
 // xfsLimitCmd is the `limit -p` command that sets the block hard limit for projID.
 func xfsLimitCmd(projID uint32, quota string) string {
 	return fmt.Sprintf("limit -p bhard=%s %d", quota, projID)
+}
+
+// xfsLimitClearCmd is the `limit -p` command that resets projID's block limits to
+// 0 (0 == "no limit" in XFS), returning its dquot to the uninitialized state so the
+// project drops out of `report -p` once its usage is also 0. Create/EnsureQuota only
+// ever set bhard (xfsLimitCmd), so zeroing bhard+bsoft clears every limit fred wrote.
+// Used by Destroy to keep the project-quota table bounded to live volumes (ENG-459).
+func xfsLimitClearCmd(projID uint32) string {
+	return fmt.Sprintf("limit -p bhard=0 bsoft=0 %d", projID)
 }
 
 func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
@@ -311,9 +344,35 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	dirPath := filepath.Join(x.dataPath, id)
 
+	// Clear the on-disk XFS project-quota limit BEFORE removing the directory.
+	// XFS does NOT implicitly free a project's limit when its files are deleted:
+	// removing the tagged inodes drops the project's *usage* to 0, but its bhard
+	// limit persists in the quota table until explicitly reset to 0. Left set, it
+	// leaks one entry per volume, and every xfs_quota op (report -p in Usage /
+	// Validate) scans the whole table — so provisioning latency degrades
+	// cumulatively as leases churn (ENG-459). Zeroing bhard+bsoft returns the dquot
+	// to the uninitialized state, so once usage is also 0 (the directory removal
+	// below) the kernel's GETNEXTQUOTA walk skips it and it disappears from
+	// report -p. Clearing before the removal keeps a failed Destroy recoverable: a
+	// retry can still re-resolve the projID from the not-yet-deleted marker file.
+	if projID, ok := x.resolveProjectID(id); ok {
+		clearCmd := xfsLimitClearCmd(projID)
+		if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(clearCmd, x.mountPoint)...).CombinedOutput(); err != nil {
+			// Best-effort: a leaked limit entry holds no disk and must not wedge
+			// teardown. Every Destroy caller reads a returned error as "the volume's
+			// bytes are still on disk" and keeps the lease Failed with its footprint
+			// counted (see deprovision/restore), so a zero-byte quota-clear failure
+			// must NOT propagate — it would strand the lease and double-count disk.
+			// Record + log it as the observable backstop; the stale entry needs a
+			// one-time operator cleanup (ENG-459).
+			volumeQuotaClearFailedTotal.Inc()
+			x.logger.Warn("xfs project-quota clear failed on destroy; entry leaked until operator cleanup",
+				"path", dirPath, "project_id", projID, "error", err, "output", string(out))
+		}
+	}
+
 	x.removeProjectID(id)
 
-	// Remove the directory (quota is implicitly freed).
 	if err := os.RemoveAll(dirPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove directory %s: %w", dirPath, err)
 	}

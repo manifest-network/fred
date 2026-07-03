@@ -21,6 +21,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend (xfs): destroying a volume now clears its XFS project-quota
+  limit (`limit -p bhard=0 bsoft=0`) instead of leaving it set, fixing a leak
+  where every closed lease left a stale project-quota entry behind. Because every
+  `xfs_quota` operation scans the whole project-quota table, the accumulating
+  entries degraded provisioning latency cumulatively (and persisted across
+  restarts with no self-healing). Introduced once ENG-449/454 made per-volume
+  quotas actually apply. The clear is best-effort — a failure is logged and
+  counted on the new `volume_quota_clear_failed_total` counter but never fails the
+  teardown (a stranded lease is worse than a leaked, observable, zero-byte
+  entry). Existing already-leaked entries on long-lived backends need a one-time
+  operator cleanup (`limit -p bhard=0` per stale projid); the fix stops all
+  further accumulation. (ENG-459)
+
 - docker-backend and k3s-backend: the `GET /retentions` list is now keyset-
   paginated end to end, closing the second un-paginated O(N) cliff left by
   ENG-380. Previously the whole retained-lease list was returned in one response
