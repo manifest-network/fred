@@ -123,7 +123,7 @@ func (x *xfsVolumeManager) resolveProjectID(volumeID string) (uint32, bool) {
 		// Marker present but unreadable/corrupt: do not guess from the map — skip
 		// the clear rather than risk zeroing a wrong/foreign project, and log it.
 		// Validate's startup scan rejects a marker already corrupt at open, but one
-		// that corrupts afterwards reaches here; skipping is still the safe choice —
+		// that corrupts later reaches here; skipping is still the safe choice —
 		// at worst a logged, leaked entry for operator cleanup, never a wrong project
 		// cleared.
 		x.logger.Warn("xfs project-id marker unreadable on destroy; skipping quota clear",
