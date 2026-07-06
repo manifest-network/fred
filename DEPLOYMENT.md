@@ -114,8 +114,9 @@ dnf install -y xfsprogs        # Fedora/RHEL
 
 Each container gets a directory with an xfs project quota.
 
-> **The docker-backend must run with both `CAP_SYS_ADMIN` and `CAP_FOWNER` to
-> enforce XFS project quotas.** Setting the block limit (`xfs_quota limit -p`,
+> **The docker-backend must run with `CAP_SYS_ADMIN` to enforce XFS project
+> quotas, and additionally with `CAP_FOWNER` for the startup quota backfill
+> (see below).** Setting the block limit (`xfs_quota limit -p`,
 > i.e. `quotactl(Q_XSETQLIM)`) is privileged and needs `CAP_SYS_ADMIN`; the
 > `report` read is not, so a missing capability is invisible until the first
 > stateful provision fails with
@@ -417,7 +418,7 @@ Fred does not currently support graceful in-place upgrades. The startup sequence
 
 Schema migrations: the bbolt files carry no explicit schema version, and Fred does **not** run schema migrations on them. An entry a newer build cannot decode is dropped (not migrated) the next time that store's age-based cleanup runs. Rolling back to an older Fred after a newer version has written is likewise not guaranteed. **Take a backup before upgrading.**
 
-> **Upgrading an XFS backend from before ENG-454/ENG-459:** it may carry orphaned XFS project-quota table entries left by volumes destroyed under the older build. New leaks are prevented going forward, but pre-existing entries are not swept automatically — `xfs_quota report -p` is filesystem-global, so Fred cannot distinguish its own orphaned entries from live foreign project limits. Clear each stale project ID with a one-time manual `xfs_quota -x -c 'limit -p bhard=0 <projid>' <mount>`.
+> **Upgrading an XFS backend from before ENG-454/ENG-459:** it may carry orphaned XFS project-quota table entries left by volumes destroyed under the older build. New leaks are prevented going forward, but pre-existing entries are not swept automatically — `xfs_quota report -p` is filesystem-global, so Fred cannot distinguish its own orphaned entries from live foreign project limits. Clear each stale project ID with a one-time manual `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 <projid>' <mount>` (matching what `Destroy` does).
 
 ---
 

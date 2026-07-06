@@ -205,9 +205,9 @@ When provisioning `redis:latest` on this SKU:
 2. Host directory created: `/var/lib/fred/volumes/fred-<lease>-0/` with 2048 MB quota
 3. Subdirectory `data/` bind-mounted to container `/data`
 4. Redis writes to `/data` — quota enforced by kernel
-5. On deprovision: host directory destroyed, and on XFS the project-quota limit is cleared (`bhard=0`) so its entry drops out of the quota table
+5. On deprovision: host directory destroyed, and on XFS the project-quota limit is cleared (`bhard=0 bsoft=0`) so its entry drops out of the quota table
 
-> **XFS quota-table hygiene (ENG-459):** on XFS, `Destroy` clears the volume's project-quota block limit (`bhard=0`) after removing the directory, so the entry leaves the quota table instead of leaking one stale zero-byte entry per provision (an unbounded table slows every `xfs_quota` scan, degrading provisioning latency as leases churn). The clear is best-effort — a failure is logged and bumps `fred_docker_backend_volume_quota_clear_failed_total` rather than wedging teardown. Entries leaked by pre-ENG-459 daemons persist and need a one-time manual operator cleanup.
+> **XFS quota-table hygiene (ENG-459):** on XFS, `Destroy` clears the volume's project-quota block limit (`bhard=0 bsoft=0`) after removing the directory, so the entry leaves the quota table instead of leaking one stale zero-byte entry per provision (an unbounded table slows every `xfs_quota` scan, degrading provisioning latency as leases churn). The clear is best-effort — a failure is logged and bumps `fred_docker_backend_volume_quota_clear_failed_total` rather than wedging teardown. Entries leaked by pre-ENG-459 daemons persist and need a one-time manual operator cleanup.
 
 ### SKU Profile Fields
 
