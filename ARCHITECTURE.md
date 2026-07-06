@@ -292,6 +292,8 @@ Restore adopts a soft-deleted lease's retained data into a new lease (see the [d
       acknowledged INLINE on-chain (ENG-358) — no ~reconciler-interval wait
 ```
 
+The new lease **may target a different SKU tier** than the source (promote/demote, ENG-438). Only the item *shape* must match (service names + quantities); the SKU/disk tier may differ. A **promote** (same-or-larger disk tier) is always allowed and the new `disk_mb` cap is applied. A **demote** (smaller disk tier) is allowed only if the retained volume's *measured* data fits the new tier's `disk_mb` cap — the backend runs `checkDemoteFit` before adopting. A refused demote returns HTTP 422; on the backend→fred hop the body carries `code=demote_exceeds_tier` (`ErrDemoteDataExceedsTier`), which the fred-api boundary forwards to the tenant as a 422 (whose own `code` field is the numeric status) — distinct from a *bare* 422 (`ErrNotRetained`, no retained data), which fred maps to 404.
+
 Reconciler interplay (level-triggered backstop):
 
 - **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path; if no restore tracker is wired, the restore still converges because the reconciler acks a `PENDING` + `ready` lease. The reconciler *skips* acking a lease the in-flight tracker already owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
@@ -561,7 +563,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fred_api_requests_total` | counter | `method, path, status` | API request count |
+| `fred_api_requests_total` | counter | `method, path, status` | API request count. The `path` label is the matched-route TEMPLATE (e.g. `/v1/leases/{lease_uuid}/status`), with a single `unmatched` bucket for requests matching no route — bounding `path` to the finite set of registered routes + 1 (closes an unauthenticated path-scan cardinality vector, ENG-448/F28) |
 | `fred_api_request_duration_seconds` | histogram | `method, path, status` | Request latency |
 | `fred_api_rate_limit_rejections_total` | counter | `limiter` | Rate limit rejections. `limiter="global"` = the single per-IP limiter shared across all routes (no route/path dimension); `limiter="tenant"` = per-tenant limiter |
 | `fred_api_non_in_flight_callbacks_total` | counter | `backend, status` | Callbacks for leases not tracked in-flight (restart/update completions, late delivery, intentional deprovision) |
@@ -662,6 +664,9 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_resource_cpu_allocated_ratio` | gauge | — | Allocated/total CPU |
 | `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
 | `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total disk |
+| `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFit`) because the retained data does not fit the requested smaller SKU tier. `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
+| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota-backfill per-volume re-application (re-tag + re-limit) attempts, `outcome` ∈ `applied`/`failed`; re-applies `disk_mb` enforcement to volumes provisioned before the daemon held the quota capability, without a re-provision (ENG-454) |
+| `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | XFS project-quota clear failures on volume Destroy; a rising rate means the project-quota table is regrowing (leaked zero-byte entry) and needs one-time manual operator cleanup (ENG-459) |
 
 **Retention:**
 

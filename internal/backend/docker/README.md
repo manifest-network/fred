@@ -17,6 +17,7 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 | HostBindIP | `host_bind_ip` | string | `"0.0.0.0"` | IP address to bind container ports to |
 | LogLevel | `log_level` | string | `"info"` | Log verbosity: `debug`, `info`, `warn`, `error`. Not set in `DefaultConfig()`; defaults to `"info"` at startup via `cmp.Or` |
 | ProductionMode | `production_mode` | bool | `false` | Tightens startup checks beyond basic validation. When true, `Validate` rejects dev-only insecure toggles — currently `callback_insecure_skip_verify`. Mirrors providerd's `production_mode` |
+| MaxRequestBodySize | `max_request_body_size` | int64 | `2097152` (2 MiB) | Caps inbound HTTP request body size (bytes). Falls back to `DefaultMaxRequestBodySize` (2 MiB) when unset or non-positive. Also settable via env `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` (ENG-448) |
 
 ### TLS & mTLS (ENG-103)
 
@@ -171,9 +172,11 @@ When any SKU profile has `disk_mb > 0`, the backend manages quota-enforced host 
 
 | Filesystem | Mechanism | Requirements |
 |---|---|---|
-| **btrfs** | Subvolumes with qgroup quotas | `btrfs quota enable` on the filesystem |
-| **xfs** | Project quotas | `pquota` mount option, `xfs_quota` binary |
-| **zfs** | Child datasets with quota property | Parent dataset exists, `zfs` binary |
+| **btrfs** | Subvolumes with qgroup quotas | `btrfs quota enable` on the filesystem; daemon `CAP_SYS_ADMIN` |
+| **xfs** | Project quotas | `pquota` mount option, `xfs_quota` binary; daemon `CAP_SYS_ADMIN` |
+| **zfs** | Child datasets with quota property | Parent dataset exists, `zfs` binary (exempt from `CAP_SYS_ADMIN` via `zfs allow` delegation) |
+
+> **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. The startup backfill that re-tags pre-existing tenant-owned volumes additionally needs `CAP_FOWNER`. Grant them ambiently — `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `zfs` is exempt (`zfs allow` delegation) and `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
 
 #### Stateful vs Ephemeral Containers
 
@@ -202,7 +205,9 @@ When provisioning `redis:latest` on this SKU:
 2. Host directory created: `/var/lib/fred/volumes/fred-<lease>-0/` with 2048 MB quota
 3. Subdirectory `data/` bind-mounted to container `/data`
 4. Redis writes to `/data` — quota enforced by kernel
-5. On deprovision: host directory destroyed
+5. On deprovision: host directory destroyed, and on XFS the project-quota limit is cleared (`bhard=0`) so its entry drops out of the quota table
+
+> **XFS quota-table hygiene (ENG-459):** on XFS, `Destroy` clears the volume's project-quota block limit (`bhard=0`) after removing the directory, so the entry leaves the quota table instead of leaking one stale zero-byte entry per provision (an unbounded table slows every `xfs_quota` scan, degrading provisioning latency as leases churn). The clear is best-effort — a failure is logged and bumps `fred_docker_backend_volume_quota_clear_failed_total` rather than wedging teardown. Entries leaked by pre-ENG-459 daemons persist and need a one-time manual operator cleanup.
 
 ### SKU Profile Fields
 
@@ -239,6 +244,7 @@ Restore-specific re-deploy behavior worth knowing:
 
 - **Image must already be present on the node.** Restore re-uses the replace machinery, which **inspects** the image but does **not** pull it. If the image was garbage-collected from the node since close, restore fails with an image-inspect error — pre-pull the image (or restore before the node's image GC runs).
 - **Image and configuration are fixed.** Restore deploys strictly from the retained `StackManifest` and items; the request carries no manifest. The new lease's requested service names and quantities must shape-match the retained set exactly (otherwise the restore is rejected with a validation error).
+- **The SKU tier may change (promote/demote).** Only the item *shape* must match (service names + quantities); the SKU's resource (disk) tier **may** differ from the source lease. A **promote** (same-or-larger `disk_mb` tier) is always allowed and the larger cap is applied. A **demote** (smaller `disk_mb` tier) is allowed only if the retained volume's **measured** data fits the new tier's `disk_mb` cap — the backend runs `checkDemoteFit` before adopting (restoring stateful data into an ephemeral `disk_mb=0` tier is always refused). A refused demote returns HTTP `422` with body `{"code":"demote_exceeds_tier"}` (`backend.ErrDemoteDataExceedsTier`) and is counted by `fred_docker_backend_restore_demote_refused_total{backend,reason}` (`reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`); it is **not** counted by `restore_total`.
 - **Containers are recreated, ownership is not rewritten.** Restore does not force-recreate beyond the normal replace, and the volume chown is non-recursive (it sets ownership on the VOLUME mount point only), so existing files keep their on-disk ownership.
 
 ### Limitations
@@ -478,7 +484,7 @@ Full diagnostics (exit codes, OOM status, container logs) are available via the 
 
 ## HTTP API
 
-All authenticated endpoints require an `X-Fred-Signature` HMAC-SHA256 header (see [Signing](#signing)). Request bodies are limited to 1 MiB. All JSON responses use `Content-Type: application/json`. Errors return `{"error": "message"}`.
+All authenticated endpoints require an `X-Fred-Signature` HMAC-SHA256 header (see [Signing](#signing)). Request bodies are limited to 2 MiB by default (`DefaultMaxRequestBodySize`), configurable via `max_request_body_size` (env `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE`). All JSON responses use `Content-Type: application/json`. Errors return `{"error": "message"}`.
 
 ### `POST /provision` (authenticated)
 
@@ -692,13 +698,15 @@ Re-deploys a lease with a new manifest (image/config change). The `payload` fiel
 
 ### `POST /restore` (authenticated)
 
-Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease) and `callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`); `422` when no retained data exists, `409` for invalid state / already provisioned, `400` (validation), `503` (insufficient resources). See [Soft-delete & Restore](#soft-delete--restore).
+Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease) and `callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), `503` (insufficient resources). See [Soft-delete & Restore](#soft-delete--restore).
 
 ### `GET /retentions` (authenticated)
 
 Lists this backend's retained (soft-deleted) leases. Used by the reconciler to route restores to the node physically holding each lease's retained volumes (ENG-333).
 
-**Response (`200`):** `{"retentions": [ ... ]}` (serialized as `[]` when empty).
+`GET /retentions` is keyset-paginated, mirroring [`GET /provisions`](#get-provisions-authenticated): it accepts `limit` (max page size) and `continue` (a lease UUID — the cursor returned by the previous page) query params and returns a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. Fred's client pages at `RetentionsPageLimit` (default 1000), fail-closing each page body at 1 MiB (ENG-451). With no params it returns the full list unpaginated (back-compat).
+
+**Response (`200`):** `{"retentions": [ ... ], "continue": "<lease-uuid>"}` (`retentions` serialized as `[]` when empty; `continue` omitted once the list is exhausted).
 
 ### `GET /releases/{lease_uuid}` (authenticated)
 
@@ -710,7 +718,7 @@ Reconciles a lease's custom-domain ingress labels to match the supplied items. B
 
 ### `GET /health` (unauthenticated)
 
-Docker daemon reachability check.
+Docker daemon reachability check. Also probes the callback, diagnostics, release, and retention bbolt stores — a locked, corrupt, or read-only store surfaces as unhealthy instead of the backend reporting healthy while soft-delete/restore silently fail (ENG-448).
 
 **Response (`200`):**
 
@@ -720,7 +728,7 @@ Docker daemon reachability check.
 }
 ```
 
-Returns `503` if the Docker daemon is unreachable.
+Returns `503` if the Docker daemon is unreachable **or** any of those stores is unhealthy.
 
 ### `GET /stats` (unauthenticated)
 

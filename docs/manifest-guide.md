@@ -7,7 +7,7 @@
 > When Fred receives a flat manifest:
 >
 > - **At provision time:** the manifest is silently auto-wrapped into a 1-service stack under the synthetic service name `app`. The submitting tenant sees no behavioural difference except a `manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack` warning in operator logs.
-> - **At fred startup:** any pre-existing containers from leases provisioned under the legacy single-service execution path (Fred releases before this migration) are migrated in-place to the stack-shape naming convention. Migration is per-lease atomic and crash-resumable across most boundaries; see the CHANGELOG's *Recover-time migration troubleshooting* section for the one narrow non-resumable window and the operator remediation.
+> - **At fred startup:** any pre-existing containers from leases provisioned under the legacy single-service execution path (Fred releases before this migration) are migrated in-place to the stack-shape naming convention. Migration is per-lease atomic and crash-resumable across most boundaries; see the CHANGELOG's *Migration → Troubleshooting* section (the *Stuck `-prev` containers …* subsection) for the one narrow non-resumable window and the operator remediation.
 >
 > The flat format will be removed in a future major release. Until then, both formats remain valid wire input.
 
@@ -551,7 +551,7 @@ Go duration strings support these units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`.
 
 ### Redis (Stateful)
 
-Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts and re-provisions but is destroyed on deprovision.
+Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts and re-provisions but is destroyed on deprovision. Quota enforcement here requires the operator to run Fred on a quota-capable filesystem and, on xfs/btrfs, to grant the backend the required Linux capabilities; see `DEPLOYMENT.md`.
 
 ```json
 {
@@ -571,7 +571,7 @@ Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automa
 
 ### PostgreSQL (User Override + Stateful)
 
-Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume ownership for `postgres` images, but setting `user` explicitly is recommended for clarity and to ensure correct behavior across image versions.
+Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume ownership for `postgres` images, but setting `user` explicitly is recommended for clarity and to ensure correct behavior across image versions. Quota enforcement of the data volume requires the operator to run Fred on a quota-capable filesystem and, on xfs/btrfs, to grant the backend the required Linux capabilities; see `DEPLOYMENT.md`.
 
 ```json
 {

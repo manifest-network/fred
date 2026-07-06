@@ -12,6 +12,7 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
 - **Credit Monitoring**: Tracks tenant credit balances and auto-closes leases when credit is depleted
 - **Cross-Provider Credit Detection**: Responds to credit depletion events from other providers
 - **Live Operations**: Restart containers or deploy new manifests (update) on active leases with full release history tracking
+- **Data Retention & Restore**: Soft-delete a lease's volumes on close and restore them into a new lease within a grace window, optionally onto a different SKU tier
 - **Security**: Rate limiting, request size limits, input validation, and optional TLS
 
 ## Architecture Overview
@@ -275,9 +276,9 @@ These options have sensible defaults but can be tuned for specific environments:
 | `tx_timeout` | Transaction confirmation timeout | `30s` |
 | `query_page_limit` | Page size for chain queries | `100` |
 | `max_withdraw_iterations` | Max iterations for withdrawal batching | `100` |
-| `gas_limit` | Gas limit for transactions | `1500000` |
-| `gas_adjustment` | Multiplier applied to `gas_limit` at sign time. Matches the Cosmos CLI flag. Range: 1.0–3.0. | `1.2` |
-| `max_gas_limit` | Caps gas during out-of-gas retries (1.5× per retry, compounding). `0` = uncapped. Must be ≥ `gas_limit` when set. | `0` |
+| `gas_limit` | Fallback gas used only when a per-tx gas simulation fails or is unavailable; every tx is otherwise gas-simulated per-tx. | `1500000` |
+| `gas_adjustment` | Multiplier applied to the simulated gas estimate (Cosmos `--gas-adjustment` convention), giving headroom above the estimate. Matches the Cosmos CLI flag. Range: 1.0–3.0. | `1.2` |
+| `max_gas_limit` | Absolute reject-cap: a tx whose adjusted simulated estimate exceeds it is terminally rejected before broadcast (never sent); it also clamps the out-of-gas retry ladder. `0` = uncapped. Must be ≥ `gas_limit` when set. | `0` |
 | `gas_price` | Gas price (micro-units of `fee_denom` per gas unit; fee = ceil(gas_limit × gas_price / 1_000_000)) | `25` |
 | `fee_denom` | Fee denomination | `umfx` |
 | `sub_signer_count` | Number of authz sub-signers for parallel tx signing. `0` = single-signer mode. | `0` |
@@ -636,7 +637,7 @@ Content-Type: application/json
 }
 ```
 
-Restore a soft-deleted lease's retained data into a **new** lease. The path `lease_uuid` is the new, fresh `PENDING` lease the data is adopted into; `from_lease_uuid` in the body names the original closed/expired lease whose volumes were retained (see [retention](internal/backend/docker/README.md#soft-delete--restore)). Fred resolves the backend that holds the source lease's retained data (restore is same-backend, ENG-333), then re-deploys the retained manifest onto the adopted volumes. The new lease's requested service names and quantities must shape-match the original.
+Restore a soft-deleted lease's retained data into a **new** lease. The path `lease_uuid` is the new, fresh `PENDING` lease the data is adopted into; `from_lease_uuid` in the body names the original closed/expired lease whose volumes were retained (see [retention](internal/backend/docker/README.md#soft-delete--restore)). Fred resolves the backend that holds the source lease's retained data (restore is same-backend, ENG-333), then re-deploys the retained manifest onto the adopted volumes. Only the item **shape** must match: the new lease's requested service names and quantities must equal the original's, but its SKU/disk tier MAY differ. A promote (same-or-larger disk tier) is always allowed and the new `disk_mb` cap is applied; a demote (smaller disk tier) is allowed only if the retained volume's measured data still fits the new tier's `disk_mb` cap (the backend runs `checkDemoteFit` before adopting). A refused demote returns `422 Unprocessable Entity`; the JSON body's `error` message begins `retained data exceeds the requested smaller tier` (the body's `code` field is the numeric HTTP status, not a string discriminator).
 
 **Response:** `202 Accepted`
 ```json
@@ -652,6 +653,7 @@ Restore a soft-deleted lease's retained data into a **new** lease. The path `lea
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - No retained data found for `from_lease_uuid` (absent, expired, cross-tenant, or its backend is gone)
 - `409 Conflict` - Target lease is not `PENDING`, is already provisioned, or is not in a restorable state
+- `422 Unprocessable Entity` - Requested a smaller SKU tier (demote) but the retained data exceeds the new tier's `disk_mb` cap; the `error` message begins `retained data exceeds the requested smaller tier`
 - `503 Service Unavailable` - Insufficient resources to restore, or placement routing is not configured
 
 ### Get Release History
@@ -1009,7 +1011,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
 - `422 Unprocessable Entity` - No retained data for the source lease (also returned by backends that don't support retention)
 - `503 Service Unavailable` - Insufficient resources
 
-> Fred maps the backend's `422` to a tenant-facing `404` on `POST /v1/leases/{uuid}/restore`.
+> Fred maps only the backend's **bare** `422` (`ErrNotRetained` — no retained data, no `code`) to a tenant-facing `404` on `POST /v1/leases/{uuid}/restore`. A `422` carrying `code: "demote_exceeds_tier"` (`ErrDemoteDataExceedsTier` — retained data exceeds the requested smaller tier) is forwarded to the tenant as `422`, not remapped.
 
 ### GET /retentions
 

@@ -13,7 +13,7 @@ Both `providerd` and `docker-backend` expose `GET /health` that returns 200 when
 | Endpoint | Checks |
 |---|---|
 | `providerd /health` | Chain gRPC reachable, all backends reachable, plus token-tracker and placement-store DB writability *if those stores are configured* (`token_tracker_db_path` and `placement_store_db_path`) |
-| `docker-backend /health` | Docker daemon reachable |
+| `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores are writable (503 if any is unhealthy) |
 
 A 503 from `providerd /health` includes a JSON body with per-check status; the failing component is identified there. The `token_tracker` and `placement_store` keys only appear when the corresponding DB is configured — a dev-mode instance without them simply omits those checks rather than failing.
 
@@ -29,8 +29,8 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_provisioner_callback_timeouts_total` rising | Backend accepted provision but never called back | Backend logs; verify `callback_base_url` is reachable from backend; check HMAC secret match |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` rising | Out-of-gas on lease acknowledgment txs | See [Out-of-gas tuning](#out-of-gas-tuning) |
 | `fred_chain_signer_oog_retries_total{result="exhausted"}` rising | Same; the broadcast retry loop hit `max_gas_limit` | Same as above |
-| `fred_docker_backend_die_event_dropped_total` sustained non-zero | Lease actor inbox is wedged | See [Wedged lease actor](#wedged-lease-actor) |
-| `fred_docker_backend_lease_actor_stuck_seconds > 900` | Some actor's `handle()` has been running for >15 min | See [Wedged lease actor](#wedged-lease-actor) |
+| `fred_docker_backend_die_event_dropped_total` sustained non-zero | Lease actor inbox is wedged | See [Wedged lease actor](#wedged-lease-actor-docker-backend) |
+| `fred_docker_backend_lease_actor_stuck_seconds > 900` | Some actor's `handle()` has been running for >15 min | See [Wedged lease actor](#wedged-lease-actor-docker-backend) |
 | `fred_docker_backend_lease_actor_panics_total > 0` | Bug — actor handler panicked | Check logs for stack trace, file an issue |
 | `fred_docker_backend_lease_terminal_event_dropped_total` rising under clean shutdown | Real data loss pattern | The release store / provision struct may be out of sync with Docker — reconciler will re-detect on next cycle, but root-cause the wedged actor |
 | `fred_provisioner_reconciler_panics_total > 0` | Bug — reconciler goroutine panicked | Reconciler keeps running for other leases, but file an issue with the stack trace |
@@ -41,6 +41,7 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
+| `fred_docker_backend_volume_quota_clear_failed_total` rising | An XFS volume `Destroy` failed to clear its project block limit — the project-quota table is regrowing (leaked zero-byte entries slow every `xfs_quota` scan) | [Leaked XFS project-quota entries](#leaked-xfs-project-quota-entries) |
 
 ---
 
@@ -81,6 +82,65 @@ If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease'
 - **Genuine deadlock**: file an issue with the goroutine dump. The actor will not unblock; the reconciler will re-detect the lease on its next cycle and retry, but the wedged goroutine leaks until restart.
 
 **Last resort:** restarting the docker-backend recovers cleanly. State is rebuilt from Docker labels and bbolt stores on startup.
+
+---
+
+## docker-backend refuses to start: `CAP_SYS_ADMIN` not available
+
+On an `xfs` or `btrfs` backend the docker-backend **fails fast at startup** if it
+cannot set volume quotas, exiting with (message from `internal/backend/docker/capability.go`):
+
+```
+docker-backend cannot set xfs volume quotas: CAP_SYS_ADMIN is not available to the
+exec'd quota tools — grant AmbientCapabilities=CAP_SYS_ADMIN for a non-root daemon,
+or include CAP_SYS_ADMIN in CapabilityBoundingSet when running as root (a plain
+`setcap cap_sys_admin+ep` on the binary does NOT propagate to the child) — refusing
+to start so per-volume disk_mb limits are enforced, not silently skipped
+```
+
+This is deliberate: a missing capability would otherwise silently drop every
+`disk_mb` cap. Grant `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the
+docker-backend systemd unit — `CAP_SYS_ADMIN` to set the block limit, and
+`CAP_FOWNER` so the startup backfill can re-tag pre-existing tenant-owned volumes.
+A plain `setcap …+ep` on the binary does **not** work — the grant must reach the
+exec'd `xfs_quota`/`btrfs` children. Full setup is in the xfs section and the
+systemd note of [DEPLOYMENT.md](DEPLOYMENT.md#xfs-good-for-large-fleets). The `zfs`
+backend is exempt (it supports `zfs allow` delegation, so a properly-delegated
+non-root host is not rejected) and the `noop` backend is unaffected (no privileged
+ops).
+
+**Startup quota backfill.** After the guard passes, the backend re-applies each
+existing managed volume's quota (re-tag + limit) so leases provisioned before the
+daemon held the capability get their `disk_mb` enforced without a re-provision.
+`fred_docker_backend_volume_quota_backfill_total{outcome}` (`outcome ∈
+{applied, failed}`) counts this per-volume work. Sustained `failed` means some
+volumes stay unenforced — usually a missing `CAP_FOWNER` (the re-tag needs it);
+grant it and restart to heal them.
+
+---
+
+## Leaked XFS project-quota entries
+
+`fred_docker_backend_volume_quota_clear_failed_total` increments when a volume
+`Destroy` fails to reset its XFS project block limit
+(`xfs_quota -x -c 'limit -p bhard=0 bsoft=0 <projID>'`). Each leaked entry holds no
+disk, but it lingers in the project-quota table and every `xfs_quota` scan
+(`report -p`, used by `Usage` and `Validate`) has to walk it — so a steadily rising
+counter surfaces as a slow cumulative provisioning-latency regression.
+
+**Remediation.** There is no automatic sweep: a `report -p` is filesystem-wide and
+cannot distinguish fred's orphaned entries from live foreign limits, so cleanup is a
+manual operator task.
+
+1. List quota entries: `xfs_quota -x -c 'report -p' <mountpoint>` and find project
+   IDs with a non-zero hard limit but no live volume directory.
+2. Clear each orphan: `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 <projID>' <mountpoint>`.
+
+Backends that ran a **pre-v0.7.0** build never cleared limits on `Destroy` and so
+accumulated one leaked entry per provision — those need this one-time manual
+cleanup. v0.7.0+ clears the limit on every successful `Destroy`; a rising counter
+there instead points at a genuine `xfs_quota` failure (check the backend logs for
+the `xfs_quota` stderr).
 
 ---
 
@@ -234,6 +294,21 @@ Never run two `providerd` or `docker-backend` instances against the same bbolt f
 ### Restore operations
 
 `POST /v1/leases/{lease_uuid}/restore` (on providerd; `POST /restore` on the docker-backend) re-deploys a lease onto its **retained** (soft-deleted) volumes — the v0.5.0 headline feature. It runs through the same replace machinery as restart/update, so the rollback semantics above apply, with one extra synchronous *adopt prelude* up front that renames the `fred-retained-*` volumes back to their canonical names before the worker spawns.
+
+**Restoring onto a different SKU tier.** A restore's new lease may target a
+different SKU than the source — only the item *shape* (service names + quantities)
+must match; the disk (`disk_mb`) tier may differ. A **promote** (same-or-larger
+`disk_mb`) is always allowed and applies the larger cap. A **demote** (smaller
+`disk_mb`) is allowed only if the retained volume's *measured* data fits the new
+tier — the backend runs `checkDemoteFit` before adopting. A demote that does not
+fit is refused: the docker-backend returns HTTP 422 with body
+`{"code":"demote_exceeds_tier"}`, which fred-api forwards to the tenant as a 422
+with the message `retained data exceeds the requested smaller tier`. (This is
+distinct from a *bare* 422 with no code — `ErrNotRetained`, no retained data —
+which fred-api maps to 404.) `fred_docker_backend_restore_demote_refused_total{backend,reason}`
+(`reason ∈ {measured_exceeds, unmeasurable_read_error, unmeasurable_backend,
+ephemeral_tier}`) counts these refusals; like other synchronous-prelude failures
+they are **not** counted by `restore_total`.
 
 **Success-rate signal.** `fred_docker_backend_restore_total{outcome}` (`outcome ∈ {success, failure}`) is the docker-backend's own restore success rate, mirroring `provisions_total`. Both outcome series are pre-initialized to 0, so a failure ratio reads 0 (not no-data) before the first restore. **Worker-scoped caveat:** a restore that fails in the synchronous adopt prelude (claim/rename/route/ack) before the worker spawns returns a synchronous error to the caller and is counted by **neither** outcome bucket — exactly as `provisions_total` omits synchronous provision failures. Such failures surface to the tenant as the restore HTTP status; providerd's `fred_provisioner_provisioning_total{operation="restore"}` counts the async callback/timeout outcomes, not these synchronous backend errors, so it does not backfill the gap.
 

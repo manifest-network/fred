@@ -393,7 +393,7 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
 }
 ```
 
-`lease_uuid` is the new lease; `from_lease_uuid` is the original retained lease. `items` must shape-match (service name → summed quantity) the retained set.
+`lease_uuid` is the new lease; `from_lease_uuid` is the original retained lease. `items` must shape-match (service name → summed quantity) the retained set. The new lease's `items` MAY specify a **different SKU disk tier** than the source — only the item *shape* (service names + summed quantities) must match, not the resource/disk tier. A **promote** (same-or-larger disk tier) is always allowed and applies the new `disk_mb` cap. A **demote** (smaller disk tier) is allowed only if the retained volume's measured data fits the new tier's `disk_mb` cap; the backend runs a demote-fit check before adopting and otherwise refuses with `422` `code=demote_exceeds_tier` (see below).
 
 **Response:** `202 Accepted`
 ```json
@@ -410,23 +410,26 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
 **Error Responses:**
 - `400 Bad Request` - Missing required fields or items/manifest validation error
 - `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"` (the invalid-state case omits `code`), so the two are distinguished by that discriminator
-- `422 Unprocessable Entity` - No retained data for `from_lease_uuid` (also the correct response for backends without retention support)
+- `422 Unprocessable Entity` - Overloaded across two cases, distinguished by a `code` discriminator like the `409` above. Both return a JSON `{"error": "..."}` body; a **bare** `422` (no `code`) means no retained data for `from_lease_uuid` (also the correct response for backends without retention support), while a `422` with `code: "demote_exceeds_tier"` means the restore requested a **smaller** SKU disk tier whose `disk_mb` cap is below the retained volume's measured footprint (a refused demote)
 - `503 Service Unavailable` - Insufficient resources
 
 ### GET /retentions (optional — retention support)
 
-List the leases whose data this backend currently retains. Fred's reconciler polls this on every backend each tick to keep restore routing affinity (route a restore to the backend holding the source data). Backends without retention return an empty list.
+List the leases whose data this backend currently retains. Fred's reconciler polls this on every backend each tick to keep restore routing affinity (route a restore to the backend holding the source data). Backends without retention return an empty list. Keyset-paginated (see **Pagination** below).
 
 **Response:** `200 OK`
 ```json
 {
   "retentions": [
     {"lease_uuid": "550e8400-e29b-41d4-a716-446655440000"}
-  ]
+  ],
+  "continue": "5a1e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 Always return `{"retentions": []}` (never `null`) when nothing is retained.
+
+**Pagination:** `GET /retentions` is keyset-paginated, mirroring `GET /provisions`. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. Fred's client walks the pages requesting `limit` = `RetentionsPageLimit` (default 1000) and fail-closes each page body at 1 MiB, reassembling the complete set (complete-or-error) so the reconciler never routes off partial retention data. (ENG-451)
 
 ### POST /reconcile_custom_domain
 

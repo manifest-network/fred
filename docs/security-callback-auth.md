@@ -2,7 +2,7 @@
 
 Reference-grade document for engineers about to touch the fred ↔ backend HMAC channel, the `callback_canonical_path_prefix` config, or the upstream proxy strip rule. Read this before "improving" any of them.
 
-Cross-links: [ENG-191 (PR #88)](https://github.com/manifest-network/fred/pull/88) bound method + URI into the HMAC canonical string. [ENG-198 (this PR)](https://linear.app/liftedinit/issue/ENG-198) adds the static prefix that compensates for the upstream proxy's path rewrite. See also [SECURITY.md § Callback Authentication](../SECURITY.md#callback-authentication-hmac-sha256).
+Cross-links: [ENG-191 (PR #88)](https://github.com/manifest-network/fred/pull/88) bound method + URI into the HMAC canonical string. [ENG-198](https://linear.app/liftedinit/issue/ENG-198) added the static prefix that compensates for the upstream proxy's path rewrite. See also [SECURITY.md § Callback Authentication](../SECURITY.md#callback-authentication-hmac-sha256).
 
 ## 1. Two-leg topology asymmetry
 
@@ -13,7 +13,7 @@ Fred ↔ backends is a **bidirectional HMAC channel**, not a one-way webhook fan
 | Fred → backend | Outbound from fred (provision, deprovision, restart, update, ...) | Direct — no proxy in front of the backend |
 | Backend → fred | Inbound callbacks (provision result, lease state) | Traverses Traefik on the way to fred |
 
-The signer's view of the URI and the verifier's view of the URI agree on the outbound leg (no rewriter sits between them) but **diverge on the inbound leg** (Traefik strips the path before fred sees it). Any signature-binding change that includes the URI in its canonical string surfaces this asymmetry. ENG-191 was such a change, and ENG-198 is the compensation.
+The signer's view of the URI and the verifier's view of the URI agree on the outbound leg (no rewriter sits between them) but **diverge on the inbound leg** (Traefik strips the path before fred sees it). Any signature-binding change that includes the URI in its canonical string surfaces this asymmetry. ENG-191 was such a change, and ENG-198 was the compensation.
 
 ## 2. TLS posture asymmetry per `manifest-deploy/CLAUDE.md:181` / `:195`
 

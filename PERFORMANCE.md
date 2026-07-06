@@ -5,7 +5,7 @@ This document presents performance benchmarks and stress test results for Fred's
 ## Test Environment
 
 - **Platform**: Linux 6.18.4-1-MANJARO
-- **Go Version**: 1.25+
+- **Go Version**: 1.26+
 - **Event Library**: Watermill with GoChannel (in-memory pub/sub)
 - **Backend**: Mock backend (instant response, no I/O)
 
@@ -117,7 +117,7 @@ In production, the limiting factors will be:
 2. **Backend provisioning time** (seconds to minutes) - real work takes time
 3. **Network latency** - round-trip to backends and chain
 
-Fred's 56,000+ events/sec throughput far exceeds realistic chain event rates, ensuring **Fred will never be the bottleneck**.
+Fred's 56,000+ events/sec throughput far exceeds realistic chain event rates, so **event ingestion will not be Fred's bottleneck**. The practical capacity limit lies elsewhere — notably the per-reconcile-tick `O(leases)` cost of listing provisions/retentions (now keyset-paginated); see capacity planning below.
 
 For capacity sizing in real deployments (chain ack throughput, per-backend image-pull dominance, memory budgeting), see [OPERATIONS.md § Capacity planning](OPERATIONS.md#capacity-planning) and [DEPLOYMENT.md § Host requirements](DEPLOYMENT.md#host-requirements).
 

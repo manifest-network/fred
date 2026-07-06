@@ -114,17 +114,34 @@ dnf install -y xfsprogs        # Fedora/RHEL
 
 Each container gets a directory with an xfs project quota.
 
-> **The docker-backend must run with `CAP_SYS_ADMIN` to _set_ XFS project
-> quotas.** `quotactl(Q_XSETQLIM)` (what `xfs_quota limit`/`project -s` invoke) is
-> privileged; the `report` read is not, so a missing capability is invisible
-> until the first stateful provision fails with
-> `xfs_quota: cannot set limits: Operation not permitted`. The backend now
-> **fails fast at startup** if it lacks the capability rather than running with
+> **The docker-backend must run with both `CAP_SYS_ADMIN` and `CAP_FOWNER` to
+> enforce XFS project quotas.** Setting the block limit (`xfs_quota limit -p`,
+> i.e. `quotactl(Q_XSETQLIM)`) is privileged and needs `CAP_SYS_ADMIN`; the
+> `report` read is not, so a missing capability is invisible until the first
+> stateful provision fails with
+> `xfs_quota: cannot set limits: Operation not permitted`. The backend
+> **fails fast at startup** if it lacks `CAP_SYS_ADMIN` rather than running with
 > silently-unenforced per-volume disk caps. See the systemd section below for how
 > to grant it. (`xfs_quota` requires a real mount point, but the backend resolves
 > the XFS mount that *contains* `volume_data_path` automatically — so
 > `volume_data_path` may be the mount itself, as above, or a subdirectory of it,
 > e.g. `/data/fred/volumes` under a `/data` mount.)
+>
+> **`CAP_FOWNER` is additionally required for the startup quota backfill.**
+> Tagging a directory with its project ID (`xfs_quota project -s`, i.e.
+> `FS_IOC_FSSETXATTR`) is permitted for the inode's owner, so a *fresh* provision
+> — which tags the still-empty, daemon-owned volume before chown'ing its subdirs
+> to the tenant — needs only `CAP_SYS_ADMIN`. The startup backfill that heals
+> volumes provisioned before the capability was granted, however, re-tags
+> directories that have already been chown'd to the tenant UID; setting a project
+> ID on an inode the daemon does not own requires `CAP_FOWNER`. By design the
+> daemon does **not** fail fast on a missing `CAP_FOWNER` — a fresh backend with no
+> pre-existing untagged volumes doesn't need it, so the startup guard gates only on
+> `CAP_SYS_ADMIN`. The backfill is best-effort instead: if it can't re-tag a volume
+> it logs `quota backfill: failed to re-apply quota` and increments
+> `volume_quota_backfill_total{outcome="failed"}`, leaving that one volume
+> unenforced. To heal such volumes, grant `CAP_FOWNER` and restart the backend (or
+> re-provision them).
 
 #### zfs (best for snapshots/backups)
 
@@ -175,6 +192,11 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `production_mode: true` — strongly recommended in production (forces replay protection, blocks SSRF, blocks `grpc_tls_skip_verify`)
 - `token_tracker_db_path` — required when `production_mode: true`
 
+**Environment variables** (providerd):
+
+- `FRED_KEYRING_PASSPHRASE` — **required** when `keyring_backend` is `file` (the default); the signer pool hard-fails at startup without it. Not needed for `keyring_backend: test` or `os`. Pass it via a systemd `EnvironmentFile=` (see [Process management](#process-management-systemd)), not `Environment=`, so it isn't exposed via `systemctl show`.
+- `FRED_MNEMONIC` — first-boot only; **required** when `sub_signer_count > 0` so the signer pool can derive its sub-signer keys. Without it the pool runs single-signer (logged as a warning, no hard fail). It can be unset on later boots once the sub-keys persist in the keyring.
+
 **`docker-backend.yaml`**:
 
 - `host_address` — public IP or hostname tenants will use to reach containers
@@ -214,6 +236,10 @@ Wants=network-online.target
 Type=simple
 User=fred
 Group=fred
+# Secrets (file chmod 0600, owned by fred): FRED_KEYRING_PASSPHRASE — required for
+# the default keyring_backend: file — plus FRED_MNEMONIC on first boot when
+# sub_signer_count > 0. EnvironmentFile= keeps them out of 'systemctl show' (unlike Environment=).
+EnvironmentFile=/etc/fred/providerd.env
 ExecStart=/usr/local/bin/providerd -c /etc/fred/config.yaml
 Restart=on-failure
 RestartSec=5s
@@ -236,7 +262,7 @@ WantedBy=multi-user.target
 
 `docker-backend.service` is the same shape with three differences:
 - It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root. Note this makes the docker-backend effectively host-root-equivalent regardless of `User=` (access to a rootful Docker socket can launch a privileged container) — so unlike `providerd`, its minimal-capability hardening is partly cosmetic. The real lever for de-privileging it is rootless Docker.
-- **On XFS hosts it needs `CAP_SYS_ADMIN`** to set per-volume project quotas (see the xfs section above). Add `AmbientCapabilities=CAP_SYS_ADMIN` and include `CAP_SYS_ADMIN` in `CapabilityBoundingSet` — ambient capabilities are compatible with `NoNewPrivileges=true`. Scope this to `docker-backend` only; `providerd` does not need it. (btrfs `subvolume`/`qgroup` and zfs `create`/`set` are likewise privileged; zfs alternatively supports `zfs allow` delegation.) Note: a plain `setcap cap_sys_admin+ep` on the binary is **not** sufficient — the daemon shells out to `xfs_quota`/`btrfs`, and a file-capability grant does not propagate to those child processes (it clears the ambient set). Use `AmbientCapabilities` (or run as root); the daemon refuses to start otherwise.
+- **On XFS hosts it needs `CAP_SYS_ADMIN` and `CAP_FOWNER`** to set per-volume project quotas (see the xfs section above): `CAP_SYS_ADMIN` to set the block limit, and `CAP_FOWNER` so the startup backfill can re-tag tenant-owned volume directories with their project ID. Add `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` and include both in `CapabilityBoundingSet` — ambient capabilities are compatible with `NoNewPrivileges=true`. Scope this to `docker-backend` only; `providerd` does not need it. (btrfs `subvolume`/`qgroup` and zfs `create`/`set` are likewise privileged; zfs alternatively supports `zfs allow` delegation.) Note: a plain `setcap cap_sys_admin,cap_fowner+ep` on the binary is **not** sufficient — the daemon shells out to `xfs_quota`/`btrfs`, and a file-capability grant does not propagate to those child processes (it clears the ambient set). Use `AmbientCapabilities` (or run as root); the daemon refuses to start without `CAP_SYS_ADMIN`.
 - `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `volume_data_path`, and — when retention is enabled — `retention_db_path`.
 
 `TimeoutStopSec` should comfortably exceed the graceful-drain window so systemd doesn't SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your config (default 30s); the `docker-backend` uses a fixed 30s drain (not configurable).
@@ -390,6 +416,8 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
 Fred does not currently support graceful in-place upgrades. The startup sequence (chain reconnect, reconciliation, accept callbacks) takes seconds; the brief downtime is generally acceptable. For zero-downtime, use the multi-instance pattern under [Secret rotation](#secret-rotation).
 
 Schema migrations: the bbolt files carry no explicit schema version, and Fred does **not** run schema migrations on them. An entry a newer build cannot decode is dropped (not migrated) the next time that store's age-based cleanup runs. Rolling back to an older Fred after a newer version has written is likewise not guaranteed. **Take a backup before upgrading.**
+
+> **Upgrading an XFS backend from before ENG-454/ENG-459:** it may carry orphaned XFS project-quota table entries left by volumes destroyed under the older build. New leaks are prevented going forward, but pre-existing entries are not swept automatically — `xfs_quota report -p` is filesystem-global, so Fred cannot distinguish its own orphaned entries from live foreign project limits. Clear each stale project ID with a one-time manual `xfs_quota -x -c 'limit -p bhard=0 <projid>' <mount>`.
 
 ---
 
