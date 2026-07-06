@@ -339,6 +339,23 @@ var (
 	}, []string{"query"})
 )
 
+// Withdraw metrics
+var (
+	// WithdrawIncompleteCyclesTotal counts provider-wide withdrawal cycles that
+	// hit the per-cycle iteration bound (max_withdraw_iterations) while the
+	// pagination cursor was still non-empty — i.e. the provider was not fully
+	// drained in that cycle. This is not fund loss (lease close settles
+	// everything) but defers active-lease collection to the next cycle. A
+	// sustained non-zero rate means the iteration bound is too low for the
+	// provider's active-lease count (ENG-475).
+	WithdrawIncompleteCyclesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "withdraw",
+		Name:      "incomplete_cycles_total",
+		Help:      "Provider-wide withdrawal cycles that hit the iteration bound with the pagination cursor still non-empty (provider not fully drained).",
+	})
+)
+
 // Watermill metrics
 var (
 	// WatermillMessagesTotal tracks Watermill message processing.

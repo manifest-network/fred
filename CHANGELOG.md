@@ -14,6 +14,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Provider-wide withdrawal now pages through **all** of a provider's active
+  leases within a single cycle, threading the chain's opaque `next_key`
+  pagination cursor until it is empty (bounded by `max_withdraw_iterations`).
+  Previously fred issued one default-limit withdrawal per tick and discarded
+  `has_more`, so a provider with more active leases than the per-transaction
+  limit had its tail leases left unsettled until lease close — deferred, uneven,
+  and silent revenue collection. A new metric
+  `fred_withdraw_incomplete_cycles_total` flags a cycle that hit the iteration
+  bound with leases still pending. Requires the paginated-withdrawal chain
+  change (manifest-ledger). (ENG-475)
+
 ### Deprecated
 
 ### Removed

@@ -6,8 +6,10 @@
 // WithdrawScheduler runs two coupled loops:
 //
 //  1. A timer-driven withdrawal at a fixed interval (`withdraw_interval`,
-//     default 1h). Each tick submits MsgWithdrawByProvider to drain accumulated
-//     fees from active leases into the provider's account.
+//     default 1h). Each tick pages MsgWithdraw through all of the provider's
+//     active leases — threading the chain's opaque next_key cursor until it is
+//     empty, bounded by `max_withdraw_iterations` — to drain accumulated fees
+//     into the provider's account.
 //
 //  2. A credit-depletion check that runs after each withdrawal. It samples
 //     tenant credit balances, estimates depletion time, and schedules an

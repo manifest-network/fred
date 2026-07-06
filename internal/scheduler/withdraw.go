@@ -29,7 +29,7 @@ const (
 // ChainClient defines the interface for chain operations needed by the scheduler.
 type ChainClient interface {
 	GetProviderWithdrawable(ctx context.Context, providerUUID string) (sdktypes.Coins, error)
-	WithdrawByProvider(ctx context.Context, providerUUID string) (string, error)
+	WithdrawByProvider(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error)
 	GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	GetCreditAccount(ctx context.Context, tenant string) (*billingtypes.CreditAccount, sdktypes.Coins, error)
 	CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
@@ -294,7 +294,15 @@ func (s *WithdrawScheduler) withdrawAndCheckCredits(ctx context.Context) {
 	slog.Debug("next credit check scheduled", "at", nextCheck, "in", time.Until(nextCheck))
 }
 
-// withdraw performs a withdrawal, handling pagination if there are more leases.
+// withdraw drains a provider's withdrawable lease fees for one cycle.
+//
+// Provider-wide withdrawal is paginated by an opaque cursor: each MsgWithdraw
+// settles up to the chain's page limit and returns a next_key that resumes
+// strictly past the settled leases (keyset pagination). We thread that cursor,
+// looping until it is empty (the provider is fully drained) or we hit
+// maxWithdrawIterations. Hitting the bound is not fund loss — lease close
+// settles everything — but it defers active-lease collection to the next cycle,
+// so it is surfaced via WithdrawIncompleteCyclesTotal for alerting.
 func (s *WithdrawScheduler) withdraw(ctx context.Context) error {
 	slog.Info("checking withdrawable amounts", "provider_uuid", s.providerUUID)
 
@@ -339,14 +347,53 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) error {
 
 	slog.Info("withdrawable amounts available", "amounts", withdrawable)
 
-	txHash, err := s.client.WithdrawByProvider(ctx, s.providerUUID)
-	if err != nil {
-		return fmt.Errorf("withdrawal failed: %w", err)
+	// Page through the provider's active leases, threading the opaque cursor.
+	// A page error is fatal for this cycle: WithdrawByProvider already retries
+	// transient tx failures internally, and re-driving a possibly-committed
+	// withdraw could double-process — the next tick is the cycle-level retry.
+	var key []byte
+	for page := 1; page <= s.maxWithdrawIterations; page++ {
+		txHash, resp, err := s.client.WithdrawByProvider(ctx, s.providerUUID, key)
+		if err != nil {
+			return fmt.Errorf("withdrawal failed (page %d): %w", page, err)
+		}
+		if resp == nil {
+			return fmt.Errorf("withdrawal returned nil response (page %d)", page)
+		}
+
+		slog.Info("withdrawal page complete",
+			"provider_uuid", s.providerUUID,
+			"tx_hash", txHash,
+			"page", page,
+			"leases_settled", resp.WithdrawalCount,
+		)
+
+		if len(resp.NextKey) == 0 {
+			slog.Info("withdrawal cycle complete",
+				"provider_uuid", s.providerUUID,
+				"pages", page,
+			)
+			return nil
+		}
+		key = resp.NextKey
+
+		// Abort before starting the next page if the context was canceled
+		// (e.g. shutdown). The check is deliberately after the first page so a
+		// cycle always issues at least one withdrawal attempt; the next tick
+		// resumes from the beginning.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 	}
 
-	slog.Info("withdrawal complete",
+	// Cursor still advancing after maxWithdrawIterations pages: the provider has
+	// more active leases than one cycle drains at the current bound. Not fund
+	// loss, but active-lease revenue is deferred to the next cycle — surface it
+	// so operators can raise max_withdraw_iterations.
+	metrics.WithdrawIncompleteCyclesTotal.Inc()
+	slog.Warn("withdrawal cycle hit iteration bound; provider not fully drained this cycle",
 		"provider_uuid", s.providerUUID,
-		"tx_hash", txHash,
+		"max_iterations", s.maxWithdrawIterations,
 	)
 	return nil
 }

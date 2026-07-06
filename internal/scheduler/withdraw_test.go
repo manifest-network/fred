@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,7 +24,7 @@ import (
 // mockChainClient implements ChainClient interface for testing.
 type mockChainClient struct {
 	GetProviderWithdrawableFunc   func(ctx context.Context, providerUUID string) (sdktypes.Coins, error)
-	WithdrawByProviderFunc        func(ctx context.Context, providerUUID string) (string, error)
+	WithdrawByProviderFunc        func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error)
 	GetActiveLeasesByProviderFunc func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	GetCreditAccountFunc          func(ctx context.Context, tenant string) (*billingtypes.CreditAccount, sdktypes.Coins, error)
 	CloseLeasesFunc               func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
@@ -36,11 +37,11 @@ func (m *mockChainClient) GetProviderWithdrawable(ctx context.Context, providerU
 	return nil, nil
 }
 
-func (m *mockChainClient) WithdrawByProvider(ctx context.Context, providerUUID string) (string, error) {
+func (m *mockChainClient) WithdrawByProvider(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 	if m.WithdrawByProviderFunc != nil {
-		return m.WithdrawByProviderFunc(ctx, providerUUID)
+		return m.WithdrawByProviderFunc(ctx, providerUUID, key)
 	}
-	return "", nil
+	return "", &billingtypes.MsgWithdrawResponse{}, nil
 }
 
 func (m *mockChainClient) GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
@@ -133,9 +134,9 @@ func TestWithdrawScheduler_Withdraw_NothingToWithdraw(t *testing.T) {
 		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
 			return sdktypes.Coins{}, nil // Empty coins
 		},
-		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 			withdrawCalled = true
-			return "", nil
+			return "", &billingtypes.MsgWithdrawResponse{}, nil
 		},
 	}
 
@@ -156,9 +157,9 @@ func TestWithdrawScheduler_Withdraw_Success(t *testing.T) {
 		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
 			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
 		},
-		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 			withdrawCalls++
-			return "txhash123", nil
+			return "txhash123", &billingtypes.MsgWithdrawResponse{}, nil
 		},
 	}
 
@@ -179,9 +180,9 @@ func TestWithdrawScheduler_Withdraw_Error(t *testing.T) {
 		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
 			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
 		},
-		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 			withdrawCalls++
-			return "", errors.New("withdrawal failed")
+			return "", nil, errors.New("withdrawal failed")
 		},
 	}
 
@@ -207,8 +208,8 @@ func TestWithdrawScheduler_Withdraw_RetryOnError(t *testing.T) {
 			}
 			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
 		},
-		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
-			return "txhash", nil
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+			return "txhash", &billingtypes.MsgWithdrawResponse{}, nil
 		},
 	}
 
@@ -223,6 +224,155 @@ func TestWithdrawScheduler_Withdraw_RetryOnError(t *testing.T) {
 	s.withdraw(ctx)
 
 	assert.Equal(t, int32(3), atomic.LoadInt32(&getCalls), "GetProviderWithdrawable called unexpected number of times (want 2 retries + 1 success)")
+}
+
+// TestWithdrawScheduler_Withdraw_PaginatesUntilCursorEmpty verifies that
+// withdraw() pages through the provider's leases, echoing each returned
+// next_key back as the next request cursor, and stops when the cursor is empty.
+func TestWithdrawScheduler_Withdraw_PaginatesUntilCursorEmpty(t *testing.T) {
+	var gotKeys [][]byte
+
+	client := &mockChainClient{
+		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+		},
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+			gotKeys = append(gotKeys, key)
+			page := len(gotKeys)
+			if page < 3 {
+				return fmt.Sprintf("tx%d", page), &billingtypes.MsgWithdrawResponse{
+					NextKey: []byte(fmt.Sprintf("cursor-%d", page)),
+					HasMore: true,
+				}, nil
+			}
+			return "tx3", &billingtypes.MsgWithdrawResponse{}, nil // drained
+		},
+	}
+
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID: "test-uuid",
+		Interval:     time.Minute,
+	})
+
+	err := s.withdraw(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, gotKeys, 3, "should page until the cursor is empty")
+	assert.Nil(t, gotKeys[0], "first page must start from an empty cursor")
+	assert.Equal(t, []byte("cursor-1"), gotKeys[1], "second page must echo the first next_key")
+	assert.Equal(t, []byte("cursor-2"), gotKeys[2], "third page must echo the second next_key")
+}
+
+// TestWithdrawScheduler_Withdraw_StopsAtIterationBoundAndReportsIncomplete
+// verifies the safety bound: if the cursor never empties, withdraw() stops
+// after maxWithdrawIterations pages and increments the under-collection metric.
+func TestWithdrawScheduler_Withdraw_StopsAtIterationBoundAndReportsIncomplete(t *testing.T) {
+	var calls int
+
+	client := &mockChainClient{
+		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+		},
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+			calls++
+			// Never drains: always returns a non-empty cursor.
+			return "tx", &billingtypes.MsgWithdrawResponse{NextKey: []byte("more"), HasMore: true}, nil
+		},
+	}
+
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID:          "test-uuid",
+		Interval:              time.Minute,
+		MaxWithdrawIterations: 5,
+	})
+
+	before := promtestutil.ToFloat64(metrics.WithdrawIncompleteCyclesTotal)
+
+	err := s.withdraw(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, 5, calls, "must stop at the iteration bound")
+	assert.Equal(t, before+1, promtestutil.ToFloat64(metrics.WithdrawIncompleteCyclesTotal),
+		"incomplete-cycle metric must increment when the bound is hit with a non-empty cursor")
+}
+
+// TestWithdrawScheduler_Withdraw_ErrorMidPagination verifies a page error is
+// fatal for the cycle: withdraw() returns the wrapped error and stops.
+func TestWithdrawScheduler_Withdraw_ErrorMidPagination(t *testing.T) {
+	var calls int
+
+	client := &mockChainClient{
+		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+		},
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+			calls++
+			if calls == 2 {
+				return "", nil, errors.New("page 2 boom")
+			}
+			return "tx1", &billingtypes.MsgWithdrawResponse{NextKey: []byte("cursor-1"), HasMore: true}, nil
+		},
+	}
+
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID: "test-uuid",
+		Interval:     time.Minute,
+	})
+
+	err := s.withdraw(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "page 2")
+	assert.Equal(t, 2, calls, "must stop paginating on the failing page")
+}
+
+// TestWithdrawScheduler_Withdraw_ContextCanceledMidPagination verifies the loop
+// aborts promptly when the context is canceled between pages.
+func TestWithdrawScheduler_Withdraw_ContextCanceledMidPagination(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+
+	client := &mockChainClient{
+		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+		},
+		WithdrawByProviderFunc: func(_ context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+			calls++
+			cancel() // cancel mid-cycle; a non-empty cursor would otherwise continue
+			return "tx", &billingtypes.MsgWithdrawResponse{NextKey: []byte("more"), HasMore: true}, nil
+		},
+	}
+
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID: "test-uuid",
+		Interval:     time.Minute,
+	})
+
+	err := s.withdraw(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, calls, "must stop paginating once the context is canceled")
+}
+
+// TestWithdrawScheduler_Withdraw_NilResponseIsError covers the defensive guard
+// against a client returning (hash, nil, nil): the cycle must error rather than
+// nil-deref the response.
+func TestWithdrawScheduler_Withdraw_NilResponseIsError(t *testing.T) {
+	client := &mockChainClient{
+		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+		},
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+			return "tx", nil, nil // misbehaving client: no error, no response
+		},
+	}
+
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID: "test-uuid",
+		Interval:     time.Minute,
+	})
+
+	err := s.withdraw(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil response")
 }
 
 func TestWithdrawScheduler_CheckCreditsAndClose_NoLeases(t *testing.T) {
@@ -464,12 +614,12 @@ func TestWithdrawScheduler_TriggerWithdraw(t *testing.T) {
 		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
 			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
 		},
-		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 			mu.Lock()
 			atomic.AddInt32(&withdrawCalled, 1)
 			mu.Unlock()
 			wg.Done()
-			return "txhash", nil
+			return "txhash", &billingtypes.MsgWithdrawResponse{}, nil
 		},
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{}, nil
@@ -503,9 +653,9 @@ func TestWithdrawScheduler_WithdrawOnce(t *testing.T) {
 		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
 			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
 		},
-		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 			withdrawCalled = true
-			return "txhash", nil
+			return "txhash", &billingtypes.MsgWithdrawResponse{}, nil
 		},
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			creditCheckCalled = true
@@ -800,12 +950,12 @@ func TestTriggerWithdraw_PanicDoesNotCrashFred(t *testing.T) {
 		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
 			return sdktypes.NewCoins(sdktypes.NewCoin("utoken", sdkmath.NewInt(100))), nil
 		},
-		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string) (string, error) {
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 			count := callCount.Add(1)
 			if count == 1 {
 				panic("synthetic chain client panic")
 			}
-			return "tx-hash", nil
+			return "tx-hash", &billingtypes.MsgWithdrawResponse{}, nil
 		},
 	}
 

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -14,12 +15,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"cosmossdk.io/math"
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	"github.com/cosmos/cosmos-sdk/types/tx"
@@ -1326,13 +1329,97 @@ func TestClient_CloseLeases(t *testing.T) {
 	assert.Len(t, hashes, 1)
 }
 
-func TestClient_WithdrawByProvider(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		c, _ := setupTxMocks(t)
+// withdrawTxData builds the hex-encoded TxResponse.Data a GetTx would return
+// for a MsgWithdraw tx carrying the given response, mirroring how the chain
+// packs MsgResponses into sdk.TxMsgData.
+func withdrawTxData(t *testing.T, resp *billingtypes.MsgWithdrawResponse) string {
+	t.Helper()
+	respBz, err := resp.Marshal()
+	require.NoError(t, err)
+	msgData := sdktypes.TxMsgData{
+		MsgResponses: []*codectypes.Any{{
+			TypeUrl: sdktypes.MsgTypeURL(&billingtypes.MsgWithdrawResponse{}),
+			Value:   respBz,
+		}},
+	}
+	dataBz, err := msgData.Marshal()
+	require.NoError(t, err)
+	return hex.EncodeToString(dataBz)
+}
 
-		hash, err := c.WithdrawByProvider(t.Context(), "prov-1")
+func TestClient_WithdrawByProvider(t *testing.T) {
+	t.Run("success decodes cursor from response", func(t *testing.T) {
+		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
+		addr, err := sdktypes.AccAddressFromBech32(s.address)
 		require.NoError(t, err)
-		assert.NotEmpty(t, hash)
+		accountAny := newTestAccountAny(t, addr, 1, 0)
+
+		aq := &mockAuthQuery{
+			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			},
+		}
+		data := withdrawTxData(t, &billingtypes.MsgWithdrawResponse{
+			WithdrawalCount: 7,
+			HasMore:         true,
+			NextKey:         []byte("cursor-1"),
+		})
+		ts := &mockTxService{
+			SimulateFn: okSimulate(200000),
+			BroadcastTxFn: func(context.Context, *tx.BroadcastTxRequest, ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+				return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TXWITHDRAW"}}, nil
+			},
+			GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+				return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash, Data: data}}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
+
+		hash, resp, err := c.WithdrawByProvider(t.Context(), "prov-1", nil)
+		require.NoError(t, err)
+		assert.Equal(t, "TXWITHDRAW", hash)
+		require.NotNil(t, resp)
+		assert.Equal(t, uint64(7), resp.WithdrawalCount)
+		assert.True(t, resp.HasMore)
+		assert.Equal(t, []byte("cursor-1"), resp.NextKey)
+	})
+
+	t.Run("forwards cursor into MsgWithdraw.Key", func(t *testing.T) {
+		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
+		addr, err := sdktypes.AccAddressFromBech32(s.address)
+		require.NoError(t, err)
+		accountAny := newTestAccountAny(t, addr, 1, 0)
+
+		aq := &mockAuthQuery{
+			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			},
+		}
+		data := withdrawTxData(t, &billingtypes.MsgWithdrawResponse{})
+		var sentKey []byte
+		ts := &mockTxService{
+			SimulateFn: okSimulate(200000),
+			BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+				decoded, decErr := s.txConfig.TxDecoder()(req.TxBytes)
+				require.NoError(t, decErr)
+				msgs := decoded.GetMsgs()
+				require.Len(t, msgs, 1)
+				wd, ok := msgs[0].(*billingtypes.MsgWithdraw)
+				require.True(t, ok, "broadcast msg must be *MsgWithdraw")
+				sentKey = wd.Key
+				return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TXKEY"}}, nil
+			},
+			GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+				return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash, Data: data}}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
+
+		_, _, err = c.WithdrawByProvider(t.Context(), "prov-1", []byte("cursor-xyz"))
+		require.NoError(t, err)
+		assert.Equal(t, []byte("cursor-xyz"), sentKey, "the opaque cursor must be forwarded into MsgWithdraw.Key")
 	})
 
 	t.Run("broadcast failure", func(t *testing.T) {
@@ -1354,9 +1441,53 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 		}
 		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts })
 
-		_, err := c.WithdrawByProvider(t.Context(), "prov-1")
+		_, _, err := c.WithdrawByProvider(t.Context(), "prov-1", nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to withdraw")
+	})
+}
+
+func TestDecodeWithdrawResponse(t *testing.T) {
+	valid := withdrawTxData(t, &billingtypes.MsgWithdrawResponse{WithdrawalCount: 3, HasMore: false})
+
+	t.Run("valid", func(t *testing.T) {
+		resp, err := decodeWithdrawResponse(valid)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(3), resp.WithdrawalCount)
+		assert.Empty(t, resp.NextKey)
+	})
+
+	t.Run("uppercase hex", func(t *testing.T) {
+		resp, err := decodeWithdrawResponse(strings.ToUpper(valid))
+		require.NoError(t, err)
+		assert.Equal(t, uint64(3), resp.WithdrawalCount)
+	})
+
+	t.Run("empty data has no responses", func(t *testing.T) {
+		_, err := decodeWithdrawResponse("")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no message responses")
+	})
+
+	t.Run("invalid hex", func(t *testing.T) {
+		_, err := decodeWithdrawResponse("zz")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "decode tx data hex")
+	})
+
+	t.Run("wrong response type", func(t *testing.T) {
+		otherBz, err := (&billingtypes.MsgWithdraw{}).Marshal()
+		require.NoError(t, err)
+		msgData := sdktypes.TxMsgData{MsgResponses: []*codectypes.Any{{
+			TypeUrl: "/some.other.Type",
+			Value:   otherBz,
+		}}}
+		bz, err := msgData.Marshal()
+		require.NoError(t, err)
+
+		_, err = decodeWithdrawResponse(hex.EncodeToString(bz))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unexpected msg response type")
 	})
 }
 
