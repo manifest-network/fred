@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- docker-backend: end-to-end integration test proving `Restore()` re-applies the
+  correct XFS disk quota (`bhard`) on a SKU promote/demote and refuses an
+  over-cap demote — closes the restore→quota-reapply routing gap. (ENG-438)
+
 ### Changed
 
 ### Deprecated
