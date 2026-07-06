@@ -110,7 +110,7 @@ What to look at:
 
 - **`state`** — `PENDING` (waiting for provisioning), `ACTIVE` (running), `CLOSED`, `EXPIRED`.
 - **`requires_payload`** — if `true` and `payload_received` is `false`, you need to upload a manifest before provisioning can start.
-- **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`).
+- **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`).
 - **`fail_count`** + **`last_error`** — present after failures; only the count and most recent message.
 
 For richer diagnostics during failures, use `GET /v1/leases/{uuid}/provision` (see [Step 5](#step-5-debug-failures)).
@@ -289,7 +289,7 @@ The body shape is different from `/data` — the manifest is base64-encoded insi
 
 ### Restore — recover a soft-deleted lease's data
 
-When a lease is closed, its volumes are not destroyed immediately; they are soft-deleted (retained) for a grace window so the data can be recovered. `POST /v1/leases/{lease_uuid}/restore` restores a soft-deleted (retained) lease's data into a fresh lease. Request body: `{"from_lease_uuid": "<source lease UUID>"}`. The target lease must be freshly PENDING and share the source's item shape; the call is authenticated with an ADR-036 bearer token and is replay-protected. Restore is pinned to the source lease's backend (node affinity).
+When a lease is closed, its volumes are not destroyed immediately; they are soft-deleted (retained) for a grace window so the data can be recovered. `POST /v1/leases/{lease_uuid}/restore` restores a soft-deleted (retained) lease's data into a fresh lease. Request body: `{"from_lease_uuid": "<source lease UUID>"}`. The target lease must be freshly PENDING and share the source's item shape — the same service names and quantities, though the SKU (disk tier) MAY differ; the call is authenticated with an ADR-036 bearer token and is replay-protected. Restore is pinned to the source lease's backend (node affinity).
 
 ```bash
 # $LEASE_UUID is the NEW, freshly PENDING lease (also the token's -lease-uuid).
@@ -300,7 +300,7 @@ curl -X POST -H "Authorization: Bearer $(fresh_token)" \
   https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/restore
 ```
 
-The new lease must be `PENDING` (a fresh lease that hasn't been provisioned) and must match the source lease's item shape — restore replays the manifest into it exactly like provisioning. A non-PENDING target returns `409 Conflict`; if no retained data remains for `from_lease_uuid` (the grace window lapsed or the source's backend is gone) you get `404 Not Found`. Use [`GET /v1/leases/{uuid}/status`](#step-2-check-lease-status) on the source lease to confirm it is still retained and to read its restore shape before you create the target lease.
+The new lease must be `PENDING` (a fresh lease that hasn't been provisioned) and must match the source lease's item shape — the same service names and quantities — because restore replays the manifest into it exactly like provisioning. The SKU (disk tier) MAY differ from the source's: **promoting** to a same-or-larger tier always succeeds and applies the new `disk_mb` cap, while **demoting** to a smaller tier succeeds only when the retained volume's measured data still fits the smaller tier's `disk_mb` cap. A non-PENDING target returns `409 Conflict`; if no retained data remains for `from_lease_uuid` (the grace window lapsed or the source's backend is gone) you get `404 Not Found`. A restore that **demotes** to a disk tier too small for the retained data is refused with `422 Unprocessable Entity`; the response `error` message begins `retained data exceeds the requested smaller tier` — restore into the original or a larger tier instead. Use [`GET /v1/leases/{uuid}/status`](#step-2-check-lease-status) on the source lease to confirm it is still retained and to read its restore shape before you create the target lease.
 
 Both `/restart` and `/update` (and `/restore`) enforce **replay protection** since they're mutating. Each retry needs a fresh token (hence `$(fresh_token)` rather than a stored `$TOKEN` variable).
 

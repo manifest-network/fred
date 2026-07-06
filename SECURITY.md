@@ -146,7 +146,7 @@ Private IPs (RFC 1918) are intentionally allowed since backends commonly run on 
 
 ### Request Body Limits
 
-All requests are wrapped with `http.MaxBytesReader` enforcing a configurable maximum (default 1MB).
+All requests are wrapped with `http.MaxBytesReader` enforcing a configurable maximum via `max_request_body_size`. The tenant-facing API (providerd) defaults to 1 MiB; the docker and k3s backends default to 2 MiB (`DefaultMaxRequestBodySize = 2 << 20`) to leave headroom over the raw tenant body providerd forwards. The backend defaults are overridable via `max_request_body_size` in the backend YAML or the `{DOCKER,K3S}_BACKEND_MAX_REQUEST_BODY_SIZE` env vars (ENG-448).
 
 ### Query Parameter Bounds
 
@@ -218,7 +218,7 @@ Optional TLS for the gRPC connection to the chain. Supports custom CA file. `grp
 
 Optional TLS, including mutual TLS, on the providerd → backend HTTP transport. TLS is opt-in: when no TLS fields are configured the hop serves plaintext HTTP (the default). When enabled, both sides pin TLS 1.3 as the minimum version (`internal/tlsconfig/tlsconfig.go:37,61`). Certificates are loaded once at startup; rotation requires a restart (tracked in ENG-294).
 
-**Server side (docker-backend YAML, `internal/backend/docker/config.go:44-60`):**
+**Server side (docker-backend YAML, `internal/backend/docker/config.go:65-81`):**
 
 | Field | Effect |
 |-------|--------|
@@ -228,7 +228,7 @@ Optional TLS, including mutual TLS, on the providerd → backend HTTP transport.
 
 Wired via `tlsconfig.ServerConfig` (`cmd/docker-backend/main.go:108-115`).
 
-**Client side (providerd `backends[]`, `internal/config/config.go:138-141`):**
+**Client side (providerd `backends[]`, `internal/config/config.go:144-147`):**
 
 | Field | Effect |
 |-------|--------|
@@ -236,7 +236,7 @@ Wired via `tlsconfig.ServerConfig` (`cmd/docker-backend/main.go:108-115`).
 | `tls_client_cert_file`, `tls_client_key_file` | Client cert/key presented for mutual TLS (both or neither) |
 | `tls_skip_verify` | Disable server cert verification (dev only; blocked in production mode) |
 
-Wired via `tlsconfig.ClientConfig` (`cmd/providerd/main.go:249-255`).
+Wired via `tlsconfig.ClientConfig` (`cmd/providerd/main.go:263`).
 
 **Client-identity pinning.** `tls.Config.RequireAndVerifyClientCert` only proves the client's certificate chains to the configured CA — it does not check *who* the client is. Without `tls_client_allowed_names`, any certificate signed by the configured client CA is accepted. When `tls_client_allowed_names` is set, the verified client leaf's CommonName or one of its DNS SANs must appear in the list. The check is implemented as a `tls.Config.VerifyConnection` callback, **not** `VerifyPeerCertificate` — a `VerifyPeerCertificate` callback is skipped on resumed TLS sessions, so using it would let a previously-authenticated client resume a session and bypass the name pin. `VerifyConnection` runs on every handshake, including resumptions, closing that bypass (`internal/tlsconfig/tlsconfig.go:24-27,47-49,84-113`).
 
@@ -272,10 +272,13 @@ Every container created by the Docker backend runs with these security measures:
 | Tmpfs for writable paths | `/tmp` and `/run` mounted as tmpfs | Size from `container_tmpfs_size_mb` (default 64MB) |
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | No swap | `MemorySwap == Memory` | Prevents swap usage entirely |
+| Per-volume disk quota | `bhard` block limit (xfs project quota / btrfs qgroup) | Enforces the SKU `disk_mb` cap on stateful volumes; requires the daemon capability noted below |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
 | Network isolation | Per-tenant bridge network | Configurable via `network_isolation` |
 
 Network isolation places each tenant's containers in a dedicated Docker bridge network. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between different bridge networks, preventing cross-tenant communication.
+
+**Daemon capabilities vs. container privileges.** The controls above constrain the tenant *container*, which continues to run with `CapDrop: ["ALL"]` — that is unchanged. Enforcing the per-volume disk quota, however, requires the docker-backend *daemon itself* to hold `CAP_SYS_ADMIN` to set the xfs/btrfs block limit — granted via `AmbientCapabilities=CAP_SYS_ADMIN` on the systemd unit, or by running as root. On an xfs or btrfs backend the daemon **fails fast at startup** if it lacks `CAP_SYS_ADMIN`, rather than silently skipping the cap and leaving `disk_mb` unenforced (`internal/backend/docker/capability.go`). zfs is exempt (it uses `zfs allow` delegation, so a cap check would wrongly reject a properly-delegated non-root host); the noop backend is unaffected. The startup backfill that re-tags pre-existing tenant-owned volumes with their project ID additionally needs `CAP_FOWNER` (best-effort — a missing `CAP_FOWNER` does not fail startup). See [DEPLOYMENT.md](DEPLOYMENT.md) — filesystem setup (xfs) and the systemd capabilities note — for the full `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` grant procedure.
 
 ## Error Handling
 
