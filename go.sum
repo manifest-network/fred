@@ -1580,8 +1580,8 @@ github.com/mailru/easyjson v0.7.7 h1:UGYAvKxe3sBsEDzO8ZeWOSlIQfWFlxbzLZe7hwFURr0
 github.com/mailru/easyjson v0.7.7/go.mod h1:xzfreul335JAWq5oZzymOObrkdz5UnU4kGfJJLY9Nlc=
 github.com/manifest-network/cosmos-sdk v0.50.14-liftedinit.1 h1:51XJsBI88Ppq0Z+ZEAZhXLUPL1K5gVeIr7GXtlexYTo=
 github.com/manifest-network/cosmos-sdk v0.50.14-liftedinit.1/go.mod h1:hrWEFMU1eoXqLJeE6VVESpJDQH67FS1nnMrQIjO2daw=
-github.com/manifest-network/manifest-ledger v1.0.15-0.20260706192220-049110541f0b h1:fM3XY4474HHJRF3RWz9cXBrZK7swu2Hf7WhE254vOss=
-github.com/manifest-network/manifest-ledger v1.0.15-0.20260706192220-049110541f0b/go.mod h1:xsR6DWw+b29FtuaWVwv0AiZIMjWecsH9PuAFmjQm8Lg=
+github.com/manifest-network/manifest-ledger v1.0.15-0.20260707142555-dcb992d7c9de h1:cd3kyeYnv6Zicfa0VaaSwgBRN38HxV+wz1ZZiO8K5Us=
+github.com/manifest-network/manifest-ledger v1.0.15-0.20260707142555-dcb992d7c9de/go.mod h1:xsR6DWw+b29FtuaWVwv0AiZIMjWecsH9PuAFmjQm8Lg=
 github.com/manifoldco/promptui v0.9.0 h1:3V4HzJk1TtXW1MTZMP7mdlwbBpIinw3HztaIlYthEiA=
 github.com/manifoldco/promptui v0.9.0/go.mod h1:ka04sppxSGFAtxX0qhlYQjISsg9mR4GWtQEhdbn6Pgg=
 github.com/mattn/go-colorable v0.0.9/go.mod h1:9vuHe8Xs5qXnSaW/c/ABM9alt+Vo+STaOChaDxuIBZU=

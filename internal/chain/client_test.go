@@ -730,11 +730,12 @@ func TestClient_GetCreditAccount(t *testing.T) {
 }
 
 func TestClient_GetProviderWithdrawable(t *testing.T) {
-	t.Run("success verifies limit", func(t *testing.T) {
+	t.Run("success verifies page limit", func(t *testing.T) {
 		bq := &mockBillingQuery{
 			ProviderWithdrawableFn: func(_ context.Context, req *billingtypes.QueryProviderWithdrawableRequest, _ ...grpc.CallOption) (*billingtypes.QueryProviderWithdrawableResponse, error) {
-				// queryPageLimit=100, so limit should be 100*10=1000
-				assert.Equal(t, uint64(1000), req.Limit)
+				// queryPageLimit=100, so the page limit should be 100*10=1000
+				require.NotNil(t, req.Pagination)
+				assert.Equal(t, uint64(1000), req.Pagination.Limit)
 				return &billingtypes.QueryProviderWithdrawableResponse{
 					Amounts: sdktypes.NewCoins(sdktypes.NewInt64Coin("umfx", 500)),
 				}, nil
@@ -745,6 +746,33 @@ func TestClient_GetProviderWithdrawable(t *testing.T) {
 		amounts, err := c.GetProviderWithdrawable(t.Context(), "prov-1")
 		require.NoError(t, err)
 		assert.False(t, amounts.IsZero())
+	})
+
+	t.Run("sums amounts across pages", func(t *testing.T) {
+		var calls int
+		bq := &mockBillingQuery{
+			ProviderWithdrawableFn: func(_ context.Context, req *billingtypes.QueryProviderWithdrawableRequest, _ ...grpc.CallOption) (*billingtypes.QueryProviderWithdrawableResponse, error) {
+				calls++
+				require.NotNil(t, req.Pagination)
+				if calls == 1 {
+					assert.Empty(t, req.Pagination.Key, "first page starts from an empty cursor")
+					return &billingtypes.QueryProviderWithdrawableResponse{
+						Amounts:    sdktypes.NewCoins(sdktypes.NewInt64Coin("umfx", 300)),
+						Pagination: &query.PageResponse{NextKey: []byte("k1")},
+					}, nil
+				}
+				assert.Equal(t, []byte("k1"), req.Pagination.Key, "second page echoes the first next_key")
+				return &billingtypes.QueryProviderWithdrawableResponse{
+					Amounts: sdktypes.NewCoins(sdktypes.NewInt64Coin("umfx", 200)),
+				}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.billingQuery = bq })
+
+		amounts, err := c.GetProviderWithdrawable(t.Context(), "prov-1")
+		require.NoError(t, err)
+		assert.Equal(t, int64(500), amounts.AmountOf("umfx").Int64(), "amounts summed across both pages")
+		assert.Equal(t, 2, calls)
 	})
 
 	t.Run("gRPC error", func(t *testing.T) {

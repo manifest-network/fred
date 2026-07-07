@@ -22,8 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   limit had its tail leases left unsettled until lease close — deferred, uneven,
   and silent revenue collection. A new metric
   `fred_withdraw_incomplete_cycles_total` flags a cycle that hit the iteration
-  bound with leases still pending. Requires the paginated-withdrawal chain
-  change (manifest-ledger). (ENG-475)
+  bound with leases still pending. The provider-withdrawable pre-check query is
+  likewise paged and summed across all active leases. Requires the
+  paginated-withdrawal chain change (manifest-ledger). (ENG-475)
 
 ### Deprecated
 

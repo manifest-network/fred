@@ -964,17 +964,33 @@ func (c *Client) GetCreditAccount(ctx context.Context, tenant string) (*billingt
 }
 
 // GetProviderWithdrawable returns the total withdrawable amounts for a provider.
+// The ProviderWithdrawable query is paginated over active leases, so we page
+// through all results and sum the amounts for the full total.
 func (c *Client) GetProviderWithdrawable(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
-	// Use a higher limit for totals query (10x normal page limit)
-	resp, err := c.billingQuery.ProviderWithdrawable(ctx, &billingtypes.QueryProviderWithdrawableRequest{
-		ProviderUuid: providerUUID,
-		Limit:        c.queryPageLimit * 10,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to query provider withdrawable: %w", err)
+	var total sdktypes.Coins
+	var nextKey []byte
+
+	for {
+		resp, err := c.billingQuery.ProviderWithdrawable(ctx, &billingtypes.QueryProviderWithdrawableRequest{
+			ProviderUuid: providerUUID,
+			Pagination: &query.PageRequest{
+				Key:   nextKey,
+				Limit: c.queryPageLimit * 10, // larger page for a totals query
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to query provider withdrawable: %w", err)
+		}
+
+		total = total.Add(resp.Amounts...)
+
+		if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
 	}
 
-	return resp.Amounts, nil
+	return total, nil
 }
 
 // RejectLeases rejects the given pending leases with an optional reason.
