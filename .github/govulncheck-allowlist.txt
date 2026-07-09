@@ -20,6 +20,12 @@ GO-2026-4887   docker/docker — no patched release
 GO-2026-4883   docker/docker — no patched release
 GO-2026-4610   no fix on the binding path — reachable via docker/compose v2 (Fixed in: N/A); the separate docker/cli v29.2.0 fix does not resolve the compose-reachable instance
 #
+# golang.org/x/crypto/openpgp is unmaintained/frozen ("Fixed in: N/A"); no
+# release removes it. fred reaches only the openpgp/armor ASCII-encoding
+# envelope via cosmos-sdk keyring ExportPrivKeyArmor/ImportPrivKey
+# (internal/chain/signer_pool.go), not openpgp message/signature crypto.
+GO-2026-5932   x/crypto/openpgp unmaintained — reached only via cosmos-sdk keyring armor
+#
 # ── Category B: fix exists upstream, but bumping cascades through the
 #    docker/compose v2 toolchain (containerd, buildkit, in-toto are
 #    transitively pinned by docker/compose v2.40.3; bumping them drags
