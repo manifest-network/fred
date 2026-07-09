@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.8.0] - 2026-07-09
+
+### Added
+
 - docker-backend: end-to-end integration test proving `Restore()` re-applies the
   correct XFS disk quota (`bhard`) on a SKU promote/demote and refuses an
   over-cap demote — closes the restore→quota-reapply routing gap. (ENG-438)
@@ -34,6 +48,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 ### Security
+
+- Release binaries are now built with Go 1.26.5, incorporating the standard-
+  library fixes for the `crypto/tls` Encrypted Client Hello privacy leak
+  (GO-2026-5856) and the `os` symlink-with-trailing-slash root escape
+  (GO-2026-4970). (ENG-415)
 
 ## [0.7.0] - 2026-07-03
 
