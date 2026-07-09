@@ -41,6 +41,7 @@ func TestMetricsRegistered(t *testing.T) {
 		NonInFlightCallbacksTotal,
 		ChainTxTotal,
 		ChainQueryDuration,
+		WithdrawIncompleteCyclesTotal,
 		WatermillMessagesTotal,
 		PoisonedMessagesTotal,
 		EventsDroppedTotal,
@@ -83,6 +84,7 @@ func TestMetricsRegistered(t *testing.T) {
 		"fred_signer_pool_size",
 		"fred_signer_pool_lane_count",
 		"fred_backend_routing_fallback_total",
+		"fred_withdraw_incomplete_cycles_total",
 	} {
 		assert.True(t, names[expected], "metric %q should be gathered", expected)
 	}

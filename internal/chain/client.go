@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -487,25 +488,97 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 	)
 }
 
-// WithdrawByProvider withdraws funds from all active leases for a provider.
-// Returns the transaction hash on success.
-// It uses Limit: 0 to let the chain use its configured DefaultProviderWithdrawLimit,
-// which matches the behavior of the CLI's `manifestd tx billing withdraw --provider` command.
-func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string) (string, error) {
+// WithdrawByProvider withdraws funds from one page of a provider's active
+// leases and returns the transaction hash and the decoded response.
+//
+// Provider-wide withdrawal is paginated by an opaque cursor: pass an empty key
+// to start from the beginning, then echo back the returned NextKey to advance
+// to the next page. NextKey is empty once every active lease has been settled
+// (equivalently, MsgWithdrawResponse.HasMore is false). The cursor is opaque —
+// it is passed back verbatim, never parsed. Callers loop until NextKey is empty
+// (see the WithdrawScheduler); the per-cycle bound lives there, not here.
+//
+// Limit is left at 0 so the chain applies its DefaultProviderWithdrawLimit,
+// matching the CLI's `manifestd tx billing withdraw --provider` behavior.
+func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 	msg := &billingtypes.MsgWithdraw{
 		Sender:       c.providerAddress,
 		ProviderUuid: providerUUID,
-		Limit:        0, // Use chain's default limit
+		Limit:        0,   // Use chain's default limit
+		Key:          key, // opaque pagination cursor; empty starts from the beginning
 	}
 
 	txHash, err := c.broadcastTx(ctx, msg)
 	recordTxMetrics("withdraw", err)
 	if err != nil {
-		return "", fmt.Errorf("failed to withdraw: %w", err)
+		return "", nil, fmt.Errorf("failed to withdraw: %w", err)
 	}
 
-	slog.Info("withdrawal completed", "tx_hash", txHash)
-	return txHash, nil
+	// The withdrawal is already committed on-chain; recover the pagination
+	// cursor from the tx result. A decode failure here does not lose funds
+	// (lease close settles everything), but it does stall this cycle's
+	// pagination, so surface it as an error and let the next tick resume.
+	resp, err := c.withdrawResponse(ctx, txHash)
+	if err != nil {
+		return txHash, nil, fmt.Errorf("decode withdraw response for tx %s: %w", txHash, err)
+	}
+
+	slog.Info("withdrawal page completed",
+		"tx_hash", txHash,
+		"leases_settled", resp.WithdrawalCount,
+		"has_more", resp.HasMore,
+	)
+	return txHash, resp, nil
+}
+
+// withdrawResponse fetches the committed tx and decodes its MsgWithdrawResponse.
+// broadcastTx already waited for the tx to be committed, so a direct GetTx
+// normally returns it immediately; waitForTx is a fallback for the rare case
+// where the node queried here has not indexed the tx yet, avoiding waitForTx's
+// leading poll-interval stall on the common path.
+func (c *Client) withdrawResponse(ctx context.Context, txHash string) (*billingtypes.MsgWithdrawResponse, error) {
+	getResp, err := c.txService.GetTx(ctx, &tx.GetTxRequest{Hash: txHash})
+	if err != nil {
+		getResp, err = c.waitForTx(ctx, txHash)
+		if err != nil {
+			return nil, fmt.Errorf("fetch tx: %w", err)
+		}
+	}
+	if getResp == nil || getResp.TxResponse == nil {
+		return nil, fmt.Errorf("tx %s has no response", txHash)
+	}
+	return decodeWithdrawResponse(getResp.TxResponse.Data)
+}
+
+// decodeWithdrawResponse decodes the first message response of a withdrawal tx
+// into a MsgWithdrawResponse. TxResponse.Data is hex-encoded sdk.TxMsgData; the
+// withdraw tx carries exactly one message, so MsgResponses[0] is the withdrawal
+// response. Both TxMsgData and MsgWithdrawResponse are concrete gogoproto types,
+// so no interface registry is required.
+func decodeWithdrawResponse(dataHex string) (*billingtypes.MsgWithdrawResponse, error) {
+	raw, err := hex.DecodeString(dataHex)
+	if err != nil {
+		return nil, fmt.Errorf("decode tx data hex: %w", err)
+	}
+
+	var msgData sdktypes.TxMsgData
+	if err := msgData.Unmarshal(raw); err != nil {
+		return nil, fmt.Errorf("unmarshal tx msg data: %w", err)
+	}
+	if len(msgData.MsgResponses) == 0 {
+		return nil, errors.New("tx has no message responses")
+	}
+
+	respAny := msgData.MsgResponses[0]
+	if wantURL := sdktypes.MsgTypeURL(&billingtypes.MsgWithdrawResponse{}); respAny.TypeUrl != wantURL {
+		return nil, fmt.Errorf("unexpected msg response type %q, want %q", respAny.TypeUrl, wantURL)
+	}
+
+	var resp billingtypes.MsgWithdrawResponse
+	if err := resp.Unmarshal(respAny.Value); err != nil {
+		return nil, fmt.Errorf("unmarshal withdraw response: %w", err)
+	}
+	return &resp, nil
 }
 
 // broadcastTx signs and broadcasts a transaction using the primary signer.
@@ -891,17 +964,33 @@ func (c *Client) GetCreditAccount(ctx context.Context, tenant string) (*billingt
 }
 
 // GetProviderWithdrawable returns the total withdrawable amounts for a provider.
+// The ProviderWithdrawable query is paginated over active leases, so we page
+// through all results and sum the amounts for the full total.
 func (c *Client) GetProviderWithdrawable(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
-	// Use a higher limit for totals query (10x normal page limit)
-	resp, err := c.billingQuery.ProviderWithdrawable(ctx, &billingtypes.QueryProviderWithdrawableRequest{
-		ProviderUuid: providerUUID,
-		Limit:        c.queryPageLimit * 10,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to query provider withdrawable: %w", err)
+	var total sdktypes.Coins
+	var nextKey []byte
+
+	for {
+		resp, err := c.billingQuery.ProviderWithdrawable(ctx, &billingtypes.QueryProviderWithdrawableRequest{
+			ProviderUuid: providerUUID,
+			Pagination: &query.PageRequest{
+				Key:   nextKey,
+				Limit: c.queryPageLimit * 10, // larger page for a totals query
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to query provider withdrawable: %w", err)
+		}
+
+		total = total.Add(resp.Amounts...)
+
+		if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
 	}
 
-	return resp.Amounts, nil
+	return total, nil
 }
 
 // RejectLeases rejects the given pending leases with an optional reason.
