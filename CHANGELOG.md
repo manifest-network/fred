@@ -49,6 +49,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- Release binaries are now built with Go 1.26.5, incorporating the standard-
+  library fixes for the `crypto/tls` Encrypted Client Hello privacy leak
+  (GO-2026-5856) and the `os` symlink-with-trailing-slash root escape
+  (GO-2026-4970). (ENG-415)
+
 ## [0.7.0] - 2026-07-03
 
 ### Added
