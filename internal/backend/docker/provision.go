@@ -36,6 +36,14 @@ func isFlatPayload(data []byte) bool {
 	return !hasServices
 }
 
+// maxLeaseQuantity bounds the total container count a single lease may request.
+// The chain's billing module caps per-item quantity at 1e9, so without this guard an
+// honest max-quantity lease would drive the pre-admission ContainerIDs allocation
+// (make([]string, 0, totalQuantity)) to ~16 GB — an OOM reachable before any admission
+// control. Real leases are a handful of containers; 1024 is far above any single node's
+// real capacity (such a lease would fail admission anyway). (ENG-503)
+const maxLeaseQuantity = 1024
+
 // Provision starts async provisioning of containers.
 // For multi-unit leases (quantity > 1), multiple containers are created.
 // For multi-SKU leases, containers are created with the appropriate profile for each SKU.
@@ -46,6 +54,20 @@ func isFlatPayload(data []byte) bool {
 // container create/start) are communicated via callback.
 func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
 	totalQuantity := req.TotalQuantity()
+
+	// Bound the chain-supplied quantity BEFORE the reservation's ContainerIDs allocation
+	// below. item.Quantity is a uint64→int cast at ingest, so a negative value signals an
+	// overflowed cast; a total above maxLeaseQuantity would drive an unbounded pre-admission
+	// allocation (~16 GB at the chain's 1e9 billing cap) or, if negative, panic the make().
+	// Rejected synchronously as a validation error, before any state is reserved. (ENG-503)
+	for _, item := range req.Items {
+		if item.Quantity < 0 || item.Quantity > maxLeaseQuantity {
+			return fmt.Errorf("%w: item quantity %d out of range [0, %d]", backend.ErrValidation, item.Quantity, maxLeaseQuantity)
+		}
+	}
+	if totalQuantity < 0 || totalQuantity > maxLeaseQuantity {
+		return fmt.Errorf("%w: total quantity %d out of range [0, %d]", backend.ErrValidation, totalQuantity, maxLeaseQuantity)
+	}
 
 	logger := b.logger.With(
 		"lease_uuid", req.LeaseUUID,

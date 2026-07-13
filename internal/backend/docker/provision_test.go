@@ -396,6 +396,43 @@ func TestProvision_UnknownSKU(t *testing.T) {
 	assert.False(t, exists)
 }
 
+// ENG-503: a lease whose total quantity exceeds maxLeaseQuantity must be rejected as a
+// validation error BEFORE the pre-admission ContainerIDs allocation, so a chain-supplied
+// quantity (billing-capped at 1e9) can't drive a ~16 GB make([]string, 0, totalQuantity).
+func TestProvision_RejectsExcessiveQuantity(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+
+	req := newProvisionRequest("lease-huge", "tenant-a", "docker-small", maxLeaseQuantity+1, validManifestJSON("nginx:latest"))
+	err := b.Provision(context.Background(), req)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrValidation)
+
+	// Rejected before any reservation — no provision slot leaked.
+	b.provisionsMu.RLock()
+	_, exists := b.provisions["lease-huge"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, exists, "an over-quota lease must not reserve a provision slot (ENG-503)")
+}
+
+// ENG-503 (defense-in-depth): a negative item quantity — the result of an overflowed
+// uint64→int cast at ingest — must be rejected as a validation error rather than
+// reaching make([]string, 0, negative), which panics.
+func TestProvision_RejectsNegativeQuantity(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+
+	req := newProvisionRequest("lease-neg", "tenant-a", "docker-small", -1, validManifestJSON("nginx:latest"))
+	err := b.Provision(context.Background(), req)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrValidation)
+
+	b.provisionsMu.RLock()
+	_, exists := b.provisions["lease-neg"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, exists)
+}
+
 func TestProvision_InvalidManifest(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
