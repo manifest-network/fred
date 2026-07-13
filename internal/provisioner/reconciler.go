@@ -775,8 +775,8 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 //   - errLeaseAlreadyInFlight: skip (not a real error)
 //   - backend.ErrAlreadyProvisioned: skip (transient race with concurrent Deprovision)
 //   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
-//   - ErrValidation: reject (PENDING) or close (ACTIVE) the lease
-//   - ErrCircuitOpen: transient (breaker auto-recovers) — flag for retry, never terminate
+//   - backend.ErrValidation: reject (PENDING) or close (ACTIVE) the lease
+//   - backend.ErrCircuitOpen: transient (breaker auto-recovers) — flag for retry, never terminate
 //   - other errors: log and flag for retry next cycle
 func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseUUID string, lease billingtypes.Lease, hadError *bool) {
 	if errors.Is(err, errLeaseAlreadyInFlight) {
