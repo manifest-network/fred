@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
@@ -558,6 +560,60 @@ func (b *Backend) recoverState(ctx context.Context) error {
 // This catches volumes leaked by crashes between volume creation and container creation,
 // or between container removal and volume destruction. Called once at startup after
 // recoverState populates the provision map.
+// leaseHasActiveRelease reports whether the lease that owns volume id
+// (fred-{uuid}-{service}-{idx}) still has an active release record. Used to keep
+// the orphan reaper from destroying a live lease's data when its containers were
+// removed out-of-band (ENG-505). Returns false (i.e. treat as reapable) when
+// there is no release store or the name doesn't carry a parseable lease UUID.
+func (b *Backend) leaseHasActiveRelease(volumeID string) bool {
+	if b.releaseStore == nil {
+		return false
+	}
+	leaseUUID, ok := leaseUUIDFromVolumeName(volumeID)
+	if !ok {
+		return false
+	}
+	rel, err := b.releaseStore.LatestActive(leaseUUID)
+	if err != nil {
+		// Fail safe: a transient release-store read error must NOT let the reaper
+		// destroy a volume that may have an active release. Keep it; the next boot
+		// retries. This mirrors the retention-store fail-safe in cleanupOrphaned-
+		// Volumes below (a read failure skips destruction rather than risking it).
+		b.logger.Warn("cleanupOrphanedVolumes: release-store read failed; keeping volume (fail-safe)", "volume_id", volumeID, "error", err)
+		return true
+	}
+	return rel != nil
+}
+
+// leaseUUIDFromVolumeName extracts the lease UUID from a managed volume name of
+// the form fred-{uuid}-{service}-{idx}, where {uuid} is the canonical 36-char
+// form. Returns ("", false) if id does not match that shape.
+func leaseUUIDFromVolumeName(id string) (string, bool) {
+	const prefix = "fred-"
+	rest, ok := strings.CutPrefix(id, prefix)
+	if !ok || len(rest) < 37 || rest[36] != '-' {
+		return "", false
+	}
+	candidate := rest[:36]
+	if _, err := uuid.Parse(candidate); err != nil {
+		return "", false
+	}
+	// Require the {service}-{idx} suffix so only real managed names match, not a
+	// bare fred-{uuid}- prefix. {service} may contain hyphens; {idx} is the
+	// numeric trailer after the last hyphen.
+	suffix := rest[37:]
+	dash := strings.LastIndexByte(suffix, '-')
+	if dash <= 0 || dash == len(suffix)-1 {
+		return "", false
+	}
+	for i := dash + 1; i < len(suffix); i++ {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return "", false
+		}
+	}
+	return candidate, true
+}
+
 func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	volumeIDs, err := b.volumes.List()
 	if err != nil {
@@ -623,6 +679,16 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 			continue
 		}
 		if expected[id] {
+			continue
+		}
+		if b.leaseHasActiveRelease(id) {
+			// A successfully-provisioned lease keeps an active release until it is
+			// cleanly deprovisioned, so a volume whose lease still has one is not a
+			// create-crash leak — its containers were merely removed out-of-band
+			// (e.g. an operator `docker prune`). Reaping it would silently destroy
+			// retained tenant data (ENG-505). Over-keeping a stale volume is the safe
+			// direction here; a genuine leak has no release.
+			b.logger.Warn("cleanupOrphanedVolumes: lease still has an active release; not reaping its volume", "volume_id", id)
 			continue
 		}
 		b.logger.Info("destroying orphaned volume", "volume_id", id)

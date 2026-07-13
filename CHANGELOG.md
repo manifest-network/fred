@@ -26,6 +26,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend: closed three retention/restore data-integrity gaps that could
+  destroy or tear down live tenant data:
+  - the startup orphan-volume reaper no longer destroys a still-open lease's
+    volume when its containers were removed out-of-band (e.g. an operator
+    prune) — it now skips any volume whose lease still has an active release,
+    instead of reaping on a single boot observation. (ENG-505)
+  - the orphan-record pruner no longer prunes a give-up-diverged retention
+    record whose volume is still on disk under its canonical name; it now
+    treats the canonical (not-yet-renamed) form as present, not just the
+    `fred-retained-*` name, so a later boot can't reap the intact data.
+    (ENG-501)
+  - `reconcileRestoring` no longer tears down a running new lease in the
+    Updating/Deprovisioning state when a completed restore's record lingered
+    past a failed terminal delete — it defers for any live non-Failed
+    provision, running the orphaned-restore rollback only for an absent or
+    Failed provision. (ENG-512)
 - scheduler: the withdraw scheduler no longer panics or wedges on a very large
   credit balance. `estimateDepletionTime` converted an unbounded balance /
   burn-rate ratio via `LegacyDec.TruncateInt64()` (panics on int64 overflow)
