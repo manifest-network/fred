@@ -13,10 +13,11 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // TestIntegration_Docker_OrphanReaper_KeepsLiveLeaseWithRemovedContainers proves
