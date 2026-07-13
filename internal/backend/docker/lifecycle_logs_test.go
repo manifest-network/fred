@@ -31,6 +31,8 @@ func TestDemuxContainerLogs_TruncatesOversizedOutput(t *testing.T) {
 
 	out, err := demuxContainerLogs(multiplexedLog(t, huge))
 	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(out), maxContainerLogBytes,
+		"truncated output must retain a full cap's worth of bytes before the marker")
 
 	assert.LessOrEqual(t, len(out), maxContainerLogBytes+64,
 		"output must be bounded to the cap plus a short marker")
